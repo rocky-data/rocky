@@ -284,11 +284,13 @@ pub fn generate_cross_source_overlap_sql(
             union.push_str("\n  UNION ALL\n  ");
         }
         // Tag each row with its source table as a string literal so the outer
-        // query can count distinct contributing sources per key.
-        let src_lit = ref_str.replace('\'', "''");
+        // query can count distinct contributing sources per key. The ref is
+        // built from validated identifiers, so this encodes nothing today; it
+        // goes through the dialect so that stays true if the ref format grows.
+        let src_lit = crate::sql_gen::string_literal(dialect, &ref_str);
         let _ = write!(
             union,
-            "SELECT {key_list}, '{src_lit}' AS _src FROM {ref_str} WHERE {not_null}"
+            "SELECT {key_list}, {src_lit} AS _src FROM {ref_str} WHERE {not_null}"
         );
     }
     Ok(format!(

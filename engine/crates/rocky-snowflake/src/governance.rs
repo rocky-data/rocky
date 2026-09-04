@@ -23,11 +23,13 @@ use async_trait::async_trait;
 use tracing::debug;
 
 use rocky_core::retention::RetentionPolicy;
+use rocky_core::sql_gen::string_literal;
 use rocky_core::traits::{AdapterError, AdapterResult, GovernanceAdapter, TagTarget};
 use rocky_ir::{Grant, GrantTarget, Permission, TableRef};
 use rocky_sql::validation;
 
 use crate::connector::SnowflakeConnector;
+use crate::dialect::SnowflakeSqlDialect;
 
 /// Snowflake governance adapter for tags and grants.
 ///
@@ -248,13 +250,11 @@ fn format_set_tags_sql(
         .iter()
         .map(|(k, v)| {
             validation::validate_identifier(k).map_err(AdapterError::new)?;
-            // Snowflake string literals honor backslash escapes by default, so
-            // doubling quotes alone is bypassable: a leading `\` escapes the
-            // first quote of a `''` pair, letting the second close the literal.
-            // Escape backslashes FIRST (so we don't double-escape the ones we
-            // add), then single quotes — closing the quote-doubling bypass.
-            let escaped = v.replace('\\', "\\\\").replace('\'', "''");
-            Ok(format!("{k} = '{escaped}'"))
+            // Snowflake's lexer reads backslash escapes, so the value goes
+            // through the dialect's own rule (`\\` and `\'`). Doubling the
+            // quote alone is bypassable there: a leading `\` escapes the
+            // first quote of the pair and the second closes the literal.
+            Ok(format!("{k} = {}", string_literal(&SnowflakeSqlDialect, v)))
         })
         .collect::<AdapterResult<Vec<_>>>()?;
 
@@ -469,18 +469,27 @@ mod tests {
         );
     }
 
+    /// Snowflake's lexer reads backslash escapes, so the value is encoded
+    /// by the dialect's own rule (issue #1596): `\` becomes `\\` and `'`
+    /// becomes `\'`. A doubled `''` would be split by a leading `\` and
+    /// the literal terminated early.
     #[test]
-    fn test_set_tags_escapes_backslash_before_quote() {
-        // Snowflake honors backslash escapes, so `\'` would otherwise let a
-        // doubled `''` be split and the literal terminated early. Escaping
-        // backslashes first neutralizes the bypass: `\` → `\\`, `'` → `''`.
+    fn test_set_tags_encodes_a_backslash_quote_pair_by_the_dialect_rule() {
         let mut tags = BTreeMap::new();
-        tags.insert("note".into(), "\\'; DROP TABLE x; --".into());
+        tags.insert("note".into(), r"\'; DROP TABLE x; --".into());
         let sql = format_set_tags_sql(&TagTarget::Catalog("db".into()), &tags).unwrap();
         assert_eq!(
             sql,
-            "ALTER DATABASE db SET TAG note = '\\\\''; DROP TABLE x; --'"
+            r"ALTER DATABASE db SET TAG note = '\\\'; DROP TABLE x; --'"
         );
+    }
+
+    #[test]
+    fn test_set_tags_encodes_a_trailing_backslash() {
+        let mut tags = BTreeMap::new();
+        tags.insert("path".into(), r"C:\data\".into());
+        let sql = format_set_tags_sql(&TagTarget::Catalog("db".into()), &tags).unwrap();
+        assert_eq!(sql, r"ALTER DATABASE db SET TAG path = 'C:\\data\\'");
     }
 
     #[test]
@@ -532,7 +541,7 @@ mod tests {
         let mut tags = BTreeMap::new();
         tags.insert("desc".into(), "Hugo's pipeline".into());
         let sql = format_set_tags_sql(&TagTarget::Catalog("db".into()), &tags).unwrap();
-        assert_eq!(sql, "ALTER DATABASE db SET TAG desc = 'Hugo''s pipeline'");
+        assert_eq!(sql, r"ALTER DATABASE db SET TAG desc = 'Hugo\'s pipeline'");
     }
 
     // ---- Grant SQL generation ----

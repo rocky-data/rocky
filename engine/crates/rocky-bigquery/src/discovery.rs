@@ -22,10 +22,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use rocky_core::source::{DiscoveredConnector, DiscoveredTable, DiscoveryResult};
+use rocky_core::sql_gen::string_literal;
 use rocky_core::traits::{AdapterError, AdapterResult, DiscoveryAdapter, WarehouseAdapter};
 use rocky_sql::validation::{validate_gcp_project_id, validate_identifier};
 
 use crate::connector::BigQueryAdapter;
+use crate::dialect::BigQueryDialect;
 
 /// BigQuery discovery adapter that lists datasets matching a prefix.
 pub struct BigQueryDiscoveryAdapter {
@@ -59,6 +61,23 @@ impl BigQueryDiscoveryAdapter {
     }
 }
 
+/// The `INFORMATION_SCHEMA.SCHEMATA` query for every dataset whose name
+/// starts with `schema_prefix`.
+///
+/// `project` and `region` are validated by the caller. The prefix is user
+/// text from `schema_pattern.prefix`, encoded by BigQuery's own lexer rule
+/// (it reads backslash escapes, and `''` is a syntax error there rather
+/// than an escaped quote). `STARTS_WITH` reads the result as plain text, so
+/// `_` and `%` need no `LIKE` treatment.
+fn schemata_sql(project: &str, region: &str, schema_prefix: &str) -> String {
+    let prefix_lit = string_literal(&BigQueryDialect, schema_prefix);
+    format!(
+        "SELECT schema_name FROM `{project}.{region}.INFORMATION_SCHEMA.SCHEMATA` \
+         WHERE STARTS_WITH(schema_name, {prefix_lit}) \
+         ORDER BY schema_name"
+    )
+}
+
 #[async_trait]
 impl DiscoveryAdapter for BigQueryDiscoveryAdapter {
     async fn discover(&self, schema_prefix: &str) -> AdapterResult<DiscoveryResult> {
@@ -66,21 +85,7 @@ impl DiscoveryAdapter for BigQueryDiscoveryAdapter {
         validate_gcp_project_id(project).map_err(AdapterError::new)?;
         let region = self.region_qualifier()?;
 
-        // SQL string-literal escape. The prefix is user input; `'`
-        // would otherwise close the literal. `STARTS_WITH` makes
-        // wildcard characters (`_`, `%`) safe — they're treated as
-        // literals. Doubling is not enough on its own: BigQuery also honours
-        // a backslash escape, so a prefix ending in `\` would escape the first
-        // quote of the pair and let the second close the literal (#1524).
-        rocky_sql::validation::reject_unquotable_literal("schema_pattern `prefix`", schema_prefix)
-            .map_err(AdapterError::new)?;
-        let prefix_lit = schema_prefix.replace('\'', "''");
-
-        let schemas_sql = format!(
-            "SELECT schema_name FROM `{project}.{region}.INFORMATION_SCHEMA.SCHEMATA` \
-             WHERE STARTS_WITH(schema_name, '{prefix_lit}') \
-             ORDER BY schema_name"
-        );
+        let schemas_sql = schemata_sql(project, &region, schema_prefix);
 
         let schema_result = self.adapter.execute_query(&schemas_sql).await?;
 
@@ -151,6 +156,31 @@ mod tests {
                 "test-token".to_string(),
             )),
         ))
+    }
+
+    /// The prefix is encoded by BigQuery's own lexer rule (issue #1596):
+    /// its lexer reads backslash escapes, so a backslash is doubled and a
+    /// quote is `\'` — and, per the GoogleSQL lexical spec, `''` would be a
+    /// syntax error there rather than an escaped quote.
+    #[test]
+    fn schemata_sql_encodes_the_prefix_by_bigquerys_lexer_rule() {
+        assert_eq!(
+            schemata_sql("p", "region-eu", r"raw\"),
+            r"SELECT schema_name FROM `p.region-eu.INFORMATION_SCHEMA.SCHEMATA` WHERE STARTS_WITH(schema_name, 'raw\\') ORDER BY schema_name"
+        );
+        assert!(
+            schemata_sql("p", "region-eu", "it's").contains(r"STARTS_WITH(schema_name, 'it\'s')")
+        );
+    }
+
+    /// A prefix without a quote or a backslash is spliced byte-identically to
+    /// the pre-encoder form.
+    #[test]
+    fn schemata_sql_plain_prefix_is_byte_identical() {
+        assert_eq!(
+            schemata_sql("p", "region-eu", "src__"),
+            "SELECT schema_name FROM `p.region-eu.INFORMATION_SCHEMA.SCHEMATA` WHERE STARTS_WITH(schema_name, 'src__') ORDER BY schema_name"
+        );
     }
 
     #[test]

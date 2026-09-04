@@ -474,19 +474,10 @@ fn generate_test_sql_inner(
             if values.is_empty() {
                 return Err(TestGenError::EmptyAcceptedValues);
             }
-            // Each value is wrapped in a `'...'` literal by doubling quotes.
-            // That is only safe where `''` is the sole escape; a backslash makes
-            // three of the five dialects read the closing quote differently.
-            for v in values {
-                validation::reject_unquotable_literal(
-                    &format!("accepted_values test value on {table}"),
-                    v,
-                )?;
-            }
             let in_list = values
                 .iter()
-                .map(|v| format!("'{}'", v.replace('\'', "''")))
-                .collect::<Vec<_>>()
+                .map(|v| accepted_value_literal(v, dialect, table))
+                .collect::<Result<Vec<_>, _>>()?
                 .join(", ");
             Ok(format!(
                 "SELECT DISTINCT {col} FROM {table} WHERE {}{col} NOT IN ({in_list})",
@@ -730,6 +721,35 @@ pub fn validate_regex_pattern(pattern: &str) -> Result<(), TestGenError> {
         }
     }
     Ok(())
+}
+
+/// Encodes one `accepted_values` entry as a complete `'…'` literal.
+///
+/// With a dialect in hand, that dialect's own lexer rule does the encoding
+/// ([`crate::sql_gen::string_literal`]), and any value round-trips. Without
+/// one — the dialect-less [`generate_test_sql`] — only quote-doubling is
+/// available, and three of the five warehouses read a backslash differently
+/// under it, so a backslash is refused there rather than guessed at. Every
+/// production caller passes a dialect; the refusal is the only defence left
+/// on the dialect-less path.
+fn accepted_value_literal(
+    value: &str,
+    dialect: Option<&dyn crate::traits::SqlDialect>,
+    table: &str,
+) -> Result<String, TestGenError> {
+    match dialect {
+        Some(dialect) => Ok(crate::sql_gen::string_literal(dialect, value)),
+        None => {
+            validation::reject_unquotable_literal(
+                &format!("accepted_values test value on {table}"),
+                value,
+            )?;
+            Ok(rocky_sql::literal::encode_string_literal(
+                rocky_sql::literal::LiteralEscape::Standard,
+                value,
+            ))
+        }
+    }
 }
 
 /// Extracts the required column from a test declaration, returning an error
@@ -1611,12 +1631,13 @@ value = "0"
     // fragment would let the author's text end that statement and start
     // another. `generate_test_sql*` refuses it at generation time.
 
+    /// The dialect-less `generate_test_sql` has no lexer rule to ask, so it
+    /// keeps the interim refusal: quote-doubling is all it can do, and a
+    /// trailing backslash would let three of the five warehouses read the
+    /// closing quote differently. With a dialect the value is encoded
+    /// instead — see `accepted_values_encodes_a_backslash_and_a_quote_per_dialect`.
     #[test]
     fn accepted_values_refuses_a_backslash_in_a_value() {
-        // The value is wrapped in a `'...'` literal by doubling quotes. On
-        // Snowflake / DuckDB / BigQuery a trailing backslash escapes the first
-        // quote of that pair, so the second closes the literal and the rest of
-        // the value becomes live SQL. Quote-doubling alone cannot contain it.
         let decl = TestDecl {
             test_type: TestType::AcceptedValues {
                 values: vec!["pending".into(), "trailing_backslash\\".into()],
@@ -1631,6 +1652,72 @@ value = "0"
         assert!(
             msg.contains("accepted_values test value on db.sc.orders"),
             "{msg}"
+        );
+    }
+
+    // ----- Dialect-owned literal encoding (issue #1596) -----
+
+    fn accepted(values: &[&str]) -> TestDecl {
+        TestDecl {
+            test_type: TestType::AcceptedValues {
+                values: values.iter().map(|v| (*v).to_string()).collect(),
+            },
+            column: Some("status".into()),
+            severity: TestSeverity::Error,
+            filter: None,
+        }
+    }
+
+    /// With a dialect in hand, each value is encoded by that dialect's own
+    /// lexer rule. Under `Standard` (DuckDB, Trino) a backslash
+    /// stands for itself and a quote is doubled. Under `Backslash` the
+    /// backslash is doubled and the quote is `\'` — a doubled quote there
+    /// would let a trailing `\` escape the first quote of the pair and free
+    /// the second one to close the literal.
+    #[test]
+    fn accepted_values_encodes_a_backslash_and_a_quote_per_dialect() {
+        use crate::traits::LiteralEscape;
+        use crate::traits::test_dialects::StubDialect;
+
+        let decl = accepted(&["pending", r"trailing\", "it's"]);
+
+        let standard =
+            generate_test_sql_with_dialect(&decl, "orders", &StubDialect(LiteralEscape::Standard))
+                .unwrap();
+        assert_eq!(
+            standard,
+            r"SELECT DISTINCT status FROM orders WHERE status NOT IN ('pending', 'trailing\', 'it''s')"
+        );
+
+        let backslash =
+            generate_test_sql_with_dialect(&decl, "orders", &StubDialect(LiteralEscape::Backslash))
+                .unwrap();
+        assert_eq!(
+            backslash,
+            r"SELECT DISTINCT status FROM orders WHERE status NOT IN ('pending', 'trailing\\', 'it\'s')"
+        );
+    }
+
+    /// A value without a quote or a backslash encodes to the same bytes under
+    /// both rules, and to the same bytes the dialect-less path emits.
+    #[test]
+    fn accepted_values_plain_values_are_byte_identical_under_both_rules() {
+        use crate::traits::LiteralEscape;
+        use crate::traits::test_dialects::StubDialect;
+
+        let decl = accepted(&["pending", "shipped"]);
+        let expected =
+            "SELECT DISTINCT status FROM orders WHERE status NOT IN ('pending', 'shipped')";
+        assert_eq!(generate_test_sql(&decl, "orders").unwrap(), expected);
+        assert_eq!(
+            generate_test_sql_with_dialect(&decl, "orders", &StubDialect(LiteralEscape::Standard))
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            generate_test_sql_with_dialect(&decl, "orders", &StubDialect(LiteralEscape::Backslash))
+                .unwrap(),
+            expected
         );
     }
 
