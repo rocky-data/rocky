@@ -356,7 +356,10 @@ pub async fn run_transformation(
     }
 
     if output_json {
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        // Through `print_json`, not the pretty serializer directly: the watch
+        // loop sets `COMPACT_JSON` to promise one compact object per line,
+        // and a serializer called here never sees that flag (#1604).
+        crate::output::print_json(&output)?;
     } else {
         crate::status_line!(
             "transformation pipeline complete: {} model(s) executed in {}ms",
@@ -607,7 +610,10 @@ pub async fn run_quality(
     let (error_failures, warning_failures) = count_failures_by_severity(&output);
 
     if output_json {
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        // Through `print_json`, not the pretty serializer directly: the watch
+        // loop sets `COMPACT_JSON` to promise one compact object per line,
+        // and a serializer called here never sees that flag (#1604).
+        crate::output::print_json(&output)?;
     } else {
         let total_checks: usize = output.check_results.iter().map(|t| t.checks.len()).sum();
         let quarantine_summary = if output.quarantine.is_empty() {
@@ -1163,7 +1169,10 @@ pub async fn run_snapshot(
     }
 
     if output_json {
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        // Through `print_json`, not the pretty serializer directly: the watch
+        // loop sets `COMPACT_JSON` to promise one compact object per line,
+        // and a serializer called here never sees that flag (#1604).
+        crate::output::print_json(&output)?;
     } else {
         crate::status_line!(
             "snapshot pipeline complete: {}.{}.{} -> {}.{}.{} in {}ms",
