@@ -893,3 +893,100 @@ fn run_watch_exits_on_a_signal_during_an_iteration() {
          SIGTERM (budget {shutdown_budget:?}, one run {one_run:?})"
     );
 }
+
+/// #1604: a TRANSFORMATION pipeline must honour the NDJSON contract too.
+///
+/// `run --watch` sets the process-global `COMPACT_JSON` flag, and
+/// `output::print_json` reads it. The transformation arm emitted its payload
+/// with `serde_json::to_string_pretty` directly, so the flag never reached it
+/// and one iteration arrived as ~65 lines instead of one. Anything consuming
+/// the stream line by line could not read it.
+///
+/// The sibling test above covers the replication arm, which always went
+/// through `print_json` — which is exactly why this defect survived.
+#[test]
+fn run_watch_transformation_emits_one_compact_json_line_per_iteration() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+
+    // The blocking fixture's shape, with its source left as an ordinary CSV:
+    // this test wants a transformation pipeline that simply completes.
+    let source_path = dir.join(BLOCKING_SOURCE_FILE);
+    fs::write(&source_path, "1\n").expect("write source csv");
+    {
+        let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
+        conn.execute_batch(&blocking_seed_sql(&source_path))
+            .expect("seed sql");
+    }
+
+    let cfg_path = dir.join("rocky.toml");
+    fs::write(&cfg_path, BLOCKING_ROCKY_TOML).expect("write rocky.toml");
+    let models_dir = dir.join("models");
+    fs::create_dir(&models_dir).expect("mkdir models");
+    fs::write(models_dir.join("blocking.sql"), BLOCKING_MODEL_SQL).expect("write model sql");
+    fs::write(models_dir.join("blocking.toml"), BLOCKING_MODEL_TOML).expect("write model toml");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rocky"))
+        .arg("-c")
+        .arg(&cfg_path)
+        .arg("run")
+        .arg("--watch")
+        .current_dir(dir)
+        .env("RUST_LOG", "error")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rocky");
+
+    let pid = child.id();
+    let stderr = child.stderr.take().expect("stderr piped");
+    let stderr_rx = spawn_line_reader(stderr);
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stdout_collector = spawn_collecting_reader(stdout);
+
+    let first = wait_for(&stderr_rx, "run completed in", BOOTSTRAP_BUDGET);
+    if !first.matched {
+        sigterm(pid);
+        let _ = child.wait();
+        panic!(
+            "the transformation run never completed within {BOOTSTRAP_BUDGET:?}.\n\
+             stderr so far:\n{}",
+            first.buffered
+        );
+    }
+
+    // One completed iteration is all this contract needs; the sibling test
+    // covers re-running on a file change.
+    sigterm(pid);
+    let _ = child.wait();
+
+    let stdout_lines = stdout_collector
+        .join()
+        .expect("stdout collector thread panicked");
+    let json_lines: Vec<&str> = stdout_lines
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    assert!(
+        !json_lines.is_empty(),
+        "expected at least one NDJSON line on stdout; got none.\nstdout:\n{}",
+        stdout_lines.join("\n")
+    );
+    for (i, line) in json_lines.iter().enumerate() {
+        // The whole point: each LINE parses on its own. A pretty-printed
+        // object fails here on its very first line, `{`.
+        let parsed: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| {
+            panic!(
+                "stdout line {i} is not valid single-line JSON ({e}) — the \
+                 transformation arm is pretty-printing again:\n{line}"
+            );
+        });
+        let cmd = parsed.get("command").and_then(|c| c.as_str());
+        assert_eq!(
+            cmd,
+            Some("run"),
+            "expected `command: \"run\"` on every iteration line; got {cmd:?} on line {i}"
+        );
+    }
+}
