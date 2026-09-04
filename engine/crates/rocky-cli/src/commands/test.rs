@@ -94,8 +94,9 @@ pub fn test_output(
         })
         .collect();
     let model_results = to_output_results(&result.model_results);
-    let mut output =
-        TestOutput::new(result.total, result.passed, failures).with_model_results(model_results);
+    let mut output = TestOutput::new(result.total, result.passed, failures)
+        .with_model_results(model_results)
+        .with_diagnostics(result.diagnostics.clone());
     let unit_run = rocky_engine::test_runner::run_unit_tests(models_dir, model_filter)?;
     if let Some(summary) = unit_summary(&unit_run) {
         output = output.with_unit_tests(summary);
@@ -131,7 +132,8 @@ pub fn run_test(
             .collect();
         let model_results = to_output_results(&result.model_results);
         let mut output = TestOutput::new(result.total, result.passed, failures)
-            .with_model_results(model_results);
+            .with_model_results(model_results)
+            .with_diagnostics(result.diagnostics.clone());
         if let Some(summary) = unit_summary(&unit_run) {
             output = output.with_unit_tests(summary);
         }
