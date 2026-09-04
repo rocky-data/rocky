@@ -103,16 +103,10 @@ jobs:
           # while competing for the repo's 10 GB budget against caches that
           # every PR restores from. Latency does not matter on a schedule.
           save-if: false
-      # The runner filled its root filesystem here, which is what has been
-      # failing this job since 2026-08-24. It surfaced as
-      # `collect2: fatal error: ld terminated with signal 7 [Bus error]`
-      # because a linker writes its output through mmap: a filesystem that
-      # fills mid-write faults instead of returning ENOSPC. The proof is the
-      # runner agent's own crash on the next run —
-      # `System.IO.IOException: No space left on device` while writing
-      # `_diag/Worker_*.log` — which is also why that run uploaded no logs at
-      # all. Removing dotnet, android and ghc was not enough for a
-      # tarpaulin-instrumented debug build of this workspace.
+      # Headroom for the coverage build, which is the largest thing this
+      # repository builds anywhere. It is not sufficient on its own — see the
+      # debug-info setting on the coverage step — but it buys back ~25 GB and
+      # the two together are what keep this job under the disk.
       - name: Free disk space and add swap
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
@@ -133,6 +127,16 @@ jobs:
           df -h / /mnt /tmp || true
           free -m || true
       - name: Run coverage
+        env:
+          # Line tables, not full DWARF. Measured: with default dev debug
+          # info this build filled a 145 GB runner disk — 106 GB available
+          # before the step, 149 MB after, so the instrumented artefacts
+          # alone are ~105 GB. That is why freeing more space did not fix
+          # it; the build outgrew the machine. Coverage needs the line
+          # mapping, which is what this keeps, and not the variable and
+          # type DWARF that dominates the size.
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+          CARGO_PROFILE_TEST_DEBUG: line-tables-only
         # No --all-targets: that pulls the criterion benches into the run, and
         # the `binary_startup` bench shells out to `cargo run` on every
         # iteration. Under tarpaulin's ptrace instrumentation that subprocess
