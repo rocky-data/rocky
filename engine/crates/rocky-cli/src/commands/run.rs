@@ -5895,13 +5895,40 @@ async fn run_batched_checks(
     // Process freshness results
     if let Some(ref freshness_cfg) = pipeline.checks.freshness {
         let now = Utc::now();
-        let measured = freshness_results.iter().filter_map(|fr| {
-            let ts = fr.max_timestamp?;
-            let lag = (now - ts).num_seconds().unsigned_abs();
-            Some((
-                fr.table.full_name(),
-                checks::check_freshness(lag, freshness_cfg.threshold_seconds),
-            ))
+        // Driven by the REQUESTED tables, not the returned ones. Iterating
+        // the results would drop a table the batch query left out, which is
+        // exactly the silent gap this change closes for row counts; the
+        // batch path never populates `freshness_failures`, so there would be
+        // nothing else to notice the omission. A returned `None` is an empty
+        // table and still emits no check: `MAX(ts)` over no rows is NULL
+        // because there is no row to be fresh, which is not the same as a
+        // query that could not answer.
+        let measured = freshness_batch_refs.iter().filter_map(|tref| {
+            let key = tref.full_name();
+            match freshness_results.iter().find(|fr| fr.table == *tref) {
+                Some(fr) => {
+                    let ts = fr.max_timestamp?;
+                    let lag = (now - ts).num_seconds().unsigned_abs();
+                    Some((key, checks::check_freshness(lag, freshness_cfg.threshold_seconds)))
+                }
+                // Absent from the results and with no recorded reason: the
+                // batch query left this table out.
+                None if !freshness_failures.iter().any(|(k, _)| *k == key) => {
+                    warn!(
+                        table = key.as_str(),
+                        "the batch freshness query returned no result for this table — reporting it as not evaluated"
+                    );
+                    Some((
+                        key,
+                        checks::freshness_not_evaluated(
+                            freshness_cfg.threshold_seconds,
+                            "the batch freshness query returned no result for this table",
+                        ),
+                    ))
+                }
+                // Absent, but the per-table path already recorded why.
+                None => None,
+            }
         });
         // A freshness query that failed, or returned a cell that is not a
         // timestamp, used to be logged and dropped: no result, no trace in
@@ -28489,6 +28516,27 @@ table = "fct_events"
             );
             assert_eq!(result.severity, rocky_core::tests::TestSeverity::Warning);
         }
+    }
+
+    /// The batch path reports an omitted freshness result too. Reading only
+    /// the returned entries would drop the table silently, and the batch path
+    /// records no per-table reason to notice it by.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_table_the_batch_freshness_left_out_is_not_evaluated() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.freshness]\nthreshold_seconds = 3600",
+        );
+
+        let (pending, _) = fx.run(&inner, Some(&EmptyBatchCheck), None).await;
+        let result = the_result(&pending, &fx.target_key(), "freshness");
+        assert!(!result.passed, "{result:?}");
+        assert_eq!(
+            result.not_evaluated.as_deref(),
+            Some("the batch freshness query returned no result for this table"),
+            "{result:?}"
+        );
     }
 
     /// A row whose counts do not parse used to be skipped, leaving that column
