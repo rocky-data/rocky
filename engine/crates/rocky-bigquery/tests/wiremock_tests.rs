@@ -182,6 +182,316 @@ async fn happy_path_inline_result_parses_values() {
     assert_eq!(result.rows[1][2], json!("hi"));
 }
 
+/// `maxResults` is a per-page limit, not a whole-query limit. A successful
+/// inline response with `pageToken` must be followed through
+/// `jobs.getQueryResults` before `execute_query` returns.
+#[tokio::test]
+async fn inline_query_collects_all_result_pages() {
+    let server = MockServer::start().await;
+    let first_page: Vec<Value> = (0..10_000)
+        .map(|id| json!({"f": [{"v": id.to_string()}]}))
+        .collect();
+
+    Mock::given(method("POST"))
+        .and(path(QUERIES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "jobReference": {"projectId": "test-project", "jobId": "job-paged"},
+            "schema": {"fields": [{"name": "id", "type": "INTEGER"}]},
+            "rows": first_page,
+            "totalRows": "10001",
+            "pageToken": "page-2"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/bigquery/v2/projects/test-project/queries/job-paged"))
+        .and(query_param("location", "EU"))
+        .and(query_param("maxResults", "10000"))
+        .and(query_param("pageToken", "page-2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "rows": [{"f": [{"v": "10000"}]}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = test_adapter(&server)
+        .execute_query("SELECT id FROM large_table")
+        .await
+        .expect("all query-result pages should be returned");
+
+    assert_eq!(result.columns, vec!["id"]);
+    assert_eq!(result.rows.len(), 10_001);
+    assert_eq!(result.rows[0][0], json!("0"));
+    assert_eq!(result.rows[10_000][0], json!("10000"));
+    server.verify().await;
+}
+
+/// Pagination composes with the deferred-job poll path: the first completed
+/// poll may itself be only page one.
+#[tokio::test]
+async fn deferred_query_collects_all_result_pages() {
+    let server = MockServer::start().await;
+    let poll_path = "/bigquery/v2/projects/test-project/queries/job-deferred-paged";
+
+    Mock::given(method("POST"))
+        .and(path(QUERIES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": false,
+            "jobReference": {"projectId": "test-project", "jobId": "job-deferred-paged"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(poll_path))
+        .and(query_param("timeoutMs", "10000"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "jobReference": {"projectId": "test-project", "jobId": "job-deferred-paged"},
+            "schema": {"fields": [{"name": "id", "type": "INTEGER"}]},
+            "rows": [{"f": [{"v": "1"}]}],
+            "totalRows": "2",
+            "pageToken": "last-page"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(poll_path))
+        .and(query_param("pageToken", "last-page"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "rows": [{"f": [{"v": "2"}]}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = test_adapter(&server)
+        .execute_query("SELECT id FROM slow_large_table")
+        .await
+        .expect("a completed poll should fetch its remaining pages");
+
+    assert_eq!(result.rows, vec![vec![json!("1")], vec![json!("2")]]);
+    server.verify().await;
+}
+
+/// A token without a job reference cannot be followed. Returning the first
+/// page would be silent truncation, so this malformed response fails closed.
+#[tokio::test]
+async fn page_token_without_job_reference_errors_cleanly() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(QUERIES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "rows": [{"f": [{"v": "1"}]}],
+            "totalRows": "2",
+            "pageToken": "unreachable-page"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let err = test_adapter(&server)
+        .execute_query("SELECT id FROM malformed_result")
+        .await
+        .expect_err("an unpageable response must not return partial success");
+
+    match as_bq_error(&err) {
+        BigQueryError::ApiError { status, message } => {
+            assert_eq!(status, "missing jobReference");
+            assert!(message.contains("remaining query results"));
+        }
+        other => panic!("expected ApiError(missing jobReference), got: {other:?}"),
+    }
+}
+
+/// A later-page failure must surface as an error rather than returning the
+/// rows collected so far as a successful result.
+#[tokio::test]
+async fn later_page_error_is_not_partial_success() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(QUERIES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "jobReference": {"projectId": "test-project", "jobId": "job-page-error"},
+            "rows": [{"f": [{"v": "1"}]}],
+            "totalRows": "2",
+            "pageToken": "page-error"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(
+            "/bigquery/v2/projects/test-project/queries/job-page-error",
+        ))
+        .and(query_param("pageToken", "page-error"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("page unavailable"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let err = test_adapter(&server)
+        .execute_query("SELECT id FROM unavailable_page")
+        .await
+        .expect_err("a later-page failure must fail the whole query result");
+
+    match as_bq_error(&err) {
+        BigQueryError::ApiError { status, message } => {
+            assert!(status.contains("503"));
+            assert!(message.contains("page unavailable"));
+        }
+        other => panic!("expected ApiError(503), got: {other:?}"),
+    }
+}
+
+/// Later pages use the same bounded transient retry policy as query
+/// submission, so a one-off API outage does not fail an otherwise completed
+/// content-addressed query.
+#[tokio::test]
+async fn later_page_transient_error_is_retried() {
+    let server = MockServer::start().await;
+    let page_path = "/bigquery/v2/projects/test-project/queries/job-page-retry";
+
+    Mock::given(method("POST"))
+        .and(path(QUERIES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "jobReference": {"projectId": "test-project", "jobId": "job-page-retry"},
+            "rows": [{"f": [{"v": "1"}]}],
+            "totalRows": "2",
+            "pageToken": "page-2"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(page_path))
+        .and(query_param("pageToken", "page-2"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("try again"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(page_path))
+        .and(query_param("pageToken", "page-2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "rows": [{"f": [{"v": "2"}]}]
+        })))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = retrying_adapter(&server, 1)
+        .execute_query("SELECT id FROM transient_page")
+        .await
+        .expect("a transient later-page error should be retried");
+
+    assert_eq!(result.rows, vec![vec![json!("1")], vec![json!("2")]]);
+    server.verify().await;
+}
+
+/// `totalRows` describes the complete result set. If BigQuery supplies no
+/// continuation token for fewer rows, fail closed instead of committing a
+/// silently truncated result.
+#[tokio::test]
+async fn row_count_mismatch_without_page_token_errors() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(QUERIES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "jobReference": {"projectId": "test-project", "jobId": "job-short-result"},
+            "rows": [{"f": [{"v": "1"}]}],
+            "totalRows": "2"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let err = test_adapter(&server)
+        .execute_query("SELECT id FROM short_result")
+        .await
+        .expect_err("a row-count mismatch must not return partial success");
+
+    match as_bq_error(&err) {
+        BigQueryError::ApiError { status, message } => {
+            assert_eq!(status, "incomplete query result");
+            assert!(message.contains("advertised 2 total row(s)"));
+            assert!(message.contains("received 1"));
+        }
+        other => panic!("expected incomplete-result ApiError, got: {other:?}"),
+    }
+}
+
+/// A repeated token would otherwise spin forever. Refuse it after the first
+/// page instead of returning incomplete rows or issuing an unbounded request
+/// loop.
+#[tokio::test]
+async fn repeated_page_token_errors_cleanly() {
+    let server = MockServer::start().await;
+    let page_path = "/bigquery/v2/projects/test-project/queries/job-token-loop";
+
+    Mock::given(method("POST"))
+        .and(path(QUERIES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "jobReference": {"projectId": "test-project", "jobId": "job-token-loop"},
+            "rows": [{"f": [{"v": "1"}]}],
+            "totalRows": "3",
+            "pageToken": "same-token"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(page_path))
+        .and(query_param("pageToken", "same-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "rows": [{"f": [{"v": "2"}]}],
+            "pageToken": "same-token"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let err = test_adapter(&server)
+        .execute_query("SELECT id FROM looping_pages")
+        .await
+        .expect_err("a repeated page token must be refused");
+
+    match as_bq_error(&err) {
+        BigQueryError::ApiError { status, message } => {
+            assert_eq!(status, "repeated pageToken");
+            assert!(message.contains("refusing to loop"));
+        }
+        other => panic!("expected repeated-page-token ApiError, got: {other:?}"),
+    }
+    server.verify().await;
+}
+
 /// `execute_statement` ignores the result body and just confirms success —
 /// the bearer token rides in the Authorization header.
 #[tokio::test]
