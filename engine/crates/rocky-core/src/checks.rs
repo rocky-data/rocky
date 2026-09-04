@@ -20,6 +20,17 @@ pub struct CheckResult {
     /// is advisory and does not fail the run.
     #[serde(default)]
     pub severity: TestSeverity,
+    /// Set when the engine could not run the check, carrying the reason.
+    ///
+    /// A check that never ran must not read as a measurement. Whenever this
+    /// is set, `passed` is `false` and the numeric fields of the flattened
+    /// details (`source_count`, `target_count`, `lag_seconds`, `null_rate`,
+    /// `failing_rows`, `result_value`, `overlap_count`) are placeholders,
+    /// not readings. A query error, an unreadable result cell, a refused
+    /// SQL fragment and a misconfigured key all land here, so the check
+    /// stays in the tally instead of vanishing or passing on a default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_evaluated: Option<String>,
     #[serde(flatten)]
     pub details: CheckDetails,
 }
@@ -83,14 +94,6 @@ pub enum CheckDetails {
         contributing_tables: Vec<String>,
         /// Bounded sample of overlapping key values (stringified) for triage.
         sample: Vec<String>,
-        /// Set when the check could NOT be evaluated, carrying the reason.
-        ///
-        /// `overlap_count` is only a measurement when this is `None`. A refused
-        /// key expression or a misconfigured key would otherwise report
-        /// `overlap_count: 0`, which reads as "no overlap found" — the check
-        /// never ran, and the tally must not imply that it did.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        not_evaluated: Option<String>,
     },
 }
 
@@ -307,17 +310,18 @@ pub fn check_cross_source_overlap(
         name: name.into(),
         passed: overlap_count <= max_overlap_rows,
         severity,
+        not_evaluated: None,
         details: CheckDetails::CrossSourceOverlap {
             overlap_count,
             contributing_tables,
             sample,
-            not_evaluated: None,
         },
     }
 }
 
 /// Builds a `CheckResult` for a cross-source overlap check that could NOT be
-/// evaluated — a refused key expression, or a `keys`/`key_expr` misconfiguration.
+/// evaluated — a refused key expression, a `keys`/`key_expr`
+/// misconfiguration, or a query that failed.
 ///
 /// Always fails. A check Rocky declined to run must stay in the tally and must
 /// not report a zero overlap count as if it had measured one.
@@ -331,11 +335,11 @@ pub fn cross_source_overlap_not_evaluated(
         name: name.into(),
         passed: false,
         severity,
+        not_evaluated: Some(reason.into()),
         details: CheckDetails::CrossSourceOverlap {
             overlap_count: 0,
             contributing_tables,
             sample: Vec::new(),
-            not_evaluated: Some(reason.into()),
         },
     }
 }
@@ -346,9 +350,29 @@ pub fn check_row_count(source_count: u64, target_count: u64) -> CheckResult {
         name: "row_count".to_string(),
         passed: source_count == target_count,
         severity: TestSeverity::Error,
+        not_evaluated: None,
         details: CheckDetails::RowCount {
             source_count,
             target_count,
+        },
+    }
+}
+
+/// A row-count check the engine could not evaluate: a side's query failed,
+/// returned no readable count, or was missing from the batch result.
+///
+/// Always fails. Both counts are placeholders, never measurements — a side
+/// that defaulted to zero used to match an empty or equally unreadable other
+/// side and pass (#1602).
+pub fn row_count_not_evaluated(reason: impl Into<String>) -> CheckResult {
+    CheckResult {
+        name: "row_count".to_string(),
+        passed: false,
+        severity: TestSeverity::Error,
+        not_evaluated: Some(reason.into()),
+        details: CheckDetails::RowCount {
+            source_count: 0,
+            target_count: 0,
         },
     }
 }
@@ -377,6 +401,7 @@ pub fn check_column_match(
         name: "column_match".to_string(),
         passed,
         severity: TestSeverity::Error,
+        not_evaluated: None,
         details: CheckDetails::ColumnMatch { missing, extra },
     }
 }
@@ -387,9 +412,31 @@ pub fn check_null_rate(column: &str, null_rate: f64, threshold: f64) -> CheckRes
         name: null_rate_check_name(column),
         passed: null_rate <= threshold,
         severity: TestSeverity::Error,
+        not_evaluated: None,
         details: CheckDetails::NullRate {
             column: column.to_string(),
             null_rate,
+            threshold,
+        },
+    }
+}
+
+/// A null-rate check for `column` the engine could not evaluate: the SQL
+/// could not be generated, the query failed, or it returned no readable row
+/// for the column. Always fails; `null_rate` is a placeholder.
+pub fn null_rate_not_evaluated(
+    column: &str,
+    threshold: f64,
+    reason: impl Into<String>,
+) -> CheckResult {
+    CheckResult {
+        name: null_rate_check_name(column),
+        passed: false,
+        severity: TestSeverity::Error,
+        not_evaluated: Some(reason.into()),
+        details: CheckDetails::NullRate {
+            column: column.to_string(),
+            null_rate: 0.0,
             threshold,
         },
     }
@@ -401,9 +448,32 @@ pub fn check_custom(name: &str, query: &str, result_value: u64, threshold: u64) 
         name: name.to_string(),
         passed: result_value <= threshold,
         severity: TestSeverity::Error,
+        not_evaluated: None,
         details: CheckDetails::Custom {
             query: query.to_string(),
             result_value,
+            threshold,
+        },
+    }
+}
+
+/// A custom check the engine could not evaluate: the query failed, returned
+/// no readable count, or its table could not be addressed. Always fails;
+/// `result_value` is a placeholder.
+pub fn custom_not_evaluated(
+    name: &str,
+    query: &str,
+    threshold: u64,
+    reason: impl Into<String>,
+) -> CheckResult {
+    CheckResult {
+        name: name.to_string(),
+        passed: false,
+        severity: TestSeverity::Error,
+        not_evaluated: Some(reason.into()),
+        details: CheckDetails::Custom {
+            query: query.to_string(),
+            result_value: 0,
             threshold,
         },
     }
@@ -428,10 +498,34 @@ pub fn check_assertion(
         name: name.into(),
         passed,
         severity,
+        not_evaluated: None,
         details: CheckDetails::Assertion {
             kind: kind.into(),
             column,
             failing_rows,
+        },
+    }
+}
+
+/// A row-level assertion the engine could not evaluate: the SQL could not be
+/// generated, the query failed, it returned no readable count, or the table
+/// could not be addressed. Always fails; `failing_rows` is a placeholder.
+pub fn assertion_not_evaluated(
+    name: impl Into<String>,
+    kind: impl Into<String>,
+    column: Option<String>,
+    severity: TestSeverity,
+    reason: impl Into<String>,
+) -> CheckResult {
+    CheckResult {
+        name: name.into(),
+        passed: false,
+        severity,
+        not_evaluated: Some(reason.into()),
+        details: CheckDetails::Assertion {
+            kind: kind.into(),
+            column,
+            failing_rows: 0,
         },
     }
 }
@@ -442,8 +536,25 @@ pub fn check_freshness(lag_seconds: u64, threshold_seconds: u64) -> CheckResult 
         name: "freshness".to_string(),
         passed: lag_seconds <= threshold_seconds,
         severity: TestSeverity::Error,
+        not_evaluated: None,
         details: CheckDetails::Freshness {
             lag_seconds,
+            threshold_seconds,
+        },
+    }
+}
+
+/// A freshness check the engine could not evaluate: the `MAX(timestamp)`
+/// query failed, or its cell did not read as a timestamp. Always fails;
+/// `lag_seconds` is a placeholder.
+pub fn freshness_not_evaluated(threshold_seconds: u64, reason: impl Into<String>) -> CheckResult {
+    CheckResult {
+        name: "freshness".to_string(),
+        passed: false,
+        severity: TestSeverity::Error,
+        not_evaluated: Some(reason.into()),
+        details: CheckDetails::Freshness {
+            lag_seconds: 0,
             threshold_seconds,
         },
     }
@@ -872,14 +983,13 @@ mod tests {
         // A genuine measurement of zero overlap PASSES.
         let measured = check_cross_source_overlap("x", 0, 0, vec![], vec![], TestSeverity::Error);
         assert!(measured.passed);
+        assert!(
+            measured.not_evaluated.is_none(),
+            "a measurement carries no reason"
+        );
         match &measured.details {
-            CheckDetails::CrossSourceOverlap {
-                overlap_count,
-                not_evaluated,
-                ..
-            } => {
+            CheckDetails::CrossSourceOverlap { overlap_count, .. } => {
                 assert_eq!(*overlap_count, 0);
-                assert!(not_evaluated.is_none(), "a measurement carries no reason");
             }
             other => panic!("expected CrossSourceOverlap, got {other:?}"),
         }
@@ -893,12 +1003,78 @@ mod tests {
             TestSeverity::Error,
         );
         assert!(!skipped.passed, "a check that did not run must not pass");
-        match &skipped.details {
-            CheckDetails::CrossSourceOverlap { not_evaluated, .. } => {
-                assert_eq!(not_evaluated.as_deref(), Some("key expression refused"));
+        assert_eq!(
+            skipped.not_evaluated.as_deref(),
+            Some("key expression refused")
+        );
+        assert!(matches!(
+            skipped.details,
+            CheckDetails::CrossSourceOverlap {
+                overlap_count: 0,
+                ..
             }
-            other => panic!("expected CrossSourceOverlap, got {other:?}"),
+        ));
+    }
+
+    /// `not_evaluated` is one field for every check kind, and it is absent
+    /// from the wire form of a check that ran (#1602).
+    #[test]
+    fn not_evaluated_constructors_fail_and_round_trip_through_json() {
+        let cases: Vec<CheckResult> = vec![
+            row_count_not_evaluated("source: the row count query failed: boom"),
+            freshness_not_evaluated(3600, "could not read 'yesterday' as a timestamp"),
+            null_rate_not_evaluated("email", 0.1, "the null-rate query failed: boom"),
+            assertion_not_evaluated(
+                "not_null:id",
+                "not_null",
+                Some("id".into()),
+                TestSeverity::Warning,
+                "the assertion query returned no readable count",
+            ),
+            custom_not_evaluated("no_dupes", "SELECT 1", 0, "custom check query failed: boom"),
+            cross_source_overlap_not_evaluated(
+                "cross_source_overlap:shopify.orders",
+                vec!["cat.s1.orders".into()],
+                "key expression refused",
+                TestSeverity::Error,
+            ),
+        ];
+        for check in &cases {
+            assert!(
+                !check.passed,
+                "{}: a check that did not run must not pass",
+                check.name
+            );
+            let reason = check
+                .not_evaluated
+                .as_deref()
+                .unwrap_or_else(|| panic!("{}: carries the reason", check.name));
+            let json = serde_json::to_value(check).unwrap();
+            assert_eq!(json["passed"], false, "{json}");
+            assert_eq!(json["not_evaluated"], reason, "{json}");
+            let back: CheckResult = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(back.not_evaluated.as_deref(), Some(reason), "{json}");
+            assert_eq!(
+                std::mem::discriminant(&back.details),
+                std::mem::discriminant(&check.details),
+                "the details variant survives the round trip: {json}"
+            );
         }
+
+        // A check that ran carries no reason and no key.
+        let measured = check_row_count(3, 3);
+        assert!(measured.passed);
+        let json = serde_json::to_value(&measured).unwrap();
+        assert!(json.get("not_evaluated").is_none(), "{json}");
+        let back: CheckResult = serde_json::from_value(json).unwrap();
+        assert!(back.not_evaluated.is_none());
+        assert!(matches!(
+            back.details,
+            CheckDetails::RowCount {
+                source_count: 3,
+                target_count: 3
+            }
+        ));
     }
 
     #[test]

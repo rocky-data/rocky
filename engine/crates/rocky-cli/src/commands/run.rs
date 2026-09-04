@@ -5613,6 +5613,16 @@ async fn run_batched_checks(
         );
     }
 
+    // Why a table has no measurement, keyed by its full name. Consulted only
+    // for a table that is missing from the measured results, so a measured
+    // table never reads a stale reason. The batch path records nothing here:
+    // a batch query that fails ends the run below, and a table it silently
+    // left out is reported without a reason.
+    let mut source_count_failures: HashMap<String, String> = HashMap::new();
+    let mut target_count_failures: HashMap<String, String> = HashMap::new();
+    // In table order, so the emitted results are deterministic.
+    let mut freshness_failures: Vec<(String, String)> = Vec::new();
+
     // Batch checks dispatch through the BatchCheckAdapter trait when the
     // warehouse provides one (UNION ALL batching). Otherwise, fall back to
     // per-table queries via the generic WarehouseAdapter — same observable
@@ -5657,55 +5667,51 @@ async fn run_batched_checks(
         let mut fresh_results: Vec<BatchFreshnessResult> = Vec::new();
 
         if row_count_enabled {
-            for br in source_batch_refs {
-                let table_ref = dialect
-                    .format_table_ref(&br.catalog, &br.schema, &br.table)
-                    .map_err(anyhow::Error::from)?;
-                let sql = format!("SELECT COUNT(*) FROM {table_ref}");
-                match warehouse.execute_query(&sql).await {
-                    Ok(result) => {
-                        let count = result
-                            .rows
-                            .first()
-                            .and_then(|r| r.first())
-                            .and_then(|v| {
-                                v.as_u64()
-                                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                            })
-                            .unwrap_or(0);
-                        src_counts.push(BatchRowCountResult {
-                            table: br.clone(),
-                            count,
-                        });
-                    }
-                    Err(e) => {
-                        warn!(table = br.table.as_str(), error = %e, "per-table row count failed");
-                    }
-                }
-            }
-            for br in target_batch_refs {
-                let table_ref = dialect
-                    .format_table_ref(&br.catalog, &br.schema, &br.table)
-                    .map_err(anyhow::Error::from)?;
-                let sql = format!("SELECT COUNT(*) FROM {table_ref}");
-                match warehouse.execute_query(&sql).await {
-                    Ok(result) => {
-                        let count = result
-                            .rows
-                            .first()
-                            .and_then(|r| r.first())
-                            .and_then(|v| {
-                                v.as_u64()
-                                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                            })
-                            .unwrap_or(0);
-                        tgt_counts.push(BatchRowCountResult {
-                            table: br.clone(),
-                            count,
-                        });
-                    }
-                    Err(e) => {
-                        warn!(table = br.table.as_str(), error = %e, "per-table row count failed");
+            // A side that fails is recorded as missing, with the reason. It
+            // used to default to 0, and 0 matched an empty or equally
+            // unreadable other side (#1602).
+            for (refs, counts, failures) in [
+                (
+                    source_batch_refs,
+                    &mut src_counts,
+                    &mut source_count_failures,
+                ),
+                (
+                    target_batch_refs,
+                    &mut tgt_counts,
+                    &mut target_count_failures,
+                ),
+            ] {
+                for br in refs {
+                    let table_ref = dialect
+                        .format_table_ref(&br.catalog, &br.schema, &br.table)
+                        .map_err(anyhow::Error::from)?;
+                    let sql = format!("SELECT COUNT(*) FROM {table_ref}");
+                    match warehouse.execute_query(&sql).await {
+                        Ok(result) => {
+                            match checks::cell_as_u64(result.rows.first().and_then(|r| r.first())) {
+                                Some(count) => counts.push(BatchRowCountResult {
+                                    table: br.clone(),
+                                    count,
+                                }),
+                                None => {
+                                    warn!(
+                                        table = br.table.as_str(),
+                                        "per-table row count returned no readable count"
+                                    );
+                                    failures.insert(
+                                        br.full_name(),
+                                        "the row count query returned no readable count"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(table = br.table.as_str(), error = %e, "per-table row count failed");
+                            failures
+                                .insert(br.full_name(), format!("the row count query failed: {e}"));
+                        }
                     }
                 }
             }
@@ -5719,31 +5725,48 @@ async fn run_batched_checks(
                 let sql = format!("SELECT MAX({}) FROM {table_ref}", pipeline.timestamp_column);
                 match warehouse.execute_query(&sql).await {
                     Ok(result) => {
-                        let max_ts = result
-                            .rows
-                            .first()
-                            .and_then(|r| r.first())
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| {
-                                s.parse::<chrono::DateTime<Utc>>().ok().or_else(|| {
-                                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
-                                        .or_else(|_| {
-                                            chrono::NaiveDateTime::parse_from_str(
-                                                s,
-                                                "%Y-%m-%d %H:%M:%S",
-                                            )
-                                        })
-                                        .ok()
-                                        .map(|naive| naive.and_utc())
-                                })
-                            });
-                        fresh_results.push(BatchFreshnessResult {
-                            table: br.clone(),
-                            max_timestamp: max_ts,
-                        });
+                        // `MAX()` over an empty table is NULL: there is no row
+                        // to be fresh, and no check is emitted (unchanged). A
+                        // non-NULL cell that does not read as a timestamp — a
+                        // DATE or numeric `timestamp_column`, say — is a check
+                        // the engine could not evaluate, and used to be
+                        // dropped without a trace.
+                        match result.rows.first().and_then(|r| r.first()) {
+                            Some(cell) if cell.is_null() => {
+                                fresh_results.push(BatchFreshnessResult {
+                                    table: br.clone(),
+                                    max_timestamp: None,
+                                });
+                            }
+                            Some(cell) => match cell.as_str().and_then(parse_freshness_timestamp) {
+                                Some(ts) => fresh_results.push(BatchFreshnessResult {
+                                    table: br.clone(),
+                                    max_timestamp: Some(ts),
+                                }),
+                                None => {
+                                    warn!(table = br.table.as_str(), cell = %cell, "per-table freshness check returned an unreadable timestamp");
+                                    freshness_failures.push((
+                                        br.full_name(),
+                                        format!("could not read {cell} as a timestamp"),
+                                    ));
+                                }
+                            },
+                            None => {
+                                warn!(
+                                    table = br.table.as_str(),
+                                    "per-table freshness check returned no rows"
+                                );
+                                freshness_failures.push((
+                                    br.full_name(),
+                                    "the freshness query returned no rows".to_string(),
+                                ));
+                            }
+                        }
                     }
                     Err(e) => {
                         warn!(table = br.table.as_str(), error = %e, "per-table freshness check failed");
+                        freshness_failures
+                            .push((br.full_name(), format!("the freshness query failed: {e}")));
                     }
                 }
             }
@@ -5752,17 +5775,20 @@ async fn run_batched_checks(
         (src_counts, tgt_counts, fresh_results)
     };
 
+    // Measured counts by full table name. A table absent from a map has no
+    // measurement: its query failed, returned no readable count, or the batch
+    // query left it out.
+    let source_map: HashMap<String, u64> = source_counts
+        .iter()
+        .map(|r| (r.table.full_name(), r.count))
+        .collect();
+    let target_map: HashMap<String, u64> = target_counts
+        .iter()
+        .map(|r| (r.table.full_name(), r.count))
+        .collect();
+
     // Process row count results
     if row_count_enabled {
-        let source_map: HashMap<String, u64> = source_counts
-            .iter()
-            .map(|r| (r.table.full_name(), r.count))
-            .collect();
-        let target_map: HashMap<String, u64> = target_counts
-            .iter()
-            .map(|r| (r.table.full_name(), r.count))
-            .collect();
-
         for (target_key, asset_key) in batch_asset_keys {
             let src_ref = &source_batch_refs
                 .iter()
@@ -5771,9 +5797,40 @@ async fn run_batched_checks(
                 .map(|(s, _)| s.full_name());
 
             if let Some(src_key) = src_ref {
-                let src_count = source_map.get(src_key).copied().unwrap_or(0);
-                let tgt_count = target_map.get(target_key).copied().unwrap_or(0);
-                let check = checks::check_row_count(src_count, tgt_count);
+                let check = match (source_map.get(src_key), target_map.get(target_key)) {
+                    (Some(&src_count), Some(&tgt_count)) => {
+                        checks::check_row_count(src_count, tgt_count)
+                    }
+                    (source, target) => {
+                        // A side with no measurement used to default to 0, and
+                        // `0 == 0` reported a check that never ran as a pass
+                        // (#1602). Report it as not evaluated, naming each
+                        // side that is missing and why.
+                        let missing_side = |label: &str, reason: Option<&String>| match reason {
+                            Some(reason) => format!("{label}: {reason}"),
+                            None => format!(
+                                "{label}: the batch row count query returned no result for this table"
+                            ),
+                        };
+                        let mut parts = Vec::new();
+                        if source.is_none() {
+                            parts.push(missing_side("source", source_count_failures.get(src_key)));
+                        }
+                        if target.is_none() {
+                            parts.push(missing_side(
+                                "target",
+                                target_count_failures.get(target_key),
+                            ));
+                        }
+                        let reason = parts.join("; ");
+                        warn!(
+                            table = target_key.as_str(),
+                            reason = reason.as_str(),
+                            "row count check could not be evaluated"
+                        );
+                        checks::row_count_not_evaluated(reason)
+                    }
+                };
                 let entry =
                     pending_checks
                         .entry(target_key.clone())
@@ -5789,11 +5846,12 @@ async fn run_batched_checks(
     // Anomaly detection
     if row_count_enabled && let Some(store) = state_store {
         for (target_key, _) in batch_asset_keys {
-            let tgt_count = target_counts
-                .iter()
-                .find(|r| r.table.full_name() == *target_key)
-                .map(|r| r.count)
-                .unwrap_or(0);
+            // Only a measured count enters the anomaly history. The 0 a
+            // failed query used to record read as "the table emptied" and
+            // skewed every later baseline.
+            let Some(&tgt_count) = target_map.get(target_key) else {
+                continue;
+            };
 
             let _ = store.record_row_count(target_key, tgt_count, 10);
 
@@ -5837,20 +5895,31 @@ async fn run_batched_checks(
     // Process freshness results
     if let Some(ref freshness_cfg) = pipeline.checks.freshness {
         let now = Utc::now();
-        for fr in &freshness_results {
-            let key = fr.table.full_name();
-            if let Some(ts) = fr.max_timestamp {
-                let lag = (now - ts).num_seconds().unsigned_abs();
-                let mut check = checks::check_freshness(lag, freshness_cfg.threshold_seconds);
-                check.severity = freshness_cfg.severity;
-
-                if let Some((_, asset_key)) = batch_asset_keys.iter().find(|(k, _)| *k == key) {
-                    let entry = pending_checks.entry(key).or_insert_with(|| PendingCheck {
-                        asset_key: asset_key.clone(),
-                        checks: Vec::new(),
-                    });
-                    entry.checks.push(check);
-                }
+        let measured = freshness_results.iter().filter_map(|fr| {
+            let ts = fr.max_timestamp?;
+            let lag = (now - ts).num_seconds().unsigned_abs();
+            Some((
+                fr.table.full_name(),
+                checks::check_freshness(lag, freshness_cfg.threshold_seconds),
+            ))
+        });
+        // A freshness query that failed, or returned a cell that is not a
+        // timestamp, used to be logged and dropped: no result, no trace in
+        // the tally. It is reported as not evaluated instead.
+        let unevaluated = freshness_failures.iter().map(|(key, reason)| {
+            (
+                key.clone(),
+                checks::freshness_not_evaluated(freshness_cfg.threshold_seconds, reason.clone()),
+            )
+        });
+        for (key, mut check) in measured.chain(unevaluated) {
+            check.severity = freshness_cfg.severity;
+            if let Some((_, asset_key)) = batch_asset_keys.iter().find(|(k, _)| *k == key) {
+                let entry = pending_checks.entry(key).or_insert_with(|| PendingCheck {
+                    asset_key: asset_key.clone(),
+                    checks: Vec::new(),
+                });
+                entry.checks.push(check);
             }
         }
     }
@@ -5867,25 +5936,33 @@ async fn run_batched_checks(
     if !pipeline.checks.assertions.is_empty() {
         let dialect = warehouse.dialect();
         for (tref, asset_key) in assertion_targets {
-            let full = match dialect.format_table_ref(&tref.catalog, &tref.schema, &tref.table) {
-                Ok(s) => s,
+            let results = match dialect.format_table_ref(&tref.catalog, &tref.schema, &tref.table) {
+                Ok(full) => {
+                    super::run_local::run_table_assertions(
+                        warehouse,
+                        dialect,
+                        &full,
+                        &tref.table,
+                        &pipeline.checks.assertions,
+                    )
+                    .await
+                }
                 Err(e) => {
+                    // The table's assertions cannot run, and used to be
+                    // skipped without a trace. Every one of them is reported
+                    // as not evaluated instead.
                     warn!(
                         table = %tref.full_name(),
                         error = %e,
-                        "assertion table ref formatting failed — skipping"
+                        "assertion table ref formatting failed — reporting the table's assertions as not evaluated"
                     );
-                    continue;
+                    super::run_local::table_assertions_not_evaluated(
+                        &tref.table,
+                        &pipeline.checks.assertions,
+                        &format!("could not address the table: {e}"),
+                    )
                 }
             };
-            let results = super::run_local::run_table_assertions(
-                warehouse,
-                dialect,
-                &full,
-                &tref.table,
-                &pipeline.checks.assertions,
-            )
-            .await;
             if !results.is_empty() {
                 let entry =
                     pending_checks
@@ -5907,20 +5984,23 @@ async fn run_batched_checks(
     if !pipeline.checks.custom.is_empty() {
         let dialect = warehouse.dialect();
         for (tref, asset_key) in assertion_targets {
-            let full = match dialect.format_table_ref(&tref.catalog, &tref.schema, &tref.table) {
-                Ok(s) => s,
+            let results = match dialect.format_table_ref(&tref.catalog, &tref.schema, &tref.table) {
+                Ok(full) => {
+                    super::run_local::run_custom_checks(warehouse, &full, &pipeline.checks.custom)
+                        .await
+                }
                 Err(e) => {
                     warn!(
                         table = %tref.full_name(),
                         error = %e,
-                        "custom check table ref formatting failed — skipping"
+                        "custom check table ref formatting failed — reporting the custom checks as not evaluated"
                     );
-                    continue;
+                    super::run_local::custom_checks_not_evaluated(
+                        &pipeline.checks.custom,
+                        &format!("could not address the table: {e}"),
+                    )
                 }
             };
-            let results =
-                super::run_local::run_custom_checks(warehouse, &full, &pipeline.checks.custom)
-                    .await;
             if !results.is_empty() {
                 pending_checks
                     .entry(tref.full_name())
@@ -5935,70 +6015,22 @@ async fn run_batched_checks(
     }
 
     // Null-rate checks: sample each configured column and flag when the null
-    // fraction exceeds the threshold. `generate_null_rate_sql` returns one row
-    // per column `(col, nulls, sampled)`; the rate is computed per row. Like the
-    // other replication checks this is advisory — the configured severity rides
-    // into the JSON CheckResult and the orchestrator decides.
+    // fraction exceeds the threshold. Like the other replication checks this
+    // is advisory — the configured severity rides into the JSON CheckResult
+    // and the orchestrator decides.
     if let Some(ref null_rate_cfg) = pipeline.checks.null_rate {
         let dialect = warehouse.dialect();
         for (tref, asset_key) in assertion_targets {
-            let sql = match checks::generate_null_rate_sql(
-                tref,
-                &null_rate_cfg.columns,
-                null_rate_cfg.sample_percent,
-                dialect,
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        table = %tref.full_name(),
-                        error = %e,
-                        "null_rate SQL generation failed — skipping"
-                    );
-                    continue;
-                }
-            };
-            match warehouse.execute_query(&sql).await {
-                Ok(result) => {
-                    for row in &result.rows {
-                        let col = row.first().and_then(|v| v.as_str()).unwrap_or_default();
-                        // A parse failure on the counts is a malformed result,
-                        // not a real zero — skip the column rather than emit a
-                        // false PASS (rate 0.0). An empty (0-row) sample still
-                        // parses to a real 0 and correctly passes below.
-                        let (Some(nulls), Some(sampled)) = (
-                            checks::cell_as_u64(row.get(1)),
-                            checks::cell_as_u64(row.get(2)),
-                        ) else {
-                            warn!(table = %tref.full_name(), column = col, "null_rate counts unparseable — skipping column");
-                            continue;
-                        };
-                        if col.is_empty() {
-                            warn!(table = %tref.full_name(), "null_rate result missing column name — skipping");
-                            continue;
-                        }
-                        let rate = if sampled == 0 {
-                            0.0
-                        } else {
-                            nulls as f64 / sampled as f64
-                        };
-                        // `check_null_rate` names the result `null_rate:{col}`,
-                        // byte-matching discover's projection.
-                        let mut check = checks::check_null_rate(col, rate, null_rate_cfg.threshold);
-                        check.severity = null_rate_cfg.severity;
-                        pending_checks
-                            .entry(tref.full_name())
-                            .or_insert_with(|| PendingCheck {
-                                asset_key: asset_key.clone(),
-                                checks: Vec::new(),
-                            })
-                            .checks
-                            .push(check);
-                    }
-                }
-                Err(e) => {
-                    warn!(table = %tref.full_name(), error = %e, "null_rate query failed — skipping");
-                }
+            let results = run_null_rate_checks(warehouse, dialect, tref, null_rate_cfg).await;
+            if !results.is_empty() {
+                pending_checks
+                    .entry(tref.full_name())
+                    .or_insert_with(|| PendingCheck {
+                        asset_key: asset_key.clone(),
+                        checks: Vec::new(),
+                    })
+                    .checks
+                    .extend(results);
             }
         }
     }
@@ -6171,6 +6203,102 @@ async fn run_batched_checks(
     }
 
     Ok(())
+}
+
+/// Reads a `MAX(timestamp_column)` cell the way the per-table freshness
+/// fallback always has: RFC 3339 first, then the `YYYY-MM-DD HH:MM:SS[.fff]`
+/// shape most warehouses render a timestamp in.
+fn parse_freshness_timestamp(s: &str) -> Option<DateTime<Utc>> {
+    s.parse::<DateTime<Utc>>().ok().or_else(|| {
+        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+            .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
+            .ok()
+            .map(|naive| naive.and_utc())
+    })
+}
+
+/// Runs the null-rate check for every configured column of one table.
+///
+/// `generate_null_rate_sql` returns one row per column, `(col, nulls,
+/// sampled)`, and the rate is computed per row. Every configured column gets
+/// exactly one result: a measurement, or a not-evaluated failure saying why
+/// (the SQL could not be generated, the query failed, or it returned no
+/// readable row for that column). Each of those used to be logged and
+/// skipped, so a column the engine never measured was absent from the tally.
+async fn run_null_rate_checks(
+    warehouse: &dyn WarehouseAdapter,
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    tref: &TableRef,
+    cfg: &rocky_core::config::NullRateConfig,
+) -> Vec<checks::CheckResult> {
+    let every_column_not_evaluated = |reason: String| -> Vec<checks::CheckResult> {
+        cfg.columns
+            .iter()
+            .map(|col| {
+                let mut check = checks::null_rate_not_evaluated(col, cfg.threshold, reason.clone());
+                check.severity = cfg.severity;
+                check
+            })
+            .collect()
+    };
+
+    let sql = match checks::generate_null_rate_sql(tref, &cfg.columns, cfg.sample_percent, dialect)
+    {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(table = %tref.full_name(), error = %e, "null_rate SQL generation failed — reporting every column as not evaluated");
+            return every_column_not_evaluated(format!(
+                "could not generate the null-rate SQL: {e}"
+            ));
+        }
+    };
+    let result = match warehouse.execute_query(&sql).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(table = %tref.full_name(), error = %e, "null_rate query failed — reporting every column as not evaluated");
+            return every_column_not_evaluated(format!("the null-rate query failed: {e}"));
+        }
+    };
+
+    cfg.columns
+        .iter()
+        .map(|col| {
+            // The query labels each row with the configured column name.
+            let row = result
+                .rows
+                .iter()
+                .find(|row| row.first().and_then(|v| v.as_str()) == Some(col.as_str()));
+            let counts = row.and_then(|row| {
+                Some((checks::cell_as_u64(row.get(1))?, checks::cell_as_u64(row.get(2))?))
+            });
+            let mut check = match counts {
+                // An empty (0-row) sample is a real 0 and passes.
+                Some((nulls, sampled)) => {
+                    let rate = if sampled == 0 {
+                        0.0
+                    } else {
+                        nulls as f64 / sampled as f64
+                    };
+                    // `check_null_rate` names the result `null_rate:{col}`,
+                    // byte-matching discover's projection.
+                    checks::check_null_rate(col, rate, cfg.threshold)
+                }
+                // A count that does not parse is a malformed result, not a
+                // real zero; a missing row is a column the query never
+                // reported on.
+                None => {
+                    warn!(table = %tref.full_name(), column = col.as_str(), "null_rate result has no readable row for the column — reporting it as not evaluated");
+                    checks::null_rate_not_evaluated(
+                        col,
+                        cfg.threshold,
+                        "the null-rate query returned no readable row for this column",
+                    )
+                }
+            };
+            check.severity = cfg.severity;
+            check
+        })
+        .collect()
 }
 
 /// End-of-run retention sweep, gated by `last_retention_sweep_at`.
@@ -27866,6 +27994,571 @@ table = "fct_events"
         assert_eq!(
             clean_rows, flaky_rows,
             "the retried-then-succeeded build materializes byte-identical data"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Batched replication checks (#1602): a check the engine could not run
+    // must not read as a pass, and must not vanish from the tally.
+    // ---------------------------------------------------------------------
+
+    /// What an intercepted query answers with.
+    #[cfg(feature = "duckdb")]
+    enum Intercept {
+        /// The query fails with this message.
+        Fail(&'static str),
+        /// The query succeeds with exactly these rows.
+        Rows(Vec<Vec<serde_json::Value>>),
+    }
+
+    /// A DuckDB adapter that intercepts every query starting with `prefix`
+    /// and runs everything else for real.
+    #[cfg(feature = "duckdb")]
+    struct InterceptingDuckDb<'a> {
+        inner: &'a rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+        prefix: &'static str,
+        reply: Intercept,
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[async_trait::async_trait]
+    impl WarehouseAdapter for InterceptingDuckDb<'_> {
+        fn dialect(&self) -> &dyn rocky_core::traits::SqlDialect {
+            self.inner.dialect()
+        }
+
+        async fn execute_statement(&self, sql: &str) -> rocky_core::traits::AdapterResult<()> {
+            self.inner.execute_statement(sql).await
+        }
+
+        async fn execute_query(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::QueryResult> {
+            if sql.trim_start().starts_with(self.prefix) {
+                return match &self.reply {
+                    Intercept::Fail(msg) => Err(rocky_core::traits::AdapterError::msg(*msg)),
+                    Intercept::Rows(rows) => Ok(rocky_core::traits::QueryResult {
+                        columns: Vec::new(),
+                        rows: rows.clone(),
+                    }),
+                };
+            }
+            self.inner.execute_query(sql).await
+        }
+
+        async fn describe_table(
+            &self,
+            table: &TableRef,
+        ) -> rocky_core::traits::AdapterResult<Vec<ColumnInfo>> {
+            self.inner.describe_table(table).await
+        }
+    }
+
+    /// One copied table, `src.orders` -> `tgt.orders`, one row each.
+    #[cfg(feature = "duckdb")]
+    async fn seeded_duckdb() -> rocky_duckdb::adapter::DuckDbWarehouseAdapter {
+        let inner = rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.orders AS SELECT 1 AS id, TIMESTAMP '2026-01-01 00:00:00' AS ts",
+            "CREATE TABLE tgt.orders AS SELECT * FROM src.orders",
+        ] {
+            inner.execute_statement(sql).await.unwrap();
+        }
+        inner
+    }
+
+    /// The inputs `run()` hands to `run_batched_checks` for that one table.
+    #[cfg(feature = "duckdb")]
+    struct BatchedCheckFixture {
+        pipeline: ReplicationPipelineConfig,
+        source_refs: Vec<TableRef>,
+        target_refs: Vec<TableRef>,
+        freshness_refs: Vec<TableRef>,
+        asset_keys: Vec<(String, Vec<String>)>,
+        assertion_targets: Vec<(TableRef, Vec<String>)>,
+    }
+
+    #[cfg(feature = "duckdb")]
+    impl BatchedCheckFixture {
+        /// `checks_toml` is the body of `[pipeline.bronze.checks]`.
+        fn new(checks_toml: &str) -> Self {
+            let pipeline = parse_pipeline(&format!(
+                "strategy = \"full_refresh\"\ntimestamp_column = \"ts\"\n\n[pipeline.bronze.checks]\n{checks_toml}\n"
+            ));
+            let source = TableRef {
+                catalog: String::new(),
+                schema: "src".into(),
+                table: "orders".into(),
+            };
+            let target = TableRef {
+                catalog: String::new(),
+                schema: "tgt".into(),
+                table: "orders".into(),
+            };
+            let asset_key = vec!["test".to_string(), "orders".to_string()];
+            Self {
+                pipeline,
+                source_refs: vec![source],
+                target_refs: vec![target.clone()],
+                freshness_refs: vec![target.clone()],
+                asset_keys: vec![(target.full_name(), asset_key.clone())],
+                assertion_targets: vec![(target, asset_key)],
+            }
+        }
+
+        fn target_key(&self) -> String {
+            self.target_refs[0].full_name()
+        }
+
+        async fn run(
+            &self,
+            warehouse: &dyn WarehouseAdapter,
+            batch_check: Option<&dyn BatchCheckAdapter>,
+            state_store: Option<&StateStore>,
+        ) -> (HashMap<String, PendingCheck>, Vec<AnomalyOutput>) {
+            let mut pending = HashMap::new();
+            let mut anomalies = Vec::new();
+            run_batched_checks(
+                warehouse,
+                batch_check,
+                state_store,
+                &HookRegistry::empty(),
+                "run-1",
+                "bronze",
+                &self.pipeline,
+                &self.source_refs,
+                &self.target_refs,
+                &self.freshness_refs,
+                &self.asset_keys,
+                &self.assertion_targets,
+                &mut pending,
+                &mut anomalies,
+            )
+            .await
+            .expect("the batched checks run");
+            (pending, anomalies)
+        }
+    }
+
+    /// The results recorded for the fixture's one target, by check name.
+    #[cfg(feature = "duckdb")]
+    fn results_named<'a>(
+        pending: &'a HashMap<String, PendingCheck>,
+        target_key: &str,
+        name: &str,
+    ) -> Vec<&'a rocky_core::checks::CheckResult> {
+        pending
+            .get(target_key)
+            .map(|p| p.checks.iter().filter(|c| c.name == name).collect())
+            .unwrap_or_default()
+    }
+
+    #[cfg(feature = "duckdb")]
+    fn the_result<'a>(
+        pending: &'a HashMap<String, PendingCheck>,
+        target_key: &str,
+        name: &str,
+    ) -> &'a rocky_core::checks::CheckResult {
+        let found = results_named(pending, target_key, name);
+        assert_eq!(
+            found.len(),
+            1,
+            "expected exactly one `{name}` result for {target_key}, got {found:?}"
+        );
+        found[0]
+    }
+
+    /// #1602: a side whose query failed defaulted to zero. When both sides
+    /// fail, `0 == 0` reported a PASS for a check that never ran.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_row_count_check_whose_queries_both_fail_does_not_pass() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new("row_count = true");
+
+        // Control: with a working warehouse the check is a real measurement.
+        let (pending, _) = fx.run(&inner, None, None).await;
+        let measured = the_result(&pending, &fx.target_key(), "row_count");
+        assert!(measured.passed, "one row on each side passes: {measured:?}");
+        assert!(measured.not_evaluated.is_none());
+
+        // Every COUNT(*) fails: the warehouse is unreachable at check time.
+        let failing = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT COUNT(*)",
+            reply: Intercept::Fail("injected COUNT failure"),
+        };
+        let (pending, _) = fx.run(&failing, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), "row_count");
+        assert!(
+            !result.passed,
+            "a row-count check whose queries failed must not pass: {result:?}"
+        );
+        assert_eq!(
+            result.not_evaluated.as_deref(),
+            Some(
+                "source: the row count query failed: injected COUNT failure; \
+                 target: the row count query failed: injected COUNT failure"
+            ),
+            "{result:?}"
+        );
+        assert!(
+            matches!(
+                result.details,
+                rocky_core::checks::CheckDetails::RowCount {
+                    source_count: 0,
+                    target_count: 0
+                }
+            ),
+            "the counts are placeholders, not measurements: {result:?}"
+        );
+    }
+
+    /// #1602, the shape the issue warns about: the copy moved nothing, and
+    /// the source that would have shown it cannot be read. A defaulted zero
+    /// matched the empty target and the check passed.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_row_count_check_with_an_unreadable_source_and_an_empty_target_does_not_pass() {
+        let inner = seeded_duckdb().await;
+        inner
+            .execute_statement("DELETE FROM tgt.orders")
+            .await
+            .unwrap();
+        let fx = BatchedCheckFixture::new("row_count = true");
+
+        let failing = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT COUNT(*) FROM src.orders",
+            reply: Intercept::Fail("injected source COUNT failure"),
+        };
+        let (pending, _) = fx.run(&failing, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), "row_count");
+        assert!(
+            !result.passed,
+            "an unreadable source must not match an empty target: {result:?}"
+        );
+        // Only the side that failed is named; the target was measured.
+        assert_eq!(
+            result.not_evaluated.as_deref(),
+            Some("source: the row count query failed: injected source COUNT failure"),
+            "{result:?}"
+        );
+    }
+
+    /// A COUNT(*) that returns a cell the parser cannot read is not a zero.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_row_count_cell_that_does_not_parse_is_not_evaluated() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new("row_count = true");
+
+        let unreadable = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT COUNT(*) FROM tgt.orders",
+            reply: Intercept::Rows(vec![vec![serde_json::json!("not-a-number")]]),
+        };
+        let (pending, _) = fx.run(&unreadable, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), "row_count");
+        assert!(!result.passed, "{result:?}");
+        assert_eq!(
+            result.not_evaluated.as_deref(),
+            Some("target: the row count query returned no readable count"),
+            "{result:?}"
+        );
+    }
+
+    /// A `BatchCheckAdapter` that answers without a row for the table.
+    #[cfg(feature = "duckdb")]
+    struct EmptyBatchCheck;
+
+    #[cfg(feature = "duckdb")]
+    #[async_trait::async_trait]
+    impl BatchCheckAdapter for EmptyBatchCheck {
+        async fn batch_row_counts(
+            &self,
+            _tables: &[TableRef],
+        ) -> rocky_core::traits::AdapterResult<Vec<BatchRowCountResult>> {
+            Ok(Vec::new())
+        }
+
+        async fn batch_freshness(
+            &self,
+            _tables: &[TableRef],
+            _timestamp_col: &str,
+        ) -> rocky_core::traits::AdapterResult<Vec<BatchFreshnessResult>> {
+            Ok(Vec::new())
+        }
+
+        async fn batch_describe_schema(
+            &self,
+            _catalog: &str,
+            _schema: &str,
+        ) -> rocky_core::traits::AdapterResult<HashMap<String, Vec<ColumnInfo>>> {
+            Ok(HashMap::new())
+        }
+    }
+
+    /// The batch path has no per-table error: a table the UNION ALL query
+    /// left out is simply absent, and used to default to zero on both sides.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_table_the_batch_row_count_left_out_is_not_evaluated() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new("row_count = true");
+
+        let (pending, _) = fx.run(&inner, Some(&EmptyBatchCheck), None).await;
+        let result = the_result(&pending, &fx.target_key(), "row_count");
+        assert!(!result.passed, "{result:?}");
+        assert_eq!(
+            result.not_evaluated.as_deref(),
+            Some(
+                "source: the batch row count query returned no result for this table; \
+                 target: the batch row count query returned no result for this table"
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// The anomaly baseline is built from the target counts. A failed target
+    /// query used to record a 0 there, which read as "the table emptied" on
+    /// every later run.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_failed_target_count_records_no_anomaly_history() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new("row_count = true");
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+
+        // Control: a measured count is recorded.
+        fx.run(&inner, None, Some(&store)).await;
+        let history = store.get_check_history(&fx.target_key()).unwrap();
+        assert_eq!(history.len(), 1, "a measurement enters the history");
+        assert_eq!(history[0].row_count, 1);
+
+        let failing = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT COUNT(*) FROM tgt.orders",
+            reply: Intercept::Fail("injected target COUNT failure"),
+        };
+        fx.run(&failing, None, Some(&store)).await;
+        let history = store.get_check_history(&fx.target_key()).unwrap();
+        assert_eq!(
+            history.len(),
+            1,
+            "a failed count must not enter the history as a 0: {history:?}"
+        );
+    }
+
+    /// A freshness query that fails used to be logged and dropped. It is
+    /// reported as not evaluated, at the configured severity.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_freshness_check_whose_query_fails_is_not_evaluated() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.freshness]\nthreshold_seconds = 3600\nseverity = \"warning\"",
+        );
+
+        let failing = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT MAX(",
+            reply: Intercept::Fail("injected MAX failure"),
+        };
+        let (pending, _) = fx.run(&failing, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), "freshness");
+        assert!(!result.passed, "{result:?}");
+        assert_eq!(
+            result.not_evaluated.as_deref(),
+            Some("the freshness query failed: injected MAX failure"),
+            "{result:?}"
+        );
+        assert_eq!(result.severity, rocky_core::tests::TestSeverity::Warning);
+        assert!(
+            matches!(
+                result.details,
+                rocky_core::checks::CheckDetails::Freshness {
+                    lag_seconds: 0,
+                    threshold_seconds: 3600
+                }
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// A `MAX(timestamp_column)` cell that is not a timestamp — a DATE or a
+    /// numeric column, say — used to emit no check at all.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_freshness_cell_that_is_not_a_timestamp_is_not_evaluated() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.freshness]\nthreshold_seconds = 3600",
+        );
+
+        let unreadable = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT MAX(",
+            reply: Intercept::Rows(vec![vec![serde_json::json!("yesterday")]]),
+        };
+        let (pending, _) = fx.run(&unreadable, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), "freshness");
+        assert!(!result.passed, "{result:?}");
+        assert_eq!(
+            result.not_evaluated.as_deref(),
+            Some("could not read \"yesterday\" as a timestamp"),
+            "{result:?}"
+        );
+    }
+
+    /// Pinned, not changed: `MAX()` over an empty table is NULL, there is no
+    /// row to be fresh, and no freshness check is emitted. A measured table
+    /// still gets its measurement.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn an_empty_table_still_emits_no_freshness_check() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.freshness]\nthreshold_seconds = 3600",
+        );
+
+        let (pending, _) = fx.run(&inner, None, None).await;
+        let measured = the_result(&pending, &fx.target_key(), "freshness");
+        assert!(measured.not_evaluated.is_none(), "{measured:?}");
+
+        inner
+            .execute_statement("DELETE FROM tgt.orders")
+            .await
+            .unwrap();
+        let (pending, _) = fx.run(&inner, None, None).await;
+        assert!(
+            results_named(&pending, &fx.target_key(), "freshness").is_empty(),
+            "an empty table has no freshness to measure: {pending:?}",
+            pending = pending.get(&fx.target_key()).map(|p| &p.checks)
+        );
+    }
+
+    /// A null-rate query that fails used to skip the table. Every configured
+    /// column is reported as not evaluated instead, at the configured
+    /// severity.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_null_rate_query_that_fails_reports_every_column_not_evaluated() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.null_rate]\ncolumns = [\"id\", \"ts\"]\nthreshold = 0.5\nseverity = \"warning\"",
+        );
+
+        // Control: both columns are measured.
+        let (pending, _) = fx.run(&inner, None, None).await;
+        for name in ["null_rate:id", "null_rate:ts"] {
+            let measured = the_result(&pending, &fx.target_key(), name);
+            assert!(
+                measured.passed && measured.not_evaluated.is_none(),
+                "{measured:?}"
+            );
+        }
+
+        let failing = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT 'id' AS col",
+            reply: Intercept::Fail("injected null-rate failure"),
+        };
+        let (pending, _) = fx.run(&failing, None, None).await;
+        for name in ["null_rate:id", "null_rate:ts"] {
+            let result = the_result(&pending, &fx.target_key(), name);
+            assert!(!result.passed, "{result:?}");
+            assert_eq!(
+                result.not_evaluated.as_deref(),
+                Some("the null-rate query failed: injected null-rate failure"),
+                "{result:?}"
+            );
+            assert_eq!(result.severity, rocky_core::tests::TestSeverity::Warning);
+        }
+    }
+
+    /// A row whose counts do not parse used to be skipped, leaving that column
+    /// out of the tally. The other columns keep their measurements.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_null_rate_row_that_does_not_parse_is_not_evaluated_for_that_column_only() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.null_rate]\ncolumns = [\"id\", \"ts\"]\nthreshold = 0.5",
+        );
+
+        let partial = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT 'id' AS col",
+            reply: Intercept::Rows(vec![
+                vec![
+                    serde_json::json!("id"),
+                    serde_json::json!("0"),
+                    serde_json::json!("1"),
+                ],
+                vec![
+                    serde_json::json!("ts"),
+                    serde_json::json!("many"),
+                    serde_json::json!("1"),
+                ],
+            ]),
+        };
+        let (pending, _) = fx.run(&partial, None, None).await;
+        let id = the_result(&pending, &fx.target_key(), "null_rate:id");
+        assert!(id.passed && id.not_evaluated.is_none(), "{id:?}");
+        let ts = the_result(&pending, &fx.target_key(), "null_rate:ts");
+        assert!(!ts.passed, "{ts:?}");
+        assert_eq!(
+            ts.not_evaluated.as_deref(),
+            Some("the null-rate query returned no readable row for this column"),
+            "{ts:?}"
+        );
+    }
+
+    /// A target whose reference cannot be formatted used to have its
+    /// assertions and custom checks skipped without a trace. Each is reported
+    /// as not evaluated instead.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn assertions_and_custom_checks_on_an_unaddressable_table_are_not_evaluated() {
+        let inner = seeded_duckdb().await;
+        let mut fx = BatchedCheckFixture::new(
+            "[[pipeline.bronze.checks.assertions]]\ntable = \"bad-name\"\ntype = \"not_null\"\ncolumn = \"id\"\nseverity = \"warning\"\n\n\
+             [[pipeline.bronze.checks.custom]]\nname = \"no_dupes\"\nsql = \"SELECT 0 FROM {table}\"\nthreshold = 0",
+        );
+        // A hyphen fails identifier validation, so the dialect cannot address
+        // the table at all.
+        let bad = TableRef {
+            catalog: String::new(),
+            schema: "tgt".into(),
+            table: "bad-name".into(),
+        };
+        let key = bad.full_name();
+        fx.assertion_targets = vec![(bad, vec!["test".into(), "bad-name".into()])];
+
+        let (pending, _) = fx.run(&inner, None, None).await;
+        let assertion = the_result(&pending, &key, "not_null:id");
+        assert!(!assertion.passed, "{assertion:?}");
+        assert!(
+            assertion
+                .not_evaluated
+                .as_deref()
+                .is_some_and(|r| r.starts_with("could not address the table: ")),
+            "{assertion:?}"
+        );
+        assert_eq!(assertion.severity, rocky_core::tests::TestSeverity::Warning);
+        let custom = the_result(&pending, &key, "no_dupes");
+        assert!(!custom.passed, "{custom:?}");
+        assert!(
+            custom
+                .not_evaluated
+                .as_deref()
+                .is_some_and(|r| r.starts_with("could not address the table: ")),
+            "{custom:?}"
         );
     }
 }
