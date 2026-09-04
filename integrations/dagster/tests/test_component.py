@@ -17,12 +17,14 @@ from dagster_rocky import component as component_module
 from dagster_rocky.component import (
     _SUPPORTED_DAG_SCHEMA_VERSION,
     RockyComponent,
+    _CompileState,
     _load_state,
     _warn_discover_signals,
     _warn_if_dag_schema_newer,
 )
 from dagster_rocky.translator import RockyDagsterTranslator
 from dagster_rocky.types import (
+    CompileResult,
     DagResult,
     DiscoverResult,
     LineageEdge,
@@ -2004,3 +2006,26 @@ def test_dag_mode_build_warns_on_newer_schema_version(
 
     assert len(list(defs.assets or [])) > 0
     assert any("schema_version=2" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# _CompileState: a missing compile slot is not a clean compile (#1619)
+# ---------------------------------------------------------------------------
+
+
+def test_compile_state_from_missing_result_is_not_compiled():
+    """No cached compile result → ``compiled`` is False, so a consumer can
+    tell "no compile output" from "compiled with nothing to report"."""
+    state = _CompileState.from_result(None)
+
+    assert state.compiled is False
+    assert state.diagnostics == []
+    assert state.has_errors is False
+
+
+def test_compile_state_from_result_is_compiled(compile_json: str):
+    state = _CompileState.from_result(CompileResult.model_validate_json(compile_json))
+
+    assert state.compiled is True
+    assert state.has_errors is True
+    assert len(state.diagnostics) == 2
