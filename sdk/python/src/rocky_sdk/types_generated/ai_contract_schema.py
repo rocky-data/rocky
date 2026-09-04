@@ -56,4 +56,16 @@ class AiContractOutput(BaseModel):
     """
     Path the contract was written to, when `--save` was passed.
     """
+    unmatched_columns: list[str] | None = None
+    """
+    Optional columns the draft declares that the model does not produce.
+
+    `W010`, dropped by the same error-only filter as `unverified_types`. A required column that is missing fails the draft outright (`E010`); an optional one only warns, so a drafted column name the model never emits went unreported. Empty when every declared column exists.
+    """
+    unverified_types: list[str] | None = None
+    """
+    Declared column types the compiler could NOT check, one message each.
+
+    The drafting loop only fails on error-severity diagnostics. A column whose type Rocky could not infer reports `I003` instead, and the declared type is then accepted without being compared to anything. With a cold schema cache that is every leaf column, so an empty `errors` list is not evidence the declared types are right. Empty when every declared type was actually checked.
+    """
     version: str
