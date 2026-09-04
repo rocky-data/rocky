@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A contract check now fails as "not verified" when there is no `rocky compile` output. Before, it passed.** `RockyComponent` caches `rocky compile` when it writes its state. That step is best-effort: if the binary is missing, the compile times out or crashes, or `models_dir` does not exist, the `compile` slot is left out of the state and the component keeps working. Contract checks read their verdict from that slot's diagnostics. A missing slot read as an empty list, and an empty list means "nothing to report", so every declared contract check went green with no compile behind it.
+
+  The two cases are now told apart. With a cached compile and no diagnostics for the model, the check passes as before. With no cached compile, each declared contract check reports `passed=False` at `WARN` severity, with `rocky/compile_missing = true` and a `status` that says why. The run logs a warning too. Refresh the state after `rocky compile` succeeds to clear it. (#1619)
+
+  For hand-rolled assets, `contract_check_results_from_diagnostics()` now accepts `diagnostics=None` to mean "no compile output". An empty list keeps its old meaning. `CONTRACT_COMPILE_MISSING_METADATA_KEY` is exported.
+
+- **In the default `streaming` mode, a source asset with a matching `.contract.toml` no longer fails its run with `returned an output ... multiple times`.** The placeholder pass that covers declared checks the engine did not produce also covered the contract checks, and reported each one as passing ("not produced by rocky"). The contract pass then reported the same check a second time, and Dagster failed the step. The contract results are now built first and the placeholder pass skips them, so each contract check is reported exactly once. Only `execution_mode="streaming"` was affected; `"pipes"` has no placeholder pass. (#1619)
+
 ## [1.65.0] — 2026-09-03
 
 Pairs with engine 1.73.0 and `rocky-sdk` 0.14.0. The `rocky-sdk>=0.13.0` floor is unchanged: nothing here reads a field that 0.13.0 lacks.
