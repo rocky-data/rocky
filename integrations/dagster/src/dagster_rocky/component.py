@@ -477,8 +477,11 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
     #: Limitation: until ``rocky run --model <name>`` lands on the engine
     #: side, derived-model multi-assets use ``can_subset=False`` (selecting
     #: any subset materializes the whole group). Per-model freshness,
-    #: optimize metadata, contract checks, and partition definitions all
-    #: still apply per-asset.
+    #: optimize metadata, and partition definitions all still apply
+    #: per-asset. Contract checks do not: they are declared only on source
+    #: assets whose table name matches a ``.contract.toml`` file
+    #: (``build_model_specs`` accepts ``contract_rules_by_model`` and
+    #: ignores it).
     surface_derived_models: bool = False
     #: When ``True``, use the DAG-driven asset builder that creates a
     #: single connected asset graph from ``rocky dag``. Every pipeline
@@ -2686,7 +2689,9 @@ def _make_rocky_asset(
         # declared spec — contract specs included — and would otherwise emit
         # a passing "not produced by rocky" placeholder for each contract
         # check, after which Dagster rejects the real result as an output
-        # returned twice (#1619).
+        # returned twice (#1619). Yielded in each branch BEFORE the
+        # quota-breach raise below, so the record survives the retriable
+        # failure the same way the materializations do.
         contract_results: list[dg.AssetCheckResult] = []
         if contract_rules_by_model:
             if not compile_state.compiled:
@@ -2719,6 +2724,7 @@ def _make_rocky_asset(
             # doesn't run — but we still need to yield the collected
             # governance events so the surfaces are wired in both modes.
             yield from governance_events
+            yield from contract_results
         else:
             results, quota_breach_cooldown = _run_filters(context, rocky, filters)
 
@@ -2744,6 +2750,7 @@ def _make_rocky_asset(
                 satisfy_empty_outputs=satisfy_empty_outputs,
                 instance=context.instance,
             )
+            yield from contract_results
 
             # If a filter surfaced the Fivetran-storm signal, raise the
             # retriable failure AFTER yielding materializations from
@@ -2752,8 +2759,6 @@ def _make_rocky_asset(
             # what was lost.
             if quota_breach_cooldown is not None:
                 raise _quota_breach_failure(quota_breach_cooldown)
-
-        yield from contract_results
 
     return _asset
 

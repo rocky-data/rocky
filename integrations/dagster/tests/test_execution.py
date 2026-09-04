@@ -1060,3 +1060,36 @@ def test_pipes_contract_checks_report_not_verified_when_compile_slot_is_missing(
     for ev in evals:
         assert ev.passed is False, ev.check_name
         assert ev.metadata[CONTRACT_COMPILE_MISSING_METADATA_KEY].value is True
+
+
+def test_streaming_contract_checks_are_recorded_before_a_quota_breach_raises(
+    discover_json: str, run_json: str, tmp_path: Path
+):
+    """A quota breach raises after the run; the contract record must land first.
+
+    The retriable failure is raised after the materializations so partial
+    progress is kept. The contract results are known before the run, so
+    they are yielded before that raise too: with no compile slot, the three
+    not-verified failures are on record even though the step fails.
+    """
+    from dagster_rocky.types import TableError  # noqa: PLC0415
+
+    defs = _build_defs_with_contracts(discover_json, tmp_path)
+    run_result = RunResult.model_validate_json(run_json)
+    run_result.errors = [
+        TableError(
+            asset_key=["fivetran", "acme", "us_west", "shopify", "payments"],
+            error="rate limited — retry after backoff",
+            failure_kind="quota-exceeded",
+        )
+    ]
+
+    exec_result = _materialize_subset(defs, run_result, [_ORDERS_KEY])
+
+    assert not exec_result.success, "quota-exceeded must still surface as a failure"
+    evals = _contract_evaluations(exec_result)
+    assert {ev.check_name for ev in evals} == _CONTRACT_CHECK_NAMES
+    assert len(evals) == 3
+    for ev in evals:
+        assert ev.passed is False, ev.check_name
+        assert ev.metadata[CONTRACT_COMPILE_MISSING_METADATA_KEY].value is True
