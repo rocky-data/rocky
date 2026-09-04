@@ -343,15 +343,15 @@ fn route_table() -> Vec<Route> {
             operation_id: "getHealth",
             tag: "meta",
             summary: "Liveness probe",
-            description: "Auth-exempt liveness probe. Server-lifecycle, outside the \
-                 `/api/v1` value contract.",
+            description: "Auth-exempt liveness probe. Server-lifecycle only: it carries no \
+                 project state. No CLI counterpart.",
             path_params: &[],
             header_params: &[],
             request_body: None,
             responses: &[Resp {
                 status: "200",
                 description: "The server is alive.",
-                body: Body::OutOfContract,
+                body: Body::Component("HealthOutput"),
             }],
             auth_exempt: true,
         },
@@ -379,17 +379,20 @@ fn route_table() -> Vec<Route> {
             path: "/api/v1/models",
             operation_id: "listModels",
             tag: "models",
-            summary: "List models (dashboard)",
-            description: "Dashboard-only model list. Outside the `/api/v1` value contract \
-                 (no canonical CLI counterpart).",
+            summary: "List compiled models",
+            description: "Every compiled model with its column count and graph edges. \
+                 No CLI counterpart. Bounded by the project's model count.",
             path_params: &[],
             header_params: &[],
             request_body: None,
-            responses: &[Resp {
-                status: "200",
-                description: "The model list.",
-                body: Body::OutOfContract,
-            }],
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The model list.",
+                    body: Body::Component("ModelListOutput"),
+                },
+                ENGINE_BUSY_OR_NOT_READY,
+            ],
             auth_exempt: false,
         },
         Route {
@@ -397,8 +400,10 @@ fn route_table() -> Vec<Route> {
             path: "/api/v1/models/{name}",
             operation_id: "getModel",
             tag: "models",
-            summary: "Model detail (dashboard)",
-            description: "Dashboard-only model detail. Outside the `/api/v1` value contract.",
+            summary: "Model detail",
+            description: "One model's SQL, source path, inferred and type-checked columns, \
+                 and graph edges. No CLI counterpart. The SQL text is capped at 256 KiB; \
+                 a cut is reported through `sql_truncated` and `sql_bytes`.",
             path_params: &["name"],
             header_params: &[],
             request_body: None,
@@ -406,9 +411,10 @@ fn route_table() -> Vec<Route> {
                 Resp {
                     status: "200",
                     description: "The model detail.",
-                    body: Body::OutOfContract,
+                    body: Body::Component("ModelDetailOutput"),
                 },
                 MODEL_NOT_FOUND,
+                ENGINE_BUSY_OR_NOT_READY,
             ],
             auth_exempt: false,
         },
@@ -584,17 +590,20 @@ fn route_table() -> Vec<Route> {
             path: "/api/v1/dag/layers",
             operation_id: "getDagLayers",
             tag: "dag",
-            summary: "Execution layers (dashboard)",
-            description: "Dashboard-only execution layers. Outside the `/api/v1` value \
-                 contract.",
+            summary: "Execution layers",
+            description: "Topologically sorted execution layers of the compiled graph. No \
+                 CLI counterpart. Bounded by the project's model count.",
             path_params: &[],
             header_params: &[],
             request_body: None,
-            responses: &[Resp {
-                status: "200",
-                description: "The execution layers.",
-                body: Body::OutOfContract,
-            }],
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The execution layers.",
+                    body: Body::Component("DagLayersOutput"),
+                },
+                ENGINE_BUSY_OR_NOT_READY,
+            ],
             auth_exempt: false,
         },
         Route {
@@ -602,9 +611,9 @@ fn route_table() -> Vec<Route> {
             path: "/api/v1/dag/status",
             operation_id: "getDagStatus",
             tag: "dag",
-            summary: "Latest DAG run status (server)",
-            description: "Latest recorded DAG execution status. Server-only, outside the \
-                 `/api/v1` value contract.",
+            summary: "Latest DAG run status",
+            description: "Latest DAG execution the in-process executor recorded. No CLI \
+                 counterpart. Bounded by the node count of that execution.",
             path_params: &[],
             header_params: &[],
             request_body: None,
@@ -612,7 +621,7 @@ fn route_table() -> Vec<Route> {
                 Resp {
                     status: "200",
                     description: "The latest DAG run status.",
-                    body: Body::OutOfContract,
+                    body: Body::Component("DagStatusOutput"),
                 },
                 Resp {
                     status: "503",

@@ -14,8 +14,8 @@
 //! GET  /api/v1/runs                             → project run history
 //! GET  /api/v1/compile                          → full compile result
 //! GET  /api/v1/dag                              → full unified DAG
-//! GET  /api/v1/dag/layers                       → execution layers (dashboard-only)
-//! GET  /api/v1/dag/status                       → latest DAG run status (server-only)
+//! GET  /api/v1/dag/layers                       → execution layers (typed, no CLI twin)
+//! GET  /api/v1/dag/status                       → latest DAG run status (typed, no CLI twin)
 //! POST /api/v1/compile                          → trigger recompilation
 //! POST /api/v1/jobs/run                         → submit a run job    → 202 {job_id}
 //! POST /api/v1/jobs/plan                        → submit a plan job   → 202 {job_id}
@@ -34,11 +34,15 @@
 //! (`compile`'s wall-clock `compile_timings` are the one non-deterministic
 //! field; everything else is deterministic given the same project + state.)
 //!
-//! `models`, `models/:name`, and `dag/layers` render the dashboard's
-//! ad-hoc shapes and are **explicitly out of the `/api/v1` value contract**
-//! for now — they have no canonical CLI counterpart (promoting them is
-//! net-new construction, deferred). `health`, `POST /compile`, and
-//! `dag/status` are server-lifecycle, also out of contract.
+//! `health`, `models`, `models/:name`, `dag/layers` and `dag/status` have
+//! **no CLI counterpart** — no verb lists compiled models with their graph
+//! edges, and the DAG status is populated by the in-process executor only.
+//! They still serve typed payloads (`HealthOutput`, `ModelListOutput`,
+//! `ModelDetailOutput`, `DagLayersOutput`, `DagStatusOutput`) exported
+//! through the same schema registry as every CLI output, so the OpenAPI
+//! document and the generated bindings describe them; `/meta` advertises
+//! the `estate` capability for them. Only `POST /compile` is still an
+//! ad-hoc server-lifecycle body.
 //!
 //! All routes except `/api/v1/health` require a Bearer token when one is
 //! configured on [`ServerState`]; see [`rocky_server::auth`]. A token
@@ -79,8 +83,11 @@ use crate::commands::{
     lineage_output, metrics_output, model_history_output, schedule_status_output, schemas_hash,
 };
 use crate::output::{
-    ColumnLineageOutput, CompileOutput, DagOutput, ErrorEnvelope, HistoryOutput, JobKind, JobState,
-    JobStatus, LineageOutput, MetaOutput, MetricsOutput, ModelHistoryOutput, ScheduleStatusOutput,
+    ColumnLineageOutput, CompileOutput, DagExecutionOutput, DagLayersOutput, DagNodeResultOutput,
+    DagNodeStatusOutput, DagOutput, DagStatusOutput, ErrorEnvelope, HealthOutput, HistoryOutput,
+    JobKind, JobState, JobStatus, LineageOutput, MetaOutput, MetricsOutput, ModelColumnOutput,
+    ModelDetailOutput, ModelHistoryOutput, ModelListEntry, ModelListOutput, ScheduleStatusOutput,
+    TypedColumnOutput, cap_model_sql,
 };
 
 /// Bind config for [`serve`].
@@ -628,7 +635,9 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
 
 /// Coarse capability tokens so embedders feature-detect a build's surface
 /// without version-sniffing. The canonical read routes carry the same
-/// `*Output` shapes the CLI `--output json` emits.
+/// `*Output` shapes the CLI `--output json` emits. `estate` says the five
+/// server-only routes (`/health`, `/models`, `/models/{name}`, `/dag/layers`,
+/// `/dag/status`) answer with their typed, schema-exported payloads.
 fn capabilities() -> Vec<String> {
     [
         "compile",
@@ -642,6 +651,7 @@ fn capabilities() -> Vec<String> {
         "jobs",
         "schedule",
         "webhooks",
+        "estate",
     ]
     .into_iter()
     .map(String::from)
@@ -650,8 +660,12 @@ fn capabilities() -> Vec<String> {
 
 // --- Route handlers ---
 
-async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
+/// `GET /api/v1/health` — auth-exempt liveness probe, typed [`HealthOutput`].
+async fn health() -> PrettyJson<HealthOutput> {
+    PrettyJson(HealthOutput {
+        status: "ok".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    })
 }
 
 /// `GET /api/v1/meta` — engine + config fingerprint for feature detection.
@@ -683,39 +697,42 @@ async fn meta(State(state): State<Arc<ServerState>>) -> PrettyJson<MetaOutput> {
     })
 }
 
-/// `GET /api/v1/models` — dashboard-only model list (out of `/api/v1` contract).
+/// `GET /api/v1/models` — the compiled model list, typed [`ModelListOutput`].
+///
+/// No CLI counterpart: no verb lists compiled models with their graph edges.
+/// Bounded by the project's model count.
 async fn list_models(
     State(state): State<Arc<ServerState>>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<PrettyJson<ModelListOutput>, ApiError> {
     let lock = state.compile_result.read().await;
     let result = lock.as_ref().ok_or_else(ApiError::engine_not_ready)?;
 
-    let models: Vec<serde_json::Value> = result
+    let models: Vec<ModelListEntry> = result
         .semantic_graph
         .models
         .iter()
-        .map(|(name, schema)| {
-            serde_json::json!({
-                "name": name,
-                "columns": schema.columns.len(),
-                "has_star": schema.has_star,
-                "upstream": schema.upstream,
-                "downstream": schema.downstream,
-            })
+        .map(|(name, schema)| ModelListEntry {
+            name: name.clone(),
+            columns: schema.columns.len(),
+            has_star: schema.has_star,
+            upstream: schema.upstream.clone(),
+            downstream: schema.downstream.clone(),
         })
         .collect();
 
-    Ok(Json(serde_json::json!({
-        "models": models,
-        "count": models.len(),
-    })))
+    let count = models.len();
+    Ok(PrettyJson(ModelListOutput { models, count }))
 }
 
-/// `GET /api/v1/models/:name` — dashboard-only model detail (out of contract).
+/// `GET /api/v1/models/:name` — one model's detail, typed [`ModelDetailOutput`].
+///
+/// No CLI counterpart. The SQL text is capped at
+/// [`crate::output::MODEL_DETAIL_SQL_CAP_BYTES`]; a cut is reported, never
+/// silent.
 async fn get_model(
     State(state): State<Arc<ServerState>>,
     ApiPath(name): ApiPath<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<PrettyJson<ModelDetailOutput>, ApiError> {
     let lock = state.compile_result.read().await;
     let result = lock.as_ref().ok_or_else(ApiError::engine_not_ready)?;
 
@@ -724,23 +741,41 @@ async fn get_model(
         .model_schema(&name)
         .ok_or_else(|| ApiError::model_not_found(&name))?;
 
-    let typed_cols = result.type_check.typed_models.get(&name);
+    let typed_columns = result.type_check.typed_models.get(&name).map(|cols| {
+        cols.iter()
+            .map(|c| TypedColumnOutput {
+                name: c.name.clone(),
+                data_type: c.data_type.to_string(),
+                nullable: c.nullable,
+            })
+            .collect()
+    });
 
     let model = result
         .project
         .model(&name)
         .ok_or_else(|| ApiError::model_not_found(&name))?;
 
-    Ok(Json(serde_json::json!({
-        "name": name,
-        "sql": model.sql,
-        "file_path": model.file_path,
-        "columns": schema.columns,
-        "typed_columns": typed_cols,
-        "has_star": schema.has_star,
-        "upstream": schema.upstream,
-        "downstream": schema.downstream,
-    })))
+    let (sql, sql_truncated) = cap_model_sql(&model.sql);
+
+    Ok(PrettyJson(ModelDetailOutput {
+        name,
+        sql,
+        sql_truncated,
+        sql_bytes: model.sql.len(),
+        file_path: model.file_path.clone(),
+        columns: schema
+            .columns
+            .iter()
+            .map(|c| ModelColumnOutput {
+                name: c.name.clone(),
+            })
+            .collect(),
+        typed_columns,
+        has_star: schema.has_star,
+        upstream: schema.upstream.clone(),
+        downstream: schema.downstream.clone(),
+    }))
 }
 
 /// `GET /api/v1/models/:name/lineage` — canonical [`LineageOutput`].
@@ -909,31 +944,73 @@ async fn model_metrics(
     Ok(PrettyJson(output))
 }
 
-/// `GET /api/v1/dag/layers` — dashboard-only execution layers (out of contract).
+/// `GET /api/v1/dag/layers` — the execution layers, typed [`DagLayersOutput`].
+///
+/// No CLI counterpart. Bounded by the project's model count.
 async fn dag_layers(
     State(state): State<Arc<ServerState>>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<PrettyJson<DagLayersOutput>, ApiError> {
     let lock = state.compile_result.read().await;
     let result = lock.as_ref().ok_or_else(ApiError::engine_not_ready)?;
 
-    Ok(Json(serde_json::json!({
-        "layers": result.project.layers,
-        "total_models": result.project.model_count(),
-    })))
+    Ok(PrettyJson(DagLayersOutput {
+        layers: result.project.layers.clone(),
+        total_models: result.project.model_count(),
+    }))
 }
 
-/// `GET /api/v1/dag/status` — latest DAG execution status (server-only).
+/// `GET /api/v1/dag/status` — latest DAG execution status, typed
+/// [`DagStatusOutput`].
 ///
 /// Returns `503 engine_not_ready` when no DAG run has been recorded yet.
-/// Serializes the [`DagStatus`][rocky_core::dag_status::DagStatus] struct;
-/// pinned out of the `/api/v1` value contract (no CLI counterpart, and the
-/// in-process executor that populates it is future work).
+/// Projects the [`DagStatus`][rocky_core::dag_status::DagStatus] the
+/// in-process executor records; there is no CLI counterpart.
 async fn dag_status(
     State(state): State<Arc<ServerState>>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<PrettyJson<DagStatusOutput>, ApiError> {
     match state.dag_status.get().await {
-        Some(status) => Ok(Json(serde_json::json!(status))),
+        Some(status) => Ok(PrettyJson(dag_status_output(&status))),
         None => Err(ApiError::engine_not_ready()),
+    }
+}
+
+/// Project the executor's [`DagStatus`][rocky_core::dag_status::DagStatus]
+/// onto the served [`DagStatusOutput`], field for field.
+fn dag_status_output(status: &rocky_core::dag_status::DagStatus) -> DagStatusOutput {
+    use rocky_core::dag_executor::NodeStatus;
+
+    let result = &status.result;
+    DagStatusOutput {
+        completed_at: status.completed_at,
+        result: DagExecutionOutput {
+            nodes: result
+                .nodes
+                .iter()
+                .map(|n| DagNodeResultOutput {
+                    id: n.id.clone(),
+                    kind: n.kind.clone(),
+                    label: n.label.clone(),
+                    // Exhaustive on purpose: a new executor status must be
+                    // given a served rendering here, not fall through.
+                    status: match n.status {
+                        NodeStatus::Pending => DagNodeStatusOutput::Pending,
+                        NodeStatus::Running => DagNodeStatusOutput::Running,
+                        NodeStatus::Completed => DagNodeStatusOutput::Completed,
+                        NodeStatus::Failed => DagNodeStatusOutput::Failed,
+                        NodeStatus::Skipped => DagNodeStatusOutput::Skipped,
+                    },
+                    layer: n.layer,
+                    duration_ms: n.duration_ms,
+                    error: n.error.clone(),
+                })
+                .collect(),
+            total_layers: result.total_layers,
+            total_nodes: result.total_nodes,
+            completed: result.completed,
+            failed: result.failed,
+            skipped: result.skipped,
+            duration_ms: result.duration_ms,
+        },
     }
 }
 
@@ -1642,8 +1719,9 @@ mod tests {
         let base = spawn_router(test_state()).await;
         let resp = reqwest::get(format!("{base}/api/v1/health")).await.unwrap();
         assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["status"], "ok");
+        let body: HealthOutput = resp.json().await.unwrap();
+        assert_eq!(body.status, "ok");
+        assert_eq!(body.version, env!("CARGO_PKG_VERSION"));
     }
 
     #[tokio::test]
@@ -1654,8 +1732,23 @@ mod tests {
 
         let resp = reqwest::get(format!("{base}/api/v1/models")).await.unwrap();
         assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["count"], 3);
+        let text = resp.text().await.unwrap();
+        let body: ModelListOutput = serde_json::from_str(&text).unwrap();
+        assert_eq!(body.count, 3);
+        assert_eq!(
+            body.models.len(),
+            body.count,
+            "count must equal the list length"
+        );
+        // Pretty-printed like every canonical route.
+        assert_eq!(text, reference_bytes(&body));
+        let customer_orders = body
+            .models
+            .iter()
+            .find(|m| m.name == "customer_orders")
+            .expect("the fixture's customer_orders model is listed");
+        assert!(customer_orders.upstream.contains(&"raw_orders".to_string()));
+        assert!(!customer_orders.has_star);
     }
 
     #[tokio::test]
@@ -1668,9 +1761,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["name"], "raw_orders");
-        assert!(body["sql"].as_str().unwrap().contains("SELECT"));
+        let body: ModelDetailOutput = resp.json().await.unwrap();
+        assert_eq!(body.name, "raw_orders");
+        assert!(body.sql.contains("SELECT"));
+        assert!(!body.sql_truncated, "a fixture-sized model is never cut");
+        assert_eq!(body.sql_bytes, body.sql.len());
+        assert!(body.file_path.ends_with("raw_orders.sql"));
+        assert!(
+            body.columns.iter().any(|c| c.name == "order_id"),
+            "inferred columns carry the projection: {:?}",
+            body.columns
+        );
+    }
+
+    /// The one estate route whose size is not bounded by the model count
+    /// carries an explicit cap, and a cut is reported, never silent.
+    #[tokio::test]
+    async fn model_detail_caps_long_sql_and_says_so() {
+        use crate::output::MODEL_DETAIL_SQL_CAP_BYTES;
+
+        // A copy of the fixture project with one model padded past the cap.
+        // The padding is a SQL comment that ends on a multi-byte character,
+        // so the cut also has to land on a char boundary.
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        for entry in std::fs::read_dir(simple_project_models()).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), models.join(entry.file_name())).unwrap();
+        }
+        let padded = models.join("raw_orders.sql");
+        let mut sql = std::fs::read_to_string(&padded).unwrap();
+        let line = "-- ééééééééééééééééééééééééééééééééééééééééééééé\n";
+        while sql.len() <= MODEL_DETAIL_SQL_CAP_BYTES + 4096 {
+            sql.push_str(line);
+        }
+        std::fs::write(&padded, &sql).unwrap();
+
+        let state = ServerState::new(models, None, None);
+        state.recompile().await;
+        let base = spawn_router(state).await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/models/raw_orders"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: ModelDetailOutput = resp.json().await.unwrap();
+        assert!(
+            body.sql_truncated,
+            "a model past the cap must say it was cut"
+        );
+        // The loader trims the file's surrounding whitespace before it stores
+        // the SQL, so the reported length is the trimmed source's.
+        let stored = sql.trim();
+        assert_eq!(body.sql_bytes, stored.len(), "the full length is reported");
+        assert!(body.sql_bytes > MODEL_DETAIL_SQL_CAP_BYTES);
+        assert!(body.sql.len() <= MODEL_DETAIL_SQL_CAP_BYTES);
+        assert!(
+            stored.starts_with(&body.sql),
+            "the served text is a prefix of the source"
+        );
     }
 
     #[tokio::test]
@@ -1698,9 +1848,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["total_models"], 3);
-        assert_eq!(body["layers"].as_array().unwrap().len(), 3);
+        let body: DagLayersOutput = resp.json().await.unwrap();
+        assert_eq!(body.total_models, 3);
+        assert_eq!(body.layers.len(), 3);
+        let listed: usize = body.layers.iter().map(Vec::len).sum();
+        assert_eq!(
+            listed, body.total_models,
+            "every model sits in exactly one layer"
+        );
+    }
+
+    /// `/dag/status` projects the executor's record field for field, with
+    /// the node status rendered in `snake_case` as the executor serializes it.
+    #[tokio::test]
+    async fn dag_status_is_typed_and_snake_case() {
+        use rocky_core::dag_executor::{DagExecutionResult, NodeResult, NodeStatus};
+
+        let state = test_state();
+        let base = spawn_router(state.clone()).await;
+
+        // Nothing recorded yet: the documented 503, with the envelope.
+        let resp = reqwest::get(format!("{base}/api/v1/dag/status"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "engine_not_ready");
+
+        state
+            .dag_status
+            .set(DagExecutionResult {
+                nodes: vec![
+                    NodeResult {
+                        id: "raw_orders".into(),
+                        kind: "model".into(),
+                        label: "raw_orders".into(),
+                        status: NodeStatus::Completed,
+                        layer: 0,
+                        duration_ms: 12,
+                        error: None,
+                    },
+                    NodeResult {
+                        id: "customer_orders".into(),
+                        kind: "model".into(),
+                        label: "customer_orders".into(),
+                        status: NodeStatus::Failed,
+                        layer: 1,
+                        duration_ms: 3,
+                        error: Some("boom".into()),
+                    },
+                ],
+                total_layers: 2,
+                total_nodes: 2,
+                completed: 1,
+                failed: 1,
+                skipped: 0,
+                duration_ms: 15,
+            })
+            .await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/dag/status"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let body: DagStatusOutput = serde_json::from_str(&text).unwrap();
+        assert_eq!(body.result.total_nodes, 2);
+        assert_eq!(body.result.failed, 1);
+        assert_eq!(body.result.nodes[0].status, DagNodeStatusOutput::Completed);
+        assert_eq!(body.result.nodes[1].status, DagNodeStatusOutput::Failed);
+        assert_eq!(body.result.nodes[1].error.as_deref(), Some("boom"));
+        assert!(body.result.nodes[0].error.is_none());
+        // The wire rendering is the executor's `snake_case`, not the variant name.
+        assert!(text.contains("\"status\": \"completed\""), "{text}");
+        assert!(!text.contains("Completed"), "{text}");
     }
 
     // --- /meta ---

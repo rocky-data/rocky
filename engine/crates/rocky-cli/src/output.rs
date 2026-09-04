@@ -5929,6 +5929,39 @@ macro_rules! status_line {
 }
 
 #[cfg(test)]
+mod model_detail_sql_cap_tests {
+    use super::*;
+
+    #[test]
+    fn short_sql_is_served_whole() {
+        let (sql, cut) = cap_model_sql("SELECT 1");
+        assert_eq!(sql, "SELECT 1");
+        assert!(!cut);
+    }
+
+    #[test]
+    fn sql_exactly_at_the_cap_is_not_cut() {
+        let sql = "x".repeat(MODEL_DETAIL_SQL_CAP_BYTES);
+        let (served, cut) = cap_model_sql(&sql);
+        assert_eq!(served.len(), MODEL_DETAIL_SQL_CAP_BYTES);
+        assert!(!cut);
+    }
+
+    #[test]
+    fn long_sql_is_cut_on_a_char_boundary() {
+        // Fill up to one byte short of the cap, then a 2-byte character
+        // straddles it: the cut must fall back to the boundary before it.
+        let mut sql = "x".repeat(MODEL_DETAIL_SQL_CAP_BYTES - 1);
+        sql.push('é');
+        sql.push_str("SELECT 1");
+        let (served, cut) = cap_model_sql(&sql);
+        assert!(cut);
+        assert_eq!(served.len(), MODEL_DETAIL_SQL_CAP_BYTES - 1);
+        assert!(sql.starts_with(&served));
+    }
+}
+
+#[cfg(test)]
 mod cost_finalize_tests {
     use super::*;
     use rocky_core::config::{BudgetBreachAction, BudgetConfig, CostSection};
@@ -9821,6 +9854,208 @@ pub struct MetaOutput {
     pub capabilities: Vec<String>,
     /// The `/api/v1` routes this build serves.
     pub routes: Vec<String>,
+}
+
+// --- The five estate routes (server-only, no CLI counterpart) ---
+//
+// `GET /api/v1/health`, `/models`, `/models/{name}`, `/dag/layers` and
+// `/dag/status` used to answer with ad-hoc `serde_json::Value` objects and
+// were marked "outside the `/api/v1` value contract". They are the routes a
+// UI leans on hardest, so they now carry typed payloads, exported through the
+// same schema registry as every CLI output. None has a CLI twin: the CLI has
+// no verb that lists compiled models with their graph edges, and the DAG
+// status is populated by the in-process executor only.
+
+/// Liveness payload for the auth-exempt `GET /api/v1/health`.
+///
+/// Server-lifecycle only: it says the process answers HTTP and which engine
+/// release it is. It carries no project state, so it is safe to hand to a
+/// prober that holds no token.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HealthOutput {
+    /// Always `"ok"` when the server answers at all.
+    pub status: String,
+    /// Engine release (`CARGO_PKG_VERSION`).
+    pub version: String,
+}
+
+/// The compiled model list for `GET /api/v1/models`.
+///
+/// One entry per model in the in-memory compile result, in the semantic
+/// graph's iteration order (model name, ascending). Bounded by the project's
+/// model count: the whole list is what an estate screen renders, so there is
+/// no pagination and no per-request cap beyond that.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ModelListOutput {
+    /// Every compiled model.
+    pub models: Vec<ModelListEntry>,
+    /// `models.len()`, repeated so a consumer can assert it received the
+    /// whole list.
+    pub count: usize,
+}
+
+/// One row of [`ModelListOutput`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ModelListEntry {
+    /// Model name.
+    pub name: String,
+    /// Number of inferred output columns.
+    pub columns: usize,
+    /// Whether the model uses `SELECT *`, so its schema depends on upstream.
+    pub has_star: bool,
+    /// Direct upstream model names.
+    pub upstream: Vec<String>,
+    /// Direct downstream model names.
+    pub downstream: Vec<String>,
+}
+
+/// Cap on the SQL text carried by [`ModelDetailOutput::sql`], in bytes.
+///
+/// Model detail is the one estate route whose size is not bounded by the
+/// model count — a single model's SQL can be arbitrarily long — so it carries
+/// an explicit cap. A model past the cap is still served; its SQL is cut and
+/// the payload says so (`sql_truncated`, `sql_bytes`).
+pub const MODEL_DETAIL_SQL_CAP_BYTES: usize = 256 * 1024;
+
+/// Cut `sql` to at most [`MODEL_DETAIL_SQL_CAP_BYTES`] bytes on a character
+/// boundary. Returns the (possibly cut) text and whether it was cut.
+pub fn cap_model_sql(sql: &str) -> (String, bool) {
+    if sql.len() <= MODEL_DETAIL_SQL_CAP_BYTES {
+        return (sql.to_string(), false);
+    }
+    let mut end = MODEL_DETAIL_SQL_CAP_BYTES;
+    while !sql.is_char_boundary(end) {
+        end -= 1;
+    }
+    (sql[..end].to_string(), true)
+}
+
+/// One model's detail for `GET /api/v1/models/{name}`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ModelDetailOutput {
+    /// Model name.
+    pub name: String,
+    /// The model's SQL text, capped at [`MODEL_DETAIL_SQL_CAP_BYTES`] bytes.
+    /// When it was cut, `sql_truncated` is `true` and `sql_bytes` carries the
+    /// full length, so a consumer never mistakes a cut text for the whole.
+    pub sql: String,
+    /// Whether `sql` was cut at the cap.
+    pub sql_truncated: bool,
+    /// Length of the full SQL text in bytes, cut or not.
+    pub sql_bytes: usize,
+    /// Path to the source file, as the compiler recorded it.
+    pub file_path: String,
+    /// Inferred output columns.
+    pub columns: Vec<ModelColumnOutput>,
+    /// Type-checked columns, or `null` when the type checker produced none
+    /// for this model.
+    pub typed_columns: Option<Vec<TypedColumnOutput>>,
+    /// Whether the model uses `SELECT *`, so its schema depends on upstream.
+    pub has_star: bool,
+    /// Direct upstream model names.
+    pub upstream: Vec<String>,
+    /// Direct downstream model names.
+    pub downstream: Vec<String>,
+}
+
+/// One inferred output column of a model.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ModelColumnOutput {
+    /// Column name.
+    pub name: String,
+}
+
+/// One type-checked column of a model.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TypedColumnOutput {
+    /// Column name.
+    pub name: String,
+    /// Rocky's rendering of the inferred type, e.g. `INT64` or
+    /// `DECIMAL(10,2)`.
+    pub data_type: String,
+    /// Whether the column may be `NULL`.
+    pub nullable: bool,
+}
+
+/// The execution layers for `GET /api/v1/dag/layers`.
+///
+/// Bounded by the project's model count: every model appears in exactly one
+/// layer.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DagLayersOutput {
+    /// Topologically sorted layers. Models in one layer have no mutual
+    /// dependencies and can run in parallel.
+    pub layers: Vec<Vec<String>>,
+    /// Number of models across all layers.
+    pub total_models: usize,
+}
+
+/// The latest recorded DAG execution for `GET /api/v1/dag/status`.
+///
+/// Populated by the in-process executor only; there is no CLI counterpart.
+/// The route answers `503 engine_not_ready` until one execution has been
+/// recorded. Bounded by the node count of that execution.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DagStatusOutput {
+    /// When the execution finished (UTC).
+    pub completed_at: DateTime<Utc>,
+    /// The aggregate execution result.
+    pub result: DagExecutionOutput,
+}
+
+/// Aggregate result of one DAG execution.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DagExecutionOutput {
+    /// One record per node the executor visited.
+    pub nodes: Vec<DagNodeResultOutput>,
+    /// Number of execution layers.
+    pub total_layers: usize,
+    /// Number of nodes in the DAG.
+    pub total_nodes: usize,
+    /// Nodes that completed.
+    pub completed: usize,
+    /// Nodes that failed.
+    pub failed: usize,
+    /// Nodes skipped because an ancestor failed.
+    pub skipped: usize,
+    /// Wall-clock duration of the whole execution, in milliseconds.
+    pub duration_ms: u64,
+}
+
+/// One node's record inside [`DagExecutionOutput`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DagNodeResultOutput {
+    /// Node id.
+    pub id: String,
+    /// Node kind, e.g. `model` or `test`.
+    pub kind: String,
+    /// Human label.
+    pub label: String,
+    /// Final status of the node.
+    pub status: DagNodeStatusOutput,
+    /// The execution layer the node ran in.
+    pub layer: usize,
+    /// Node duration, in milliseconds.
+    pub duration_ms: u64,
+    /// Error message when the node failed; omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Status of one node in a recorded DAG execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DagNodeStatusOutput {
+    /// Node has not started yet.
+    Pending,
+    /// Node is currently executing.
+    Running,
+    /// Node completed successfully.
+    Completed,
+    /// Node failed; `error` is attached.
+    Failed,
+    /// Node was skipped because an ancestor failed.
+    Skipped,
 }
 
 /// The kind of long-running operation a job wraps.

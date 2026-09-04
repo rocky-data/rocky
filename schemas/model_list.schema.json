@@ -1,0 +1,68 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ModelListEntry": {
+      "description": "One row of [`ModelListOutput`].",
+      "properties": {
+        "columns": {
+          "description": "Number of inferred output columns.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "downstream": {
+          "description": "Direct downstream model names.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "has_star": {
+          "description": "Whether the model uses `SELECT *`, so its schema depends on upstream.",
+          "type": "boolean"
+        },
+        "name": {
+          "description": "Model name.",
+          "type": "string"
+        },
+        "upstream": {
+          "description": "Direct upstream model names.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "columns",
+        "downstream",
+        "has_star",
+        "name",
+        "upstream"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "The compiled model list for `GET /api/v1/models`.\n\nOne entry per model in the in-memory compile result, in the semantic graph's iteration order (model name, ascending). Bounded by the project's model count: the whole list is what an estate screen renders, so there is no pagination and no per-request cap beyond that.",
+  "properties": {
+    "count": {
+      "description": "`models.len()`, repeated so a consumer can assert it received the whole list.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "models": {
+      "description": "Every compiled model.",
+      "items": {
+        "$ref": "#/definitions/ModelListEntry"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "count",
+    "models"
+  ],
+  "title": "ModelListOutput",
+  "type": "object"
+}

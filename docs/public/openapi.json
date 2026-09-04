@@ -5834,6 +5834,90 @@
         ],
         "type": "object"
       },
+      "DagExecutionOutput": {
+        "description": "Aggregate result of one DAG execution.",
+        "properties": {
+          "completed": {
+            "description": "Nodes that completed.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "duration_ms": {
+            "description": "Wall-clock duration of the whole execution, in milliseconds.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "failed": {
+            "description": "Nodes that failed.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "nodes": {
+            "description": "One record per node the executor visited.",
+            "items": {
+              "$ref": "#/components/schemas/DagNodeResultOutput"
+            },
+            "type": "array"
+          },
+          "skipped": {
+            "description": "Nodes skipped because an ancestor failed.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "total_layers": {
+            "description": "Number of execution layers.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "total_nodes": {
+            "description": "Number of nodes in the DAG.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "completed",
+          "duration_ms",
+          "failed",
+          "nodes",
+          "skipped",
+          "total_layers",
+          "total_nodes"
+        ],
+        "type": "object"
+      },
+      "DagLayersOutput": {
+        "description": "The execution layers for `GET /api/v1/dag/layers`.\n\nBounded by the project's model count: every model appears in exactly one layer.",
+        "properties": {
+          "layers": {
+            "description": "Topologically sorted layers. Models in one layer have no mutual dependencies and can run in parallel.",
+            "items": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": "array"
+          },
+          "total_models": {
+            "description": "Number of models across all layers.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "layers",
+          "total_models"
+        ],
+        "type": "object"
+      },
       "DagNodeOutput": {
         "description": "One node in the enriched DAG, projected for orchestrators.\n\nCross-references the engine's internal `UnifiedNode` with model configs, seeds, and pipeline configs to attach the metadata that orchestrators need (target, strategy, freshness, partition shape).",
         "properties": {
@@ -5914,6 +5998,99 @@
           "label"
         ],
         "type": "object"
+      },
+      "DagNodeResultOutput": {
+        "description": "One node's record inside [`DagExecutionOutput`].",
+        "properties": {
+          "duration_ms": {
+            "description": "Node duration, in milliseconds.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "error": {
+            "description": "Error message when the node failed; omitted otherwise.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "Node id.",
+            "type": "string"
+          },
+          "kind": {
+            "description": "Node kind, e.g. `model` or `test`.",
+            "type": "string"
+          },
+          "label": {
+            "description": "Human label.",
+            "type": "string"
+          },
+          "layer": {
+            "description": "The execution layer the node ran in.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "status": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/DagNodeStatusOutput"
+              }
+            ],
+            "description": "Final status of the node."
+          }
+        },
+        "required": [
+          "duration_ms",
+          "id",
+          "kind",
+          "label",
+          "layer",
+          "status"
+        ],
+        "type": "object"
+      },
+      "DagNodeStatusOutput": {
+        "description": "Status of one node in a recorded DAG execution.",
+        "oneOf": [
+          {
+            "description": "Node has not started yet.",
+            "enum": [
+              "pending"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Node is currently executing.",
+            "enum": [
+              "running"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Node completed successfully.",
+            "enum": [
+              "completed"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Node failed; `error` is attached.",
+            "enum": [
+              "failed"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Node was skipped because an ancestor failed.",
+            "enum": [
+              "skipped"
+            ],
+            "type": "string"
+          }
+        ]
       },
       "DagOutput": {
         "description": "JSON output for `rocky dag`.\n\nProjects the engine's internal [`UnifiedDag`] into an enriched, orchestrator-friendly shape: every pipeline stage becomes a node with its target table coordinates, materialization strategy, freshness SLA, partition shape, and direct upstream dependencies.\n\nConsumers (dagster-rocky) can build a complete, connected asset graph from a single `rocky dag --output json` call.\n\n[`UnifiedDag`]: rocky_core::unified_dag::UnifiedDag",
@@ -6105,6 +6282,29 @@
           "total_layers",
           "total_nodes",
           "version"
+        ],
+        "type": "object"
+      },
+      "DagStatusOutput": {
+        "description": "The latest recorded DAG execution for `GET /api/v1/dag/status`.\n\nPopulated by the in-process executor only; there is no CLI counterpart. The route answers `503 engine_not_ready` until one execution has been recorded. Bounded by the node count of that execution.",
+        "properties": {
+          "completed_at": {
+            "description": "When the execution finished (UTC).",
+            "format": "date-time",
+            "type": "string"
+          },
+          "result": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/DagExecutionOutput"
+              }
+            ],
+            "description": "The aggregate execution result."
+          }
+        },
+        "required": [
+          "completed_at",
+          "result"
         ],
         "type": "object"
       },
@@ -8518,6 +8718,24 @@
         ],
         "type": "object"
       },
+      "HealthOutput": {
+        "description": "Liveness payload for the auth-exempt `GET /api/v1/health`.\n\nServer-lifecycle only: it says the process answers HTTP and which engine release it is. It carries no project state, so it is safe to hand to a prober that holds no token.",
+        "properties": {
+          "status": {
+            "description": "Always `\"ok\"` when the server answers at all.",
+            "type": "string"
+          },
+          "version": {
+            "description": "Engine release (`CARGO_PKG_VERSION`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "version"
+        ],
+        "type": "object"
+      },
       "HealthStatus": {
         "description": "Health check status.",
         "enum": [
@@ -10605,6 +10823,19 @@
           }
         ]
       },
+      "ModelColumnOutput": {
+        "description": "One inferred output column of a model.",
+        "properties": {
+          "name": {
+            "description": "Column name.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
       "ModelCostEntry": {
         "description": "Per-model cost attribution entry inside [`RunCostSummary`].",
         "properties": {
@@ -10769,6 +11000,80 @@
           "name",
           "strategy",
           "target"
+        ],
+        "type": "object"
+      },
+      "ModelDetailOutput": {
+        "description": "One model's detail for `GET /api/v1/models/{name}`.",
+        "properties": {
+          "columns": {
+            "description": "Inferred output columns.",
+            "items": {
+              "$ref": "#/components/schemas/ModelColumnOutput"
+            },
+            "type": "array"
+          },
+          "downstream": {
+            "description": "Direct downstream model names.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "file_path": {
+            "description": "Path to the source file, as the compiler recorded it.",
+            "type": "string"
+          },
+          "has_star": {
+            "description": "Whether the model uses `SELECT *`, so its schema depends on upstream.",
+            "type": "boolean"
+          },
+          "name": {
+            "description": "Model name.",
+            "type": "string"
+          },
+          "sql": {
+            "description": "The model's SQL text, capped at [`MODEL_DETAIL_SQL_CAP_BYTES`] bytes. When it was cut, `sql_truncated` is `true` and `sql_bytes` carries the full length, so a consumer never mistakes a cut text for the whole.",
+            "type": "string"
+          },
+          "sql_bytes": {
+            "description": "Length of the full SQL text in bytes, cut or not.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "sql_truncated": {
+            "description": "Whether `sql` was cut at the cap.",
+            "type": "boolean"
+          },
+          "typed_columns": {
+            "description": "Type-checked columns, or `null` when the type checker produced none for this model.",
+            "items": {
+              "$ref": "#/components/schemas/TypedColumnOutput"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "upstream": {
+            "description": "Direct upstream model names.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "columns",
+          "downstream",
+          "file_path",
+          "has_star",
+          "name",
+          "sql",
+          "sql_bytes",
+          "sql_truncated",
+          "upstream"
         ],
         "type": "object"
       },
@@ -10968,6 +11273,70 @@
           "executions",
           "model",
           "version"
+        ],
+        "type": "object"
+      },
+      "ModelListEntry": {
+        "description": "One row of [`ModelListOutput`].",
+        "properties": {
+          "columns": {
+            "description": "Number of inferred output columns.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "downstream": {
+            "description": "Direct downstream model names.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "has_star": {
+            "description": "Whether the model uses `SELECT *`, so its schema depends on upstream.",
+            "type": "boolean"
+          },
+          "name": {
+            "description": "Model name.",
+            "type": "string"
+          },
+          "upstream": {
+            "description": "Direct upstream model names.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "columns",
+          "downstream",
+          "has_star",
+          "name",
+          "upstream"
+        ],
+        "type": "object"
+      },
+      "ModelListOutput": {
+        "description": "The compiled model list for `GET /api/v1/models`.\n\nOne entry per model in the in-memory compile result, in the semantic graph's iteration order (model name, ascending). Bounded by the project's model count: the whole list is what an estate screen renders, so there is no pagination and no per-request cap beyond that.",
+        "properties": {
+          "count": {
+            "description": "`models.len()`, repeated so a consumer can assert it received the whole list.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "models": {
+            "description": "Every compiled model.",
+            "items": {
+              "$ref": "#/components/schemas/ModelListEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "count",
+          "models"
         ],
         "type": "object"
       },
@@ -19985,6 +20354,29 @@
         ],
         "type": "object"
       },
+      "TypedColumnOutput": {
+        "description": "One type-checked column of a model.",
+        "properties": {
+          "data_type": {
+            "description": "Rocky's rendering of the inferred type, e.g. `INT64` or `DECIMAL(10,2)`.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Column name.",
+            "type": "string"
+          },
+          "nullable": {
+            "description": "Whether the column may be `NULL`.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "data_type",
+          "name",
+          "nullable"
+        ],
+        "type": "object"
+      },
       "UnitTestResult": {
         "description": "Result of running a single unit test.",
         "properties": {
@@ -20560,23 +20952,31 @@
     },
     "/api/v1/dag/layers": {
       "get": {
-        "description": "Dashboard-only execution layers. Outside the `/api/v1` value contract.",
+        "description": "Topologically sorted execution layers of the compiled graph. No CLI counterpart. Bounded by the project's model count.",
         "operationId": "getDagLayers",
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "description": "Ad-hoc body outside the `/api/v1` value contract; shape is not pinned and may change without a version bump.",
-                  "type": "object"
+                  "$ref": "#/components/schemas/DagLayersOutput"
                 }
               }
             },
             "description": "The execution layers."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
           }
         },
-        "summary": "Execution layers (dashboard)",
+        "summary": "Execution layers",
         "tags": [
           "dag"
         ]
@@ -20584,16 +20984,14 @@
     },
     "/api/v1/dag/status": {
       "get": {
-        "description": "Latest recorded DAG execution status. Server-only, outside the `/api/v1` value contract.",
+        "description": "Latest DAG execution the in-process executor recorded. No CLI counterpart. Bounded by the node count of that execution.",
         "operationId": "getDagStatus",
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "description": "Ad-hoc body outside the `/api/v1` value contract; shape is not pinned and may change without a version bump.",
-                  "type": "object"
+                  "$ref": "#/components/schemas/DagStatusOutput"
                 }
               }
             },
@@ -20610,7 +21008,7 @@
             "description": "No DAG run has been recorded yet."
           }
         },
-        "summary": "Latest DAG run status (server)",
+        "summary": "Latest DAG run status",
         "tags": [
           "dag"
         ]
@@ -20618,16 +21016,14 @@
     },
     "/api/v1/health": {
       "get": {
-        "description": "Auth-exempt liveness probe. Server-lifecycle, outside the `/api/v1` value contract.",
+        "description": "Auth-exempt liveness probe. Server-lifecycle only: it carries no project state. No CLI counterpart.",
         "operationId": "getHealth",
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "description": "Ad-hoc body outside the `/api/v1` value contract; shape is not pinned and may change without a version bump.",
-                  "type": "object"
+                  "$ref": "#/components/schemas/HealthOutput"
                 }
               }
             },
@@ -20998,23 +21394,31 @@
     },
     "/api/v1/models": {
       "get": {
-        "description": "Dashboard-only model list. Outside the `/api/v1` value contract (no canonical CLI counterpart).",
+        "description": "Every compiled model with its column count and graph edges. No CLI counterpart. Bounded by the project's model count.",
         "operationId": "listModels",
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "description": "Ad-hoc body outside the `/api/v1` value contract; shape is not pinned and may change without a version bump.",
-                  "type": "object"
+                  "$ref": "#/components/schemas/ModelListOutput"
                 }
               }
             },
             "description": "The model list."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
           }
         },
-        "summary": "List models (dashboard)",
+        "summary": "List compiled models",
         "tags": [
           "models"
         ]
@@ -21022,7 +21426,7 @@
     },
     "/api/v1/models/{name}": {
       "get": {
-        "description": "Dashboard-only model detail. Outside the `/api/v1` value contract.",
+        "description": "One model's SQL, source path, inferred and type-checked columns, and graph edges. No CLI counterpart. The SQL text is capped at 256 KiB; a cut is reported through `sql_truncated` and `sql_bytes`.",
         "operationId": "getModel",
         "parameters": [
           {
@@ -21040,9 +21444,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "description": "Ad-hoc body outside the `/api/v1` value contract; shape is not pinned and may change without a version bump.",
-                  "type": "object"
+                  "$ref": "#/components/schemas/ModelDetailOutput"
                 }
               }
             },
@@ -21057,9 +21459,19 @@
               }
             },
             "description": "The named model is not in the compiled graph."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
           }
         },
-        "summary": "Model detail (dashboard)",
+        "summary": "Model detail",
         "tags": [
           "models"
         ]

@@ -1,0 +1,114 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ModelColumnOutput": {
+      "description": "One inferred output column of a model.",
+      "properties": {
+        "name": {
+          "description": "Column name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "TypedColumnOutput": {
+      "description": "One type-checked column of a model.",
+      "properties": {
+        "data_type": {
+          "description": "Rocky's rendering of the inferred type, e.g. `INT64` or `DECIMAL(10,2)`.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Column name.",
+          "type": "string"
+        },
+        "nullable": {
+          "description": "Whether the column may be `NULL`.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "data_type",
+        "name",
+        "nullable"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "One model's detail for `GET /api/v1/models/{name}`.",
+  "properties": {
+    "columns": {
+      "description": "Inferred output columns.",
+      "items": {
+        "$ref": "#/definitions/ModelColumnOutput"
+      },
+      "type": "array"
+    },
+    "downstream": {
+      "description": "Direct downstream model names.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "file_path": {
+      "description": "Path to the source file, as the compiler recorded it.",
+      "type": "string"
+    },
+    "has_star": {
+      "description": "Whether the model uses `SELECT *`, so its schema depends on upstream.",
+      "type": "boolean"
+    },
+    "name": {
+      "description": "Model name.",
+      "type": "string"
+    },
+    "sql": {
+      "description": "The model's SQL text, capped at [`MODEL_DETAIL_SQL_CAP_BYTES`] bytes. When it was cut, `sql_truncated` is `true` and `sql_bytes` carries the full length, so a consumer never mistakes a cut text for the whole.",
+      "type": "string"
+    },
+    "sql_bytes": {
+      "description": "Length of the full SQL text in bytes, cut or not.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "sql_truncated": {
+      "description": "Whether `sql` was cut at the cap.",
+      "type": "boolean"
+    },
+    "typed_columns": {
+      "description": "Type-checked columns, or `null` when the type checker produced none for this model.",
+      "items": {
+        "$ref": "#/definitions/TypedColumnOutput"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "upstream": {
+      "description": "Direct upstream model names.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "columns",
+    "downstream",
+    "file_path",
+    "has_star",
+    "name",
+    "sql",
+    "sql_bytes",
+    "sql_truncated",
+    "upstream"
+  ],
+  "title": "ModelDetailOutput",
+  "type": "object"
+}

@@ -151,8 +151,12 @@ _LAZY: dict[str, tuple[str, str]] = {
     "ContractViolation": ("load_schema", "ContractViolation"),
     "CostOutput": ("cost_schema", "CostOutput"),
     "DagEdgeOutput": ("dag_schema", "DagEdgeOutput"),
+    "DagExecutionOutput": ("dag_status_schema", "DagExecutionOutput"),
+    "DagLayersOutput": ("dag_layers_schema", "DagLayersOutput"),
     "DagNodeOutput": ("dag_schema", "DagNodeOutput"),
+    "DagNodeResultOutput": ("dag_status_schema", "DagNodeResultOutput"),
     "DagOutput": ("dag_schema", "DagOutput"),
+    "DagStatusOutput": ("dag_status_schema", "DagStatusOutput"),
     "DagRunNodeOutput": ("dag_run_schema", "DagRunNodeOutput"),
     "DagRunOutput": ("dag_run_schema", "DagRunOutput"),
     "DagSummaryOutput": ("dag_schema", "DagSummaryOutput"),
@@ -196,6 +200,7 @@ _LAZY: dict[str, tuple[str, str]] = {
     "GcReportOutput": ("gc_schema", "GcReportOutput"),
     "HealthCheck": ("doctor_schema", "HealthCheck"),
     "HealthStatus": ("doctor_schema", "HealthStatus"),
+    "HealthOutput": ("health_schema", "HealthOutput"),
     "HistoryOutput": ("history_schema", "HistoryOutput"),
     "HookEntry": ("hooks_list_schema", "HookEntry"),
     "HooksListOutput": ("hooks_list_schema", "HooksListOutput"),
@@ -226,7 +231,11 @@ _LAZY: dict[str, tuple[str, str]] = {
     "ModelEstimate": ("estimate_schema", "ModelEstimate"),
     "ModelExecutionRecord": ("model_history_schema", "ModelExecutionRecord"),
     "ModelFreshnessConfig": ("compile_schema", "ModelFreshnessConfig"),
+    "ModelColumnOutput": ("model_detail_schema", "ModelColumnOutput"),
+    "ModelDetailOutput": ("model_detail_schema", "ModelDetailOutput"),
     "ModelHistoryOutput": ("model_history_schema", "ModelHistoryOutput"),
+    "ModelListEntry": ("model_list_schema", "ModelListEntry"),
+    "ModelListOutput": ("model_list_schema", "ModelListOutput"),
     "ModelRetentionStatus": ("retention_status_schema", "ModelRetentionStatus"),
     "ModelTestResult": ("test_schema", "ModelTestResult"),
     "ModelValidationOutput": ("validate_migration_schema", "ModelValidationOutput"),
@@ -334,6 +343,7 @@ _LAZY: dict[str, tuple[str, str]] = {
     "TickOutput": ("tick_schema", "TickOutput"),
     "TraceModelEntry": ("trace_schema", "TraceModelEntry"),
     "TraceOutput": ("trace_schema", "TraceOutput"),
+    "TypedColumnOutput": ("model_detail_schema", "TypedColumnOutput"),
     "UnitTestResult": ("test_schema", "UnitTestResult"),
     "ValidateAdapterStatus": ("validate_schema", "ValidateAdapterStatus"),
     "ValidateMessage": ("validate_schema", "ValidateMessage"),
@@ -390,6 +400,19 @@ if TYPE_CHECKING:
     from .error_envelope_schema import ErrorEnvelope
     from .job_status_schema import JobStatus
     from .meta_schema import MetaOutput
+    from .health_schema import HealthOutput
+    from .model_list_schema import ModelListEntry, ModelListOutput
+    from .model_detail_schema import (
+        ModelColumnOutput,
+        ModelDetailOutput,
+        TypedColumnOutput,
+    )
+    from .dag_layers_schema import DagLayersOutput
+    from .dag_status_schema import (
+        DagExecutionOutput,
+        DagNodeResultOutput,
+        DagStatusOutput,
+    )
     from .dag_schema import (
         DagEdgeOutput,
         DagNodeOutput,
@@ -794,8 +817,12 @@ __all__ = [
     "JobStatus",
     "MetaOutput",
     "DagEdgeOutput",
+    "DagExecutionOutput",
+    "DagLayersOutput",
     "DagNodeOutput",
+    "DagNodeResultOutput",
     "DagOutput",
+    "DagStatusOutput",
     "DagSummaryOutput",
     "PartitionShapeOutput",
     "CompileOutput",
@@ -816,9 +843,14 @@ __all__ = [
     "HealthStatus",
     "DriftSummary",
     "DriftActionOutput",
+    "HealthOutput",
     "HistoryOutput",
     "RunHistoryRecord",
+    "ModelColumnOutput",
+    "ModelDetailOutput",
     "ModelHistoryOutput",
+    "ModelListEntry",
+    "ModelListOutput",
     "ModelExecutionRecord",
     "RecipeHistoryOutput",
     "RecipeExecutionRecord",
@@ -1037,6 +1069,7 @@ __all__ = [
     "ProfileOutput",
     "ProfileColumnStats",
     "TraceOutput",
+    "TypedColumnOutput",
     "TraceModelEntry",
     "ValidateOutput",
     "ValidateAdapterStatus",
