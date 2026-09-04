@@ -103,21 +103,31 @@ jobs:
           # while competing for the repo's 10 GB budget against caches that
           # every PR restores from. Latency does not matter on a schedule.
           save-if: false
+      # The runner filled its root filesystem here, which is what has been
+      # failing this job since 2026-08-24. It surfaced as
+      # `collect2: fatal error: ld terminated with signal 7 [Bus error]`
+      # because a linker writes its output through mmap: a filesystem that
+      # fills mid-write faults instead of returning ENOSPC. The proof is the
+      # runner agent's own crash on the next run —
+      # `System.IO.IOException: No space left on device` while writing
+      # `_diag/Worker_*.log` — which is also why that run uploaded no logs at
+      # all. Removing dotnet, android and ghc was not enough for a
+      # tarpaulin-instrumented debug build of this workspace.
       - name: Free disk space and add swap
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/share/swift \
+                      /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
           sudo fallocate -l 4G /mnt/swapfile && sudo chmod 600 /mnt/swapfile && sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile || true
       - run: sudo apt-get update && sudo apt-get install -y cmake
       - name: Install cargo-tarpaulin
         # Pinned + --locked for the same reason as cargo-audit above.
         run: cargo install cargo-tarpaulin --version 0.31.2 --locked
-      # Kept permanently, not just while #1638 is open. The failure this job
-      # hit for six weeks was `collect2: fatal error: ld terminated with
-      # signal 7 [Bus error]` while linking a test binary, and the log said
-      # nothing about the machine it happened on. A linker writes its output
-      # through mmap, so a filesystem that fills mid-link faults instead of
-      # returning ENOSPC — the one failure mode whose evidence is exactly
-      # these two numbers, and exactly what no log had.
+      # Kept permanently. Six weeks of failures carried a bus error and no
+      # word about the machine it happened on, and the cause turned out to
+      # be the one thing these two numbers would have shown immediately.
+      # Headroom here is the early warning for the next time the build grows.
       - name: Machine state before coverage
         run: |
           df -h / /mnt /tmp || true
@@ -129,15 +139,7 @@ jobs:
         # never returns (it contends on the target/ lock) and the bench blows
         # the --timeout, failing the whole job. tarpaulin's default target set
         # (lib + bins + tests) is what we want coverage for anyway.
-        #
-        # `--jobs 1`: the workflow-level `CARGO_BUILD_JOBS: 4` had four of
-        # these linking at once. Each `rocky-cli` test binary pulls in every
-        # adapter, DuckDB, aws-lc, ring and the OpenTelemetry stack — the
-        # failing link listed several hundred rlibs — and tarpaulin's
-        # instrumentation inflates every object on top of that. Four
-        # concurrent links of that size is the cheapest explanation for the
-        # bus error, and serialising them is the cheapest test of it.
-        run: cargo tarpaulin --timeout 600 --out xml --output-dir coverage/ --jobs 1
+        run: cargo tarpaulin --timeout 600 --out xml --output-dir coverage/
       - name: Machine state after coverage
         # Runs even when the step above fails: on a failure this is the
         # reading that matters.
