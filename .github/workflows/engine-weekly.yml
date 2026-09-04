@@ -127,16 +127,6 @@ jobs:
           df -h / /mnt /tmp || true
           free -m || true
       - name: Run coverage
-        env:
-          # Line tables, not full DWARF. Measured: with default dev debug
-          # info this build filled a 145 GB runner disk — 106 GB available
-          # before the step, 149 MB after, so the instrumented artefacts
-          # alone are ~105 GB. That is why freeing more space did not fix
-          # it; the build outgrew the machine. Coverage needs the line
-          # mapping, which is what this keeps, and not the variable and
-          # type DWARF that dominates the size.
-          CARGO_PROFILE_DEV_DEBUG: line-tables-only
-          CARGO_PROFILE_TEST_DEBUG: line-tables-only
         # No --all-targets: that pulls the criterion benches into the run, and
         # the `binary_startup` bench shells out to `cargo run` on every
         # iteration. Under tarpaulin's ptrace instrumentation that subprocess
@@ -145,8 +135,11 @@ jobs:
         # (lib + bins + tests) is what we want coverage for anyway.
         run: cargo tarpaulin --timeout 600 --out xml --output-dir coverage/
       - name: Machine state after coverage
-        # Runs even when the step above fails: on a failure this is the
-        # reading that matters.
+        # `always()` so a failing coverage step still reports. Note the
+        # limit: when the disk fills hard enough the runner AGENT dies, and
+        # then no step runs and no logs upload at all. A job that ends with
+        # `Run coverage` having no conclusion and an empty log IS that case
+        # — treat it as the disk, not as a mystery.
         if: always()
         run: |
           df -h / /mnt /tmp || true
