@@ -49,7 +49,7 @@ import dagster as dg
 _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     from .types import Diagnostic
 
@@ -94,6 +94,19 @@ _CONTRACT_UNVERIFIED_CODE_TO_CHECK: dict[str, str] = {
 #: result also fails, so this key only tells a "not verified" failure apart
 #: from a real violation; it is never present on a passing result.
 CONTRACT_COMPILE_MISSING_METADATA_KEY: str = "rocky/compile_missing"
+
+#: Metadata key stamped (``True``) on a contract check result that was not
+#: evaluated because the compiler never found the model the contract names
+#: (``W011``). As with the compile-missing key above, the result also fails,
+#: so this key only tells a "not verified" failure apart from a real
+#: violation; it is never present on a passing result.
+CONTRACT_MODEL_NOT_FOUND_METADATA_KEY: str = "rocky/contract_model_not_found"
+
+#: The compiler diagnostic that says a contract names a model the project does
+#: not contain. ``validate_all_contracts`` emits this *instead of* calling
+#: ``validate_contract``, so no ``E010``-``E014`` can follow it and an absence
+#: of violations proves nothing.
+_CONTRACT_MODEL_NOT_FOUND_CODE: str = "W011"
 
 
 @dataclass(frozen=True)
@@ -364,18 +377,13 @@ def contract_check_results_from_diagnostics(
         number of declared rule kinds in ``rules``.
     """
     if diagnostics is None:
-        if rules.has_required:
-            yield _not_verified_result(
-                check_name=CONTRACT_REQUIRED_COLUMNS_CHECK, asset_key=asset_key
-            )
-        if rules.has_protected:
-            yield _not_verified_result(
-                check_name=CONTRACT_PROTECTED_COLUMNS_CHECK, asset_key=asset_key
-            )
-        if rules.has_column_constraints:
-            yield _not_verified_result(
-                check_name=CONTRACT_COLUMN_CONSTRAINTS_CHECK, asset_key=asset_key
-            )
+        yield from _not_verified_results_for_rules(
+            rules=rules,
+            asset_key=asset_key,
+            build=lambda check_name: _not_verified_result(
+                check_name=check_name, asset_key=asset_key
+            ),
+        )
         return
 
     # Group diagnostics by which check they belong to
@@ -392,6 +400,18 @@ def contract_check_results_from_diagnostics(
     for diag in diagnostics:
         if diag.model != model_name:
             continue
+        # Nothing was validated for this model, so the absence of violations
+        # below would be evidence of nothing. Report every declared check as
+        # not verified, the same way a missing compile does (#1644).
+        if diag.code == _CONTRACT_MODEL_NOT_FOUND_CODE:
+            yield from _not_verified_results_for_rules(
+                rules=rules,
+                asset_key=asset_key,
+                build=lambda check_name: _model_not_found_result(
+                    check_name=check_name, asset_key=asset_key, model_name=model_name
+                ),
+            )
+            return
         check_name = _CONTRACT_CODE_TO_CHECK.get(diag.code)
         if check_name is not None:
             by_check[check_name].append(diag)
@@ -421,6 +441,52 @@ def contract_check_results_from_diagnostics(
             diagnostics=by_check[CONTRACT_COLUMN_CONSTRAINTS_CHECK],
             unverified=unverified_by_check[CONTRACT_COLUMN_CONSTRAINTS_CHECK],
         )
+
+
+def _not_verified_results_for_rules(
+    *,
+    rules: ContractRules,
+    asset_key: dg.AssetKey,
+    build: Callable[[str], dg.AssetCheckResult],
+) -> Iterator[dg.AssetCheckResult]:
+    """Yield one ``build(check_name)`` result per rule kind the contract declares.
+
+    Shared by every "nothing was checked" path so they all report exactly the
+    checks that were declared, in the same order as the evaluated path.
+    """
+    if rules.has_required:
+        yield build(CONTRACT_REQUIRED_COLUMNS_CHECK)
+    if rules.has_protected:
+        yield build(CONTRACT_PROTECTED_COLUMNS_CHECK)
+    if rules.has_column_constraints:
+        yield build(CONTRACT_COLUMN_CONSTRAINTS_CHECK)
+
+
+def _model_not_found_result(
+    *, check_name: str, asset_key: dg.AssetKey, model_name: str
+) -> dg.AssetCheckResult:
+    """Build the failing result for a contract whose model the compiler did not find.
+
+    ``validate_all_contracts`` emits ``W011`` *instead of* validating, so the
+    contract may be violated and nothing looked. Fails at ``WARN`` like the
+    integration's other "not checked" placeholders.
+    """
+    status = (
+        f"not verified: the compiler did not find a model named '{model_name}', so its "
+        "contract was never checked — the contract file may name a model that was "
+        "renamed or removed, or the model may be missing from the compiled project"
+    )
+    return dg.AssetCheckResult(
+        asset_key=asset_key,
+        check_name=check_name,
+        passed=False,
+        severity=dg.AssetCheckSeverity.WARN,
+        description="contract not verified: model not found in project",
+        metadata={
+            "status": dg.MetadataValue.text(status),
+            CONTRACT_MODEL_NOT_FOUND_METADATA_KEY: dg.MetadataValue.bool(True),
+        },
+    )
 
 
 def _not_verified_result(*, check_name: str, asset_key: dg.AssetKey) -> dg.AssetCheckResult:
