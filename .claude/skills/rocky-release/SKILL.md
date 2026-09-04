@@ -19,7 +19,7 @@ Four artifacts ship independently from one monorepo, each with its own tag names
 ## When to use this skill
 
 - Cutting any Rocky release (engine, sdk, dagster, vscode)
-- Debugging a release failure — the failing job is always in the relevant `*-release.yml` logs
+- Debugging a release failure — the failing job is always in the relevant `*-release.yml` logs. A failed run leaves the GitHub Release as a draft; re-run the failed job. If a sdk/dagster/vscode job failed *after* its registry upload, the re-run fails on the duplicate upload: attach the artifacts with `gh release upload` and publish with `gh release edit <tag> --draft=false --latest=false` by hand.
 - Deciding whether a release needs the local-build fallback (only when CI runner credits are exhausted or a workflow itself is broken)
 
 ## The flow: release PR → merge → tag → push
@@ -32,7 +32,9 @@ All four artifacts follow the same pattern:
 
 The workflow handles the GitHub Release creation, build, and (for dagster/vscode) the publish to the external registry.
 
-`scripts/release.sh` + the `just release-engine|sdk|dagster|vscode` recipes survive as **local-build fallbacks** when CI is unavailable. The local path also works — it creates the GH Release + uploads artifacts, and `ensure-release` is idempotent.
+`scripts/release.sh` + the `just release-engine|sdk|dagster|vscode` recipes survive as **local-build fallbacks** when CI is unavailable. The local path creates the GH Release as a **draft** with its artifacts attached. The tag push's CI run accepts that draft and publishes it. `ensure-release` refuses a release that is already published, so CI never attaches to, or re-publishes, a live release.
+
+Every release is a draft until its last step. No path publishes a GitHub Release before every artifact it lists exists and the registry upload (PyPI, Marketplace) has succeeded. A failed run leaves a draft, which the public release list omits. Re-run the failed job; the draft is the intended leftover, not a bug.
 
 ## Engine release (default: just tag and push)
 
@@ -45,7 +47,7 @@ git push origin engine-v0.2.0
 
 That's it. The tag push triggers `engine-release.yml`, which:
 
-1. `ensure-release` — creates the `engine-v0.2.0` GitHub Release if missing, as a **draft** (`--generate-notes --draft`).
+1. `ensure-release` — creates the `engine-v0.2.0` GitHub Release if missing, as a **draft** (`--generate-notes --draft`). An existing draft (the local fallback) is used as it is. An existing published release stops the run.
 2. `build` matrix — runs on macos-14, ubuntu-24.04, and windows-2022 across 5 targets. Each target produces **two** archives, one per binary: `rocky-<target>.tar.gz` and `rocky-lsp-<target>.tar.gz` (`.zip` on Windows). **10 archives in total**, not 5.
 3. `checksums` — generates **`checksums.txt`** (not `SHA256SUMS`) from every platform archive and uploads it alongside them.
 4. `publish` — flips the release out of draft, once and only once every artifact is attached.
@@ -73,7 +75,7 @@ just release-engine 0.2.0
 ./scripts/release.sh engine 0.2.0
 ```
 
-This builds macOS locally (`cargo --release`), cross-builds Linux via `cargo-zigbuild` or Docker (`scripts/build_rocky_linux.sh`), creates the GitHub Release with `--generate-notes`, uploads macOS + Linux tarballs, then pushes the tag. The tag push still triggers `engine-release.yml` — if CI is healthy it'll re-build everything and overwrite the local uploads; if CI is broken but the tag-push side-effect you want is just the release itself, the local upload suffices.
+This builds macOS locally (`cargo --release`), cross-builds Linux via `cargo-zigbuild` or Docker (`scripts/build_rocky_linux.sh`), pushes the tag, then creates the GitHub Release as a **draft** (`--generate-notes --draft`) with the macOS + Linux tarballs. The tag push still triggers `engine-release.yml`: if CI is healthy it rebuilds everything, overwrites the local uploads, adds `checksums.txt`, and publishes the draft. If CI is broken, the draft stays a draft. Publish it by hand with `gh release edit engine-v0.2.0 --repo rocky-data/rocky --draft=false --latest`, knowing that `install.sh` will still fail on it: the local path builds neither `checksums.txt` nor the `rocky-lsp` archives.
 
 **Only reach for this when CI is genuinely unavailable.** It's slower, riskier, and produces artifacts signed by your laptop instead of the GitHub runner.
 
@@ -88,8 +90,8 @@ git push origin sdk-v0.2.0
 
 The tag push triggers `sdk-release.yml`, which:
 
-1. `ensure-release` — creates the `sdk-v0.2.0` GitHub Release if missing (`--latest=false`).
-2. `publish-pypi` — `uv build`, publish via `pypa/gh-action-pypi-publish` using **OIDC** (trusted publisher; no token in repo secrets), then attach the wheel + sdist to the GH Release.
+1. `ensure-release` — creates the `sdk-v0.2.0` GitHub Release if missing, as a **draft** (`--draft --latest=false`). An existing draft (the local fallback) is used as it is. An existing published release stops the run.
+2. `publish-pypi` — `uv build`, publish via `pypa/gh-action-pypi-publish` using **OIDC** (trusted publisher; no token in repo secrets), attach `dist/*` to the GH Release (wheel, sdist, and the two `.publish.attestation` files the publish step writes), then publish the release (`gh release edit --draft=false --latest=false`) as the last step.
 
 **Ordering rule:** release `rocky-sdk` *before* any `dagster-rocky` release that raises its `rocky-sdk>=…` floor — the published dagster wheel resolves the SDK from PyPI, not the monorepo path source.
 
@@ -111,9 +113,8 @@ git push origin dagster-v0.4.0
 
 The tag push triggers `dagster-release.yml`, which:
 
-1. `ensure-release` — creates the `dagster-v0.4.0` GitHub Release if missing.
-2. `build` — `uv build` produces the wheel + sdist, uploads them to the GH Release.
-3. `publish` — `pypa/gh-action-pypi-publish` pushes to PyPI via **OIDC** (trusted publisher; no token in repo secrets).
+1. `ensure-release` — creates the `dagster-v0.4.0` GitHub Release if missing, as a **draft** (`--draft --latest=false`). An existing draft (the local fallback) is used as it is. An existing published release stops the run.
+2. `publish-pypi` — `uv build`, publish via `pypa/gh-action-pypi-publish` using **OIDC** (trusted publisher; no token in repo secrets), attach `dist/*` to the GH Release (wheel, sdist, and the two `.publish.attestation` files), then publish the release (`gh release edit --draft=false --latest=false`) as the last step.
 
 ### Dagster fallback: local build
 
@@ -122,7 +123,7 @@ just release-dagster 0.4.0                # GH release only
 just release-dagster 0.4.0 --publish      # + PyPI via UV_PUBLISH_TOKEN or ~/.pypirc
 ```
 
-The local path is idempotent with CI — `ensure-release` detects an existing release. Only reach for this when the CI workflow itself is broken.
+Without `--publish`, the local path creates a draft and the tag push's CI run publishes it after the PyPI upload. With `--publish`, PyPI already has the wheel, so the script publishes the release itself; the tag push's CI run then stops at `ensure-release` (already published). That red run is expected. Only reach for this when the CI workflow itself is broken.
 
 ## VS Code release (default: just tag and push)
 
@@ -135,9 +136,8 @@ git push origin vscode-v0.3.0
 
 The tag push triggers `vscode-release.yml`, which:
 
-1. `ensure-release` — creates the `vscode-v0.3.0` GitHub Release if missing.
-2. `package` — `npx vsce package` produces the VSIX, uploads it to the GH Release.
-3. `publish` — `vsce publish` pushes to the VS Code Marketplace using the `VSCE_PAT` repo secret.
+1. `ensure-release` — creates the `vscode-v0.3.0` GitHub Release if missing, as a **draft** (`--draft --latest=false`). An existing draft (the local fallback) is used as it is. An existing published release stops the run.
+2. `build` — `npx vsce package` produces the VSIX and attaches it with `gh release upload`; `vsce publish` pushes to the VS Code Marketplace using the `VSCE_PAT` repo secret; then the release is published (`gh release edit --draft=false --latest=false`) as the last step. In `rocky-data/rocky` an unset `VSCE_PAT` fails the run and the release stays a draft. A fork without the secret skips the Marketplace step.
 
 ### VS Code fallback: local build
 
@@ -197,7 +197,7 @@ chore(vscode): release 0.3.0
 
 For engine releases, the PR touches ~25 `Cargo.toml` files — one per crate (including `rocky-bigquery`), plus `engine/rocky/Cargo.toml` and `engine/rocky-lsp/Cargo.toml`. All crates version in lockstep.
 
-Neither CI (`engine-release.yml`) nor `scripts/release.sh` bump versions for you — that's a manual step before the tag. `scripts/release.sh` WILL refuse to proceed if the tag already exists (`confirm_tag()` in `release.sh`); `engine-release.yml` won't, but the `ensure-release` job will silently attach to the existing release.
+Neither CI (`engine-release.yml`) nor `scripts/release.sh` bump versions for you — that's a manual step before the tag. `scripts/release.sh` WILL refuse to proceed if the tag already exists (`confirm_tag()` in `release.sh`); `engine-release.yml` won't, but its `ensure-release` job attaches only to an existing **draft** and refuses a release that is already published.
 
 ## Common pitfalls
 
@@ -222,7 +222,7 @@ Path-filtered workflows in `.github/workflows/`:
 
 ## Post-release checklist
 
-- [ ] `gh release view <tag>` shows all expected artifacts (**11 for engine**: 10 archives + `checksums.txt`; **4 for sdk and 4 for dagster**: wheel, sdist and one `.publish.attestation` for each, uploaded by the PyPI trusted-publisher step; 1 for vscode)
+- [ ] `gh release view <tag>` shows all expected artifacts (**11 for engine**: 10 archives + `checksums.txt`; **4 for sdk and 4 for dagster**: wheel, sdist and one `.publish.attestation` for each, uploaded by the PyPI trusted-publisher step; 1 for vscode) and `gh release view <tag> --json isDraft` is `false`
 - [ ] Install script (`engine/install.sh` or `install.ps1`) resolves and installs the new version on a clean machine
 - [ ] Changelog is on `main` (it merged with the release PR, but double-check)
 - [ ] Announcement, if public-facing (blog, release notes)

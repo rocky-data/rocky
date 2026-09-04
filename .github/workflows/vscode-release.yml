@@ -1,10 +1,13 @@
 name: vscode-release
 
 # Builds, packages, and publishes the Rocky VS Code extension when a vscode-v*
-# tag is pushed. Creates the GitHub Release (if it doesn't already exist),
-# attaches the .vsix artifact, and publishes to the VS Code Marketplace when
-# the VSCE_PAT secret is configured. scripts/release.sh remains as a local
-# fallback.
+# tag is pushed. Creates the GitHub Release as a draft (if it doesn't already
+# exist), attaches the .vsix artifact, publishes to the VS Code Marketplace,
+# and only then publishes the GitHub Release. A failed package or Marketplace
+# publish therefore leaves a draft, which the public release list omits, not
+# an empty or partial public release. In rocky-data/rocky a missing VSCE_PAT
+# fails the run; a fork without the secret gets a soft no-op instead.
+# scripts/release.sh remains as a local fallback.
 
 on:
   push:
@@ -37,13 +40,21 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${GITHUB_REF_NAME}"
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $TAG already exists (created by scripts/release.sh)"
+          # `gh release view` finds a draft by its pending tag too, so a draft
+          # made by scripts/release.sh is seen here. Any other failure falls
+          # through to `create`, which fails on its own if the release exists.
+          if is_draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [ "$is_draft" != "true" ]; then
+              echo "::error::Release $TAG already exists and is published. Refusing to publish again on top of a live release. If scripts/release.sh --publish made it, this run has nothing left to do. Otherwise convert it back to a draft (gh release edit $TAG --repo $GITHUB_REPOSITORY --draft) or delete it, then re-run."
+              exit 1
+            fi
+            echo "Release $TAG already exists as a draft (scripts/release.sh path); this run will publish it"
           else
-            echo "Creating release $TAG"
+            echo "Creating draft release $TAG"
             gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --generate-notes \
+              --draft \
               --latest=false \
               --title "$TAG"
           fi
@@ -69,21 +80,61 @@ jobs:
       - name: Package VSIX
         run: npx @vscode/vsce package
 
+      # Upload with `gh` rather than a release action: the pinned
+      # softprops/action-gh-release finalizes an existing draft after it
+      # uploads (it clears `draft` unless `draft: true` is passed), which would
+      # make the release public before the Marketplace publish below has run.
+      # `gh release upload` touches assets only. Same mechanism the engine, sdk
+      # and dagster workflows use. Paths are relative to the workflow-level
+      # `working-directory: editors/vscode`, where `vsce package` wrote the file.
       - name: Attach VSIX to GitHub Release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
-        with:
-          files: editors/vscode/*.vsix
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Guard the glob so a package step that produced nothing doesn't
+          # send the literal string `./*.vsix` to the upload command.
+          shopt -s nullglob
+          artifacts=( ./*.vsix )
+          shopt -u nullglob
+          if (( ${#artifacts[@]} == 0 )); then
+            echo "ERROR: no .vsix found after vsce package" >&2
+            ls -la
+            exit 1
+          fi
+          gh release upload "${GITHUB_REF_NAME}" "${artifacts[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
 
       - name: Publish to VS Code Marketplace
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
         # `if: env.VSCE_PAT != ''` doesn't work — the `env` context isn't
-        # available in step-level `if:` evaluation. Guard inline instead so
-        # forks without the secret produce a soft no-op rather than a hard
-        # failure (matches the pattern documented in engine-wasm-release.yml).
+        # available in step-level `if:` evaluation. Guard inline instead. A
+        # fork without the secret gets a soft no-op (matches the pattern in
+        # engine-wasm-release.yml). In rocky-data/rocky an unset VSCE_PAT is a
+        # missing or rotated secret, and a green run that never reached the
+        # Marketplace would hide exactly that, so it fails instead.
         run: |
           if [ -z "$VSCE_PAT" ]; then
+            if [ "$GITHUB_REPOSITORY" = "rocky-data/rocky" ]; then
+              echo "::error::VSCE_PAT is not set in rocky-data/rocky, so the Marketplace publish cannot run. Restore the secret and re-run this job; the GitHub Release stays a draft until then."
+              exit 1
+            fi
             echo "VSCE_PAT not set — skipping marketplace publish (this is expected on forks)"
             exit 0
           fi
           npx @vscode/vsce publish --pat "$VSCE_PAT"
+
+      # Last on purpose: a failure in any step above leaves the release a
+      # draft. `--latest=false` again here, because GitHub's API defaults
+      # `make_latest` to true when a draft is published, and the engine
+      # release owns the repo's "Latest" badge.
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "${GITHUB_REF_NAME}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --latest=false
+          echo "Published ${GITHUB_REF_NAME}"
