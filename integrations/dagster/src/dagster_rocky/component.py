@@ -313,16 +313,23 @@ class _GroupBuild:
 
 @dataclass
 class _CompileState:
-    """Compile diagnostics + error flag pulled from cached state."""
+    """Compile diagnostics + error flag pulled from cached state.
+
+    ``compiled`` is ``False`` when the state has no ``compile`` slot — the
+    compile failed, or never ran, when the state was written. Then
+    ``diagnostics`` is empty for lack of a compile, not for lack of
+    findings, and a consumer must not read it as "clean" (#1619).
+    """
 
     has_errors: bool = False
     diagnostics: list[Diagnostic] = field(default_factory=list)
+    compiled: bool = False
 
     @classmethod
     def from_result(cls, result: CompileResult | None) -> _CompileState:
         if result is None:
             return cls()
-        return cls(has_errors=result.has_errors, diagnostics=result.diagnostics)
+        return cls(has_errors=result.has_errors, diagnostics=result.diagnostics, compiled=True)
 
 
 # ---------------------------------------------------------------------------
@@ -470,8 +477,11 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
     #: Limitation: until ``rocky run --model <name>`` lands on the engine
     #: side, derived-model multi-assets use ``can_subset=False`` (selecting
     #: any subset materializes the whole group). Per-model freshness,
-    #: optimize metadata, contract checks, and partition definitions all
-    #: still apply per-asset.
+    #: optimize metadata, and partition definitions all still apply
+    #: per-asset. Contract checks do not: they are declared only on source
+    #: assets whose table name matches a ``.contract.toml`` file
+    #: (``build_model_specs`` accepts ``contract_rules_by_model`` and
+    #: ignores it).
     surface_derived_models: bool = False
     #: When ``True``, use the DAG-driven asset builder that creates a
     #: single connected asset graph from ``rocky dag``. Every pipeline
@@ -2667,6 +2677,41 @@ def _make_rocky_asset(
                     # pass through unchanged.
                     governance_events.append(event)
 
+        # Contract check results — sourced from compile diagnostics, not
+        # from the run, so they are known before the run and emitted in
+        # both modes (Pipes doesn't carry a build-time signal). Each
+        # declared contract spec gets exactly one result; specs without
+        # a matching contract are skipped.
+        #
+        # Built BEFORE the run so their ``(asset_key, check_name)`` pairs can
+        # prime ``_emit_results``'s dedup set, the same way the compliance
+        # results do above. The streaming placeholder pass walks every
+        # declared spec — contract specs included — and would otherwise emit
+        # a passing "not produced by rocky" placeholder for each contract
+        # check, after which Dagster rejects the real result as an output
+        # returned twice (#1619). Yielded in each branch BEFORE the
+        # quota-breach raise below, so the record survives the retriable
+        # failure the same way the materializations do.
+        contract_results: list[dg.AssetCheckResult] = []
+        if contract_rules_by_model:
+            if not compile_state.compiled:
+                context.log.warning(
+                    "No rocky compile output in the cached state (rocky compile "
+                    "failed, or did not run, when the state was written) — "
+                    "contract checks will report as not verified"
+                )
+            contract_results = list(
+                _emit_contract_check_results(
+                    group=group,
+                    selected_keys=selected_keys,
+                    compile_state=compile_state,
+                    contract_rules_by_model=contract_rules_by_model,
+                )
+            )
+        contract_yielded: set[tuple[dg.AssetKey, str]] = {
+            (r.asset_key, r.check_name) for r in contract_results
+        }
+
         if execution_mode == "pipes":
             yield from _run_filters_pipes(
                 context=context,
@@ -2679,6 +2724,7 @@ def _make_rocky_asset(
             # doesn't run — but we still need to yield the collected
             # governance events so the surfaces are wired in both modes.
             yield from governance_events
+            yield from contract_results
         else:
             results, quota_breach_cooldown = _run_filters(context, rocky, filters)
 
@@ -2699,11 +2745,12 @@ def _make_rocky_asset(
                 check_specs=check_specs,
                 selected_keys=selected_keys,
                 rocky_key_to_dagster_key=group.rocky_key_to_dagster_key,
-                extra_yielded_checks=compliance_yielded,
+                extra_yielded_checks=compliance_yielded | contract_yielded,
                 collapsed_key_by_table=group.collapsed_key_by_table or None,
                 satisfy_empty_outputs=satisfy_empty_outputs,
                 instance=context.instance,
             )
+            yield from contract_results
 
             # If a filter surfaced the Fivetran-storm signal, raise the
             # retriable failure AFTER yielding materializations from
@@ -2712,20 +2759,6 @@ def _make_rocky_asset(
             # what was lost.
             if quota_breach_cooldown is not None:
                 raise _quota_breach_failure(quota_breach_cooldown)
-
-        # Contract check results — sourced from compile diagnostics, not
-        # from the run. Each declared contract spec gets exactly one
-        # result (pass/fail) per materialization. Specs without
-        # corresponding rule entries are skipped. Emitted in both modes
-        # because compile diagnostics are a build-time signal Pipes
-        # doesn't carry.
-        if contract_rules_by_model:
-            yield from _emit_contract_check_results(
-                group=group,
-                selected_keys=selected_keys,
-                compile_state=compile_state,
-                contract_rules_by_model=contract_rules_by_model,
-            )
 
     return _asset
 
@@ -2858,7 +2891,12 @@ def _emit_contract_check_results(
     ``AssetCheckResult`` per declared rule kind by translating compile
     diagnostics. Skips specs that aren't in ``selected_keys`` so
     partial-subset runs don't emit results for unselected assets.
+
+    When ``compile_state.compiled`` is ``False`` there is no compile output
+    to translate, so ``None`` is passed through and every declared check
+    fails as "not verified" rather than passing on an empty list (#1619).
     """
+    diagnostics = compile_state.diagnostics if compile_state.compiled else None
     for spec in group.specs:
         if spec.key not in selected_keys:
             continue
@@ -2867,7 +2905,7 @@ def _emit_contract_check_results(
         if rules is None:
             continue
         yield from contract_check_results_from_diagnostics(
-            compile_state.diagnostics,
+            diagnostics,
             asset_key=spec.key,
             model_name=table_name,
             rules=rules,
