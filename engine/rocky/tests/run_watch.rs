@@ -929,6 +929,11 @@ fn run_watch_transformation_emits_one_compact_json_line_per_iteration() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rocky"))
         .arg("-c")
         .arg(&cfg_path)
+        // `--output json` explicitly, though a piped stdout already resolves
+        // to JSON: this test is ABOUT the JSON contract, so it should not
+        // depend on TTY detection to select the thing under test.
+        .arg("--output")
+        .arg("json")
         .arg("run")
         .arg("--watch")
         .current_dir(dir)
