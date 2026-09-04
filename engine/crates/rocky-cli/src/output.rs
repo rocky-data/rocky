@@ -1809,6 +1809,17 @@ pub struct TestOutput {
     /// tests ran. Filtered to `--model` when that flag is set.
     #[serde(default)]
     pub model_results: Vec<ModelTestResult>,
+    /// Compiler diagnostics from the compile `rocky test` ran.
+    ///
+    /// Errors already fail the command, so what shows up here is everything
+    /// that does not: `W001`, `W004`, `W005`, `P002`, `I001`, `I002`,
+    /// `I003`. The runner has always carried them and the output dropped
+    /// them (#1617). `rocky test` is the command most likely to run in CI,
+    /// and it compiles with empty source schemas, so it is where an
+    /// unchecked-contract report is most likely to exist. Empty when the
+    /// compile reported nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<Diagnostic>,
     /// Results from declarative `[[tests]]` in model sidecars.
     /// Present only when `--declarative` is used.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1899,9 +1910,19 @@ impl TestOutput {
             failed: failures.len(),
             failures,
             model_results: Vec::new(),
+            diagnostics: Vec::new(),
             declarative: None,
             unit_tests: None,
         }
+    }
+
+    /// Attach the compile's diagnostics. Returns `self` for chaining.
+    ///
+    /// Errors have already failed the command by the time this is called, so
+    /// this carries the warnings, lints and info codes that used to vanish.
+    pub fn with_diagnostics(mut self, diagnostics: Vec<Diagnostic>) -> Self {
+        self.diagnostics = diagnostics;
+        self
     }
 
     /// Attach per-model results from the engine test runner. Returns `self`

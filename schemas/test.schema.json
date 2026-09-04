@@ -98,6 +98,56 @@
       ],
       "type": "object"
     },
+    "Diagnostic": {
+      "description": "A compiler diagnostic (error, warning, or informational message).\n\n`code` and `message` use `Arc<str>` (§P3.5) — cloning a `Diagnostic` in the LSP publish loop becomes a refcount bump. Construction still accepts any `Into<String>` / `&str` via the helper constructors below; the arc wrap happens once at construction time.",
+      "properties": {
+        "code": {
+          "description": "Diagnostic code (e.g., \"E001\", \"W001\").",
+          "type": "string"
+        },
+        "message": {
+          "description": "Human-readable message.",
+          "type": "string"
+        },
+        "model": {
+          "description": "Which model this diagnostic relates to.",
+          "type": "string"
+        },
+        "severity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Severity"
+            }
+          ],
+          "description": "Severity level."
+        },
+        "span": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SourceSpan"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Source location (if available)."
+        },
+        "suggestion": {
+          "description": "Suggested fix (if any).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "model",
+        "severity"
+      ],
+      "type": "object"
+    },
     "MismatchKind": {
       "description": "Type of row mismatch.",
       "oneOf": [
@@ -172,6 +222,39 @@
         "expected",
         "kind",
         "row_index"
+      ],
+      "type": "object"
+    },
+    "Severity": {
+      "description": "Severity level of a diagnostic.\n\nSerialized in PascalCase (`\"Error\"`, `\"Warning\"`, `\"Info\"`) to stay compatible with existing dagster fixtures and the hand-written `Severity` StrEnum in `integrations/dagster/src/dagster_rocky/types.py`.",
+      "enum": [
+        "Error",
+        "Warning",
+        "Info"
+      ],
+      "type": "string"
+    },
+    "SourceSpan": {
+      "description": "Location in a source file.",
+      "properties": {
+        "col": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "col",
+        "file",
+        "line"
       ],
       "type": "object"
     },
@@ -279,6 +362,13 @@
         }
       ],
       "description": "Results from declarative `[[tests]]` in model sidecars. Present only when `--declarative` is used."
+    },
+    "diagnostics": {
+      "description": "Compiler diagnostics from the compile `rocky test` ran.\n\nErrors already fail the command, so what shows up here is everything that does not: `W001`, `W004`, `W005`, `P002`, `I001`, `I002`, `I003`. The runner has always carried them and the output dropped them (#1617). `rocky test` is the command most likely to run in CI, and it compiles with empty source schemas, so it is where an unchecked-contract report is most likely to exist. Empty when the compile reported nothing.",
+      "items": {
+        "$ref": "#/definitions/Diagnostic"
+      },
+      "type": "array"
     },
     "failed": {
       "format": "uint",
