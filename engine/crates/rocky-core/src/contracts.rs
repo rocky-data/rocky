@@ -333,8 +333,12 @@ fn decimal_family_type(upper: &str) -> RockyType {
                 scale: 0,
             };
         }
+        // `DECIMAL (10,2)` is valid SQL, and a `.contract.toml` is written by
+        // hand, so the space between the name and the parameters is trimmed
+        // rather than making the type unreadable.
         let Some(params) = upper
             .strip_prefix(name)
+            .map(str::trim_start)
             .and_then(|rest| rest.strip_prefix('('))
             .and_then(|rest| rest.strip_suffix(')'))
         else {
@@ -863,13 +867,16 @@ mod tests {
         for bare in ["NUMBER", "DECIMAL", "NUMERIC", "BIGNUMERIC", "number"] {
             assert_eq!(warehouse_type_to_rocky(bare), d38, "{bare}");
         }
-        assert_eq!(
-            warehouse_type_to_rocky("NUMERIC(10, 2)"),
-            RockyType::Decimal {
-                precision: 10,
-                scale: 2
-            }
-        );
+        for spelled in ["NUMERIC(10, 2)", "NUMERIC (10,2)", "  numeric(10,2)  "] {
+            assert_eq!(
+                warehouse_type_to_rocky(spelled),
+                RockyType::Decimal {
+                    precision: 10,
+                    scale: 2
+                },
+                "{spelled}"
+            );
+        }
         // `NAME(p)` is scale 0, the reading the compile-time gate gives
         // `Decimal(p)`. The two gates must not disagree about one spelling.
         assert_eq!(
