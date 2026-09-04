@@ -6268,8 +6268,18 @@ async fn run_null_rate_checks(
                 .rows
                 .iter()
                 .find(|row| row.first().and_then(|v| v.as_str()) == Some(col.as_str()));
+            // `sampled` decides whether there was anything to measure, so it
+            // is read first. `SUM(...)` over an empty sample is NULL, not 0,
+            // and the default `sample_percent` is 10, so a small table
+            // sampled at 10% lands here routinely. That is an empty sample,
+            // not a check the engine failed to run, and it must not be
+            // reported as one.
             let counts = row.and_then(|row| {
-                Some((checks::cell_as_u64(row.get(1))?, checks::cell_as_u64(row.get(2))?))
+                let sampled = checks::cell_as_u64(row.get(2))?;
+                if sampled == 0 {
+                    return Some((0, 0));
+                }
+                Some((checks::cell_as_u64(row.get(1))?, sampled))
             });
             let mut check = match counts {
                 // An empty (0-row) sample is a real 0 and passes.
@@ -28516,6 +28526,37 @@ table = "fct_events"
             ts.not_evaluated.as_deref(),
             Some("the null-rate query returned no readable row for this column"),
             "{ts:?}"
+        );
+    }
+
+    /// An empty sample is not an unevaluatable check. `SUM(...)` over zero
+    /// sampled rows is NULL, and the default `sample_percent` is 10, so a
+    /// small table hits this on an ordinary run. It must stay a measured
+    /// zero, or #1602's honesty fix would report a failing check for every
+    /// small table.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn an_empty_null_rate_sample_is_measured_not_reported() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.null_rate]\ncolumns = [\"id\"]\nthreshold = 0.5",
+        );
+
+        let empty_sample = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT 'id' AS col",
+            reply: Intercept::Rows(vec![vec![
+                serde_json::json!("id"),
+                // What the warehouse really returns for SUM() over no rows.
+                serde_json::json!(null),
+                serde_json::json!("0"),
+            ]]),
+        };
+        let (pending, _) = fx.run(&empty_sample, None, None).await;
+        let id = the_result(&pending, &fx.target_key(), "null_rate:id");
+        assert!(
+            id.passed && id.not_evaluated.is_none(),
+            "an empty sample is a measured zero: {id:?}"
         );
     }
 
