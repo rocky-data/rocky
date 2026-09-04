@@ -4844,589 +4844,23 @@ pub async fn run(
     let _checks_span = info_span!("batched_checks");
     let checks_start = Instant::now();
 
-    let row_count_enabled = pipeline.checks.row_count.enabled() && !source_batch_refs.is_empty();
-    let freshness_enabled = pipeline.checks.freshness.is_some() && !freshness_batch_refs.is_empty();
-
-    // §P2.6 emit: before_checks. Table count is the number of tables
-    // participating in row-count / freshness batched checks (distinct
-    // from the per-table count from materialization — a table might
-    // skip one or both check types).
-    let _ = hook_registry
-        .fire(&HookContext::before_checks(
-            &run_id,
-            pipeline_name,
-            source_batch_refs.len().max(freshness_batch_refs.len()),
-        ))
-        .await;
-
-    if row_count_enabled || freshness_enabled {
-        info!(
-            row_count_tables = source_batch_refs.len(),
-            freshness_tables = freshness_batch_refs.len(),
-            "running batched checks concurrently"
-        );
-    }
-
-    // Batch checks dispatch through the BatchCheckAdapter trait when the
-    // warehouse provides one (UNION ALL batching). Otherwise, fall back to
-    // per-table queries via the generic WarehouseAdapter — same observable
-    // check results, just more round-trips.
-    let (source_counts, target_counts, freshness_results): (
-        Vec<BatchRowCountResult>,
-        Vec<BatchRowCountResult>,
-        Vec<BatchFreshnessResult>,
-    ) = if let Some(ref bc) = shared_batch_check {
-        let (src, tgt, fresh) = tokio::try_join!(
-            async {
-                if row_count_enabled {
-                    bc.batch_row_counts(&source_batch_refs).await
-                } else {
-                    Ok(vec![])
-                }
-            },
-            async {
-                if row_count_enabled {
-                    bc.batch_row_counts(&target_batch_refs).await
-                } else {
-                    Ok(vec![])
-                }
-            },
-            async {
-                if freshness_enabled {
-                    bc.batch_freshness(&freshness_batch_refs, &pipeline.timestamp_column)
-                        .await
-                } else {
-                    Ok(vec![])
-                }
-            },
-        )
-        .map_err(anyhow::Error::from)?;
-        (src, tgt, fresh)
-    } else {
-        // Per-table fallback via WarehouseAdapter for adapters with no
-        // BatchCheckAdapter implementation.
-        let dialect = shared_warehouse.dialect();
-        let mut src_counts = Vec::new();
-        let mut tgt_counts = Vec::new();
-        let mut fresh_results: Vec<BatchFreshnessResult> = Vec::new();
-
-        if row_count_enabled {
-            for br in &source_batch_refs {
-                let table_ref = dialect
-                    .format_table_ref(&br.catalog, &br.schema, &br.table)
-                    .map_err(anyhow::Error::from)?;
-                let sql = format!("SELECT COUNT(*) FROM {table_ref}");
-                match shared_warehouse.execute_query(&sql).await {
-                    Ok(result) => {
-                        let count = result
-                            .rows
-                            .first()
-                            .and_then(|r| r.first())
-                            .and_then(|v| {
-                                v.as_u64()
-                                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                            })
-                            .unwrap_or(0);
-                        src_counts.push(BatchRowCountResult {
-                            table: br.clone(),
-                            count,
-                        });
-                    }
-                    Err(e) => {
-                        warn!(table = br.table.as_str(), error = %e, "per-table row count failed");
-                    }
-                }
-            }
-            for br in &target_batch_refs {
-                let table_ref = dialect
-                    .format_table_ref(&br.catalog, &br.schema, &br.table)
-                    .map_err(anyhow::Error::from)?;
-                let sql = format!("SELECT COUNT(*) FROM {table_ref}");
-                match shared_warehouse.execute_query(&sql).await {
-                    Ok(result) => {
-                        let count = result
-                            .rows
-                            .first()
-                            .and_then(|r| r.first())
-                            .and_then(|v| {
-                                v.as_u64()
-                                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                            })
-                            .unwrap_or(0);
-                        tgt_counts.push(BatchRowCountResult {
-                            table: br.clone(),
-                            count,
-                        });
-                    }
-                    Err(e) => {
-                        warn!(table = br.table.as_str(), error = %e, "per-table row count failed");
-                    }
-                }
-            }
-        }
-
-        if freshness_enabled {
-            for br in &freshness_batch_refs {
-                let table_ref = dialect
-                    .format_table_ref(&br.catalog, &br.schema, &br.table)
-                    .map_err(anyhow::Error::from)?;
-                let sql = format!("SELECT MAX({}) FROM {table_ref}", pipeline.timestamp_column);
-                match shared_warehouse.execute_query(&sql).await {
-                    Ok(result) => {
-                        let max_ts = result
-                            .rows
-                            .first()
-                            .and_then(|r| r.first())
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| {
-                                s.parse::<chrono::DateTime<Utc>>().ok().or_else(|| {
-                                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
-                                        .or_else(|_| {
-                                            chrono::NaiveDateTime::parse_from_str(
-                                                s,
-                                                "%Y-%m-%d %H:%M:%S",
-                                            )
-                                        })
-                                        .ok()
-                                        .map(|naive| naive.and_utc())
-                                })
-                            });
-                        fresh_results.push(BatchFreshnessResult {
-                            table: br.clone(),
-                            max_timestamp: max_ts,
-                        });
-                    }
-                    Err(e) => {
-                        warn!(table = br.table.as_str(), error = %e, "per-table freshness check failed");
-                    }
-                }
-            }
-        }
-
-        (src_counts, tgt_counts, fresh_results)
-    };
-
-    // Process row count results
-    if row_count_enabled {
-        let source_map: HashMap<String, u64> = source_counts
-            .iter()
-            .map(|r| (r.table.full_name(), r.count))
-            .collect();
-        let target_map: HashMap<String, u64> = target_counts
-            .iter()
-            .map(|r| (r.table.full_name(), r.count))
-            .collect();
-
-        for (target_key, asset_key) in &batch_asset_keys {
-            let src_ref = &source_batch_refs
-                .iter()
-                .zip(target_batch_refs.iter())
-                .find(|(_, t)| t.full_name() == *target_key)
-                .map(|(s, _)| s.full_name());
-
-            if let Some(src_key) = src_ref {
-                let src_count = source_map.get(src_key).copied().unwrap_or(0);
-                let tgt_count = target_map.get(target_key).copied().unwrap_or(0);
-                let check = checks::check_row_count(src_count, tgt_count);
-                let entry =
-                    pending_checks
-                        .entry(target_key.clone())
-                        .or_insert_with(|| PendingCheck {
-                            asset_key: asset_key.clone(),
-                            checks: Vec::new(),
-                        });
-                entry.checks.push(check);
-            }
-        }
-    }
-
-    // Anomaly detection
-    if row_count_enabled
-        && let Some(ref store) = state_store {
-            for (target_key, _) in &batch_asset_keys {
-                let tgt_count = target_counts
-                    .iter()
-                    .find(|r| r.table.full_name() == *target_key)
-                    .map(|r| r.count)
-                    .unwrap_or(0);
-
-                let _ = store.record_row_count(target_key, tgt_count, 10);
-
-                if let Ok(history) = store.get_check_history(target_key) {
-                    let anomaly = rocky_core::state::detect_anomaly(
-                        target_key,
-                        tgt_count,
-                        &history,
-                        pipeline.checks.anomaly_threshold_pct,
-                    );
-                    if anomaly.is_anomaly {
-                        warn!(
-                            table = target_key.as_str(),
-                            reason = anomaly.reason.as_str(),
-                            "row count anomaly detected"
-                        );
-                        rocky_observe::metrics::METRICS.inc_anomalies_detected();
-                        // §P2.6 emit: anomaly_detected. Fires before
-                        // pushing to output.anomalies so we can pass
-                        // references without cloning.
-                        let _ = hook_registry
-                            .fire(&HookContext::anomaly_detected(
-                                &run_id,
-                                pipeline_name,
-                                &anomaly.table,
-                                &anomaly.reason,
-                            ))
-                            .await;
-                        output.anomalies.push(AnomalyOutput {
-                            table: anomaly.table,
-                            current_count: anomaly.current_count,
-                            baseline_avg: anomaly.baseline_avg,
-                            deviation_pct: anomaly.deviation_pct,
-                            reason: anomaly.reason,
-                        });
-                    }
-                }
-            }
-        }
-
-    // Process freshness results
-    if let Some(ref freshness_cfg) = pipeline.checks.freshness {
-        let now = Utc::now();
-        for fr in &freshness_results {
-            let key = fr.table.full_name();
-            if let Some(ts) = fr.max_timestamp {
-                let lag = (now - ts).num_seconds().unsigned_abs();
-                let mut check = checks::check_freshness(lag, freshness_cfg.threshold_seconds);
-                check.severity = freshness_cfg.severity;
-
-                if let Some((_, asset_key)) = batch_asset_keys.iter().find(|(k, _)| *k == key) {
-                    let entry = pending_checks.entry(key).or_insert_with(|| PendingCheck {
-                        asset_key: asset_key.clone(),
-                        checks: Vec::new(),
-                    });
-                    entry.checks.push(check);
-                }
-            }
-        }
-    }
-
-    // Row-level assertions (uniqueness, etc.) on each replication target.
-    // The replication runner runs the SAME `[checks].assertions` the quality
-    // runner does, so uniqueness fires at replication time. Driven by
-    // `assertion_targets` (populated per materialized table, independent of
-    // row_count/freshness) so it runs even when those checks are disabled.
-    // Results are surfaced advisorily — like every other check in this runner,
-    // the run does not bail; the orchestrator decides from the JSON
-    // CheckResult + severity. (The data has already landed by check time, so
-    // bailing would only change the exit code, not prevent the write.)
-    if !pipeline.checks.assertions.is_empty() {
-        let dialect = shared_warehouse.dialect();
-        for (tref, asset_key) in &assertion_targets {
-            let full = match dialect.format_table_ref(&tref.catalog, &tref.schema, &tref.table) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        table = %tref.full_name(),
-                        error = %e,
-                        "assertion table ref formatting failed — skipping"
-                    );
-                    continue;
-                }
-            };
-            let results = super::run_local::run_table_assertions(
-                shared_warehouse.as_ref(),
-                dialect,
-                &full,
-                &tref.table,
-                &pipeline.checks.assertions,
-            )
-            .await;
-            if !results.is_empty() {
-                let entry =
-                    pending_checks
-                        .entry(tref.full_name())
-                        .or_insert_with(|| PendingCheck {
-                            asset_key: asset_key.clone(),
-                            checks: Vec::new(),
-                        });
-                entry.checks.extend(results);
-            }
-        }
-    }
-
-    // Custom SQL checks on each replication target. Ported from the quality
-    // runner so `[[checks.custom]]` fires at replication time too. Driven by
-    // `assertion_targets` (every materialized table); surfaced advisorily like
-    // the other replication checks — the run reports pass/fail in the JSON
-    // CheckResult + severity rather than bailing (the data has already landed).
-    if !pipeline.checks.custom.is_empty() {
-        let dialect = shared_warehouse.dialect();
-        for (tref, asset_key) in &assertion_targets {
-            let full = match dialect.format_table_ref(&tref.catalog, &tref.schema, &tref.table) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        table = %tref.full_name(),
-                        error = %e,
-                        "custom check table ref formatting failed — skipping"
-                    );
-                    continue;
-                }
-            };
-            let results = super::run_local::run_custom_checks(
-                shared_warehouse.as_ref(),
-                &full,
-                &pipeline.checks.custom,
-            )
-            .await;
-            if !results.is_empty() {
-                pending_checks
-                    .entry(tref.full_name())
-                    .or_insert_with(|| PendingCheck {
-                        asset_key: asset_key.clone(),
-                        checks: Vec::new(),
-                    })
-                    .checks
-                    .extend(results);
-            }
-        }
-    }
-
-    // Null-rate checks: sample each configured column and flag when the null
-    // fraction exceeds the threshold. `generate_null_rate_sql` returns one row
-    // per column `(col, nulls, sampled)`; the rate is computed per row. Like the
-    // other replication checks this is advisory — the configured severity rides
-    // into the JSON CheckResult and the orchestrator decides.
-    if let Some(ref null_rate_cfg) = pipeline.checks.null_rate {
-        let dialect = shared_warehouse.dialect();
-        for (tref, asset_key) in &assertion_targets {
-            let sql = match checks::generate_null_rate_sql(
-                tref,
-                &null_rate_cfg.columns,
-                null_rate_cfg.sample_percent,
-                dialect,
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        table = %tref.full_name(),
-                        error = %e,
-                        "null_rate SQL generation failed — skipping"
-                    );
-                    continue;
-                }
-            };
-            match shared_warehouse.execute_query(&sql).await {
-                Ok(result) => {
-                    for row in &result.rows {
-                        let col = row.first().and_then(|v| v.as_str()).unwrap_or_default();
-                        // A parse failure on the counts is a malformed result,
-                        // not a real zero — skip the column rather than emit a
-                        // false PASS (rate 0.0). An empty (0-row) sample still
-                        // parses to a real 0 and correctly passes below.
-                        let (Some(nulls), Some(sampled)) =
-                            (checks::cell_as_u64(row.get(1)), checks::cell_as_u64(row.get(2)))
-                        else {
-                            warn!(table = %tref.full_name(), column = col, "null_rate counts unparseable — skipping column");
-                            continue;
-                        };
-                        if col.is_empty() {
-                            warn!(table = %tref.full_name(), "null_rate result missing column name — skipping");
-                            continue;
-                        }
-                        let rate = if sampled == 0 {
-                            0.0
-                        } else {
-                            nulls as f64 / sampled as f64
-                        };
-                        // `check_null_rate` names the result `null_rate:{col}`,
-                        // byte-matching discover's projection.
-                        let mut check = checks::check_null_rate(col, rate, null_rate_cfg.threshold);
-                        check.severity = null_rate_cfg.severity;
-                        pending_checks
-                            .entry(tref.full_name())
-                            .or_insert_with(|| PendingCheck {
-                                asset_key: asset_key.clone(),
-                                checks: Vec::new(),
-                            })
-                            .checks
-                            .push(check);
-                    }
-                }
-                Err(e) => {
-                    warn!(table = %tref.full_name(), error = %e, "null_rate query failed — skipping");
-                }
-            }
-        }
-    }
-
-    // Cross-source overlap — flag a business key shared across SIBLING targets:
-    // tables with the same source type + table name that landed in more than
-    // one target schema (the hierarchy/tenant fan-out that gets unioned
-    // downstream, doubling rows). Generic — groups by the discovered source
-    // type (asset_key[0]) + table name, with no schema-pattern-component
-    // assumptions. Self-limiting: only groups of ≥2 siblings are checked, so a
-    // single-target pipeline runs nothing. Surfaced advisorily like the other
-    // replication checks; a missing-key/keyless table is skipped with a logged
-    // reason rather than failing.
-    if let Some(ref overlap_cfg) = pipeline.checks.cross_source_overlap {
-        // Resolved once, but NOT unwrapped here: a `keys`/`key_expr`
-        // misconfiguration used to be logged and skipped, which left the run
-        // green with no record that the check existed. The groups are walked
-        // either way so a refusal is reported per group, like any other
-        // check that cannot run.
-        let key_exprs_result = overlap_cfg.resolved_key_exprs();
-        {
-            {
-                // (source_type, table) -> sibling members (target ref, asset key).
-                // The ≥2 grouping and the result name come from shared helpers
-                // in rocky-core so `rocky discover` can declare the exact same
-                // overlap names this runner emits (byte-match guarantee).
-                type SiblingGroups = HashMap<(String, String), Vec<(TableRef, Vec<String>)>>;
-                let mut groups: SiblingGroups = HashMap::new();
-                let mut pairs: Vec<(String, String)> = Vec::new();
-                for (tref, asset_key) in &assertion_targets {
-                    let source_type = asset_key.first().cloned().unwrap_or_default();
-                    let key = (source_type, tref.table.clone());
-                    pairs.push(key.clone());
-                    groups
-                        .entry(key)
-                        .or_default()
-                        .push((tref.clone(), asset_key.clone()));
-                }
-                // Qualifying (source_type, table) keys (≥2 siblings), sorted.
-                let qualifying = checks::cross_source_overlap_groups(pairs);
-
-                let dialect = shared_warehouse.dialect();
-                for gk in &qualifying {
-                    let members = &groups[gk];
-                    let (source_type, table) = gk;
-                    let siblings: Vec<TableRef> =
-                        members.iter().map(|(t, _)| t.clone()).collect();
-                    let name = checks::cross_source_overlap_name(source_type, table);
-                    let contributing: Vec<String> =
-                        siblings.iter().map(TableRef::full_name).collect();
-                    let key_exprs = match &key_exprs_result {
-                        Ok(k) => k,
-                        Err(e) => {
-                            warn!(source_type, table, error = %e, "cross_source_overlap key is misconfigured — reporting the check as not evaluated");
-                            let entry = pending_checks
-                                .entry(siblings[0].full_name())
-                                .or_insert_with(|| PendingCheck {
-                                    asset_key: members[0].1.clone(),
-                                    checks: Vec::new(),
-                                });
-                            entry.checks.push(
-                                rocky_core::checks::cross_source_overlap_not_evaluated(
-                                    name,
-                                    contributing,
-                                    e.clone(),
-                                    overlap_cfg.severity,
-                                ),
-                            );
-                            continue;
-                        }
-                    };
-                    let sql = match rocky_core::checks::generate_cross_source_overlap_sql(
-                        &siblings, key_exprs, dialect,
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            // A check that will not run must stay in the tally.
-                            // Skipping silently let `after_checks` and the JSON
-                            // `check_results` claim a clean group that was never
-                            // evaluated. (The QUERY-error arm below still skips
-                            // by design — that is the keyless-table case.)
-                            warn!(source_type, table, error = %e, "cross_source_overlap SQL generation failed — reporting the check as not evaluated");
-                            let entry = pending_checks
-                                .entry(siblings[0].full_name())
-                                .or_insert_with(|| PendingCheck {
-                                    asset_key: members[0].1.clone(),
-                                    checks: Vec::new(),
-                                });
-                            entry.checks.push(
-                                rocky_core::checks::cross_source_overlap_not_evaluated(
-                                    name,
-                                    contributing,
-                                    e.to_string(),
-                                    overlap_cfg.severity,
-                                ),
-                            );
-                            continue;
-                        }
-                    };
-                    match shared_warehouse.execute_query(&sql).await {
-                        Ok(result) => {
-                            let overlap_count = result.rows.len() as u64;
-                            let sample: Vec<String> = result
-                                .rows
-                                .iter()
-                                .take(overlap_cfg.sample)
-                                .map(|row| {
-                                    row.iter()
-                                        .take(key_exprs.len())
-                                        .map(|v| {
-                                            v.as_str()
-                                                .map(str::to_string)
-                                                .unwrap_or_else(|| v.to_string())
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join(" | ")
-                                })
-                                .collect();
-                            let contributing: Vec<String> =
-                                siblings.iter().map(TableRef::full_name).collect();
-                            let check = rocky_core::checks::check_cross_source_overlap(
-                                name,
-                                overlap_count,
-                                overlap_cfg.max_overlap_rows,
-                                contributing,
-                                sample,
-                                overlap_cfg.severity,
-                            );
-                            // Attach to the first sibling's asset (the result's
-                            // contributing_tables lists the whole group).
-                            let entry = pending_checks
-                                .entry(siblings[0].full_name())
-                                .or_insert_with(|| PendingCheck {
-                                    asset_key: members[0].1.clone(),
-                                    checks: Vec::new(),
-                                });
-                            entry.checks.push(check);
-                        }
-                        Err(e) => {
-                            // A missing key column / keyless table surfaces as a
-                            // query error, and that case is tolerated by design
-                            // (FR acceptance criterion) — but the ERROR TYPE does
-                            // not say which case this is. Syntax, permission and
-                            // transport failures arrive here too, and skipping
-                            // silently dropped the check from `check_results`,
-                            // the `after_checks` tally and the JSON entirely, so
-                            // a group that was never evaluated read as a group
-                            // with nothing to report. Record the same explicit
-                            // not-evaluated state the generation arm above uses:
-                            // still not a hard failure, but never invisible.
-                            warn!(source_type, table, error = %e, "cross_source_overlap query failed (missing key column / keyless table?) — reporting the check as not evaluated");
-                            let entry = pending_checks
-                                .entry(siblings[0].full_name())
-                                .or_insert_with(|| PendingCheck {
-                                    asset_key: members[0].1.clone(),
-                                    checks: Vec::new(),
-                                });
-                            entry.checks.push(
-                                rocky_core::checks::cross_source_overlap_not_evaluated(
-                                    name,
-                                    contributing,
-                                    e.to_string(),
-                                    overlap_cfg.severity,
-                                ),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
+    run_batched_checks(
+        shared_warehouse.as_ref(),
+        shared_batch_check.as_deref(),
+        state_store.as_ref(),
+        &hook_registry,
+        &run_id,
+        pipeline_name,
+        pipeline,
+        &source_batch_refs,
+        &target_batch_refs,
+        &freshness_batch_refs,
+        &batch_asset_keys,
+        &assertion_targets,
+        &mut pending_checks,
+        &mut output.anomalies,
+    )
+    .await?;
 
     // Assemble check results
     for (_table_key, pending) in pending_checks {
@@ -6124,6 +5558,619 @@ pub async fn run(
     // Every exit of the body block ran (or no-oped) past the idempotency
     // gate; the skip terminations returned from `run()` directly, above.
     run_result.map(|()| RunTermination::Completed)
+}
+
+/// Runs the batched replication checks against the tables copied this run
+/// and appends the results to `pending_checks`.
+///
+/// Row count and freshness go through the warehouse's `BatchCheckAdapter`
+/// when it has one (one UNION ALL query) and fall back to one query per
+/// table otherwise. Assertions, custom checks, null-rate checks and the
+/// cross-source overlap check run per table through the plain
+/// `WarehouseAdapter`. Row-count anomalies detected on the way are pushed to
+/// `anomalies`.
+///
+/// Lifted out of `run()` so a test can drive it with a warehouse that fails
+/// a specific query; `run()` itself builds its adapters from the config and
+/// offers no seam for that.
+#[allow(clippy::too_many_arguments)]
+async fn run_batched_checks(
+    warehouse: &dyn WarehouseAdapter,
+    batch_check: Option<&dyn BatchCheckAdapter>,
+    state_store: Option<&StateStore>,
+    hook_registry: &HookRegistry,
+    run_id: &str,
+    pipeline_name: &str,
+    pipeline: &ReplicationPipelineConfig,
+    source_batch_refs: &[TableRef],
+    target_batch_refs: &[TableRef],
+    freshness_batch_refs: &[TableRef],
+    batch_asset_keys: &[(String, Vec<String>)],
+    assertion_targets: &[(TableRef, Vec<String>)],
+    pending_checks: &mut HashMap<String, PendingCheck>,
+    anomalies: &mut Vec<AnomalyOutput>,
+) -> Result<()> {
+    let row_count_enabled = pipeline.checks.row_count.enabled() && !source_batch_refs.is_empty();
+    let freshness_enabled = pipeline.checks.freshness.is_some() && !freshness_batch_refs.is_empty();
+
+    // §P2.6 emit: before_checks. Table count is the number of tables
+    // participating in row-count / freshness batched checks (distinct
+    // from the per-table count from materialization — a table might
+    // skip one or both check types).
+    let _ = hook_registry
+        .fire(&HookContext::before_checks(
+            run_id,
+            pipeline_name,
+            source_batch_refs.len().max(freshness_batch_refs.len()),
+        ))
+        .await;
+
+    if row_count_enabled || freshness_enabled {
+        info!(
+            row_count_tables = source_batch_refs.len(),
+            freshness_tables = freshness_batch_refs.len(),
+            "running batched checks concurrently"
+        );
+    }
+
+    // Batch checks dispatch through the BatchCheckAdapter trait when the
+    // warehouse provides one (UNION ALL batching). Otherwise, fall back to
+    // per-table queries via the generic WarehouseAdapter — same observable
+    // check results, just more round-trips.
+    let (source_counts, target_counts, freshness_results): (
+        Vec<BatchRowCountResult>,
+        Vec<BatchRowCountResult>,
+        Vec<BatchFreshnessResult>,
+    ) = if let Some(bc) = batch_check {
+        let (src, tgt, fresh) = tokio::try_join!(
+            async {
+                if row_count_enabled {
+                    bc.batch_row_counts(source_batch_refs).await
+                } else {
+                    Ok(vec![])
+                }
+            },
+            async {
+                if row_count_enabled {
+                    bc.batch_row_counts(target_batch_refs).await
+                } else {
+                    Ok(vec![])
+                }
+            },
+            async {
+                if freshness_enabled {
+                    bc.batch_freshness(freshness_batch_refs, &pipeline.timestamp_column)
+                        .await
+                } else {
+                    Ok(vec![])
+                }
+            },
+        )
+        .map_err(anyhow::Error::from)?;
+        (src, tgt, fresh)
+    } else {
+        // Per-table fallback via WarehouseAdapter for adapters with no
+        // BatchCheckAdapter implementation.
+        let dialect = warehouse.dialect();
+        let mut src_counts = Vec::new();
+        let mut tgt_counts = Vec::new();
+        let mut fresh_results: Vec<BatchFreshnessResult> = Vec::new();
+
+        if row_count_enabled {
+            for br in source_batch_refs {
+                let table_ref = dialect
+                    .format_table_ref(&br.catalog, &br.schema, &br.table)
+                    .map_err(anyhow::Error::from)?;
+                let sql = format!("SELECT COUNT(*) FROM {table_ref}");
+                match warehouse.execute_query(&sql).await {
+                    Ok(result) => {
+                        let count = result
+                            .rows
+                            .first()
+                            .and_then(|r| r.first())
+                            .and_then(|v| {
+                                v.as_u64()
+                                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                            })
+                            .unwrap_or(0);
+                        src_counts.push(BatchRowCountResult {
+                            table: br.clone(),
+                            count,
+                        });
+                    }
+                    Err(e) => {
+                        warn!(table = br.table.as_str(), error = %e, "per-table row count failed");
+                    }
+                }
+            }
+            for br in target_batch_refs {
+                let table_ref = dialect
+                    .format_table_ref(&br.catalog, &br.schema, &br.table)
+                    .map_err(anyhow::Error::from)?;
+                let sql = format!("SELECT COUNT(*) FROM {table_ref}");
+                match warehouse.execute_query(&sql).await {
+                    Ok(result) => {
+                        let count = result
+                            .rows
+                            .first()
+                            .and_then(|r| r.first())
+                            .and_then(|v| {
+                                v.as_u64()
+                                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                            })
+                            .unwrap_or(0);
+                        tgt_counts.push(BatchRowCountResult {
+                            table: br.clone(),
+                            count,
+                        });
+                    }
+                    Err(e) => {
+                        warn!(table = br.table.as_str(), error = %e, "per-table row count failed");
+                    }
+                }
+            }
+        }
+
+        if freshness_enabled {
+            for br in freshness_batch_refs {
+                let table_ref = dialect
+                    .format_table_ref(&br.catalog, &br.schema, &br.table)
+                    .map_err(anyhow::Error::from)?;
+                let sql = format!("SELECT MAX({}) FROM {table_ref}", pipeline.timestamp_column);
+                match warehouse.execute_query(&sql).await {
+                    Ok(result) => {
+                        let max_ts = result
+                            .rows
+                            .first()
+                            .and_then(|r| r.first())
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| {
+                                s.parse::<chrono::DateTime<Utc>>().ok().or_else(|| {
+                                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+                                        .or_else(|_| {
+                                            chrono::NaiveDateTime::parse_from_str(
+                                                s,
+                                                "%Y-%m-%d %H:%M:%S",
+                                            )
+                                        })
+                                        .ok()
+                                        .map(|naive| naive.and_utc())
+                                })
+                            });
+                        fresh_results.push(BatchFreshnessResult {
+                            table: br.clone(),
+                            max_timestamp: max_ts,
+                        });
+                    }
+                    Err(e) => {
+                        warn!(table = br.table.as_str(), error = %e, "per-table freshness check failed");
+                    }
+                }
+            }
+        }
+
+        (src_counts, tgt_counts, fresh_results)
+    };
+
+    // Process row count results
+    if row_count_enabled {
+        let source_map: HashMap<String, u64> = source_counts
+            .iter()
+            .map(|r| (r.table.full_name(), r.count))
+            .collect();
+        let target_map: HashMap<String, u64> = target_counts
+            .iter()
+            .map(|r| (r.table.full_name(), r.count))
+            .collect();
+
+        for (target_key, asset_key) in batch_asset_keys {
+            let src_ref = &source_batch_refs
+                .iter()
+                .zip(target_batch_refs.iter())
+                .find(|(_, t)| t.full_name() == *target_key)
+                .map(|(s, _)| s.full_name());
+
+            if let Some(src_key) = src_ref {
+                let src_count = source_map.get(src_key).copied().unwrap_or(0);
+                let tgt_count = target_map.get(target_key).copied().unwrap_or(0);
+                let check = checks::check_row_count(src_count, tgt_count);
+                let entry =
+                    pending_checks
+                        .entry(target_key.clone())
+                        .or_insert_with(|| PendingCheck {
+                            asset_key: asset_key.clone(),
+                            checks: Vec::new(),
+                        });
+                entry.checks.push(check);
+            }
+        }
+    }
+
+    // Anomaly detection
+    if row_count_enabled && let Some(store) = state_store {
+        for (target_key, _) in batch_asset_keys {
+            let tgt_count = target_counts
+                .iter()
+                .find(|r| r.table.full_name() == *target_key)
+                .map(|r| r.count)
+                .unwrap_or(0);
+
+            let _ = store.record_row_count(target_key, tgt_count, 10);
+
+            if let Ok(history) = store.get_check_history(target_key) {
+                let anomaly = rocky_core::state::detect_anomaly(
+                    target_key,
+                    tgt_count,
+                    &history,
+                    pipeline.checks.anomaly_threshold_pct,
+                );
+                if anomaly.is_anomaly {
+                    warn!(
+                        table = target_key.as_str(),
+                        reason = anomaly.reason.as_str(),
+                        "row count anomaly detected"
+                    );
+                    rocky_observe::metrics::METRICS.inc_anomalies_detected();
+                    // §P2.6 emit: anomaly_detected. Fires before
+                    // pushing to `anomalies` so we can pass
+                    // references without cloning.
+                    let _ = hook_registry
+                        .fire(&HookContext::anomaly_detected(
+                            run_id,
+                            pipeline_name,
+                            &anomaly.table,
+                            &anomaly.reason,
+                        ))
+                        .await;
+                    anomalies.push(AnomalyOutput {
+                        table: anomaly.table,
+                        current_count: anomaly.current_count,
+                        baseline_avg: anomaly.baseline_avg,
+                        deviation_pct: anomaly.deviation_pct,
+                        reason: anomaly.reason,
+                    });
+                }
+            }
+        }
+    }
+
+    // Process freshness results
+    if let Some(ref freshness_cfg) = pipeline.checks.freshness {
+        let now = Utc::now();
+        for fr in &freshness_results {
+            let key = fr.table.full_name();
+            if let Some(ts) = fr.max_timestamp {
+                let lag = (now - ts).num_seconds().unsigned_abs();
+                let mut check = checks::check_freshness(lag, freshness_cfg.threshold_seconds);
+                check.severity = freshness_cfg.severity;
+
+                if let Some((_, asset_key)) = batch_asset_keys.iter().find(|(k, _)| *k == key) {
+                    let entry = pending_checks.entry(key).or_insert_with(|| PendingCheck {
+                        asset_key: asset_key.clone(),
+                        checks: Vec::new(),
+                    });
+                    entry.checks.push(check);
+                }
+            }
+        }
+    }
+
+    // Row-level assertions (uniqueness, etc.) on each replication target.
+    // The replication runner runs the SAME `[checks].assertions` the quality
+    // runner does, so uniqueness fires at replication time. Driven by
+    // `assertion_targets` (populated per materialized table, independent of
+    // row_count/freshness) so it runs even when those checks are disabled.
+    // Results are surfaced advisorily — like every other check in this runner,
+    // the run does not bail; the orchestrator decides from the JSON
+    // CheckResult + severity. (The data has already landed by check time, so
+    // bailing would only change the exit code, not prevent the write.)
+    if !pipeline.checks.assertions.is_empty() {
+        let dialect = warehouse.dialect();
+        for (tref, asset_key) in assertion_targets {
+            let full = match dialect.format_table_ref(&tref.catalog, &tref.schema, &tref.table) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        table = %tref.full_name(),
+                        error = %e,
+                        "assertion table ref formatting failed — skipping"
+                    );
+                    continue;
+                }
+            };
+            let results = super::run_local::run_table_assertions(
+                warehouse,
+                dialect,
+                &full,
+                &tref.table,
+                &pipeline.checks.assertions,
+            )
+            .await;
+            if !results.is_empty() {
+                let entry =
+                    pending_checks
+                        .entry(tref.full_name())
+                        .or_insert_with(|| PendingCheck {
+                            asset_key: asset_key.clone(),
+                            checks: Vec::new(),
+                        });
+                entry.checks.extend(results);
+            }
+        }
+    }
+
+    // Custom SQL checks on each replication target. Ported from the quality
+    // runner so `[[checks.custom]]` fires at replication time too. Driven by
+    // `assertion_targets` (every materialized table); surfaced advisorily like
+    // the other replication checks — the run reports pass/fail in the JSON
+    // CheckResult + severity rather than bailing (the data has already landed).
+    if !pipeline.checks.custom.is_empty() {
+        let dialect = warehouse.dialect();
+        for (tref, asset_key) in assertion_targets {
+            let full = match dialect.format_table_ref(&tref.catalog, &tref.schema, &tref.table) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        table = %tref.full_name(),
+                        error = %e,
+                        "custom check table ref formatting failed — skipping"
+                    );
+                    continue;
+                }
+            };
+            let results =
+                super::run_local::run_custom_checks(warehouse, &full, &pipeline.checks.custom)
+                    .await;
+            if !results.is_empty() {
+                pending_checks
+                    .entry(tref.full_name())
+                    .or_insert_with(|| PendingCheck {
+                        asset_key: asset_key.clone(),
+                        checks: Vec::new(),
+                    })
+                    .checks
+                    .extend(results);
+            }
+        }
+    }
+
+    // Null-rate checks: sample each configured column and flag when the null
+    // fraction exceeds the threshold. `generate_null_rate_sql` returns one row
+    // per column `(col, nulls, sampled)`; the rate is computed per row. Like the
+    // other replication checks this is advisory — the configured severity rides
+    // into the JSON CheckResult and the orchestrator decides.
+    if let Some(ref null_rate_cfg) = pipeline.checks.null_rate {
+        let dialect = warehouse.dialect();
+        for (tref, asset_key) in assertion_targets {
+            let sql = match checks::generate_null_rate_sql(
+                tref,
+                &null_rate_cfg.columns,
+                null_rate_cfg.sample_percent,
+                dialect,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        table = %tref.full_name(),
+                        error = %e,
+                        "null_rate SQL generation failed — skipping"
+                    );
+                    continue;
+                }
+            };
+            match warehouse.execute_query(&sql).await {
+                Ok(result) => {
+                    for row in &result.rows {
+                        let col = row.first().and_then(|v| v.as_str()).unwrap_or_default();
+                        // A parse failure on the counts is a malformed result,
+                        // not a real zero — skip the column rather than emit a
+                        // false PASS (rate 0.0). An empty (0-row) sample still
+                        // parses to a real 0 and correctly passes below.
+                        let (Some(nulls), Some(sampled)) = (
+                            checks::cell_as_u64(row.get(1)),
+                            checks::cell_as_u64(row.get(2)),
+                        ) else {
+                            warn!(table = %tref.full_name(), column = col, "null_rate counts unparseable — skipping column");
+                            continue;
+                        };
+                        if col.is_empty() {
+                            warn!(table = %tref.full_name(), "null_rate result missing column name — skipping");
+                            continue;
+                        }
+                        let rate = if sampled == 0 {
+                            0.0
+                        } else {
+                            nulls as f64 / sampled as f64
+                        };
+                        // `check_null_rate` names the result `null_rate:{col}`,
+                        // byte-matching discover's projection.
+                        let mut check = checks::check_null_rate(col, rate, null_rate_cfg.threshold);
+                        check.severity = null_rate_cfg.severity;
+                        pending_checks
+                            .entry(tref.full_name())
+                            .or_insert_with(|| PendingCheck {
+                                asset_key: asset_key.clone(),
+                                checks: Vec::new(),
+                            })
+                            .checks
+                            .push(check);
+                    }
+                }
+                Err(e) => {
+                    warn!(table = %tref.full_name(), error = %e, "null_rate query failed — skipping");
+                }
+            }
+        }
+    }
+
+    // Cross-source overlap — flag a business key shared across SIBLING targets:
+    // tables with the same source type + table name that landed in more than
+    // one target schema (the hierarchy/tenant fan-out that gets unioned
+    // downstream, doubling rows). Generic — groups by the discovered source
+    // type (asset_key[0]) + table name, with no schema-pattern-component
+    // assumptions. Self-limiting: only groups of ≥2 siblings are checked, so a
+    // single-target pipeline runs nothing. Surfaced advisorily like the other
+    // replication checks; a missing-key/keyless table is skipped with a logged
+    // reason rather than failing.
+    if let Some(ref overlap_cfg) = pipeline.checks.cross_source_overlap {
+        // Resolved once, but NOT unwrapped here: a `keys`/`key_expr`
+        // misconfiguration used to be logged and skipped, which left the run
+        // green with no record that the check existed. The groups are walked
+        // either way so a refusal is reported per group, like any other
+        // check that cannot run.
+        let key_exprs_result = overlap_cfg.resolved_key_exprs();
+        {
+            {
+                // (source_type, table) -> sibling members (target ref, asset key).
+                // The ≥2 grouping and the result name come from shared helpers
+                // in rocky-core so `rocky discover` can declare the exact same
+                // overlap names this runner emits (byte-match guarantee).
+                type SiblingGroups = HashMap<(String, String), Vec<(TableRef, Vec<String>)>>;
+                let mut groups: SiblingGroups = HashMap::new();
+                let mut pairs: Vec<(String, String)> = Vec::new();
+                for (tref, asset_key) in assertion_targets {
+                    let source_type = asset_key.first().cloned().unwrap_or_default();
+                    let key = (source_type, tref.table.clone());
+                    pairs.push(key.clone());
+                    groups
+                        .entry(key)
+                        .or_default()
+                        .push((tref.clone(), asset_key.clone()));
+                }
+                // Qualifying (source_type, table) keys (≥2 siblings), sorted.
+                let qualifying = checks::cross_source_overlap_groups(pairs);
+
+                let dialect = warehouse.dialect();
+                for gk in &qualifying {
+                    let members = &groups[gk];
+                    let (source_type, table) = gk;
+                    let siblings: Vec<TableRef> = members.iter().map(|(t, _)| t.clone()).collect();
+                    let name = checks::cross_source_overlap_name(source_type, table);
+                    let contributing: Vec<String> =
+                        siblings.iter().map(TableRef::full_name).collect();
+                    let key_exprs = match &key_exprs_result {
+                        Ok(k) => k,
+                        Err(e) => {
+                            warn!(source_type, table, error = %e, "cross_source_overlap key is misconfigured — reporting the check as not evaluated");
+                            let entry = pending_checks
+                                .entry(siblings[0].full_name())
+                                .or_insert_with(|| PendingCheck {
+                                    asset_key: members[0].1.clone(),
+                                    checks: Vec::new(),
+                                });
+                            entry.checks.push(
+                                rocky_core::checks::cross_source_overlap_not_evaluated(
+                                    name,
+                                    contributing,
+                                    e.clone(),
+                                    overlap_cfg.severity,
+                                ),
+                            );
+                            continue;
+                        }
+                    };
+                    let sql = match rocky_core::checks::generate_cross_source_overlap_sql(
+                        &siblings, key_exprs, dialect,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            // A check that will not run must stay in the tally.
+                            // Skipping silently let `after_checks` and the JSON
+                            // `check_results` claim a clean group that was never
+                            // evaluated. (The QUERY-error arm below still skips
+                            // by design — that is the keyless-table case.)
+                            warn!(source_type, table, error = %e, "cross_source_overlap SQL generation failed — reporting the check as not evaluated");
+                            let entry = pending_checks
+                                .entry(siblings[0].full_name())
+                                .or_insert_with(|| PendingCheck {
+                                    asset_key: members[0].1.clone(),
+                                    checks: Vec::new(),
+                                });
+                            entry.checks.push(
+                                rocky_core::checks::cross_source_overlap_not_evaluated(
+                                    name,
+                                    contributing,
+                                    e.to_string(),
+                                    overlap_cfg.severity,
+                                ),
+                            );
+                            continue;
+                        }
+                    };
+                    match warehouse.execute_query(&sql).await {
+                        Ok(result) => {
+                            let overlap_count = result.rows.len() as u64;
+                            let sample: Vec<String> = result
+                                .rows
+                                .iter()
+                                .take(overlap_cfg.sample)
+                                .map(|row| {
+                                    row.iter()
+                                        .take(key_exprs.len())
+                                        .map(|v| {
+                                            v.as_str()
+                                                .map(str::to_string)
+                                                .unwrap_or_else(|| v.to_string())
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(" | ")
+                                })
+                                .collect();
+                            let contributing: Vec<String> =
+                                siblings.iter().map(TableRef::full_name).collect();
+                            let check = rocky_core::checks::check_cross_source_overlap(
+                                name,
+                                overlap_count,
+                                overlap_cfg.max_overlap_rows,
+                                contributing,
+                                sample,
+                                overlap_cfg.severity,
+                            );
+                            // Attach to the first sibling's asset (the result's
+                            // contributing_tables lists the whole group).
+                            let entry = pending_checks
+                                .entry(siblings[0].full_name())
+                                .or_insert_with(|| PendingCheck {
+                                    asset_key: members[0].1.clone(),
+                                    checks: Vec::new(),
+                                });
+                            entry.checks.push(check);
+                        }
+                        Err(e) => {
+                            // A missing key column / keyless table surfaces as a
+                            // query error, and that case is tolerated by design
+                            // (FR acceptance criterion) — but the ERROR TYPE does
+                            // not say which case this is. Syntax, permission and
+                            // transport failures arrive here too, and skipping
+                            // silently dropped the check from `check_results`,
+                            // the `after_checks` tally and the JSON entirely, so
+                            // a group that was never evaluated read as a group
+                            // with nothing to report. Record the same explicit
+                            // not-evaluated state the generation arm above uses:
+                            // still not a hard failure, but never invisible.
+                            warn!(source_type, table, error = %e, "cross_source_overlap query failed (missing key column / keyless table?) — reporting the check as not evaluated");
+                            let entry = pending_checks
+                                .entry(siblings[0].full_name())
+                                .or_insert_with(|| PendingCheck {
+                                    asset_key: members[0].1.clone(),
+                                    checks: Vec::new(),
+                                });
+                            entry.checks.push(
+                                rocky_core::checks::cross_source_overlap_not_evaluated(
+                                    name,
+                                    contributing,
+                                    e.to_string(),
+                                    overlap_cfg.severity,
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// End-of-run retention sweep, gated by `last_retention_sweep_at`.
