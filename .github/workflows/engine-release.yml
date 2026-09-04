@@ -129,7 +129,7 @@ jobs:
         if: matrix.zigbuild
         # Prebuilt binary — avoids ~35s of `cargo install cargo-zigbuild
         # --locked` (compiles from source) per Linux target.
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
         with:
           tool: cargo-zigbuild
 
