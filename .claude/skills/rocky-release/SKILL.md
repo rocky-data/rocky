@@ -34,7 +34,7 @@ The workflow handles the GitHub Release creation, build, and (for dagster/vscode
 
 `scripts/release.sh` + the `just release-engine|sdk|dagster|vscode` recipes survive as **local-build fallbacks** when CI is unavailable. The local path creates the GH Release as a **draft** with its artifacts attached. The tag push's CI run accepts that draft and publishes it. `ensure-release` refuses a release that is already published, so CI never attaches to, or re-publishes, a live release.
 
-Every release is a draft until its last step. No path publishes a GitHub Release before every artifact it lists exists and the registry upload (PyPI, Marketplace) has succeeded. A failed run leaves a draft, which the public release list omits. Re-run the failed job; the draft is the intended leftover, not a bug.
+Every release is a draft until its last step — all five workflows and every local path. No path publishes a GitHub Release before every artifact it lists exists and the registry upload (PyPI, Marketplace, npm) has succeeded. A failed run leaves a draft, which the public release list omits. Re-run the failed job; the draft is the intended leftover, not a bug.
 
 ## Engine release (default: just tag and push)
 
@@ -123,7 +123,7 @@ just release-dagster 0.4.0                # GH release only
 just release-dagster 0.4.0 --publish      # + PyPI via UV_PUBLISH_TOKEN or ~/.pypirc
 ```
 
-Without `--publish`, the local path creates a draft and the tag push's CI run publishes it after the PyPI upload. With `--publish`, PyPI already has the wheel, so the script publishes the release itself; the tag push's CI run then stops at `ensure-release` (already published). That red run is expected. Only reach for this when the CI workflow itself is broken.
+Without `--publish`, the local path creates a draft and the tag push's CI run publishes it after the PyPI upload. With `--publish`, PyPI already has the wheel, so the script creates the draft, attaches the artifacts, and then publishes it in a separate step; the tag push's CI run then stops at `ensure-release` (already published). That red run is expected. Only reach for this when the CI workflow itself is broken.
 
 ## VS Code release (default: just tag and push)
 
@@ -216,7 +216,7 @@ Path-filtered workflows in `.github/workflows/`:
 - `engine-bench.yml` — only PRs labeled `perf` touching `engine/crates/**` or `engine/Cargo.*`
 - `engine-release.yml` — **full 5-target matrix build on tag `engine-v*` push**. Owns the GitHub Release creation + binary uploads + `checksums.txt`.
 - `sdk-release.yml` / `dagster-release.yml` / `vscode-release.yml` — tag-triggered (`sdk-v*` / `dagster-v*` / `vscode-v*`) release + publish
-- `engine-wasm-release.yml` — builds `rocky-wasm` and publishes to npm on `engine-wasm-v*` tags (independent of CLI releases)
+- `engine-wasm-release.yml` — builds `rocky-wasm` and publishes to npm on `engine-wasm-v*` tags (independent of CLI releases). Same draft-until-last-step shape as the other four; an unset `NPM_TOKEN` fails the run here and stays a no-op on a fork
 - `engine-docs.yml` — build + deploy Astro docs from `docs/` to GitHub Pages
 - `codegen-drift.yml` — fails any PR where committed bindings drift from `just codegen` output
 

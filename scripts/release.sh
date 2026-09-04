@@ -53,10 +53,27 @@ confirm_tag() {
 
 create_release() {
     local tag="$1"; shift
-    info "Creating GitHub Release $tag"
+    info "Creating GitHub Release $tag as a draft"
     gh release create "$tag" \
         --repo rocky-data/rocky \
         --generate-notes \
+        --draft \
+        "$@"
+}
+
+# Publish a draft that already has every asset attached.
+#
+# Always a separate step from `create_release`. `gh release create` does keep
+# a release with assets as a draft until the uploads finish, but relying on
+# that puts the guarantee inside gh's internals, where a version bump could
+# move it. Creating a draft and flipping it here states the ordering in this
+# script, and matches what the release workflows do.
+publish_release() {
+    local tag="$1"; shift
+    info "Publishing GitHub Release $tag"
+    gh release edit "$tag" \
+        --repo rocky-data/rocky \
+        --draft=false \
         "$@"
 }
 
@@ -113,7 +130,6 @@ release_engine() {
     # installable: this script builds neither checksums.txt nor the rocky-lsp
     # archives that install.sh downloads.
     create_release "$tag" \
-        --draft \
         "$macos_archive" \
         "$linux_archive"
 
@@ -161,20 +177,21 @@ release_dagster() {
     git -C "$WORKSPACE_ROOT" push origin "$tag" \
         || die "git push origin $tag failed"
 
-    # 4. Create GitHub Release. It goes public only once PyPI has the
-    # artifact: with --publish that happened in step 2, so publish now
-    # (gh uploads the assets before it publishes); without it, the tag push's
-    # CI run publishes to PyPI and then flips the draft.
+    # 4. Create the GitHub Release as a draft with the wheel attached, then
+    # publish it in a separate step below.
     # --latest=false: never let a wheel grab the "Latest" badge — the engine
     # release owns it (see release_engine).
-    local draft_flag="--draft"
-    if [[ "$publish" == "--publish" ]]; then
-        draft_flag="--draft=false"
-    fi
     create_release "$tag" \
-        "$draft_flag" \
         --latest=false \
         "$WORKSPACE_ROOT/integrations/dagster/dist/"*
+
+    # Public only once the registry has the artifact AND every asset is
+    # attached. With --publish the registry upload happened in step 2 and the
+    # create above has finished, so publishing here is safe; without it, the
+    # tag push's CI run publishes to the registry and then flips the draft.
+    if [[ "$publish" == "--publish" ]]; then
+        publish_release "$tag" --latest=false
+    fi
 
     echo
     if [[ "$publish" == "--publish" ]]; then
@@ -222,19 +239,20 @@ release_sdk() {
     git -C "$WORKSPACE_ROOT" push origin "$tag" \
         || die "git push origin $tag failed"
 
-    # 4. Create GitHub Release. It goes public only once PyPI has the
-    # artifact: with --publish that happened in step 2, so publish now
-    # (gh uploads the assets before it publishes); without it, the tag push's
-    # CI run publishes to PyPI and then flips the draft.
+    # 4. Create the GitHub Release as a draft with the wheel attached, then
+    # publish it in a separate step below.
     # --latest=false: the engine release owns the "Latest" badge.
-    local draft_flag="--draft"
-    if [[ "$publish" == "--publish" ]]; then
-        draft_flag="--draft=false"
-    fi
     create_release "$tag" \
-        "$draft_flag" \
         --latest=false \
         "$WORKSPACE_ROOT/sdk/python/dist/"*
+
+    # Public only once the registry has the artifact AND every asset is
+    # attached. With --publish the registry upload happened in step 2 and the
+    # create above has finished, so publishing here is safe; without it, the
+    # tag push's CI run publishes to the registry and then flips the draft.
+    if [[ "$publish" == "--publish" ]]; then
+        publish_release "$tag" --latest=false
+    fi
 
     echo
     if [[ "$publish" == "--publish" ]]; then
@@ -288,19 +306,20 @@ release_vscode() {
     git -C "$WORKSPACE_ROOT" push origin "$tag" \
         || die "git push origin $tag failed"
 
-    # 4. Create GitHub Release. It goes public only once the Marketplace has
-    # the extension: with --publish that happened in step 2, so publish now
-    # (gh uploads the assets before it publishes); without it, the tag push's
-    # CI run publishes to the Marketplace and then flips the draft.
+    # 4. Create the GitHub Release as a draft with the VSIX attached, then
+    # publish it in a separate step below.
     # --latest=false: the engine release owns the "Latest" badge.
-    local draft_flag="--draft"
-    if [[ "$publish" == "--publish" ]]; then
-        draft_flag="--draft=false"
-    fi
     create_release "$tag" \
-        "$draft_flag" \
         --latest=false \
         "$WORKSPACE_ROOT/editors/vscode/"*.vsix
+
+    # Public only once the Marketplace has the extension AND every asset is
+    # attached. With --publish the Marketplace publish happened in step 2 and
+    # the create above has finished, so publishing here is safe; without it,
+    # the tag push's CI run publishes and then flips the draft.
+    if [[ "$publish" == "--publish" ]]; then
+        publish_release "$tag" --latest=false
+    fi
 
     echo
     if [[ "$publish" == "--publish" ]]; then
