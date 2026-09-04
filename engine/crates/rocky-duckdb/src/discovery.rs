@@ -12,9 +12,11 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use rocky_core::source::{DiscoveredConnector, DiscoveredTable, DiscoveryResult};
+use rocky_core::sql_gen::string_literal;
 use rocky_core::traits::{AdapterError, AdapterResult, DiscoveryAdapter};
 
 use crate::DuckDbConnector;
+use crate::dialect::DuckDbSqlDialect;
 
 /// DuckDB discovery adapter that lists schemas + tables matching a prefix.
 pub struct DuckDbDiscoveryAdapter {
@@ -35,16 +37,16 @@ impl DiscoveryAdapter for DuckDbDiscoveryAdapter {
             .lock()
             .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
 
-        // 1. Find schemas matching the prefix. Quote-doubling alone only holds
-        // where `''` is the sole escape; refuse a backslash rather than rely on
-        // DuckDB staying in its standard-SQL default (#1524).
-        rocky_sql::validation::reject_unquotable_literal("schema_pattern `prefix`", schema_prefix)
-            .map_err(AdapterError::new)?;
+        // 1. Find schemas matching the prefix. The prefix is user text from
+        // `schema_pattern.prefix`, encoded by this dialect's own lexer rule.
+        // `%` is the LIKE wildcard; a backslash is a plain character in
+        // DuckDB's LIKE (there is no default ESCAPE), so it needs no second
+        // encoding for the pattern.
         let schema_sql = format!(
             "SELECT schema_name FROM information_schema.schemata \
-             WHERE schema_name LIKE '{}%' \
+             WHERE schema_name LIKE {} \
              ORDER BY schema_name",
-            schema_prefix.replace('\'', "''")
+            string_literal(&DuckDbSqlDialect, &format!("{schema_prefix}%"))
         );
         let schema_result = conn.execute_sql(&schema_sql).map_err(AdapterError::new)?;
 
@@ -56,12 +58,14 @@ impl DiscoveryAdapter for DuckDbDiscoveryAdapter {
                 .ok_or_else(|| AdapterError::msg("schema_name not a string"))?
                 .to_string();
 
-            // 2. Find tables in this schema.
+            // 2. Find tables in this schema. The name came back from the
+            // warehouse and can hold any character, so it is encoded the
+            // same way.
             let table_sql = format!(
                 "SELECT table_name FROM information_schema.tables \
-                 WHERE table_schema = '{}' AND table_type = 'BASE TABLE' \
+                 WHERE table_schema = {} AND table_type = 'BASE TABLE' \
                  ORDER BY table_name",
-                schema.replace('\'', "''")
+                string_literal(&DuckDbSqlDialect, &schema)
             );
             let table_result = conn.execute_sql(&table_sql).map_err(AdapterError::new)?;
 
@@ -96,16 +100,36 @@ impl DiscoveryAdapter for DuckDbDiscoveryAdapter {
 mod tests {
     use super::*;
 
+    /// Executed proof, not a string assertion: the prefix and each schema
+    /// name are encoded by DuckDB's own lexer rule (issue #1596). A schema
+    /// whose name ends in a backslash, and one holding a quote, are both
+    /// found; a backslash in the prefix matches only itself, because
+    /// DuckDB's `LIKE` has no default escape character.
     #[tokio::test]
-    async fn discover_refuses_a_backslash_in_the_schema_prefix() {
-        // `schema_pattern.prefix` reaches this literal from `rocky.toml`.
-        // Doubling quotes alone does not contain a backslash — see
-        // `rocky_sql::validation::reject_unquotable_literal` (#1524).
+    async fn discover_finds_schemas_whose_names_hold_a_backslash_or_a_quote() {
         let connector = Arc::new(Mutex::new(DuckDbConnector::in_memory().unwrap()));
+        {
+            let conn = connector.lock().unwrap();
+            for stmt in [
+                r#"CREATE SCHEMA "raw\""#,
+                r#"CREATE SCHEMA "raw\x""#,
+                r#"CREATE SCHEMA "rawx""#,
+                r#"CREATE SCHEMA "it's""#,
+                r#"CREATE TABLE "it's".t (id INTEGER)"#,
+            ] {
+                conn.execute_sql(stmt).unwrap();
+            }
+        }
         let adapter = DuckDbDiscoveryAdapter::new(connector);
-        let err = adapter.discover(r"raw\").await.unwrap_err();
-        assert!(err.to_string().contains("backslash"), "{err}");
-        assert!(err.to_string().contains("schema_pattern `prefix`"), "{err}");
+
+        let found = adapter.discover(r"raw\").await.unwrap();
+        let names: Vec<&str> = found.connectors.iter().map(|c| c.schema.as_str()).collect();
+        assert_eq!(names, [r"raw\", r"raw\x"]);
+
+        let found = adapter.discover("it'").await.unwrap();
+        let names: Vec<&str> = found.connectors.iter().map(|c| c.schema.as_str()).collect();
+        assert_eq!(names, ["it's"]);
+        assert_eq!(found.connectors[0].tables[0].name, "t");
     }
 
     #[tokio::test]

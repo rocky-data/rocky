@@ -30,6 +30,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
+use crate::traits::SqlDialect;
+
 /// A unit test definition from a model sidecar.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct UnitTestDef {
@@ -103,22 +105,23 @@ pub enum MismatchKind {
     ValueDiff,
 }
 
-/// Render a JSON scalar to a DuckDB SQL literal.
+/// Render a JSON scalar to a SQL literal for `dialect`.
 ///
-/// Strings are single-quote escaped; numbers and bools pass through their
-/// canonical text form; anything else (including `null`, arrays, objects) is
-/// rendered as `NULL`. Shared by [`fixture_to_sql`] and the unit-test runner's
-/// expected-table builder so both stringify values identically.
-pub fn json_to_sql_literal(value: &JsonValue) -> String {
+/// Strings become a single-quoted literal encoded by the dialect's own lexer
+/// rule; numbers and bools pass through their canonical text form; anything
+/// else (including `null`, arrays, objects) is rendered as `NULL`. Shared by
+/// [`fixture_to_sql`] and the unit-test runner's expected-table builder so
+/// both stringify values identically.
+pub fn json_to_sql_literal(value: &JsonValue, dialect: &dyn SqlDialect) -> String {
     match value {
-        JsonValue::String(s) => format!("'{}'", s.replace('\'', "''")),
+        JsonValue::String(s) => crate::sql_gen::string_literal(dialect, s),
         JsonValue::Number(n) => n.to_string(),
         JsonValue::Bool(b) => b.to_string(),
         _ => "NULL".to_string(),
     }
 }
 
-/// Generate DuckDB SQL to create a temporary table from fixture rows.
+/// Generate SQL for `dialect` to create a temporary table from fixture rows.
 ///
 /// Returns a `CREATE TABLE <ref> AS SELECT ... UNION ALL ...` statement
 /// that the test runner can execute before running the model.
@@ -131,7 +134,7 @@ pub fn json_to_sql_literal(value: &JsonValue) -> String {
 /// omitted by the dbt-import emitter because its value was JSON `null`)
 /// materializes as SQL `NULL` rather than dropping the column or skewing the
 /// `SELECT` width. (FR-045)
-pub fn fixture_to_sql(fixture: &TestFixture) -> Option<String> {
+pub fn fixture_to_sql(fixture: &TestFixture, dialect: &dyn SqlDialect) -> Option<String> {
     if fixture.rows.is_empty() {
         return None;
     }
@@ -157,7 +160,7 @@ pub fn fixture_to_sql(fixture: &TestFixture) -> Option<String> {
             .map(|col| {
                 let lit = table
                     .get(*col)
-                    .map_or_else(|| "NULL".to_string(), json_to_sql_literal);
+                    .map_or_else(|| "NULL".to_string(), |v| json_to_sql_literal(v, dialect));
                 format!("{lit} AS {col}")
             })
             .collect();
@@ -174,6 +177,27 @@ pub fn fixture_to_sql(fixture: &TestFixture) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::LiteralEscape;
+    use crate::traits::test_dialects::StubDialect;
+
+    fn standard() -> StubDialect {
+        StubDialect(LiteralEscape::Standard)
+    }
+
+    /// A fixture string holding a backslash or a quote is encoded by the
+    /// dialect's own lexer rule (issue #1596): verbatim backslash and doubled
+    /// quote under `Standard` (DuckDB, the dialect the runner passes); doubled
+    /// backslash and `\'` under `Backslash`.
+    #[test]
+    fn json_to_sql_literal_encodes_a_backslash_and_a_quote_per_dialect() {
+        let backslash = StubDialect(LiteralEscape::Backslash);
+        let bs = serde_json::json!(r"C:\tmp\");
+        let quote = serde_json::json!("it's");
+        assert_eq!(json_to_sql_literal(&bs, &standard()), r"'C:\tmp\'");
+        assert_eq!(json_to_sql_literal(&quote, &standard()), "'it''s'");
+        assert_eq!(json_to_sql_literal(&bs, &backslash), r"'C:\\tmp\\'");
+        assert_eq!(json_to_sql_literal(&quote, &backslash), r"'it\'s'");
+    }
 
     #[test]
     fn test_fixture_to_sql_basic() {
@@ -185,7 +209,7 @@ mod tests {
             ],
         };
 
-        let sql = fixture_to_sql(&fixture).unwrap();
+        let sql = fixture_to_sql(&fixture, &standard()).unwrap();
         assert!(sql.starts_with("CREATE OR REPLACE TABLE orders AS"));
         assert!(sql.contains("UNION ALL"));
         assert!(sql.contains("1 AS id"));
@@ -197,7 +221,7 @@ mod tests {
             model_ref: "empty".into(),
             rows: vec![],
         };
-        assert!(fixture_to_sql(&fixture).is_none());
+        assert!(fixture_to_sql(&fixture, &standard()).is_none());
     }
 
     #[test]
@@ -233,7 +257,7 @@ mod tests {
             model_ref: "names".into(),
             rows: vec![serde_json::json!({ "name": "O'Brien" })],
         };
-        let sql = fixture_to_sql(&fixture).unwrap();
+        let sql = fixture_to_sql(&fixture, &standard()).unwrap();
         assert!(sql.contains("O''Brien")); // escaped single quote
     }
 
@@ -249,7 +273,7 @@ mod tests {
                 serde_json::json!({ "id": 2, "email": "a@b.com" }),
             ],
         };
-        let sql = fixture_to_sql(&fixture).unwrap();
+        let sql = fixture_to_sql(&fixture, &standard()).unwrap();
 
         // Union column order is sorted: email before id.
         let selects: Vec<&str> = sql.split("UNION ALL").collect();
@@ -275,7 +299,7 @@ mod tests {
             model_ref: "users".into(),
             rows: vec![serde_json::json!({ "id": 1, "email": serde_json::Value::Null })],
         };
-        let sql = fixture_to_sql(&fixture).unwrap();
+        let sql = fixture_to_sql(&fixture, &standard()).unwrap();
         assert!(sql.contains("NULL AS email"));
         assert!(sql.contains("1 AS id"));
     }
@@ -286,6 +310,6 @@ mod tests {
             model_ref: "empty".into(),
             rows: vec![serde_json::json!({})],
         };
-        assert!(fixture_to_sql(&fixture).is_none());
+        assert!(fixture_to_sql(&fixture, &standard()).is_none());
     }
 }

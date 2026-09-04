@@ -2147,3 +2147,101 @@ mod tests {
         }
     }
 }
+
+/// A stub dialect for this crate's own literal-encoding tests.
+///
+/// A real adapter dialect cannot stand in here: a dev-dependency on an
+/// adapter crate links a second instance of `rocky-core`, so its dialect
+/// implements that instance's `SqlDialect`, not this one's. The stub answers
+/// the lexer fact it is built with and the handful of methods a SQL
+/// generator calls; the real dialects are exercised in the adapter crates.
+#[cfg(test)]
+pub(crate) mod test_dialects {
+    use super::{AdapterError, AdapterResult, LiteralEscape, SqlDialect};
+
+    /// A dialect that answers exactly the lexer rule it carries.
+    pub(crate) struct StubDialect(pub(crate) LiteralEscape);
+
+    impl SqlDialect for StubDialect {
+        fn literal_escape(&self) -> LiteralEscape {
+            self.0
+        }
+
+        fn format_table_ref(
+            &self,
+            catalog: &str,
+            schema: &str,
+            table: &str,
+        ) -> AdapterResult<String> {
+            rocky_sql::validation::format_table_ref(catalog, schema, table)
+                .map_err(AdapterError::new)
+        }
+
+        fn create_table_as(&self, target: &str, select_sql: &str) -> String {
+            format!("CREATE OR REPLACE TABLE {target} AS\n{select_sql}")
+        }
+
+        fn insert_into(&self, target: &str, select_sql: &str) -> String {
+            format!("INSERT INTO {target}\n{select_sql}")
+        }
+
+        fn merge_into(
+            &self,
+            _target: &str,
+            _source_sql: &str,
+            _keys: &[std::sync::Arc<str>],
+            _update_cols: &rocky_ir::ColumnSelection,
+        ) -> AdapterResult<String> {
+            unimplemented!("not reached by literal-encoding tests")
+        }
+
+        fn select_clause(
+            &self,
+            _columns: &rocky_ir::ColumnSelection,
+            _metadata: &[rocky_ir::MetadataColumn],
+        ) -> AdapterResult<String> {
+            unimplemented!("not reached by literal-encoding tests")
+        }
+
+        fn watermark_where(
+            &self,
+            _timestamp_col: &str,
+            _last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
+        ) -> AdapterResult<String> {
+            unimplemented!("not reached by literal-encoding tests")
+        }
+
+        fn describe_table_sql(&self, table_ref: &str) -> String {
+            format!("DESCRIBE TABLE {table_ref}")
+        }
+
+        fn drop_table_sql(&self, table_ref: &str) -> String {
+            format!("DROP TABLE IF EXISTS {table_ref}")
+        }
+
+        fn create_catalog_sql(&self, _name: &str) -> Option<AdapterResult<String>> {
+            None
+        }
+
+        fn create_schema_sql(
+            &self,
+            _catalog: &str,
+            _schema: &str,
+        ) -> Option<AdapterResult<String>> {
+            None
+        }
+
+        fn tablesample_clause(&self, _percent: u32) -> Option<String> {
+            None
+        }
+
+        fn insert_overwrite_partition(
+            &self,
+            _target: &str,
+            _partition_filter: &str,
+            _select_sql: &str,
+        ) -> AdapterResult<Vec<String>> {
+            unimplemented!("not reached by literal-encoding tests")
+        }
+    }
+}
