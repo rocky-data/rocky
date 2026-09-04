@@ -378,21 +378,20 @@ pub fn reject_statement_terminator(context: &str, sql: &str) -> Result<(), Valid
 
 /// Refuses a value Rocky cannot safely wrap in a `'…'` SQL literal.
 ///
-/// Rocky encodes a config-supplied string constant — a declarative check's
-/// `accepted_values`, for instance — by doubling single quotes. That is enough
-/// only where `''` is the *only* escape. Snowflake, DuckDB and BigQuery also
-/// honour a backslash escape, so a value ending in `\` escapes the first quote
-/// of the `''` pair Rocky emits and the second quote closes the literal — the
-/// bypass `rocky-snowflake/src/governance.rs` documents for tag values.
+/// Doubling single quotes encodes a string constant correctly only where `''`
+/// is the *only* escape. Snowflake, Databricks and BigQuery also read a
+/// backslash escape, so a value ending in `\` escapes the first quote of the
+/// `''` pair and the second quote closes the literal.
 ///
-/// Escaping backslashes as well closes the bypass on those three but changes the
-/// *value* on Trino and standard-SQL DuckDB, where a doubled backslash is two
-/// literal backslashes. No single encoding is correct everywhere, and these call
-/// sites have no dialect to ask. So a backslash is refused and the author is
-/// told which value to change.
+/// Escaping backslashes as well would change the *value* on Trino and DuckDB,
+/// where a backslash stands for itself. No single encoding is correct without
+/// knowing the dialect, so a caller that has none refuses a backslash and
+/// tells the author which value to change.
 ///
-/// The proper fix is dialect-owned literal encoding or parameter binding at
-/// these call sites; this is the cheap, sound guard until that lands.
+/// Every sink with a dialect in hand encodes through
+/// [`crate::literal::encode_string_literal`] instead and needs no guard. The
+/// one remaining caller is the dialect-less `generate_test_sql` in
+/// `rocky-core`, kept for callers that cannot name a dialect.
 ///
 /// # Errors
 ///
