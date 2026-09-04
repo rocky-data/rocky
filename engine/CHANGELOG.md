@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`rocky load` now reports a required column whose type it could not compare.** The load contract gate normalises the landed type (from a live `DESCRIBE` of the staging table) and the contract's declared type into Rocky's type vocabulary. A type string outside that map, on either side, became `Unknown`, and `Unknown` was assignable to and from anything, so the column satisfied whatever the contract declared and staging was promoted with nothing said. The gate now reports such a column in `ContractResult.warnings`, naming the column, the landed type and the declared type, and saying which side Rocky did not recognise. The warning reaches stderr as a log line and `--output json` under `files[].contract.warnings`. It does not change `passed`, so a load that promoted before still promotes; presence and nullability are checked as before. The matcher behind the gate also stops treating `Unknown` as a match, so a future caller that skips the branch gets a violation rather than a silent pass. The same shape was closed on the compile-time gate in 1.73.0 (`I003`, #1240). (#1614)
+
 ## [1.73.0] — 2026-09-03
 
 ### Added

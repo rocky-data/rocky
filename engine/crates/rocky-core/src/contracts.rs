@@ -28,8 +28,9 @@ pub struct RequiredColumn {
     /// `VARCHAR`, `NUMBER(38,0)`). It is normalized to a portable Rocky type
     /// before comparison, so the same contract ports across warehouses
     /// (DuckDB `VARCHAR` and Snowflake `STRING` both match). A type the
-    /// normalizer doesn't recognize is treated as unknown and never fails the
-    /// type check — presence and nullability still apply.
+    /// normalizer does not recognise is never compared: the load gate reports
+    /// the column in `ContractResult::warnings` instead, and the type check
+    /// neither passes nor fails it — presence and nullability still apply.
     #[serde(rename = "type")]
     pub data_type: String,
     #[serde(default = "default_true")]
@@ -53,7 +54,9 @@ pub struct ContractResult {
     pub passed: bool,
     pub violations: Vec<ContractViolation>,
     /// Non-fatal warnings — e.g. a contract clause that can't be
-    /// meaningfully enforced in this context. Does not affect `passed`.
+    /// meaningfully enforced in this context, or a required column whose
+    /// type Rocky could not compare because the landed or the declared type
+    /// string is outside its type map. Does not affect `passed`.
     #[serde(default)]
     pub warnings: Vec<String>,
 }
@@ -176,8 +179,10 @@ pub fn validate_contract(
 ///   a violation is emitted only when both normalize to a *known* type and the
 ///   landed type is not assignable to (does not fit within) the expected type.
 ///   So a narrower landed type (`INT32`) satisfies a wider contract (`BIGINT`),
-///   but not the reverse. If either side normalizes to [`RockyType::Unknown`],
-///   the match is skipped (never a false failure).
+///   but not the reverse. If either side normalizes to [`RockyType::Unknown`]
+///   the column cannot be compared: it is reported in `warnings`, naming the
+///   column and both raw type strings, and is neither a violation nor a
+///   silent pass (#1614).
 ///
 /// `protected_columns` and `allowed_type_changes` describe source-vs-target
 /// *evolution*, which a single-table load can't meaningfully evaluate (there
@@ -216,9 +221,29 @@ pub fn validate_contract_typed(
         }
 
         // Type match — best-effort in Rocky's type vocabulary.
+        //
+        // `Unknown` is decided here, before the matcher runs. Until #1614 a
+        // type string outside `warehouse_type_to_rocky`'s map — on either
+        // side — became `Unknown`, and `is_assignable` treats `Unknown` as
+        // assignable to and from anything, so the column satisfied whatever
+        // the contract declared and staging was promoted with nothing said.
+        // The same shape was closed on the compile-time gate in #1240 (I003).
+        // This gate has no info channel, so the report goes to `warnings`:
+        // it names the column and both raw type strings, and does not touch
+        // `passed`, because "could not compare" is not "does not conform".
         let landed_ty = warehouse_type_to_rocky(&col.data_type);
         let expected_ty = warehouse_type_to_rocky(&req.data_type);
-        if !landed_type_conforms(&landed_ty, &expected_ty) {
+        let landed_unknown = landed_ty == RockyType::Unknown;
+        let expected_unknown = expected_ty == RockyType::Unknown;
+        if landed_unknown || expected_unknown {
+            warnings.push(unchecked_type_warning(
+                &req.name,
+                &col.data_type,
+                &req.data_type,
+                landed_unknown,
+                expected_unknown,
+            ));
+        } else if !landed_type_conforms(&landed_ty, &expected_ty) {
             violations.push(ContractViolation {
                 rule: "required_column_type".to_string(),
                 column: req.name.clone(),
@@ -261,8 +286,10 @@ pub fn validate_contract_typed(
 /// (not rocky-compiler) so the runtime load path can reach it without a
 /// dependency cycle; [`RockyType`] is shared via rocky-ir.
 ///
-/// Unrecognized types map to [`RockyType::Unknown`] (which matches anything),
-/// so a type the map doesn't cover never produces a false failure.
+/// Unrecognized types map to [`RockyType::Unknown`]. [`validate_contract_typed`]
+/// reports such a column in its warnings instead of comparing it, so a type
+/// the map doesn't cover never produces a false failure — and, since #1614,
+/// never passes silently either.
 pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
     let upper = warehouse_type.trim().to_uppercase();
     match upper.as_str() {
@@ -319,9 +346,41 @@ pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
 /// narrower landed type (e.g. `INT32`) satisfies a wider contract (`BIGINT`),
 /// but a wider landed type does not satisfy a narrower contract. Decimal
 /// assignments must preserve fractional scale and integer-digit capacity.
-/// `Unknown` on either side passes to avoid a false failure.
+///
+/// `Unknown` on either side is *not* a match. [`validate_contract_typed`]
+/// branches on `Unknown` before calling this, so that arm is unreachable
+/// from there; it answers "no" so a future caller that forgets the branch
+/// gets a violation, not a silent pass. (`is_assignable` itself treats
+/// `Unknown` as assignable both ways — correct for the compiler's
+/// best-effort inference, wrong for a gate.)
 fn landed_type_conforms(landed: &RockyType, expected: &RockyType) -> bool {
+    if *landed == RockyType::Unknown || *expected == RockyType::Unknown {
+        return false;
+    }
     is_assignable(landed, expected)
+}
+
+/// The warning for a required column whose type could not be compared.
+/// Names the column and both raw type strings, and says which side Rocky
+/// did not recognise, so the reader can fix the contract or extend the map.
+fn unchecked_type_warning(
+    column: &str,
+    landed_type: &str,
+    declared_type: &str,
+    landed_unknown: bool,
+    declared_unknown: bool,
+) -> String {
+    let which = match (landed_unknown, declared_unknown) {
+        (true, true) => "Rocky recognises neither type",
+        (true, false) => "Rocky does not recognise the landed type",
+        (false, true) => "Rocky does not recognise the declared type",
+        (false, false) => unreachable!("only called when at least one side is Unknown"),
+    };
+    format!(
+        "column '{column}' landed as '{landed_type}' and the contract declares '{declared_type}'; \
+         {which}, so the declared type was not checked. Presence and nullability were checked. \
+         The load was not refused for this."
+    )
 }
 
 #[cfg(test)]
@@ -566,6 +625,11 @@ mod tests {
         let landed = vec![col_n("id", "BIGINT", true), col_n("name", "VARCHAR", true)];
         let result = validate_contract_typed(&contract, &landed);
         assert!(result.passed, "violations: {:?}", result.violations);
+        assert!(
+            result.warnings.is_empty(),
+            "known, matching types must not warn: {:?}",
+            result.warnings
+        );
     }
 
     #[test]
@@ -685,9 +749,11 @@ mod tests {
         }
     }
 
+    /// A landed type outside Rocky's map cannot be compared, so it must not
+    /// produce a type violation — and it must not pass silently either. Until
+    /// #1614 this test pinned the fail-open: it asserted only `passed`.
     #[test]
-    fn test_typed_unknown_type_never_fails() {
-        // An un-normalizable landed type must not produce a type violation.
+    fn test_typed_unknown_landed_type_is_reported_not_passed_silently() {
         let contract = ContractConfig {
             required_columns: vec![RequiredColumn {
                 name: "geo".into(),
@@ -699,6 +765,76 @@ mod tests {
         let landed = vec![col_n("geo", "GEOMETRY", true)];
         let result = validate_contract_typed(&contract, &landed);
         assert!(result.passed, "violations: {:?}", result.violations);
+        assert!(result.violations.is_empty());
+        assert_eq!(
+            result.warnings.len(),
+            1,
+            "exactly one warning for the unchecked column: {:?}",
+            result.warnings
+        );
+        let w = &result.warnings[0];
+        assert!(
+            w.contains("'geo'") && w.contains("'GEOMETRY'") && w.contains("'BIGINT'"),
+            "the warning must name the column, the landed type and the declared type: {w}"
+        );
+    }
+
+    /// The declared side has the same hole: a contract type string the
+    /// normalizer does not know must be reported, not matched to anything.
+    #[test]
+    fn test_typed_unknown_declared_type_is_reported_not_passed_silently() {
+        let contract = ContractConfig {
+            required_columns: vec![RequiredColumn {
+                name: "id".into(),
+                data_type: "SOMETHING_WEIRD".into(),
+                nullable: true,
+            }],
+            ..Default::default()
+        };
+        let landed = vec![col_n("id", "BIGINT", true)];
+        let result = validate_contract_typed(&contract, &landed);
+        assert!(result.passed, "violations: {:?}", result.violations);
+        assert_eq!(result.warnings.len(), 1, "warnings: {:?}", result.warnings);
+        let w = &result.warnings[0];
+        assert!(
+            w.contains("'id'") && w.contains("'SOMETHING_WEIRD'") && w.contains("'BIGINT'"),
+            "the warning must name the column, the declared type and the landed type: {w}"
+        );
+    }
+
+    /// Both sides unrecognised is one unchecked column, so one warning.
+    #[test]
+    fn test_typed_both_types_unknown_reported_once() {
+        let contract = ContractConfig {
+            required_columns: vec![RequiredColumn {
+                name: "geo".into(),
+                data_type: "GEOM".into(),
+                nullable: true,
+            }],
+            ..Default::default()
+        };
+        let landed = vec![col_n("geo", "GEOMETRY", true)];
+        let result = validate_contract_typed(&contract, &landed);
+        assert!(result.passed, "violations: {:?}", result.violations);
+        assert_eq!(result.warnings.len(), 1, "warnings: {:?}", result.warnings);
+        let w = &result.warnings[0];
+        assert!(
+            w.contains("'geo'") && w.contains("'GEOMETRY'") && w.contains("'GEOM'"),
+            "the warning must name the column and both type strings: {w}"
+        );
+    }
+
+    /// The matcher must answer "not a match" for `Unknown` on either side.
+    /// `validate_contract_typed` branches on `Unknown` before calling it, so
+    /// this arm is unreachable from there today; it exists so a future caller
+    /// that forgets the branch gets a violation, not a silent pass.
+    #[test]
+    fn test_landed_type_conforms_rejects_unknown_on_either_side() {
+        assert!(!landed_type_conforms(&RockyType::Unknown, &RockyType::Int64));
+        assert!(!landed_type_conforms(&RockyType::Int64, &RockyType::Unknown));
+        assert!(!landed_type_conforms(&RockyType::Unknown, &RockyType::Unknown));
+        // Sanity: known widening still conforms.
+        assert!(landed_type_conforms(&RockyType::Int32, &RockyType::Int64));
     }
 
     #[test]
