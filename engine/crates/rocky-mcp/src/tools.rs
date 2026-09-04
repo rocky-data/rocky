@@ -1507,6 +1507,7 @@ impl RockyMcpServer {
             attempts: Some(drafted.attempts),
             message: None,
             unverified_types: drafted.unverified_types,
+            unmatched_columns: drafted.unmatched_columns,
         }))
     }
 

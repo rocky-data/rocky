@@ -73,6 +73,12 @@ pub struct DraftedContract {
     /// is not evidence the types are right (#1618). Empty when every
     /// declared type was actually checked.
     pub unverified_types: Vec<String>,
+    /// Optional columns the draft declares that the model does not produce.
+    ///
+    /// `W010`, dropped by the same error-only filter. A required column that
+    /// is missing fails the draft as `E010`; an optional one only warns, so
+    /// an LLM that invented a column name was never contradicted.
+    pub unmatched_columns: Vec<String>,
 }
 
 /// Map a Rocky `Display` type rendering (e.g. `INT64`, `DECIMAL(10,2)`) to the
@@ -209,6 +215,9 @@ struct VerifiedContract {
     /// `I003` messages: declared types the compiler did not compare because it
     /// could not infer the column's own type.
     unverified_types: Vec<String>,
+    /// `W010` messages: optional columns the draft declares that the model
+    /// does not produce.
+    unmatched_columns: Vec<String>,
 }
 
 fn verify_contract_toml(
@@ -233,18 +242,30 @@ fn verify_contract_toml(
         return Err(errors.join("\n"));
     }
 
-    // Carried, not dropped. An `I003` says a declared type was accepted
-    // without being compared, which is not the same as a type that checked
-    // out, and the caller has no other way to tell the two apart (#1618).
-    let unverified_types: Vec<String> = diagnostics
-        .iter()
-        .filter(|d| &*d.code == rocky_compiler::diagnostic::I003)
-        .map(|d| d.message.to_string())
-        .collect();
+    // Carried, not dropped. `validate_contract` emits exactly two diagnostics
+    // that do not fail this loop, and both mean the draft was accepted with
+    // something unconfirmed:
+    //
+    //   I003  the declared type was never compared, because Rocky could not
+    //         infer the column's own type
+    //   W010  the draft declares an OPTIONAL column the model does not
+    //         produce (a required one fails as E010)
+    //
+    // Every other code it emits is error severity and has already returned
+    // above. Without these two, a caller cannot tell a verified draft from
+    // one nothing checked (#1618).
+    let collect_code = |code: &str| -> Vec<String> {
+        diagnostics
+            .iter()
+            .filter(|d| &*d.code == code)
+            .map(|d| d.message.to_string())
+            .collect()
+    };
 
     Ok(VerifiedContract {
         contract,
-        unverified_types,
+        unverified_types: collect_code(rocky_compiler::diagnostic::I003),
+        unmatched_columns: collect_code(rocky_compiler::diagnostic::W010),
     })
 }
 
@@ -290,6 +311,7 @@ pub async fn draft_contract(
                     toml,
                     attempts: attempt,
                     unverified_types: verified.unverified_types,
+                    unmatched_columns: verified.unmatched_columns,
                 });
             }
             Err(errors) => {
@@ -459,6 +481,41 @@ protected = ["id"]
             verified.unverified_types.is_empty(),
             "every declared type was checked against a known column type: {:?}",
             verified.unverified_types
+        );
+        assert!(
+            verified.unmatched_columns.is_empty(),
+            "every declared column exists in the model: {:?}",
+            verified.unmatched_columns
+        );
+    }
+
+    /// The same error-only filter drops `W010`: an OPTIONAL column the draft
+    /// declares that the model does not produce. A required one fails as
+    /// `E010`, so only this arm was silent — and an LLM that invented a
+    /// column name was never contradicted.
+    #[test]
+    fn verify_reports_a_declared_column_the_model_does_not_produce() {
+        let schema = vec![tc("id", RockyType::Int64, false)];
+        let toml_body = r#"
+[[columns]]
+name = "id"
+type = "Int64"
+
+[[columns]]
+name = "invented"
+type = "String"
+"#;
+        let verified = verify_contract_toml(toml_body, "orders", &schema).expect("should verify");
+        assert_eq!(
+            verified.unmatched_columns.len(),
+            1,
+            "expected one unmatched column: {:?}",
+            verified.unmatched_columns
+        );
+        assert!(
+            verified.unmatched_columns[0].contains("invented"),
+            "the message must name the column: {}",
+            verified.unmatched_columns[0]
         );
     }
 

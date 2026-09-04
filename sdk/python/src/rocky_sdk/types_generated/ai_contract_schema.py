@@ -56,6 +56,12 @@ class AiContractOutput(BaseModel):
     """
     Path the contract was written to, when `--save` was passed.
     """
+    unmatched_columns: list[str] | None = None
+    """
+    Optional columns the draft declares that the model does not produce.
+
+    `W010`, dropped by the same error-only filter as `unverified_types`. A required column that is missing fails the draft outright (`E010`); an optional one only warns, so a drafted column name the model never emits went unreported. Empty when every declared column exists.
+    """
     unverified_types: list[str] | None = None
     """
     Declared column types the compiler could NOT check, one message each.

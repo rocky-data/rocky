@@ -518,6 +518,7 @@ pub async fn run_ai_contract(
             saved_path: saved_path.clone(),
             profile: profile_out,
             unverified_types: drafted.unverified_types.clone(),
+            unmatched_columns: drafted.unmatched_columns.clone(),
         };
         print_json(&output)?;
     } else {
@@ -527,6 +528,16 @@ pub async fn run_ai_contract(
             println!("Wrote: {path}");
         }
         // Said out loud, because the draft otherwise reads as verified.
+        if !drafted.unmatched_columns.is_empty() {
+            println!();
+            println!(
+                "{} declared column(s) are NOT produced by the model:",
+                drafted.unmatched_columns.len()
+            );
+            for message in &drafted.unmatched_columns {
+                println!("  - {message}");
+            }
+        }
         if !drafted.unverified_types.is_empty() {
             println!();
             println!(

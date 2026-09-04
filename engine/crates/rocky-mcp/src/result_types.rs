@@ -692,6 +692,14 @@ pub struct AiContractResult {
     /// Empty when every declared type was actually checked.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unverified_types: Vec<String>,
+    /// Optional columns the draft declares that the model does not produce.
+    ///
+    /// `W010`, dropped by the same error-only filter as `unverified_types`.
+    /// A missing REQUIRED column fails the draft (`E010`); an optional one
+    /// only warns, so a drafted column the model never emits went
+    /// unreported. Empty when every declared column exists.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmatched_columns: Vec<String>,
 }
 
 /// One generated test assertion in an `ai_test` result.
