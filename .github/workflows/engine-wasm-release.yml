@@ -149,10 +149,20 @@ jobs:
       - name: Archive WASM package
         run: tar czf rocky-wasm.tar.gz -C crates/rocky-wasm/pkg .
 
+      # Upload with `gh` rather than a release action: the pinned
+      # softprops/action-gh-release finalizes an existing draft after it
+      # uploads (it clears `draft` unless `draft: true` is passed), which
+      # would make the release public before the npm publish below has run.
+      # `gh release upload` touches assets only. Same mechanism the engine,
+      # sdk, dagster and vscode workflows use.
       - name: Attach to GitHub Release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
-        with:
-          files: engine/rocky-wasm.tar.gz
+        working-directory: engine
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" rocky-wasm.tar.gz \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
 
       # Guard inline so the step never parses `secrets.*` in a step-level
       # `if:` (disallowed on public repos) and never depends on step-env
