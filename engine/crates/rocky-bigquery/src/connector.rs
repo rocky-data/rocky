@@ -1,5 +1,6 @@
 //! BigQuery REST API connector — jobs.query + jobs.getQueryResults.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -501,6 +502,134 @@ impl BigQueryAdapter {
         })
     }
 
+    /// Fetch every remaining page for a completed query response.
+    ///
+    /// BigQuery's `maxResults` is a per-page limit. A non-empty
+    /// `pageToken` means the response is incomplete even when
+    /// `jobComplete=true`, so returning the first page would silently
+    /// truncate callers such as content-addressed materialization.
+    async fn collect_query_pages(
+        &self,
+        mut response: BigQueryResponse,
+    ) -> Result<BigQueryResponse, BigQueryError> {
+        let Some(mut page_token) = response.page_token.take().filter(|t| !t.is_empty()) else {
+            return response.validate_row_count();
+        };
+        let job_id = response
+            .job_reference
+            .as_ref()
+            .map(|r| r.job_id.clone())
+            .ok_or_else(|| BigQueryError::ApiError {
+                status: "missing jobReference".into(),
+                message: "BigQuery returned a pageToken without a jobReference; cannot fetch the remaining query results".into(),
+            })?;
+        let token = self.auth.get_token(&self.client).await?;
+        let url = format!(
+            "{}/bigquery/v2/projects/{}/queries/{job_id}",
+            self.base_url(),
+            self.project_id,
+        );
+        let mut seen = HashSet::new();
+
+        loop {
+            if !seen.insert(page_token.clone()) {
+                return Err(BigQueryError::ApiError {
+                    status: "repeated pageToken".into(),
+                    message: "BigQuery repeated a query-results pageToken; refusing to loop or return an incomplete result".into(),
+                });
+            }
+
+            let mut page = self
+                .fetch_query_result_page(&url, &token, &page_token)
+                .await?;
+            if !page.job_complete {
+                return Err(BigQueryError::ApiError {
+                    status: "incomplete query-results page".into(),
+                    message: "BigQuery returned jobComplete=false while paging a completed query"
+                        .into(),
+                });
+            }
+            page.check_job_error()?;
+            if response.schema.is_none() {
+                response.schema = page.schema.take();
+            }
+            if let Some(mut rows) = page.rows.take() {
+                response.rows.get_or_insert_with(Vec::new).append(&mut rows);
+            }
+
+            match page.page_token.take().filter(|t| !t.is_empty()) {
+                Some(next) => page_token = next,
+                None => return response.validate_row_count(),
+            }
+        }
+    }
+
+    /// Fetch one result page with the connector's bounded transient retry
+    /// policy. A flaky page must not force a full query resubmission, which is
+    /// especially important for content-addressed model runs.
+    async fn fetch_query_result_page(
+        &self,
+        url: &str,
+        token: &str,
+        page_token: &str,
+    ) -> Result<BigQueryResponse, BigQueryError> {
+        for attempt in 0..=self.retry.max_retries {
+            let result = async {
+                let resp = self
+                    .client
+                    .get(url)
+                    .bearer_auth(token)
+                    .query(&[
+                        ("location", self.location.as_str()),
+                        ("maxResults", "10000"),
+                        ("pageToken", page_token),
+                    ])
+                    .send()
+                    .await?;
+
+                if !resp.status().is_success() {
+                    let status = resp.status().to_string();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(BigQueryError::ApiError {
+                        status,
+                        message: body,
+                    });
+                }
+
+                Ok(resp.json().await?)
+            }
+            .await;
+
+            match result {
+                Ok(page) => {
+                    if attempt > 0 {
+                        rocky_observe::metrics::METRICS.inc_retries_succeeded();
+                    }
+                    return Ok(page);
+                }
+                Err(err) if attempt < self.retry.max_retries && is_transient(&err) => {
+                    if !self.retry_budget.try_consume() {
+                        let limit = self.retry_budget.total().unwrap_or(0);
+                        return Err(BigQueryError::RetryBudgetExhausted { limit });
+                    }
+                    rocky_observe::metrics::METRICS.inc_retries_attempted();
+                    let backoff_ms = compute_backoff(&self.retry, attempt);
+                    warn!(
+                        attempt = attempt + 1,
+                        max_retries = self.retry.max_retries,
+                        backoff_ms,
+                        error = %err,
+                        "transient BigQuery result-page error, retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        unreachable!("retry loop should always return")
+    }
+
     /// Fetch the full `Job` resource for a completed job ID and return
     /// its `configuration.query.destinationTable` reference.
     ///
@@ -939,6 +1068,10 @@ impl WarehouseAdapter for BigQueryAdapter {
 
     async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
         let response = self.run_query(sql).await.map_err(AdapterError::new)?;
+        let response = self
+            .collect_query_pages(response)
+            .await
+            .map_err(AdapterError::new)?;
 
         let columns: Vec<String> = response
             .schema
@@ -1573,6 +1706,10 @@ struct BigQueryResponse {
     #[allow(dead_code)]
     #[serde(default)]
     total_rows: Option<String>,
+    /// Token for the next page of query rows. A non-empty token means this
+    /// response is incomplete even when `jobComplete=true`.
+    #[serde(default)]
+    page_token: Option<String>,
     /// Top-level `totalBytesProcessed` from the `jobs.query` /
     /// `jobs.getQueryResults` response shape (decimal-encoded int64).
     /// Set on every successful query job. **Note:** the synchronous
@@ -1613,6 +1750,28 @@ struct BigQueryResponse {
 }
 
 impl BigQueryResponse {
+    /// Refuse a response whose advertised total does not match the rows
+    /// collected after pagination. BigQuery encodes `totalRows` as a decimal
+    /// string; an absent or malformed value remains best-effort metadata.
+    fn validate_row_count(self) -> Result<Self, BigQueryError> {
+        if let Some(expected) = self
+            .total_rows
+            .as_deref()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            let actual = self.rows.as_ref().map_or(0, |rows| rows.len() as u64);
+            if actual != expected {
+                return Err(BigQueryError::ApiError {
+                    status: "incomplete query result".into(),
+                    message: format!(
+                        "BigQuery advertised {expected} total row(s), but Rocky received {actual}"
+                    ),
+                });
+            }
+        }
+        Ok(self)
+    }
+
     /// Map a top-level `errors[]` on a completed job to a
     /// [`BigQueryError::JobError`], so an async job failure surfaces as an
     /// error instead of an empty result set. No-op when `errors` is absent
