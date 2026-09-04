@@ -76,7 +76,12 @@ from .derived_models import (
     build_model_specs,
     split_model_specs_by_partition_shape,
 )
-from .freshness import freshness_policy_from_checks, per_model_freshness_policies
+from .freshness import (
+    FRESHNESS_CHECK_NAME,
+    freshness_is_configured,
+    freshness_policy_from_checks,
+    per_model_freshness_policies,
+)
 from .observability import (
     ANOMALY_CHECK_NAME,
     COMPLIANCE_CHECK_NAME,
@@ -193,10 +198,17 @@ EMPTY_FOR_PARTITION_METADATA_KEY: str = "rocky/empty_for_partition"
 #: ``row_count_anomaly`` check is emitted with severity WARN whenever Rocky
 #: detects a row-count deviation above its anomaly threshold; the other
 #: three are pass/fail with severity ERROR.
+#:
+#: ``freshness`` is conditional: the engine emits a ``freshness`` result only
+#: when the pipeline declares ``[checks.freshness]``, so
+#: :func:`_build_check_specs` declares that one spec only when
+#: :func:`~.freshness.freshness_is_configured` is ``True``. Declaring it
+#: unconditionally made :func:`_emit_placeholder_checks` report a check that
+#: never ran as ``passed=True`` on every materialized table (#1645).
 DEFAULT_CHECK_NAMES: tuple[str, ...] = (
     "row_count",
     "column_match",
-    "freshness",
+    FRESHNESS_CHECK_NAME,
     ANOMALY_CHECK_NAME,
 )
 
@@ -1476,9 +1488,22 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
                 for table, names in discover.checks.configured_checks.items()
             }
 
+        # `freshness` is declared only when the pipeline configures it. The
+        # engine gates its `freshness` CheckResult on `[checks.freshness]`
+        # (`run.rs`), so an unconditional spec would leave every materialized
+        # table with a placeholder that reads green for a check that never ran
+        # (#1645). Same predicate as the FreshnessPolicy above, so the badge
+        # and the policy cannot disagree.
+        #
+        # Caveat: this reads the CACHED discover state. Adding
+        # `[checks.freshness]` to `rocky.toml` without refreshing the state
+        # leaves the spec undeclared, and `_emit_results` drops an undeclared
+        # check — refresh the state after changing `[checks]`. The
+        # `configured_checks` surface below has the same property.
         check_specs = _build_check_specs(
             groups,
             contract_rules_by_model,
+            declare_freshness=freshness_is_configured(discover.checks),
             surface_compliance=self.surface_compliance,
             configured_checks_by_model=configured_checks_by_model,
             partitions_def=tenant_partitions_def,
@@ -2239,15 +2264,28 @@ def _build_check_specs(
     groups: list[_GroupBuild],
     contract_rules_by_model: dict[str, ContractRules] | None = None,
     *,
+    declare_freshness: bool,
     surface_compliance: bool = False,
     configured_checks_by_model: dict[str, list[str]] | None = None,
     partitions_def: dg.PartitionsDefinition | None = None,
 ) -> list[dg.AssetCheckSpec]:
     """Pre-declare check specs for every asset in every group.
 
-    Always emits the four ``DEFAULT_CHECK_NAMES`` per asset (row_count,
-    column_match, freshness, row_count_anomaly). When
-    ``contract_rules_by_model`` is provided, additionally emits one
+    Emits the ``DEFAULT_CHECK_NAMES`` per asset (row_count, column_match,
+    freshness, row_count_anomaly), minus ``freshness`` when
+    ``declare_freshness`` is ``False``.
+
+    ``declare_freshness`` is required — there is no default — because the
+    wrong answer is silent. The engine emits a ``freshness`` result only when
+    the pipeline declares ``[checks.freshness]``; pass
+    :func:`~.freshness.freshness_is_configured` of the discover projection.
+    Declared-but-never-produced made :func:`_emit_placeholder_checks` report
+    ``passed=True`` on every materialized table (#1645). The other two
+    switchable defaults (``row_count`` / ``column_match``) cannot be gated the
+    same way yet: ``ChecksConfigOutput`` exposes no toggle for them, so Dagster
+    has no way to know they were switched off.
+
+    When ``contract_rules_by_model`` is provided, additionally emits one
     AssetCheckSpec per declared contract rule kind for assets whose
     table name matches a key in the map. The contract specs are gated
     on the presence of the matching rule kind in the contract file
@@ -2307,8 +2345,10 @@ def _build_check_specs(
 
     for group in groups:
         for spec in group.specs:
-            # Default checks (4 per asset)
+            # Default checks (4 per asset, 3 without a freshness config)
             for check_name in DEFAULT_CHECK_NAMES:
+                if check_name == FRESHNESS_CHECK_NAME and not declare_freshness:
+                    continue
                 _add(
                     dg.AssetCheckSpec(
                         name=check_name, asset=spec.key, partitions_def=partitions_def

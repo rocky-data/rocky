@@ -24,6 +24,34 @@ from .types import ChecksConfig
 if TYPE_CHECKING:
     from .types import CompileResult, ModelFreshnessConfig
 
+#: Name of the built-in freshness check. The engine emits a ``CheckResult``
+#: under this exact name, and only when the pipeline declares
+#: ``[checks.freshness]`` — see :func:`freshness_is_configured`.
+FRESHNESS_CHECK_NAME: str = "freshness"
+
+
+def freshness_is_configured(checks: ChecksConfig | None) -> bool:
+    """Return ``True`` when the pipeline declares ``[checks.freshness]``.
+
+    This is the single predicate for "the engine will emit a ``freshness``
+    ``CheckResult`` for this pipeline". Two consumers depend on it:
+
+    * :func:`freshness_policy_from_checks` attaches a
+      :class:`dagster.FreshnessPolicy` only when it is ``True``;
+    * ``RockyComponent`` pre-declares the ``freshness``
+      :class:`dagster.AssetCheckSpec` only when it is ``True``.
+
+    Both must agree, so they read the same predicate. ``tests/test_freshness.py``
+    pins the equivalence.
+
+    ``checks`` is ``None`` in two cases, and both mean "no freshness":
+    the pipeline declares no ``[checks]`` block at all (the engine's
+    ``ChecksConfigOutput::from_engine`` returns ``None`` when there is neither a
+    freshness config nor a configured check), or the ``rocky`` binary predates
+    the ``checks`` projection in ``rocky discover``.
+    """
+    return checks is not None and checks.freshness is not None
+
 
 def freshness_policy_from_checks(checks: ChecksConfig | None) -> dg.FreshnessPolicy | None:
     """Build a Dagster ``FreshnessPolicy`` from Rocky's projected checks config.

@@ -1634,7 +1634,7 @@ def test_build_check_specs_dedupes_when_group_has_duplicate_specs():
     # Bypass the group-level dedup explicitly.
     group.specs = [spec, spec]
 
-    check_specs = component_module._build_check_specs([group])
+    check_specs = component_module._build_check_specs([group], declare_freshness=True)
 
     # Four DEFAULT_CHECK_NAMES once, not twice.
     assert len(check_specs) == len(component_module.DEFAULT_CHECK_NAMES)
