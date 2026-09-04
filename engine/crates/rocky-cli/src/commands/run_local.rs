@@ -503,6 +503,7 @@ pub async fn run_quality(
                                 name: "row_count".into(),
                                 passed: count > 0,
                                 severity: row_count_severity,
+                                not_evaluated: None,
                                 details: CheckDetails::RowCount {
                                     source_count: count,
                                     target_count: count,
@@ -514,6 +515,7 @@ pub async fn run_quality(
                                 name: "row_count".into(),
                                 passed: false,
                                 severity: row_count_severity,
+                                not_evaluated: None,
                                 details: CheckDetails::Custom {
                                     query: format!("SELECT COUNT(*) FROM {full_table}"),
                                     result_value: 0,
@@ -690,7 +692,7 @@ pub(crate) async fn run_custom_checks(
     full_table: &str,
     customs: &[rocky_core::config::CustomCheckConfig],
 ) -> Vec<rocky_core::checks::CheckResult> {
-    use rocky_core::checks::{CheckDetails, CheckResult, cell_as_u64};
+    use rocky_core::checks::cell_as_u64;
 
     let mut results = Vec::new();
     for custom in customs {
@@ -726,35 +728,78 @@ pub(crate) async fn run_custom_checks(
                             check = custom.name.as_str(),
                             "custom check returned no parseable count; failing the check"
                         );
-                        results.push(CheckResult {
-                            name: custom.name.clone(),
-                            passed: false,
-                            severity,
-                            details: CheckDetails::Custom {
-                                query: sql,
-                                result_value: 0,
-                                threshold: custom.threshold,
-                            },
-                        });
+                        let mut check = rocky_core::checks::custom_not_evaluated(
+                            &custom.name,
+                            &sql,
+                            custom.threshold,
+                            "the custom check query returned no readable count",
+                        );
+                        check.severity = severity;
+                        results.push(check);
                     }
                 }
             }
             Err(e) => {
                 warn!(error = %e, check = custom.name.as_str(), "custom check query failed");
-                results.push(CheckResult {
-                    name: custom.name.clone(),
-                    passed: false,
-                    severity,
-                    details: CheckDetails::Custom {
-                        query: sql,
-                        result_value: 0,
-                        threshold: custom.threshold,
-                    },
-                });
+                let mut check = rocky_core::checks::custom_not_evaluated(
+                    &custom.name,
+                    &sql,
+                    custom.threshold,
+                    format!("the custom check query failed: {e}"),
+                );
+                check.severity = severity;
+                results.push(check);
             }
         }
     }
     results
+}
+
+/// The not-evaluated results for every `[[checks.custom]]` entry, for a
+/// table the runner could not address at all (its reference failed to
+/// format). One result per custom check, so the tally stays complete.
+pub(crate) fn custom_checks_not_evaluated(
+    customs: &[rocky_core::config::CustomCheckConfig],
+    reason: &str,
+) -> Vec<rocky_core::checks::CheckResult> {
+    customs
+        .iter()
+        .map(|custom| {
+            let mut check = rocky_core::checks::custom_not_evaluated(
+                &custom.name,
+                &custom.sql,
+                custom.threshold,
+                reason,
+            );
+            check.severity = custom.severity;
+            check
+        })
+        .collect()
+}
+
+/// The not-evaluated results for every assertion declared on
+/// `table_unqualified`, for a table the runner could not address at all
+/// (its reference failed to format). Same selection as
+/// [`run_table_assertions`], so the two agree on which assertions a table
+/// owns.
+pub(crate) fn table_assertions_not_evaluated(
+    table_unqualified: &str,
+    assertions: &[rocky_core::config::QualityAssertion],
+    reason: &str,
+) -> Vec<rocky_core::checks::CheckResult> {
+    assertions
+        .iter()
+        .filter(|assertion| assertion.table.as_str() == table_unqualified)
+        .map(|assertion| {
+            rocky_core::checks::assertion_not_evaluated(
+                assertion.resolved_name(),
+                rocky_core::tests::test_type_kind(&assertion.test.test_type),
+                assertion.test.column.clone(),
+                assertion.test.severity,
+                reason,
+            )
+        })
+        .collect()
 }
 
 pub(crate) async fn run_table_assertions(
@@ -764,7 +809,7 @@ pub(crate) async fn run_table_assertions(
     table_unqualified: &str,
     assertions: &[rocky_core::config::QualityAssertion],
 ) -> Vec<rocky_core::checks::CheckResult> {
-    use rocky_core::checks::{CheckDetails, CheckResult};
+    use rocky_core::checks::{CheckDetails, CheckResult, assertion_not_evaluated};
     use rocky_core::tests::generate_test_sql_with_dialect;
 
     let mut results = Vec::new();
@@ -786,48 +831,55 @@ pub(crate) async fn run_table_assertions(
                     error = %e,
                     table = %full_table,
                     assertion = %name,
-                    "failed to generate assertion SQL — reporting the check as failed"
+                    "failed to generate assertion SQL — reporting the check as not evaluated"
                 );
-                results.push(CheckResult {
+                results.push(assertion_not_evaluated(
                     name,
-                    passed: false,
-                    severity: test.severity,
-                    details: CheckDetails::Assertion {
-                        kind: kind.to_string(),
-                        column: test.column.clone(),
-                        failing_rows: 0,
-                    },
-                });
+                    kind,
+                    test.column.clone(),
+                    test.severity,
+                    format!("could not generate the assertion SQL: {e}"),
+                ));
                 continue;
             }
         };
 
         match warehouse.execute_query(&sql).await {
-            Ok(result) => {
-                let (passed, failing_rows) = classify_assertion(&test.test_type, &result.rows);
-                results.push(CheckResult {
+            Ok(result) => match classify_assertion(&test.test_type, &result.rows) {
+                Some((passed, failing_rows)) => results.push(CheckResult {
                     name,
                     passed,
                     severity: test.severity,
+                    not_evaluated: None,
                     details: CheckDetails::Assertion {
                         kind: kind.to_string(),
                         column: test.column.clone(),
                         failing_rows,
                     },
-                });
-            }
+                }),
+                None => {
+                    // A count that does not parse is not a zero. Defaulting it
+                    // passed every count-based assertion whose result cell the
+                    // adapter rendered in a shape the parser did not read.
+                    warn!(table = %full_table, assertion = %name, "assertion query returned no readable count — reporting the check as not evaluated");
+                    results.push(assertion_not_evaluated(
+                        name,
+                        kind,
+                        test.column.clone(),
+                        test.severity,
+                        "the assertion query returned no readable count",
+                    ));
+                }
+            },
             Err(e) => {
                 warn!(error = %e, table = %full_table, assertion = %name, "assertion query failed");
-                results.push(CheckResult {
+                results.push(assertion_not_evaluated(
                     name,
-                    passed: false,
-                    severity: test.severity,
-                    details: CheckDetails::Assertion {
-                        kind: kind.to_string(),
-                        column: test.column.clone(),
-                        failing_rows: 0,
-                    },
-                });
+                    kind,
+                    test.column.clone(),
+                    test.severity,
+                    format!("the assertion query failed: {e}"),
+                ));
             }
         }
     }
@@ -842,20 +894,17 @@ pub(crate) async fn run_table_assertions(
 ///   violation; empty result passes. `failing_rows` is the row count.
 /// - `RowCountRange`: first cell is the total row count; pass/fail decided
 ///   by the caller against `min`/`max` (handled below).
+///
+/// Returns `None` when a count-based kind's first cell is absent or does not
+/// read as a non-negative integer. That is "could not evaluate", not zero
+/// failing rows: a defaulted 0 passed the assertion (#1602).
 fn classify_assertion(
     t: &rocky_core::tests::TestType,
     rows: &[Vec<serde_json::Value>],
-) -> (bool, u64) {
+) -> Option<(bool, u64)> {
     use rocky_core::tests::TestType;
-    let first_cell_u64 = || -> u64 {
-        rows.first()
-            .and_then(|r| r.first())
-            .and_then(|v| {
-                v.as_u64()
-                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-            })
-            .unwrap_or(0)
-    };
+    let first_cell_u64 =
+        || -> Option<u64> { rocky_core::checks::cell_as_u64(rows.first().and_then(|r| r.first())) };
     match t {
         // Count-based: first cell is the count of failing rows.
         TestType::NotNull
@@ -864,8 +913,8 @@ fn classify_assertion(
         | TestType::RegexMatch { .. }
         | TestType::NotInFuture
         | TestType::OlderThanNDays { .. } => {
-            let n = first_cell_u64();
-            (n == 0, n)
+            let n = first_cell_u64()?;
+            Some((n == 0, n))
         }
         // Row-set-based: every returned row is a violation.
         TestType::Unique
@@ -874,18 +923,18 @@ fn classify_assertion(
         | TestType::Relationships { .. }
         | TestType::Composite { .. } => {
             let n = rows.len() as u64;
-            (n == 0, n)
+            Some((n == 0, n))
         }
         TestType::RowCountRange { min, max } => {
-            let n = first_cell_u64();
+            let n = first_cell_u64()?;
             let within_min = min.map(|m| n >= m).unwrap_or(true);
             let within_max = max.map(|m| n <= m).unwrap_or(true);
-            (within_min && within_max, n)
+            Some((within_min && within_max, n))
         }
         // Aggregate: the test SQL returns a single 0/1 cell (0 = pass).
         TestType::Aggregate { .. } => {
-            let n = first_cell_u64();
-            (n == 0, n)
+            let n = first_cell_u64()?;
+            Some((n == 0, n))
         }
     }
 }
@@ -2365,7 +2414,14 @@ auto_create_schemas = true
             !results[0].passed,
             "an unparseable count must fail the check, not pass on a defaulted 0"
         );
+        assert_eq!(
+            results[0].not_evaluated.as_deref(),
+            Some("the custom check query returned no readable count"),
+            "{:?}",
+            results[0]
+        );
         assert!(results[1].passed, "a genuine 0 <= threshold still passes");
+        assert!(results[1].not_evaluated.is_none());
     }
 
     #[test]
@@ -2457,7 +2513,85 @@ auto_create_schemas = true
             !results[0].passed,
             "a refused check must not report as passed"
         );
+        assert!(
+            results[0]
+                .not_evaluated
+                .as_deref()
+                .is_some_and(|r| r.starts_with("could not generate the assertion SQL: ")),
+            "a refused check says why it did not run: {:?}",
+            results[0]
+        );
         assert!(results[1].passed);
+        assert!(results[1].not_evaluated.is_none());
+    }
+
+    /// A count-based assertion whose result cell does not parse used to read
+    /// as zero failing rows and pass (#1602). It is reported as not evaluated.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn an_assertion_count_that_does_not_parse_is_not_evaluated() {
+        use async_trait::async_trait;
+        use rocky_core::traits::{AdapterResult, QueryResult, SqlDialect, WarehouseAdapter};
+
+        /// Answers every query with one unreadable cell.
+        struct Unreadable<'a> {
+            inner: &'a DuckDbWarehouseAdapter,
+        }
+
+        #[async_trait]
+        impl WarehouseAdapter for Unreadable<'_> {
+            fn dialect(&self) -> &dyn SqlDialect {
+                self.inner.dialect()
+            }
+
+            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+                self.inner.execute_statement(sql).await
+            }
+
+            async fn execute_query(&self, _sql: &str) -> AdapterResult<QueryResult> {
+                Ok(QueryResult {
+                    columns: Vec::new(),
+                    rows: vec![vec![serde_json::json!("nope")]],
+                })
+            }
+
+            async fn describe_table(
+                &self,
+                table: &rocky_ir::TableRef,
+            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+                self.inner.describe_table(table).await
+            }
+        }
+
+        let inner = DuckDbWarehouseAdapter::in_memory().expect("open");
+        let warehouse = Unreadable { inner: &inner };
+        let not_null = rocky_core::config::QualityAssertion {
+            table: "t".into(),
+            name: None,
+            test: rocky_core::tests::TestDecl {
+                test_type: rocky_core::tests::TestType::NotNull,
+                column: Some("id".into()),
+                severity: rocky_core::tests::TestSeverity::Error,
+                filter: None,
+            },
+        };
+
+        let results =
+            super::run_table_assertions(&warehouse, inner.dialect(), "main.t", "t", &[not_null])
+                .await;
+
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert!(
+            !results[0].passed,
+            "an unreadable count is not zero failing rows: {:?}",
+            results[0]
+        );
+        assert_eq!(
+            results[0].not_evaluated.as_deref(),
+            Some("the assertion query returned no readable count"),
+            "{:?}",
+            results[0]
+        );
     }
 
     /// Single-decision lazy gate: the dispatch site's resolved

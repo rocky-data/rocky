@@ -10,6 +10,12 @@
  */
 export type CheckResult = CheckResult1 & {
   name: string;
+  /**
+   * Set when the engine could not run the check, carrying the reason.
+   *
+   * A check that never ran must not read as a measurement. Whenever this is set, `passed` is `false` and the numeric fields of the flattened details (`source_count`, `target_count`, `lag_seconds`, `null_rate`, `failing_rows`, `result_value`, `overlap_count`) are placeholders, not readings. A query error, an unreadable result cell, a refused SQL fragment and a misconfigured key all land here, so the check stays in the tally instead of vanishing or passing on a default.
+   */
+  not_evaluated?: string | null;
   passed: boolean;
   /**
    * Severity reported when the check fails. `error` causes the quality pipeline to exit non-zero (subject to `fail_on_error`); `warning` is advisory and does not fail the run.
@@ -65,12 +71,6 @@ export type CheckResult1 =
        * Fully-qualified sibling tables that were compared.
        */
       contributing_tables: string[];
-      /**
-       * Set when the check could NOT be evaluated, carrying the reason.
-       *
-       * `overlap_count` is only a measurement when this is `None`. A refused key expression or a misconfigured key would otherwise report `overlap_count: 0`, which reads as "no overlap found" — the check never ran, and the tally must not imply that it did.
-       */
-      not_evaluated?: string | null;
       /**
        * Count of distinct keys that appear in more than one sibling table.
        */
