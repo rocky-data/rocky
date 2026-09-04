@@ -4278,13 +4278,6 @@
                 },
                 "type": "array"
               },
-              "not_evaluated": {
-                "description": "Set when the check could NOT be evaluated, carrying the reason.\n\n`overlap_count` is only a measurement when this is `None`. A refused key expression or a misconfigured key would otherwise report `overlap_count: 0`, which reads as \"no overlap found\" — the check never ran, and the tally must not imply that it did.",
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
               "overlap_count": {
                 "description": "Count of distinct keys that appear in more than one sibling table.",
                 "format": "uint64",
@@ -4311,6 +4304,13 @@
         "properties": {
           "name": {
             "type": "string"
+          },
+          "not_evaluated": {
+            "description": "Set when the engine could not run the check, carrying the reason.\n\nA check that never ran must not read as a measurement. Whenever this is set, `passed` is `false` and the numeric fields of the flattened details (`source_count`, `target_count`, `lag_seconds`, `null_rate`, `failing_rows`, `result_value`, `overlap_count`) are placeholders, not readings. A query error, an unreadable result cell, a refused SQL fragment and a misconfigured key all land here, so the check stays in the tally instead of vanishing or passing on a default.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "passed": {
             "type": "boolean"
