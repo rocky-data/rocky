@@ -206,7 +206,6 @@ Neither CI (`engine-release.yml`) nor `scripts/release.sh` bump versions for you
 - **Missing Cargo.toml bumps**: every crate in `engine/crates/*` must bump. Grep for the old version before pushing the release PR: `grep -rn '^version = "1.2.0"$' engine --include="Cargo.toml"` should return zero after the bump.
 - **Dirty codegen**: `just codegen` produced a diff that wasn't committed — `codegen-drift.yml` CI retroactively fails.
 - **Docker not running (fallback only)**: `scripts/build_rocky_linux.sh` silently falls back to zigbuild which has its own issues with `ring` on newer Rust. The `--docker` flag forces the Docker path.
-- **Stale binary in `vendor/`**: downstream consumers that vendor the rocky binary via `scripts/vendor_rocky.sh` need a re-run after a release if they pin to a vendored copy.
 
 ## CI surface
 
@@ -225,6 +224,5 @@ Path-filtered workflows in `.github/workflows/`:
 
 - [ ] `gh release view <tag>` shows all expected artifacts (**11 for engine**: 10 archives + `checksums.txt`; **4 for sdk and 4 for dagster**: wheel, sdist and one `.publish.attestation` for each, uploaded by the PyPI trusted-publisher step; 1 for vscode)
 - [ ] Install script (`engine/install.sh` or `install.ps1`) resolves and installs the new version on a clean machine
-- [ ] Downstream consumers that vendor the binary + Python wheel atomically have been updated — see `scripts/vendor_rocky.sh` for the vendoring workflow
 - [ ] Changelog is on `main` (it merged with the release PR, but double-check)
 - [ ] Announcement, if public-facing (blog, release notes)

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Build the Rocky binary for Linux x86_64 and place it in vendor/rocky-linux-amd64.
+# Build the Rocky binary for Linux x86_64 and place it in vendor/rocky-linux-amd64,
+# where scripts/release.sh packages it for the local-build release fallback.
 #
 # Use this when GitHub Actions release credits are exhausted, or when you need
-# to test a Rocky source change locally before pushing. This is the local-build
-# counterpart to vendor_rocky.sh (which downloads from a GH release).
+# to test a Rocky source change locally before pushing.
 #
 # Requirements (zigbuild, default):
 #   - cargo-zigbuild:  cargo install cargo-zigbuild
@@ -22,10 +22,6 @@
 #   1. Cargo-builds rocky in release mode targeting x86_64-unknown-linux-gnu
 #   2. Copies the resulting binary into vendor/rocky-linux-amd64
 #   3. Verifies the binary is ELF x86-64
-#
-# Downstream consumers copy from vendor/rocky-linux-amd64 into their
-# own vendor/ directory:
-#   cp vendor/rocky-linux-amd64 /path/to/consumer/vendor/
 
 set -euo pipefail
 
