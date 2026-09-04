@@ -10,6 +10,7 @@ import pytest
 from dagster_rocky.contracts import (
     CONTRACT_COLUMN_CONSTRAINTS_CHECK,
     CONTRACT_COMPILE_MISSING_METADATA_KEY,
+    CONTRACT_MODEL_NOT_FOUND_METADATA_KEY,
     CONTRACT_PROTECTED_COLUMNS_CHECK,
     CONTRACT_REQUIRED_COLUMNS_CHECK,
     ContractParseError,
@@ -590,6 +591,73 @@ def test_results_not_verified_when_there_is_no_compile_output():
         assert r.metadata[CONTRACT_COMPILE_MISSING_METADATA_KEY].value is True
         assert "not verified" in (r.description or "")
         assert "not verified" in r.metadata["status"].value
+
+
+def test_results_not_verified_when_the_model_was_not_found():
+    """``W011`` means the compiler never found the model the contract names.
+
+    ``validate_contract`` is not called at all in that branch, so no
+    ``E010``-``E014`` can follow and an unmapped ``W011`` used to be dropped,
+    leaving every declared check green (#1644).
+    """
+    asset_key = dg.AssetKey(["orders"])
+    rules = ContractRules(has_required=True, has_protected=True, has_column_constraints=True)
+    diagnostics = [
+        _diag(
+            "W011",
+            "orders",
+            "contract exists for 'orders' but model was not found in project",
+            severity=Severity.warning,
+        )
+    ]
+
+    results = list(
+        contract_check_results_from_diagnostics(
+            diagnostics=diagnostics,
+            asset_key=asset_key,
+            model_name="orders",
+            rules=rules,
+        )
+    )
+
+    assert [r.check_name for r in results] == [
+        CONTRACT_REQUIRED_COLUMNS_CHECK,
+        CONTRACT_PROTECTED_COLUMNS_CHECK,
+        CONTRACT_COLUMN_CONSTRAINTS_CHECK,
+    ]
+    for r in results:
+        assert r.passed is False, r.check_name
+        assert r.severity == dg.AssetCheckSeverity.WARN
+        assert r.metadata[CONTRACT_MODEL_NOT_FOUND_METADATA_KEY].value is True
+        assert "not verified" in (r.description or "")
+        assert "did not find a model named 'orders'" in r.metadata["status"].value
+
+
+def test_a_model_not_found_warning_for_another_model_does_not_leak():
+    """``W011`` names its own model; another model's must not blank this one."""
+    asset_key = dg.AssetKey(["orders"])
+    rules = ContractRules(has_required=True, has_protected=False, has_column_constraints=False)
+    diagnostics = [
+        _diag(
+            "W011",
+            "customers",
+            "contract exists for 'customers' but model was not found in project",
+            severity=Severity.warning,
+        )
+    ]
+
+    results = list(
+        contract_check_results_from_diagnostics(
+            diagnostics=diagnostics,
+            asset_key=asset_key,
+            model_name="orders",
+            rules=rules,
+        )
+    )
+
+    assert len(results) == 1
+    assert results[0].passed is True
+    assert CONTRACT_MODEL_NOT_FOUND_METADATA_KEY not in results[0].metadata
 
 
 def test_results_not_verified_only_for_declared_rules():

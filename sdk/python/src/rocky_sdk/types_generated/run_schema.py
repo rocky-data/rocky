@@ -534,6 +534,12 @@ class CheckResult1(BaseModel):
     """
 
     name: str
+    not_evaluated: str | None = None
+    """
+    Set when the engine could not run the check, carrying the reason.
+
+    A check that never ran must not read as a measurement. Whenever this is set, `passed` is `false` and the numeric fields of the flattened details (`source_count`, `target_count`, `lag_seconds`, `null_rate`, `failing_rows`, `result_value`, `overlap_count`) are placeholders, not readings. A query error, an unreadable result cell, a refused SQL fragment and a misconfigured key all land here, so the check stays in the tally instead of vanishing or passing on a default.
+    """
     passed: bool
     severity: TestSeverity7 | TestSeverity8 | None = "error"
     """
@@ -549,6 +555,12 @@ class CheckResult2(BaseModel):
     """
 
     name: str
+    not_evaluated: str | None = None
+    """
+    Set when the engine could not run the check, carrying the reason.
+
+    A check that never ran must not read as a measurement. Whenever this is set, `passed` is `false` and the numeric fields of the flattened details (`source_count`, `target_count`, `lag_seconds`, `null_rate`, `failing_rows`, `result_value`, `overlap_count`) are placeholders, not readings. A query error, an unreadable result cell, a refused SQL fragment and a misconfigured key all land here, so the check stays in the tally instead of vanishing or passing on a default.
+    """
     passed: bool
     severity: TestSeverity7 | TestSeverity8 | None = "error"
     """
@@ -564,6 +576,12 @@ class CheckResult3(BaseModel):
     """
 
     name: str
+    not_evaluated: str | None = None
+    """
+    Set when the engine could not run the check, carrying the reason.
+
+    A check that never ran must not read as a measurement. Whenever this is set, `passed` is `false` and the numeric fields of the flattened details (`source_count`, `target_count`, `lag_seconds`, `null_rate`, `failing_rows`, `result_value`, `overlap_count`) are placeholders, not readings. A query error, an unreadable result cell, a refused SQL fragment and a misconfigured key all land here, so the check stays in the tally instead of vanishing or passing on a default.
+    """
     passed: bool
     severity: TestSeverity7 | TestSeverity8 | None = "error"
     """
@@ -579,6 +597,12 @@ class CheckResult4(BaseModel):
     """
 
     name: str
+    not_evaluated: str | None = None
+    """
+    Set when the engine could not run the check, carrying the reason.
+
+    A check that never ran must not read as a measurement. Whenever this is set, `passed` is `false` and the numeric fields of the flattened details (`source_count`, `target_count`, `lag_seconds`, `null_rate`, `failing_rows`, `result_value`, `overlap_count`) are placeholders, not readings. A query error, an unreadable result cell, a refused SQL fragment and a misconfigured key all land here, so the check stays in the tally instead of vanishing or passing on a default.
+    """
     passed: bool
     severity: TestSeverity7 | TestSeverity8 | None = "error"
     """
@@ -597,6 +621,12 @@ class CheckResult5(BaseModel):
     """
 
     name: str
+    not_evaluated: str | None = None
+    """
+    Set when the engine could not run the check, carrying the reason.
+
+    A check that never ran must not read as a measurement. Whenever this is set, `passed` is `false` and the numeric fields of the flattened details (`source_count`, `target_count`, `lag_seconds`, `null_rate`, `failing_rows`, `result_value`, `overlap_count`) are placeholders, not readings. A query error, an unreadable result cell, a refused SQL fragment and a misconfigured key all land here, so the check stays in the tally instead of vanishing or passing on a default.
+    """
     passed: bool
     severity: TestSeverity7 | TestSeverity8 | None = "error"
     """
@@ -622,6 +652,12 @@ class CheckResult6(BaseModel):
     """
 
     name: str
+    not_evaluated: str | None = None
+    """
+    Set when the engine could not run the check, carrying the reason.
+
+    A check that never ran must not read as a measurement. Whenever this is set, `passed` is `false` and the numeric fields of the flattened details (`source_count`, `target_count`, `lag_seconds`, `null_rate`, `failing_rows`, `result_value`, `overlap_count`) are placeholders, not readings. A query error, an unreadable result cell, a refused SQL fragment and a misconfigured key all land here, so the check stays in the tally instead of vanishing or passing on a default.
+    """
     passed: bool
     severity: TestSeverity7 | TestSeverity8 | None = "error"
     """
@@ -638,6 +674,12 @@ class CheckResult7(BaseModel):
     """
 
     name: str
+    not_evaluated: str | None = None
+    """
+    Set when the engine could not run the check, carrying the reason.
+
+    A check that never ran must not read as a measurement. Whenever this is set, `passed` is `false` and the numeric fields of the flattened details (`source_count`, `target_count`, `lag_seconds`, `null_rate`, `failing_rows`, `result_value`, `overlap_count`) are placeholders, not readings. A query error, an unreadable result cell, a refused SQL fragment and a misconfigured key all land here, so the check stays in the tally instead of vanishing or passing on a default.
+    """
     passed: bool
     severity: TestSeverity7 | TestSeverity8 | None = "error"
     """
@@ -646,12 +688,6 @@ class CheckResult7(BaseModel):
     contributing_tables: list[str]
     """
     Fully-qualified sibling tables that were compared.
-    """
-    not_evaluated: str | None = None
-    """
-    Set when the check could NOT be evaluated, carrying the reason.
-
-    `overlap_count` is only a measurement when this is `None`. A refused key expression or a misconfigured key would otherwise report `overlap_count: 0`, which reads as "no overlap found" — the check never ran, and the tally must not imply that it did.
     """
     overlap_count: conint(ge=0)
     """
