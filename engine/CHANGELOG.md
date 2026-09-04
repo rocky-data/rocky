@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Ten SQL string-literal sinks now encode through the dialect's own lexer rule, and the interim backslash refusal from #1595 is gone where they do.** A value in `accepted_values` (declarative checks and quarantine assertions), a seed cell, a `rocky load` cell on BigQuery's local-file `INSERT` path, a `rocky test` unit-test fixture string, `schema_pattern.prefix` in DuckDB and BigQuery discovery, the schema name DuckDB discovery reads back from the warehouse, a Snowflake tag value and the cross-source `_src` tag were each spliced into `'…'` by doubling quotes. On Snowflake, Databricks and BigQuery a value ending in `\` escaped the first quote of that pair and let the second one close the literal; #1595 refused any backslash at four of those sites, on every warehouse. Each sink now calls `rocky_core::sql_gen::string_literal(dialect, value)`, so a backslash stands for itself on DuckDB and Trino and is doubled, with the quote written as `\'`, on Snowflake, Databricks and BigQuery.
+
+  **On upgrade:** a backslash in `accepted_values` or in `schema_pattern.prefix` is accepted again and carried as a value. For a value with no quote, backslash or line break the generated SQL is byte-identical to 1.73.0. For a value that has one, it differs only on the three backslash-reading warehouses. Snowflake tag values were already escaped correctly and now share the one encoder. The dialect-less `generate_test_sql` API still refuses a backslash, because it has no lexer rule to ask; every `rocky` command passes a dialect.
+
+  **Still not routed:** a string literal written in a `.rocky` model (`rocky-lang` lowers to SQL before any dialect is chosen); `regex_match.pattern`, where a backslash is regex syntax and Snowflake and Databricks read it as an escape before the regex engine sees it; a Databricks tag value and a lakehouse `COMMENT` or `TBLPROPERTIES` value, which refuse a quote but still let a trailing backslash break the statement. (Refs #1596, #1524)
+
 ## [1.73.0] — 2026-09-03
 
 ### Added

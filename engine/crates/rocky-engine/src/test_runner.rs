@@ -12,6 +12,7 @@ use rocky_core::unit_test::{
     MismatchKind, RowMismatch, UnitTestDef, UnitTestResult, fixture_to_sql, json_to_sql_literal,
 };
 use rocky_duckdb::DuckDbConnector;
+use rocky_duckdb::dialect::DuckDbSqlDialect;
 use rocky_sql::validation::validate_identifier;
 use tracing::info;
 
@@ -312,7 +313,7 @@ fn run_one_unit_test(model: &str, compiled_sql: &str, test: &UnitTestDef) -> Uni
                 Vec::new(),
             );
         }
-        if let Some(sql) = fixture_to_sql(fx)
+        if let Some(sql) = fixture_to_sql(fx, &DuckDbSqlDialect)
             && let Err(e) = db.execute_statement(&sql)
         {
             return fail(
@@ -432,9 +433,10 @@ fn expected_table_sql(rows: &[serde_json::Value], cols: &[String]) -> String {
             let vals: Vec<String> = cols
                 .iter()
                 .map(|c| {
-                    let lit = obj
-                        .and_then(|o| o.get(c))
-                        .map_or_else(|| "NULL".to_string(), json_to_sql_literal);
+                    let lit = obj.and_then(|o| o.get(c)).map_or_else(
+                        || "NULL".to_string(),
+                        |v| json_to_sql_literal(v, &DuckDbSqlDialect),
+                    );
                     format!("{lit} AS {c}")
                 })
                 .collect();

@@ -244,15 +244,15 @@ pub fn read_csv_batches(path: &Path, batch_size: usize) -> Result<Vec<RowBatch>,
 /// Cell values are formatted using the same rules as [`crate::seeds`]:
 /// - Empty cells become `NULL`.
 /// - Numeric-looking values are emitted bare.
-/// - Everything else is single-quoted with internal quotes escaped.
+/// - Everything else is a single-quoted string literal encoded by
+///   `dialect`'s own lexer rule.
 ///
-/// The `dialect` parameter is used to format the target table reference via
-/// [`SqlDialect`]; if the caller already has a fully-qualified target string,
-/// pass it directly — this function accepts `&str` for the target.
+/// `target` is spliced as given: the caller formats the table reference
+/// (normally via [`SqlDialect::format_table_ref`]) before calling.
 pub fn generate_batch_insert_sql(
     batch: &RowBatch,
     target: &str,
-    _dialect: &dyn SqlDialect,
+    dialect: &dyn SqlDialect,
 ) -> Result<String, BatchLoaderError> {
     if batch.rows.is_empty() {
         return Err(BatchLoaderError::EmptyBatch);
@@ -274,7 +274,7 @@ pub fn generate_batch_insert_sql(
         .rows
         .iter()
         .map(|row| {
-            let cells: Vec<String> = row.iter().map(|cell| format_cell(cell)).collect();
+            let cells: Vec<String> = row.iter().map(|cell| format_cell(cell, dialect)).collect();
             format!("({})", cells.join(", "))
         })
         .collect();
@@ -292,8 +292,9 @@ pub fn generate_batch_insert_sql(
 /// - Parseable as `i64` → bare integer
 /// - Parseable as `f64` → bare float
 /// - Boolean (`true`/`false`, case-insensitive) → bare boolean
-/// - Everything else → single-quoted with `'` escaped to `''`
-fn format_cell(value: &str) -> String {
+/// - Everything else → a single-quoted string literal encoded by `dialect`'s
+///   own lexer rule
+fn format_cell(value: &str, dialect: &dyn SqlDialect) -> String {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return "NULL".to_string();
@@ -315,8 +316,8 @@ fn format_cell(value: &str) -> String {
         return trimmed.to_string();
     }
 
-    // Default: single-quoted string
-    format!("'{}'", trimmed.replace('\'', "''"))
+    // Default: a string literal encoded by the dialect's own lexer rule.
+    crate::sql_gen::string_literal(dialect, trimmed)
 }
 
 // ---------------------------------------------------------------------------
@@ -671,32 +672,59 @@ mod tests {
 
     #[test]
     fn format_cell_empty_is_null() {
-        assert_eq!(format_cell(""), "NULL");
-        assert_eq!(format_cell("   "), "NULL");
+        assert_eq!(format_cell("", &TestDialect), "NULL");
+        assert_eq!(format_cell("   ", &TestDialect), "NULL");
     }
 
     #[test]
     fn format_cell_integer() {
-        assert_eq!(format_cell("42"), "42");
-        assert_eq!(format_cell("-7"), "-7");
+        assert_eq!(format_cell("42", &TestDialect), "42");
+        assert_eq!(format_cell("-7", &TestDialect), "-7");
     }
 
     #[test]
     fn format_cell_float() {
-        assert_eq!(format_cell("3.14"), "3.14");
-        assert_eq!(format_cell("-0.5"), "-0.5");
+        assert_eq!(format_cell("3.14", &TestDialect), "3.14");
+        assert_eq!(format_cell("-0.5", &TestDialect), "-0.5");
     }
 
     #[test]
     fn format_cell_boolean() {
-        assert_eq!(format_cell("true"), "true");
-        assert_eq!(format_cell("False"), "false");
+        assert_eq!(format_cell("true", &TestDialect), "true");
+        assert_eq!(format_cell("False", &TestDialect), "false");
     }
 
     #[test]
     fn format_cell_string_escaping() {
-        assert_eq!(format_cell("hello"), "'hello'");
-        assert_eq!(format_cell("it's"), "'it''s'");
+        assert_eq!(format_cell("hello", &TestDialect), "'hello'");
+        assert_eq!(format_cell("it's", &TestDialect), "'it''s'");
+    }
+
+    /// A loader cell holding a backslash or a quote is encoded by the
+    /// dialect's own lexer rule (issue #1596): verbatim backslash and doubled
+    /// quote under `Standard` (DuckDB, Trino); doubled backslash
+    /// and `\'` under `Backslash`.
+    #[test]
+    fn format_cell_encodes_a_backslash_and_a_quote_per_dialect() {
+        use crate::traits::LiteralEscape;
+        use crate::traits::test_dialects::StubDialect;
+
+        assert_eq!(
+            format_cell(r"C:\tmp\", &StubDialect(LiteralEscape::Standard)),
+            r"'C:\tmp\'"
+        );
+        assert_eq!(
+            format_cell("it's", &StubDialect(LiteralEscape::Standard)),
+            "'it''s'"
+        );
+        assert_eq!(
+            format_cell(r"C:\tmp\", &StubDialect(LiteralEscape::Backslash)),
+            r"'C:\\tmp\\'"
+        );
+        assert_eq!(
+            format_cell("it's", &StubDialect(LiteralEscape::Backslash)),
+            r"'it\'s'"
+        );
     }
 
     // -- generate_batch_insert_sql --------------------------------------------
