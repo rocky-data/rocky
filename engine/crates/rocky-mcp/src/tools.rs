@@ -7415,6 +7415,7 @@ mod tests {
             }
         }
         out
+    }
 
     // ------------------------------------------------------------------
     // An invalid rocky.toml refuses instead of reading as absent (#1625).

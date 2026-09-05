@@ -110,7 +110,9 @@ fn emit_models(
         .with_context(|| {
             format!(
                 "failed to load config from {}",
-                config_path.map(|p| p.display().to_string()).unwrap_or_default()
+                config_path
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
             )
         })?;
     let dialect = resolve_dialect(project_config.as_ref());

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use rocky_compiler::compile::{self, CompilerConfig, default_type_mapper};
 use rocky_compiler::cost_check;
@@ -108,11 +108,13 @@ fn compile_inner(
     // message cannot tell the reader whether to fix `rocky.toml` or a
     // `<model>.toml`. The shared loader (#1625) decides WHAT refuses — only a
     // missing file is tolerated; this context says WHICH file refused.
-    let project_config = rocky_config::load_optional_project_config(config_path)
-        .with_context(|| {
+    let project_config =
+        rocky_config::load_optional_project_config(config_path).with_context(|| {
             format!(
                 "failed to load config from {}",
-                config_path.map(|p| p.display().to_string()).unwrap_or_default()
+                config_path
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
             )
         })?;
 

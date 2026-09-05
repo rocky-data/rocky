@@ -670,12 +670,15 @@ pub(crate) fn preview_dialect(
     // The shared loader (#1625) decides what refuses: only a missing file is
     // tolerated. The context names the file, which the loader's own error
     // does not.
-    let config = rocky_core::config::load_optional_project_config(config_path).with_context(|| {
-        format!(
-            "failed to load config from {} for the offline SQL preview",
-            config_path.map(|p| p.display().to_string()).unwrap_or_default()
-        )
-    })?;
+    let config =
+        rocky_core::config::load_optional_project_config(config_path).with_context(|| {
+            format!(
+                "failed to load config from {} for the offline SQL preview",
+                config_path
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            )
+        })?;
     let adapter_type = config
         .and_then(|cfg| {
             // Prefer the default replication pipeline's target adapter; fall
