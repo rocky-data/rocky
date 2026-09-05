@@ -249,10 +249,14 @@ pub struct RunOutput {
     /// runtime) failures and excludes models excluded before execution.
     pub tables_failed: usize,
     /// `true` when this run's declared checks failed in a way that must fail
-    /// the run: at least one **error-severity** check failed (a check the
-    /// engine could not evaluate counts as a failure — `not_evaluated`
-    /// always carries `passed: false`) **and** the pipeline's
-    /// `[pipeline.<name>.checks] fail_on_error` gate is on.
+    /// the run: at least one **error-severity** check failed **and** the
+    /// pipeline's `[pipeline.<name>.checks] fail_on_error` gate is on.
+    ///
+    /// A check the engine could not evaluate counts as a failure: every
+    /// `not_evaluated` result carries `passed: false`, except a check the
+    /// configuration does not apply to, which passes and does not gate (a
+    /// cross-source overlap group holding a sibling with no key column,
+    /// #1654). This reads `passed`, never `not_evaluated`.
     ///
     /// Deliberately NOT folded into `tables_failed`, which stays a count of
     /// tables and models and never counts checks. This is a gate, not a
