@@ -33,6 +33,12 @@ GITHUB_SCRIPT_SOURCE = (
 UPLOAD_ARTIFACT_SOURCE = (
     "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
 )
+# The browser UI is built once per release and handed to every target as an
+# artifact (engine-release.yml `ui` -> `build`), so the release matrix reads
+# one artifact with the same pinned first-party action family that writes it.
+DOWNLOAD_ARTIFACT_SOURCE = (
+    "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+)
 RUST_TOOLCHAIN_SOURCE = (
     "dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8"
 )
@@ -73,6 +79,7 @@ RELEASE_ACTION_SOURCES = frozenset(
     {
         CHECKOUT_SOURCE,
         DEPLOY_PAGES_SOURCE,
+        DOWNLOAD_ARTIFACT_SOURCE,
         GH_RELEASE_SOURCE,
         GITHUB_SCRIPT_SOURCE,
         PYPI_PUBLISH_SOURCE,
