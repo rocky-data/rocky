@@ -13,7 +13,8 @@
     "resolveJsonModule": true,
     "types": ["vite/client", "vitest/globals", "@testing-library/jest-dom"],
     "paths": {
-      "@rocky-types/*": ["../../editors/vscode/src/types/generated/*"]
+      "@rocky-types/*": ["../../editors/vscode/src/types/generated/*"],
+      "@rocky-fixtures/*": ["../../integrations/dagster/tests/fixtures_generated/*"]
     }
   },
   "include": ["src", "vite.config.ts"]

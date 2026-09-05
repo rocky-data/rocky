@@ -55,7 +55,7 @@ describe("EnginePanel", () => {
 
 describe("App", () => {
   it("renders the three lanes and the engine slot", () => {
-    render(<App engine={<span>engine slot</span>} />);
+    render(<App engine={<span>engine slot</span>} estate={<span>estate slot</span>} />);
     for (const lane of ["Estate", "Review", "Governor"]) {
       expect(screen.getByRole("link", { name: lane })).toHaveAttribute(
         "href",
@@ -63,5 +63,22 @@ describe("App", () => {
       );
     }
     expect(screen.getByText("engine slot")).toBeInTheDocument();
+  });
+
+  it("switches lanes on a nav click without a reload, and deep-links by path", async () => {
+    window.history.pushState(null, "", "/ui/governor");
+    render(<App engine={<span>engine slot</span>} estate={<span>estate slot</span>} />);
+    expect(screen.getByText("The governor screen is not built yet")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Governor" })).toHaveAttribute("aria-current", "page");
+
+    screen.getByRole("link", { name: "Estate" }).click();
+    await waitFor(() => expect(screen.getByText("estate slot")).toBeInTheDocument());
+    expect(window.location.pathname).toBe("/ui/estate");
+
+    screen.getByRole("link", { name: "Review" }).click();
+    await waitFor(() =>
+      expect(screen.getByText("The review screen is not built yet")).toBeInTheDocument(),
+    );
+    expect(window.location.pathname).toBe("/ui/review");
   });
 });
