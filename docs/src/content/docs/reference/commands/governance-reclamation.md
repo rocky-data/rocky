@@ -144,6 +144,8 @@ Every event line cites a `run_id`, a `plan_id`, or a `decision_ref`. The schedul
 
 A section whose signal is not recorded reports `unavailable` rather than a false all-clear. The default output is a Markdown digest ready to paste into Slack or an email. `--output json` is the machine surface.
 
+`rocky serve` answers the same JSON at `GET /api/v1/brief?since=last|24h|7d`, except `generated_at` and `since_timestamp`. The route never advances the cursor, so `since=last` reads it as it stands, and the route's default is `7d`.
+
 ---
 
 ## `rocky audit`
@@ -166,6 +168,8 @@ rocky audit --scorecard --by principal --window 30d
 | `--window <W>` | `string` | `all` | Scorecard window, e.g. `30d` or `12h`. |
 
 Read-only. Only mutating enforcement seams record decisions — reads are never logged — so the ledger is the audit trail of governed mutations. A signal the ledger does not persist is reported as *not recorded* rather than inferred, and the scorecard is wired to no automatic policy change.
+
+`rocky serve` answers the scorecard at `GET /api/v1/audit/scorecard?by=<dim>&window=<w>`, except `window_start` for a duration window, and the custody chain at `GET /api/v1/custody/{subject}`, byte for byte.
 
 ---
 

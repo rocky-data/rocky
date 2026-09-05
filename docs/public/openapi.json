@@ -21132,6 +21132,151 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/v1/audit/scorecard": {
+      "get": {
+        "description": "Acceptance, denial and require-review rates per group over the policy-decision ledger. The same bytes as `rocky audit --scorecard --by <by> --window <window> --output json`, except `window_start` for a duration window, which derives from the request instant. Reads the state store only, so it needs no bound config. A ledger that cannot be read answers `200` with `availability: unavailable` and a note, as the CLI prints. Reads only.",
+        "operationId": "getAuditScorecard",
+        "parameters": [
+          {
+            "description": "The grouping: `principal`, `rule` or `scope`. Defaults to `principal`.",
+            "in": "query",
+            "name": "by",
+            "required": false,
+            "schema": {
+              "enum": [
+                "principal",
+                "rule",
+                "scope"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "`all`, or a `<N>d` / `<N>h` duration such as `30d`. Defaults to `all`.",
+            "in": "query",
+            "name": "window",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditScorecardOutput"
+                }
+              }
+            },
+            "description": "The scorecard."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A query parameter is not one of its documented values, or the subject is longer than 512 bytes."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store could not be opened for reading, or a ledger in it could not be read."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "The trust scorecard",
+        "tags": [
+          "governor"
+        ]
+      }
+    },
+    "/api/v1/brief": {
+      "get": {
+        "description": "What happened over the window and what needs a human: agent activity by principal, the ranked escalations, runs, drift, freshness, quality, cost, autonomy budgets and the scheduler's posture, every line citing a ledger id. The same bytes as `rocky brief --since <since> --output json`, except `generated_at` and, for the relative windows, `since_timestamp`, which derive from the request instant. Never advances the digest cursor: `since=last` reads it as it stands. The default is `7d`, not the CLI's `last`, because a read cannot advance the cursor. Scans at most 10,000 runs and decisions; compiles nothing. Reads only.",
+        "operationId": "getBrief",
+        "parameters": [
+          {
+            "description": "The window: `last` (since the stored cursor, read-only), `24h` or `7d`. Defaults to `7d`.",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "enum": [
+                "last",
+                "24h",
+                "7d"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BriefOutput"
+                }
+              }
+            },
+            "description": "The digest."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A query parameter is not one of its documented values, or the subject is longer than 512 bytes."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store could not be opened for reading, or a ledger in it could not be read."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "The governor's estate digest",
+        "tags": [
+          "governor"
+        ]
+      }
+    },
     "/api/v1/compile": {
       "get": {
         "description": "Canonical compile result. Byte-identical to `rocky compile --output json`, except the wall-clock `compile_timings`, which is inherently non-deterministic.",
@@ -21183,6 +21328,69 @@
         "summary": "Trigger recompilation",
         "tags": [
           "compile"
+        ]
+      }
+    },
+    "/api/v1/custody/{subject}": {
+      "get": {
+        "description": "Who proposed it, what the policy plane decided, what the plan changed, which runs materialized it, what verification found, and the downstream blast radius, for a model name, a run id, a plan id or a decision-only custody id such as `freeze:global`. The same bytes as `rocky audit --for <subject> --output json`. A subject nothing references is `200` with `resolved: false`, as the CLI. Compiles the project once per call for the blast radius, as the CLI does. Reads only.",
+        "operationId": "getCustodyChain",
+        "parameters": [
+          {
+            "description": "Path parameter `subject`.",
+            "in": "path",
+            "name": "subject",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditForOutput"
+                }
+              }
+            },
+            "description": "The custody chain."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A query parameter is not one of its documented values, or the subject is longer than 512 bytes."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store could not be opened for reading, or a ledger in it could not be read."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "One subject's custody chain",
+        "tags": [
+          "governor"
         ]
       }
     },
