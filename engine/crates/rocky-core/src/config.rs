@@ -154,6 +154,16 @@ pub enum ConfigError {
     #[error("failed to read config file: {0}")]
     ReadFile(#[from] std::io::Error),
 
+    /// Reading the config reported "not found", but an entry IS still present
+    /// at the path — most often a `rocky.toml` symlink whose target is gone.
+    ///
+    /// Deliberately NOT [`ConfigError::FileNotFound`]. The project has a
+    /// config; it just cannot be read. Reporting absence here would let every
+    /// caller carry on against defaults (#1668). `detail` says what was found,
+    /// so the refusal is diagnosable without a second look at the disk.
+    #[error("config file at '{}' cannot be read: {detail}", .path.display())]
+    UnreadableFile { path: PathBuf, detail: String },
+
     #[error("failed to parse TOML: {0}")]
     ParseToml(#[from] toml::de::Error),
 
@@ -6218,19 +6228,90 @@ pub fn parse_rocky_config(path: &Path) -> Result<RockyConfig, ConfigError> {
     parse_rocky_config_str(&raw)
 }
 
-/// Read the raw config file bytes, mapping a missing file to
-/// [`ConfigError::FileNotFound`]. The single read site for every loader in
-/// this module — the fingerprinted loader hashes exactly this string's bytes.
+/// Read the raw config file bytes.
+///
+/// A path with nothing at it maps to [`ConfigError::FileNotFound`] — the one
+/// signal every caller reads as "this project has no `rocky.toml`". A path
+/// that HAS an entry but still fails the read maps to
+/// [`ConfigError::UnreadableFile`], so a config the project plainly has can
+/// never walk through as absent (#1668).
+///
+/// The single read site for every loader in this module — the fingerprinted
+/// loader hashes exactly this string's bytes.
 fn read_config_file(path: &Path) -> Result<String, ConfigError> {
     std::fs::read_to_string(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
-            ConfigError::FileNotFound {
-                path: path.to_path_buf(),
-            }
+            classify_read_not_found(path)
         } else {
             ConfigError::ReadFile(e)
         }
     })
+}
+
+/// Decide what a `NotFound` from reading `path` actually means.
+///
+/// `std::io::ErrorKind::NotFound` covers two different worlds, and only one of
+/// them is "this project has no config":
+///
+/// ```text
+///   read_to_string(path) -> NotFound
+///            |
+///            +-- symlink_metadata FAILS with NotFound
+///            |        nothing is at this path -> FileNotFound  (absent)
+///            |
+///            +-- symlink_metadata SUCCEEDS
+///                     an entry IS at this path -> UnreadableFile (refuse)
+/// ```
+///
+/// [`std::fs::symlink_metadata`] stats the link itself instead of following
+/// it, so a `rocky.toml` symlink whose target is missing still stats even
+/// though the read failed. That is the discriminator. Without it a project
+/// whose config symlink is broken looks configless and runs on defaults
+/// (#1668).
+///
+/// A directory at the path never reaches here: reading a directory fails with
+/// `IsADirectory` (Windows: `PermissionDenied`), so it was already a
+/// [`ConfigError::ReadFile`] refusal and stays one.
+fn classify_read_not_found(path: &Path) -> ConfigError {
+    match std::fs::symlink_metadata(path) {
+        // Nothing at this path. Genuinely absent — unchanged behaviour, and
+        // the case dozens of callers depend on.
+        Err(stat_error) if stat_error.kind() == std::io::ErrorKind::NotFound => {
+            ConfigError::FileNotFound {
+                path: path.to_path_buf(),
+            }
+        }
+        // The path could not even be stat-ed, so absence is unproven.
+        // Refusing is the fail-closed answer.
+        Err(stat_error) => ConfigError::UnreadableFile {
+            path: path.to_path_buf(),
+            detail: format!("the path could not be inspected: {stat_error}"),
+        },
+        // A symlink is here and the read followed it into nothing: dangling.
+        // `read_link` names the immediate hop — the link as written, which is
+        // what the operator has to go fix — so the message says the target
+        // cannot be RESOLVED rather than claiming that one name is missing.
+        Ok(metadata) if metadata.is_symlink() => ConfigError::UnreadableFile {
+            path: path.to_path_buf(),
+            detail: match std::fs::read_link(path) {
+                Ok(target) => format!(
+                    "it is a symlink to '{}', which cannot be resolved",
+                    target.display()
+                ),
+                Err(link_error) => {
+                    format!("it is a symlink that cannot be resolved ({link_error})")
+                }
+            },
+        },
+        // An entry that is not a symlink is here, yet the read said the file
+        // was missing — it was replaced under us between the two calls. Not
+        // absence either way.
+        Ok(_) => ConfigError::UnreadableFile {
+            path: path.to_path_buf(),
+            detail: "an entry exists at this path, but reading it reported the file missing"
+                .to_string(),
+        },
+    }
 }
 
 /// Parse an already-read raw config string — env-var substitution,
@@ -6528,7 +6609,8 @@ pub fn load_rocky_config_credential_tolerant(path: &Path) -> Result<RockyConfig,
 /// could not be compiled at all (#1536).
 ///
 /// Only that one rule is relaxed. A parse error, a permission denial, a
-/// directory sitting where the file should be, an unresolved `${VAR}` anywhere
+/// directory sitting where the file should be, a `rocky.toml` symlink whose
+/// target is gone (#1668), an unresolved `${VAR}` anywhere
 /// else, or any validator failure still refuses — we cannot tell what that
 /// config would have changed, and proceeding without it silently answers a
 /// different question. **Do not relax this to a tolerant match.**
@@ -6897,6 +6979,169 @@ mod tests {
         assert!(
             matches!(err, ConfigError::AdapterMissingDiscoveryKind { .. }),
             "the validator's own error must survive, got: {err:?}"
+        );
+    }
+
+    // ---- a rocky.toml that EXISTS but cannot be read is not absent (#1668) ----
+    //
+    // The symlink cases are `#[cfg(unix)]`: creating a symlink on Windows
+    // needs Developer Mode or SeCreateSymbolicLinkPrivilege, so the test would
+    // fail for a reason that has nothing to do with the discriminator. The
+    // non-symlink cases below run everywhere.
+
+    /// The defect. `read_to_string` returns `ErrorKind::NotFound` for a
+    /// symlink whose target is gone, exactly as it does for a path with
+    /// nothing at it. Before #1668 both became `FileNotFound`, so a project
+    /// whose config symlink was broken compiled against defaults.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_config_symlink_refuses_instead_of_reading_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("shared-prod.toml");
+        let link = dir.path().join("rocky.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = read_config_file(&link).expect_err("a dangling symlink must not read");
+        assert!(
+            !matches!(err, ConfigError::FileNotFound { .. }),
+            "a config that is present must never be reported as absent, got: {err:?}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(&link.display().to_string()),
+            "the refusal must name the config path, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(&target.display().to_string()),
+            "the refusal must name the target it could not resolve, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("symlink"),
+            "the refusal must say what was found, got: {rendered}"
+        );
+    }
+
+    /// The honest-failure control: a plain missing `rocky.toml` is STILL
+    /// `FileNotFound`. Dozens of callers read that variant as "standalone
+    /// project, no config"; narrowing it would break every one of them.
+    #[test]
+    fn an_absent_config_path_is_still_file_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("rocky.toml");
+        assert!(
+            matches!(
+                read_config_file(&missing),
+                Err(ConfigError::FileNotFound { .. })
+            ),
+            "absence must keep its own variant"
+        );
+    }
+
+    /// A path whose PARENT directory does not exist is absent too: the read
+    /// and the stat both report `NotFound`, so nothing changes for it.
+    #[test]
+    fn a_config_path_under_a_missing_directory_is_file_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-dir").join("rocky.toml");
+        assert!(
+            matches!(
+                read_config_file(&missing),
+                Err(ConfigError::FileNotFound { .. })
+            ),
+            "a missing parent directory is still absence, not a broken config"
+        );
+    }
+
+    /// A symlink that RESOLVES is an ordinary config and keeps loading. The
+    /// refusal is about the dangling case only — sharing one `rocky.toml`
+    /// across checkouts by symlink is a normal setup.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_real_config_loads_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("shared-prod.toml");
+        std::fs::write(
+            &target,
+            "[adapters.wh]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n",
+        )
+        .unwrap();
+        let link = dir.path().join("rocky.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let cfg = load_optional_project_config(Some(&link))
+            .expect("a resolvable symlink is an ordinary config")
+            .expect("it is present, so Some");
+        assert!(cfg.adapters.contains_key("wh"));
+    }
+
+    /// A chain of symlinks broken at the far end refuses as well. `read_link`
+    /// names the immediate hop, and that hop exists — which is why the message
+    /// says the target cannot be RESOLVED instead of claiming it is missing.
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_symlink_chain_refuses_and_names_the_immediate_hop() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = dir.path().join("rocky.toml");
+        let middle = dir.path().join("middle.toml");
+        std::os::unix::fs::symlink(&middle, &head).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("gone.toml"), &middle).unwrap();
+
+        let err = read_config_file(&head).expect_err("a broken chain must not read");
+        assert!(
+            matches!(err, ConfigError::UnreadableFile { .. }),
+            "a broken chain is a present config, got: {err:?}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(&middle.display().to_string()),
+            "the message names the hop the operator wrote, got: {rendered}"
+        );
+    }
+
+    /// A directory sitting where `rocky.toml` should be already refused before
+    /// #1668: reading a directory fails with `IsADirectory`, never
+    /// `NotFound`, so it never reached the absent branch. Behaviour is
+    /// unchanged and now pinned — the shared loader's doc comment claims it
+    /// and nothing tested it.
+    #[test]
+    fn a_directory_at_the_config_path_refuses_as_a_read_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let as_dir = dir.path().join("rocky.toml");
+        std::fs::create_dir(&as_dir).unwrap();
+        assert!(
+            matches!(read_config_file(&as_dir), Err(ConfigError::ReadFile(_))),
+            "a directory must refuse as a read error, never as absence"
+        );
+        assert!(
+            load_optional_project_config(Some(&as_dir)).is_err(),
+            "and the shared offline loader must refuse it too"
+        );
+    }
+
+    /// The caller-level shape, both halves in one directory: the shared
+    /// offline loader turns absence into `Ok(None)` and a dangling symlink
+    /// into an error. Every offline entry point routed through this loader
+    /// inherits that answer.
+    #[cfg(unix)]
+    #[test]
+    fn optional_project_config_refuses_a_dangling_symlink_but_not_absence() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let absent = dir.path().join("absent.toml");
+        assert!(
+            load_optional_project_config(Some(&absent))
+                .expect("absent is not an error")
+                .is_none(),
+            "absent must still resolve to None"
+        );
+
+        let link = dir.path().join("rocky.toml");
+        std::os::unix::fs::symlink(dir.path().join("gone.toml"), &link).unwrap();
+        let err = load_optional_project_config(Some(&link))
+            .expect_err("a dangling config symlink must refuse");
+        assert!(
+            matches!(err, ConfigError::UnreadableFile { .. }),
+            "the refusal must be the present-but-unreadable variant, got: {err:?}"
         );
     }
 
