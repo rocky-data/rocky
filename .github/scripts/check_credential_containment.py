@@ -49,6 +49,19 @@ SETUP_UV_SOURCE = "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d"
 SETUP_NODE_SOURCE = (
     "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020"
 )
+# The container image the engine release publishes (engine-release.yml, job
+# `image`): buildx, the GHCR login, and the build-and-push. Pinned like every
+# other release source; the image tags derive from the release tag in a `run`
+# step, so no tag-parsing action is needed here.
+DOCKER_BUILD_PUSH_SOURCE = (
+    "docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a"
+)
+DOCKER_LOGIN_SOURCE = (
+    "docker/login-action@dbcb813823bdd20940b903addbd779551569679f"
+)
+DOCKER_SETUP_BUILDX_SOURCE = (
+    "docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e"
+)
 DEPLOY_PAGES_SOURCE = (
     "actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128"
 )
@@ -79,6 +92,9 @@ RELEASE_ACTION_SOURCES = frozenset(
     {
         CHECKOUT_SOURCE,
         DEPLOY_PAGES_SOURCE,
+        DOCKER_BUILD_PUSH_SOURCE,
+        DOCKER_LOGIN_SOURCE,
+        DOCKER_SETUP_BUILDX_SOURCE,
         DOWNLOAD_ARTIFACT_SOURCE,
         GH_RELEASE_SOURCE,
         GITHUB_SCRIPT_SOURCE,
