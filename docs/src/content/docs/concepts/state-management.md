@@ -175,6 +175,8 @@ freshness = { threshold_seconds = 86400 }
 
 Rocky writes state to local disk by default. A container or a CI runner throws that disk away between runs, which loses every watermark. Point Rocky at a remote backend and the state survives the machine.
 
+A remote backend carries the watermarks and the history, never the scheduler's own cursors and claims. What that means for a process that dies, two that overlap, or a rollout, per backend, is on the [deployment contract](/advanced/deployment-contract/).
+
 ### Backends
 
 | Backend | Config | Use Case |
