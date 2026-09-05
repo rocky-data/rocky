@@ -1664,15 +1664,30 @@ fn ensure_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> 
 /// the conservative direction: the refusal is loud and says to re-run, while
 /// admitting it would risk the silent exit-0 this gate exists to stop.
 ///
-/// The completeness test deliberately does NOT rest on a count alone. A count
-/// compared against `total_tables` is only sound while every recorded key comes
-/// from the invocation's own plan — true today (both `record_table_progress`
-/// call sites iterate `tables_to_process`, whose length *is* `total_tables`),
-/// but nothing in this function proves it, and a future site that records a
-/// table outside the plan would silently turn this into a refusal. So a
-/// checkpoint entry in ANY non-`Success` state means work remains, whatever the
-/// count says: a `Failed`, `Interrupted` or `Skipped` table is re-attempted by
-/// a resume, because the resume filter admits only `Success` keys.
+/// # The invariant this refusal depends on, stated
+///
+/// "Every planned table copied" is decided by comparing a count of `Success`
+/// entries against `total_tables`. A count can only stand in for the planned
+/// SET while every recorded key comes from the invocation's own plan. That
+/// producer invariant holds today and is enforced entirely by the callers:
+/// `init_run_progress` is called once per run with `tables_to_process.len()`,
+/// both `record_table_progress` sites iterate that same `tables_to_process`,
+/// entries are keyed `{run_id}|{table_key}` so a table cannot be counted twice,
+/// and DAG sub-runs mint their own run ids rather than sharing a checkpoint.
+///
+/// This function cannot check any of that, and no arithmetic on counts can
+/// recover it: a checkpoint holding `Success(a)` and `Success(x)` against a
+/// plan of `{a, b}` has the right count and the wrong set, and would be refused
+/// although `b` still needs copying. Proving completeness properly needs the
+/// planned table identities on the checkpoint, which is a `RunProgress` shape
+/// change and so out of scope here. **If you add a `record_table_progress` call
+/// site, it must record a table from `tables_to_process` or this gate becomes
+/// wrong.**
+///
+/// The non-`Success` guard below narrows the exposure rather than removing it.
+/// It is what makes every mixed-state checkpoint resumable regardless of the
+/// count: a `Failed`, `Interrupted` or `Skipped` table is re-attempted by a
+/// resume, because the resume filter admits only `Success` keys.
 fn ensure_the_resume_would_do_work(
     record: &rocky_core::state::RunRecord,
     progress: &RunProgress,
@@ -13760,11 +13775,12 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
     /// gate. Each one must stay RESUMABLE: the refusal is for a checkpoint that
     /// proves there is nothing left to copy, and none of these do.
     ///
-    /// The `Success`-entries-exceed-`total_tables` shape cannot arise today —
-    /// both `record_table_progress` call sites iterate `tables_to_process`,
-    /// whose length is `total_tables`, so recorded keys are a subset of the
-    /// plan. It is pinned anyway, because the gate must not depend on an
-    /// invariant it cannot see.
+    /// The `Success`-entries-exceed-`total_tables` shape cannot arise today,
+    /// because every recorded key comes from `tables_to_process` — see the
+    /// producer invariant named on `ensure_the_resume_would_do_work`. It is
+    /// pinned anyway: the mixed-state class must be resumable on the entry
+    /// STATES alone, so that a checkpoint carrying unfinished work is admitted
+    /// even where the count would read as complete.
     #[test]
     fn adversarial_checkpoints_stay_resumable() {
         use rocky_core::state::TableStatus;
