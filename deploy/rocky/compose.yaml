@@ -1,0 +1,65 @@
+# Rocky on Docker Compose: one long-lived `rocky serve` with the browser UI
+# and the resident scheduler, on one machine.
+#
+# Community-supported. An example to start from, not a supported deployment:
+# the rules it encodes are the engine's (see README.md and the guide,
+# docs/src/content/docs/guides/run-the-image.md), the file itself is not a
+# contract. Local state only: the state store lives on the mounted volume.
+#
+#   ./project/rocky.toml, ./project/models/  ──►  /data in the container
+#   http://127.0.0.1:8080/ui/#token=...      ◄──  the address the server prints
+#
+# Start: copy .env.example to .env, fill the two secrets, put a project in
+# ./project, then `docker compose up -d`. The README has every step.
+
+name: rocky
+
+services:
+  rocky:
+    # Pin the version tag you run. `latest` moves on every release; a
+    # version tag never does. ROCKY_IMAGE overrides it (a locally built
+    # image, for one) without editing this file.
+    image: ${ROCKY_IMAGE:-ghcr.io/rocky-data/rocky:1.74.0}
+
+    # `--host 0.0.0.0`: inside a container the server must bind every
+    # interface to be reachable through the published port; the port mapping
+    # below keeps it on the host's loopback. `--ui` needs the read-only token
+    # scope, set in the environment. `--ui --scheduler` needs the webhook
+    # secret, so the scheduler's ingress cannot be reached with the browser
+    # token. Drop `--scheduler` for a read-only sidecar.
+    command: ["serve", "--host", "0.0.0.0", "--ui", "--scheduler"]
+
+    environment:
+      # Both secrets come from .env. `${VAR:?...}` refuses to start without
+      # them rather than starting an unauthenticated server.
+      ROCKY_SERVE_TOKEN: ${ROCKY_SERVE_TOKEN:?set ROCKY_SERVE_TOKEN in .env (openssl rand -hex 32)}
+      ROCKY_SERVE_TOKEN_SCOPE: read-only
+      ROCKY_WEBHOOK_SECRET: ${ROCKY_WEBHOOK_SECRET:?set ROCKY_WEBHOOK_SECRET in .env (openssl rand -hex 32)}
+      # Warehouse credentials your rocky.toml reads through ${VAR} go here,
+      # from .env as well. Examples:
+      # DATABRICKS_HOST: ${DATABRICKS_HOST}
+      # DATABRICKS_TOKEN: ${DATABRICKS_TOKEN}
+
+    ports:
+      # Loopback only. Publish on 0.0.0.0 only behind your own TLS and
+      # identity layer; the server terminates neither.
+      - "127.0.0.1:8080:8080"
+
+    volumes:
+      # The project: rocky.toml, models/, and under models/ the state store
+      # (`.rocky-state.redb`). One mount carries the project and its state.
+      # On Linux the server's user (uid 65532) must be able to write it: see
+      # README.md for `user:` and `chown`.
+      - ./project:/data
+
+    # `docker compose stop` sends SIGTERM and the server drains: in-flight
+    # requests, then a running scheduled child (up to the server's
+    # --drain-timeout-seconds, default 60). Keep this above that.
+    stop_grace_period: 90s
+
+    restart: unless-stopped
+
+    # One scheduler per project. Two instances on one volume would both run
+    # what is due. Never `--scale rocky=2`; run one service per project instead.
+    deploy:
+      replicas: 1
