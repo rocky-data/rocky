@@ -432,3 +432,37 @@ def test_parse_rocky_output_dispatches_product_list():
     )
     assert isinstance(empty, ProductListOutput)
     assert empty.products == []
+
+
+def test_parse_rocky_output_dispatches_product_journal():
+    from rocky_sdk.types import ProductJournalOutput
+
+    payload = {
+        "version": "1.74.0",
+        "command": "product_journal",
+        "product": "revenue_daily",
+        "product_id": "product:revenue_daily",
+        "rows": [
+            {
+                "seq": 1,
+                "at": "2026-08-19T00:00:00Z",
+                "event": "spec approved",
+                "to_state": "spec_approved",
+                "spec_digest": "sha256:" + "a" * 64,
+            },
+            {
+                "seq": 2,
+                "event": "plan proposed",
+                "from_state": "spec_approved",
+                "to_state": "proposed",
+                "plan_id": "b" * 64,
+            },
+        ],
+        "count": 2,
+    }
+    result = parse_rocky_output(json.dumps(payload))
+    assert isinstance(result, ProductJournalOutput)
+    assert result.count == 2
+    assert [row.seq for row in result.rows] == [1, 2]
+    assert result.rows[1].from_state == "spec_approved"
+    assert result.rows[1].plan_id == "b" * 64

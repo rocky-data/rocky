@@ -14075,6 +14075,107 @@
         ],
         "type": "object"
       },
+      "ProductJournalEntry": {
+        "description": "One persisted fulfillment journal row, as `rocky product journal` prints it: the loop's own record of a transition, field for field.",
+        "properties": {
+          "at": {
+            "description": "RFC 3339 instant of the transition, when recorded.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "event": {
+            "description": "What happened, in the loop's plain language (`spec approved`, …). A label to render, not an enum to switch on.",
+            "type": "string"
+          },
+          "from_state": {
+            "description": "The state tag before the transition, when one existed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "idempotency_key": {
+            "description": "The idempotency key pinned by this event, when it pinned one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "plan_id": {
+            "description": "The plan involved, when the event concerns one (propose, apply).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "seq": {
+            "description": "Sequence number, also encoded in the row's store key.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "spec_digest": {
+            "description": "The spec digest involved, when the event concerns one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to_state": {
+            "description": "The state tag after the transition.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event",
+          "seq",
+          "to_state"
+        ],
+        "type": "object"
+      },
+      "ProductJournalOutput": {
+        "description": "JSON output of `rocky product journal <name>`.\n\nThe product's fulfillment journal, whole and in append order, read through the same store function the fulfillment loop reads through. A known product with no rows is an empty journal; a product the project does not know (no spec file, no store record) is a refusal, never an empty journal.",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "count": {
+            "description": "`rows.len()`, repeated so a consumer can assert it received the whole journal.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "product": {
+            "description": "The product name as given.",
+            "type": "string"
+          },
+          "product_id": {
+            "description": "`product:<name>`, the store key every record of the product hangs off.",
+            "type": "string"
+          },
+          "rows": {
+            "description": "Every journal row, in append order.",
+            "items": {
+              "$ref": "#/components/schemas/ProductJournalEntry"
+            },
+            "type": "array"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "count",
+          "product",
+          "product_id",
+          "rows",
+          "version"
+        ],
+        "type": "object"
+      },
       "ProductListEntry": {
         "description": "One product's row in `rocky product list`.\n\nA projection of [`ProductStatusOutput`], built by the same function `product status` uses, so the two can never disagree. Missing values are `null`, never invented.",
         "properties": {
@@ -22356,6 +22457,69 @@
           }
         },
         "summary": "Product status",
+        "tags": [
+          "products"
+        ]
+      }
+    },
+    "/api/v1/products/{name}/journal": {
+      "get": {
+        "description": "Every persisted fulfillment journal row of the product, in append order: the loop's own record of each transition (`event`, the state before and after, and the spec digest, plan id and idempotency key involved). The same bytes as `rocky product journal <name> --output json`, read through the store function the loop reads through. A known product with no rows is an empty journal. Reads only.",
+        "operationId": "getProductJournal",
+        "parameters": [
+          {
+            "description": "Path parameter `name`.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductJournalOutput"
+                }
+              }
+            },
+            "description": "The journal."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No spec file and no state record exists under this product name."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store could not be opened for reading (malformed, or written by a newer engine), or `products/` could not be read."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "One product's fulfillment journal",
         "tags": [
           "products"
         ]

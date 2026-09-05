@@ -834,6 +834,34 @@ fn route_table() -> Vec<Route> {
         },
         Route {
             method: "get",
+            path: "/api/v1/products/{name}/journal",
+            operation_id: "getProductJournal",
+            tag: "products",
+            summary: "One product's fulfillment journal",
+            description: "Every persisted fulfillment journal row of the product, in append \
+                 order: the loop's own record of each transition (`event`, the state \
+                 before and after, and the spec digest, plan id and idempotency key \
+                 involved). The same bytes as `rocky product journal <name> --output \
+                 json`, read through the store function the loop reads through. A known \
+                 product with no rows is an empty journal. Reads only.",
+            path_params: &["name"],
+            query_params: &[],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The journal.",
+                    body: Body::Component("ProductJournalOutput"),
+                },
+                PRODUCT_NOT_FOUND,
+                ENGINE_BUSY_OR_NOT_READY,
+                PRODUCT_READ_FAILED,
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
             path: "/api/v1/review/queue",
             operation_id: "getReviewQueue",
             tag: "review",
@@ -1363,6 +1391,7 @@ mod tests {
             "DagStatusOutput",
             "ProductListOutput",
             "ProductStatusOutput",
+            "ProductJournalOutput",
             "ReviewQueueOutput",
             "ReviewStatusOutput",
             "BriefOutput",
@@ -1430,6 +1459,7 @@ mod tests {
             ("/api/v1/dag/status", "DagStatusOutput"),
             ("/api/v1/products", "ProductListOutput"),
             ("/api/v1/products/{name}", "ProductStatusOutput"),
+            ("/api/v1/products/{name}/journal", "ProductJournalOutput"),
             ("/api/v1/review/queue", "ReviewQueueOutput"),
             ("/api/v1/review/{plan_id}/status", "ReviewStatusOutput"),
             ("/api/v1/brief", "BriefOutput"),

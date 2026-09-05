@@ -128,6 +128,27 @@ The same payload is served over HTTP by `rocky serve` at `GET /api/v1/products`,
 
 ---
 
+## `rocky product journal`
+
+Read-only. A product's fulfillment journal: every persisted transition, in append order.
+
+```bash
+rocky product journal revenue_daily
+rocky product journal revenue_daily --output json
+```
+
+Each row is the loop's own record of one transition: its sequence number, when it happened, what happened in plain words (`spec approved`, …), the state before and after, and the spec digest, plan id and idempotency key involved when the event concerns one. The rows are read through the same store function the fulfillment loop reads through, so what the command shows is what the loop sees. `rocky product status` reports only the count of these rows.
+
+A product is known by the same rule `status` and `list` use: `products/<name>.toml` exists, or the state store holds a fulfillment or approval record under the name. A known product with no rows prints an empty journal and exits `0`. A product the project does not know exits `1`, because an empty journal for a typo would read as "nothing happened".
+
+The same payload is served over HTTP by `rocky serve` at `GET /api/v1/products/{name}/journal`. An unknown name answers `404 product_not_found`.
+
+### JSON output
+
+`ProductJournalOutput` — `product`, `product_id`, `rows` (one `ProductJournalEntry` each) and `count`.
+
+---
+
 ## Validation codes
 
 `rocky validate` checks `products/` offline with its own code band:
