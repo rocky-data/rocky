@@ -2,17 +2,20 @@ import { useState, type ReactNode } from "react";
 import type { DagOutput } from "@rocky-types/dag";
 import type { HistoryOutput } from "@rocky-types/history";
 import type { ModelDetailOutput } from "@rocky-types/model_detail";
+import type { ProjectOutput } from "@rocky-types/project";
 import type { ScheduleStatusOutput } from "@rocky-types/schedule_status";
 import { apiGet } from "../api";
 import { StatusCard } from "../components";
 import { DagPanel } from "./DagPanel";
 import { ModelDetail } from "./ModelDetail";
+import { ProjectStrip } from "./ProjectStrip";
 import { RunsPanel } from "./RunsPanel";
 import { SchedulePanel } from "./SchedulePanel";
 import { type Resource, useResource } from "./useResource";
 
 /** The four producers this screen reads. Tests hand in fixtures. */
 export interface EstateLoaders {
+  project: () => Promise<ProjectOutput>;
   dag: () => Promise<DagOutput>;
   runs: () => Promise<HistoryOutput>;
   schedule: () => Promise<ScheduleStatusOutput>;
@@ -20,6 +23,7 @@ export interface EstateLoaders {
 }
 
 export const defaultLoaders: EstateLoaders = {
+  project: () => apiGet<ProjectOutput>("project"),
   dag: () => apiGet<DagOutput>("dag"),
   runs: () => apiGet<HistoryOutput>("runs"),
   schedule: () => apiGet<ScheduleStatusOutput>("schedule"),
@@ -43,12 +47,14 @@ export function EstateScreen({
   refreshMs?: number;
   now?: number;
 }) {
+  const project = useResource(loaders.project, [loaders], refreshMs);
   const dag = useResource(loaders.dag, [loaders]);
   const runs = useResource(loaders.runs, [loaders], refreshMs);
   const schedule = useResource(loaders.schedule, [loaders], refreshMs);
   const [selected, setSelected] = useState<string | null>(null);
 
   const refreshAll = () => {
+    project.reload();
     dag.reload();
     runs.reload();
     schedule.reload();
@@ -66,6 +72,10 @@ export function EstateScreen({
           Refresh
         </button>
       </div>
+
+      <Panel title="Project" producer="GET /api/v1/project">
+        <Loaded resource={project}>{(value) => <ProjectStrip project={value} now={now} />}</Loaded>
+      </Panel>
 
       <Panel title="DAG" producer="GET /api/v1/dag">
         <Loaded resource={dag}>

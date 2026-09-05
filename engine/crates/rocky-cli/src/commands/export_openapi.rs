@@ -680,6 +680,33 @@ fn route_table() -> Vec<Route> {
         },
         Route {
             method: "get",
+            path: "/api/v1/project",
+            operation_id: "getProject",
+            tag: "meta",
+            summary: "The project this sidecar serves",
+            description: "What the retired dashboard at `/` used to show, typed: the config \
+                 directory's name and the config path, its pipelines and adapters by name \
+                 and type, the compiled model count, the diagnostics counts, and the newest \
+                 run in the state store the server resolved. Without a bound config the \
+                 lists are empty and `config_path` is null; a config that does not load \
+                 sets `config_error`. No CLI counterpart. Reads only.",
+            path_params: &[],
+            query_params: &[],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The project.",
+                    body: Body::Component("ProjectOutput"),
+                },
+                ENGINE_BUSY_OR_NOT_READY,
+                GOVERNOR_READ_FAILED,
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
             path: "/api/v1/dag/status",
             operation_id: "getDagStatus",
             tag: "dag",
@@ -1389,6 +1416,7 @@ mod tests {
             "ModelDetailOutput",
             "DagLayersOutput",
             "DagStatusOutput",
+            "ProjectOutput",
             "ProductListOutput",
             "ProductStatusOutput",
             "ProductJournalOutput",
@@ -1457,6 +1485,7 @@ mod tests {
             ("/api/v1/models/{name}", "ModelDetailOutput"),
             ("/api/v1/dag/layers", "DagLayersOutput"),
             ("/api/v1/dag/status", "DagStatusOutput"),
+            ("/api/v1/project", "ProjectOutput"),
             ("/api/v1/products", "ProductListOutput"),
             ("/api/v1/products/{name}", "ProductStatusOutput"),
             ("/api/v1/products/{name}/journal", "ProductJournalOutput"),

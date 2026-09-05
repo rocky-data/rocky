@@ -85,6 +85,7 @@ pub(crate) fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<ModelDetailOutput>("model_detail"),
         entry::<DagLayersOutput>("dag_layers"),
         entry::<DagStatusOutput>("dag_status"),
+        entry::<crate::output::ProjectOutput>("project"),
         entry::<TestOutput>("test"),
         entry::<CiOutput>("ci"),
         entry::<CiDiffOutput>("ci_diff"),
