@@ -183,7 +183,8 @@ pub use schedule_status::{ScheduleStatusError, schedule_status_output};
 // `--target-dialect` without taking a direct dep on rocky-sql.
 pub use rocky_sql::transpile::Dialect;
 pub use run::{
-    DeferOptions, Interrupted, PartialFailure, PartitionRunOptions, SkipRunOptions, run,
+    CheckGateFailure, DeferOptions, Interrupted, PartialFailure, PartitionRunOptions,
+    SkipRunOptions, run,
 };
 pub use run_dag_exec::run_with_dag;
 pub use run_watch::run_watch as run_with_watch;
