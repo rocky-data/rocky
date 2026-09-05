@@ -4,8 +4,11 @@
 //! `after`, `freshness`), runs what is due through child `rocky run` processes,
 //! records scheduler state, and emits a typed [`TickOutput`]. There is no
 //! daemon: the tick comes from an external timer (cron, systemd, CI). The
-//! reconciler core lives in `rocky-core` and reads no wall clock — this wrapper
-//! is the only place the clock is consulted (via `--now`, else `Utc::now()`).
+//! reconciler core lives in `rocky-core`; this wrapper resolves the instant that
+//! drives every scheduling decision (via `--now`, else `Utc::now()`) and passes
+//! it down. That instant does not reach the webhook spool's tombstone sweep,
+//! which ages files by their filesystem mtime and reads the wall clock that
+//! stamped them — otherwise `--now <future>` erased the dedup window (#1716).
 //!
 //! This layer is deliberately thin: it loads config + state, resolves the
 //! per-pipeline member-model freshness budgets the core cannot load itself
@@ -40,7 +43,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Run one demand-reconciliation tick.
 ///
 /// `now_arg` is the injected evaluation instant (`--now`); `None` reads the wall
-/// clock — the sole clock read in the whole reconciler. A `PartialFailure`
+/// clock. It is the only clock the reconciler consults to decide what is due;
+/// the spool's tombstone sweep reads the filesystem clock instead. A `PartialFailure`
 /// sentinel is returned (after the JSON is emitted) when any executed run failed
 /// or was partial, so `rocky/src/main.rs` maps it to exit 2; a genuine infra
 /// fault returns an ordinary error mapped to exit 1.
