@@ -628,6 +628,42 @@ fn map_state_err(err: anyhow::Error, running_job_id: Option<String>) -> ApiError
     }
 }
 
+/// Run a request-local read of the state store off the async runtime, one at
+/// a time per process.
+///
+/// Every state-backed read opens the store for the request and drops it with
+/// the response, and redb takes an exclusive `flock` on the file for the life
+/// of a handle. Two requests opening at once therefore race: the loser polls
+/// the lock five times, 50 ms apart (`StateStore::open_redb_with_retry`), and
+/// answers `503 engine_busy` when it loses every poll. Two browser tabs
+/// refreshing together manage that routinely — measured with
+/// `scripts/serve-ceiling.py`: 76 of 1,982 requests at two clients, none at
+/// one — so the ceiling of one process was one viewer. A poll cannot tell "a
+/// `rocky run` holds the store" from "the request next to me is reading it";
+/// this process can. Its own reads queue on one permit and never contend with
+/// each other, so the only `503 engine_busy` left is the one that status is
+/// for: another process holding the store.
+///
+/// The permit is taken inside the blocking task, not in the handler: a client
+/// that disconnects drops the handler's future, not the running read, and the
+/// next read must not start until this one has closed the store.
+async fn store_read<T, F>(state: &ServerState, read: F) -> Result<T, ApiError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let permit = Arc::clone(&state.store_reads)
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::internal("the state-store read queue is closed".to_string()))?;
+    tokio::task::spawn_blocking(move || {
+        let _held = permit;
+        read()
+    })
+    .await
+    .map_err(|e| map_join_err(&e))
+}
+
 /// Router-level fallback: an unmatched path answers the enveloped
 /// `404 route_not_found` instead of axum's default empty body. Registered
 /// before the auth layer in [`router`], so it is auth-wrapped like every
@@ -959,7 +995,7 @@ async fn compile_status(
     let contracts_dir = state.contracts_dir.clone();
     let state_path = state_path_for(&state);
 
-    let output = tokio::task::spawn_blocking(move || {
+    let output = store_read(&state, move || {
         compile_output(
             config_path.as_deref(),
             &state_path,
@@ -972,8 +1008,7 @@ async fn compile_status(
             None,  // cache_ttl_override
         )
     })
-    .await
-    .map_err(|e| map_join_err(&e))?
+    .await?
     .map_err(|e| ApiError::internal(e.to_string()))?;
 
     Ok(PrettyJson(output))
@@ -1009,7 +1044,7 @@ async fn full_dag(
     let contracts_dir = state.contracts_dir.clone();
     let state_path = state_path_for(&state);
 
-    let output = tokio::task::spawn_blocking(move || {
+    let output = store_read(&state, move || {
         dag_output(
             &config_path,
             &state_path,
@@ -1020,8 +1055,7 @@ async fn full_dag(
             None,  // cache_ttl_override
         )
     })
-    .await
-    .map_err(|e| map_join_err(&e))?
+    .await?
     .map_err(|e| ApiError::internal(e.to_string()))?;
 
     Ok(PrettyJson(output))
@@ -1037,10 +1071,11 @@ async fn list_runs(
     // The redb open + scan are sync work that can sleep on the state flock
     // (see `StateStore::open_redb_with_retry`); move it off the async runtime.
     let state_path = state_path_for(&state);
-    let output = tokio::task::spawn_blocking(move || history_runs_output(&state_path, None, false))
-        .await
-        .map_err(|e| map_join_err(&e))?
-        .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    let output = store_read(&state, move || {
+        history_runs_output(&state_path, None, false)
+    })
+    .await?
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
     Ok(PrettyJson(output))
 }
 
@@ -1052,13 +1087,12 @@ async fn model_history(
     ApiPath(name): ApiPath<String>,
 ) -> Result<PrettyJson<ModelHistoryOutput>, ApiError> {
     let state_path = state_path_for(&state);
-    let output = tokio::task::spawn_blocking(move || {
+    let output = store_read(&state, move || {
         // `window` (20) is the CLI default; it is unused when rolling_stats
         // is false, so the output matches `rocky history --model <name>`.
         model_history_output(&state_path, &name, None, false, 20)
     })
-    .await
-    .map_err(|e| map_join_err(&e))?
+    .await?
     .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
     Ok(PrettyJson(output))
 }
@@ -1072,11 +1106,11 @@ async fn model_metrics(
     ApiPath(name): ApiPath<String>,
 ) -> Result<PrettyJson<MetricsOutput>, ApiError> {
     let state_path = state_path_for(&state);
-    let output =
-        tokio::task::spawn_blocking(move || metrics_output(&state_path, &name, false, None, false))
-            .await
-            .map_err(|e| map_join_err(&e))?
-            .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    let output = store_read(&state, move || {
+        metrics_output(&state_path, &name, false, None, false)
+    })
+    .await?
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
     Ok(PrettyJson(output))
 }
 
@@ -1173,9 +1207,8 @@ async fn list_products(
 ) -> Result<PrettyJson<ProductListOutput>, ApiError> {
     let root = project_root_for(&state)?;
     let state_path = state_path_for(&state);
-    let output = tokio::task::spawn_blocking(move || product_list_in(&root, Some(&state_path)))
-        .await
-        .map_err(|e| map_join_err(&e))?
+    let output = store_read(&state, move || product_list_in(&root, Some(&state_path)))
+        .await?
         .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
     Ok(PrettyJson(output))
 }
@@ -1200,15 +1233,14 @@ async fn get_product(
     let root = project_root_for(&state)?;
     let state_path = state_path_for(&state);
     let lookup = name.clone();
-    let output = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<_>> {
+    let output = store_read(&state, move || -> anyhow::Result<Option<_>> {
         let known = product_names_in(&root, Some(&state_path))?;
         if !known.iter().any(|known| known == &lookup) {
             return Ok(None);
         }
         product_status_in(&root, Some(&state_path), &lookup).map(Some)
     })
-    .await
-    .map_err(|e| map_join_err(&e))?
+    .await?
     .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
     match output {
         Some(status) => Ok(PrettyJson(status)),
@@ -1234,11 +1266,11 @@ async fn product_journal(
     let root = project_root_for(&state)?;
     let state_path = state_path_for(&state);
     let lookup = name.clone();
-    let output =
-        tokio::task::spawn_blocking(move || product_journal_in(&root, Some(&state_path), &lookup))
-            .await
-            .map_err(|e| map_join_err(&e))?
-            .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    let output = store_read(&state, move || {
+        product_journal_in(&root, Some(&state_path), &lookup)
+    })
+    .await?
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
     match output {
         Some(journal) => Ok(PrettyJson(journal)),
         None => Err(ApiError::product_not_found(&name)),
@@ -1261,11 +1293,10 @@ async fn review_queue(
         .ok_or_else(ApiError::engine_not_ready)?;
     let state_path = state_path_for(&state);
     let models_dir = state.models_dir.clone();
-    let output = tokio::task::spawn_blocking(move || {
+    let output = store_read(&state, move || {
         compute_review_queue(&root, &config, &state_path, &models_dir)
     })
-    .await
-    .map_err(|e| map_join_err(&e))?
+    .await?
     .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
     Ok(PrettyJson(output))
 }
@@ -1285,7 +1316,7 @@ async fn review_status(
     }
     let root = project_root_for(&state)?;
     let lookup = plan_id.clone();
-    let output = tokio::task::spawn_blocking(move || -> anyhow::Result<ReviewStatusLookup> {
+    let output = store_read(&state, move || -> anyhow::Result<ReviewStatusLookup> {
         if !plan_file_path(&root, &lookup).is_file() {
             return Ok(ReviewStatusLookup::NoPlan);
         }
@@ -1295,8 +1326,7 @@ async fn review_status(
         compute_review_status(&root, &lookup)
             .map(|status| ReviewStatusLookup::Found(Box::new(status)))
     })
-    .await
-    .map_err(|e| map_join_err(&e))?
+    .await?
     .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
     match output {
         ReviewStatusLookup::Found(status) => Ok(PrettyJson(*status)),
@@ -1384,11 +1414,10 @@ async fn governor_brief(
         .clone()
         .ok_or_else(ApiError::engine_not_ready)?;
     let state_path = state_path_for(&state);
-    let output = tokio::task::spawn_blocking(move || {
+    let output = store_read(&state, move || {
         compute_brief(&root, &state_path, &config, since, chrono::Utc::now())
     })
-    .await
-    .map_err(|e| map_join_err(&e))?
+    .await?
     .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
     Ok(PrettyJson(output))
 }
@@ -1430,11 +1459,10 @@ async fn audit_scorecard(
     })?;
     let state_path = state_path_for(&state);
     let window = query.window;
-    let output = tokio::task::spawn_blocking(move || {
+    let output = store_read(&state, move || {
         compute_audit_scorecard(&state_path, by, window.as_deref())
     })
-    .await
-    .map_err(|e| map_join_err(&e))?
+    .await?
     .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
     Ok(PrettyJson(output))
 }
@@ -1469,11 +1497,10 @@ async fn custody_chain(
         .ok_or_else(ApiError::engine_not_ready)?;
     let state_path = state_path_for(&state);
     let models_dir = state.models_dir.clone();
-    let output = tokio::task::spawn_blocking(move || {
+    let output = store_read(&state, move || {
         compute_audit_for(&root, &config, &state_path, &models_dir, &subject)
     })
-    .await
-    .map_err(|e| map_join_err(&e))?
+    .await?
     .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
     Ok(PrettyJson(output))
 }
@@ -1524,7 +1551,7 @@ async fn audit_ledger(
         }
     };
     let state_path = state_path_for(&state);
-    let output = tokio::task::spawn_blocking(move || -> anyhow::Result<AuditLookup> {
+    let output = store_read(&state, move || -> anyhow::Result<AuditLookup> {
         let product = match scope {
             None => None,
             Some((root, name)) => match resolve_product_scope(&root, &name) {
@@ -1542,8 +1569,7 @@ async fn audit_ledger(
         };
         compute_audit(&state_path, product).map(|output| AuditLookup::Found(Box::new(output)))
     })
-    .await
-    .map_err(|e| map_join_err(&e))?
+    .await?
     .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
     match output {
         AuditLookup::Found(output) => Ok(PrettyJson(*output)),
@@ -1588,11 +1614,10 @@ async fn schedule_status(
     let rocky_dir = crate::commands::scheduler::rocky_dir_for_config(&config_path);
     let running_job_id = state.mutation_permit.running_job();
 
-    let output = tokio::task::spawn_blocking(move || {
+    let output = store_read(&state, move || {
         schedule_status_output(&config_path, &state_path, &rocky_dir, chrono::Utc::now())
     })
-    .await
-    .map_err(|e| map_join_err(&e))?
+    .await?
     .map_err(|e| map_schedule_err(e, running_job_id))?;
     Ok(PrettyJson(output))
 }
@@ -2163,12 +2188,11 @@ async fn get_job(
     }
 
     let lookup_id = id.clone();
-    let record = tokio::task::spawn_blocking(move || {
+    let record = store_read(&state, move || {
         let store = rocky_core::state::StateStore::open_read_only(&state_path)?;
         store.get_job(&lookup_id)
     })
-    .await
-    .map_err(|e| map_join_err(&e))?
+    .await?
     .map_err(|e| map_state_err(anyhow::Error::from(e), state.mutation_permit.running_job()))?;
 
     match record {
@@ -2947,6 +2971,55 @@ mod tests {
     /// `/brief` answers with the CLI's bytes for each window, modulo the two
     /// clock fields, defaults to `7d`, never advances the cursor, and refuses
     /// an unknown window with the envelope.
+    /// Sixty-four concurrent reads of the store-backed routes all answer
+    /// `200`. Every one of them opens the store for the request, and redb's
+    /// exclusive flock made two of this process's own reads race for it: the
+    /// loser polled five times and answered `503 engine_busy`. The load test
+    /// (`scripts/serve-ceiling.py`) measured that at two clients, so the
+    /// in-process read queue exists; this pins it. Without the queue this
+    /// test fails on the first run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_store_reads_never_answer_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path, _) = governor_fixture(dir.path());
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config),
+            &state_path,
+        ))
+        .await;
+        let routes = [
+            "/api/v1/runs",
+            "/api/v1/schedule",
+            "/api/v1/audit",
+            "/api/v1/products",
+            "/api/v1/brief",
+            "/api/v1/audit/scorecard",
+        ];
+        let client = reqwest::Client::new();
+        let tasks: Vec<_> = (0..64)
+            .map(|n| {
+                let client = client.clone();
+                let url = format!("{base}{}", routes[n % routes.len()]);
+                tokio::spawn(async move {
+                    let status = client.get(&url).send().await.unwrap().status().as_u16();
+                    (url, status)
+                })
+            })
+            .collect();
+        let mut failed = Vec::new();
+        for task in tasks {
+            let (url, status) = task.await.unwrap();
+            if status != 200 {
+                failed.push((url, status));
+            }
+        }
+        assert!(
+            failed.is_empty(),
+            "concurrent reads answered non-200: {failed:?}"
+        );
+    }
+
     #[tokio::test]
     async fn brief_matches_the_cli_modulo_the_clock_and_never_moves_the_cursor() {
         let dir = tempfile::tempdir().unwrap();
