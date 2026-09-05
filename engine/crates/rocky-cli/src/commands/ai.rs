@@ -34,20 +34,40 @@ fn proposed_source_format(file_path: &str) -> &'static str {
 
 /// Create an LLM client from environment + project config.
 ///
-/// Reads `[ai] max_tokens` from `rocky.toml` when the config loads cleanly;
-/// falls back to [`DEFAULT_MAX_TOKENS`] if the config is missing or
-/// malformed (so `rocky ai` keeps working in greenfield projects without
-/// any `rocky.toml`).
+/// Reads `[ai] max_tokens` from `rocky.toml`. A project with NO `rocky.toml`
+/// falls back to [`DEFAULT_MAX_TOKENS`], so `rocky ai` keeps working in a
+/// greenfield project. A `rocky.toml` that is PRESENT and does not load
+/// REFUSES (#1680) rather than silently using the default — the configured
+/// ceiling is the one the operator chose, and a truncated completion is not a
+/// visible failure.
+///
+/// This matters most for `rocky ai generate`, whose own compile is
+/// `compile_project(..).ok()` — a deliberate degrade to unschema'd generation.
+/// That `.ok()` swallows the compile-side config refusal, so this is the only
+/// place `rocky ai generate` can see a broken config at all.
+///
+/// Credential-TOLERANT: `rocky ai` talks to the Anthropic API, never to the
+/// warehouse, so an unset `${DATABRICKS_HOST}` must not block it (#1536).
+/// Under the strict loader this site used before, that unset variable silently
+/// discarded a configured `max_tokens`.
 ///
 /// `api_key` is wrapped in [`RedactedString`] so any future `?config` /
 /// `{:?}` formatting in trace output prints `***` instead of the secret.
 fn make_client(config_path: &Path) -> Result<LlmClient> {
-    let api_key = std::env::var(ANTHROPIC_API_KEY_VAR)
-        .context("ANTHROPIC_API_KEY not set. Set it to use `rocky ai`.")?;
-
-    let max_tokens = rocky_core::config::load_rocky_config(config_path)
+    // The config is read BEFORE the API key, deliberately. A broken
+    // `rocky.toml` is a project-level fault the operator must fix either way,
+    // and reading it first is what makes this refusal reachable from a unit
+    // test without setting a process-wide environment variable (`set_var` is
+    // `unsafe` on edition 2024 and racy across test threads). The only
+    // behaviour this reorders is the message a user with NEITHER a key NOR a
+    // loadable config sees: the config error rather than the key error.
+    let max_tokens = rocky_core::config::load_optional_project_config(Some(config_path))
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?
         .map(|cfg| cfg.ai.max_tokens)
         .unwrap_or(DEFAULT_MAX_TOKENS);
+
+    let api_key = std::env::var(ANTHROPIC_API_KEY_VAR)
+        .context("ANTHROPIC_API_KEY not set. Set it to use `rocky ai`.")?;
 
     let config = AiConfig {
         provider: "anthropic".to_string(),
@@ -598,5 +618,142 @@ mod tests {
             on_disk, original,
             "an invalid proposal must not overwrite the model file"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #1680 — the two config reads `rocky ai` makes.
+    //
+    // `compile_project` is #1667's converted caller (its shared-loader test
+    // stays green if `.ok()` comes back here). `make_client` is the `[ai]`
+    // secondary read, and it matters most for `rocky ai generate`, whose own
+    // compile is `compile_project(..).ok()` — so `make_client` is the ONLY
+    // place that subcommand can see a broken config at all.
+    // ------------------------------------------------------------------
+
+    /// Parses as TOML, fails a validator: `fivetran` is discovery-only and
+    /// needs `kind = "discovery"`. Present-and-broken, never absent.
+    const BROKEN_CONFIG_1680: &str =
+        "[adapter.ft]\ntype = \"fivetran\"\napi_key = \"k\"\napi_secret = \"s\"\n";
+
+    /// Loads under the credential-TOLERANT loader (#1536), refuses under the
+    /// strict one: `${...}` is unset and sits in an adapter connection field.
+    const UNSET_CREDENTIAL_CONFIG_1680: &str = "[adapters.wh]\ntype = \"databricks\"\n\
+         host = \"${ROCKY_T_1680_UNSET}\"\n";
+
+    /// The converted caller: a present-but-unloadable `rocky.toml` refuses the
+    /// grounding compile, naming the file.
+    #[test]
+    fn ai_compile_project_refuses_a_present_but_unloadable_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("m.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("m.toml"),
+            "name = \"m\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+        let cfg = tmp.path().join("rocky.toml");
+        std::fs::write(&cfg, BROKEN_CONFIG_1680).unwrap();
+
+        // `let ... else` rather than `expect_err`: `CompileResult` is not `Debug`.
+        let Err(err) = compile_project(
+            &cfg,
+            &tmp.path().join("state.redb"),
+            models_dir.to_str().unwrap(),
+            None,
+        ) else {
+            panic!("a present but unloadable rocky.toml must refuse the ai compile");
+        };
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failed to load config from") && rendered.contains("rocky.toml"),
+            "the refusal must name the config file, got: {rendered}"
+        );
+    }
+
+    /// Honest-failure guard for the converted caller: no `rocky.toml`, no
+    /// refusal.
+    #[test]
+    fn ai_compile_project_still_runs_without_any_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("m.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("m.toml"),
+            "name = \"m\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+        let cfg = tmp.path().join("rocky.toml");
+        assert!(!cfg.exists());
+
+        compile_project(
+            &cfg,
+            &tmp.path().join("state.redb"),
+            models_dir.to_str().unwrap(),
+            None,
+        )
+        .expect("a missing rocky.toml must not refuse the ai compile");
+    }
+
+    /// The `[ai]` secondary read: a present-but-unloadable `rocky.toml` refuses
+    /// the client build instead of silently falling back to
+    /// `DEFAULT_MAX_TOKENS`. Asserted without touching `ANTHROPIC_API_KEY`,
+    /// which `make_client` reads only after the config.
+    #[test]
+    fn ai_make_client_refuses_a_present_but_unloadable_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("rocky.toml");
+        std::fs::write(&cfg, BROKEN_CONFIG_1680).unwrap();
+
+        let Err(err) = make_client(&cfg) else {
+            panic!("a present but unloadable rocky.toml must refuse the ai client");
+        };
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failed to load config from") && rendered.contains("rocky.toml"),
+            "the refusal must name the config file, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("ANTHROPIC_API_KEY"),
+            "the config fault must be reported as itself, not as a missing key: {rendered}"
+        );
+    }
+
+    /// Honest-failure, case (b): a VALID config whose adapter connection field
+    /// holds an unset `${VAR}` must not refuse. Under the strict loader this
+    /// site used before, that config silently discarded a configured
+    /// `[ai] max_tokens`; the tolerant loader honours it.
+    #[test]
+    fn ai_make_client_tolerates_an_unset_credential_var() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("rocky.toml");
+        std::fs::write(&cfg, UNSET_CREDENTIAL_CONFIG_1680).unwrap();
+
+        // The loader swap is what makes the difference — pin both directions.
+        assert!(
+            rocky_core::config::load_rocky_config(&cfg).is_err(),
+            "fixture must fail the STRICT loader, or this proves nothing"
+        );
+        assert!(
+            rocky_core::config::load_optional_project_config(Some(&cfg))
+                .expect("the tolerant loader must accept an unset adapter credential")
+                .is_some()
+        );
+
+        // `make_client` gets past the config and stops only at the API key.
+        match make_client(&cfg) {
+            Ok(_) => {}
+            Err(e) => {
+                let rendered = format!("{e:#}");
+                assert!(
+                    rendered.contains("ANTHROPIC_API_KEY"),
+                    "an unset credential var must not refuse the ai client: {rendered}"
+                );
+            }
+        }
     }
 }

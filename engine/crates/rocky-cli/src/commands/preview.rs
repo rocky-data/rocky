@@ -1164,10 +1164,22 @@ pub async fn run_preview_cost(
     let (branch_run, base_run, _base_note) =
         newest_branch_and_base_runs(&store, branch_name, None)?;
 
-    // Resolve adapter cost params + project-level budget best-effort.
-    // A missing or malformed config silently skips both projections —
-    // the same fallback `run_cost` uses.
-    let loaded_config = rocky_core::config::load_rocky_config(config_path).ok();
+    // Resolve adapter cost params + project-level budget.
+    //
+    // A project with NO `rocky.toml` still skips both projections — there is no
+    // budget to breach and no warehouse to price. A `rocky.toml` that is
+    // PRESENT and does not load REFUSES (#1680): the `[budget]` block is read
+    // from it, so swallowing the error reported "no budget breach" for a
+    // project whose budget was never read. That is the answer a passing budget
+    // gate looks like, and it is the one answer this command must not invent.
+    //
+    // Credential-TOLERANT: `preview cost` reads the state store and prices from
+    // history; it opens no warehouse connection, so an unset `${VAR}` in an
+    // adapter's connection field must not block it (#1536). Under the strict
+    // loader this site used before, that unset variable silently dropped the
+    // budget projection too.
+    let loaded_config = rocky_core::config::load_optional_project_config(Some(config_path))
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
     let cost_params: Option<(rocky_core::cost::WarehouseType, f64, f64)> =
         loaded_config.as_ref().and_then(|cfg| {
             let dbu_per_hour =
@@ -3969,5 +3981,66 @@ table = "plain"
         bisect_one_model(&adapter, "t", "id", &base_table, &branch_table)
             .await
             .expect("empty-window bisect must short-circuit cleanly");
+    }
+
+    // ------------------------------------------------------------------
+    // #1680 — `rocky preview cost` reads `[budget]` from the config, so a
+    // swallowed load error reported "no budget breach" for a project whose
+    // budget was never read.
+    // ------------------------------------------------------------------
+
+    const BROKEN_CONFIG_1680: &str =
+        "[adapter.ft]\ntype = \"fivetran\"\napi_key = \"k\"\napi_secret = \"s\"\n";
+
+    const UNSET_CREDENTIAL_CONFIG_1680: &str = "[adapters.wh]\ntype = \"databricks\"\n\
+         host = \"${ROCKY_T_1680_PREVIEW_UNSET}\"\n";
+
+    /// FAIL-BEFORE: a present-but-unloadable `rocky.toml` refuses instead of
+    /// silently projecting against a default (empty) `[budget]`. On unmodified
+    /// production code this returns `Ok` and prints no breach.
+    #[tokio::test]
+    async fn preview_cost_refuses_a_present_but_unloadable_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        drop(rocky_core::state::StateStore::open(&state_path).unwrap());
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let cfg = dir.path().join("rocky.toml");
+        std::fs::write(&cfg, BROKEN_CONFIG_1680).unwrap();
+
+        let err = run_preview_cost(&cfg, &state_path, &models_dir, "feature_x", true)
+            .await
+            .expect_err("a present but unloadable rocky.toml must refuse `preview cost`");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failed to load config from") && rendered.contains("rocky.toml"),
+            "the refusal must name the config file, got: {rendered}"
+        );
+    }
+
+    /// Honest failure, both tolerated cases: no `rocky.toml` at all, and a
+    /// valid one whose adapter credentials do not resolve. Neither refuses.
+    /// The second used to fail the strict load and silently drop the budget
+    /// projection as well.
+    #[tokio::test]
+    async fn preview_cost_tolerates_an_absent_config_and_an_unset_credential_var() {
+        for (label, body) in [
+            ("absent", None),
+            ("unset credential", Some(UNSET_CREDENTIAL_CONFIG_1680)),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let state_path = dir.path().join("state.redb");
+            drop(rocky_core::state::StateStore::open(&state_path).unwrap());
+            let models_dir = dir.path().join("models");
+            std::fs::create_dir_all(&models_dir).unwrap();
+            let cfg = dir.path().join("rocky.toml");
+            if let Some(body) = body {
+                std::fs::write(&cfg, body).unwrap();
+            }
+
+            run_preview_cost(&cfg, &state_path, &models_dir, "feature_x", true)
+                .await
+                .unwrap_or_else(|e| panic!("{label} config must not refuse `preview cost`: {e:#}"));
+        }
     }
 }

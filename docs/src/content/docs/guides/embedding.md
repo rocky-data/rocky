@@ -146,6 +146,29 @@ So if agent-scoped `[policy]` rules gate `run` and `apply` in your setup, set `R
 
 **Multi-tenancy.** One `rocky serve` process serves one project configuration. For several tenants, run one sidecar per tenant with that tenant's config. Do not multiplex tenants through one server. One process per tenant keeps each tenant's state store, compiled graph, and credentials apart.
 
-**One mutation at a time.** The server admits one mutating job (`run` or `apply`) per project at a time. A second mutating submission during that job returns `409` and puts the in-flight job's id in `running_job_id`. Your client can then poll that job instead of colliding with it. A `plan` job mutates nothing and is never blocked. Reads stay available throughout. A read that briefly races the state lock returns a retryable `503` rather than an error.
+**One mutation at a time.** The server admits one mutating job (`run` or `apply`) per project at a time. A second mutating submission during that job returns `409` and puts the in-flight job's id in `running_job_id`. Your client can then poll that job instead of colliding with it. A `plan` job mutates nothing and is never blocked. Reads stay available throughout. A read that finds the state store held by another process, a `rocky run` in a terminal for example, returns a retryable `503 engine_busy` rather than an error.
+
+**Reads queue, one at a time.** Every state-backed read (`/runs`, `/schedule`, `/audit`, `/brief`, `/products`, `/review/queue`, and the rest) opens the state store for the request, and the store's file lock allows one open at a time. The server queues its own reads on one permit, so two clients refreshing together wait for each other instead of racing for the lock. Routes served from the compile result (`/models`, `/dag/layers`, `/dag`) never take the queue. The queue sets the ceiling of one process.
+
+### What one process carries
+
+Measured with `scripts/serve-ceiling.py` on 2026-09-05, against the playground project, on an Apple M3 Pro: a staircase of concurrent clients, each looping over the reads the browser UI makes, 20 seconds per step.
+
+| Concurrent clients | Requests per second | p99 latency |
+|---|---|---|
+| 1 | 90 | 20 ms |
+| 2 | 95 | 45 ms |
+| 4 | 97 | 69 ms |
+| 8 | 96 | 140 ms |
+| 16 | 97 | 274 ms |
+
+Zero errors at every step, and the process's memory did not move. Throughput saturates near 95 store-backed reads per second on that machine, about 10 ms per read; latency then grows with the queue, about 15 ms per waiting request. A viewer costs its refresh rate times the reads per refresh: at one read per second per viewer, that machine carries about 90 viewers, and 8 viewers refreshing at the same instant wait 140 ms. The number is machine-specific by construction. Reproduce it on yours:
+
+```bash
+rocky serve --port 8420 --token T &
+python3 scripts/serve-ceiling.py --url http://127.0.0.1:8420 --token T --pid $!
+```
+
+The script names any route the server cannot answer, and refuses to report a ceiling its own client was the limit of.
 
 Treat the sidecar as part of your deployment: one process per project, bound to loopback or sitting behind your gateway, with the bearer token provisioned as a secret. The [OpenAPI document](/openapi.json) describes everything your application needs.
