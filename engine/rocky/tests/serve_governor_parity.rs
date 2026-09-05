@@ -178,4 +178,89 @@ fn real_server_answers_the_real_cli_governor_bytes() {
     let chain: serde_json::Value = serde_json::from_str(&body).expect("json body");
     assert_eq!(chain["resolved"], true, "{body}");
     assert_eq!(chain["subject_kind"], "model");
+
+    // The ledger: one freeze row recorded by the CLI, listed whole and
+    // scoped to a product whose output model is a playground model.
+    let freeze = rocky()
+        .current_dir(&root)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--state-path",
+            state.to_str().unwrap(),
+            "policy",
+            "freeze",
+            "--scope",
+            "model=revenue_summary",
+            "--reason",
+            "governor parity",
+        ])
+        .output()
+        .expect("spawn rocky policy freeze");
+    assert!(
+        freeze.status.success(),
+        "{}",
+        String::from_utf8_lossy(&freeze.stderr)
+    );
+    std::fs::create_dir_all(root.join("products")).expect("mkdir products");
+    std::fs::write(
+        root.join("products/revenue_daily.toml"),
+        SPEC_FIXTURE.replace("model = \"revenue_daily\"", "model = \"revenue_summary\""),
+    )
+    .expect("write spec");
+
+    let cli = cli_json(&root, &state, &["audit"]);
+    let (status, body) = http_get(port, "/api/v1/audit");
+    assert!(status.contains("200"), "{status}: {body}");
+    assert_eq!(body, cli);
+    let ledger: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    assert!(
+        !ledger["decisions"]
+            .as_array()
+            .expect("decisions")
+            .is_empty(),
+        "the freeze recorded a row: {body}"
+    );
+
+    let cli = cli_json(&root, &state, &["audit", "--product", "revenue_daily"]);
+    let (status, body) = http_get(port, "/api/v1/audit?product=revenue_daily");
+    assert!(status.contains("200"), "{status}: {body}");
+    assert_eq!(body, cli);
+    let scoped: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(
+        scoped["product"]["output_model"], "revenue_summary",
+        "{body}"
+    );
+
+    // The CLI's own refusals: an unknown product names the loader's code
+    // and exits 1; the flag conflicts with `--scorecard` (a usage error).
+    let unknown = rocky()
+        .current_dir(&root)
+        .args([
+            "-o",
+            "json",
+            "--state-path",
+            state.to_str().unwrap(),
+            "audit",
+            "--product",
+            "nope",
+        ])
+        .output()
+        .expect("spawn rocky audit");
+    assert_eq!(unknown.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("spec-file-missing"),
+        "{}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+    let conflict = rocky()
+        .current_dir(&root)
+        .args(["audit", "--product", "revenue_daily", "--scorecard"])
+        .output()
+        .expect("spawn rocky audit");
+    assert_eq!(conflict.status.code(), Some(2), "clap refuses the pair");
 }
+
+/// The answer key's spec fixture, shared with the rocky-core lowering tests.
+const SPEC_FIXTURE: &str =
+    include_str!("../../crates/rocky-core/src/product/testdata/revenue_daily.spec.toml");

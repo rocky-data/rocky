@@ -44,9 +44,13 @@ export type PolicyPrincipal = "human" | "agent";
 export interface AuditOutput {
   command: string;
   /**
-   * Every recorded policy decision, oldest first.
+   * Every recorded policy decision, oldest first. Under `product`, only the rows whose `model` is that product's output model.
    */
   decisions: AuditDecisionEntry[];
+  /**
+   * The product the ledger was filtered to (`--product <name>`), absent when the whole ledger is listed.
+   */
+  product?: AuditProductScope | null;
   version: string;
   [k: string]: unknown;
 }
@@ -86,5 +90,21 @@ export interface AuditDecisionEntry {
    * RFC 3339 timestamp when the decision was recorded.
    */
   timestamp: string;
+  [k: string]: unknown;
+}
+/**
+ * The product filter of `rocky audit --product <name>`, resolved from the product's spec before the ledger is read.
+ *
+ * A product owns exactly one output model (`product.output.model`, which defaults to the product name), and the ledger records one row per plan per model, so the product's rows are the rows about that model. No plan file or journal is consulted.
+ */
+export interface AuditProductScope {
+  /**
+   * The product name as given.
+   */
+  name: string;
+  /**
+   * The output model the rows were filtered to.
+   */
+  output_model: string;
   [k: string]: unknown;
 }

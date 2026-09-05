@@ -1599,11 +1599,22 @@
             "type": "string"
           },
           "decisions": {
-            "description": "Every recorded policy decision, oldest first.",
+            "description": "Every recorded policy decision, oldest first. Under `product`, only the rows whose `model` is that product's output model.",
             "items": {
               "$ref": "#/components/schemas/AuditDecisionEntry"
             },
             "type": "array"
+          },
+          "product": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AuditProductScope"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The product the ledger was filtered to (`--product <name>`), absent when the whole ledger is listed."
           },
           "version": {
             "type": "string"
@@ -1634,6 +1645,24 @@
         "required": [
           "capability",
           "model"
+        ],
+        "type": "object"
+      },
+      "AuditProductScope": {
+        "description": "The product filter of `rocky audit --product <name>`, resolved from the product's spec before the ledger is read.\n\nA product owns exactly one output model (`product.output.model`, which defaults to the product name), and the ledger records one row per plan per model, so the product's rows are the rows about that model. No plan file or journal is consulted.",
+        "properties": {
+          "name": {
+            "description": "The product name as given.",
+            "type": "string"
+          },
+          "output_model": {
+            "description": "The output model the rows were filtered to.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "output_model"
         ],
         "type": "object"
       },
@@ -21132,6 +21161,79 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/v1/audit": {
+      "get": {
+        "description": "Every policy decision recorded at a mutating enforcement seam, oldest first: the same bytes as `rocky audit --output json`. With `product=<name>`, only the rows about that product's output model (`product.output.model`, default the product name), resolved from `products/<name>.toml`: the same bytes as `rocky audit --product <name> --output json`. Unfiltered it reads the state store only and needs no bound config. The ledger is returned whole, as the CLI prints it. Reads only.",
+        "operationId": "getAuditLedger",
+        "parameters": [
+          {
+            "description": "A product name. Lists only the rows whose model is that product's output model.",
+            "in": "query",
+            "name": "product",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditOutput"
+                }
+              }
+            },
+            "description": "The ledger, whole or scoped to the product."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No spec file and no state record exists under this product name."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "`products/<name>.toml` exists but the spec loader rejects it, so the product's output model cannot be resolved. The body carries the loader's code and reason."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store could not be opened for reading, or a ledger in it could not be read."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "The policy-decision ledger",
+        "tags": [
+          "governor"
+        ]
+      }
+    },
     "/api/v1/audit/scorecard": {
       "get": {
         "description": "Acceptance, denial and require-review rates per group over the policy-decision ledger. The same bytes as `rocky audit --scorecard --by <by> --window <window> --output json`, except `window_start` for a duration window, which derives from the request instant. Reads the state store only, so it needs no bound config. A ledger that cannot be read answers `200` with `availability: unavailable` and a note, as the CLI prints. Reads only.",

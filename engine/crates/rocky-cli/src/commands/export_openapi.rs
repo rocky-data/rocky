@@ -359,6 +359,13 @@ fn route_table() -> Vec<Route> {
              parsed.",
         body: Body::Component("ErrorEnvelope"),
     };
+    const PRODUCT_SPEC_INVALID: Resp = Resp {
+        status: "409",
+        description: "`products/<name>.toml` exists but the spec loader rejects it, so the \
+             product's output model cannot be resolved. The body carries the loader's code \
+             and reason.",
+        body: Body::Component("ErrorEnvelope"),
+    };
     const BAD_QUERY: Resp = Resp {
         status: "400",
         description: "A query parameter is not one of its documented values, or the subject \
@@ -880,6 +887,42 @@ fn route_table() -> Vec<Route> {
         },
         Route {
             method: "get",
+            path: "/api/v1/audit",
+            operation_id: "getAuditLedger",
+            tag: "governor",
+            summary: "The policy-decision ledger",
+            description: "Every policy decision recorded at a mutating enforcement seam, \
+                 oldest first: the same bytes as `rocky audit --output json`. With \
+                 `product=<name>`, only the rows about that product's output model \
+                 (`product.output.model`, default the product name), resolved from \
+                 `products/<name>.toml`: the same bytes as `rocky audit --product <name> \
+                 --output json`. Unfiltered it reads the state store only and needs no \
+                 bound config. The ledger is returned whole, as the CLI prints it. Reads \
+                 only.",
+            path_params: &[],
+            query_params: &[QueryParam {
+                name: "product",
+                description: "A product name. Lists only the rows whose model is that \
+                     product's output model.",
+                allowed: &[],
+            }],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The ledger, whole or scoped to the product.",
+                    body: Body::Component("AuditOutput"),
+                },
+                PRODUCT_NOT_FOUND,
+                PRODUCT_SPEC_INVALID,
+                ENGINE_BUSY_OR_NOT_READY,
+                GOVERNOR_READ_FAILED,
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
             path: "/api/v1/brief",
             operation_id: "getBrief",
             tag: "governor",
@@ -1325,6 +1368,7 @@ mod tests {
             "BriefOutput",
             "AuditScorecardOutput",
             "AuditForOutput",
+            "AuditOutput",
             "ErrorEnvelope",
             "JobRequest",
         ] {
@@ -1391,6 +1435,7 @@ mod tests {
             ("/api/v1/brief", "BriefOutput"),
             ("/api/v1/audit/scorecard", "AuditScorecardOutput"),
             ("/api/v1/custody/{subject}", "AuditForOutput"),
+            ("/api/v1/audit", "AuditOutput"),
         ] {
             let schema = &doc["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]
                 ["schema"];

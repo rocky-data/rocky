@@ -65,6 +65,24 @@
       ],
       "type": "object"
     },
+    "AuditProductScope": {
+      "description": "The product filter of `rocky audit --product <name>`, resolved from the product's spec before the ledger is read.\n\nA product owns exactly one output model (`product.output.model`, which defaults to the product name), and the ledger records one row per plan per model, so the product's rows are the rows about that model. No plan file or journal is consulted.",
+      "properties": {
+        "name": {
+          "description": "The product name as given.",
+          "type": "string"
+        },
+        "output_model": {
+          "description": "The output model the rows were filtered to.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "output_model"
+      ],
+      "type": "object"
+    },
     "PolicyCapability": {
       "description": "The class of action a policy rule governs.\n\n`read` is always allowed (short-circuit). The mutating verbs (`propose` … `quarantine`) name coarse operations; `schema_change.additive`, `schema_change.breaking`, and `value_change` are *refinements* of the apply/promote verbs — a rule naming a bare verb (`apply`/`promote`) matches those refinements too, but a rule naming a refinement matches only that exact refinement.",
       "oneOf": [
@@ -206,11 +224,22 @@
       "type": "string"
     },
     "decisions": {
-      "description": "Every recorded policy decision, oldest first.",
+      "description": "Every recorded policy decision, oldest first. Under `product`, only the rows whose `model` is that product's output model.",
       "items": {
         "$ref": "#/definitions/AuditDecisionEntry"
       },
       "type": "array"
+    },
+    "product": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/AuditProductScope"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The product the ledger was filtered to (`--product <name>`), absent when the whole ledger is listed."
     },
     "version": {
       "type": "string"

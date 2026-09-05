@@ -87,7 +87,7 @@ pub fn approval_snapshot_rel(product_name: &str, spec_digest: &str) -> String {
 /// whose `product.name` disagrees with its own file name is refused: the
 /// generated-artifact headers, the state directory, and the approval
 /// records all key on the name, and a mismatch would split that identity.
-fn load_spec(root: &Path, product_name: &str) -> SpecResult<ParsedSpec> {
+pub(crate) fn load_spec(root: &Path, product_name: &str) -> SpecResult<ParsedSpec> {
     let rel = spec_rel(product_name);
     let parsed = parse_spec_file(&root.join(&rel))?;
     if parsed.product().name != product_name {

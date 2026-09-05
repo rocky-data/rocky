@@ -7450,8 +7450,28 @@ pub struct PolicyFreezeEntry {
 pub struct AuditOutput {
     pub version: String,
     pub command: String,
-    /// Every recorded policy decision, oldest first.
+    /// The product the ledger was filtered to (`--product <name>`), absent
+    /// when the whole ledger is listed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product: Option<AuditProductScope>,
+    /// Every recorded policy decision, oldest first. Under `product`, only
+    /// the rows whose `model` is that product's output model.
     pub decisions: Vec<AuditDecisionEntry>,
+}
+
+/// The product filter of `rocky audit --product <name>`, resolved from the
+/// product's spec before the ledger is read.
+///
+/// A product owns exactly one output model (`product.output.model`, which
+/// defaults to the product name), and the ledger records one row per plan per
+/// model, so the product's rows are the rows about that model. No plan file or
+/// journal is consulted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct AuditProductScope {
+    /// The product name as given.
+    pub name: String,
+    /// The output model the rows were filtered to.
+    pub output_model: String,
 }
 
 /// One recorded policy decision in the [`AuditOutput`] ledger.

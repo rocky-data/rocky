@@ -91,6 +91,7 @@ _LAZY: dict[str, tuple[str, str]] = {
     "AuditForOutput": ("audit_for_schema", "AuditForOutput"),
     "AuditOutput": ("audit_schema", "AuditOutput"),
     "AuditPlanChange": ("audit_for_schema", "AuditPlanChange"),
+    "AuditProductScope": ("audit_schema", "AuditProductScope"),
     "AuditRunEntry": ("audit_for_schema", "AuditRunEntry"),
     "AuditScorecardOutput": ("audit_scorecard_schema", "AuditScorecardOutput"),
     "BackfillCostEstimate": ("backfill_schema", "BackfillCostEstimate"),
@@ -714,6 +715,7 @@ if TYPE_CHECKING:
     from .audit_schema import (
         AuditDecisionEntry,
         AuditOutput,
+        AuditProductScope,
     )
     from .audit_for_schema import (
         AuditChainBlastRadius,
@@ -1036,6 +1038,7 @@ __all__ = [
     "PerModelBudgetBreachOutput",
     "AuditOutput",
     "AuditDecisionEntry",
+    "AuditProductScope",
     "AuditForOutput",
     "AuditRunEntry",
     "AuditChainBlastRadius",

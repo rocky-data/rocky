@@ -101,7 +101,8 @@ pub use apply::{
 };
 pub use archive::{run_archive, run_archive_apply, run_archive_catalog};
 pub use audit::{
-    compute_audit_for, compute_audit_scorecard, run_audit, run_audit_for, run_audit_scorecard,
+    compute_audit, compute_audit_for, compute_audit_scorecard, resolve_product_scope, run_audit,
+    run_audit_for, run_audit_scorecard,
 };
 pub use backfill::run_backfill;
 #[cfg(feature = "duckdb")]
