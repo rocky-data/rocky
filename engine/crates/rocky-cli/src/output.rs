@@ -248,6 +248,25 @@ pub struct RunOutput {
     /// `execution.tables_failed`, which counts only execution-phase (copy /
     /// runtime) failures and excludes models excluded before execution.
     pub tables_failed: usize,
+    /// `true` when this run's declared checks failed in a way that must fail
+    /// the run: at least one **error-severity** check failed (a check the
+    /// engine could not evaluate counts as a failure — `not_evaluated`
+    /// always carries `passed: false`) **and** the pipeline's
+    /// `[pipeline.<name>.checks] fail_on_error` gate is on.
+    ///
+    /// Deliberately NOT folded into `tables_failed`, which stays a count of
+    /// tables and models and never counts checks. This is a gate, not a
+    /// tally: it is `false` when every failed check is warning-severity, and
+    /// `false` whenever the pipeline sets `fail_on_error = false`. The raw
+    /// per-check outcomes are in `check_results` either way — count those if
+    /// you want the number of failed checks.
+    ///
+    /// `derive_run_status` reads it, so a run whose only failure is the check
+    /// gate still reports `partial_failure` / `failure` here, in the persisted
+    /// run record, and in the process exit code. Omitted from the JSON when
+    /// `false`, so a run that did not trip the gate is unchanged on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub check_gate_failed: bool,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub tables_skipped: usize,
     /// Tables that the discovery adapter reported as enabled but that do not
@@ -4856,6 +4875,7 @@ impl RunOutput {
             duration_ms,
             tables_copied: 0,
             tables_failed: 0,
+            check_gate_failed: false,
             tables_skipped: 0,
             excluded_tables: vec![],
             resumed_from: None,
@@ -5227,6 +5247,37 @@ impl RunOutput {
         }
     }
 
+    /// Failed checks across every table result, bucketed as
+    /// `(error_severity, warning_severity)`.
+    ///
+    /// A check the engine could not evaluate is a failure here: every
+    /// `*_not_evaluated` constructor in `rocky_core::checks` sets
+    /// `passed: false`, so it lands in its own severity's bucket rather than
+    /// vanishing from the tally. Severity is the check's own — a
+    /// `not_evaluated` assertion declared `severity = "warning"` counts as a
+    /// warning, because a check the user made advisory does not become
+    /// gating by failing to run.
+    ///
+    /// Shared by the replication gate (`commands/run.rs`) and the quality
+    /// runner (`commands/run_local.rs`) so both bucket identically.
+    pub fn check_failures_by_severity(&self) -> (usize, usize) {
+        use rocky_core::tests::TestSeverity;
+        let mut error = 0usize;
+        let mut warning = 0usize;
+        for table in &self.check_results {
+            for check in &table.checks {
+                if check.passed {
+                    continue;
+                }
+                match check.severity {
+                    TestSeverity::Error => error += 1,
+                    TestSeverity::Warning => warning += 1,
+                }
+            }
+        }
+        (error, warning)
+    }
+
     /// Derive the [`rocky_core::state::RunStatus`] from the output's
     /// end-state counters. Interrupt (`self.interrupted`) with no
     /// materializations → `Failure`; with at least one → `PartialFailure`.
@@ -5238,9 +5289,16 @@ impl RunOutput {
     /// rather than `tables_copied`, so a partial transformation run (one
     /// model built, another failed to compile) correctly reports
     /// `PartialFailure` instead of a total `Failure`.
+    ///
+    /// A tripped check gate (`check_gate_failed`) is a problem too, on the
+    /// same footing as a failed table: a replication run that copied every
+    /// table and then failed an error-severity check is a `PartialFailure`,
+    /// not a `Success` (#1598). The gate is a separate field precisely so
+    /// this does not require inflating `tables_failed`, whose documented
+    /// meaning is a count of tables and models.
     pub fn derive_run_status(&self) -> rocky_core::state::RunStatus {
         let has_progress = self.tables_copied > 0 || !self.materializations.is_empty();
-        let has_problem = self.interrupted || self.tables_failed > 0;
+        let has_problem = self.interrupted || self.tables_failed > 0 || self.check_gate_failed;
         match (has_progress, has_problem) {
             (_, false) => rocky_core::state::RunStatus::Success,
             (true, true) => rocky_core::state::RunStatus::PartialFailure,
@@ -6682,6 +6740,128 @@ mod run_record_tests {
             .push(mat(&["", "marts", "good"], 10, Some("h"), fixed_start()));
         out.tables_failed = 1;
         assert!(matches!(out.derive_run_status(), RunStatus::PartialFailure));
+    }
+
+    /// A failing check bag for one table, as the replication runner
+    /// assembles it.
+    fn checks_for(table: &str, checks: Vec<rocky_core::checks::CheckResult>) -> TableCheckOutput {
+        TableCheckOutput {
+            asset_key: vec!["wh".to_string(), "staging".to_string(), table.to_string()],
+            checks,
+        }
+    }
+
+    /// #1598: a replication run that copied every table and then failed an
+    /// error-severity check under `fail_on_error` is a `PartialFailure`, not a
+    /// `Success`. Before the gate existed `derive_run_status` read only
+    /// `tables_copied` / `tables_failed` / `interrupted`, so this run
+    /// persisted `Success`, told idempotency it succeeded, and exited 0.
+    #[test]
+    fn derive_run_status_check_gate_on_a_fully_copied_run_is_partial() {
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.tables_copied = 2;
+        out.check_results.push(checks_for(
+            "orders",
+            vec![rocky_core::checks::check_row_count(10, 7)],
+        ));
+        out.check_gate_failed = true;
+        assert!(matches!(out.derive_run_status(), RunStatus::PartialFailure));
+        assert_eq!(
+            out.tables_failed, 0,
+            "the gate must not inflate the documented table/model count"
+        );
+    }
+
+    /// The honest-failure half of #1598: the gate is the only thing that
+    /// changes a status. A failed check with the gate off — `severity =
+    /// "warning"`, or `fail_on_error = false` — leaves a healthy run
+    /// `Success`, exactly as before.
+    #[test]
+    fn derive_run_status_ignores_failed_checks_without_the_gate() {
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.tables_copied = 2;
+        out.check_results.push(checks_for(
+            "orders",
+            vec![rocky_core::checks::check_row_count(10, 7)],
+        ));
+        assert!(!out.check_gate_failed);
+        assert!(matches!(out.derive_run_status(), RunStatus::Success));
+    }
+
+    /// A check the engine could not evaluate (#1595 / #1602) is a failure in
+    /// its OWN severity bucket: `not_evaluated` always carries
+    /// `passed: false`, and a check the user declared advisory does not become
+    /// gating by failing to run.
+    #[test]
+    fn check_failures_by_severity_buckets_not_evaluated_by_its_own_severity() {
+        use rocky_core::tests::TestSeverity;
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.check_results.push(checks_for(
+            "orders",
+            vec![
+                // Hard-coded error severity, so a broken row_count gates.
+                rocky_core::checks::row_count_not_evaluated("the source query failed"),
+                rocky_core::checks::assertion_not_evaluated(
+                    "not_null:name",
+                    "not_null",
+                    Some("name".to_string()),
+                    TestSeverity::Warning,
+                    "the assertion query failed",
+                ),
+                rocky_core::checks::check_row_count(10, 10),
+            ],
+        ));
+        assert_eq!(out.check_failures_by_severity(), (1, 1));
+    }
+
+    /// The whole point of the gate being a separate field: the persisted
+    /// record agrees with the JSON, and it records NO failed model. The resume
+    /// gate reads exactly that ("no model failed" + a complete checkpoint) to
+    /// refuse a resume that would copy nothing.
+    #[test]
+    fn a_check_gated_run_records_partial_failure_and_no_failed_model() {
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.tables_copied = 1;
+        out.check_results.push(checks_for(
+            "orders",
+            vec![rocky_core::checks::check_row_count(10, 7)],
+        ));
+        out.check_gate_failed = true;
+
+        let started = fixed_start();
+        let record = out.to_run_record(
+            "run-checkgate",
+            started,
+            started + chrono::Duration::seconds(1),
+            String::new(),
+            RunTrigger::Manual,
+            out.derive_run_status(),
+            RunRecordAudit::test_sentinels(),
+        );
+
+        assert!(matches!(record.status, RunStatus::PartialFailure));
+        assert!(
+            !record
+                .models_executed
+                .iter()
+                .any(|m| m.status.as_str() == "failed"),
+            "a failed check is not a failed model"
+        );
+        assert_eq!(record.check_outcomes.len(), 1);
+        assert!(!record.check_outcomes[0].passed);
+    }
+
+    /// The new field is omitted from the wire when the gate did not trip, so
+    /// every run that does not trip it emits the same JSON as before.
+    #[test]
+    fn check_gate_failed_is_omitted_from_json_unless_it_tripped() {
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        let clean = serde_json::to_value(&out).unwrap();
+        assert!(clean.get("check_gate_failed").is_none());
+
+        out.check_gate_failed = true;
+        let tripped = serde_json::to_value(&out).unwrap();
+        assert_eq!(tripped["check_gate_failed"], serde_json::json!(true));
     }
 
     #[test]

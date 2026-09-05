@@ -180,6 +180,30 @@ pub struct RunFailed {
     pub run_id: String,
 }
 
+/// Sentinel error signalling that a replication run moved its data and then
+/// failed its declared check gate (#1598): at least one error-severity check
+/// failed, or could not be evaluated, while
+/// `[pipeline.<name>.checks] fail_on_error` was on. `main.rs` maps it to exit
+/// code 2, the same partial-success code a failed table produces — the run
+/// did real work and then reported a real problem.
+///
+/// A distinct type from [`PartialFailure`] because the operator advice
+/// differs: a failed *copy* is resumable, and a failed *check* is not. Every
+/// table already copied, and a resume rebuilds its check inputs only from the
+/// tables it copies, so a resume of this run would copy nothing and run no
+/// checks. `ensure_run_is_resumable` refuses it for the same reason; this
+/// message must not send the user there.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{count} error-severity check(s) failed (run_id: {run_id}, see `check_results` in the JSON \
+     output); the data has already landed — fix the source and re-run the pipeline, a resume \
+     would copy nothing"
+)]
+pub struct CheckGateFailure {
+    pub count: usize,
+    pub run_id: String,
+}
+
 /// Map a finalized [`RunOutput`]'s derived status onto the CLI exit-code
 /// contract for the transformation / model-only execution paths.
 ///
@@ -265,6 +289,27 @@ fn merge_replication_compile_and_copy_errors(output: &mut RunOutput, table_error
             cooldown_seconds: e.cooldown_seconds,
         }));
     output.status = output.derive_run_status();
+}
+
+/// Whether this replication run's declared checks must fail the run.
+///
+/// `[pipeline.<name>.checks] fail_on_error` already exists, defaults to
+/// `true`, and is documented as "the run exits non-zero if any error-severity
+/// check fails". The replication runner assembled `check_results` and then
+/// never read the flag, so a pipeline that copied violating data exited 0
+/// (#1598). This is the missing read, not a new policy.
+///
+/// Error severity only, so a `severity = "warning"` check stays advisory and
+/// `fail_on_error = false` keeps every check advisory — neither may change a
+/// status or an exit code. A check the engine could NOT evaluate counts as a
+/// failure at its own severity: every `*_not_evaluated` constructor sets
+/// `passed: false` (#1602 / #1595), so a broken check gates exactly as a
+/// violated one does instead of reading as clean.
+fn replication_check_gate_failed(
+    output: &RunOutput,
+    checks: &rocky_core::config::ChecksConfig,
+) -> bool {
+    checks.fail_on_error && output.check_failures_by_severity().0 > 0
 }
 
 /// Arm a background watcher that hard-exits with code 130 on a *second*
@@ -1573,7 +1618,9 @@ fn ensure_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> 
     };
     use rocky_core::state::RunStatus;
     match record.status {
-        RunStatus::Failure | RunStatus::PartialFailure => Ok(()),
+        RunStatus::Failure | RunStatus::PartialFailure => {
+            ensure_the_resume_would_do_work(&record, progress)
+        }
         RunStatus::Success => anyhow::bail!(
             "nothing to resume: run {} already succeeded",
             progress.run_id
@@ -1585,6 +1632,106 @@ fn ensure_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> 
             record.status
         ),
     }
+}
+
+/// Refuse a *failed* run that left no copy work behind (#1598).
+///
+/// The two failure statuses stay resumable because a failed run usually has
+/// tables left to copy. A check-gated run does not: every table copied, and
+/// then an error-severity check failed. A resume of it skips every completed
+/// table, and the runner builds its check inputs only from the tables the
+/// current invocation copies — so the resumed run would copy nothing, run no
+/// check, and exit 0 on data that is still violating. That false recovery is
+/// worse than the exit-0 bug this whole change closes, so it is refused here.
+///
+/// The discriminator is deliberately neither the status alone nor the recorded
+/// check outcomes:
+///
+/// ```text
+///   copied < planned            -> resume: real copy work remains
+///   copied == planned, a model failed -> resume: the model phase re-runs
+///   copied == planned, no model failed -> refuse: a resume would do nothing
+/// ```
+///
+/// `RunRecord::check_outcomes` is NOT consulted, because it records no
+/// severity: keying on it would refuse a legitimate resume over a
+/// `severity = "warning"` result, or over any result at all under
+/// `fail_on_error = false` — both of which the user declared advisory. The
+/// "did a model fail" question is severity-free: `to_run_record` writes one
+/// `models_executed` entry with `status: "failed"` per `RunOutput::errors`
+/// entry, and on the replication path those are exactly the compile failures
+/// and the failed copies. A check failure adds none.
+///
+/// `total_tables` is what the recorded run planned to copy *after* its own
+/// resume filtering, not the pipeline's whole table set. So a resume of a
+/// resume — run N-1 copied 3 of 5, run N copied its remaining 2 — reads as
+/// complete and is refused even though 3 tables would be re-copied. That is
+/// the conservative direction: the refusal is loud and says to re-run, while
+/// admitting it would risk the silent exit-0 this gate exists to stop.
+///
+/// # The invariant this refusal depends on, stated
+///
+/// "Every planned table copied" is decided by comparing a count of `Success`
+/// entries against `total_tables`. A count can only stand in for the planned
+/// SET while every recorded key comes from the invocation's own plan. That
+/// producer invariant holds today and is enforced entirely by the callers:
+/// `init_run_progress` is called once per run with `tables_to_process.len()`,
+/// both `record_table_progress` sites iterate that same `tables_to_process`,
+/// entries are keyed `{run_id}|{table_key}` so a table cannot be counted twice,
+/// and DAG sub-runs mint their own run ids rather than sharing a checkpoint.
+///
+/// This function cannot check any of that, and no arithmetic on counts can
+/// recover it: a checkpoint holding `Success(a)` and `Success(x)` against a
+/// plan of `{a, b}` has the right count and the wrong set, and would be refused
+/// although `b` still needs copying. Proving completeness properly needs the
+/// planned table identities on the checkpoint, which is a `RunProgress` shape
+/// change and so out of scope here. **If you add a `record_table_progress` call
+/// site, it must record a table from `tables_to_process` or this gate becomes
+/// wrong.**
+///
+/// The non-`Success` guard below narrows the exposure rather than removing it.
+/// It is what makes every mixed-state checkpoint resumable regardless of the
+/// count: a `Failed`, `Interrupted` or `Skipped` table is re-attempted by a
+/// resume, because the resume filter admits only `Success` keys.
+fn ensure_the_resume_would_do_work(
+    record: &rocky_core::state::RunRecord,
+    progress: &RunProgress,
+) -> Result<()> {
+    // A run that planned nothing — discovery returned no table, or an earlier
+    // resume had already taken them all — left no copy checkpoint to reason
+    // about, and a resume of it re-plans from scratch. It also cannot have
+    // tripped the check gate: a check exists only for a table this invocation
+    // copied. Resumable.
+    if progress.total_tables == 0 {
+        return Ok(());
+    }
+    if progress
+        .tables
+        .iter()
+        .any(|t| t.status != rocky_core::state::TableStatus::Success)
+    {
+        return Ok(());
+    }
+    let copied = progress
+        .tables
+        .iter()
+        .filter(|t| t.status == rocky_core::state::TableStatus::Success)
+        .count();
+    if copied < progress.total_tables {
+        return Ok(());
+    }
+    if record
+        .models_executed
+        .iter()
+        .any(|m| m.status.as_str() == "failed")
+    {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "nothing to resume: run {} copied every table it planned to copy and no model failed, \
+         so a resume would copy nothing and run no checks — re-run the pipeline",
+        progress.run_id
+    )
 }
 
 fn resolve_resume_progress(
@@ -4942,6 +5089,16 @@ pub async fn run(
             ))
             .await;
     }
+    // Read `[pipeline.<name>.checks] fail_on_error` against the results just
+    // assembled (#1598). Stamped HERE, before anything derives or stamps a
+    // status: `merge_replication_compile_and_copy_errors` below writes
+    // `output.status = output.derive_run_status()`, and `persist_run_record`
+    // and `finalize_idempotency` each call `derive_run_status` again. All
+    // three now read the same gate, so the JSON payload, the persisted
+    // `RunRecord`, the idempotency outcome and the exit code give one answer
+    // instead of three.
+    output.check_gate_failed = replication_check_gate_failed(&output, &pipeline.checks);
+
     // Finding #1: whether the compiled-model phase completed cleanly, hoisted so
     // the recipe-manifest write (outside the model block below) can also skip on
     // a failed model phase. `true` when no models run (nothing to fail).
@@ -5495,6 +5652,39 @@ pub async fn run(
         return run_status_exit_result(&output, &run_id);
     }
 
+    // Check gate. Separate from both branches above on purpose: a failed
+    // check is neither a failed table nor a failed model, so it is not folded
+    // into `tables_failed` (a documented count of tables and models) and it
+    // never reaches the "N model(s) failed to compile" message above. The JSON
+    // `status` and the persisted `RunRecord` already say `PartialFailure` —
+    // `output.check_gate_failed` fed `derive_run_status` before either was
+    // written — so this is only the exit-code half of the same answer (#1598).
+    if output.check_gate_failed {
+        let count = output.check_failures_by_severity().0;
+        let msg = format!("{count} error-severity check(s) failed");
+        let _ = hook_registry
+            .fire(&HookContext::pipeline_error(&run_id, pipeline_name, &msg))
+            .await;
+        let _ = hook_registry.wait_async_webhooks().await;
+        // Exit 2 (partial success) whenever data landed, which is the only
+        // shape this gate can reach in practice: a per-table check exists only
+        // for a table this invocation copied. A no-progress run would derive
+        // `Failure` and keeps the generic exit 1.
+        if matches!(
+            output.derive_run_status(),
+            rocky_core::state::RunStatus::PartialFailure
+        ) {
+            return Err(CheckGateFailure {
+                count,
+                run_id: run_id.clone(),
+            }
+            .into());
+        }
+        anyhow::bail!(
+            "{count} error-severity check(s) failed (run_id: {run_id}, see `check_results` in the JSON output)"
+        );
+    }
+
     // §P2.6 emit: pipeline_complete on happy-path exit. Drain async
     // webhooks before returning.
     let _ = hook_registry
@@ -5978,10 +6168,12 @@ async fn run_batched_checks(
     // runner does, so uniqueness fires at replication time. Driven by
     // `assertion_targets` (populated per materialized table, independent of
     // row_count/freshness) so it runs even when those checks are disabled.
-    // Results are surfaced advisorily — like every other check in this runner,
-    // the run does not bail; the orchestrator decides from the JSON
-    // CheckResult + severity. (The data has already landed by check time, so
-    // bailing would only change the exit code, not prevent the write.)
+    // The runner does not bail mid-checks: the data has already landed by
+    // check time, so stopping here would only change the exit code, not
+    // prevent the write. The results are collected and read once at the end
+    // by the check gate (`replication_check_gate_failed`), which fails the run
+    // when an error-severity check failed and `fail_on_error` is on (#1598).
+    // A `severity = "warning"` result stays advisory.
     if !pipeline.checks.assertions.is_empty() {
         let dialect = warehouse.dialect();
         for (tref, asset_key) in assertion_targets {
@@ -13561,6 +13753,230 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         }
     }
 
+    /// A run record whose model phase recorded a failure — the compile-error
+    /// shape a resume genuinely re-runs.
+    fn seed_run_record_with_a_failed_model(store: &StateStore, run_id: &str, status: &str) {
+        let record: rocky_core::state::RunRecord = serde_json::from_value(serde_json::json!({
+            "run_id": run_id,
+            "started_at": "2026-08-30T00:00:00Z",
+            "finished_at": "2026-08-30T00:01:00Z",
+            "status": status,
+            "models_executed": [{
+                "model_name": "silver_orders",
+                "started_at": "2026-08-30T00:00:30Z",
+                "finished_at": "2026-08-30T00:00:31Z",
+                "duration_ms": 0,
+                "status": "failed",
+                "sql_hash": "",
+            }],
+            "trigger": "Manual",
+            "config_hash": "test",
+        }))
+        .expect("minimal RunRecord deserializes");
+        store.record_run(&record).unwrap();
+    }
+
+    /// Mark `count` of the checkpoint's tables copied.
+    fn complete_tables(store: &StateStore, run_id: &str, count: usize) {
+        for index in 0..count {
+            store
+                .record_table_progress(
+                    run_id,
+                    &table_entry(
+                        index,
+                        &format!("wh.staging_p1__acme.t{index}"),
+                        rocky_core::state::TableStatus::Success,
+                    ),
+                )
+                .unwrap();
+        }
+    }
+
+    /// #1598: the check-gated shape. Every table this run planned to copy
+    /// copied, and no model failed — so a resume would skip every table, build
+    /// no check inputs, run no check, and exit 0 on data that is still
+    /// violating. Both entry points refuse it.
+    ///
+    /// Without this the fix is worse than the bug: the run now records
+    /// `PartialFailure`, which `ensure_run_is_resumable` used to admit
+    /// unconditionally.
+    #[test]
+    fn resume_refuses_a_complete_checkpoint_whose_failure_was_not_a_copy_or_a_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        store.init_run_progress("run-1", 2, Some(&scope)).unwrap();
+        complete_tables(&store, "run-1", 2);
+
+        for status in ["PartialFailure", "Failure"] {
+            seed_run_record(&store, "run-1", status);
+            for (resume_run_id, resume_latest) in [(None, true), (Some("run-1"), false)] {
+                let err = resolve_resume_progress(&store, resume_run_id, resume_latest, &scope)
+                    .expect_err("a resume that would copy nothing must refuse");
+                let message = format!("{err:#}");
+                assert!(
+                    message.contains("nothing to resume: run run-1")
+                        && message.contains("copied every table it planned to copy")
+                        && message.contains("re-run the pipeline"),
+                    "unexpected refusal for {status} {resume_run_id:?}/{resume_latest}: {message}"
+                );
+            }
+        }
+    }
+
+    /// The narrowing conjunct. A complete checkpoint whose run ALSO failed a
+    /// model still resumes: the model phase re-runs on a resume, so there is
+    /// real work to recover.
+    ///
+    /// This is why the gate asks "did a model fail" and not "did a check
+    /// fail". `RunRecord::check_outcomes` carries no severity, so keying on it
+    /// would refuse this same resume over a `severity = "warning"` result, or
+    /// over any result at all under `fail_on_error = false` — outcomes the
+    /// user declared advisory.
+    #[test]
+    fn resume_allows_a_complete_checkpoint_when_a_model_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        store.init_run_progress("run-1", 2, Some(&scope)).unwrap();
+        complete_tables(&store, "run-1", 2);
+        seed_run_record_with_a_failed_model(&store, "run-1", "PartialFailure");
+
+        for (resume_run_id, resume_latest) in [(None, true), (Some("run-1"), false)] {
+            let progress = resolve_resume_progress(&store, resume_run_id, resume_latest, &scope)
+                .unwrap()
+                .unwrap();
+            assert_eq!(progress.run_id, "run-1");
+        }
+    }
+
+    /// The other narrowing conjunct: an unfinished copy is real work, so it
+    /// resumes however the run failed. One of two tables copied.
+    #[test]
+    fn resume_allows_an_incomplete_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        store.init_run_progress("run-1", 2, Some(&scope)).unwrap();
+        complete_tables(&store, "run-1", 1);
+        seed_run_record(&store, "run-1", "PartialFailure");
+
+        for (resume_run_id, resume_latest) in [(None, true), (Some("run-1"), false)] {
+            let progress = resolve_resume_progress(&store, resume_run_id, resume_latest, &scope)
+                .unwrap()
+                .unwrap();
+            assert_eq!(progress.run_id, "run-1");
+        }
+    }
+
+    /// A table the checkpoint recorded as `Failed` or `Interrupted` is not a
+    /// completed copy, so the count that drives the refusal must not include
+    /// it — otherwise a genuinely resumable run would be refused.
+    #[test]
+    fn a_failed_or_interrupted_table_does_not_count_as_copied() {
+        use rocky_core::state::TableStatus;
+
+        for status in [TableStatus::Failed, TableStatus::Interrupted] {
+            let label = format!("{status:?}");
+            let dir = tempfile::tempdir().unwrap();
+            let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+            let scope = test_resume_scope("p1");
+            store.init_run_progress("run-1", 2, Some(&scope)).unwrap();
+            complete_tables(&store, "run-1", 1);
+            store
+                .record_table_progress("run-1", &table_entry(1, "wh.staging_p1__acme.t1", status))
+                .unwrap();
+            seed_run_record(&store, "run-1", "PartialFailure");
+
+            let progress = resolve_resume_progress(&store, None, true, &scope)
+                .unwrap()
+                .unwrap();
+            assert_eq!(progress.run_id, "run-1", "{label} is not a copied table");
+        }
+    }
+
+    /// The adversarial checkpoint shapes an independent review named for this
+    /// gate. Each one must stay RESUMABLE: the refusal is for a checkpoint that
+    /// proves there is nothing left to copy, and none of these do.
+    ///
+    /// The `Success`-entries-exceed-`total_tables` shape cannot arise today,
+    /// because every recorded key comes from `tables_to_process` — see the
+    /// producer invariant named on `ensure_the_resume_would_do_work`. It is
+    /// pinned anyway: the mixed-state class must be resumable on the entry
+    /// STATES alone, so that a checkpoint carrying unfinished work is admitted
+    /// even where the count would read as complete.
+    #[test]
+    fn adversarial_checkpoints_stay_resumable() {
+        use rocky_core::state::TableStatus;
+
+        // A non-Success entry means work remains, whatever the count says.
+        for trailing in [
+            TableStatus::Interrupted,
+            TableStatus::Skipped,
+            TableStatus::Failed,
+        ] {
+            let label = format!("{trailing:?}");
+            let dir = tempfile::tempdir().unwrap();
+            let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+            let scope = test_resume_scope("p1");
+            // Two copied tables against a post-filter plan of ONE, plus an
+            // unfinished third: a count alone would read this as complete.
+            store.init_run_progress("run-1", 1, Some(&scope)).unwrap();
+            complete_tables(&store, "run-1", 2);
+            store
+                .record_table_progress("run-1", &table_entry(2, "wh.staging_p1__acme.t2", trailing))
+                .unwrap();
+            seed_run_record(&store, "run-1", "PartialFailure");
+
+            let progress = resolve_resume_progress(&store, None, true, &scope)
+                .unwrap()
+                .unwrap_or_else(|| {
+                    panic!("{label}: a checkpoint with unfinished work must resume")
+                });
+            assert_eq!(progress.run_id, "run-1", "{label}");
+        }
+
+        // A run that planned nothing has no copy checkpoint to reason about and
+        // cannot have tripped the check gate — a check exists only for a table
+        // this invocation copied. A resume re-plans from scratch.
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        store.init_run_progress("run-0", 0, Some(&scope)).unwrap();
+        seed_run_record(&store, "run-0", "Failure");
+        let progress = resolve_resume_progress(&store, Some("run-0"), false, &scope)
+            .unwrap()
+            .expect("a zero-table plan must stay resumable");
+        assert_eq!(progress.run_id, "run-0");
+    }
+
+    /// `total_tables` is what the recorded run planned to copy AFTER its own
+    /// resume filtering, not the pipeline's whole table set. So a resume of a
+    /// resume reads as complete and is refused, even though the earlier run's
+    /// tables would have been re-copied.
+    ///
+    /// Pinned rather than fixed: the refusal is loud and tells the operator to
+    /// re-run, while admitting it would risk the silent exit 0 this gate
+    /// exists to stop.
+    #[test]
+    fn resume_of_a_resume_reads_as_complete_and_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        // Run N was itself a resume: it planned only the 2 tables run N-1
+        // left behind, and copied both.
+        store.init_run_progress("run-2", 2, Some(&scope)).unwrap();
+        complete_tables(&store, "run-2", 2);
+        seed_run_record(&store, "run-2", "PartialFailure");
+
+        let err = resolve_resume_progress(&store, Some("run-2"), false, &scope)
+            .expect_err("a complete checkpoint refuses, conservatively");
+        assert!(
+            format!("{err:#}").contains("copied every table it planned to copy"),
+            "unexpected refusal: {err:#}"
+        );
+    }
+
     /// Run-history retention takes a swept run's checkpoint with its record,
     /// so a succeeded run that retention dropped can no longer pose as a
     /// crash. Both resume forms then hit the "no checkpoint" refusal
@@ -14960,7 +15376,14 @@ auto_create_schemas = true
         // checkpoint with no record. (The complete-checkpoint crash, a kill
         // after the last table, is
         // `resume_latest_resumes_a_run_that_crashed_after_its_last_table`.)
-        for (run_record_status, planned_tables) in [(None, 2), (Some("Failure"), 1)] {
+        //
+        // The `Failure` case plans two as well, because #1598 refuses a
+        // *complete* checkpoint whose run failed with no failed model: a
+        // resume of that copies nothing and runs no check. A failed run that
+        // left a table behind is the shape this test is about, and it stays
+        // resumable. The refusal has its own coverage in
+        // `resume_refuses_a_complete_checkpoint_whose_failure_was_not_a_copy_or_a_model`.
+        for (run_record_status, planned_tables) in [(None, 2), (Some("Failure"), 2)] {
             let dir = tempfile::tempdir().unwrap();
             let (config_path, state_path, db_path) = write_two_pipeline_project(
                 dir.path(),
@@ -15289,7 +15712,13 @@ auto_create_schemas = true
         );
 
         // A resumable checkpoint against warehouse A: the run completed its
-        // table, and its record says Failure (so #1548 does not refuse it).
+        // table, and its record says PartialFailure with a failed model (so
+        // neither #1548 nor #1598 refuses it). The failed-model half matters:
+        // this run copied everything it planned, and #1598 refuses a complete
+        // checkpoint whose failure was neither a copy nor a model, because a
+        // resume of that would copy nothing. A failed model phase re-runs on a
+        // resume, so it is genuinely resumable — which is what this test needs
+        // to reach its real subject, the endpoint scope.
         drive_resume_test_run(&config_path, &state_path, "p2", None, false)
             .await
             .expect("p2 runs fresh against warehouse A");
@@ -15297,7 +15726,7 @@ auto_create_schemas = true
         let run_id = {
             let store = StateStore::open(&state_path).unwrap();
             let run_id = store.get_latest_run_progress().unwrap().unwrap().run_id;
-            seed_run_record(&store, &run_id, "Failure");
+            seed_run_record_with_a_failed_model(&store, &run_id, "PartialFailure");
             run_id
         };
         let endpoint_a = std::fs::canonicalize(&db_a).unwrap().display().to_string();
@@ -16138,6 +16567,7 @@ auto_create_schemas = true
             duration_ms: 100,
             tables_copied: 0,
             tables_failed: 0,
+            check_gate_failed: false,
             tables_skipped: 0,
             excluded_tables: vec![],
             resumed_from: None,
@@ -20115,6 +20545,123 @@ backend = "local"
         );
         assert_eq!(out.errors.len(), 2, "both diagnostics are preserved");
         assert!(matches!(out.status, rocky_core::state::RunStatus::Failure));
+    }
+
+    /// One failing check bag for a table, as the replication runner
+    /// assembles it.
+    fn failing_check_bag(
+        check: rocky_core::checks::CheckResult,
+    ) -> crate::output::TableCheckOutput {
+        crate::output::TableCheckOutput {
+            asset_key: vec![
+                "wh".to_string(),
+                "staging".to_string(),
+                "orders".to_string(),
+            ],
+            checks: vec![check],
+        }
+    }
+
+    fn checks_config(toml_src: &str) -> rocky_core::config::ChecksConfig {
+        toml::from_str(toml_src).expect("checks config parses")
+    }
+
+    /// #1598: the gate reads `fail_on_error` against error-severity failures
+    /// only. `fail_on_error` defaults to `true` when the `[checks]` table is
+    /// present, so the first row is the default posture.
+    #[test]
+    fn the_check_gate_reads_severity_and_fail_on_error() {
+        use rocky_core::tests::TestSeverity;
+
+        let failed_error = rocky_core::checks::check_row_count(10, 7);
+        let failed_warning = rocky_core::checks::assertion_not_evaluated(
+            "not_null:name",
+            "not_null",
+            Some("name".to_string()),
+            TestSeverity::Warning,
+            "the assertion query failed",
+        );
+        // Hard-coded error severity: a check the engine could not evaluate
+        // gates exactly as a violated one does (#1602).
+        let not_evaluated_error =
+            rocky_core::checks::row_count_not_evaluated("the source query failed");
+        let passed = rocky_core::checks::check_row_count(10, 10);
+
+        let cases: Vec<(&str, rocky_core::checks::CheckResult, &str, bool)> = vec![
+            (
+                "row_count = true",
+                failed_error.clone(),
+                "an error-severity failure gates by default",
+                true,
+            ),
+            (
+                "fail_on_error = false",
+                failed_error,
+                "fail_on_error = false keeps every check advisory",
+                false,
+            ),
+            (
+                "row_count = true",
+                failed_warning,
+                "a warning-severity failure never gates",
+                false,
+            ),
+            (
+                "row_count = true",
+                not_evaluated_error,
+                "a check that could not be evaluated gates",
+                true,
+            ),
+            (
+                "row_count = true",
+                passed,
+                "a passing check never gates",
+                false,
+            ),
+        ];
+
+        for (config, check, why, expected) in cases {
+            let mut out = RunOutput::new(String::new(), 0, 1);
+            out.tables_copied = 1;
+            out.check_results.push(failing_check_bag(check));
+            assert_eq!(
+                super::replication_check_gate_failed(&out, &checks_config(config)),
+                expected,
+                "{why}"
+            );
+        }
+    }
+
+    /// The stale-JSON-status defect: `merge_replication_compile_and_copy_errors`
+    /// stamps `output.status` from the counters, and it used to be the ONLY
+    /// thing that decided the payload's status. The gate is set before this
+    /// call, so the JSON now agrees with the persisted record and the exit
+    /// code — and `tables_failed` stays a count of tables.
+    #[test]
+    fn merge_stamps_partial_failure_for_a_check_gated_run() {
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.tables_copied = 2;
+        out.check_results
+            .push(failing_check_bag(rocky_core::checks::check_row_count(
+                10, 7,
+            )));
+        out.check_gate_failed = true;
+        let no_errors: Vec<TableError> = Vec::new();
+
+        super::merge_replication_compile_and_copy_errors(&mut out, &no_errors);
+
+        assert!(
+            matches!(out.status, rocky_core::state::RunStatus::PartialFailure),
+            "the JSON payload must not report Success"
+        );
+        assert_eq!(
+            out.tables_failed, 0,
+            "a failed check is not a failed table — the documented count keeps its meaning"
+        );
+        assert!(
+            out.errors.is_empty(),
+            "a failed check is not a table error either"
+        );
     }
 
     /// A clean replication run (no compile errors, no copy errors) stays
