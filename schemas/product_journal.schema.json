@@ -1,0 +1,105 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ProductJournalEntry": {
+      "description": "One persisted fulfillment journal row, as `rocky product journal` prints it: the loop's own record of a transition, field for field.",
+      "properties": {
+        "at": {
+          "description": "RFC 3339 instant of the transition, when recorded.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "event": {
+          "description": "What happened, in the loop's plain language (`spec approved`, …). A label to render, not an enum to switch on.",
+          "type": "string"
+        },
+        "from_state": {
+          "description": "The state tag before the transition, when one existed.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "idempotency_key": {
+          "description": "The idempotency key pinned by this event, when it pinned one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plan_id": {
+          "description": "The plan involved, when the event concerns one (propose, apply).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "seq": {
+          "description": "Sequence number, also encoded in the row's store key.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "spec_digest": {
+          "description": "The spec digest involved, when the event concerns one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "to_state": {
+          "description": "The state tag after the transition.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event",
+        "seq",
+        "to_state"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output of `rocky product journal <name>`.\n\nThe product's fulfillment journal, whole and in append order, read through the same store function the fulfillment loop reads through. A known product with no rows is an empty journal; a product the project does not know (no spec file, no store record) is a refusal, never an empty journal.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "count": {
+      "description": "`rows.len()`, repeated so a consumer can assert it received the whole journal.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "product": {
+      "description": "The product name as given.",
+      "type": "string"
+    },
+    "product_id": {
+      "description": "`product:<name>`, the store key every record of the product hangs off.",
+      "type": "string"
+    },
+    "rows": {
+      "description": "Every journal row, in append order.",
+      "items": {
+        "$ref": "#/definitions/ProductJournalEntry"
+      },
+      "type": "array"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "count",
+    "product",
+    "product_id",
+    "rows",
+    "version"
+  ],
+  "title": "ProductJournalOutput",
+  "type": "object"
+}

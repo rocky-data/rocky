@@ -325,3 +325,14 @@ export type {
   BriefSinceMode,
   SectionAvailability,
 } from "./brief";
+
+// Products — `rocky product list` / `product status`, also served at
+// `GET /api/v1/products` and `/products/{name}`.
+export type {
+  ProductListOutput,
+  ProductListEntry,
+  ProductApprovalOutput,
+} from "./product_list";
+export type { ProductStatusOutput } from "./product_status";
+// `rocky product journal <name>`, also served at `GET /api/v1/products/{name}/journal`.
+export type { ProductJournalOutput, ProductJournalEntry } from "./product_journal";

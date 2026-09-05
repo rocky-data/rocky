@@ -1599,11 +1599,22 @@
             "type": "string"
           },
           "decisions": {
-            "description": "Every recorded policy decision, oldest first.",
+            "description": "Every recorded policy decision, oldest first. Under `product`, only the rows whose `model` is that product's output model.",
             "items": {
               "$ref": "#/components/schemas/AuditDecisionEntry"
             },
             "type": "array"
+          },
+          "product": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AuditProductScope"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The product the ledger was filtered to (`--product <name>`), absent when the whole ledger is listed."
           },
           "version": {
             "type": "string"
@@ -1634,6 +1645,24 @@
         "required": [
           "capability",
           "model"
+        ],
+        "type": "object"
+      },
+      "AuditProductScope": {
+        "description": "The product filter of `rocky audit --product <name>`, resolved from the product's spec before the ledger is read.\n\nA product owns exactly one output model (`product.output.model`, which defaults to the product name), and the ledger records one row per plan per model, so the product's rows are the rows about that model. No plan file or journal is consulted.",
+        "properties": {
+          "name": {
+            "description": "The product name as given.",
+            "type": "string"
+          },
+          "output_model": {
+            "description": "The output model the rows were filtered to.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "output_model"
         ],
         "type": "object"
       },
@@ -14046,6 +14075,235 @@
         ],
         "type": "object"
       },
+      "ProductJournalEntry": {
+        "description": "One persisted fulfillment journal row, as `rocky product journal` prints it: the loop's own record of a transition, field for field.",
+        "properties": {
+          "at": {
+            "description": "RFC 3339 instant of the transition, when recorded.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "event": {
+            "description": "What happened, in the loop's plain language (`spec approved`, …). A label to render, not an enum to switch on.",
+            "type": "string"
+          },
+          "from_state": {
+            "description": "The state tag before the transition, when one existed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "idempotency_key": {
+            "description": "The idempotency key pinned by this event, when it pinned one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "plan_id": {
+            "description": "The plan involved, when the event concerns one (propose, apply).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "seq": {
+            "description": "Sequence number, also encoded in the row's store key.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "spec_digest": {
+            "description": "The spec digest involved, when the event concerns one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to_state": {
+            "description": "The state tag after the transition.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event",
+          "seq",
+          "to_state"
+        ],
+        "type": "object"
+      },
+      "ProductJournalOutput": {
+        "description": "JSON output of `rocky product journal <name>`.\n\nThe product's fulfillment journal, whole and in append order, read through the same store function the fulfillment loop reads through. A known product with no rows is an empty journal; a product the project does not know (no spec file, no store record) is a refusal, never an empty journal.",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "count": {
+            "description": "`rows.len()`, repeated so a consumer can assert it received the whole journal.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "product": {
+            "description": "The product name as given.",
+            "type": "string"
+          },
+          "product_id": {
+            "description": "`product:<name>`, the store key every record of the product hangs off.",
+            "type": "string"
+          },
+          "rows": {
+            "description": "Every journal row, in append order.",
+            "items": {
+              "$ref": "#/components/schemas/ProductJournalEntry"
+            },
+            "type": "array"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "count",
+          "product",
+          "product_id",
+          "rows",
+          "version"
+        ],
+        "type": "object"
+      },
+      "ProductListEntry": {
+        "description": "One product's row in `rocky product list`.\n\nA projection of [`ProductStatusOutput`], built by the same function `product status` uses, so the two can never disagree. Missing values are `null`, never invented.",
+        "properties": {
+          "approval": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProductApprovalOutput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The approval record, when one exists."
+          },
+          "artifact_problems": {
+            "description": "Number of committed artifacts whose bytes no longer match the manifest. `0` is clean.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "committed_phase": {
+            "description": "The committed lowering phase, when a manifest exists.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fulfill_state": {
+            "description": "The persisted fulfillment state tag, when one exists.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "journal_rows": {
+            "description": "Number of fulfillment journal rows recorded for this product.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "name": {
+            "description": "Product name: the spec file's stem, or the state store's key.",
+            "type": "string"
+          },
+          "output_model": {
+            "description": "The resolved output model, when the spec parses.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "product_id": {
+            "description": "`product:<name>`, when the spec parses.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "spec_digest": {
+            "description": "The working spec's digest, when it parses.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "spec_error": {
+            "description": "Why the spec failed to load — absent or unparseable — when it did.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "spec_matches_approval": {
+            "description": "Whether the working spec equals the approved revision. `null` when either side is missing.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "spec_present": {
+            "description": "Whether `products/<name>.toml` exists and parses.",
+            "type": "boolean"
+          },
+          "staging_journal_present": {
+            "description": "Whether an uncommitted staging journal is pending.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "artifact_problems",
+          "journal_rows",
+          "name",
+          "spec_present",
+          "staging_journal_present"
+        ],
+        "type": "object"
+      },
+      "ProductListOutput": {
+        "description": "JSON output of `rocky product list`.\n\nOne row per product the project knows, sorted by name. A project with no `products/` directory and no records lists nothing; that is not an error.",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "count": {
+            "description": "`products.len()`, repeated so a consumer can assert it received the whole list.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "products": {
+            "description": "Every product, sorted by name.",
+            "items": {
+              "$ref": "#/components/schemas/ProductListEntry"
+            },
+            "type": "array"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "count",
+          "products",
+          "version"
+        ],
+        "type": "object"
+      },
       "ProductSpec": {
         "additionalProperties": false,
         "description": "The `[product]` table.",
@@ -21004,6 +21262,224 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/v1/audit": {
+      "get": {
+        "description": "Every policy decision recorded at a mutating enforcement seam, oldest first: the same bytes as `rocky audit --output json`. With `product=<name>`, only the rows about that product's output model (`product.output.model`, default the product name), resolved from `products/<name>.toml`: the same bytes as `rocky audit --product <name> --output json`. Unfiltered it reads the state store only and needs no bound config. The ledger is returned whole, as the CLI prints it. Reads only.",
+        "operationId": "getAuditLedger",
+        "parameters": [
+          {
+            "description": "A product name. Lists only the rows whose model is that product's output model.",
+            "in": "query",
+            "name": "product",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditOutput"
+                }
+              }
+            },
+            "description": "The ledger, whole or scoped to the product."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No spec file and no state record exists under this product name."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "`products/<name>.toml` exists but the spec loader rejects it, so the product's output model cannot be resolved. The body carries the loader's code and reason."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store could not be opened for reading, or a ledger in it could not be read."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "The policy-decision ledger",
+        "tags": [
+          "governor"
+        ]
+      }
+    },
+    "/api/v1/audit/scorecard": {
+      "get": {
+        "description": "Acceptance, denial and require-review rates per group over the policy-decision ledger. The same bytes as `rocky audit --scorecard --by <by> --window <window> --output json`, except `window_start` for a duration window, which derives from the request instant. Reads the state store only, so it needs no bound config. A ledger that cannot be read answers `200` with `availability: unavailable` and a note, as the CLI prints. Reads only.",
+        "operationId": "getAuditScorecard",
+        "parameters": [
+          {
+            "description": "The grouping: `principal`, `rule` or `scope`. Defaults to `principal`.",
+            "in": "query",
+            "name": "by",
+            "required": false,
+            "schema": {
+              "enum": [
+                "principal",
+                "rule",
+                "scope"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "`all`, or a `<N>d` / `<N>h` duration such as `30d`. Defaults to `all`.",
+            "in": "query",
+            "name": "window",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditScorecardOutput"
+                }
+              }
+            },
+            "description": "The scorecard."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A query parameter is not one of its documented values, or the subject is longer than 512 bytes."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store could not be opened for reading, or a ledger in it could not be read."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "The trust scorecard",
+        "tags": [
+          "governor"
+        ]
+      }
+    },
+    "/api/v1/brief": {
+      "get": {
+        "description": "What happened over the window and what needs a human: agent activity by principal, the ranked escalations, runs, drift, freshness, quality, cost, autonomy budgets and the scheduler's posture, every line citing a ledger id. The same bytes as `rocky brief --since <since> --output json`, except `generated_at` and, for the relative windows, `since_timestamp`, which derive from the request instant. Never advances the digest cursor: `since=last` reads it as it stands. The default is `7d`, not the CLI's `last`, because a read cannot advance the cursor. Scans at most 10,000 runs and decisions; compiles nothing. Reads only.",
+        "operationId": "getBrief",
+        "parameters": [
+          {
+            "description": "The window: `last` (since the stored cursor, read-only), `24h` or `7d`. Defaults to `7d`.",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "enum": [
+                "last",
+                "24h",
+                "7d"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BriefOutput"
+                }
+              }
+            },
+            "description": "The digest."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A query parameter is not one of its documented values, or the subject is longer than 512 bytes."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store could not be opened for reading, or a ledger in it could not be read."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "The governor's estate digest",
+        "tags": [
+          "governor"
+        ]
+      }
+    },
     "/api/v1/compile": {
       "get": {
         "description": "Canonical compile result. Byte-identical to `rocky compile --output json`, except the wall-clock `compile_timings`, which is inherently non-deterministic.",
@@ -21055,6 +21531,69 @@
         "summary": "Trigger recompilation",
         "tags": [
           "compile"
+        ]
+      }
+    },
+    "/api/v1/custody/{subject}": {
+      "get": {
+        "description": "Who proposed it, what the policy plane decided, what the plan changed, which runs materialized it, what verification found, and the downstream blast radius, for a model name, a run id, a plan id or a decision-only custody id such as `freeze:global`. The same bytes as `rocky audit --for <subject> --output json`. A subject nothing references is `200` with `resolved: false`, as the CLI. Compiles the project once per call for the blast radius, as the CLI does. Reads only.",
+        "operationId": "getCustodyChain",
+        "parameters": [
+          {
+            "description": "Path parameter `subject`.",
+            "in": "path",
+            "name": "subject",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditForOutput"
+                }
+              }
+            },
+            "description": "The custody chain."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A query parameter is not one of its documented values, or the subject is longer than 512 bytes."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store could not be opened for reading, or a ledger in it could not be read."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "One subject's custody chain",
+        "tags": [
+          "governor"
         ]
       }
     },
@@ -21815,6 +22354,289 @@
         "summary": "Per-model quality snapshots",
         "tags": [
           "history"
+        ]
+      }
+    },
+    "/api/v1/products": {
+      "get": {
+        "description": "Every product the project knows, sorted by name: the `products/*.toml` specs plus every name the state store holds a fulfillment or approval record for, so a product whose spec file was deleted still lists with `spec_present = false`. The same bytes as `rocky product list --output json` run from the project root against the same state store. Reads `products/` under the directory of the bound `rocky.toml` and the store `--state-path` names (or the default under the models directory). The store is opened read-only: a store at the current schema version is never written, an older one is migrated forward as every read does, a newer one is refused.",
+        "operationId": "listProducts",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductListOutput"
+                }
+              }
+            },
+            "description": "The product list."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store could not be opened for reading (malformed, or written by a newer engine), or `products/` could not be read."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "List products",
+        "tags": [
+          "products"
+        ]
+      }
+    },
+    "/api/v1/products/{name}": {
+      "get": {
+        "description": "One product's spec identity, committed lowering, artifact byte verification, pending staging journal, approval with snapshot integrity, and persisted fulfillment state. The same bytes as `rocky product status <name> --output json`. A spec that exists but does not parse is `200` with `spec_error` set.",
+        "operationId": "getProduct",
+        "parameters": [
+          {
+            "description": "Path parameter `name`.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductStatusOutput"
+                }
+              }
+            },
+            "description": "The product status."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No spec file and no state record exists under this product name."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store could not be opened for reading (malformed, or written by a newer engine), or `products/` could not be read."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "Product status",
+        "tags": [
+          "products"
+        ]
+      }
+    },
+    "/api/v1/products/{name}/journal": {
+      "get": {
+        "description": "Every persisted fulfillment journal row of the product, in append order: the loop's own record of each transition (`event`, the state before and after, and the spec digest, plan id and idempotency key involved). The same bytes as `rocky product journal <name> --output json`, read through the store function the loop reads through. A known product with no rows is an empty journal. Reads only.",
+        "operationId": "getProductJournal",
+        "parameters": [
+          {
+            "description": "Path parameter `name`.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductJournalOutput"
+                }
+              }
+            },
+            "description": "The journal."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No spec file and no state record exists under this product name."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store could not be opened for reading (malformed, or written by a newer engine), or `products/` could not be read."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "One product's fulfillment journal",
+        "tags": [
+          "products"
+        ]
+      }
+    },
+    "/api/v1/review/queue": {
+      "get": {
+        "description": "Every outstanding `require_review` escalation that a persisted plan can clear, ranked by blast radius, change class and staleness. The same bytes as `rocky review --queue --output json` for the same project and store, except `staleness_seconds` and `score`, which derive from the request instant. Compiles the project once per call to rank by blast radius, as the CLI does. Reads only.",
+        "operationId": "getReviewQueue",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewQueueOutput"
+                }
+              }
+            },
+            "description": "The ranked queue."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The decision ledger could not be read, or the plan file could not be parsed."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "Pending review queue",
+        "tags": [
+          "review"
+        ]
+      }
+    },
+    "/api/v1/review/{plan_id}/status": {
+      "get": {
+        "description": "Whether a well-formed sign-off marker naming the plan exists, who approved it and when, and its product binding. The same bytes as `rocky review <plan-id> --status --output json`. Reads only.",
+        "operationId": "getReviewStatus",
+        "parameters": [
+          {
+            "description": "Path parameter `plan_id`.",
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewStatusOutput"
+                }
+              }
+            },
+            "description": "The plan's review state."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The id is not 64 lower-case hex characters, or no plan file exists under it."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A review marker exists for the plan but does not parse, or names another plan. Re-approve with `rocky review <plan-id> --approve` to rewrite it."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The decision ledger could not be read, or the plan file could not be parsed."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "One plan's review state",
+        "tags": [
+          "review"
         ]
       }
     },

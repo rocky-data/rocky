@@ -87,7 +87,7 @@ pub fn approval_snapshot_rel(product_name: &str, spec_digest: &str) -> String {
 /// whose `product.name` disagrees with its own file name is refused: the
 /// generated-artifact headers, the state directory, and the approval
 /// records all key on the name, and a mismatch would split that identity.
-fn load_spec(root: &Path, product_name: &str) -> SpecResult<ParsedSpec> {
+pub(crate) fn load_spec(root: &Path, product_name: &str) -> SpecResult<ParsedSpec> {
     let rel = spec_rel(product_name);
     let parsed = parse_spec_file(&root.join(&rel))?;
     if parsed.product().name != product_name {
@@ -718,6 +718,137 @@ pub struct ProductStatusOutput {
     pub journal_rows: u64,
 }
 
+/// One product's row in `rocky product list`.
+///
+/// A projection of [`ProductStatusOutput`], built by the same function
+/// `product status` uses, so the two can never disagree. Missing values are
+/// `null`, never invented.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ProductListEntry {
+    /// Product name: the spec file's stem, or the state store's key.
+    pub name: String,
+    /// Whether `products/<name>.toml` exists and parses.
+    pub spec_present: bool,
+    /// `product:<name>`, when the spec parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    /// The resolved output model, when the spec parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_model: Option<String>,
+    /// The working spec's digest, when it parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_digest: Option<String>,
+    /// Why the spec failed to load — absent or unparseable — when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_error: Option<String>,
+    /// The committed lowering phase, when a manifest exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_phase: Option<String>,
+    /// Number of committed artifacts whose bytes no longer match the
+    /// manifest. `0` is clean.
+    pub artifact_problems: usize,
+    /// Whether an uncommitted staging journal is pending.
+    pub staging_journal_present: bool,
+    /// The approval record, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ProductApprovalOutput>,
+    /// Whether the working spec equals the approved revision. `null`
+    /// when either side is missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_matches_approval: Option<bool>,
+    /// The persisted fulfillment state tag, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fulfill_state: Option<String>,
+    /// Number of fulfillment journal rows recorded for this product.
+    pub journal_rows: u64,
+}
+
+impl ProductListEntry {
+    fn from_status(status: ProductStatusOutput) -> Self {
+        Self {
+            name: status.product,
+            spec_present: status.spec_present,
+            product_id: status.product_id,
+            output_model: status.output_model,
+            spec_digest: status.spec_digest,
+            spec_error: status.spec_error,
+            committed_phase: status.committed_phase,
+            artifact_problems: status.artifact_problems.len(),
+            staging_journal_present: status.staging_journal_present,
+            approval: status.approval,
+            spec_matches_approval: status.spec_matches_approval,
+            fulfill_state: status.fulfill_state,
+            journal_rows: status.journal_rows,
+        }
+    }
+}
+
+/// JSON output of `rocky product list`.
+///
+/// One row per product the project knows, sorted by name. A project with
+/// no `products/` directory and no records lists nothing; that is not an
+/// error.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ProductListOutput {
+    pub version: String,
+    pub command: String,
+    /// Every product, sorted by name.
+    pub products: Vec<ProductListEntry>,
+    /// `products.len()`, repeated so a consumer can assert it received the
+    /// whole list.
+    pub count: usize,
+}
+
+/// One persisted fulfillment journal row, as `rocky product journal`
+/// prints it: the loop's own record of a transition, field for field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProductJournalEntry {
+    /// Sequence number, also encoded in the row's store key.
+    pub seq: u64,
+    /// RFC 3339 instant of the transition, when recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+    /// What happened, in the loop's plain language (`spec approved`, …).
+    /// A label to render, not an enum to switch on.
+    pub event: String,
+    /// The state tag before the transition, when one existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_state: Option<String>,
+    /// The state tag after the transition.
+    pub to_state: String,
+    /// The spec digest involved, when the event concerns one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_digest: Option<String>,
+    /// The plan involved, when the event concerns one (propose, apply).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    /// The idempotency key pinned by this event, when it pinned one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+/// JSON output of `rocky product journal <name>`.
+///
+/// The product's fulfillment journal, whole and in append order, read
+/// through the same store function the fulfillment loop reads through. A
+/// known product with no rows is an empty journal; a product the project
+/// does not know (no spec file, no store record) is a refusal, never an
+/// empty journal.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ProductJournalOutput {
+    pub version: String,
+    pub command: String,
+    /// The product name as given.
+    pub product: String,
+    /// `product:<name>`, the store key every record of the product hangs off.
+    pub product_id: String,
+    /// Every journal row, in append order.
+    pub rows: Vec<ProductJournalEntry>,
+    /// `rows.len()`, repeated so a consumer can assert it received the
+    /// whole journal.
+    pub count: usize,
+}
+
 // ---------------------------------------------------------------------------
 // verify
 // ---------------------------------------------------------------------------
@@ -1171,6 +1302,24 @@ fn open_state_store(state_path: &Path) -> Result<StateStore> {
     })
 }
 
+/// The redb cache budget for a request-local read of the product records:
+/// open, read a handful of rows, drop. See the `GET /api/v1/runs` RSS
+/// measurement on [`StateStore::open_read_only_with_cache`].
+const PRODUCT_READ_CACHE_BYTES: usize = 1 << 20;
+
+/// Open the store for a read: `product status` and `product list`, on the
+/// CLI and over HTTP. A store at the current schema version is opened with
+/// a read transaction and never written; an older one is migrated forward,
+/// as every read command does; one written by a newer engine is refused.
+fn open_state_store_read_only(state_path: &Path) -> Result<StateStore> {
+    StateStore::open_read_only_with_cache(state_path, PRODUCT_READ_CACHE_BYTES).with_context(|| {
+        format!(
+            "failed to open the state store at {} to read the product records",
+            state_path.display()
+        )
+    })
+}
+
 /// The E4 authority transition, as one function the CLI wraps.
 ///
 /// 1. Snapshot bytes first, immutable and digest-addressed (tmp+rename;
@@ -1420,7 +1569,7 @@ pub(crate) fn product_status_in(
         .is_file();
 
     let store = match state_path {
-        Some(path) if path.exists() => Some(open_state_store(path)?),
+        Some(path) if path.exists() => Some(open_state_store_read_only(path)?),
         _ => None,
     };
     if let Some(store) = store {
@@ -1445,6 +1594,197 @@ pub(crate) fn product_status_in(
         }
     }
     Ok(output)
+}
+
+/// Every product name this project knows, sorted and deduplicated.
+///
+/// The union of the `products/*.toml` stems and every name the state store
+/// holds a fulfillment or approval record for. So a product whose spec file
+/// was deleted still lists, with `spec_present = false`. A missing directory
+/// or a state file that does not exist yet contributes nothing.
+pub(crate) fn product_names_in(root: &Path, state_path: Option<&Path>) -> Result<Vec<String>> {
+    let mut names = std::collections::BTreeSet::new();
+
+    let dir = root.join("products");
+    if dir.is_dir() {
+        for entry in
+            std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))?
+        {
+            let entry = entry.with_context(|| format!("reading an entry of {}", dir.display()))?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+                continue;
+            }
+            // Only a regular file is a spec. A directory named `x.toml`, a
+            // FIFO, a socket or a dangling link is not a product — and a
+            // FIFO would block a reader that opened it. `metadata()` follows
+            // a link to a regular file, the same way `product status` reads
+            // one: the project tree is the operator's, and links inside it
+            // are followed as every command follows them. A dangling link
+            // is skipped; any other failure to stat an entry is reported,
+            // never turned into a silently shorter list.
+            let is_regular_file = match entry.metadata() {
+                Ok(meta) => meta.file_type().is_file(),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("reading the type of {}", path.display()));
+                }
+            };
+            if !is_regular_file {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                names.insert(stem.to_string());
+            }
+        }
+    }
+
+    if let Some(path) = state_path.filter(|path| path.exists()) {
+        let store = open_state_store_read_only(path)?;
+        names.extend(store.fulfill_state_product_names()?);
+        names.extend(store.product_approval_product_names()?);
+    }
+
+    Ok(names.into_iter().collect())
+}
+
+/// The `rocky product list` payload: one [`ProductListEntry`] per known
+/// product, each a projection of [`product_status_in`].
+pub(crate) fn product_list_in(root: &Path, state_path: Option<&Path>) -> Result<ProductListOutput> {
+    let products = product_names_in(root, state_path)?
+        .into_iter()
+        .map(|name| product_status_in(root, state_path, &name).map(ProductListEntry::from_status))
+        .collect::<Result<Vec<_>>>()?;
+    let count = products.len();
+    Ok(ProductListOutput {
+        version: VERSION.to_string(),
+        command: "product_list".to_string(),
+        products,
+        count,
+    })
+}
+
+/// Execute `rocky product list`.
+///
+/// Reads `products/` under the working directory, as `product status` does.
+pub fn run_product_list(_config_path: &Path, state_path: &Path, output_json: bool) -> Result<()> {
+    let root = std::env::current_dir().context("failed to get current working directory")?;
+    let output = product_list_in(&root, Some(state_path))?;
+    if output_json {
+        print_json(&output)?;
+        return Ok(());
+    }
+    if output.products.is_empty() {
+        println!("no products: no products/*.toml, and no product records in the state store");
+        return Ok(());
+    }
+    for product in &output.products {
+        let spec = if product.spec_present {
+            "ok"
+        } else {
+            "missing or unreadable"
+        };
+        println!(
+            "{}  spec={}  lowering={}  approved={}  state={}  journal={}",
+            product.name,
+            spec,
+            product.committed_phase.as_deref().unwrap_or("none"),
+            if product.approval.is_some() {
+                "yes"
+            } else {
+                "no"
+            },
+            product.fulfill_state.as_deref().unwrap_or("none"),
+            product.journal_rows,
+        );
+    }
+    Ok(())
+}
+
+/// The journal of one product, or `None` when the project does not know
+/// the name: no `products/<name>.toml` and no fulfillment or approval
+/// record in the store. The same rule `product status` and the product
+/// routes use for "known".
+///
+/// Rows come from [`StateStore::fulfill_journal_rows`], the function the
+/// fulfillment loop's own driver reads through, so what this shows is what
+/// the loop sees. The store is opened read-only; an absent store is an
+/// empty journal.
+pub(crate) fn product_journal_in(
+    root: &Path,
+    state_path: Option<&Path>,
+    product_name: &str,
+) -> Result<Option<ProductJournalOutput>> {
+    let known = product_names_in(root, state_path)?;
+    if !known.iter().any(|name| name == product_name) {
+        return Ok(None);
+    }
+    let rows: Vec<ProductJournalEntry> = match state_path {
+        Some(path) if path.exists() => open_state_store_read_only(path)?
+            .fulfill_journal_rows(product_name)?
+            .into_iter()
+            .map(|row| ProductJournalEntry {
+                seq: row.seq,
+                at: row.at,
+                event: row.event,
+                from_state: row.from_state,
+                to_state: row.to_state,
+                spec_digest: row.spec_digest,
+                plan_id: row.plan_id,
+                idempotency_key: row.idempotency_key,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    Ok(Some(ProductJournalOutput {
+        version: VERSION.to_string(),
+        command: "product_journal".to_string(),
+        product: product_name.to_string(),
+        product_id: rocky_core::fulfill::fulfill_state_key(product_name),
+        count: rows.len(),
+        rows,
+    }))
+}
+
+/// Execute `rocky product journal <name>`.
+pub fn run_product_journal(
+    _config_path: &Path,
+    product_name: &str,
+    state_path: &Path,
+    output_json: bool,
+) -> Result<()> {
+    let root = std::env::current_dir().context("failed to get current working directory")?;
+    let Some(output) = product_journal_in(&root, Some(state_path), product_name)? else {
+        anyhow::bail!(
+            "product '{product_name}' is not known: no products/{product_name}.toml, and no \
+             fulfillment or approval record in the state store"
+        );
+    };
+    if output_json {
+        print_json(&output)?;
+        return Ok(());
+    }
+    println!(
+        "product {} journal: {} row(s)",
+        output.product, output.count
+    );
+    for row in &output.rows {
+        let plan = row
+            .plan_id
+            .as_deref()
+            .map(|plan_id| format!("  plan={plan_id}"))
+            .unwrap_or_default();
+        println!(
+            "  #{:08}  {}  {}  {} -> {}{plan}",
+            row.seq,
+            row.at.as_deref().unwrap_or("-"),
+            row.event,
+            row.from_state.as_deref().unwrap_or("(none)"),
+            row.to_state,
+        );
+    }
+    Ok(())
 }
 
 /// Execute `rocky product status <name>`.
@@ -1542,7 +1882,7 @@ pub(crate) fn product_reopen_in(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use rocky_core::product::spec::parse_spec_bytes;
 
@@ -2247,6 +2587,134 @@ effect = "require_review"
 
     fn temp_state_path(dir: &Path) -> PathBuf {
         dir.join("state.redb")
+    }
+
+    /// A project the HTTP tests can serve: the spec fixture, a passing
+    /// config, and a pinned state path. Returns `(root, config, state_path)`.
+    pub(crate) fn api_fixture_project(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let (root, config) = project_with_config(dir, &passing_config());
+        (root, config, temp_state_path(dir))
+    }
+
+    #[test]
+    fn list_is_empty_for_a_project_without_products() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).expect("mkdir");
+
+        let out = product_list_in(&root, None).expect("list");
+        assert_eq!(out.command, "product_list");
+        assert_eq!(out.count, 0);
+        assert!(out.products.is_empty());
+
+        // A state path that does not exist yet contributes nothing either.
+        let out = product_list_in(&root, Some(&temp_state_path(dir.path()))).expect("list");
+        assert_eq!(out.count, 0);
+    }
+
+    #[test]
+    fn list_projects_status_for_every_spec_and_is_sorted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, _config) = project_with_config(dir.path(), &passing_config());
+        let state_path = temp_state_path(dir.path());
+        // A second spec that sorts first. Its bytes name the other product,
+        // so it is refused at parse time and lists with a `spec_error` —
+        // the list must carry that row, never drop it.
+        write_file(&root.join("products/alpha_daily.toml"), SPEC_FIXTURE);
+        // A non-spec file in the directory is not a product.
+        write_file(&root.join("products/README.md"), b"not a spec");
+
+        let out = product_list_in(&root, Some(&state_path)).expect("list");
+        let names: Vec<&str> = out.products.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["alpha_daily", "revenue_daily"]);
+        assert_eq!(out.count, 2);
+
+        let alpha = &out.products[0];
+        assert!(!alpha.spec_present);
+        assert!(
+            alpha.spec_error.is_some(),
+            "the mismatch is reported, not hidden"
+        );
+        let revenue = &out.products[1];
+        assert!(revenue.spec_present);
+        assert_eq!(revenue.product_id.as_deref(), Some("product:revenue_daily"));
+
+        // Every row equals the status projection for the same name.
+        for row in &out.products {
+            let status = product_status_in(&root, Some(&state_path), &row.name).expect("status");
+            let projected = ProductListEntry::from_status(status);
+            assert_eq!(
+                serde_json::to_value(row).unwrap(),
+                serde_json::to_value(&projected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn list_includes_a_product_only_the_store_knows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, _config) = project_with_config(dir.path(), &passing_config());
+        let state_path = temp_state_path(dir.path());
+        product_approve_in(&root, &state_path, "revenue_daily").expect("approves");
+
+        // The spec file goes away; the store still holds the records.
+        std::fs::remove_file(root.join("products/revenue_daily.toml")).expect("remove");
+
+        let out = product_list_in(&root, Some(&state_path)).expect("list");
+        assert_eq!(out.count, 1, "{out:?}");
+        let row = &out.products[0];
+        assert_eq!(row.name, "revenue_daily");
+        assert!(!row.spec_present);
+        assert!(row.approval.is_some());
+        assert_eq!(row.fulfill_state.as_deref(), Some("spec_approved"));
+        assert_eq!(row.journal_rows, 1);
+
+        // The name set is the union, deduplicated: one row, not two.
+        let names = product_names_in(&root, Some(&state_path)).expect("names");
+        assert_eq!(names, ["revenue_daily"]);
+    }
+
+    /// Only a regular `*.toml` file is a spec: a directory that happens to
+    /// carry the extension, a dangling link, and a non-`.toml` file are not
+    /// products.
+    #[test]
+    fn list_counts_only_regular_toml_files_as_specs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, _config) = project_with_config(dir.path(), &passing_config());
+        std::fs::create_dir_all(root.join("products/not_a_spec.toml")).expect("mkdir");
+        write_file(&root.join("products/notes.md"), b"# notes");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            root.join("products/gone.toml"),
+            root.join("products/dangling.toml"),
+        )
+        .expect("symlink");
+
+        let names = product_names_in(&root, None).expect("names");
+        assert_eq!(names, ["revenue_daily"]);
+    }
+
+    /// The reads never write: the store file's bytes are the same before
+    /// and after a list and a status, and a path that does not exist is
+    /// not created.
+    #[test]
+    fn list_and_status_never_write_the_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, _config) = project_with_config(dir.path(), &passing_config());
+        let state_path = temp_state_path(dir.path());
+        product_approve_in(&root, &state_path, "revenue_daily").expect("approves");
+
+        let before = std::fs::read(&state_path).expect("store bytes");
+        let out = product_list_in(&root, Some(&state_path)).expect("list");
+        assert_eq!(out.count, 1);
+        let status = product_status_in(&root, Some(&state_path), "revenue_daily").expect("status");
+        assert!(status.approval.is_some());
+        let after = std::fs::read(&state_path).expect("store bytes");
+        assert_eq!(before, after, "a read must not change the store file");
+
+        let absent = dir.path().join("never-created.redb");
+        product_list_in(&root, Some(&absent)).expect("list with no store");
+        assert!(!absent.exists(), "a read must not create a store");
     }
 
     #[test]
