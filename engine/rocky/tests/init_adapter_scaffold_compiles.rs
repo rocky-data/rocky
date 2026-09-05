@@ -49,11 +49,18 @@
 //!   a dependency the template declares wrongly — or fails to declare — is not
 //!   caught here. The three render tests in `commands/init_adapter.rs` and a
 //!   human running `rocky init-adapter` still own that half.
-//! - Provenance of the rlibs. The externs are picked newest-by-mtime out of the
-//!   shared `deps/` directory, which is a heuristic, not a proof that they came
-//!   from this build. The compile below is deliberately written so the only
-//!   thing that heuristic can cause is a false FAILURE — see the comment at the
-//!   positive half.
+//! - Provenance of the rlibs. `deps/` is shared, and nothing in it records
+//!   which build produced which file. The pick is the newest rlib per crate
+//!   that is **not newer than this test binary**, which is a heuristic, not a
+//!   proof. It rules out the states that arise on their own — a later `cargo`
+//!   invocation with a different feature set leaves rlibs newer than this
+//!   binary, and those are now skipped rather than mixed in. It does NOT rule
+//!   out a `deps/` doctored after the build: rlibs copied in, `touch`ed, or
+//!   written by another checkout sharing this target directory can carry a
+//!   newer mtime than the artifacts this binary linked. In that state the
+//!   scaffold could compile against an older `SqlDialect` and this test would
+//!   pass when it should fail. Proving otherwise needs artifact identity that
+//!   `cargo` does not expose to a test; a clean `target/` is the assumption.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -96,12 +103,13 @@ fn the_scaffold_refuses_to_compile_until_literal_escape_is_chosen_and_compiles_a
     }
 
     let deps = deps_dir();
+    let built_at = self_mtime();
     let edition = workspace_edition();
     let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("init_adapter_scaffold");
     std::fs::create_dir_all(&scratch).expect("create scratch dir");
 
     // 2. Negative half — the emitted form must NOT compile, and must say why.
-    let externs = newest_externs(&deps);
+    let externs = newest_externs(&deps, built_at);
     let refusal = compile(&lib_rs, &deps, &externs, edition, &scratch);
     assert!(
         !refusal.status.success(),
@@ -141,16 +149,14 @@ fn the_scaffold_refuses_to_compile_until_literal_escape_is_chosen_and_compiles_a
     )
     .expect("write the substituted dialect.rs");
 
-    // ONE compile, against the newest rlib for each crate. There is
-    // deliberately no fallback to other candidates: "try combinations until one
-    // compiles" would accept a STALE but self-consistent set, so a scaffold
-    // that is broken against today's `SqlDialect` could still compile against
-    // yesterday's and the test would go green on the exact drift it exists to
-    // catch.
+    // ONE compile, against one rlib set. There is deliberately no fallback to
+    // other candidates: "try combinations until one compiles" would accept a
+    // STALE but self-consistent set, so a scaffold broken against today's
+    // `SqlDialect` could still compile against yesterday's and go green on the
+    // exact drift this test exists to catch.
     //
-    // The residual risk is therefore a false FAILURE on a `target/` holding
-    // several builds, never a false PASS. That is the safe direction, and the
-    // message below says how to clear it.
+    // What is left is the pick itself, and it is a heuristic — see "What this
+    // does NOT cover" in the header for the state it cannot rule out.
     let compiled = compile(&lib_rs, &deps, &externs, edition, &scratch);
     if compiled.status.success() {
         return;
@@ -260,11 +266,49 @@ fn rlib_candidates(deps: &Path, crate_name: &str) -> Vec<PathBuf> {
     found
 }
 
-/// The newest rlib for each crate the scaffold names.
-fn newest_externs(deps: &Path) -> Vec<PathBuf> {
+/// This test binary's own modification time.
+///
+/// Everything `cargo` linked into this binary was written before it, so it is
+/// an upper bound on the rlibs that belong to this build.
+fn self_mtime() -> std::time::SystemTime {
+    std::fs::metadata(std::env::current_exe().expect("current_exe"))
+        .and_then(|m| m.modified())
+        .expect("test binary modification time")
+}
+
+/// The newest rlib per crate that is **not newer than `not_after`**.
+///
+/// The bound matters. A later `cargo` invocation with a different feature set
+/// leaves a second, newer rlib for the same crate in the shared `deps/` while
+/// this test binary is left untouched, and mixing that one in gives a rustc
+/// crate-loading error. Skipping anything newer than this binary keeps the
+/// pick inside the set of artifacts that could have been linked into it.
+///
+/// It is still not proof of identity — see the header. It bounds the pick from
+/// above; it cannot tell two artifacts written before this binary apart.
+fn newest_externs(deps: &Path, not_after: std::time::SystemTime) -> Vec<PathBuf> {
     SCAFFOLD_EXTERNS
         .iter()
-        .map(|name| rlib_candidates(deps, name)[0].clone())
+        .map(|name| {
+            let candidates = rlib_candidates(deps, name);
+            candidates
+                .iter()
+                .find(|path| {
+                    std::fs::metadata(path)
+                        .and_then(|m| m.modified())
+                        .is_ok_and(|t| t <= not_after)
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "every lib{name}-*.rlib in {} is newer than this test \
+                         binary, so none of them can be what it linked. That is \
+                         a stale or shared target directory; re-run after a full \
+                         `cargo build --tests`.",
+                        deps.display(),
+                    )
+                })
+                .clone()
+        })
         .collect()
 }
 
