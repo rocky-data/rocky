@@ -3308,4 +3308,52 @@ mod tests {
         assert_eq!(data.results[0].model_name, "rocky");
         assert_eq!(data.results[0].status, ModelDiffStatus::Modified);
     }
+
+    // ------------------------------------------------------------------
+    // #1680: caller-coupled fail-before for #1667's conversion at this site.
+    // `base_ref` is a VALID ref on purpose — `validate_base_ref` runs before
+    // the config load, so an invalid one would fail the test for the wrong
+    // reason and prove nothing about the config leg.
+    // ------------------------------------------------------------------
+
+    /// Parses as TOML, fails a validator: `fivetran` is discovery-only and
+    /// needs `kind = "discovery"`. Present-and-broken, never absent.
+    const BROKEN_CONFIG_1680: &str =
+        "[adapter.ft]\ntype = \"fivetran\"\napi_key = \"k\"\napi_secret = \"s\"\n";
+
+    /// A present-but-unloadable `rocky.toml` refuses `rocky ci --diff` /
+    /// `rocky lineage-diff`, naming the file. A cold map here turns real type
+    /// diffs into `Unknown`-vs-`Unknown` noise, which is the opposite of what
+    /// the command is for.
+    #[test]
+    fn ci_diff_refuses_a_present_but_unloadable_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("m.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("m.toml"),
+            "name = \"m\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+        let cfg = tmp.path().join("rocky.toml");
+        std::fs::write(&cfg, BROKEN_CONFIG_1680).unwrap();
+
+        // `let ... else` rather than `expect_err`: `CiDiffData` is not `Debug`.
+        let Err(err) = compute_ci_diff(
+            &cfg,
+            &tmp.path().join("state.redb"),
+            "HEAD",
+            &models_dir,
+            None,
+        ) else {
+            panic!("a present but unloadable rocky.toml must refuse the ci diff");
+        };
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failed to load config from") && rendered.contains("rocky.toml"),
+            "the refusal must name the config file, got: {rendered}"
+        );
+    }
 }

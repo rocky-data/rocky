@@ -172,7 +172,8 @@ pub fn compute_catalog_output(
     // Absent `rocky.toml` -> None (unchanged); present but unloadable refuses
     // (#1625). `rocky_cfg` drives both the schema cache and `project_name`, so
     // swallowing the error mislabelled the catalog as well as cooling it.
-    let rocky_cfg = rocky_core::config::load_optional_project_config(Some(config_path))?;
+    let rocky_cfg = rocky_core::config::load_optional_project_config(Some(config_path))
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
     let source_schemas = match &rocky_cfg {
         Some(cfg) => {
             let schema_cfg = cfg
@@ -1377,5 +1378,61 @@ mod tests {
                 },
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // #1680: caller-coupled fail-before for #1667's conversion at this site.
+    // ------------------------------------------------------------------
+
+    /// Parses as TOML, fails a validator: `fivetran` is discovery-only and
+    /// needs `kind = "discovery"`. Present-and-broken, never absent.
+    const BROKEN_CONFIG_1680: &str =
+        "[adapter.ft]\ntype = \"fivetran\"\napi_key = \"k\"\napi_secret = \"s\"\n";
+
+    /// A present-but-unloadable `rocky.toml` refuses `rocky catalog`, naming
+    /// the file. The config drives BOTH the schema cache and `project_name`,
+    /// so the old `.ok()` mislabelled the catalog as well as cooling it.
+    #[test]
+    fn catalog_refuses_a_present_but_unloadable_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("m.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("m.toml"),
+            "name = \"m\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+        let cfg = tmp.path().join("rocky.toml");
+        std::fs::write(&cfg, BROKEN_CONFIG_1680).unwrap();
+
+        let err = compute_catalog_output(&cfg, &tmp.path().join("state.redb"), &models_dir, None)
+            .expect_err("a present but unloadable rocky.toml must refuse `rocky catalog`");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failed to load config from") && rendered.contains("rocky.toml"),
+            "the refusal must name the config file, got: {rendered}"
+        );
+    }
+
+    /// Honest-failure guard: no `rocky.toml` at all still produces a catalog.
+    #[test]
+    fn catalog_still_runs_without_any_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("m.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("m.toml"),
+            "name = \"m\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+        let cfg = tmp.path().join("rocky.toml");
+        assert!(!cfg.exists());
+
+        compute_catalog_output(&cfg, &tmp.path().join("state.redb"), &models_dir, None)
+            .expect("a missing rocky.toml must not refuse `rocky catalog`");
     }
 }
