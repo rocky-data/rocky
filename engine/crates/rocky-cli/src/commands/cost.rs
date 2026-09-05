@@ -950,11 +950,22 @@ mod tests {
             "fixture must fail the STRICT loader, or this proves nothing"
         );
 
-        let (name, wh, dbu_per_hour, cost_per_dbu) = adapter_pricing(&cfg)
+        let pricing = adapter_pricing(&cfg)
             .expect("an unset ${VAR} in adapter credentials must not refuse")
             .expect("the billed warehouse must resolve");
-        assert_eq!(name, "databricks");
-        assert_eq!(wh, WarehouseType::Databricks);
-        assert!(dbu_per_hour > 0.0 && cost_per_dbu > 0.0);
+        assert_eq!(pricing.0, "databricks");
+        assert_eq!(pricing.1, WarehouseType::Databricks);
+
+        // The claim is that the run is PRICED, so assert the dollar figure,
+        // not just that the parameters were read.
+        let record = sample_run(
+            "run-1",
+            vec![sample_exec("m", "success", 60_000, Some(1_000), None)],
+        );
+        let out = build_output(&record, Some(&pricing), None, None);
+        let cost = out
+            .total_cost_usd
+            .expect("the rollup must carry a dollar figure");
+        assert!(cost > 0.0, "priced run must cost something: {cost}");
     }
 }
