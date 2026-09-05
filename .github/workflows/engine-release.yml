@@ -354,7 +354,10 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.licenses=Apache-2.0
           provenance: mode=max
-          sbom: true
+          # The SBOM generator is itself an image BuildKit pulls at build
+          # time; pinned by digest like every other release source, so a
+          # moved `:1` tag cannot change what attests the release.
+          sbom: generator=docker/buildkit-syft-scanner:1@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9
 
       # Pull what was pushed and run it once: the version it prints must be
       # the release's. A wrong binary in an archive, or a wrong tag, fails here

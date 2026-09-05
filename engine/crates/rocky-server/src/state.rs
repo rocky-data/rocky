@@ -76,16 +76,19 @@ pub struct ServerState {
     /// emits once per server start, not once per recompile. Keyed on
     /// `models_dir`, which stays constant.
     schema_cache_throttle: SchemaCacheThrottle,
-    /// The one permit every request-local read of the state store takes.
+    /// The one permit every state-store open in this process takes: the
+    /// request-local reads, the job records, and the resident scheduler's tick.
     ///
     /// redb holds an exclusive `flock` on the store file for the life of a
     /// handle, and a concurrent open polls that lock a few times before it
     /// gives up with a busy error. Two of this process's own reads racing for
     /// the file therefore turned into `503 engine_busy` at two concurrent
-    /// clients, before any other process was involved. Reads that go through
-    /// this permit queue instead of racing; the busy error is left to mean
-    /// what it says, another process holding the store.
-    pub store_reads: Arc<tokio::sync::Semaphore>,
+    /// clients, and a scheduler tick under sustained reads gave up as
+    /// `state_busy` (43 of 67 ticks at eight polling clients), before any
+    /// other process was involved. Opens that go through this permit take
+    /// turns instead of racing; the busy error is left to mean what it says,
+    /// another process holding the store.
+    pub store_access: Arc<tokio::sync::Semaphore>,
 }
 
 impl ServerState {
@@ -169,7 +172,7 @@ impl ServerState {
             auth,
             allowed_origins,
             schema_cache_throttle: SchemaCacheThrottle::new(),
-            store_reads: Arc::new(tokio::sync::Semaphore::new(1)),
+            store_access: Arc::new(tokio::sync::Semaphore::new(1)),
         });
 
         // Initial compile
@@ -298,7 +301,15 @@ impl ServerState {
         // worker would intermittently starve HTTP handlers; move it to
         // the blocking pool.
         let ttl = schema_cache_config.ttl();
+        // Take the process's store gate like every other open here. Without
+        // it this read raced the HTTP reads and the scheduler's tick for
+        // redb's file lock, and a loss returns an empty map below — a compile
+        // that silently drops its cached warehouse types, at `debug!`, under
+        // load. A closed gate (shutdown) is treated as no gate: the read then
+        // contends exactly as it did before, which is the safe direction.
+        let permit = Arc::clone(&self.store_access).acquire_owned().await.ok();
         let map = match tokio::task::spawn_blocking(move || {
+            let _held = permit;
             let store = rocky_core::state::StateStore::open_read_only(&state_path)
                 .map_err(|e| ("state open", e.to_string()))?;
             rocky_compiler::schema_cache::load_source_schemas_from_cache(
