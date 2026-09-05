@@ -297,9 +297,14 @@ pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &[
 /// [`LOCAL_ONLY_TABLE_NAMES`] without `schema_cache` — the set used when
 /// `[cache.schemas] replicate = true`.
 ///
-/// Kept as its own const rather than built at runtime so the two postures are
-/// both visible here, next to the table definitions, and a new local-only
-/// table cannot be added to one list and forgotten in the other.
+/// Kept as its own const rather than built at runtime so both postures are
+/// visible here, next to the table definitions.
+///
+/// Duplicating the list does not by itself prevent the two from drifting — it
+/// permits exactly that. `the_two_local_only_sets_differ_by_exactly_one_table`
+/// is what enforces it: adding a local-only table here and forgetting it there
+/// (or the reverse) fails that test rather than silently replicating a table
+/// that must stay node-local.
 pub const LOCAL_ONLY_TABLE_NAMES_REPLICATING_SCHEMA_CACHE: &[&str] = &[
     "jobs",
     "schedule_state",
