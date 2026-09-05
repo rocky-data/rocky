@@ -7091,6 +7091,78 @@ mod tests {
         assert_eq!(rows[0].event, "approved revenue");
     }
 
+    /// The two name scans read their own table only, and neither reports a
+    /// journal row as a product: a fulfillment-only name shows in one, an
+    /// approved name in both, and the journal rows the CAS appended are
+    /// skipped.
+    #[test]
+    fn product_name_scans_split_by_table_and_skip_journal_rows() {
+        use crate::fulfill::{
+            FulfillCas, FulfillJournalRow, FulfillState, FulfillStateRecord, ProductApprovalRecord,
+        };
+        let (store, _dir) = temp_store();
+        let row = |event: &str, to: &str| FulfillJournalRow {
+            seq: 0,
+            at: None,
+            event: event.to_string(),
+            from_state: None,
+            to_state: to.to_string(),
+            spec_digest: None,
+            plan_id: None,
+            idempotency_key: None,
+        };
+
+        // `alpha`: a fulfillment record only (and its journal row).
+        let alpha =
+            FulfillStateRecord::new(FulfillState::Init, "product:alpha".to_string(), None, None);
+        assert_eq!(
+            store
+                .fulfill_state_cas("alpha", None, &alpha, &row("loop started", "init"))
+                .unwrap(),
+            FulfillCas::Won
+        );
+
+        // `beta`: an approval, which also writes the fulfillment record.
+        let beta_state = FulfillStateRecord::new(
+            FulfillState::SpecApproved,
+            "product:beta".to_string(),
+            Some("sha256:bb".to_string()),
+            None,
+        );
+        let beta_approval = ProductApprovalRecord {
+            product_id: "product:beta".to_string(),
+            spec_digest: "sha256:bb".to_string(),
+            approver: "tester".to_string(),
+            approved_at: None,
+            snapshot_path: ".rocky/fulfillment/beta/approved-bb.toml".to_string(),
+        };
+        assert_eq!(
+            store
+                .product_approval_cas(
+                    "beta",
+                    None,
+                    &beta_approval,
+                    None,
+                    &beta_state,
+                    &row("approved", "spec_approved"),
+                )
+                .unwrap(),
+            FulfillCas::Won
+        );
+
+        assert_eq!(
+            store.fulfill_state_product_names().unwrap(),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+        assert_eq!(
+            store.product_approval_product_names().unwrap(),
+            vec!["beta".to_string()]
+        );
+        // The journal rows exist and were not counted as products.
+        assert_eq!(store.fulfill_journal_rows("alpha").unwrap().len(), 1);
+        assert_eq!(store.fulfill_journal_rows("beta").unwrap().len(), 1);
+    }
+
     #[test]
     fn fulfill_state_cas_inserts_transitions_and_journals_atomically() {
         use crate::fulfill::{FulfillCas, FulfillJournalRow, FulfillState, FulfillStateRecord};

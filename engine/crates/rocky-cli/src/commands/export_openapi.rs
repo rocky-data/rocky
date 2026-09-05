@@ -324,6 +324,12 @@ fn route_table() -> Vec<Route> {
         description: "No spec file and no state record exists under this product name.",
         body: Body::Component("ErrorEnvelope"),
     };
+    const PRODUCT_READ_FAILED: Resp = Resp {
+        status: "500",
+        description: "The state store could not be opened for reading (malformed, or written \
+             by a newer engine), or `products/` could not be read.",
+        body: Body::Component("ErrorEnvelope"),
+    };
     const JOB_ACCEPTED: Resp = Resp {
         status: "202",
         description: "Job accepted. Poll `GET /api/v1/jobs/{id}` for status.",
@@ -712,8 +718,11 @@ fn route_table() -> Vec<Route> {
             description: "Every product the project knows, sorted by name: the `products/*.toml` \
                  specs plus every name the state store holds a fulfillment or approval record \
                  for, so a product whose spec file was deleted still lists with \
-                 `spec_present = false`. The same bytes as `rocky product list --output json`. \
-                 Reads `products/` under the directory of the bound `rocky.toml`; never writes.",
+                 `spec_present = false`. The same bytes as `rocky product list --output json` \
+                 run from the project root against the same state store. Reads `products/` \
+                 under the directory of the bound `rocky.toml` and the store `--state-path` \
+                 names (or the default under the models directory); opens it read-only and \
+                 never writes.",
             path_params: &[],
             header_params: &[],
             request_body: None,
@@ -724,6 +733,7 @@ fn route_table() -> Vec<Route> {
                     body: Body::Component("ProductListOutput"),
                 },
                 ENGINE_BUSY_OR_NOT_READY,
+                PRODUCT_READ_FAILED,
             ],
             auth_exempt: false,
         },
@@ -749,6 +759,7 @@ fn route_table() -> Vec<Route> {
                 },
                 PRODUCT_NOT_FOUND,
                 ENGINE_BUSY_OR_NOT_READY,
+                PRODUCT_READ_FAILED,
             ],
             auth_exempt: false,
         },

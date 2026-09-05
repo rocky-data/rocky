@@ -1252,6 +1252,24 @@ fn open_state_store(state_path: &Path) -> Result<StateStore> {
     })
 }
 
+/// The redb cache budget for a request-local read of the product records:
+/// open, read a handful of rows, drop. See the `GET /api/v1/runs` RSS
+/// measurement on [`StateStore::open_read_only_with_cache`].
+const PRODUCT_READ_CACHE_BYTES: usize = 1 << 20;
+
+/// Open the store for a read: `product status` and `product list`, on the
+/// CLI and over HTTP. A store at the current schema version is opened with
+/// a read transaction and never written; an older one is migrated forward,
+/// as every read command does; one written by a newer engine is refused.
+fn open_state_store_read_only(state_path: &Path) -> Result<StateStore> {
+    StateStore::open_read_only_with_cache(state_path, PRODUCT_READ_CACHE_BYTES).with_context(|| {
+        format!(
+            "failed to open the state store at {} to read the product records",
+            state_path.display()
+        )
+    })
+}
+
 /// The E4 authority transition, as one function the CLI wraps.
 ///
 /// 1. Snapshot bytes first, immutable and digest-addressed (tmp+rename;
@@ -1501,7 +1519,7 @@ pub(crate) fn product_status_in(
         .is_file();
 
     let store = match state_path {
-        Some(path) if path.exists() => Some(open_state_store(path)?),
+        Some(path) if path.exists() => Some(open_state_store_read_only(path)?),
         _ => None,
     };
     if let Some(store) = store {
@@ -1542,10 +1560,21 @@ pub(crate) fn product_names_in(root: &Path, state_path: Option<&Path>) -> Result
         for entry in
             std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))?
         {
-            let path = entry
-                .with_context(|| format!("reading an entry of {}", dir.display()))?
-                .path();
+            let entry = entry.with_context(|| format!("reading an entry of {}", dir.display()))?;
+            let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+                continue;
+            }
+            // Only a regular file is a spec. A directory named `x.toml`, a
+            // FIFO, a socket or a dangling link is not a product — and a
+            // FIFO would block a reader that opened it. `metadata()` follows
+            // a link to a regular file, the same way `product status` reads
+            // one.
+            let is_regular_file = entry
+                .metadata()
+                .map(|meta| meta.file_type().is_file())
+                .unwrap_or(false);
+            if !is_regular_file {
                 continue;
             }
             if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
@@ -1555,7 +1584,7 @@ pub(crate) fn product_names_in(root: &Path, state_path: Option<&Path>) -> Result
     }
 
     if let Some(path) = state_path.filter(|path| path.exists()) {
-        let store = open_state_store(path)?;
+        let store = open_state_store_read_only(path)?;
         names.extend(store.fulfill_state_product_names()?);
         names.extend(store.product_approval_product_names()?);
     }
@@ -2501,6 +2530,49 @@ effect = "require_review"
         // The name set is the union, deduplicated: one row, not two.
         let names = product_names_in(&root, Some(&state_path)).expect("names");
         assert_eq!(names, ["revenue_daily"]);
+    }
+
+    /// Only a regular `*.toml` file is a spec: a directory that happens to
+    /// carry the extension, a dangling link, and a non-`.toml` file are not
+    /// products.
+    #[test]
+    fn list_counts_only_regular_toml_files_as_specs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, _config) = project_with_config(dir.path(), &passing_config());
+        std::fs::create_dir_all(root.join("products/not_a_spec.toml")).expect("mkdir");
+        write_file(&root.join("products/notes.md"), b"# notes");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            root.join("products/gone.toml"),
+            root.join("products/dangling.toml"),
+        )
+        .expect("symlink");
+
+        let names = product_names_in(&root, None).expect("names");
+        assert_eq!(names, ["revenue_daily"]);
+    }
+
+    /// The reads never write: the store file's bytes are the same before
+    /// and after a list and a status, and a path that does not exist is
+    /// not created.
+    #[test]
+    fn list_and_status_never_write_the_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, _config) = project_with_config(dir.path(), &passing_config());
+        let state_path = temp_state_path(dir.path());
+        product_approve_in(&root, &state_path, "revenue_daily").expect("approves");
+
+        let before = std::fs::read(&state_path).expect("store bytes");
+        let out = product_list_in(&root, Some(&state_path)).expect("list");
+        assert_eq!(out.count, 1);
+        let status = product_status_in(&root, Some(&state_path), "revenue_daily").expect("status");
+        assert!(status.approval.is_some());
+        let after = std::fs::read(&state_path).expect("store bytes");
+        assert_eq!(before, after, "a read must not change the store file");
+
+        let absent = dir.path().join("never-created.redb");
+        product_list_in(&root, Some(&absent)).expect("list with no store");
+        assert!(!absent.exists(), "a read must not create a store");
     }
 
     #[test]

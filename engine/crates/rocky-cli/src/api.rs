@@ -1072,6 +1072,13 @@ async fn get_product(
     State(state): State<Arc<ServerState>>,
     ApiPath(name): ApiPath<String>,
 ) -> Result<PrettyJson<ProductStatusOutput>, ApiError> {
+    // A name is only ever looked up in the computed product set before any
+    // path is built from it, so a traversal cannot reach the filesystem.
+    // This guard refuses anything that is not a bare identifier before
+    // opening anything: a spec's own `product.name` must be one to exist.
+    if !is_bare_product_name(&name) {
+        return Err(ApiError::product_not_found(&name));
+    }
     let root = project_root_for(&state)?;
     let state_path = state_path_for(&state);
     let lookup = name.clone();
@@ -1089,6 +1096,20 @@ async fn get_product(
         Some(status) => Ok(PrettyJson(status)),
         None => Err(ApiError::product_not_found(&name)),
     }
+}
+
+/// The rule a product name must satisfy to exist at all: a bare identifier,
+/// ASCII letter or `_` first, then ASCII letters, digits or `_`. It is the
+/// spec parser's `product-name-invalid` rule, so a name that fails it can
+/// name no spec file and no state record, and the route can answer 404
+/// without touching the filesystem or the store.
+fn is_bare_product_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    match bytes.next() {
+        Some(b) if b.is_ascii_alphabetic() || b == b'_' => {}
+        _ => return false,
+    }
+    bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// `GET /api/v1/schedule` — a read-only scheduler snapshot.
@@ -2073,6 +2094,31 @@ mod tests {
         let err: ErrorEnvelope = resp.json().await.unwrap();
         assert_eq!(err.code, "product_not_found");
         assert!(err.remediation_hint.is_some());
+
+        // A traversal-shaped or non-identifier name is a 404 before any path
+        // is built from it: the router refuses shapes that do not match one
+        // segment (`route_not_found`), and the handler's identifier guard
+        // refuses the rest (`product_not_found`). Either way nothing on
+        // disk is touched.
+        for shape in [
+            "..",
+            "..%2F..%2Fetc%2Fpasswd",
+            "a%5Cb",
+            "a.b",
+            "-x",
+            "a%23b",
+        ] {
+            let resp = reqwest::get(format!("{base}/api/v1/products/{shape}"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 404, "{shape}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert!(
+                err.code == "product_not_found" || err.code == "route_not_found",
+                "{shape}: {}",
+                err.code
+            );
+        }
     }
 
     /// A product the store knows but whose spec file is gone is still a
@@ -2213,6 +2259,15 @@ mod tests {
             "{:?}",
             body.capabilities
         );
+        // So are the product routes, and both are registered.
+        assert!(
+            body.capabilities.iter().any(|c| c == "products"),
+            "{:?}",
+            body.capabilities
+        );
+        for route in ["GET /api/v1/products", "GET /api/v1/products/{name}"] {
+            assert!(body.routes.iter().any(|r| r == route), "{route} missing");
+        }
         // No config bound in this fixture (models-only ServerState).
         assert!(body.config_hash.is_none());
     }

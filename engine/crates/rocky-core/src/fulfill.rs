@@ -312,16 +312,21 @@ pub fn fulfill_state_key(product_name: &str) -> String {
 
 /// The product name a `product:<name>` record key names.
 ///
-/// `None` for a journal-row key (`product:<name>#<seq>`, which shares the
-/// table) and for any key outside the `product:` namespace, so a scan over
-/// the table yields each product once.
+/// `None` for a journal-row key and for any key outside the `product:`
+/// namespace, so a scan over the table yields each product once. A journal
+/// row is recognised by the exact shape [`fulfill_journal_key`] writes —
+/// `#` followed by eight ASCII digits at the end — not by the presence of
+/// `#`, so a product name that happens to contain `#` is not mistaken for
+/// one.
 pub fn product_name_from_state_key(key: &str) -> Option<&str> {
     let name = key.strip_prefix("product:")?;
-    if name.is_empty() || name.contains('#') {
-        None
-    } else {
-        Some(name)
+    if name.is_empty() {
+        return None;
     }
+    let is_journal_row = name
+        .rsplit_once('#')
+        .is_some_and(|(_, seq)| seq.len() == 8 && seq.bytes().all(|b| b.is_ascii_digit()));
+    if is_journal_row { None } else { Some(name) }
 }
 
 /// The key of one journal row: `product:<name>#<seq:08>`.
@@ -354,6 +359,35 @@ pub enum FulfillCas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The name scan must invert exactly the two key writers: a record key
+    /// yields its name, a journal key yields nothing, and a `#` inside a
+    /// name does not turn the record into a journal row.
+    #[test]
+    fn product_name_from_state_key_inverts_the_key_writers() {
+        assert_eq!(
+            product_name_from_state_key(&fulfill_state_key("revenue_daily")),
+            Some("revenue_daily")
+        );
+        assert_eq!(
+            product_name_from_state_key(&fulfill_journal_key("revenue_daily", 1)),
+            None
+        );
+        assert_eq!(
+            product_name_from_state_key(&fulfill_journal_key("revenue_daily", 99_999_999)),
+            None
+        );
+        // A `#` that is not followed by exactly eight digits is part of a name.
+        assert_eq!(product_name_from_state_key("product:a#b"), Some("a#b"));
+        assert_eq!(product_name_from_state_key("product:a#123"), Some("a#123"));
+        assert_eq!(
+            product_name_from_state_key("product:a#0000000x"),
+            Some("a#0000000x")
+        );
+        // Outside the namespace, or empty: nothing.
+        assert_eq!(product_name_from_state_key("run:abc"), None);
+        assert_eq!(product_name_from_state_key("product:"), None);
+    }
 
     /// `drafting_round` (#1493) must be readable in BOTH directions
     /// across the version that added it, because the record is persisted

@@ -21948,7 +21948,7 @@
     },
     "/api/v1/products": {
       "get": {
-        "description": "Every product the project knows, sorted by name: the `products/*.toml` specs plus every name the state store holds a fulfillment or approval record for, so a product whose spec file was deleted still lists with `spec_present = false`. The same bytes as `rocky product list --output json`. Reads `products/` under the directory of the bound `rocky.toml`; never writes.",
+        "description": "Every product the project knows, sorted by name: the `products/*.toml` specs plus every name the state store holds a fulfillment or approval record for, so a product whose spec file was deleted still lists with `spec_present = false`. The same bytes as `rocky product list --output json` run from the project root against the same state store. Reads `products/` under the directory of the bound `rocky.toml` and the store `--state-path` names (or the default under the models directory); opens it read-only and never writes.",
         "operationId": "listProducts",
         "responses": {
           "200": {
@@ -21960,6 +21960,16 @@
               }
             },
             "description": "The product list."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store could not be opened for reading (malformed, or written by a newer engine), or `products/` could not be read."
           },
           "503": {
             "content": {
@@ -22013,6 +22023,16 @@
               }
             },
             "description": "No spec file and no state record exists under this product name."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store could not be opened for reading (malformed, or written by a newer engine), or `products/` could not be read."
           },
           "503": {
             "content": {

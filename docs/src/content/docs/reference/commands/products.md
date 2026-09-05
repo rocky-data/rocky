@@ -120,7 +120,7 @@ A product is listed when either is true: `products/<name>.toml` exists, or the s
 
 Each row is a projection of `rocky product status <name>`: spec identity or its error, the committed lowering phase, the count of artifact byte-verification problems, whether a staging journal is pending, the approval record, whether the working spec matches the approved revision, the fulfillment state, and the journal row count. The two commands are built by the same code, so a row can never disagree with the status it summarises.
 
-The same payload is served over HTTP by `rocky serve` at `GET /api/v1/products`, and one product's status at `GET /api/v1/products/{name}`. The server reads `products/` under the directory of the bound `rocky.toml`; the CLI reads it under the working directory.
+The same payload is served over HTTP by `rocky serve` at `GET /api/v1/products`, and one product's status at `GET /api/v1/products/{name}`. The server reads `products/` under the directory of the bound `rocky.toml`; the CLI reads it under the working directory. The server reads the state store named by its own `--state-path`, or the default under its models directory, as every route does; `--state-namespace` is a CLI-side resolution and does not reach the server. Both reads open the store read-only: a store at the current schema version is never written, an older one is migrated forward as every read command does, and a store written by a newer engine is refused.
 
 ### JSON output
 
