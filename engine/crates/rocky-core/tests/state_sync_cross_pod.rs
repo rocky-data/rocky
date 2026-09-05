@@ -139,7 +139,7 @@ async fn global_override_visible_across_threads() {
             .enable_all()
             .build()
             .expect("build upload runtime")
-            .block_on(state_sync::upload_state(&cfg, &path))
+            .block_on(state_sync::upload_state(&cfg, &path, false))
     })
     .join()
     .expect("upload thread panicked");
@@ -253,4 +253,173 @@ async fn scheduler_state_and_claims_stay_local_across_sync_cycle() {
         assert!(store.get_schedule_claim(claim_key).unwrap().is_some());
         assert!(store.get_watermark("cat.sch.orders").unwrap().is_some());
     }
+}
+
+// ---------------------------------------------------------------------------
+// `[cache.schemas] replicate` — the schema cache crosses pods only when the
+// project opts in (#1620).
+// ---------------------------------------------------------------------------
+
+/// Seed one schema-cache entry into `pod`'s local store.
+fn seed_schema_cache(harness: &CrossPodHarness, pod: &rocky_core::test_harness::Pod, table: &str) {
+    let store = harness.open_store(pod);
+    let key = rocky_core::schema_cache::schema_cache_key("cat", "staging", table);
+    let entry = rocky_core::schema_cache::SchemaCacheEntry {
+        columns: vec![rocky_core::schema_cache::StoredColumn {
+            name: "id".into(),
+            data_type: "BIGINT".into(),
+            nullable: false,
+        }],
+        cached_at: Utc::now(),
+    };
+    store.write_schema_cache_entry(&key, &entry).unwrap();
+}
+
+/// How many schema-cache rows `pod`'s local store holds.
+fn schema_cache_len(harness: &CrossPodHarness, pod: &rocky_core::test_harness::Pod) -> usize {
+    harness.open_store(pod).list_schema_cache().unwrap().len()
+}
+
+/// THE DEFAULT, UNCHANGED. With `replicate = false` — every project that has
+/// not opted in — the schema cache stays node-local: pod A's cached warehouse
+/// types must not reach pod B, so a fresh clone never inherits another
+/// machine's stale types.
+#[tokio::test]
+async fn schema_cache_stays_local_by_default() {
+    let _serial = remote_testing::serial_guard();
+    let harness = CrossPodHarness::new_s3_like();
+
+    seed_schema_cache(&harness, &harness.pod_a, "orders");
+    harness
+        .upload_replicating(&harness.pod_a, false)
+        .await
+        .expect("pod A upload");
+
+    let _authority = harness
+        .download_replicating(&harness.pod_b, false)
+        .await
+        .expect("pod B download");
+    assert_eq!(
+        schema_cache_len(&harness, &harness.pod_b),
+        0,
+        "the default posture must not replicate the schema cache"
+    );
+}
+
+/// THE FIX. `[cache.schemas] replicate = true` makes the schema cache travel:
+/// pod A's cached types reach pod B through the real upload → remote →
+/// download chain. Before #1620 this test failed — the setting parsed and
+/// changed neither leg.
+#[tokio::test]
+async fn schema_cache_crosses_pods_when_replicate_is_enabled() {
+    let _serial = remote_testing::serial_guard();
+    let harness = CrossPodHarness::new_s3_like();
+
+    seed_schema_cache(&harness, &harness.pod_a, "orders");
+    harness
+        .upload_replicating(&harness.pod_a, true)
+        .await
+        .expect("pod A upload");
+
+    let _authority = harness
+        .download_replicating(&harness.pod_b, true)
+        .await
+        .expect("pod B download");
+    assert_eq!(
+        schema_cache_len(&harness, &harness.pod_b),
+        1,
+        "replicate = true must carry the schema cache across pods"
+    );
+}
+
+/// Both legs are required. Uploading with `replicate = true` but downloading
+/// with it off still leaves pod B empty — the download leg overwrites the
+/// staged remote cache from pod B's own (empty) local table. This pins that
+/// the fix is not accidentally one-sided.
+#[tokio::test]
+async fn replicating_upload_alone_does_not_reach_the_other_pod() {
+    let _serial = remote_testing::serial_guard();
+    let harness = CrossPodHarness::new_s3_like();
+
+    seed_schema_cache(&harness, &harness.pod_a, "orders");
+    harness
+        .upload_replicating(&harness.pod_a, true)
+        .await
+        .expect("pod A upload");
+
+    let _authority = harness
+        .download_replicating(&harness.pod_b, false)
+        .await
+        .expect("pod B download");
+    assert_eq!(
+        schema_cache_len(&harness, &harness.pod_b),
+        0,
+        "a non-replicating download keeps its own local cache"
+    );
+}
+
+/// HONEST FAILURE. A remote object written before anyone opted in carries NO
+/// `schema_cache` table at all. Turning `replicate = true` on must not fail
+/// that download — an absent table is not an error, and pod B simply has an
+/// empty cache afterwards.
+#[tokio::test]
+async fn replicating_download_tolerates_a_remote_with_no_schema_cache_table() {
+    let _serial = remote_testing::serial_guard();
+    let harness = CrossPodHarness::new_s3_like();
+
+    // Pod A uploads under the OLD posture, so the remote has no schema_cache.
+    {
+        let store = harness.open_store(&harness.pod_a);
+        store.set_watermark("cat.sch.orders", &wm_now()).unwrap();
+    }
+    seed_schema_cache(&harness, &harness.pod_a, "orders");
+    harness
+        .upload_replicating(&harness.pod_a, false)
+        .await
+        .expect("pod A upload");
+
+    // Pod B now opts in and downloads that older remote.
+    let authority = harness
+        .download_replicating(&harness.pod_b, true)
+        .await
+        .expect("an absent remote schema_cache table must not fail the download");
+    assert_eq!(authority, StateAuthority::Authoritative);
+
+    let store = harness.open_store(&harness.pod_b);
+    assert!(
+        store.get_watermark("cat.sch.orders").unwrap().is_some(),
+        "the replicated tables must still arrive"
+    );
+    assert_eq!(
+        store.list_schema_cache().unwrap().len(),
+        0,
+        "no remote cache to inherit → empty, not an error"
+    );
+}
+
+/// Replication must never DESTROY a warm local cache. When there is no remote
+/// object at all, the download rebuilds the local file from the local-only
+/// tables — and `schema_cache` stays in that set even under `replicate = true`,
+/// or opting in would wipe this machine's cache every time the remote is
+/// missing.
+#[tokio::test]
+async fn replicating_download_keeps_the_local_cache_when_the_remote_is_absent() {
+    let _serial = remote_testing::serial_guard();
+    let harness = CrossPodHarness::new_s3_like();
+
+    // A local store with a warm cache, and NOTHING uploaded to the remote.
+    seed_schema_cache(&harness, &harness.pod_b, "orders");
+    assert_eq!(schema_cache_len(&harness, &harness.pod_b), 1);
+
+    let authority = harness
+        .download_replicating(&harness.pod_b, true)
+        .await
+        .expect("an absent remote object is not a download failure");
+    assert_eq!(authority, StateAuthority::FreshStart);
+
+    assert_eq!(
+        schema_cache_len(&harness, &harness.pod_b),
+        1,
+        "opting into replication must not discard the local cache when the remote is absent"
+    );
 }

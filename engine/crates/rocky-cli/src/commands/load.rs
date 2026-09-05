@@ -167,8 +167,12 @@ pub async fn run_load(
     // Remote-state session (WP-01 PR-B 2b, RD-003) — acquired only once there
     // is at least one file to load, BEFORE the store open below.
     // -----------------------------------------------------------------------
-    let mut session =
-        rocky_core::state_sync::RemoteStateSession::new(&rocky_cfg.state, state_path, durability);
+    let mut session = rocky_core::state_sync::RemoteStateSession::new(
+        &rocky_cfg.state,
+        state_path,
+        durability,
+        rocky_cfg.cache.schemas.replicate,
+    );
     if let Err(e) = session.acquire().await {
         // Unreachable on a fresh session (`Err` = double-acquire misuse);
         // consume defensively so no exit path can leak the session.

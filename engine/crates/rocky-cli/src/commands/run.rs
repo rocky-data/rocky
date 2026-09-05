@@ -1950,6 +1950,7 @@ pub async fn run(
             } else {
                 rocky_core::state_sync::FinalizeDurability::ConfigDefault
             },
+            loaded.config.cache.schemas.replicate,
         );
         if let Err(e) = model_session.acquire().await {
             // Unreachable on a fresh session (`Err` = double-acquire misuse);
@@ -2356,6 +2357,7 @@ pub async fn run(
                     } else {
                         rocky_core::state_sync::FinalizeDurability::ConfigDefault
                     },
+                    loaded.config.cache.schemas.replicate,
                 );
                 if let Err(e) = session.acquire().await {
                     // Unreachable on a fresh session (`Err` = double-acquire
@@ -2502,6 +2504,7 @@ pub async fn run(
                 } else {
                     rocky_core::state_sync::FinalizeDurability::ConfigDefault
                 },
+                loaded.config.cache.schemas.replicate,
             );
             if let Err(e) = session.acquire().await {
                 session.abandon("quality acquire misuse").await;
@@ -2580,6 +2583,7 @@ pub async fn run(
                 } else {
                     rocky_core::state_sync::FinalizeDurability::ConfigDefault
                 },
+                loaded.config.cache.schemas.replicate,
             );
             if let Err(e) = session.acquire().await {
                 session.abandon("snapshot acquire misuse").await;
@@ -2756,6 +2760,7 @@ pub async fn run(
         } else {
             rocky_core::state_sync::FinalizeDurability::ConfigDefault
         },
+        loaded.config.cache.schemas.replicate,
     ));
     let authority = session.acquire().await?;
     let authority = if authority.is_usable() {

@@ -1710,19 +1710,27 @@ pub(crate) async fn run_gc_apply_in_with(
         .as_ref()
         .map(|cfg| cfg.state.clone())
         .unwrap_or_default();
+    // Same posture as every other sync leg (#1620); absent config → false,
+    // which is the pre-existing table set.
+    let replicate_schema_cache = loaded_cfg
+        .as_ref()
+        .is_some_and(|cfg| cfg.cache.schemas.replicate);
     let remote_state = !matches!(state_cfg.backend, StateBackend::Local);
     if remote_state {
         // WP-01 PR-B (2b): the session half-seam owns the download shape; a
         // successful download of either usable variant means the local ledger
         // now mirrors remote truth; failure still `?`-bails fail-closed
         // (unchanged).
-        let _authority =
-            rocky_core::state_sync::RemoteStateSession::download_only(&state_cfg, state_path)
-                .await
-                .with_context(|| {
-                    "failed to download remote state before gc apply; a remote-backend gc apply \
+        let _authority = rocky_core::state_sync::RemoteStateSession::download_only(
+            &state_cfg,
+            state_path,
+            replicate_schema_cache,
+        )
+        .await
+        .with_context(|| {
+            "failed to download remote state before gc apply; a remote-backend gc apply \
                  requires the state backend to be reachable"
-                })?;
+        })?;
     }
 
     // Durable freeze-marker LIST for the gate below, hoisted beside the ledger
@@ -1814,7 +1822,11 @@ pub(crate) async fn run_gc_apply_in_with(
         // attempt's local rows are rolled back by the session's
         // restore-the-winner-on-terminal-failure rule, so no side effect
         // outlives a discarded attempt, remotely OR locally.
-        let session = rocky_core::state_sync::LedgerSeamSession::new(&state_cfg, state_path);
+        let session = rocky_core::state_sync::LedgerSeamSession::new(
+            &state_cfg,
+            state_path,
+            replicate_schema_cache,
+        );
         // The attempt future must OWN everything it touches (the session's
         // `for<'a>` bound): master copies move into the closure, and each
         // attempt clones what its future needs.
@@ -1906,7 +1918,10 @@ pub(crate) async fn run_gc_apply_in_with(
             // WP-01 PR-B (2b): the half-seam owns the forced-`Fail` durability
             // policy (previously a local `StateConfig` clone here).
             rocky_core::state_sync::RemoteStateSession::upload_only_fail_closed(
-                &state_cfg, state_path, "gc apply",
+                &state_cfg,
+                state_path,
+                "gc apply",
+                replicate_schema_cache,
             )
             .await
             .with_context(|| "failed to upload remote state after gc apply")?;
@@ -4038,9 +4053,10 @@ auto_create_schemas = true
                 // 2's first read — after ITS download, before ITS put: the
                 // winner published here makes that put a genuine conflict.
                 if n == 3 {
-                    let _authority = rocky_core::state_sync::download_state(&self.cfg, &self.path)
-                        .await
-                        .unwrap();
+                    let _authority =
+                        rocky_core::state_sync::download_state(&self.cfg, &self.path, false)
+                            .await
+                            .unwrap();
                     {
                         let store = StateStore::open(&self.path).unwrap();
                         seed(
@@ -4055,7 +4071,7 @@ auto_create_schemas = true
                         );
                         record_run(&store, "r-winner", "winner_model");
                     }
-                    rocky_core::state_sync::upload_state(&self.cfg, &self.path)
+                    rocky_core::state_sync::upload_state(&self.cfg, &self.path, false)
                         .await
                         .unwrap();
                 }
@@ -4079,7 +4095,7 @@ auto_create_schemas = true
         crate::commands::review::write_test_review_marker(root.path(), &plan_id);
 
         // Publish G0 (candidate present, no winner rows yet).
-        rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path)
+        rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path, false)
             .await
             .unwrap();
 
@@ -4131,10 +4147,13 @@ auto_create_schemas = true
         );
 
         // Read back the PUBLISHED blob (fresh pod_a download), not local files.
-        let _authority =
-            rocky_core::state_sync::download_state(&harness.pod_a.cfg, &harness.pod_a.state_path)
-                .await
-                .unwrap();
+        let _authority = rocky_core::state_sync::download_state(
+            &harness.pod_a.cfg,
+            &harness.pod_a.state_path,
+            false,
+        )
+        .await
+        .unwrap();
         let published = StateStore::open(&harness.pod_a.state_path).unwrap();
         let tombs = published.list_tombstones().unwrap();
         assert_eq!(tombs.len(), 1, "the candidate must be tombstoned");
@@ -4166,7 +4185,7 @@ auto_create_schemas = true
                 .unwrap()
         };
         crate::commands::review::write_test_review_marker(root.path(), &plan_id);
-        rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path)
+        rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path, false)
             .await
             .unwrap();
 
@@ -4207,10 +4226,13 @@ auto_create_schemas = true
             "the CAS seam must never fall back to an unconditional blob put"
         );
 
-        let _authority =
-            rocky_core::state_sync::download_state(&harness.pod_a.cfg, &harness.pod_a.state_path)
-                .await
-                .unwrap();
+        let _authority = rocky_core::state_sync::download_state(
+            &harness.pod_a.cfg,
+            &harness.pod_a.state_path,
+            false,
+        )
+        .await
+        .unwrap();
         let published = StateStore::open(&harness.pod_a.state_path).unwrap();
         assert_eq!(published.list_tombstones().unwrap().len(), 1);
     }
@@ -4234,7 +4256,7 @@ auto_create_schemas = true
                 .unwrap()
         };
         crate::commands::review::write_test_review_marker(root.path(), &plan_id);
-        rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path)
+        rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path, false)
             .await
             .unwrap();
 
@@ -4267,10 +4289,13 @@ auto_create_schemas = true
             "got: {err:#}"
         );
 
-        let _authority =
-            rocky_core::state_sync::download_state(&harness.pod_a.cfg, &harness.pod_a.state_path)
-                .await
-                .unwrap();
+        let _authority = rocky_core::state_sync::download_state(
+            &harness.pod_a.cfg,
+            &harness.pod_a.state_path,
+            false,
+        )
+        .await
+        .unwrap();
         let published = StateStore::open(&harness.pod_a.state_path).unwrap();
         assert!(
             published.list_tombstones().unwrap().is_empty(),
@@ -4437,9 +4462,10 @@ auto_create_schemas = true
             async fn reclaim_verdict(&self, _sp: &str, _fp: &str, _cv: u64) -> ReclaimVerdict {
                 let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 if n == 3 {
-                    let _authority = rocky_core::state_sync::download_state(&self.cfg, &self.path)
-                        .await
-                        .unwrap();
+                    let _authority =
+                        rocky_core::state_sync::download_state(&self.cfg, &self.path, false)
+                            .await
+                            .unwrap();
                     {
                         let store = StateStore::open(&self.path).unwrap();
                         store
@@ -4457,7 +4483,7 @@ auto_create_schemas = true
                             })
                             .unwrap();
                     }
-                    rocky_core::state_sync::upload_state(&self.cfg, &self.path)
+                    rocky_core::state_sync::upload_state(&self.cfg, &self.path, false)
                         .await
                         .unwrap();
                 }
@@ -4479,7 +4505,7 @@ auto_create_schemas = true
                 .unwrap()
         };
         crate::commands::review::write_test_review_marker(root.path(), &plan_id);
-        rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path)
+        rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path, false)
             .await
             .unwrap();
 
@@ -4532,10 +4558,13 @@ auto_create_schemas = true
         );
 
         // And remote is untouched by the refused seam: no tombstones there.
-        let _authority =
-            rocky_core::state_sync::download_state(&harness.pod_a.cfg, &harness.pod_a.state_path)
-                .await
-                .unwrap();
+        let _authority = rocky_core::state_sync::download_state(
+            &harness.pod_a.cfg,
+            &harness.pod_a.state_path,
+            false,
+        )
+        .await
+        .unwrap();
         let published = StateStore::open(&harness.pod_a.state_path).unwrap();
         assert!(published.list_tombstones().unwrap().is_empty());
     }
@@ -4592,7 +4621,7 @@ auto_create_schemas = true
                 .unwrap()
         };
         crate::commands::review::write_test_review_marker(root.path(), &plan_id);
-        rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path)
+        rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path, false)
             .await
             .unwrap();
 
@@ -4630,10 +4659,13 @@ auto_create_schemas = true
 
         // Remote untouched (the GET outage blocks reads, not this check —
         // faults were cleared above).
-        let _authority =
-            rocky_core::state_sync::download_state(&harness.pod_a.cfg, &harness.pod_a.state_path)
-                .await
-                .unwrap();
+        let _authority = rocky_core::state_sync::download_state(
+            &harness.pod_a.cfg,
+            &harness.pod_a.state_path,
+            false,
+        )
+        .await
+        .unwrap();
         let published = StateStore::open(&harness.pod_a.state_path).unwrap();
         assert!(published.list_tombstones().unwrap().is_empty());
     }
@@ -4686,7 +4718,7 @@ auto_create_schemas = true
                 .unwrap()
         };
         crate::commands::review::write_test_review_marker(root.path(), &plan_id);
-        rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path)
+        rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path, false)
             .await
             .unwrap();
 
@@ -4719,10 +4751,13 @@ auto_create_schemas = true
         );
 
         // Remote untouched.
-        let _authority =
-            rocky_core::state_sync::download_state(&harness.pod_a.cfg, &harness.pod_a.state_path)
-                .await
-                .unwrap();
+        let _authority = rocky_core::state_sync::download_state(
+            &harness.pod_a.cfg,
+            &harness.pod_a.state_path,
+            false,
+        )
+        .await
+        .unwrap();
         let published = StateStore::open(&harness.pod_a.state_path).unwrap();
         assert!(published.list_tombstones().unwrap().is_empty());
     }

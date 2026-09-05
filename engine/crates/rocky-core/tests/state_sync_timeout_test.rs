@@ -136,7 +136,7 @@ async fn upload_state_times_out_on_hung_endpoint_fail_mode() {
     );
 
     let start = Instant::now();
-    let result = upload_state(&config, &state_path).await;
+    let result = upload_state(&config, &state_path, false).await;
     let elapsed = start.elapsed();
 
     match result {
@@ -182,7 +182,7 @@ async fn upload_state_hung_endpoint_skip_mode_converts_to_ok() {
     );
 
     let start = Instant::now();
-    let result = upload_state(&config, &state_path).await;
+    let result = upload_state(&config, &state_path, false).await;
     let elapsed = start.elapsed();
 
     result.expect("skip-mode should swallow terminal upload error");
@@ -222,7 +222,7 @@ async fn upload_state_succeeds_when_endpoint_is_prompt() {
     );
 
     let start = Instant::now();
-    let result = upload_state(&config, &state_path).await;
+    let result = upload_state(&config, &state_path, false).await;
     let elapsed = start.elapsed();
 
     result.expect("prompt endpoint upload should succeed");
@@ -284,7 +284,7 @@ async fn upload_state_retries_transient_then_succeeds() {
     );
 
     let start = Instant::now();
-    let result = upload_state(&config, &state_path).await;
+    let result = upload_state(&config, &state_path, false).await;
     let elapsed = start.elapsed();
 
     result.expect("retry after transient 500 should succeed");
