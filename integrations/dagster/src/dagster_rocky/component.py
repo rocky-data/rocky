@@ -32,7 +32,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 import dagster as dg
 from dagster._core.definitions.metadata.metadata_set import NamespacedMetadataSet
@@ -64,6 +64,7 @@ from pydantic import ValidationError
 from .checks import check_metadata, dagster_check_severity
 from .column_lineage import build_column_lineage
 from .contracts import (
+    GROUP_CHECK_METADATA_KEY,
     ContractRules,
     configured_check_specs_for_model,
     contract_check_results_from_diagnostics,
@@ -1476,16 +1477,27 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         # re-derived in Python) so the pre-declared spec name byte-matches the
         # CheckResult.name the engine emits — see surface_configured_checks.
         #
-        # `candidate` names (cross_source_overlap) are excluded: that is a GROUP
-        # check the engine emits once (on one sibling asset), so pre-declaring
-        # it on every same-named sibling would leave the others with a passing
-        # placeholder that doesn't reflect a real evaluation. Only exact,
-        # per-asset names (custom / null_rate / assertions) are surfaced.
+        # `candidate` names (cross_source_overlap) ARE declared, and collected
+        # separately as group-check names. They used to be excluded, because a
+        # GROUP check the engine emits once (on one sibling asset) left every
+        # other sibling with a passing placeholder that reflected no
+        # evaluation. The emit side then dropped the one real result too, so a
+        # FAILED overlap check reached nobody (#1669). Declaring them and
+        # emitting an explicit "not evaluated on this asset" result on the
+        # non-carrier siblings keeps the real verdict visible without inventing
+        # a green one — see `_emit_placeholder_checks`.
         configured_checks_by_model: dict[str, list[str]] = {}
+        group_check_names: set[str] = set()
         if self.surface_configured_checks and discover.checks is not None:
             configured_checks_by_model = {
-                table: [c.name for c in names if not c.candidate]
+                table: [c.name for c in names]
                 for table, names in discover.checks.configured_checks.items()
+            }
+            group_check_names = {
+                c.name
+                for names in discover.checks.configured_checks.values()
+                for c in names
+                if c.candidate
             }
 
         # `freshness` is declared only when the pipeline configures it. The
@@ -1516,6 +1528,7 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
             declare_freshness=freshness_is_configured(discover.checks),
             surface_compliance=self.surface_compliance,
             configured_checks_by_model=configured_checks_by_model,
+            group_check_names=group_check_names,
             partitions_def=tenant_partitions_def,
         )
 
@@ -2270,6 +2283,35 @@ def _build_asset_spec(
     return spec
 
 
+#: Prefix of the engine's cross-source-overlap check name
+#: (``cross_source_overlap:{source_type}.{table}``, built by
+#: ``rocky_core::checks::cross_source_overlap_name``). Read ONLY to decide
+#: which assets a group-check spec targets — the spec name itself always comes
+#: verbatim from the discover projection. See
+#: :func:`_group_check_targets_source_types`.
+_OVERLAP_CHECK_PREFIX: str = "cross_source_overlap"
+
+
+def _group_check_targets_source_types(name: str, source_types: set[str]) -> bool:
+    """Does this group-check name apply to an asset with these Rocky source types?
+
+    ``discover.checks.configured_checks`` is keyed by TABLE name only, so the
+    candidate name ``cross_source_overlap:duckdb.orders`` is projected under
+    ``orders`` and would otherwise be declared on *every* asset whose table is
+    ``orders`` — including a ``postgres.orders`` that is not in that sibling
+    group and can never receive the verdict.
+
+    Fail OPEN: a name whose shape this does not recognise (a future group-check
+    kind, a renamed prefix) returns ``True``, so the spec is declared on every
+    same-named asset — noisier, but never a silently undeclared check whose
+    result is then dropped. Same for an asset with no known source type.
+    """
+    kind, sep, rest = name.partition(":")
+    if kind != _OVERLAP_CHECK_PREFIX or not sep or not source_types:
+        return True
+    return any(rest.startswith(f"{source_type}.") for source_type in source_types)
+
+
 def _build_check_specs(
     groups: list[_GroupBuild],
     contract_rules_by_model: dict[str, ContractRules] | None = None,
@@ -2277,6 +2319,7 @@ def _build_check_specs(
     declare_freshness: bool,
     surface_compliance: bool = False,
     configured_checks_by_model: dict[str, list[str]] | None = None,
+    group_check_names: set[str] | None = None,
     partitions_def: dg.PartitionsDefinition | None = None,
 ) -> list[dg.AssetCheckSpec]:
     """Pre-declare check specs for every asset in every group.
@@ -2301,6 +2344,18 @@ def _build_check_specs(
     on the presence of the matching rule kind in the contract file
     (e.g. a contract with only `[[columns]]` constraints does NOT get a
     `contract_required_columns` spec).
+
+    ``group_check_names`` names the subset of ``configured_checks_by_model``
+    the engine evaluates once per sibling GROUP (the ``candidate`` names in
+    the discover projection — today only ``cross_source_overlap``). Those
+    specs are stamped with :data:`GROUP_CHECK_METADATA_KEY`, and are declared
+    only on assets whose Rocky source type the name targets: the projection is
+    keyed by TABLE name alone, so ``cross_source_overlap:duckdb.orders`` would
+    otherwise also land on a ``postgres.orders`` asset that is not in that
+    sibling group. The spec NAME still comes verbatim from discover; only the
+    targeting reads the name, and a name whose shape it does not recognise is
+    declared on every same-named asset (fail open to the prior behaviour)
+    rather than dropped.
 
     When ``surface_compliance`` is ``True``, additionally pre-declares a
     ``compliance_exception`` :class:`dg.AssetCheckSpec` per asset so the
@@ -2353,7 +2408,17 @@ def _build_check_specs(
         seen.add(marker)
         specs.append(spec)
 
+    group_check_names = group_check_names or set()
+
     for group in groups:
+        # Rocky source type(s) behind each asset key — ``_native_rocky_key``
+        # puts the source type first, and a tenant-collapsed key can fold
+        # several native keys (hence a set) onto one asset.
+        source_types_by_key: dict[dg.AssetKey, set[str]] = defaultdict(set)
+        for native_key, dagster_key in group.rocky_key_to_dagster_key.items():
+            if native_key:
+                source_types_by_key[dagster_key].add(native_key[0])
+
         for spec in group.specs:
             # Default checks (4 per asset, 3 without a freshness config)
             for check_name in DEFAULT_CHECK_NAMES:
@@ -2387,8 +2452,19 @@ def _build_check_specs(
             # spec name byte-matches the CheckResult.name the engine emits.
             configured_names = (configured_checks_by_model or {}).get(table_name)
             if configured_names:
+                targeted = [
+                    name
+                    for name in configured_names
+                    if name not in group_check_names
+                    or _group_check_targets_source_types(
+                        name, source_types_by_key.get(spec.key, set())
+                    )
+                ]
                 for configured_spec in configured_check_specs_for_model(
-                    spec.key, configured_names, partitions_def=partitions_def
+                    spec.key,
+                    targeted,
+                    partitions_def=partitions_def,
+                    group_check_names=group_check_names,
                 ):
                     _add(configured_spec)
 
@@ -2769,6 +2845,7 @@ def _make_rocky_asset(
                 filters=filters,
                 group=group,
                 selected_keys=selected_keys,
+                declared_check_pairs=declared_check_pairs,
             )
             # In pipes mode, the placeholder pass inside ``_emit_results``
             # doesn't run — but we still need to yield the collected
@@ -2799,6 +2876,7 @@ def _make_rocky_asset(
                 collapsed_key_by_table=group.collapsed_key_by_table or None,
                 satisfy_empty_outputs=satisfy_empty_outputs,
                 instance=context.instance,
+                log=context.log,
             )
             yield from contract_results
 
@@ -2820,6 +2898,7 @@ def _run_filters_pipes(
     filters: list[str],
     group: _GroupBuild,
     selected_keys: set[dg.AssetKey],
+    declared_check_pairs: set[tuple[dg.AssetKey, str]],
 ) -> Iterator[object]:
     """Execute ``rocky run`` for each filter over the Dagster Pipes protocol.
 
@@ -2830,6 +2909,18 @@ def _run_filters_pipes(
     unselected tables are dropped at the reader layer — Rocky runs at
     source granularity even on partial subsets, so without the filter
     the run viewer would show events for tables the user didn't request.
+
+    ``declared_check_pairs`` is the multi-asset's declared
+    ``(asset_key, check_name)`` set — the SAME set the compliance path and
+    :func:`_emit_results` filter against. It is required, with no default,
+    because the wrong answer is silent: an empty default would read as
+    "nothing is declared" and drop every check, and a "pass everything
+    through" default is exactly the bug. Rocky emits check results the
+    component never declared (a `[checks]` edit with no state refresh, or a
+    non-default check with ``surface_configured_checks`` off); yielding one
+    made Dagster raise ``DagsterInvariantViolationError`` and FAIL THE STEP
+    (#1673). They are now filtered out here and carried as an
+    ``AssetObservation`` with a warning, the same as on the streaming path.
     """
     rocky_key_to_dagster_key = group.rocky_key_to_dagster_key
 
@@ -2875,7 +2966,32 @@ def _run_filters_pipes(
             asset_key_fn=asset_key_fn,
             include_keys=selected_keys,
         )
-        yield from invocation.get_results()
+        for result in invocation.get_results():
+            # Only ``AssetCheckResult`` is constrained by the declared specs.
+            # Pipes reports a check as a TOP-LEVEL result (see
+            # ``PipesMessageHandler._handle_report_asset_check``), never nested
+            # inside a ``MaterializeResult``, so there is no second place to
+            # look. A result with no ``asset_key``/``check_name`` cannot be
+            # paired against the declared set — Dagster resolves those itself
+            # when unambiguous — so it passes through unchanged.
+            if (
+                isinstance(result, dg.AssetCheckResult)
+                and result.asset_key is not None
+                and result.check_name is not None
+                and (result.asset_key, result.check_name) not in declared_check_pairs
+            ):
+                observation = _undeclared_check_observation(
+                    asset_key=result.asset_key,
+                    check_name=result.check_name,
+                    passed=result.passed,
+                    metadata=result.metadata,
+                    selected_keys=selected_keys,
+                    log=context.log,
+                )
+                if observation is not None:
+                    yield observation
+                continue
+            yield result
 
 
 def _emit_governance_events(
@@ -3194,6 +3310,74 @@ def _log_run_diagnostics(
         context.log.error(f"Table failed: {err.error}")
 
 
+#: Metadata key stamped on the :class:`dg.AssetObservation` that carries a
+#: check result Rocky produced but the component never declared as an
+#: ``AssetCheckSpec``. The verdict cannot be recorded as an asset check
+#: (Dagster rejects a result outside the declared specs — in Pipes mode it
+#: fails the whole step, #1673), so it is recorded as an observation on the
+#: same asset instead of vanishing.
+UNDECLARED_CHECK_METADATA_KEY: str = "rocky/undeclared_check"
+
+
+def _undeclared_check_observation(
+    *,
+    asset_key: dg.AssetKey,
+    check_name: str,
+    passed: bool,
+    metadata: Mapping[str, Any] | None,
+    selected_keys: AbstractSet[dg.AssetKey],
+    log: logging.Logger | dg.DagsterLogManager,
+) -> dg.AssetObservation | None:
+    """Warn about a check result with no declared spec, and carry its verdict.
+
+    Shared by BOTH execution paths so they agree on one behaviour: the
+    streaming path used to drop such a result silently, while the Pipes path
+    yielded it and Dagster raised ``DagsterInvariantViolationError``, failing
+    the step (#1673). Neither is right — a configuration edit must not become
+    a hard step failure, and a FAILED check must not reach nobody (#1669).
+
+    Returns an :class:`dg.AssetObservation` carrying the verdict when the
+    asset is part of this step, else ``None``. An observation is the right
+    primitive because it is unconstrained by the declared ``check_specs``: it
+    records the value on the asset's timeline without claiming to be a check
+    evaluation (it cannot gate, and no alert on the check key fires — declare
+    the spec for that). The warning is logged either way.
+    """
+    verdict = "passed" if passed else "FAILED"
+    log.warning(
+        f"Rocky reported check {check_name!r} on "
+        f"{asset_key.to_user_string()!r} ({verdict}), but the component "
+        f"declared no matching check spec. Recording it as an "
+        f"AssetObservation — Dagster rejects an AssetCheckResult outside the "
+        f"declared check_specs, which fails the whole step in pipes mode. "
+        f"Likely cause: the declared specs are stale — refresh the component "
+        f"state (`dg defs state refresh`) after editing `[checks]` in "
+        f"rocky.toml. A non-default check (custom / null_rate / assertion / "
+        f"cross_source_overlap) additionally needs "
+        f"`surface_configured_checks: true` on the component."
+    )
+    if asset_key not in selected_keys:
+        # An observation on an asset this step does not own would put an event
+        # on someone else's timeline. Dagster tolerates it; we still refuse —
+        # the warning above is the record.
+        return None
+    observation_metadata: dict[str, Any] = {
+        UNDECLARED_CHECK_METADATA_KEY: dg.MetadataValue.bool(True),
+        "rocky/check_name": dg.MetadataValue.text(check_name),
+        "rocky/check_passed": dg.MetadataValue.bool(passed),
+        "status": dg.MetadataValue.text(
+            f"undeclared check {check_name!r}: {verdict} — no AssetCheckSpec "
+            f"was declared for it, so the verdict is recorded here instead"
+        ),
+    }
+    observation_metadata.update(metadata or {})
+    return dg.AssetObservation(
+        asset_key=asset_key,
+        description=f"Rocky check {check_name!r} ({verdict}) — not declared as an asset check",
+        metadata=observation_metadata,
+    )
+
+
 def _emit_results(
     *,
     results: list[RunResult],
@@ -3204,6 +3388,7 @@ def _emit_results(
     collapsed_key_by_table: dict[str, dg.AssetKey] | None = None,
     satisfy_empty_outputs: bool = False,
     instance: dg.DagsterInstance | None = None,
+    log: logging.Logger | dg.DagsterLogManager | None = None,
 ) -> Iterator[dg.MaterializeResult | dg.AssetCheckResult | dg.AssetObservation]:
     """Yield Dagster events for every materialization, check, drift event and anomaly.
 
@@ -3214,8 +3399,15 @@ def _emit_results(
        request. Yielding those would crash with
        ``DagsterInvariantViolationError``.
     2. **Declared-check filter**: Rocky may emit additional check kinds that
-       were not pre-declared (e.g. ``null_rate``). Dagster rejects checks
-       outside the declared ``check_specs``, so we drop them too.
+       were not pre-declared (e.g. ``null_rate`` when
+       ``surface_configured_checks`` is off, or any check added to
+       ``rocky.toml`` since the component state was refreshed). Dagster
+       rejects checks outside the declared ``check_specs``, so they are not
+       yielded as checks — but they are no longer dropped silently either:
+       each one logs a warning and is carried as an
+       :class:`dg.AssetObservation` (#1669, #1673). The Pipes path applies the
+       SAME filter through the same helper, where it previously failed the
+       step instead.
     3. **Subset filter on drift/anomaly**: drift and anomaly events are also
        restricted to ``selected_keys`` so partial-subset runs don't emit
        events for tables the caller did not request.
@@ -3346,6 +3538,16 @@ def _emit_results(
             check_name = sanitize_check_name(check.name)
             spec_key = (asset_key, check_name)
             if spec_key not in declared_checks:
+                observation = _undeclared_check_observation(
+                    asset_key=asset_key,
+                    check_name=check_name,
+                    passed=check.passed,
+                    metadata=check_metadata(check),
+                    selected_keys=selected_keys,
+                    log=log or _log,
+                )
+                if observation is not None:
+                    yield observation
                 continue
             if spec_key in yielded_checks:
                 _log.debug(
@@ -3503,6 +3705,7 @@ def _emit_results(
         pruned_keys=pruned_keys,
         contained_by_key=contained_by_key,
         instance=instance,
+        log=log or _log,
     )
 
 
@@ -3664,6 +3867,7 @@ def _emit_placeholder_checks(
     pruned_keys: AbstractSet[dg.AssetKey] = frozenset(),
     contained_by_key: Mapping[dg.AssetKey, ContainedModel] = MappingProxyType({}),
     instance: dg.DagsterInstance | None = None,
+    log: logging.Logger | dg.DagsterLogManager | None = None,
 ) -> Iterator[dg.AssetCheckResult]:
     """Emit placeholders for declared checks Rocky did not produce.
 
@@ -3682,6 +3886,37 @@ def _emit_placeholder_checks(
     ``rocky/pruned_unchanged=True`` so the UI can tell them from real
     evaluations.
 
+    A GROUP check (a spec carrying :data:`GROUP_CHECK_METADATA_KEY` — today
+    only ``cross_source_overlap``) is evaluated once for a whole sibling
+    group, and the engine reports the verdict on ONE member: the first
+    sibling it copied in that run (``run.rs`` attaches it to
+    ``siblings[0]``). Which member that is depends on run order and on the
+    subset, so it cannot be predicted when the specs are built — and the
+    group does not run at all when fewer than two siblings are copied.
+
+    Every other member gets **no result at all**, plus one INFO line naming
+    the sibling that carried the verdict. Not a passing placeholder (that is
+    the green verdict for a check that never ran, #1645/#1669), and not a
+    failing one either: a three-sibling group would then show two warning
+    failures on every run, for ever — the same "placeholder that reflects no
+    evaluation" the original exclusion existed to avoid, only amber instead
+    of green.
+
+    Yielding nothing is Dagster's own way to say "planned, did not run".
+    Dagster writes an ``ASSET_CHECK_EVALUATION_PLANNED`` record for every
+    declared check in the step; a check with no evaluation keeps status
+    ``PLANNED``, and ``AssetCheckExecutionRecord.resolve_status`` maps
+    ``PLANNED`` on a finished, non-failed run to
+    ``AssetCheckExecutionResolvedStatus.SKIPPED`` — "the run finished, didn't
+    fail, but the check didn't execute". So the run records a SKIP for this
+    check, and the last real verdict stays attached to the earlier run id it
+    came from. Verified by probe on Dagster 1.13.17, not assumed.
+
+    This branch runs BEFORE the pruned / contained branches: those explain
+    why the ASSET was skipped, which is not why this CHECK has no verdict,
+    and the pruned branch would otherwise carry a prior verdict forward as
+    though it were this run's.
+
     A check on a model in ``contained_by_key`` was withheld by failure
     containment (its upstream failed). It is unmaterialized, so it would
     otherwise get the generic "table not materialized" WARN placeholder — which
@@ -3691,10 +3926,37 @@ def _emit_placeholder_checks(
     / WARN — the model was not built and the check did not run; the hard error
     lives on the root-cause asset in ``errors``.
     """
+    # Which asset carried each check's verdict this run — the sibling the
+    # engine reported a group check on. Built once, not scanned per spec.
+    carriers_by_check_name: dict[str, list[dg.AssetKey]] = defaultdict(list)
+    for yielded_key, yielded_name in yielded_checks:
+        carriers_by_check_name[yielded_name].append(yielded_key)
+
     for cs in check_specs:
         if cs.asset_key not in selected_keys:
             continue
         if (cs.asset_key, cs.name) in yielded_checks:
+            continue
+
+        if cs.metadata.get(GROUP_CHECK_METADATA_KEY):
+            carriers = sorted(
+                key.to_user_string()
+                for key in carriers_by_check_name.get(cs.name, ())
+                if key != cs.asset_key
+            )
+            where = (
+                f"this run evaluated it on {', '.join(carriers)}"
+                if carriers
+                else "it was not evaluated in this run"
+            )
+            (log or _log).info(
+                f"Group check {cs.name!r} has no verdict for "
+                f"{cs.asset_key.to_user_string()!r}: {where}. Rocky evaluates "
+                f"a cross-source overlap once for the whole sibling group and "
+                f"reports it on the sibling it copied first; it does not run "
+                f"at all when fewer than two siblings are copied. Dagster "
+                f"records the check as skipped for this run."
+            )
             continue
 
         contained = contained_by_key.get(cs.asset_key)

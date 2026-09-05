@@ -49,7 +49,7 @@ import dagster as dg
 _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Collection, Iterator
 
     from .types import Diagnostic
 
@@ -264,6 +264,15 @@ def contract_check_specs_for_model(
         )
 
 
+#: Metadata key stamped on an :class:`dg.AssetCheckSpec` whose check the engine
+#: evaluates once for a GROUP of assets rather than per asset — today only
+#: ``cross_source_overlap``. The engine reports the verdict on ONE member of
+#: the sibling group (the first sibling it copied in that run), so the other
+#: members must not report a passing placeholder for a check that never ran on
+#: them. ``_emit_placeholder_checks`` reads this marker and emits an explicit
+#: "not evaluated on this asset" result instead (#1669).
+GROUP_CHECK_METADATA_KEY = "rocky/group_check"
+
 _INVALID_CHECK_NAME_CHARS = re.compile(r"[^A-Za-z0-9_]")
 
 
@@ -298,6 +307,7 @@ def configured_check_specs_for_model(
     check_names: list[str],
     *,
     partitions_def: dg.PartitionsDefinition | None = None,
+    group_check_names: Collection[str] = (),
 ) -> Iterator[dg.AssetCheckSpec]:
     """Yield one ``AssetCheckSpec`` per engine-resolved configured check name.
 
@@ -321,15 +331,31 @@ def configured_check_specs_for_model(
             the raw history is per-partition. ``None`` (unpartitioned) is
             byte-identical to prior behaviour. Mirrors
             :func:`contract_check_specs_for_model`.
+        group_check_names: The subset of ``check_names`` the engine evaluates
+            once per sibling GROUP instead of once per asset — the
+            ``candidate`` names in ``discover.checks.configured_checks``,
+            today only ``cross_source_overlap``. Their specs are stamped with
+            :data:`GROUP_CHECK_METADATA_KEY` so the emit side can tell a
+            "not evaluated on this asset" outcome apart from a real one.
+            Compared against the VERBATIM engine name, before sanitizing.
 
     Yields:
         ``dg.AssetCheckSpec`` instances — one per name, in order.
     """
     for name in check_names:
+        is_group_check = name in group_check_names
         yield dg.AssetCheckSpec(
             name=sanitize_check_name(name),
             asset=asset_key,
             partitions_def=partitions_def,
+            description=(
+                "Group check: Rocky evaluates it once for the whole sibling "
+                "group and reports the verdict on the sibling it copied first "
+                "in that run."
+                if is_group_check
+                else None
+            ),
+            metadata={GROUP_CHECK_METADATA_KEY: True} if is_group_check else None,
         )
 
 
