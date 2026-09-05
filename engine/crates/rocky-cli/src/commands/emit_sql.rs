@@ -20,8 +20,9 @@
 //! files carry a leading note to that effect.
 //!
 //! The dialect is the project's configured target adapter type (resolved from
-//! `rocky.toml` without credentials); with no resolvable config it defaults to
-//! DuckDB. All models render in this one resolved dialect, so for a project
+//! `rocky.toml` without credentials); with no project file at all it defaults
+//! to DuckDB. A `rocky.toml` that exists but does not load is an error, not a
+//! fallback. All models render in this one resolved dialect, so for a project
 //! whose models target more than one adapter, the emitted SQL matches
 //! `rocky run` only for the models whose target uses that dialect. Output is
 //! one `<model>.sql` file per model when `--out-dir` is given,
@@ -103,7 +104,17 @@ fn emit_models(
 ) -> Result<EmitResult> {
     use rocky_compiler::compile::{self, CompilerConfig};
 
-    let project_config = rocky_core::config::load_optional_project_config(config_path)?;
+    // Same rule and same wording as `rocky compile`: only a missing
+    // `rocky.toml` is tolerated, and the refusal names the file.
+    let project_config = rocky_core::config::load_optional_project_config(config_path)
+        .with_context(|| {
+            format!(
+                "failed to load config from {}",
+                config_path
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            )
+        })?;
     let dialect = resolve_dialect(project_config.as_ref());
 
     let config = CompilerConfig {
@@ -472,6 +483,158 @@ mod tests {
         assert_eq!(
             emitted[0].sql,
             "CREATE OR REPLACE TABLE main.m AS\nSELECT 1 AS id;"
+        );
+    }
+
+    /// SIXTEENTH ROUND, finding 1 — `emit-sql` shares
+    /// [`super::plan::preview_dialect`] with `plan_preview`, so it inherited
+    /// the refusal. Pinned HERE as well as on the plan side, because sharing a
+    /// helper is only half the guarantee: a future caller could re-inline a
+    /// tolerant copy and the plan-side test would stay green.
+    ///
+    /// Both arms in one test, because the tolerated case is the load-bearing
+    /// half — `--config` defaults to `rocky.toml`, so the standalone
+    /// `--models <dir>` invocation reaches this with a path that does not
+    /// exist, and it must still emit.
+    #[test]
+    fn emit_refuses_a_malformed_config_but_tolerates_an_absent_one() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model(dir.path(), "m", "SELECT 1 AS id", "");
+        let vars = rocky_core::run_vars::RunVars::new();
+
+        // ABSENT — the standalone case. Emits in the default dialect.
+        let absent = dir.path().join("rocky.toml");
+        assert!(!absent.exists());
+        let emitted = emit_models(Some(&absent), dir.path(), None, &vars)
+            .expect("an ABSENT config is the standalone case, not a malformed one")
+            .models;
+        assert_eq!(emitted.len(), 1, "the absent-config arm must still emit");
+
+        // MALFORMED — unterminated table header, so TOML parsing fails.
+        std::fs::write(&absent, "[adapter.default\ntype = \"snowflake\"\n").unwrap();
+        // `EmitResult` is not `Debug`, so match rather than `expect_err`.
+        let Err(err) = emit_models(Some(&absent), dir.path(), None, &vars) else {
+            panic!("a malformed rocky.toml must refuse, not emit DuckDB SQL");
+        };
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failed to load config"),
+            "the refusal must name the config as the cause: {rendered}"
+        );
+    }
+
+    /// SEVENTEENTH ROUND, finding 1 — `emit-sql`'s own pin.
+    ///
+    /// The published contract for this command is "without a warehouse
+    /// connection" and "resolved from `rocky.toml` without credentials"
+    /// (`docs/.../reference/commands/modeling.md`). Round sixteen's shared
+    /// `preview_dialect` briefly expanded env vars, so an initialized
+    /// Databricks project with `${DATABRICKS_HOST}` unset exited 1 here.
+    ///
+    /// Pinned on this side as well as the plan side for the reason the
+    /// neighbouring test gives: sharing a helper is only half the guarantee.
+    #[test]
+    fn emit_tolerates_an_unset_credential_placeholder() {
+        assert!(
+            std::env::var("ROCKY_DEFINITELY_NOT_SET_EMIT_HOST").is_err(),
+            "premise: the variable is unset"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        // Written by hand rather than via `write_model`: that helper pins
+        // `catalog = ""`, and the Databricks dialect refuses a two-part
+        // reference, so the model would be SKIPPED and the test would pass
+        // on an empty result set for the wrong reason.
+        std::fs::write(dir.path().join("m.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            dir.path().join("m.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"main\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+        let cfg = dir.path().join("rocky.toml");
+        std::fs::write(
+            &cfg,
+            "[adapter.default]\ntype = \"databricks\"\n\
+             host = \"${ROCKY_DEFINITELY_NOT_SET_EMIT_HOST}\"\n\
+             http_path = \"/sql/1.0/warehouses/abc\"\ntoken = \"pat\"\n",
+        )
+        .unwrap();
+
+        let emitted = emit_models(
+            Some(&cfg),
+            dir.path(),
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .expect("emit-sql opens no connection, so an unset credential must not stop it")
+        .models;
+        assert_eq!(emitted.len(), 1, "the model must still render");
+        assert!(
+            emitted[0].sql.contains("CREATE OR REPLACE TABLE"),
+            "unexpected SQL: {}",
+            emitted[0].sql
+        );
+        // This arm does NOT prove the dialect: a trivial CTAS renders
+        // identically in Databricks and DuckDB, so asserting on this SQL
+        // could not tell a correct resolution from a silent fallback. The
+        // two-sided dialect claim is pinned where it is observable, on the
+        // shared resolver — `plan::tests::
+        // plan_preview_tolerates_an_unset_credential_placeholder` asserts
+        // `preview_dialect(...).name() == "snowflake"`.
+    }
+
+    /// SEVENTEENTH ROUND, finding 2 — the parity pin, placed HERE because
+    /// this is the one test module that can reach both renderers.
+    ///
+    /// `plan_preview_output` used to skip `apply_surrogate_keys` while this
+    /// command and `rocky run` both applied it. A reviewer reading the
+    /// preview — over MCP, an agent about to approve a model — saw SQL
+    /// missing a column the run would materialize.
+    ///
+    /// Asserted as EQUALITY, not as "the preview also mentions the column".
+    /// A containment check would go green again the moment the two renderers
+    /// diverged in some other way, which is the failure this pin is for. The
+    /// only normalization is the statement terminator: `emit-sql` joins a
+    /// model's statements into a runnable script and terminates each with
+    /// `;`, while the preview returns them unterminated.
+    #[test]
+    fn plan_preview_and_emit_sql_render_the_same_keyed_sql() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model(
+            dir.path(),
+            "keyed",
+            "SELECT order_id FROM upstream",
+            "\n[[surrogate_key]]\nname = \"order_key\"\ncolumns = [\"order_id\"]\n",
+        );
+
+        let emitted = emit_models(
+            None,
+            dir.path(),
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap()
+        .models;
+        assert_eq!(emitted.len(), 1);
+
+        let preview = crate::commands::plan_preview_output(None, dir.path(), None, None).unwrap();
+        assert_eq!(
+            preview.statements.len(),
+            1,
+            "the preview must render the same one model"
+        );
+
+        assert_eq!(
+            format!("{};", preview.statements[0].sql.trim_end_matches(';')),
+            emitted[0].sql,
+            "the offline preview and `emit-sql` must render the same SQL"
+        );
+        // Named explicitly so a future reader sees WHICH column the equality
+        // is protecting; equality alone would pass if both dropped it.
+        assert!(
+            preview.statements[0].sql.contains("AS order_key"),
+            "the preview must carry the declared surrogate key:\n{}",
+            preview.statements[0].sql
         );
     }
 

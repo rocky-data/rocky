@@ -42,7 +42,7 @@ mod tools;
 use rmcp::{ServiceExt, transport::stdio};
 
 pub use error::{ToolError, ToolErrorCode, ToolResult};
-pub use tools::{McpProfile, RockyMcpServer};
+pub use tools::{McpProfile, RockyMcpServer, excluded_mention_forms, names_excluded_tool};
 
 /// Serve the Rocky MCP server over stdio until the client disconnects.
 ///
@@ -53,11 +53,29 @@ pub use tools::{McpProfile, RockyMcpServer};
 /// [`McpProfile::Approver`] the same tools with that action served, and
 /// [`McpProfile::Worker`] the minimal drafting allowlist.
 /// Logging goes to stderr (stdout is reserved for the MCP wire protocol).
+///
+/// # Errors
+///
+/// Refuses to start if the worker profile's guidance projection no longer
+/// matches its source — a needle that stopped matching, or an entry naming
+/// a route this profile no longer serves. That check is not a build
+/// invariant: the projection's operands are compile-time constants, but the
+/// match is verified here, at construction, so an edit to the
+/// `rocky-ai-workflow` skill compiles and then fails at startup. Refusing is
+/// deliberate. A server that starts with a half-applied projection serves a
+/// worker the DEFAULT workflow text, which is the hole the projection
+/// exists to close, and it does so quietly.
 pub async fn serve_stdio(
     config_path: std::path::PathBuf,
     profile: McpProfile,
 ) -> anyhow::Result<()> {
-    let server = RockyMcpServer::new_with_profile(config_path, profile);
+    let server = RockyMcpServer::try_new_with_profile(config_path, profile).map_err(|drift| {
+        anyhow::anyhow!(
+            "refusing to serve the {profile:?} profile: its guidance projection no longer \
+             matches its source ({drift}). Re-project it deliberately — serving the \
+             unprojected text would hand a worker the default workflow."
+        )
+    })?;
     tracing::info!(?profile, "starting rocky MCP server over stdio");
     let service = server.serve(stdio()).await.inspect_err(|e| {
         tracing::error!("rocky MCP serve error: {e:?}");

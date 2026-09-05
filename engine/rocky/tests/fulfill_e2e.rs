@@ -64,6 +64,21 @@ const DRAFT_SQL: &str =
 /// round (#1493).
 const BAD_DRAFT_SQL: &str = "SELECT 1::BIGINT AS client_id, now() AS loaded_at";
 
+/// A draft that COMPILES, satisfies the contract, and applies cleanly —
+/// and is wrong. The spec declares `checks = ["revenue_eur >= 0"]`,
+/// which lowers into the model sidecar as an expression test at
+/// `severity = "error"`, and a sidecar test can only run against a
+/// materialised table. So nothing before the apply can catch this: the
+/// compiler sees a well-typed Float64, the runner's own model test
+/// executes fine, and the number is negative.
+///
+/// It is also the mistake the fixture's own elicitation asks about
+/// ("Should refunds subtract from revenue_eur?"), which is the point:
+/// this is the failure class a data product exists to prevent, and the
+/// one the loop could not see before F3.
+const NEGATIVE_DRAFT_SQL: &str =
+    "SELECT 1::BIGINT AS client_id, now() AS loaded_at, -3.5::DOUBLE AS revenue_eur";
+
 fn rocky_toml() -> String {
     r#"[adapter]
 type = "duckdb"
@@ -140,6 +155,17 @@ fn session_json_with_tasks(
     drafting_calls: &[serde_json::Value],
     repair_calls: &[serde_json::Value],
 ) -> String {
+    // Drills that never reach a data-red reuse the repair round's calls
+    // for the data-repair task: the task must EXIST (a missing one is a
+    // replay error), but nothing dispatches it.
+    session_json_with_rounds(drafting_calls, repair_calls, repair_calls)
+}
+
+fn session_json_with_rounds(
+    drafting_calls: &[serde_json::Value],
+    repair_calls: &[serde_json::Value],
+    data_repair_calls: &[serde_json::Value],
+) -> String {
     let digest = rocky_core::product::spec::spec_digest(CANDIDATE_SPEC.as_bytes());
     serde_json::json!({
         "mcp_command": [env!("CARGO_BIN_EXE_rocky"), "mcp", "--profile", "worker"],
@@ -153,10 +179,22 @@ fn session_json_with_tasks(
                 }
             },
             "drafting": { "calls": drafting_calls },
-            "repair": { "calls": repair_calls }
+            "repair": { "calls": repair_calls },
+            "data-repair": { "calls": data_repair_calls }
         }
     })
     .to_string()
+}
+
+/// A session whose first draft applies CLEANLY but violates a check the
+/// product declared about its own output, and whose data-repair round
+/// authors `data_repair_sql`.
+fn session_json_with_data_repair(data_repair_sql: &str) -> String {
+    session_json_with_rounds(
+        &[draft_model_call(NEGATIVE_DRAFT_SQL)],
+        &[draft_model_call(NEGATIVE_DRAFT_SQL)],
+        &[draft_model_call(data_repair_sql)],
+    )
 }
 
 /// A COLD scratch project: config + models/_defaults.toml + the session.
@@ -198,6 +236,21 @@ fn rocky_env(
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     let json = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok();
     (out.status.code().unwrap_or(-1), json, stdout, stderr)
+}
+
+/// Create the target the recorded `DRAFT_SQL` would have produced.
+///
+/// For drills that seed a receipt instead of running an apply. The
+/// declared checks (grain uniqueness on `client_id`, `revenue_eur >= 0`)
+/// pass against this row, so observation reaches a real verdict rather
+/// than erroring on a missing table.
+fn materialize_target(dir: &Path) {
+    let conn = duckdb::Connection::open(dir.join("wh.duckdb")).expect("duckdb");
+    conn.execute_batch(&format!(
+        "CREATE SCHEMA IF NOT EXISTS out; \
+         CREATE OR REPLACE TABLE out.{PRODUCT} AS {DRAFT_SQL};"
+    ))
+    .expect("materialize the target");
 }
 
 fn state_store(dir: &Path) -> rocky_core::state::StateStore {
@@ -260,8 +313,8 @@ fn drive_to_plan_review(dir: &Path) -> String {
 
     // 3. The loop lowers, drafts, merges, verifies, proposes, then asks
     //    for plan review.
-    let (code, json, _out, err) = rocky(dir, &["fulfill", PRODUCT]);
-    assert_eq!(code, 0, "drive to proposed: {err}");
+    let (code, json, out, err) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "drive to proposed: {err}{out}");
     let json = json.expect("fulfill json");
     assert_eq!(json["state"], "needs_input", "{json}");
     let plan_id = json["plan_id"].as_str().expect("plan pinned").to_string();
@@ -345,8 +398,15 @@ fn happy_path_cold_init_to_observing() {
             ],
             "the D6 order, exactly"
         );
-        let applied_rows = rows.iter().filter(|r| r.to_state == "applied").count();
-        assert_eq!(applied_rows, 1, "exactly one applied journal row");
+        // Counted by EVENT, not by `to_state`: the observation journals
+        // its staleness/test reading before claiming any state, so more
+        // than one row legitimately carries `to_state == "applied"`.
+        // What must be exactly one is the APPLY.
+        let applied_rows = rows
+            .iter()
+            .filter(|r| r.event.starts_with("applied ("))
+            .count();
+        assert_eq!(applied_rows, 1, "exactly one apply journal row");
 
         // #1495: the verify bundle's green verdict must say what green
         // did NOT cover. The product's declared data checks lower into
@@ -390,7 +450,9 @@ fn happy_path_cold_init_to_observing() {
     let store = state_store(dir);
     let rows = store.fulfill_journal_rows(PRODUCT).expect("journal");
     assert_eq!(
-        rows.iter().filter(|r| r.to_state == "applied").count(),
+        rows.iter()
+            .filter(|r| r.event.starts_with("applied ("))
+            .count(),
         1,
         "the rerun applied nothing new"
     );
@@ -1145,7 +1207,9 @@ fn fault_at_digest_recompute_to_apply_resumes_through_applying_unknown() {
         "the resume went through applying_unknown: {tags:?}"
     );
     assert_eq!(
-        rows.iter().filter(|r| r.to_state == "applied").count(),
+        rows.iter()
+            .filter(|r| r.event.starts_with("applied ("))
+            .count(),
         1,
         "exactly one applied row"
     );
@@ -1223,9 +1287,16 @@ fn applying_unknown_receipt_arms_park_on_in_flight_and_resolve_on_success() {
     let (code, json, _o, _e) = rocky(dir, &["fulfill", PRODUCT]);
     assert_eq!(code, 0);
     let json = json.expect("json");
-    // Applied via the receipt; observation runs (and may find the target
-    // missing — that is a finding to journal, not a failure).
-    assert_eq!(json["state"], "observing", "{json}");
+    // Applied via the receipt — and observation HOLDS, because this
+    // drill seeds a receipt instead of running an apply, so the target
+    // was never written and not one declared check can be evaluated.
+    //
+    // It used to assert `observing` here, over a read of nothing. That
+    // is the silent-zero this work package exists to remove, so the
+    // drill now asserts the honest terminal instead. The table-absence
+    // proof below is why it cannot simply materialize first: that proof
+    // IS the drill.
+    assert_eq!(json["state"], "applied", "{json}");
     let store = state_store(dir);
     let rows = store.fulfill_journal_rows(PRODUCT).expect("journal");
     let receipt_row = rows
@@ -1243,6 +1314,23 @@ fn applying_unknown_receipt_arms_park_on_in_flight_and_resolve_on_success() {
         )
         .expect("query");
     assert_eq!(table_exists, 0, "nothing executed: the receipt resolved it");
+
+    // With the target in place — what a real apply would have left — the
+    // same resume reaches `observing` on a genuine verdict. Both halves
+    // hold: nothing re-executed, AND health is claimed only once the
+    // declared checks could actually run.
+    //
+    // The store is dropped first: an open handle locks out the next
+    // binary invocation (the convention this file follows throughout).
+    drop(store);
+    materialize_target(dir);
+    let (code, json, _o, _e) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        json.expect("json")["state"],
+        "observing",
+        "the checks pass against the materialized target"
+    );
 }
 
 /// F3: the REAL `skipped_in_flight` arm — the loop reaches an ACTUAL
@@ -1447,6 +1535,12 @@ fn worker_profile_excluded_tools_are_not_found() {
         "propose",
         "review_queue",
         "draft_contract",
+        // FF-WP-F3: a check's `expression` is raw-interpolated into SQL the
+        // loop now EXECUTES unattended after every apply, so the worker
+        // profile must not SERVE one. The probe proves the route is gone;
+        // it does not prove the worker cannot author a check — a file
+        // writer still can, and that boundary is #1491 / #1515.
+        "draft_check",
         "draft_metadata",
         "pause_schedule",
     ]
@@ -1463,4 +1557,985 @@ fn worker_profile_excluded_tools_are_not_found() {
 
     let plan_id = drive_to_plan_review(dir);
     assert!(!plan_id.is_empty(), "the gate held and the flow completed");
+}
+
+// =========================================================================
+// FF-WP-F3 — the declared data checks, read against the APPLIED output
+// =========================================================================
+
+/// Drive one lap: confirm the red, spend a data-repair round, and return
+/// the NEW plan id parked at the human gate.
+fn confirm_red_and_repair(dir: &Path) -> String {
+    let (code, json, _o, err) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "data-repair round: {err}");
+    let json = json.expect("fulfill json");
+    assert_eq!(
+        json["state"], "needs_input",
+        "a repair must park at the human gate, never apply itself: {json}"
+    );
+    json["plan_id"]
+        .as_str()
+        .expect("the repair produced a plan")
+        .to_string()
+}
+
+/// THE F3 acceptance path. A model that applies cleanly but violates a
+/// check the product declared about its own output is observed red,
+/// routes into a repair round, converges, and lands a NEW proposal that
+/// a FRESH human approval must accept before it applies.
+///
+/// The load-bearing negative is the plan id. A review marker is a file
+/// named for the plan, and the plan id is a hash of the plan payload —
+/// so a repair that recomputed the id of the plan the human already
+/// approved would find that approval still on disk and re-apply with no
+/// review at all. The loop's idempotency key rides inside the hashed
+/// payload and advances with the journal, which is what makes that
+/// impossible; this asserts the property, not the mechanism.
+#[test]
+fn a_data_red_after_apply_routes_to_repair_behind_a_new_human_gate() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_project(dir, &session_json_with_data_repair(DRAFT_SQL));
+
+    let first_plan = drive_to_plan_review(dir);
+    let (code, _j, _o, err) = rocky(dir, &["review", &first_plan, "--approve"]);
+    assert_eq!(code, 0, "review approve: {err}");
+
+    // The apply succeeds — and the output is wrong.
+    let (code, json, _o, err) = rocky(dir, &["fulfill", PRODUCT]);
+    let json = json.expect("fulfill json");
+    assert_eq!(
+        code, 4,
+        "a data-red is its own exit code, never a clean stop: {err}"
+    );
+    assert_eq!(
+        json["state"], "observed_failing",
+        "applied, and failing its own declared checks: {json}"
+    );
+    assert_ne!(
+        json["state"], "observing",
+        "a failing product must never be recorded as a healthy one"
+    );
+    let message = json["message"].as_str().expect("message");
+    assert!(
+        message.contains("failing its own declared data checks"),
+        "{message}"
+    );
+    assert!(
+        message.contains("violating row"),
+        "the stop reports what the check MEASURED, not just that one failed: {message}"
+    );
+    assert!(
+        message.contains("expression"),
+        "and which check it was: {message}"
+    );
+
+    // The apply really did happen: the wrong number is live.
+    {
+        let conn = duckdb::Connection::open(dir.join("wh.duckdb")).expect("duckdb");
+        let revenue: f64 = conn
+            .query_row("SELECT revenue_eur FROM out.revenue_daily", [], |r| {
+                r.get(0)
+            })
+            .expect("target table");
+        assert!(revenue < 0.0, "the bad data is applied, not prevented");
+    }
+
+    // A second, independent reading confirms it and spends one round.
+    let repaired_plan = confirm_red_and_repair(dir);
+    assert_ne!(
+        repaired_plan, first_plan,
+        "a repair that reused the applied plan's id would inherit its approval marker"
+    );
+
+    // The earlier approval buys the new plan nothing.
+    let (code, _j, _o, _e) = rocky(dir, &["apply", &repaired_plan]);
+    assert_ne!(
+        code, 0,
+        "a bare apply of the repaired plan must refuse — a data-red grants the loop \
+         no authority it lacked"
+    );
+
+    // A FRESH approval, and only then does it apply.
+    let (code, _j, _o, err) = rocky(dir, &["review", &repaired_plan, "--approve"]);
+    assert_eq!(code, 0, "fresh review: {err}");
+    let (code, json, _o, err) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "repaired apply: {err}");
+    assert_eq!(
+        json.expect("json")["state"],
+        "observing",
+        "the repaired output passes its own checks"
+    );
+    {
+        let conn = duckdb::Connection::open(dir.join("wh.duckdb")).expect("duckdb");
+        let revenue: f64 = conn
+            .query_row("SELECT revenue_eur FROM out.revenue_daily", [], |r| {
+                r.get(0)
+            })
+            .expect("target table");
+        assert!(revenue >= 0.0, "the repaired output is correct: {revenue}");
+    }
+
+    // The journal shows the whole path, in order.
+    let store = state_store(dir);
+    let rows = store.fulfill_journal_rows(PRODUCT).expect("journal");
+    let walk = deduped_states(&rows);
+    let tail: Vec<&str> = walk
+        .iter()
+        .skip_while(|s| **s != "observed_failing")
+        .copied()
+        .collect();
+    assert_eq!(
+        tail,
+        vec![
+            "observed_failing",
+            "drafting",
+            "merged",
+            "verifying",
+            "proposed",
+            "needs_input",
+            "plan_approved",
+            "applying",
+            "applied",
+            "observing",
+        ],
+        "the red re-enters at drafting and leaves through the SAME gates as any \
+         other change; walk was {walk:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.event.contains("data repair round 1")),
+        "the round is journaled as a data repair"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.event.contains("declared data checks FAILING")
+                && r.event.contains("violating row")),
+        "and the red verdict carries its evidence into the journal"
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.event.starts_with("applied ("))
+            .count(),
+        2,
+        "exactly two applies: the original and the repaired one"
+    );
+    drop(store);
+
+    // The worker was dispatched on the DATA-repair brief, not the
+    // verify-repair one — pinned by transcript kind, because a
+    // data-repair dispatched as a plain repair would hand the worker a
+    // brief about a compiler error it cannot act on.
+    // Transcripts are named `<stamp>-<kind>.log`. Matched by SUFFIX with
+    // `data-repair` tried first: splitting on the last dash cannot tell a
+    // data-repair from a plain repair, and telling them apart is the
+    // whole point — a data-red dispatched as a verify-repair would hand
+    // the worker a brief about a compiler error it cannot act on.
+    let kind_of = |name: &str| -> &'static str {
+        let stem = name.trim_end_matches(".log");
+        for kind in ["data-repair", "elicitation", "drafting", "repair"] {
+            if stem.ends_with(&format!("-{kind}")) {
+                return kind;
+            }
+        }
+        "unrecognised"
+    };
+    let mut kinds: Vec<&'static str> = std::fs::read_dir(
+        dir.join(".rocky/fulfillment")
+            .join(PRODUCT)
+            .join("transcripts"),
+    )
+    .expect("transcripts")
+    .map(|e| kind_of(&e.expect("entry").file_name().to_string_lossy()))
+    .collect();
+    kinds.sort_unstable();
+    assert_eq!(
+        kinds,
+        vec!["data-repair", "drafting", "elicitation"],
+        "the round ran on the DATA-repair brief; no verify-repair round was dispatched"
+    );
+}
+
+/// The budget binds. A data-repair that keeps producing a failing output
+/// exhausts the ceiling and lands `blocked`, naming the check — there is
+/// no unbounded repair cycle against a live table.
+///
+/// This is also the test that would fail if the data budget were folded
+/// into `repair_rounds`: that counter is reset on every successful
+/// propose, and this loop proposes on every lap, so a shared counter
+/// would be zeroed each time round and never reach any ceiling.
+///
+/// Note what bounds this in the meantime: every lap still crosses a
+/// human review, so the loop was never re-applying unattended. The
+/// ceiling is what makes the bound TESTABLE, and what stops a product
+/// from cycling a reviewer forever on a defect the worker cannot fix.
+#[test]
+fn repeated_data_reds_exhaust_the_ceiling_and_block_naming_the_check() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    // The data-repair round never fixes anything.
+    write_project(dir, &session_json_with_data_repair(NEGATIVE_DRAFT_SQL));
+    let ceiling = rocky_fulfill::machine::MAX_REPAIR_ROUNDS;
+
+    let mut plan = drive_to_plan_review(dir);
+    for round in 0..ceiling {
+        let (code, _j, _o, err) = rocky(dir, &["review", &plan, "--approve"]);
+        assert_eq!(code, 0, "review approve (round {round}): {err}");
+        let (code, json, _o, err) = rocky(dir, &["fulfill", PRODUCT]);
+        let json = json.expect("fulfill json");
+        assert_eq!(code, 4, "round {round} must observe red: {err} {json}");
+        assert_eq!(json["state"], "observed_failing", "round {round}: {json}");
+        plan = confirm_red_and_repair(dir);
+    }
+
+    // The ceiling is spent. The next red does not even record a
+    // repairable state: it blocks, and a human is the escalation.
+    let (code, _j, _o, err) = rocky(dir, &["review", &plan, "--approve"]);
+    assert_eq!(code, 0, "final review approve: {err}");
+    let (code, json, _o, _e) = rocky(dir, &["fulfill", PRODUCT]);
+    let json = json.expect("fulfill json");
+    assert_eq!(code, 2, "an exhausted budget is `blocked`: {json}");
+    assert_eq!(json["state"], "blocked", "{json}");
+    let message = json["message"].as_str().expect("message");
+    assert!(
+        message.contains("still fails its declared data checks"),
+        "{message}"
+    );
+    assert!(
+        message.contains("violating row"),
+        "the block NAMES the check that would not go green: {message}"
+    );
+    assert!(
+        message.contains(&ceiling.to_string()),
+        "and how many rounds it spent: {message}"
+    );
+    assert!(
+        json["next_command"]
+            .as_str()
+            .expect("next_command")
+            .contains("--retry"),
+        "a human is the escalation, not another round: {json}"
+    );
+
+    // And the ceiling really was reached by DATA repairs, not by the
+    // verify budget standing in for them.
+    let store = state_store(dir);
+    let rows = store.fulfill_journal_rows(PRODUCT).expect("journal");
+    let repairs = rows
+        .iter()
+        .filter(|r| r.event.starts_with("data repair round "))
+        .count();
+    assert_eq!(
+        repairs, ceiling as usize,
+        "exactly {ceiling} data-repair rounds ran before the block"
+    );
+    let applies = rows
+        .iter()
+        .filter(|r| r.event.starts_with("applied ("))
+        .count();
+    assert_eq!(
+        applies,
+        ceiling as usize + 1,
+        "and the live table was written a BOUNDED number of times"
+    );
+}
+
+/// Resume honesty at all three F3 seams. A crash before, during, or
+/// after the observation must resume into a fresh READING — never into
+/// the verdict the record last carried.
+#[test]
+fn a_crash_at_every_observation_seam_resumes_into_a_re_read() {
+    for seam in ["pre-observation", "mid-observation"] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        write_project(dir, &session_json_with_data_repair(DRAFT_SQL));
+        let plan = drive_to_plan_review(dir);
+        let (code, _j, _o, err) = rocky(dir, &["review", &plan, "--approve"]);
+        assert_eq!(code, 0, "review approve: {err}");
+
+        // Abort mid-flight: the no-cleanup exit a SIGKILL produces.
+        let (code, _j, _o, _e) =
+            rocky_env(dir, &["fulfill", PRODUCT], &[("ROCKY_FULFILL_FAULT", seam)]);
+        assert_ne!(code, 0, "the fault at '{seam}' must abort the process");
+        {
+            let store = state_store(dir);
+            let record = store
+                .fulfill_state_get(PRODUCT)
+                .expect("state")
+                .expect("record");
+            assert_eq!(
+                record.state.tag(),
+                "applied",
+                "a crash around the observation leaves `applied`, never a \
+                 verdict nobody finished reading (seam {seam})"
+            );
+            assert_eq!(
+                record.observation_detail, None,
+                "and no evidence is recorded for a reading that did not complete"
+            );
+        }
+
+        // The resume READS, and finds the red.
+        let (code, json, _o, err) = rocky(dir, &["fulfill", PRODUCT]);
+        let json = json.expect("fulfill json");
+        assert_eq!(code, 4, "resume at '{seam}': {err} {json}");
+        assert_eq!(json["state"], "observed_failing", "seam {seam}: {json}");
+    }
+
+    // The third seam: the data-repair transition is committed, the
+    // worker not yet dispatched.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_project(dir, &session_json_with_data_repair(DRAFT_SQL));
+    let plan = drive_to_plan_review(dir);
+    let (code, _j, _o, err) = rocky(dir, &["review", &plan, "--approve"]);
+    assert_eq!(code, 0, "review approve: {err}");
+    let (code, _j, _o, _e) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 4, "the first reading records the red");
+
+    let (code, _j, _o, _e) = rocky_env(
+        dir,
+        &["fulfill", PRODUCT],
+        &[("ROCKY_FULFILL_FAULT", "pre-repair-reopen")],
+    );
+    assert_ne!(code, 0, "the fault must abort the process");
+    {
+        let store = state_store(dir);
+        let record = store
+            .fulfill_state_get(PRODUCT)
+            .expect("state")
+            .expect("record");
+        assert_eq!(record.state.tag(), "drafting");
+        assert_eq!(
+            record.drafting_round,
+            rocky_core::fulfill::DraftingRound::DataRepair,
+            "the round is persisted WITH the transition that decided it, so the \
+             resume dispatches a data repair rather than a plain draft"
+        );
+        assert_eq!(
+            record.data_repair_rounds, 1,
+            "the round was counted before the dispatch, so a crash cannot buy a free one"
+        );
+        assert!(
+            record
+                .observation_detail
+                .as_deref()
+                .is_some_and(|d| d.contains("violating row")),
+            "and the evidence survives, so the resumed worker is not handed a blank: {:?}",
+            record.observation_detail
+        );
+    }
+
+    // The resume converges through the same human gate.
+    let repaired = confirm_red_and_repair(dir);
+    assert_ne!(repaired, plan);
+    let (code, _j, _o, err) = rocky(dir, &["review", &repaired, "--approve"]);
+    assert_eq!(code, 0, "fresh review: {err}");
+    let (code, json, _o, err) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "repaired apply: {err}");
+    assert_eq!(json.expect("json")["state"], "observing");
+}
+
+/// Deleting a check must not beat fixing it.
+///
+/// The sidecar holding the declared `[[tests]]` is byte-verified against
+/// the committed lowering manifest at Phase B and then not looked at
+/// again until observation — which is after an apply, and arbitrarily
+/// later. Without a custody gate at that point, emptying the sidecar
+/// yields `declared = 0`, which tallies identically to "every declared
+/// check passed": the loop would transition a known-red product to a
+/// healthy `observing`, clear the evidence, and refund the repair budget,
+/// all while the bad table sits untouched.
+///
+/// That also makes the repair ceiling meaningless — alternate removing
+/// and restoring the checks and the budget refills every lap.
+///
+/// So a sidecar that no longer matches what was approved is UNEVALUABLE:
+/// the checks are not run, the state does not move, and the loop says
+/// why. Deliberately not `blocked` — a human editing their own models
+/// directory is ordinary and must not strand the product.
+#[test]
+fn emptying_the_sidecar_cannot_turn_a_known_red_into_observing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_project(dir, &session_json_with_data_repair(DRAFT_SQL));
+
+    let plan = drive_to_plan_review(dir);
+    let (code, _j, _o, err) = rocky(dir, &["review", &plan, "--approve"]);
+    assert_eq!(code, 0, "review approve: {err}");
+    let (code, json, _o, _e) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 4, "the product is observed red first");
+    assert_eq!(json.expect("json")["state"], "observed_failing");
+    assert!(
+        declared_check_count(dir) > 0,
+        "the fixture must declare checks for this to mean anything"
+    );
+
+    // The attack: delete every declared check from the sidecar.
+    let sidecar = dir.join(format!("models/{PRODUCT}.toml"));
+    let text = std::fs::read_to_string(&sidecar).expect("sidecar");
+    let mut document: toml::Table = toml::from_str(&text).expect("sidecar parses");
+    document.remove("tests");
+    document.remove("use_test");
+    std::fs::write(&sidecar, toml::to_string(&document).expect("re-serialize"))
+        .expect("write sidecar");
+    assert_eq!(
+        declared_check_count(dir),
+        0,
+        "the sidecar now declares nothing — the tally a clean run would produce"
+    );
+
+    let (code, json, _o, err) = rocky(dir, &["fulfill", PRODUCT]);
+    let json = json.expect("fulfill json");
+    assert_ne!(
+        json["state"], "observing",
+        "a product whose checks were DELETED must never read as healthy: {json}"
+    );
+    assert_eq!(
+        json["state"], "observed_failing",
+        "and the known red is not cleared by a reading that could not be trusted: {json} {err}"
+    );
+    assert_eq!(code, 4, "still the data-red exit code");
+    let message = json["message"].as_str().expect("message");
+    assert!(
+        message.contains("not the ones this generation verified"),
+        "the stop says the checks on disk are not the verified ones: {message}"
+    );
+    // And it names a way OUT — which is a RESTORE, stated before the
+    // command. No engine verb adopts a post-apply check change: nothing
+    // after an apply can re-enter `verifying` to pin a new digest.
+    assert!(
+        message.contains("restore the file you changed"),
+        "the hold states the manual step first: {message}"
+    );
+    assert!(
+        message.contains("approve the spec again"),
+        "and the route for keeping the change: {message}"
+    );
+
+    // The evidence and the budget both survive — otherwise the ceiling
+    // could be refilled by editing a file.
+    let store = state_store(dir);
+    let record = store
+        .fulfill_state_get(PRODUCT)
+        .expect("state")
+        .expect("record");
+    assert!(
+        record
+            .observation_detail
+            .as_deref()
+            .is_some_and(|d| d.contains("violating row")),
+        "the recorded evidence survives: {:?}",
+        record.observation_detail
+    );
+    assert_eq!(
+        record.data_repair_rounds, 0,
+        "no round was spent on a reading that never ran"
+    );
+    drop(store);
+
+    // THE REMEDY IS REAL — and it is the restore, not a verb.
+    //
+    // `rocky product compile` was offered here once and does NOT work:
+    // it byte-verifies before Phase B and refuses a drifted sidecar
+    // outright. Asserting that refusal keeps the message honest, because
+    // the moment someone re-offers the verb this test fails.
+    let (code, _j, _o, err) = rocky(dir, &["product", "compile", PRODUCT]);
+    assert_ne!(
+        code, 0,
+        "re-lowering must NOT be presented as the remedy — it refuses drift"
+    );
+    assert!(
+        err.contains("tampered") || err.contains("drift"),
+        "and it refuses for the reason the message relies on: {err}"
+    );
+
+    // Restoring is what works.
+    std::fs::write(&sidecar, &text).expect("restore the sidecar");
+    assert!(
+        declared_check_count(dir) > 0,
+        "the restored sidecar declares its checks again"
+    );
+    let (code, json, _o, _e) = rocky(dir, &["fulfill", PRODUCT]);
+    let json = json.expect("fulfill json");
+    assert_eq!(code, 0, "the loop resumes its normal course: {json}");
+    // The record was already at `observed_failing`, so this reading is
+    // the CONFIRMING one: the gate held while the checks were unreadable,
+    // and the moment they are readable again the red is confirmed and a
+    // repair round runs — parking at the human gate, as any repair does.
+    assert_eq!(json["state"], "needs_input", "{json}");
+    assert!(
+        json["plan_id"].as_str().is_some_and(|p| !p.is_empty()),
+        "with a new plan for a human to review: {json}"
+    );
+
+    // And the round was spent on the real finding, not on the custody
+    // hold — the gate never burned budget while it was holding.
+    let store = state_store(dir);
+    let rows = store.fulfill_journal_rows(PRODUCT).expect("journal");
+    assert!(
+        rows.iter()
+            .any(|r| r.event.starts_with("data repair round 1")),
+        "exactly one repair round, and only after the checks were readable"
+    );
+    drop(store);
+}
+
+/// A BROKEN CONFIG IS NOT A CUSTODY DIVERGENCE.
+///
+/// Editing the TARGET ADAPTER is a routing change, and the hold must
+/// say so — not "the warehouse could not be resolved".
+///
+/// This test predates the round-18 ordering fix and used to assert the
+/// resolution error. That expectation was the weaker truth: the config
+/// this generation applied under names `default`; the edited one names
+/// `no_such_warehouse`; the identities differ, and the routing gate now
+/// runs BEFORE adapter resolution (it has to — resolution failure used
+/// to mask divergence, and the freshness query used to run before
+/// either). So the operator is told the config diverged from the one
+/// the apply saw, which subsumes "and the adapter it now names does not
+/// resolve".
+///
+/// What this test still earns is its NEGATIVE: the stop must not say
+/// "restore the file you changed" — that is the check-set custody
+/// remedy, and nothing under `models/` moved. And its positive tail:
+/// the printed remedy (put the configuration back) must actually work.
+///
+/// The bare resolution error still exists for the one case that can
+/// reach it: a legacy plan (no identity, routing-exempt) over a config
+/// whose adapter fails to construct.
+#[test]
+fn a_reroute_to_an_unresolvable_adapter_reports_routing_not_custody() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_project(dir, &session_json(&[]));
+    let plan_id = drive_to_plan_review(dir);
+    approve_and_apply(dir, &plan_id);
+
+    // THE BREAKAGE: the config still parses and the pipeline still
+    // resolves — only the adapter it names is gone. Nothing under
+    // `models/` is touched, so the check digest is unchanged and the
+    // custody comparison has no complaint to make.
+    let broken = rocky_toml().replace(
+        "[pipeline.p.target]\nadapter = \"default\"",
+        "[pipeline.p.target]\nadapter = \"no_such_warehouse\"",
+    );
+    assert!(
+        broken.contains("no_such_warehouse"),
+        "the fixture must actually rewrite the target adapter"
+    );
+    std::fs::write(dir.join("rocky.toml"), &broken).expect("broken config");
+
+    let (code, json, out, err) = rocky(dir, &["fulfill", PRODUCT]);
+    let json = json.expect("fulfill json");
+    // Exit 0 and `applied`: a clean stop carrying an ask. Exit 4 is
+    // reserved for `observed_failing`, and nothing here says the output is
+    // wrong — only that it could not be read.
+    assert_eq!(
+        code, 0,
+        "an unevaluable reading is a clean stop: {err}{out}"
+    );
+    assert_eq!(
+        json["state"], "applied",
+        "it holds where it is rather than claiming a healthy `observing`: {json}"
+    );
+    let message = json["message"].as_str().expect("message");
+    assert!(
+        message.contains("is not the one this generation applied under")
+            || message.contains("is not the configuration now on disk"),
+        "the stop names the routing divergence, the stronger truth: {message}"
+    );
+    assert!(
+        message.contains("Put the configuration back as the apply saw it"),
+        "and the remedy that works is stated: {message}"
+    );
+    assert!(
+        !message.contains("restore the file you changed"),
+        "a config problem must NOT print the custody remedy — there is no file to \
+         restore into the verified set: {message}"
+    );
+    assert!(
+        !message.contains("put the change in the product spec"),
+        "and it must not send the operator to a spec field that cannot hold a \
+         warehouse: {message}"
+    );
+    assert_eq!(
+        json["next_command"].as_str(),
+        Some(format!("rocky fulfill {PRODUCT}").as_str()),
+        "re-running after fixing the config IS the remedy here: {json}"
+    );
+
+    // And it is genuinely recoverable: restore the config and the same
+    // command clears the hold.
+    std::fs::write(dir.join("rocky.toml"), rocky_toml()).expect("restore config");
+    let (code, json, out, err) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "the printed remedy has to work: {err}{out}");
+    assert_eq!(
+        json.expect("fulfill json")["state"],
+        "observing",
+        "the product returns to a healthy reading once the warehouse resolves"
+    );
+}
+
+/// The `[[use_test]]` bypass, end to end.
+///
+/// A sidecar's `[[use_test]]` entry carries a NAME and a binding. The
+/// check's type and its SQL live in `models/test_definitions.toml`,
+/// which is not a lowering artifact, appears in no manifest, and is
+/// hashed nowhere. So editing that one file changes the SQL the loop is
+/// about to run while the sidecar stays byte-identical and every
+/// recorded artifact hash still matches.
+///
+/// The assertion that makes this test worth having is the SECOND one:
+/// that `artifact_problems` is empty at the moment the gate fires. That
+/// is what proves the sidecar-hash check walked straight past this and
+/// the digest over the expanded set is what caught it. Without it, the
+/// test would pass on a gate that merely noticed the sidecar changed.
+#[test]
+fn editing_a_shared_test_definition_cannot_change_what_the_loop_executes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_project(dir, &session_json_with_data_repair(DRAFT_SQL));
+
+    // The reference cannot be pre-placed: Phase A refuses a cold start
+    // when the sidecar already exists (`model-collision`). It goes in at
+    // the seam where the drafting worker has just written the sidecar and
+    // Phase B has not merged yet — the same window a worker's own
+    // `[[use_test]]` would arrive through. Phase B preserves it (not a
+    // spec-owned key), so the digest the verify bundle pins covers the
+    // expansion.
+    let (code, json, _o, err) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "elicit: {err}");
+    assert_eq!(json.expect("json")["state"], "needs_input");
+    let (code, _j, _o, err) = rocky(dir, &["fulfill", "approve-spec", PRODUCT]);
+    assert_eq!(code, 0, "approve-spec: {err}");
+
+    let (code, _j, _o, _e) = rocky_env(
+        dir,
+        &["fulfill", PRODUCT],
+        &[("ROCKY_FULFILL_FAULT", "post-drafting")],
+    );
+    assert_ne!(code, 0, "the fault aborts after drafting, before Phase B");
+
+    std::fs::write(
+        dir.join("models/test_definitions.toml"),
+        "[revenue_is_positive]\ntype = \"expression\"\nexpression = \"revenue_eur >= 0\"\n",
+    )
+    .expect("definitions");
+    let sidecar_path = dir.join(format!("models/{PRODUCT}.toml"));
+    let drafted = std::fs::read_to_string(&sidecar_path).expect("the worker wrote a sidecar");
+    std::fs::write(
+        &sidecar_path,
+        format!("{drafted}\n[[use_test]]\nname = \"revenue_is_positive\"\n"),
+    )
+    .expect("sidecar with a use_test reference");
+
+    // Resume: Phase B merges, the bundle verifies, and a plan is pinned.
+    let (code, json, out, err) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "resume to proposed: {err}{out}");
+    let json = json.expect("fulfill json");
+    assert_eq!(json["state"], "needs_input", "{json}");
+    let plan = json["plan_id"].as_str().expect("plan pinned").to_string();
+    let (code, _j, _o, err) = rocky(dir, &["review", &plan, "--approve"]);
+    assert_eq!(code, 0, "review approve: {err}");
+    let (code, _j, _o, _e) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 4, "the product applies and is observed red");
+
+    // The reference must have survived the merge, or this proves nothing.
+    let sidecar_before = std::fs::read(&sidecar_path).expect("sidecar");
+    assert!(
+        String::from_utf8_lossy(&sidecar_before).contains("use_test"),
+        "the fixture needs the reference to survive Phase B: {}",
+        String::from_utf8_lossy(&sidecar_before)
+    );
+
+    // THE EDIT: only the shared definition, and it now asserts the
+    // opposite of what was verified.
+    std::fs::write(
+        dir.join("models/test_definitions.toml"),
+        "[revenue_is_positive]\ntype = \"expression\"\nexpression = \"revenue_eur < 999999\"\n",
+    )
+    .expect("edited definitions");
+    assert_eq!(
+        std::fs::read(&sidecar_path).expect("sidecar"),
+        sidecar_before,
+        "the sidecar must be byte-identical — that is the whole bypass"
+    );
+
+    // The sidecar-hash check sees nothing wrong. This is the control.
+    let (code, status, _o, err) = rocky(dir, &["product", "status", PRODUCT]);
+    assert_eq!(code, 0, "product status: {err}");
+    let status = status.expect("status json");
+    assert_eq!(
+        status["artifact_problems"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0),
+        0,
+        "every recorded artifact hash still matches — the sidecar check is blind here: {status}"
+    );
+
+    // And the loop still refuses to run them.
+    let (code, json, _o, err) = rocky(dir, &["fulfill", PRODUCT]);
+    let json = json.expect("fulfill json");
+    assert_eq!(code, 4, "still held, not clean: {err} {json}");
+    let message = json["message"].as_str().expect("message");
+    assert!(
+        message.contains("something changed what would run"),
+        "the digest over the EXPANDED set is what catches this: {message}"
+    );
+    assert!(
+        message.contains("restore the file you changed"),
+        "and it still names the remedy — a restore, not a verb: {message}"
+    );
+}
+
+/// A record carrying NO check digest must hold, not pass.
+///
+/// This is the upgrade path, and it is the only way the `None` arm is
+/// reachable now that an unpinnable generation fails its verify bundle:
+/// a product mid-flight when the binary was upgraded has a record
+/// written before `checks_digest` existed, so it deserializes to `None`.
+///
+/// The rule that arm encodes is that absence of evidence is not evidence
+/// of absence — "every claim matched" is trivially true when no claim
+/// was made. Without this test the rule is unexercised: a mutation
+/// making `None` pass survives the entire suite, which is how it was
+/// found.
+#[test]
+fn a_record_with_no_recorded_digest_holds_rather_than_passing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_project(dir, &session_json(&[]));
+    let plan = drive_to_plan_review(dir);
+    let (code, _j, _o, err) = rocky(dir, &["review", &plan, "--approve"]);
+    assert_eq!(code, 0, "review approve: {err}");
+    let (code, json, _o, err) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "apply+observe: {err}");
+    assert_eq!(
+        json.expect("json")["state"],
+        "observing",
+        "the baseline is a clean, pinned generation"
+    );
+
+    // Rewrite the record the way an older binary left it: everything
+    // else intact, no digest.
+    {
+        let store = state_store(dir);
+        let current = store
+            .fulfill_state_get(PRODUCT)
+            .expect("state")
+            .expect("record");
+        assert!(
+            current.checks_digest.is_some(),
+            "the fixture must start pinned, or this proves nothing"
+        );
+        let mut older = current.clone();
+        older.checks_digest = None;
+        let row = rocky_core::fulfill::FulfillJournalRow {
+            seq: 0,
+            at: None,
+            event: "test: simulate a record written before checks_digest existed".to_string(),
+            from_state: Some(current.state.tag().to_string()),
+            to_state: older.state.tag().to_string(),
+            spec_digest: older.spec_digest.clone(),
+            plan_id: older.plan_id.clone(),
+            idempotency_key: older.idempotency_key.clone(),
+        };
+        let outcome = store
+            .fulfill_state_cas(PRODUCT, Some(&current), &older, &row)
+            .expect("seed the unpinned record");
+        assert!(
+            matches!(outcome, rocky_core::fulfill::FulfillCas::Won),
+            "the seed must land"
+        );
+    }
+
+    // The checks on disk are unchanged and would pass. The loop must
+    // still refuse to call that health, because it cannot show they are
+    // the checks this generation verified.
+    let (code, json, _o, err) = rocky(dir, &["fulfill", PRODUCT]);
+    let json = json.expect("fulfill json");
+    assert_eq!(code, 0, "a hold is a clean stop: {err}");
+    assert_ne!(
+        json["state"], "observing",
+        "an unpinned generation must not be reported healthy: {json}"
+    );
+    assert_eq!(json["state"], "applied", "{json}");
+    let message = json["message"].as_str().expect("message");
+    assert!(
+        message.contains("recorded no digest"),
+        "and it says exactly what is missing: {message}"
+    );
+}
+
+/// A DIGEST FROM AN OLDER PREIMAGE SCHEME IS NOT A CUSTODY DIVERGENCE.
+///
+/// The persisted `checks_digest` is an opaque string, and the
+/// comparison at observation is exact. So the day the preimage changes
+/// — which `CheckSetPreimage`'s own rule invites, and which this work
+/// package already did once when it folded `[target]` in — every
+/// generation the previous build pinned mismatches on a directory
+/// nobody touched.
+///
+/// Reported as custody, that is unrecoverable. The remedy printed is
+/// "restore the file you changed", and no restore changes a hash
+/// algorithm. The landing is `applied`, where `rocky product approve`
+/// is refused. Both exits are closed, permanently, by an upgrade.
+///
+/// The scheme tag makes the two facts separable, and this drives the
+/// separation end to end: seed the record with the untagged digest an
+/// intermediate build wrote, and the loop must say the two were never
+/// comparable, must NOT print the restore, and must land somewhere a
+/// human can act — `blocked`, whose `--retry` starts a generation that
+/// re-pins under the current scheme.
+///
+/// The recovery half is the point. A test that only asserted the new
+/// message would pass over a hold just as permanent as the one it
+/// replaced.
+#[test]
+fn a_digest_from_an_older_scheme_blocks_with_a_remedy_that_works() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_project(dir, &session_json(&[]));
+    let plan = drive_to_plan_review(dir);
+    let (code, _j, _o, err) = rocky(dir, &["review", &plan, "--approve"]);
+    assert_eq!(code, 0, "review approve: {err}");
+    let (code, json, _o, err) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "apply+observe: {err}");
+    assert_eq!(
+        json.expect("json")["state"],
+        "observing",
+        "the baseline is a clean, pinned generation"
+    );
+
+    // Seed the record the way a build BEFORE the scheme tag left it:
+    // the same hash, without the `checks/N:` prefix. Nothing on disk
+    // moves, so the check set itself is beyond suspicion — which is
+    // exactly the case a strict compare gets wrong.
+    {
+        let store = state_store(dir);
+        let current = store
+            .fulfill_state_get(PRODUCT)
+            .expect("state")
+            .expect("record");
+        let pinned = current
+            .checks_digest
+            .clone()
+            .expect("the fixture must start pinned, or this proves nothing");
+        let (scheme, hash) = pinned
+            .split_once(':')
+            .expect("a pinned digest carries its scheme");
+        assert_eq!(
+            scheme, "checks/1",
+            "this test strips the CURRENT scheme tag; update it when the scheme is bumped"
+        );
+        let mut older = current.clone();
+        older.checks_digest = Some(hash.to_string());
+        let row = rocky_core::fulfill::FulfillJournalRow {
+            seq: 0,
+            at: None,
+            event: "test: simulate a digest pinned under an older preimage scheme".to_string(),
+            from_state: Some(current.state.tag().to_string()),
+            to_state: older.state.tag().to_string(),
+            spec_digest: older.spec_digest.clone(),
+            plan_id: older.plan_id.clone(),
+            idempotency_key: older.idempotency_key.clone(),
+        };
+        let outcome = store
+            .fulfill_state_cas(PRODUCT, Some(&current), &older, &row)
+            .expect("seed the old-scheme record");
+        assert!(
+            matches!(outcome, rocky_core::fulfill::FulfillCas::Won),
+            "the seed must land"
+        );
+    }
+
+    let (code, json, _o, err) = rocky(dir, &["fulfill", PRODUCT]);
+    let json = json.expect("fulfill json");
+    assert_eq!(code, 2, "blocked exits 2: {err} {json}");
+    assert_eq!(
+        json["state"], "blocked",
+        "it must land where a human can act, not in the `applied` holding pattern that \
+         refuses `rocky product approve`: {json}"
+    );
+    let message = json["message"].as_str().expect("message");
+    assert!(
+        message.contains("was taken under an older check-set scheme"),
+        "the stop says the two were never comparable, not that something changed: {message}"
+    );
+    // THE ASSERTIONS THAT EARN THIS TEST are the negative ones. A
+    // change that routed the scheme mismatch back through the custody
+    // arm would still pass an assertion that only checked the product
+    // held.
+    assert!(
+        !message.contains("restore the file you changed"),
+        "no restore changes a hash algorithm, so the custody remedy must not be printed \
+         here: {message}"
+    );
+    assert!(
+        !message.contains("something changed what would run"),
+        "and no comparison here says anything did — saying so would accuse an operator of \
+         an edit that was never checked for: {message}"
+    );
+    // THE OTHER DIRECTION, which this test used to get wrong in its own
+    // prose: the message must not claim disk is CLEAN either. The scheme
+    // branch returns before the check set is loaded, so an edit to
+    // unmanifested `models/test_definitions.toml` can sit underneath this
+    // stop undetected. Custody here is unknown, and the stop has to say
+    // so — asserted positively, because "does not say clean" is satisfied
+    // by a message that says nothing at all.
+    assert!(
+        !message.contains("nothing on disk changed"),
+        "the expanded check set was never loaded here, so the stop cannot claim disk is \
+         unchanged: {message}"
+    );
+    assert!(
+        message.contains("UNKNOWN"),
+        "it must name the custody it did NOT establish, not quietly omit it: {message}"
+    );
+    assert_eq!(
+        json["next_command"].as_str(),
+        Some(format!("rocky fulfill {PRODUCT} --retry").as_str()),
+        "and the printed command is the one that starts a generation this build can pin: \
+         {json}"
+    );
+
+    // THE REMEDY IS EXECUTED. `--retry` re-enters at `spec_approved`,
+    // and the fresh generation pins its own digest at its own verify —
+    // so the product comes back, rather than trading one permanent hold
+    // for another.
+    let (code, json, out, err) = rocky(dir, &["fulfill", PRODUCT, "--retry"]);
+    assert_eq!(code, 0, "the printed remedy has to work: {err}{out}");
+    let json = json.expect("fulfill json");
+    assert_eq!(
+        json["state"], "needs_input",
+        "the retry re-enters the loop at the next gate rather than staying blocked: {json}"
+    );
+
+    // AND THE OLD-SCHEME VALUE IS GONE, replaced rather than carried.
+    // `--retry` clears the pin, and the run above went on through
+    // `verifying` — which re-pins — before stopping at the plan gate.
+    // So the record here is pinned again, under the CURRENT scheme, and
+    // the next observation compares like for like.
+    //
+    // Asserted positively (`Some` that starts with the tag), not as
+    // "None or tagged". The state here is `needs_input`, and an
+    // `is_none_or` would silently pass through its `None` branch the
+    // day the retry stopped one transition earlier — proving nothing
+    // about the tagging it appears to check.
+    let store = state_store(dir);
+    let record = store
+        .fulfill_state_get(PRODUCT)
+        .expect("state")
+        .expect("record");
+    let repinned = record
+        .checks_digest
+        .as_deref()
+        .expect("the retry ran through `verifying`, which pins a digest");
+    assert!(
+        repinned.starts_with("checks/1:"),
+        "the new generation pins under the CURRENT scheme, so the old value is replaced \
+         rather than carried: {repinned}"
+    );
+    drop(store);
 }

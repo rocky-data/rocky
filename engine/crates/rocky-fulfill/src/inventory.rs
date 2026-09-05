@@ -36,6 +36,39 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     "rocky_cli::commands::fulfill_api::ProductBinding",
     "rocky_cli::commands::fulfill_api::ProposeOutcome",
     "rocky_cli::commands::fulfill_api::ProposeRequest",
+    // F3 — the post-apply reading of the DECLARED data checks: the same
+    // typed core `rocky test --declarative` runs, scoped to the
+    // product's output model. DELIBERATE addition, and deliberately a
+    // second entry point rather than a widened `test_output`: this one
+    // runs against the MATERIALISED table, and its result type drops the
+    // generated SQL so worker-authored text cannot ride into a brief.
+    "rocky_cli::commands::fulfill_api::ObservedCheck",
+    "rocky_cli::commands::fulfill_api::ObservedChecks",
+    // F3 — the OWNED, digested, warehouse-BOUND check-set snapshot.
+    // DELIBERATE addition: the custody gate compares this handle's
+    // digest and then hands the same handle to
+    // `observe_declarative_checks`, which consumes it, so the compared
+    // set and the executed set are one object rather than two reads of
+    // the same directory — and the warehouse is bound before the digest
+    // is READABLE (`bind` computes the digest first and resolves the
+    // adapter second, then returns both together, so there is no handle
+    // whose digest can be read while its warehouse is still open), so
+    // no config edit after the comparison can reroute the query.
+    // `BindFailure` is its two-remedy error: a check set that
+    // will not load is the custody gate's business, an unresolvable
+    // warehouse is not, and printing the custody remedy for a config
+    // typo would name a fix that cannot work.
+    "rocky_cli::commands::fulfill_api::BindFailure",
+    // F3 — the check-set digest's PREIMAGE SCHEME tag and the predicate
+    // that reads it. DELIBERATE addition: a persisted digest is an
+    // opaque string, so without asking this question the loop reports a
+    // build that hashes different fields as "something changed what
+    // would run", and prints a restore remedy no restore can satisfy at
+    // a state where re-approving is refused. The tag makes the two
+    // facts distinguishable; the loop routes the scheme one to
+    // `blocked`, which has a working exit.
+    "rocky_cli::commands::fulfill_api::CHECK_SET_DIGEST_SCHEME",
+    "rocky_cli::commands::fulfill_api::LoadedCheckSet",
     "rocky_cli::commands::fulfill_api::ReceiptLookup",
     // #1493 — the drafting-window reopen (typed outcome + the call).
     "rocky_cli::commands::fulfill_api::ReopenOutcome",
@@ -48,9 +81,32 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     // execute, so the deferred count the verify bundle reports is the
     // executed set by construction (it includes `[[use_test]]`
     // expansion, which reading the sidecar's raw array misses).
+    // F3 — the custody digest over the EXPANDED check set, so an edit to
+    // a shared `test_definitions.toml` cannot change what observation
+    // executes without the loop noticing.
+    "rocky_cli::commands::fulfill_api::check_set_digest_scheme_is_current",
+    "rocky_cli::commands::fulfill_api::declarative_check_digest",
     "rocky_cli::commands::fulfill_api::declarative_test_count",
     "rocky_cli::commands::fulfill_api::lookup_apply_receipt",
+    "rocky_cli::commands::fulfill_api::observe_declarative_checks",
     "rocky_cli::commands::fulfill_api::observe_max_time_column",
+    // F3 — the routing custody surface, three routes. DELIBERATE:
+    // observation bound whatever `rocky.toml` named at that moment, so
+    // one re-route between apply and observation made the declared
+    // checks certify a warehouse this generation never wrote to.
+    //
+    // `plan_routing` reads what the applied plan authorised, TYPED —
+    // identity / legacy-exempt / missing-but-required / unreadable —
+    // because collapsing those to an Option printed a restore remedy
+    // for evidence a restore cannot recreate. The legacy exemption is
+    // apply's own (`fingerprint_version >= 1`), reused not re-derived.
+    // `current_routing_identity` is the EARLY read that lets `observe`
+    // refuse before the staleness query touches the wrong warehouse;
+    // the authoritative comparison stays on the executing handle's own
+    // load (`LoadedCheckSet::routing_identity`).
+    "rocky_cli::commands::fulfill_api::PlanRouting",
+    "rocky_cli::commands::fulfill_api::current_routing_identity",
+    "rocky_cli::commands::fulfill_api::plan_routing",
     "rocky_cli::commands::fulfill_api::print_json",
     "rocky_cli::commands::fulfill_api::product_approve",
     "rocky_cli::commands::fulfill_api::product_compile",

@@ -175,12 +175,23 @@ person.
 `rocky mcp --profile worker` serves a smaller, fixed list meant for an untrusted drafting worker: the
 read and inspect tools (`plan_preview`, `lineage`, `list`, `inspect_schema`,
 `catalog`, `sample_rows`, `profile_column`), the verification loop (`compile`,
-`test`, `breaking_change`, `dependents`), `draft_model` + `draft_check`, and the
-prompts. Everything else — `draft_contract`, `draft_metadata`, `propose`,
-`review_queue`, `pause_schedule`, the governor reads, and the generators — is
-absent from the listing, and calling one returns tool-not-found. The list is an
-allowlist: a tool added in a future release stays out of the worker profile
-unless it is added deliberately.
+`test`, `breaking_change`, `dependents`), `draft_model`, and the
+prompts. Everything else — `draft_check`, `draft_contract`, `draft_metadata`,
+`propose`, `review_queue`, `pause_schedule`, the governor reads, and the
+generators — is absent from the listing, and calling one returns
+tool-not-found. The list is an allowlist: a tool added in a future release
+stays out of the worker profile unless it is added deliberately.
+
+`draft_check` is the one that moved recently. A check's expression is put
+straight into SQL, and `rocky fulfill` now runs a product's declared checks
+against the live table after every apply, with no human watching. So the
+worker profile no longer serves it. Read that for exactly what it is: it
+closes the tool route. It does not confine the worker's filesystem, and the
+lowering keeps a check it finds in a sidecar, so a worker that can write
+files can still write one. What catches a check changed after the plan was
+verified is the fulfillment loop's own custody digest, which refuses to run
+a check set that is not the one it verified. A check already on disk at that
+moment is inside the verified set, so nothing catches that one.
 
 The prompt names are the same in both profiles, but under the worker profile
 the workflow prompts are served as worker variants: they orchestrate only

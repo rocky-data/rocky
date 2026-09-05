@@ -54,6 +54,10 @@ rocky-snowflake = { path = "../rocky-snowflake" }
 rocky-ai = { path = "../rocky-ai" }
 tempfile = "3"
 serde_json = { workspace = true }
+# The served-text golden (`roundtrip.rs`) digests every worded MCP surface so
+# a wording change cannot land without a re-bless. Any stable hash would do;
+# blake3 is already a workspace dependency.
+blake3 = { workspace = true }
 # The mid-flight mutation probes in roundtrip.rs hold the draft handler on a
 # FIFO between its write and its verdict: `O_NONBLOCK` for the write-end open
 # and `ENXIO` for "no reader yet".

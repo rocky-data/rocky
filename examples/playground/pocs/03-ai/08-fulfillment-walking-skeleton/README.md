@@ -15,6 +15,13 @@ end — including one repair round, because the recorded first draft is wrong:
 elicit spec ─▶ human approves spec ─▶ lower to contract ─▶ agent drafts SQL
    ─▶ verify ──red (E010)──▶ repair round (agent redrafts) ─▶ re-verify green
    ─▶ propose plan ─▶ human approves plan ─▶ digest-gated apply ─▶ observe
+                                                                     │
+                        the output violates a check the product declared
+                                                                     │
+   observed_failing ◀───────────────────────────────────────────────┘
+        │
+        └─▶ (confirm on a fresh reading) ─▶ data-repair round ─▶ re-verify green
+              ─▶ NEW plan ─▶ human approves AGAIN ─▶ digest-gated apply ─▶ observe
 ```
 
 Every step that could let an agent change the warehouse without a human is a real
@@ -24,6 +31,16 @@ CI. `./run-live.sh` swaps in a **real** worker (`claude -p`) that writes the SQL
 itself. The recorded drafting round forgets the required `revenue_eur` column, so
 the runner's own verify bundle comes back red and the loop recovers through a
 recorded repair round (#1493, fixed — see below).
+
+The loop also recovers from a defect no compiler can catch. The checks a product
+declares about its *output* need a table to run against, so they cannot run at
+verify — they are reported deferred there and first evaluated after the apply.
+Assert 11 violates one in the materialised table: the loop records that in
+`observed_failing` (never a healthy-looking `observing`), confirms it on a fresh
+reading, spends one repair round, and comes back through a **second** human
+review. The bad data is already live at that point, so the loop repairs forward;
+it never rolls back, and it never re-applies on the strength of the approval the
+failing plan already had.
 
 ## Why it's distinctive
 
@@ -77,8 +94,30 @@ recorded repair round (#1493, fixed — see below).
   [#1515](https://github.com/rocky-data/rocky/issues/1515).
 - **Freshness is observed, not enforced.** Assert 10 shows the loop *reporting*
   staleness (lag vs budget) after the data is aged. Staleness is a finding in the
-  loop's journal; it never blocks an apply. This POC makes no claim that Rocky
-  gates on freshness, and no claim about any regulated use.
+  loop's journal; it never blocks an apply, and it never routes into a repair
+  round either — staleness is usually a scheduling fact rather than a model
+  defect, and rewriting SQL cannot fix a job that did not run. Warning-severity
+  checks report the same way. Only a check that FAILED at `severity = "error"`
+  routes. This POC makes no claim that Rocky gates on freshness, and no claim
+  about any regulated use.
+- **The data-red lane repairs FORWARD; it does not undo.** Assert 11 injects the
+  violation directly into the materialised output, which is a stand-in for the
+  real case (a model that computes the wrong number and applies cleanly). By the
+  time the loop sees it the bad data is live, and F3 does not roll it back —
+  rollback needs a tested restore substrate that does not exist yet. What the
+  lane proves is that the failure is *recorded honestly* and *routed*, and that
+  the fix takes the same road as any other change: a new plan, a new plan id, a
+  refused bare apply, and a second human approval.
+- **A check the loop cannot EVALUATE is not a check that passed.** If a declared
+  check errors, the loop neither claims health nor spends a repair round: it
+  holds at `applied` and says so. That is a deliberate divergence from `rocky
+  test --declarative`, which exits non-zero on an errored check — the CLI reports
+  to a human who will read the error, while the loop is deciding whether to
+  rewrite a model, and "cannot tell" is not "the data is wrong".
+- **The data-repair ceiling is not exercised here.** Repeated data-reds exhaust a
+  bounded budget and land `blocked` naming the check, but reaching it needs four
+  laps through a human approval gate, which a scripted lane cannot honestly
+  stage. It is covered by the state machine's unit tests, not by this POC.
 
 ## Binary provenance (read before running)
 
@@ -157,12 +196,13 @@ into the sidecar tests (a composite-unique test from the grain, an expression
 test per check), so hand-authored `[[tests]]` are redundant and easy to malform.
 Be precise about what this is: **cooperative prompt steering, not enforcement.**
 The worker still holds raw `Write`/`Edit`, and the lowering PRESERVES a
-worker-authored sidecar test — nothing in the engine discards it. The POC also
-drops `draft_check` from the live worker's tool allowlist, which removes the
-easiest path to that mistake but does not architecturally prevent a determined
-worker from editing the sidecar. The digest-gated apply and human review are the
-real gates; the drafting brief is only a nudge toward a clean, redundant-free
-sidecar.
+worker-authored sidecar test — nothing in the engine discards it. The engine
+also drops `draft_check` from the worker MCP profile, which removes the easiest
+path to that mistake but does not architecturally prevent a determined worker
+from editing the sidecar (that is #1491's OS sandbox, not this). The
+digest-gated apply, the post-apply check-custody digest, and human review are
+the real gates; the drafting brief is only a nudge toward a clean,
+redundant-free sidecar.
 
 ## Run
 
@@ -189,7 +229,7 @@ gate -> digest-gated apply, with 6 refusal paths exercised (negatives,
 policy, supersession, backstop, staleness).
 ```
 
-## The 10 asserts, each mapped to the engine gate it exercises
+## The 11 asserts, each mapped to the engine gate it exercises
 
 | # | Assert | Engine gate |
 |---|---|---|
@@ -203,3 +243,4 @@ policy, supersession, backstop, staleness).
 | 8 | Wrong `--expect-spec-digest` refused | the engine's digest backstop (bypasses the loop; `rocky apply` direct) |
 | 9 | Composite-unique grain test RAN green (declarative) | `rocky test --declarative` executes the generated `[[tests]] type=composite kind=unique` on `[client_id, day]` against the warehouse (plain `rocky test` runs only the model) |
 | 10 | Staleness observed after backdating | the runner's observation phase (MAX(time_column) vs budget), reported not enforced |
+| 11 | A violated declared check → `observed_failing` (exit 4) → repair round → NEW plan → second human review → `observing` | the post-apply reading of the declared `[[tests]]` through the same typed core `rocky test --declarative` uses; the data-repair route, its own budget, and the plan-id/marker binding that stops a repair inheriting the failing plan's approval |

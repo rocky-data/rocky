@@ -7,7 +7,7 @@ sidebar:
 
 These commands cover a Rocky pipeline's whole life. You create the project, check the config, and see what the source holds. Then you plan the SQL, apply the plan, and read back what ran.
 
-The two commands to know first are `rocky plan` and `rocky apply`. A plan is the SQL Rocky would run, written to a file and given an id. An apply executes a stored plan. [`rocky run`](#rocky-run) fuses both into one step for local work.
+The two commands to know first are `rocky plan` and `rocky apply`. `rocky plan` prints the SQL it generates and writes a plan file with an id. For a `run` plan that file holds the settings the run needs, not the SQL. `rocky apply` reads the file and recompiles the project to run it. [`rocky run`](#rocky-run) fuses both into one step for local work.
 
 ## Global Flags
 
@@ -261,7 +261,7 @@ Two opt-in discover-time signals help catch onboarding problems before any catal
 
 ## `rocky plan`
 
-Generate the SQL Rocky would run, without running it. Rocky writes the plan to `.rocky/plans/<plan-id>.json` and prints the `plan_id`. A reviewer reads the plan. Then [`rocky apply <plan-id>`](#rocky-apply) executes it.
+Generate the replication SQL Rocky would run, without running it. The command needs a replication pipeline; it refuses a transformation-only project. It connects to the source to discover tables, then prints the copy SQL for each one. It does not print a transformation model's SQL. Add `--model <name>` for that, or use [`rocky emit-sql`](/reference/commands/modeling/#rocky-emit-sql). Rocky writes the plan to `.rocky/plans/<plan-id>.json` and prints the `plan_id`. For a `run` plan that file holds the settings the run needs, not the SQL. A reviewer reads the printed SQL. Then [`rocky apply <plan-id>`](#rocky-apply) recompiles the project and executes it with those settings.
 
 `rocky plan` plus `rocky apply` is the canonical path for production and for gating a pull request. Nothing touches the warehouse between the two steps. For local iteration, [`rocky run`](#rocky-run) does the same work in one command and writes no plan file.
 
@@ -278,10 +278,11 @@ rocky plan promote <branch> [flags]
           ▼
   ┌──────────────┐  writes the plan   ┌────────────────────────────┐
   │  rocky plan  │───────────────────►│ .rocky/plans/<plan-id>.json│
-  └──────────────┘  prints plan_id    └─────────────┬──────────────┘
-                                                    │
-                                     a human reads the SQL
-                                                    │
+  └───────┬──────┘  prints plan_id    │ run plan: settings, not SQL│
+          │                           └─────────────┬──────────────┘
+   prints replication SQL                           │
+          │                                         │
+          └──► a human reads it ────────────────────┤
                                                     ▼
                                       ┌───────────────────────────┐
                     approval gate ───►│ rocky review <plan-id>    │
@@ -433,6 +434,7 @@ rocky apply <plan-id>
 
 - [`rocky apply`](#rocky-apply) -- execute a stored plan
 - [`rocky run`](#rocky-run) -- plan and execute in one step
+- [`rocky emit-sql`](/reference/commands/modeling/#rocky-emit-sql) -- read a transformation model's SQL, which `rocky plan` does not print
 - [`rocky validate`](#rocky-validate) -- check config before planning
 - [`rocky discover`](#rocky-discover) -- see available sources
 - [`rocky review`](/reference/commands/governance-reclamation/#rocky-review) -- sign off on a gated plan

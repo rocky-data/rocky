@@ -1527,6 +1527,41 @@ mod tests {
         Ok(())
     }
 
+    /// Every field at its default — the shape the golden ids below are
+    /// taken over. Shared with `the_idempotency_key_alone_moves_the_plan_id`
+    /// so the two cannot drift apart silently; a new `RunPlan` field
+    /// breaks this literal at compile time.
+    fn minimal_run_plan() -> crate::output::RunPlan {
+        crate::output::RunPlan {
+            filter: None,
+            pipeline: None,
+            model: None,
+            branch: None,
+            partition: None,
+            partition_from: None,
+            partition_to: None,
+            latest: false,
+            missing: false,
+            lookback: None,
+            parallel: 1,
+            run_all: false,
+            env: None,
+            models_dir: None,
+            resume: None,
+            resume_latest: false,
+            shadow: false,
+            shadow_suffix: None,
+            shadow_schema: None,
+            dag: false,
+            idempotency_key: None,
+            governance_override: None,
+            models: Vec::new(),
+            execution_layers: Vec::new(),
+            product_id: None,
+            spec_digest: None,
+        }
+    }
+
     /// Digest-stability golden (FF-WP1): a `RunPlan` that does not use the
     /// optional product-identity fields must serialize to byte-identical JSON —
     /// and therefore hash to the identical `plan_id` — as it did before those
@@ -1541,34 +1576,7 @@ mod tests {
     #[test]
     fn run_plan_without_product_fields_keeps_legacy_bytes_and_plan_id() -> anyhow::Result<()> {
         fn baseline() -> crate::output::RunPlan {
-            crate::output::RunPlan {
-                filter: None,
-                pipeline: None,
-                model: None,
-                branch: None,
-                partition: None,
-                partition_from: None,
-                partition_to: None,
-                latest: false,
-                missing: false,
-                lookback: None,
-                parallel: 1,
-                run_all: false,
-                env: None,
-                models_dir: None,
-                resume: None,
-                resume_latest: false,
-                shadow: false,
-                shadow_suffix: None,
-                shadow_schema: None,
-                dag: false,
-                idempotency_key: None,
-                governance_override: None,
-                models: Vec::new(),
-                execution_layers: Vec::new(),
-                product_id: None,
-                spec_digest: None,
-            }
+            minimal_run_plan()
         }
 
         const GOLDEN_MINIMAL_JSON: &str = "{\"latest\":false,\"missing\":false,\"parallel\":1,\
@@ -1622,6 +1630,62 @@ mod tests {
         assert_ne!(
             bound_id, GOLDEN_MINIMAL_PLAN_ID,
             "a product-bound plan must hash to a different id than its unbound twin"
+        );
+        Ok(())
+    }
+
+    /// Two plans that differ ONLY by `idempotency_key` must hash to
+    /// different ids.
+    ///
+    /// This is load-bearing outside the plan store. The fulfillment loop
+    /// derives its key as `<product_id>@<spec_digest>@<journal_seq+1>`,
+    /// and a review marker is a file named for the plan id — so "a repair
+    /// always produces a NEW proposal a human must review" holds only
+    /// because the key rides INSIDE the hashed payload. Without that, a
+    /// repair round that converged on byte-identical SQL would recompute
+    /// the id of a plan the human already approved, and the stale marker
+    /// would wave the re-apply through with no fresh review.
+    ///
+    /// `run_plan_without_product_fields_keeps_legacy_bytes_and_plan_id`
+    /// pins the serialized bytes, but its populated case varies four
+    /// fields at once, so it cannot tell which one moved the id. This one
+    /// isolates the key.
+    #[test]
+    fn the_idempotency_key_alone_moves_the_plan_id() -> anyhow::Result<()> {
+        let base = crate::output::RunPlan {
+            model: Some("orders".to_string()),
+            product_id: Some("product:revenue_daily".to_string()),
+            spec_digest: Some("sha256:aaaa".to_string()),
+            ..minimal_run_plan()
+        };
+        let first = crate::output::RunPlan {
+            idempotency_key: Some("product:revenue_daily@sha256:aaaa@7".to_string()),
+            ..base.clone()
+        };
+        let repaired = crate::output::RunPlan {
+            idempotency_key: Some("product:revenue_daily@sha256:aaaa@19".to_string()),
+            ..base.clone()
+        };
+
+        let dir = tempfile::tempdir()?;
+        let first_id = write_plan(dir.path(), PlanKind::Run, &first)?;
+        let repaired_id = write_plan(dir.path(), PlanKind::Run, &repaired)?;
+        assert_ne!(
+            first_id, repaired_id,
+            "same product, same spec, same SQL, later journal position — the id must still move, \
+             or a repair inherits the earlier plan's approval marker"
+        );
+
+        // And the key is what did it: with the key back to identical, the
+        // otherwise-identical plan hashes the same.
+        let same_again = crate::output::RunPlan {
+            idempotency_key: Some("product:revenue_daily@sha256:aaaa@7".to_string()),
+            ..base
+        };
+        assert_eq!(
+            write_plan(dir.path(), PlanKind::Run, &same_again)?,
+            first_id,
+            "the id is a pure function of the payload; only the key differed above"
         );
         Ok(())
     }

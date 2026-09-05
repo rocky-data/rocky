@@ -315,6 +315,179 @@ pub enum ReceiptSummary {
     },
 }
 
+/// Why a reading of the declared checks could not be trusted.
+///
+/// The verdict alone is not enough to tell an operator what to do: the
+/// causes share one `unevaluable` verdict but need three different
+/// remedies, and one of them needs a different LANDING STATE as well.
+/// Carrying the cause is what keeps the stop from printing a command
+/// that cannot fix the condition it just reported.
+///
+/// [`decide_observation`] matches every variant explicitly. A new cause
+/// therefore has to state its own landing and remedy at the point it is
+/// added; it cannot inherit the custody one, which would print "restore
+/// the file you changed" at someone whose problem no restore can fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnevaluableCause {
+    /// The checks on disk are not the ones this generation VERIFIED.
+    ///
+    /// Re-running the loop re-reads the same diverged files and reports
+    /// the same thing forever, so the stop must not offer it bare. The
+    /// remedy is a RESTORE: put back what changed, and the digests match
+    /// again. No engine verb adopts the change instead — `rocky product
+    /// compile` refuses sidecar drift outright, and on a
+    /// `test_definitions.toml` edit it re-lowers the sidecar without
+    /// touching the definitions, so the expansion still diverges. Nor can
+    /// the loop adopt it: the only route into `verifying` is from
+    /// `merged` (the `Merged` arm of [`decide`] is the sole transition
+    /// into it), and no post-apply event re-enters `merged` in the SAME
+    /// generation, so nothing after an apply can pin a new digest.
+    ///
+    /// To keep the change it belongs in the product spec — but not from
+    /// here, and not every change fits. A first custody divergence lands
+    /// the record back at `applied`, and `rocky product approve` refuses
+    /// `applied`, pinned against the real verb by
+    /// `approving_refuses_at_applied_and_permits_at_observing` in
+    /// rocky-cli. So the order is: restore, re-run until the loop leaves
+    /// `applied`, and only then change and approve the spec — which
+    /// starts a new generation that pins at its own verify.
+    ///
+    /// WHAT FITS is narrower than "the spec", and the message says so.
+    /// `output.checks` is `Vec<String>` — opaque SQL booleans
+    /// (`product::spec::OutputSpec`) — and the lowering turns every one
+    /// of them into an `expression` test at `severity = "error"`
+    /// (`product::lowering::generated_tests`). A `not_null` comes from
+    /// an `output.columns` entry with `nullable = false`. And
+    /// `output.grain` lowers to exactly ONE uniqueness check: `unique`
+    /// on a single grain column, or `composite` + `kind = "unique"`
+    /// over several.
+    ///
+    /// That last one is the correction. The message used to list
+    /// `unique` flat among the shapes with no spec spelling, which is
+    /// false — the declared grain IS a uniqueness check, and the
+    /// lowering emits it in both arms. What has no spelling is
+    /// uniqueness that is not the grain: a `unique` on some other
+    /// column, a second one, or a `composite` whose `kind` is not
+    /// `unique`. Alongside it: another typed shape
+    /// (`row_count_range`, `accepted_values`, `in_range`,
+    /// `regex_match`, `relationships`), a `warning` severity, a
+    /// `filter`, or a `[[use_test]]` reference. For those the restore
+    /// is the whole remedy. Pinned from the lowering side by
+    /// `spec_checks_lower_only_to_error_severity_expression_tests` and
+    /// the composite-grain arm in rocky-core, so teaching `checks` a
+    /// new shape fails a test that names this message.
+    /// The checks are the verified ones, but the warehouse they would
+    /// read is not the one the apply WROTE.
+    ///
+    /// Apply refuses unless the config's routing identity equals the
+    /// `config_identity` its plan authorised. Observation had no such
+    /// gate: it bound whatever `rocky.toml` named at that moment, so a
+    /// single re-route between the apply and the observation made the
+    /// checks certify a different warehouse — reporting health, or a
+    /// data-red, about a table the loop never wrote. A repair round
+    /// spent on that evidence is the loop's most expensive action taken
+    /// on its least trustworthy input.
+    ///
+    /// The comparison reuses `config_policy_identity`, the value the
+    /// apply gate already refuses on, rather than a narrower derivation
+    /// of its own. Two derivations would let the two gates disagree
+    /// about what a re-route is, and disagree silently.
+    ///
+    /// TWO CAUSES, ONE STRING, AND THE MESSAGE MUST NAME BOTH. The
+    /// identity is env-resolved: `substitute_env_vars` expands `${VAR}`
+    /// in the raw TOML text before it is parsed, so ANY routing field
+    /// can carry one. So an unequal identity means either the file was
+    /// edited or a variable resolved differently in this process, and
+    /// the two opaque JSON strings cannot be told apart. Printing only
+    /// "restore the file you changed" would send an operator who
+    /// changed no file looking for an edit that does not exist — the
+    /// same wrong-remedy defect that kept `rocky.toml` out of the
+    /// custody digest for credentials.
+    ///
+    /// ABSENCE IS A HOLD, not a pass. A plan with no `config_identity`
+    /// is one this gate cannot check, and `if let Some(..)` around the
+    /// comparison would pass exactly those. Apply already refuses a
+    /// `fingerprint_version >= 1` plan that carries none, so a plan that
+    /// applied necessarily has one — which makes absence a broken
+    /// invariant rather than a normal case, and holding the right
+    /// answer.
+    RoutingDiverged,
+    /// The evidence needed to CHECK the routing is gone: the applied
+    /// plan is unreadable, or it required an identity and carries none.
+    ///
+    /// A separate variant because the remedy is opposite to
+    /// `RoutingDiverged`'s. "Put the configuration back" cannot create
+    /// evidence a plan never carried or a file that will not read, and a
+    /// re-run re-reads the same absence forever — so this routes to
+    /// `blocked`, whose `--retry` starts a fresh generation that pins
+    /// its own evidence at its own verify. The same exit
+    /// `CheckSchemeChanged` uses, for the same reason: the hold cannot
+    /// be cleared from inside the generation it holds.
+    RoutingEvidenceMissing,
+    CheckCustody,
+    /// The pinned digest and the recomputed one were taken under
+    /// DIFFERENT preimage schemes, so they were never comparable.
+    ///
+    /// Not a custody divergence, and it must never be reported as one.
+    /// Nothing on disk is in doubt: the generation was pinned by a build
+    /// whose `CheckSetPreimage` covered different fields, and this build
+    /// cannot reproduce that value. The custody remedy is a RESTORE, and
+    /// no restore changes a hash algorithm — printing it here is the
+    /// exact "instruction that cannot resolve what it was printed for"
+    /// the custody arm exists to avoid. It would also land at `applied`,
+    /// where `rocky product approve` is refused, so the operator would
+    /// have neither of the two routes out.
+    ///
+    /// This one lands `blocked` instead, which is a state a human can
+    /// act on: `rocky fulfill <product> --retry` re-enters at
+    /// `spec_approved` (the `Blocked` arm of [`decide`]) and the fresh
+    /// generation pins its own digest at its own `verifying`, under the
+    /// current scheme. That is the printed remedy, and
+    /// `a_digest_from_an_older_scheme_blocks_with_a_remedy_that_works`
+    /// drives it end to end.
+    ///
+    /// (Reading `product.rs`, `rocky product approve` is also ACCEPTED
+    /// here: `blocked` is in `product_approve_in`'s stop set, and the
+    /// clean stop's `release` clears the `driver_pgid` that its second
+    /// refusal arm reads. Accepted is not recovered, and the earlier
+    /// version of this note stopped at the first half. Re-approving the
+    /// UNCHANGED spec takes that function's same-digest early return: it
+    /// verifies the snapshot and returns having written no approval
+    /// record, no state record and no journal row, so the record is
+    /// still blocked. Only a NEW digest reaches the CAS that moves it to
+    /// `spec_approved`. Read from the code, NOT exercised by a test, and
+    /// not the command the stop prints.)
+    ///
+    /// REACHABILITY, without the narrowing this note used to carry. It
+    /// said "reachable today only from a record written by an
+    /// intermediate build of this work package", which reads as
+    /// near-unreachable and was used that way in a review. Only half of
+    /// it is true, and the half that is true does not carry the
+    /// conclusion:
+    ///
+    ///  - TRUE: `checks_digest` never shipped on `main`, so no RELEASED
+    ///    binary has written an untagged one.
+    ///  - Every build of this branch from before the scheme tag DID
+    ///    write one, and those pins persist in redb across the upgrade —
+    ///    nothing migrates a stored record.
+    ///  - The loop re-reads that stored record on the next `rocky
+    ///    fulfill`, so upgrade and resume compose into this arm without
+    ///    anyone doing anything unusual.
+    ///  - `a_digest_from_an_older_scheme_blocks_with_a_remedy_that_works`
+    ///    seeds exactly that persisted state and drives this arm on
+    ///    every CI run.
+    ///
+    /// So this is an exercised path, not a theoretical one. The
+    /// versioning also covers the NEXT preimage change, which the rule
+    /// on `CheckSetPreimage` positively invites, and which would
+    /// otherwise strand every generation a released build had pinned —
+    /// but that is the second reason, not the only one.
+    CheckSchemeChanged,
+    /// The reading itself failed, or checks errored. Re-running can
+    /// genuinely resolve this one: the warehouse may answer next time.
+    Unreadable,
+}
+
 /// What the runner observed, for the state the record is in.
 ///
 /// Each variant is produced by exactly one gathering step in
@@ -403,6 +576,13 @@ pub enum Event {
         /// Reported, never gated: deferred is not a failure, so this
         /// field is deliberately absent from the green pattern below.
         tests_deferred: Option<usize>,
+        /// Digest over the EXPANDED check set this bundle verified, when
+        /// it could be computed. Recorded on the green transition and
+        /// re-checked at observation, so an edit to a shared
+        /// `test_definitions.toml` cannot change what runs without the
+        /// loop noticing. `None` when this build or this bundle could not
+        /// ask the loader — which makes observation hold, never pass.
+        checks_digest: Option<String>,
         /// Rendered detail. Carries the deferred-checks note on the
         /// paths that counted, plus the red legs' reasons when there
         /// are any.
@@ -455,6 +635,41 @@ pub enum Event {
         /// Rendered findings, journaled.
         detail: String,
     },
+    /// The product's declared data checks were read against the APPLIED
+    /// output — the checks the verify bundle could only report deferred,
+    /// finally evaluable because the table now exists.
+    ObservationChecks {
+        /// Checks that failed at `severity = "error"`. The only signal
+        /// that routes to a repair round: positive evidence that the
+        /// live output contradicts something the product declared about
+        /// itself.
+        failed: usize,
+        /// Checks whose execution errored. NOT a failure — the runner
+        /// could not tell whether the data is right, and guessing in
+        /// either direction is worse than holding.
+        errored: usize,
+        /// Checks that failed at `severity = "warning"`. Reported, never
+        /// routed: a warning is by definition not a defect the product
+        /// declared as disqualifying.
+        warned: usize,
+        /// Declared checks that produced no verdict at all. `None` when
+        /// the read failed outright, so even the count is unknown —
+        /// distinct from `Some(0)`, which positively claims every
+        /// declared check was evaluated (the #1495 rule, applied to the
+        /// observation side).
+        deferred: Option<usize>,
+        /// The rendered evidence: which checks, and what they measured.
+        /// This is what reaches the repair worker, so it stays pure
+        /// evidence — the staleness/test reading rides beside it.
+        detail: String,
+        /// The staleness/test reading from earlier in the same pass,
+        /// already journaled, carried only so the stop message reports
+        /// the whole observation.
+        prior_detail: String,
+        /// Why the reading is incomplete, when it is. `None` on a
+        /// reading that evaluated everything it declared.
+        cause: Option<UnevaluableCause>,
+    },
     /// `blocked` re-entry with `--retry`.
     RetryRequested,
     /// A plain re-entry with nothing new observed (resume dispatch).
@@ -466,7 +681,14 @@ pub enum Event {
 // ---------------------------------------------------------------------------
 
 /// A task the runner performs next; its outcome is the next [`Event`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy`: [`Self::ObserveChecks`] carries the reading that came
+/// before it, because the two halves of an observation must end in ONE
+/// message to the human. Splitting them into two tasks is what gives the
+/// crash seam between them a real resting point; letting the second half
+/// forget the first is what would quietly drop the staleness finding out
+/// of the stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskKind {
     /// Dispatch the elicitation driver task, then do the confined
     /// candidate write.
@@ -483,6 +705,10 @@ pub enum TaskKind {
     Draft,
     /// Dispatch the repair driver task (same supervision).
     Repair,
+    /// Dispatch the data-repair driver task: same supervision, same
+    /// reopened drafting window, different brief — the worker is handed
+    /// the failing check and what it measured, not a compiler error.
+    DataRepair,
     /// Run Phase-B metadata merge through the staged commit.
     RunPhaseB,
     /// Run the runner's own verification bundle (compile, test,
@@ -500,6 +726,15 @@ pub enum TaskKind {
     LookupReceipt,
     /// The post-apply observation (scoped test + staleness read).
     Observe,
+    /// Read the product's declared data checks against the applied
+    /// output. Separate from [`Self::Observe`] so each event has exactly
+    /// one producer, and so the crash seam between the two is real.
+    ObserveChecks {
+        /// The staleness/test reading already journaled this pass,
+        /// carried so the final stop reports the whole observation
+        /// rather than only its second half.
+        prior_detail: String,
+    },
 }
 
 /// A stop: the loop can go no further without a human (or an external
@@ -1052,18 +1287,36 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
             // without this row the bundle would leave no trace at all,
             // and "verify green" would be a claim with no record of
             // what green did and did not cover.
+            // `checks_digest: Some(_)` IS in this pattern, unlike
+            // `tests_deferred`. A generation whose check set could not be
+            // digested cannot be pinned, and an unpinnable generation is
+            // doomed rather than degraded: nothing after apply can
+            // re-enter `verifying` to pin one, so observation would hold
+            // terminally on a divergence it can never resolve. Failing
+            // the bundle here costs a repair round and, if it persists,
+            // a `blocked` a human can act on — which is what an
+            // unverifiable generation should cost.
             Event::VerifyBundle {
                 compile_green: true,
                 test_green: true,
                 posture_green: true,
                 manifest_total: true,
+                checks_digest: Some(checks_digest),
                 detail,
                 ..
-            } => Decision::AdvanceAndAct {
-                record: to_state(observed, FulfillState::Verifying, now),
-                event: verify_green_event(&detail),
-                task: TaskKind::Propose,
-            },
+            } => {
+                // The green verdict is where the executed check set is
+                // pinned: this is the last point the runner validated the
+                // model, and everything after it (propose, the human
+                // review window, apply) must run the SAME checks.
+                let mut next = to_state(observed, FulfillState::Verifying, now);
+                next.checks_digest = Some(checks_digest);
+                Decision::AdvanceAndAct {
+                    record: next,
+                    event: verify_green_event(&detail),
+                    task: TaskKind::Propose,
+                }
+            }
             Event::VerifyBundle { detail, .. } => {
                 if observed.repair_rounds >= MAX_REPAIR_ROUNDS {
                     let record = blocked(
@@ -1255,50 +1508,60 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
         },
 
         // ------------------------------------------------------------------
-        // applied → observation checks → observing
+        // applied      | apply result | observation → observing
+        // observing    | runner       | staleness/test findings journaled
+        // observed_failing | red checks | re-read → repair round, or blocked
+        //
+        // One arm for all three: every entry does the SAME two readings,
+        // in the same order, and the verdict — not the state it was read
+        // from — decides where the record lands. That is what makes
+        // "a crash mid-observation re-reads the checks" structural
+        // rather than a property of one code path: `Reentry` from any of
+        // the three observes again, and nothing carries the last verdict
+        // forward.
+        //
+        // The staleness/test reading is journaled where it happens, and
+        // only then are the DECLARED checks read. Landing `observing` on
+        // the first event would record health before the one signal that
+        // can contradict it had been looked at.
         // ------------------------------------------------------------------
-        FulfillState::Applied => match event {
-            Event::Reentry => Decision::Act(TaskKind::Observe),
-            Event::ObservationDone {
-                test_green,
-                staleness_ok,
-                detail,
-            } => {
-                let next = to_state(observed, FulfillState::Observing, now);
-                Decision::AdvanceAndStop {
-                    record: next,
+        FulfillState::Applied | FulfillState::Observing | FulfillState::ObservedFailing => {
+            match event {
+                Event::Reentry => Decision::Act(TaskKind::Observe),
+                Event::ObservationDone {
+                    test_green,
+                    staleness_ok,
+                    detail,
+                } => Decision::AdvanceAndAct {
+                    record: to_state(observed, observed.state.clone(), now),
                     event: observation_event(test_green, staleness_ok, &detail),
-                    stop: Stop {
-                        message: format!("product {product} is applied; {detail}"),
-                        next_command: None,
+                    task: TaskKind::ObserveChecks {
+                        prior_detail: detail,
                     },
-                }
+                },
+                Event::ObservationChecks {
+                    failed,
+                    errored,
+                    warned,
+                    deferred,
+                    detail,
+                    prior_detail,
+                    cause,
+                } => decide_observation_checks(
+                    observed,
+                    &product,
+                    failed,
+                    errored,
+                    warned,
+                    deferred,
+                    &detail,
+                    &prior_detail,
+                    cause.as_ref(),
+                    now,
+                ),
+                other => internal_mismatch(observed, &other),
             }
-            other => internal_mismatch(observed, &other),
-        },
-
-        // ------------------------------------------------------------------
-        // observing | staleness/test findings journaled
-        // ------------------------------------------------------------------
-        FulfillState::Observing => match event {
-            Event::Reentry => Decision::Act(TaskKind::Observe),
-            Event::ObservationDone {
-                test_green,
-                staleness_ok,
-                detail,
-            } => {
-                let next = to_state(observed, FulfillState::Observing, now);
-                Decision::AdvanceAndStop {
-                    record: next,
-                    event: observation_event(test_green, staleness_ok, &detail),
-                    stop: Stop {
-                        message: format!("product {product} is live; {detail}"),
-                        next_command: None,
-                    },
-                }
-            }
-            other => internal_mismatch(observed, &other),
-        },
+        }
 
         // ------------------------------------------------------------------
         // superseded | old/new digests journaled |
@@ -1312,6 +1575,11 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
                 next.idempotency_key = None;
                 next.drafting_attempts = 0;
                 next.repair_rounds = 0;
+                // A new approved generation inherits no budget and no
+                // evidence: the checks it declares may not even be the
+                // checks the old one failed.
+                next.data_repair_rounds = 0;
+                next.observation_detail = None;
                 Decision::Advance {
                     record: next,
                     event: format!("re-entering at spec_approved ({new_digest})"),
@@ -1335,6 +1603,22 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
                 next.idempotency_key = None;
                 next.drafting_attempts = 0;
                 next.repair_rounds = 0;
+                // A human asked for another attempt after reading the
+                // remedy, so both budgets refill and the stale evidence
+                // goes — the next observation reads the checks fresh.
+                next.data_repair_rounds = 0;
+                next.observation_detail = None;
+                // The check-set pin goes with it. The re-entry is at
+                // `spec_approved`, and the only route to an observation
+                // from there runs through `verifying`, which pins a
+                // fresh digest — so this is behaviour-neutral today.
+                // It is cleared anyway so no value from an older
+                // preimage scheme can outlive the retry that was
+                // printed to escape it, and so any future path that
+                // reached observation without re-verifying would find
+                // `None` and hold, rather than compare against a stale
+                // pin.
+                next.checks_digest = None;
                 Decision::Advance {
                     record: next,
                     event: "manual retry".to_string(),
@@ -1435,6 +1719,417 @@ fn decide_marker(
 }
 
 /// The propose-outcome decision at `verifying`.
+/// The post-apply verdict on the product's declared data checks — the
+/// F3 routing decision.
+///
+/// Three landings, and which one is reached depends only on the reading:
+///
+/// ```text
+///   clean        → observing              (budget reset, evidence cleared)
+///   unevaluable  → applied                (from applied/observing)
+///                → observed_failing       (from observed_failing — no new
+///                                          news does not clear old news)
+///   failing      → observed_failing       first sighting: record and stop
+///                → drafting(data_repair)  confirmed: spend one round
+///                → blocked                budget exhausted, naming the check
+/// ```
+///
+/// The two-step failing path is deliberate. The bad data is ALREADY
+/// applied, so nothing is gained by racing: the first red is recorded in
+/// a state a human can see, and only a second reading — a fresh read from
+/// a fresh invocation, never the stored verdict — spends a repair round.
+/// A transient warehouse blip therefore cannot burn budget, and the
+/// "post-data-red pre-repair" crash seam has a real resting state to
+/// resume from.
+///
+/// Forward-only: no arm here rolls anything back. The repaired output
+/// re-enters at drafting and leaves through the same propose → human
+/// review → apply gates as any other change.
+#[allow(clippy::too_many_arguments)]
+fn decide_observation_checks(
+    observed: &FulfillStateRecord,
+    product: &str,
+    failed: usize,
+    errored: usize,
+    warned: usize,
+    deferred: Option<usize>,
+    detail: &str,
+    prior_detail: &str,
+    cause: Option<&UnevaluableCause>,
+    now: DateTime<Utc>,
+) -> Decision {
+    let verdict = classify_checks(failed, errored, deferred);
+    // One observation, one message. The staleness/test reading is
+    // already in the journal; repeating it here is what keeps a single
+    // `rocky fulfill` stop from reporting half of what it looked at.
+    let whole = if prior_detail.is_empty() {
+        detail.to_string()
+    } else {
+        format!("{prior_detail} | {detail}")
+    };
+    // `applied` on the pass that first reaches it, `live` thereafter —
+    // the pre-F3 wording, kept because it is the difference between
+    // "this just shipped" and "this is running".
+    let standing = match &observed.state {
+        FulfillState::Applied => "applied",
+        _ => "live",
+    };
+    let event = observation_checks_event(&verdict, failed, errored, warned, deferred, detail);
+    match verdict {
+        // Every declared check ran, none failed. This is the ONLY path
+        // to `observing`, and it is where the data-repair budget resets:
+        // the cycle closed, so the next red starts from a full ceiling.
+        CheckVerdict::Clean => {
+            let mut next = to_state(observed, FulfillState::Observing, now);
+            next.data_repair_rounds = 0;
+            next.observation_detail = None;
+            Decision::AdvanceAndStop {
+                record: next,
+                event,
+                stop: Stop {
+                    message: format!("product {product} is {standing}; {whole}"),
+                    next_command: None,
+                },
+            }
+        }
+        // Something could not be evaluated. Never `observing`: claiming
+        // health on checks that did not run is the exact dishonesty this
+        // work package exists to remove. Never a repair round either —
+        // "cannot tell" is not "the data is wrong", and rewriting a
+        // model on a suspicion spends a live-table cycle on a guess.
+        //
+        // This is where the loop diverges from `rocky test
+        // --declarative`, which exits non-zero when a check errors. The
+        // CLI is reporting to a human who will read the error; the loop
+        // is deciding whether to rewrite a model, and the honest answer
+        // to an unreadable check is to stop and say so.
+        CheckVerdict::Unevaluable => {
+            // A digest pinned under an older PREIMAGE SCHEME is handled
+            // before anything else, because it is the one cause whose
+            // landing state differs. Everything below assumes the two
+            // digests were comparable and one of them moved; this one
+            // says they were never comparable at all.
+            //
+            // It cannot land at `applied` like the others. That state is
+            // the honest "observation not concluded" holding pattern for
+            // conditions a later run can resolve — and this one cannot:
+            // re-running recomputes the same current-scheme digest and
+            // compares it against the same old-scheme value, forever.
+            // `applied` is also in `rocky product approve`'s in-flight
+            // refusal set, so the operator would be left with no route
+            // out at all. `blocked` has two exits, and the SECOND IS
+            // CONDITIONAL. That distinction is the correction: this
+            // comment used to say only "`approve` is accepted from the
+            // stop set", which checks that the verb is PERMITTED here
+            // and reads as if that meant it recovers. Those are
+            // different properties, and only one of them was verified.
+            //
+            //  1. `--retry` — unconditional. `Event::RetryRequested` on
+            //     `Blocked` re-enters at `spec_approved` (or `init` when
+            //     no spec digest is recorded), clears `checks_digest`,
+            //     and the fresh generation pins its own digest at its
+            //     own verify. This is the exit that always works, and it
+            //     is the one the stop message prints.
+            //  2. `rocky product approve` — permitted, but under TWO
+            //     conditions, and it only MOVES the record under a third.
+            //     `product_approve_in` refuses on `active_state ||
+            //     driver_pgid.is_some()`. `blocked` is absent from
+            //     `active_state`, and `blocked()` here does NOT clear
+            //     `driver_pgid` — `step.rs`'s `release` does, on every
+            //     clean stop, which is what leaves the record approvable
+            //     at rest. Then: re-approving the UNCHANGED spec takes
+            //     that function's same-digest early return, which
+            //     verifies the snapshot and returns having written
+            //     nothing — no approval record, no state record, no
+            //     journal row — so the record is still blocked
+            //     afterwards. Only a new digest reaches the CAS that
+            //     replaces the fulfillment record with `spec_approved`.
+            //     The exit is therefore "edit the spec, then approve",
+            //     never "approve again".
+            if matches!(cause, Some(UnevaluableCause::RoutingEvidenceMissing)) {
+                let reason = format!(
+                    "{detail} — re-running cannot recreate this evidence, and the \
+                     configuration is not the problem, so no restore clears it. `--retry` \
+                     starts a fresh generation that records its own routing identity at its \
+                     own propose"
+                );
+                let record = blocked(observed, reason, now);
+                return blocked_stop(
+                    record,
+                    "routing evidence missing under an applied generation".to_string(),
+                    product,
+                    detail,
+                );
+            }
+            if matches!(cause, Some(UnevaluableCause::CheckSchemeChanged)) {
+                // WHAT THIS ARM MAY AND MAY NOT SAY ABOUT DISK.
+                //
+                // It used to say "nothing on disk changed". That is an
+                // over-claim of exactly the kind this work package keeps
+                // finding, and it is now inside the new code: the scheme
+                // branch in `step.rs` returns BEFORE binding the check
+                // set, so no expansion is loaded and nothing is compared.
+                // An edit to `models/test_definitions.toml` is invisible
+                // to every hash that DID run — the file is not a lowering
+                // artifact and appears in no manifest — so it can sit
+                // underneath a scheme mismatch perfectly happily.
+                //
+                // What the branch does prove is narrower, and it is worth
+                // stating rather than dropping: the arm is gated on
+                // `custody.is_empty()`, so the manifested artifacts were
+                // checked and matched, and the lowering is committed at
+                // `merged`. Beyond those, disk custody here is UNKNOWN,
+                // not clean.
+                //
+                //   manifested artifacts ─▶ compared, matched
+                //   expanded check set   ─▶ NEVER LOADED (returned first)
+                //   test_definitions.toml─▶ inside that expansion ⇒ unknown
+                //
+                // Unknown does not change the remedy: a hash algorithm is
+                // not restorable either way, and `--retry` re-pins the
+                // whole expansion under the current scheme, which settles
+                // the unknown as a side effect. So the message states the
+                // limit and keeps the same exit.
+                let reason = format!(
+                    "{detail} — the manifested artifacts still match, and the lowering is \
+                     committed. The expanded check set was never loaded here. So whether an \
+                     unmanifested file such as `models/test_definitions.toml` also moved is \
+                     UNKNOWN. No restore alters a hash algorithm either way. Re-running this \
+                     generation cannot resolve it: only a fresh generation pins a digest, at \
+                     its own verify. That re-pin covers the whole expansion, so it settles \
+                     the unknown too"
+                );
+                let record = blocked(observed, reason, now);
+                return blocked_stop(
+                    record,
+                    "check-set digest scheme changed under an applied generation".to_string(),
+                    product,
+                    detail,
+                );
+            }
+            let landing = match &observed.state {
+                // No new news does not clear old news: a product already
+                // known to be failing stays failing.
+                FulfillState::ObservedFailing => FulfillState::ObservedFailing,
+                // "Applied, observation not concluded" — the honest
+                // state, and the one whose re-entry re-reads.
+                _ => FulfillState::Applied,
+            };
+            let next = to_state(observed, landing, now);
+            // One verdict, three causes, three remedies. Printing "run
+            // the loop again" for a custody divergence would name a
+            // command that re-reads the same diverged file and reports
+            // the same thing forever — an instruction that cannot
+            // resolve what it was printed for is worse than no
+            // instruction.
+            // The custody remedy is a RESTORE, not a command, and saying
+            // so is the only honest option available.
+            //
+            // `rocky product compile` was offered here and does not work
+            // for either drift class: it refuses outright on sidecar
+            // drift (`phase-a-tampered`), and on a `test_definitions.toml`
+            // edit it re-lowers the sidecar without touching the
+            // definitions, so the expansion still diverges. Nor can the
+            // loop adopt the edit — the only route into `verifying` is
+            // from `merged`, and an applied product can never reach it
+            // again, so no post-apply path can pin a new digest.
+            //
+            // What remains true: undo the edit and the digests match, or
+            // put the change in the spec and approve it, which writes a
+            // fresh record at `spec_approved` (outside this table, in the
+            // approve verb) and re-pins at that generation's own verify.
+            //
+            // Those two are SEQUENTIAL, not alternatives. This arm lands
+            // the record back at `applied` (see `landing` above), and
+            // `rocky product approve` refuses every in-flight state,
+            // `applied` included — grounded by
+            // `approving_refuses_at_applied_and_permits_at_observing` in
+            // rocky-cli, which drives the real verb from both states. So
+            // the spec route does not open until the restore has let the
+            // loop finish observing and leave `applied`. The message
+            // prints that order: a remedy whose second half is refused
+            // from the state it is printed in is not a remedy.
+            //
+            //   custody stop ──▶ applied ──(approve REFUSED)
+            //        │
+            //        └─ restore ─▶ rocky fulfill ─▶ observing / observed_failing
+            //                                              │
+            //                                              └─ approve is accepted here
+            //
+            // `rocky fulfill` is named because it IS the command that
+            // resolves this — after the restore, which the message states
+            // first so the order is not a guess.
+            //
+            // The spec route is also QUALIFIED, because it does not fit
+            // every divergence. `output.checks` is a list of opaque SQL
+            // boolean strings and the lowering turns each one into an
+            // `expression` test at `severity = "error"` — so a changed
+            // `row_count_range`, a `warning` severity, a `filter`, or a
+            // `[[use_test]]` reference has no spec spelling at all.
+            // Naming `checks` bare told an operator to carry a change
+            // the field cannot hold, which is the same defect as naming
+            // a command that cannot run. See `UnevaluableCause` for the
+            // grounding and the lowering-side pin.
+            //
+            // The QUALIFICATION itself then over-corrected, and that is
+            // the same defect with the sign flipped. It listed `unique`
+            // flat among the unspellable shapes, but `output.grain`
+            // lowers straight to one — `unique` on a single grain
+            // column, `composite` + `kind = "unique"` over several
+            // (`product::lowering::generated_tests`, pinned there in
+            // both arms). What has no spelling is uniqueness that is
+            // NOT the declared grain. An over-claim about our own gate
+            // and an under-claim about our own spec both send an
+            // operator down a route the code does not support, so the
+            // sentence is checked in both directions by
+            // `applied_unevaluable_holds_and_names_the_restore`.
+            let (next_command, remedy) = match cause {
+                Some(UnevaluableCause::CheckCustody) => (
+                    format!("rocky fulfill {product}"),
+                    " — restore the file you changed and re-run; the loop cannot adopt an \
+                     edit here, because nothing after an apply can re-verify a new set of \
+                     checks. To keep the change instead, take it in this order: restore, \
+                     re-run until the loop leaves `applied` (`observing` when the checks \
+                     pass, `observed_failing` when one is genuinely red), and only then put \
+                     the change in the product spec and approve the spec again. Approving \
+                     is refused while the state is `applied`, so that order is not \
+                     optional. Check first that the spec can hold your change: \
+                     `output.checks` takes a SQL boolean and always lowers it to an \
+                     error-severity `expression` test, a not-null comes from an \
+                     `output.columns` entry with `nullable = false`, and `output.grain` \
+                     lowers to exactly one uniqueness check — `unique` on a single grain \
+                     column, or `composite` with `kind = \"unique\"` over several. Anything \
+                     else has no spec spelling: a uniqueness check that is not the declared \
+                     grain, another typed shape such as `row_count_range`, a `warning` \
+                     severity, a `filter`, or a `[[use_test]]` reference. For those the \
+                     restore is the whole remedy"
+                        .to_string(),
+                ),
+                // Named, not folded in with the bare re-run. Re-running
+                // binds the SAME diverged config and reports the same
+                // thing forever, so "rocky fulfill" alone is the remedy
+                // that cannot resolve what it is printed for.
+                //
+                // Both causes, because the compared value is
+                // env-resolved and the two are indistinguishable in it.
+                // Telling an operator who changed no file to restore one
+                // is the wrong-remedy defect this branch already
+                // rejected once, for credentials.
+                Some(UnevaluableCause::RoutingDiverged) => (
+                    format!("rocky fulfill {product}"),
+                    " — the checks are the verified ones, but the configuration this \
+                     generation applied under is not the configuration now on disk, so the \
+                     checks were not run: they could read a table this generation never \
+                     wrote. WHAT IS COMPARED is the same value `rocky apply` refuses on — \
+                     every adapter and every pipeline, serialised. That is broader than the \
+                     warehouse: editing an unrelated pipeline's `execution`, `schedule` or \
+                     `models` moves it too, and this hold cannot tell that apart from a \
+                     genuine re-route. Causes, in the order worth checking: the config was \
+                     edited; a `${VAR}` in an adapter or pipeline field resolved to a \
+                     different value in this process (check the environment first if you \
+                     changed no file); or this binary serialises that value differently \
+                     from the one that wrote the plan. Put the configuration back as the \
+                     apply saw it and re-run. To move the product somewhere else instead, \
+                     that is a new generation: restore, re-run until the loop leaves \
+                     `applied`, then change the config and approve the spec again. \
+                     Credentials are not part of this value, so a rotation never causes it"
+                        .to_string(),
+                ),
+                // Enumerated, not defaulted. A `_ =>` here is how a
+                // fourth cause would silently acquire "re-run the loop"
+                // — the remedy that is right only when re-running can
+                // change the answer. `CheckSchemeChanged` is listed and
+                // unreachable because it returned above; writing it out
+                // means a variant added later has to come to this match
+                // and choose.
+                Some(UnevaluableCause::CheckSchemeChanged)
+                | Some(UnevaluableCause::RoutingEvidenceMissing)
+                | Some(UnevaluableCause::Unreadable)
+                | None => (format!("rocky fulfill {product}"), String::new()),
+            };
+            Decision::AdvanceAndStop {
+                record: next,
+                event,
+                stop: Stop {
+                    message: format!(
+                        "product {product} is applied, but its declared data checks could not \
+                         be evaluated, so nothing here says the output is right: {whole}{remedy}"
+                    ),
+                    next_command: Some(next_command),
+                },
+            }
+        }
+        CheckVerdict::Failing => {
+            // One ceiling, two counters. `repair_rounds` cannot serve
+            // here: `decide_proposed` resets it to 0 on every successful
+            // propose, and a data-red cycle proposes every lap, so the
+            // bound would never bind. See `FulfillStateRecord::
+            // data_repair_rounds`.
+            if observed.data_repair_rounds >= MAX_REPAIR_ROUNDS {
+                let record = blocked(
+                    observed,
+                    format!(
+                        "the applied output still fails its declared data checks after \
+                         {MAX_REPAIR_ROUNDS} repair rounds: {detail}"
+                    ),
+                    now,
+                );
+                return blocked_stop(
+                    record,
+                    format!("data repair budget exhausted: {detail}"),
+                    product,
+                    detail,
+                );
+            }
+            match &observed.state {
+                // Confirmed by a second, independent reading: spend one
+                // round. The evidence is refreshed from THIS reading —
+                // the worker must act on what is true now, not on what
+                // was true when the red was first recorded.
+                FulfillState::ObservedFailing => {
+                    let mut next = to_state(observed, FulfillState::Drafting, now);
+                    next.data_repair_rounds = observed.data_repair_rounds + 1;
+                    next.drafting_attempts = 1;
+                    // Persisted WITH the transition that decided them, so
+                    // a crash before the worker starts resumes into the
+                    // same round carrying the same evidence (#1493's
+                    // lesson, applied to the data-red path).
+                    next.drafting_round = DraftingRound::DataRepair;
+                    next.observation_detail = Some(truncate_detail(detail));
+                    Decision::AdvanceAndAct {
+                        record: next,
+                        event: format!(
+                            "data repair round {} ({detail})",
+                            observed.data_repair_rounds + 1
+                        ),
+                        task: round_task(DraftingRound::DataRepair),
+                    }
+                }
+                // First sighting: record it and stop. The state says
+                // plainly that the live output is failing its own
+                // declared checks — it is never a healthy `observing`.
+                _ => {
+                    let mut next = to_state(observed, FulfillState::ObservedFailing, now);
+                    next.observation_detail = Some(truncate_detail(detail));
+                    Decision::AdvanceAndStop {
+                        record: next,
+                        event,
+                        stop: Stop {
+                            message: format!(
+                                "product {product} is applied, and the applied output is failing \
+                                 its own declared data checks: {whole} — re-run to confirm the \
+                                 reading and start a repair round (the repaired model goes back \
+                                 through review before it applies)"
+                            ),
+                            next_command: Some(format!("rocky fulfill {product}")),
+                        },
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn decide_proposed(
     observed: &FulfillStateRecord,
     product: &str,
@@ -1685,7 +2380,92 @@ fn round_task(round: DraftingRound) -> TaskKind {
     match round {
         DraftingRound::Draft => TaskKind::Draft,
         DraftingRound::Repair => TaskKind::Repair,
+        DraftingRound::DataRepair => TaskKind::DataRepair,
     }
+}
+
+/// The longest `observation_detail` the record will carry.
+///
+/// The evidence is warehouse-shaped: a model can declare many checks and
+/// every one of them can fail at once. The record is compare-and-set as a
+/// whole on every transition, so an unbounded string is an unbounded cost
+/// on every subsequent write. Truncation is visible, never silent — the
+/// marker says what was dropped.
+const MAX_OBSERVATION_DETAIL: usize = 4000;
+
+/// Cap the observed evidence at [`MAX_OBSERVATION_DETAIL`], on a char
+/// boundary, with a marker naming the loss.
+///
+/// Pure so the boundary behaviour is pinned by test rather than by
+/// reading: slicing a multi-byte string at a byte index panics, and the
+/// evidence is the one field in the record built from data the loop does
+/// not author.
+fn truncate_detail(detail: &str) -> String {
+    if detail.len() <= MAX_OBSERVATION_DETAIL {
+        return detail.to_string();
+    }
+    let mut end = MAX_OBSERVATION_DETAIL;
+    while end > 0 && !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}… [evidence truncated at {MAX_OBSERVATION_DETAIL} bytes]",
+        &detail[..end]
+    )
+}
+
+/// The three-way verdict on a reading of the declared data checks.
+///
+/// Named rather than inlined because the ORDER of the arms is the whole
+/// decision: positive evidence of failure outranks a partial reading, and
+/// a partial reading outranks a clean tally. Inverting the last two would
+/// let "we could not evaluate anything" render as health.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CheckVerdict {
+    /// At least one declared check failed at `severity = "error"`.
+    Failing,
+    /// Nothing failed, but the reading is incomplete — some check
+    /// errored, or the read could not evaluate everything it declared.
+    Unevaluable,
+    /// Every declared check was evaluated and none failed. Warnings may
+    /// be present; a warning is not a defect.
+    Clean,
+}
+
+/// Classify a check reading. See [`CheckVerdict`] for why the order is
+/// load-bearing.
+fn classify_checks(failed: usize, errored: usize, deferred: Option<usize>) -> CheckVerdict {
+    if failed > 0 {
+        return CheckVerdict::Failing;
+    }
+    if errored > 0 || deferred != Some(0) {
+        return CheckVerdict::Unevaluable;
+    }
+    CheckVerdict::Clean
+}
+
+/// The journal event for one reading of the declared data checks.
+fn observation_checks_event(
+    verdict: &CheckVerdict,
+    failed: usize,
+    errored: usize,
+    warned: usize,
+    deferred: Option<usize>,
+    detail: &str,
+) -> String {
+    let head = match verdict {
+        CheckVerdict::Failing => "declared data checks FAILING",
+        CheckVerdict::Unevaluable => "declared data checks not evaluable",
+        CheckVerdict::Clean => "declared data checks green",
+    };
+    let deferred = match deferred {
+        Some(n) => n.to_string(),
+        None => "unknown".to_string(),
+    };
+    format!(
+        "observation: {head} ({failed} failed, {errored} errored, {warned} warned, \
+         {deferred} unevaluated): {detail}"
+    )
 }
 
 /// The ONE wording for unevaluated declared data checks.
@@ -2605,6 +3385,7 @@ mod tests {
             manifest_total: true,
             tests_deferred: Some(tests_deferred),
             detail: deferred_note(tests_deferred).unwrap_or_default(),
+            checks_digest: Some("sha256:verified".to_string()),
         }
     }
 
@@ -2702,6 +3483,7 @@ mod tests {
                 manifest_total: true,
                 tests_deferred: None,
                 detail: note.clone(),
+                checks_digest: Some("sha256:verified".to_string()),
             },
             now(),
         );
@@ -2731,6 +3513,7 @@ mod tests {
                 manifest_total: true,
                 tests_deferred: Some(6),
                 detail: "test failures: revenue_daily: binder error".into(),
+                checks_digest: Some("sha256:verified".to_string()),
             },
             now(),
         );
@@ -2755,6 +3538,7 @@ mod tests {
                 manifest_total: true,
                 tests_deferred: Some(6),
                 detail: "E012 on revenue_eur".into(),
+                checks_digest: Some("sha256:verified".to_string()),
             },
             now(),
         );
@@ -2796,6 +3580,7 @@ mod tests {
                 manifest_total: true,
                 tests_deferred: None,
                 detail: "E012 on revenue_eur".into(),
+                checks_digest: Some("sha256:verified".to_string()),
             },
             now(),
         );
@@ -2904,6 +3689,7 @@ mod tests {
                 manifest_total: true,
                 tests_deferred: Some(6),
                 detail: "unique(client_id,date) failed".into(),
+                checks_digest: Some("sha256:verified".to_string()),
             },
             now(),
         );
@@ -3457,7 +4243,7 @@ mod tests {
     // =====================================================================
 
     #[test]
-    fn applied_observes_then_settles_into_observing() {
+    fn applied_journals_the_reading_then_reads_the_declared_checks() {
         let d = decide(&rec(FulfillState::Applied), Event::Reentry, now());
         assert_eq!(d, Decision::Act(TaskKind::Observe));
         let d = decide(
@@ -3469,10 +4255,26 @@ mod tests {
             },
             now(),
         );
-        let Decision::AdvanceAndStop { record, event, .. } = d else {
-            panic!("expected AdvanceAndStop, got {d:?}");
+        let Decision::AdvanceAndAct {
+            record,
+            event,
+            task,
+        } = d
+        else {
+            panic!("expected AdvanceAndAct, got {d:?}");
         };
-        assert_eq!(record.state, FulfillState::Observing);
+        // The staleness/test reading is journaled where it happened, but
+        // NO health is claimed yet: `observing` is not reachable until
+        // the declared checks have been read.
+        assert_eq!(record.state, FulfillState::Applied, "no state claimed yet");
+        assert_eq!(
+            task,
+            TaskKind::ObserveChecks {
+                prior_detail: "lag 60s, budget 86400s".to_string()
+            },
+            "the reading is carried forward, so the final stop reports the whole \
+             observation and not only its second half"
+        );
         assert!(event.contains("staleness fresh"));
     }
 
@@ -3489,12 +4291,826 @@ mod tests {
             },
             now(),
         );
+        let Decision::AdvanceAndAct {
+            record,
+            event,
+            task,
+        } = d
+        else {
+            panic!("expected AdvanceAndAct, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::Observing, "stays observing");
+        assert_eq!(
+            task,
+            TaskKind::ObserveChecks {
+                prior_detail: "lag 200000s, budget 86400s".to_string()
+            }
+        );
+        assert!(event.contains("tests RED"));
+        assert!(event.contains("staleness STALE"));
+    }
+
+    // =====================================================================
+    // F3 — the declared data checks, read against the APPLIED output
+    // =====================================================================
+
+    /// A rendered reading in the shape `step::render_check_findings`
+    /// actually produces — the "N of M" prefix included.
+    ///
+    /// Fixtures that omit the prefix silently weaken every message
+    /// assertion made against them: the assertion still passes or fails,
+    /// but about a string production never emits. Shared as a constant so
+    /// the exact-match assertions and the message assertions cannot drift
+    /// apart.
+    const CHECK_DETAIL: &str = "3 of 4 declared data checks passed; \
+         revenue_daily.client_id [unique] fail (error): 4 duplicate value(s) found";
+
+    /// The reading, with everything green unless a field says otherwise.
+    fn checks(failed: usize, errored: usize, warned: usize, deferred: Option<usize>) -> Event {
+        Event::ObservationChecks {
+            failed,
+            errored,
+            warned,
+            deferred,
+            detail: CHECK_DETAIL.into(),
+            prior_detail: "MAX(loaded_at) = t, lag 60s, budget 86400s".into(),
+            cause: (errored > 0 || deferred != Some(0)).then_some(UnevaluableCause::Unreadable),
+        }
+    }
+
+    /// THE REGRESSION PIN. A clean reading still lands `observing`, from
+    /// both entry states, and it is the only verdict that does.
+    #[test]
+    fn a_clean_reading_is_the_only_path_to_observing() {
+        for from in [FulfillState::Applied, FulfillState::Observing] {
+            let mut prior = rec(from.clone());
+            // A product that spent budget on an earlier red arrives here
+            // carrying it; a closed cycle refills the ceiling.
+            prior.data_repair_rounds = 2;
+            prior.observation_detail = Some("stale evidence from the last red".into());
+            let d = decide(&prior, checks(0, 0, 0, Some(0)), now());
+            let Decision::AdvanceAndStop { record, event, .. } = d else {
+                panic!("expected AdvanceAndStop from {from:?}, got {d:?}");
+            };
+            assert_eq!(record.state, FulfillState::Observing, "from {from:?}");
+            assert_eq!(record.data_repair_rounds, 0, "the cycle closed");
+            assert_eq!(
+                record.observation_detail, None,
+                "evidence from a red that is no longer true must not survive it"
+            );
+            assert!(event.contains("green"), "{event}");
+        }
+    }
+
+    /// Freshness and warning-severity checks REPORT; they never route.
+    ///
+    /// Staleness is a scheduling fact far more often than a model defect,
+    /// and a `severity = "warning"` check is by definition one the
+    /// product did not declare disqualifying. Rewriting SQL on either
+    /// would spend a live-table cycle on something the rewrite cannot
+    /// fix.
+    #[test]
+    fn warnings_and_staleness_report_but_never_route_to_repair() {
+        // Stale, and its model tests red — the pre-F3 signals — with
+        // every declared check passing.
+        let d = decide(
+            &rec(FulfillState::Applied),
+            Event::ObservationDone {
+                test_green: false,
+                staleness_ok: Some(false),
+                detail: "lag 200000s, budget 86400s".into(),
+            },
+            now(),
+        );
+        assert!(
+            matches!(&d, Decision::AdvanceAndAct { task, .. }
+                if matches!(task, TaskKind::ObserveChecks { .. })),
+            "staleness routes nowhere on its own: {d:?}"
+        );
+        let d = decide(&rec(FulfillState::Applied), checks(0, 0, 7, Some(0)), now());
         let Decision::AdvanceAndStop { record, event, .. } = d else {
             panic!("expected AdvanceAndStop, got {d:?}");
         };
-        assert_eq!(record.state, FulfillState::Observing, "stays observing");
-        assert!(event.contains("tests RED"));
-        assert!(event.contains("staleness STALE"));
+        assert_eq!(
+            record.state,
+            FulfillState::Observing,
+            "seven warnings are seven reports, not a defect"
+        );
+        assert!(
+            event.contains("7 warned"),
+            "the count is journaled: {event}"
+        );
+    }
+
+    /// A first red is RECORDED, in a state that says what is wrong, and
+    /// the loop stops there. It does not repair on one reading.
+    #[test]
+    fn a_first_data_red_lands_the_visibly_distinct_state_and_stops() {
+        let d = decide(&rec(FulfillState::Applied), checks(1, 0, 0, Some(0)), now());
+        let Decision::AdvanceAndStop {
+            record,
+            event,
+            stop,
+        } = d
+        else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::ObservedFailing);
+        assert_ne!(
+            record.state,
+            FulfillState::Observing,
+            "a failing product must never be recorded as a healthy one"
+        );
+        assert_eq!(
+            record.data_repair_rounds, 0,
+            "recording a red spends nothing; only a confirmed one does"
+        );
+        assert_eq!(
+            record.observation_detail.as_deref(),
+            Some(CHECK_DETAIL),
+            "the evidence is persisted for the worker that must act on it"
+        );
+        assert!(event.contains("FAILING"), "{event}");
+        // The human-facing message names the check and the actual value,
+        // and promises the review gate rather than a silent fix.
+        assert!(
+            stop.message
+                .contains("failing its own declared data checks")
+        );
+        assert!(stop.message.contains("4 duplicate value(s) found"));
+        assert!(stop.message.contains("review"));
+    }
+
+    /// Resume honesty: entering the data-red state re-READS the checks.
+    /// Nothing loads the stored verdict.
+    #[test]
+    fn the_data_red_state_re_reads_the_checks_rather_than_assuming_the_verdict() {
+        let mut prior = rec(FulfillState::ObservedFailing);
+        prior.observation_detail = Some("the verdict from before the crash".into());
+        assert_eq!(
+            decide(&prior, Event::Reentry, now()),
+            Decision::Act(TaskKind::Observe),
+            "a crashed data-red resumes into a reading, never into its own last answer"
+        );
+        // And a re-read that comes back CLEAN releases it — a red is not
+        // a trap, it is the current answer.
+        let d = decide(&prior, checks(0, 0, 0, Some(0)), now());
+        let Decision::AdvanceAndStop { record, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::Observing);
+        assert_eq!(record.observation_detail, None);
+    }
+
+    /// A CONFIRMED red — a second, independent reading — spends exactly
+    /// one round and dispatches the data-repair brief.
+    #[test]
+    fn a_confirmed_data_red_spends_one_round_and_dispatches_the_data_repair_task() {
+        let mut prior = rec(FulfillState::ObservedFailing);
+        prior.data_repair_rounds = 1;
+        prior.drafting_attempts = 5;
+        prior.observation_detail = Some("the FIRST reading's evidence".into());
+        let d = decide(&prior, checks(2, 0, 0, Some(0)), now());
+        let Decision::AdvanceAndAct {
+            record,
+            event,
+            task,
+        } = d
+        else {
+            panic!("expected AdvanceAndAct, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::Drafting);
+        assert_eq!(task, TaskKind::DataRepair);
+        assert_eq!(record.data_repair_rounds, 2, "exactly one round spent");
+        assert_eq!(record.repair_rounds, 0, "the verify budget is untouched");
+        assert_eq!(record.drafting_attempts, 1, "a fresh compile-loop budget");
+        assert_eq!(
+            record.drafting_round,
+            DraftingRound::DataRepair,
+            "persisted WITH the deciding transition, so a crash before the \
+             worker starts resumes into the same round"
+        );
+        assert_eq!(
+            record.observation_detail.as_deref(),
+            Some(CHECK_DETAIL),
+            "the worker acts on what is true NOW, not on the first reading"
+        );
+        assert!(event.contains("data repair round 2"), "{event}");
+    }
+
+    /// An errored check is "cannot tell", and cannot tell is neither
+    /// health nor a licence to rewrite a model.
+    #[test]
+    fn an_errored_check_holds_and_never_reads_as_health() {
+        let d = decide(
+            &rec(FulfillState::Observing),
+            checks(0, 3, 0, Some(0)),
+            now(),
+        );
+        let Decision::AdvanceAndStop {
+            record,
+            event,
+            stop,
+        } = d
+        else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert_eq!(
+            record.state,
+            FulfillState::Applied,
+            "applied, observation not concluded — never a healthy `observing`"
+        );
+        assert_eq!(record.data_repair_rounds, 0, "no round is spent on a guess");
+        assert!(event.contains("not evaluable"), "{event}");
+        assert!(stop.message.contains("could not be evaluated"));
+    }
+
+    /// A reading that cannot even count is not a reading of zero
+    /// problems — the #1495 rule, on the observation side.
+    #[test]
+    fn an_uncountable_reading_holds_rather_than_claiming_zero() {
+        for deferred in [None, Some(2)] {
+            let d = decide(
+                &rec(FulfillState::Applied),
+                checks(0, 0, 0, deferred),
+                now(),
+            );
+            let Decision::AdvanceAndStop { record, event, .. } = d else {
+                panic!("expected AdvanceAndStop for {deferred:?}, got {d:?}");
+            };
+            assert_eq!(
+                record.state,
+                FulfillState::Applied,
+                "an incomplete reading claims nothing: {deferred:?}"
+            );
+            assert!(event.contains("not evaluable"), "{event}");
+        }
+    }
+
+    /// No new news does not clear old news.
+    #[test]
+    fn an_unevaluable_reading_from_the_data_red_state_stays_failing() {
+        let mut prior = rec(FulfillState::ObservedFailing);
+        prior.observation_detail = Some("4 duplicate value(s) found".into());
+        let d = decide(&prior, checks(0, 1, 0, Some(0)), now());
+        let Decision::AdvanceAndStop { record, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert_eq!(
+            record.state,
+            FulfillState::ObservedFailing,
+            "a product already known to be failing is not cleared by a reading \
+             that could not tell"
+        );
+        assert_eq!(
+            record.observation_detail.as_deref(),
+            Some("4 duplicate value(s) found"),
+            "and the last real evidence survives"
+        );
+    }
+
+    /// The ceiling binds: repeated data-reds land `blocked`, naming the
+    /// check. No unbounded repair cycle against a live table.
+    #[test]
+    fn repeated_data_reds_exhaust_the_ceiling_and_block_naming_the_check() {
+        for from in [FulfillState::Applied, FulfillState::ObservedFailing] {
+            let mut prior = rec(from.clone());
+            prior.data_repair_rounds = MAX_REPAIR_ROUNDS;
+            let d = decide(&prior, checks(1, 0, 0, Some(0)), now());
+            let Decision::AdvanceAndStop {
+                record,
+                event,
+                stop,
+            } = d
+            else {
+                panic!("expected AdvanceAndStop from {from:?}, got {d:?}");
+            };
+            let FulfillState::Blocked { reason } = &record.state else {
+                panic!("expected blocked from {from:?}, got {:?}", record.state);
+            };
+            assert!(
+                reason.contains("4 duplicate value(s) found"),
+                "the block names the check that would not go green: {reason}"
+            );
+            assert!(reason.contains(&MAX_REPAIR_ROUNDS.to_string()), "{reason}");
+            assert!(event.contains("budget exhausted"), "{event}");
+            assert_eq!(
+                stop.next_command.as_deref(),
+                Some("rocky fulfill revenue_daily --retry"),
+                "a human is the escalation, not another round"
+            );
+        }
+    }
+
+    /// The two budgets are separate because they RESET differently, and
+    /// this is the difference that makes the data ceiling bind at all.
+    ///
+    /// `decide_proposed` clears `repair_rounds` on every successful
+    /// propose. A data-red cycle proposes every lap (red → repair →
+    /// propose → apply → red), so a shared counter would be zeroed each
+    /// time and the ceiling would never be reached.
+    #[test]
+    fn a_propose_resets_the_verify_budget_and_never_the_data_budget() {
+        let mut prior = rec(FulfillState::Verifying);
+        prior.repair_rounds = 2;
+        prior.data_repair_rounds = 2;
+        let d = decide(
+            &prior,
+            Event::Proposed {
+                outcome: ProposeSummary::Written {
+                    plan_id: "plan-2".into(),
+                },
+                plan_payload_digest: None,
+                approved_digest: None,
+                idempotency_key: "k".into(),
+            },
+            now(),
+        );
+        let Decision::Advance { record, .. } = d else {
+            panic!("expected Advance, got {d:?}");
+        };
+        assert_eq!(record.repair_rounds, 0, "the verify cycle closed");
+        assert_eq!(
+            record.data_repair_rounds, 2,
+            "the data cycle has NOT closed — the output is not observed yet, \
+             and zeroing here is what would make the ceiling vacuous"
+        );
+    }
+
+    /// A human intervention refills both budgets and drops the evidence.
+    #[test]
+    fn a_retry_and_a_supersession_both_clear_the_data_budget_and_evidence() {
+        let mut blocked_rec = rec(FulfillState::Blocked {
+            reason: "the applied output still fails its declared data checks".into(),
+        });
+        blocked_rec.spec_digest = Some("sha256:aa".into());
+        blocked_rec.data_repair_rounds = MAX_REPAIR_ROUNDS;
+        blocked_rec.observation_detail = Some("4 duplicate value(s) found".into());
+        let Decision::Advance { record, .. } = decide(&blocked_rec, Event::RetryRequested, now())
+        else {
+            panic!("expected Advance");
+        };
+        assert_eq!(record.data_repair_rounds, 0);
+        assert_eq!(record.observation_detail, None);
+
+        let mut superseded = rec(FulfillState::Superseded {
+            old_digest: "sha256:aa".into(),
+            new_digest: "sha256:bb".into(),
+        });
+        superseded.data_repair_rounds = 2;
+        superseded.observation_detail = Some("4 duplicate value(s) found".into());
+        let Decision::Advance { record, .. } = decide(&superseded, Event::Reentry, now()) else {
+            panic!("expected Advance");
+        };
+        assert_eq!(record.data_repair_rounds, 0);
+        assert_eq!(
+            record.observation_detail, None,
+            "a new generation may not even declare the check the old one failed"
+        );
+    }
+
+    /// One observation, one message — and the standing word is the one
+    /// the reader had before F3.
+    ///
+    /// Splitting the observation into two readings must not cost the
+    /// human half the answer: the staleness finding is journaled by the
+    /// first reading and would otherwise vanish from the stop, which is
+    /// the only place most people ever look. And the first pass still
+    /// says "applied" while later ones say "live" — that difference is
+    /// how a reader tells a fresh ship from a running product.
+    #[test]
+    fn one_observation_reports_as_one_message_with_the_standing_word_intact() {
+        let d = decide(&rec(FulfillState::Applied), checks(0, 0, 0, Some(0)), now());
+        let Decision::AdvanceAndStop { stop, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert!(
+            stop.message.contains("is applied;"),
+            "the first pass to reach it says applied: {}",
+            stop.message
+        );
+        assert!(
+            stop.message.contains("lag 60s, budget 86400s"),
+            "the staleness reading must survive into the stop: {}",
+            stop.message
+        );
+        assert!(
+            stop.message.contains("declared data checks"),
+            "and so must the check reading: {}",
+            stop.message
+        );
+
+        let d = decide(
+            &rec(FulfillState::Observing),
+            checks(0, 0, 0, Some(0)),
+            now(),
+        );
+        let Decision::AdvanceAndStop { stop, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert!(
+            stop.message.contains("is live;"),
+            "a product already observed says live: {}",
+            stop.message
+        );
+
+        // A red stop carries the whole observation too — the human
+        // deciding whether to let a repair run needs both halves.
+        let d = decide(&rec(FulfillState::Applied), checks(1, 0, 0, Some(0)), now());
+        let Decision::AdvanceAndStop { stop, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert!(stop.message.contains("lag 60s"), "{}", stop.message);
+        assert!(
+            stop.message.contains("4 duplicate value(s) found"),
+            "{}",
+            stop.message
+        );
+    }
+
+    /// A hold must name a command that can actually END the hold.
+    ///
+    /// Both causes land the same `unevaluable` verdict, but only one is
+    /// resolved by running the loop again. A custody divergence re-reads
+    /// the same diverged sidecar every time, so telling the operator to
+    /// re-run points them at an infinite loop — the product is not
+    /// stranded by its STATE, but by never being told the way out.
+    ///
+    /// Asserted as the SPECIFIC command per cause. A test that only
+    /// checked `next_command.is_some()` passes on the broken behaviour
+    /// and proves nothing.
+    #[test]
+    fn each_unevaluable_cause_names_the_remedy_that_resolves_it() {
+        let reading = |cause: Option<UnevaluableCause>| Event::ObservationChecks {
+            failed: 0,
+            errored: 0,
+            warned: 0,
+            deferred: None,
+            // "verified", not "approved" — the set this compares against
+            // is the one the generation pinned at `verifying`, and no
+            // human is ever shown it (see the README paragraph and
+            // `WORKER_PROFILE_TOOLS`). A fixture that says "approved"
+            // teaches the wrong word to the next reader of this test.
+            detail: "the declared checks on disk are not the ones this generation verified".into(),
+            prior_detail: String::new(),
+            cause,
+        };
+
+        // Custody divergence: a RESTORE is what puts the verified checks
+        // back — no verb adopts the edit — so that is what the stop must
+        // say, and it must say it before naming any command.
+        let d = decide(
+            &rec(FulfillState::Applied),
+            reading(Some(UnevaluableCause::CheckCustody)),
+            now(),
+        );
+        let Decision::AdvanceAndStop { stop, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert!(
+            stop.message.contains("restore the file you changed"),
+            "the remedy is a RESTORE, stated before the command: {}",
+            stop.message
+        );
+        assert!(
+            stop.message.contains("cannot adopt an edit here"),
+            "and the operator is told WHY the loop will not take their edit: {}",
+            stop.message
+        );
+        assert!(
+            stop.message.contains("approve the spec again"),
+            "with the route for keeping the change named too: {}",
+            stop.message
+        );
+
+        // AND IT IS AN ORDER, not a menu. This arm lands the record at
+        // `applied`, and `rocky product approve` refuses `applied` —
+        // pinned against the real verb by
+        // `approving_refuses_at_applied_and_permits_at_observing` in
+        // rocky-cli. So "approve the spec again" is unreachable from the
+        // state this message is printed in until the restore + re-run
+        // has moved the product off `applied`.
+        //
+        // Asserted by POSITION. Substring presence passed on the broken
+        // wording too — it named both steps and implied neither order.
+        let message = &stop.message;
+        let at = |needle: &str| {
+            message
+                .find(needle)
+                .unwrap_or_else(|| panic!("the remedy must contain {needle:?}: {message}"))
+        };
+        assert!(
+            at("restore the file you changed") < at("re-run until the loop leaves `applied`"),
+            "the restore comes first: {message}"
+        );
+        assert!(
+            at("re-run until the loop leaves `applied`") < at("approve the spec again"),
+            "the re-run comes before the approval, because the approval is refused at \
+             `applied`: {message}"
+        );
+        assert!(
+            message.contains("`observing`"),
+            "the state the operator waits for is named, not left as a guess: {message}"
+        );
+        assert!(
+            message.contains("Approving is refused while the state is `applied`"),
+            "and WHY that order is forced is stated, so it does not read as a preference: \
+             {message}"
+        );
+
+        // AND THE SPEC ROUTE IS QUALIFIED. It used to say "put the
+        // change in the product spec's `checks`" flat out. `checks` is a
+        // list of opaque SQL boolean strings that the lowering turns
+        // into `expression` tests at `severity = "error"`
+        // (`spec_checks_lower_only_to_error_severity_expression_tests`
+        // in rocky-core pins that), so for a changed `row_count_range`,
+        // a `warning` severity, or a `filter`, the sentence named a
+        // route the field cannot carry. That is the same defect as
+        // naming a command that cannot run, and it must not come back.
+        assert!(
+            message.contains("always lowers it to an error-severity `expression` test"),
+            "what `output.checks` can carry is stated, not implied: {message}"
+        );
+        assert!(
+            message.contains("has no spec spelling"),
+            "and the shapes it CANNOT carry are called out, so the spec route is never \
+             offered for a change it would silently distort: {message}"
+        );
+        assert!(
+            at("has no spec spelling") < at("the restore is the whole remedy"),
+            "with the honest fallback stated right after them: {message}"
+        );
+        for shape in ["row_count_range", "`warning` severity", "`filter`"] {
+            assert!(
+                message.contains(shape),
+                "each unrepresentable shape is named — {shape} is missing: {message}"
+            );
+        }
+
+        // AND THE QUALIFICATION IS ITSELF QUALIFIED — the same defect
+        // with the sign flipped. Fixing the over-claim produced an
+        // under-claim: the sentence listed `unique` flat among the
+        // shapes with no spec spelling, when `output.grain` lowers
+        // DIRECTLY to a single-column `unique` or a `composite` +
+        // `kind = "unique"` (`product::lowering::generated_tests`,
+        // pinned in both arms in rocky-core). So it is checked in BOTH
+        // directions here: the grain's uniqueness is stated as
+        // spellable, and the uniqueness that is not spellable is
+        // qualified rather than the whole shape.
+        assert!(
+            message.contains("`output.grain` lowers to exactly one uniqueness check"),
+            "the declared grain IS a uniqueness check the spec can spell, and the message \
+             says so instead of listing `unique` as unreachable: {message}"
+        );
+        for spelled in [
+            "`unique` on a single grain column",
+            "`composite` with `kind = \"unique\"`",
+        ] {
+            assert!(
+                message.contains(spelled),
+                "both grain arms are named — {spelled} is missing: {message}"
+            );
+        }
+        assert!(
+            message.contains("a uniqueness check that is not the declared grain"),
+            "and the uniqueness that genuinely has no spelling is the NON-grain one, stated \
+             as such rather than as `unique` bare: {message}"
+        );
+        assert!(
+            at("`output.grain` lowers to exactly one uniqueness check")
+                < at("has no spec spelling"),
+            "what the spec CAN hold is stated before what it cannot, so the operator reads \
+             the route before the refusal: {message}"
+        );
+
+        // A transient read failure: re-running genuinely can resolve it.
+        // ROUTING DIVERGENCE — a different hold with a different
+        // remedy, and the failure mode here is naming only ONE of its
+        // two causes.
+        //
+        // The compared value is env-resolved: `substitute_env_vars`
+        // expands `${VAR}` in the raw TOML text before it is parsed, so
+        // any routing field can carry one. An operator who edited
+        // nothing and had a variable resolve differently gets the same
+        // opaque inequality as one who edited the file. Printing only
+        // "restore the file you changed" sends the first of them hunting
+        // an edit that does not exist — the wrong-remedy defect this
+        // branch already rejected once, which is why `rocky.toml` is not
+        // in the custody digest for credentials.
+        let d = decide(
+            &rec(FulfillState::Applied),
+            reading(Some(UnevaluableCause::RoutingDiverged)),
+            now(),
+        );
+        let Decision::AdvanceAndStop { stop, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        let routing = &stop.message;
+        assert!(
+            routing.contains("is not the configuration now on disk"),
+            "the hold says what diverged: {routing}"
+        );
+        assert!(
+            routing.contains("read a table this generation never wrote"),
+            "and WHY running anyway would be wrong, not merely disallowed: {routing}"
+        );
+        // THE SCOPE IS STATED, not implied. The compared value is every
+        // adapter and every pipeline, so an edit to an unrelated
+        // pipeline's `execution` or `schedule` lands here too. A message
+        // that said "a different warehouse" flat out would be false for
+        // exactly that operator, and they would go looking at routing
+        // that never changed.
+        assert!(
+            routing.contains("broader than the \nwarehouse")
+                || routing.contains("broader than the warehouse"),
+            "the message must admit the compared value is broader than routing: {routing}"
+        );
+        assert!(
+            routing.contains("execution") && routing.contains("schedule"),
+            "and name the non-routing fields that also move it: {routing}"
+        );
+
+        // BOTH CAUSES. Each half asserted separately, because a message
+        // naming only the edit passes any test that just looks for
+        // "rocky.toml".
+        assert!(
+            routing.contains("the config was \nedited")
+                || routing.contains("the config was edited"),
+            "cause one — the file changed — is named: {routing}"
+        );
+        assert!(
+            routing.contains("resolved to a \ndifferent value")
+                || routing.contains("resolved to a different value"),
+            "cause two — the environment resolved a field differently — is named, because \
+             the recorded value cannot tell it from an edit: {routing}"
+        );
+        assert!(
+            routing.contains("check the environment first if you \nchanged no file")
+                || routing.contains("check the environment first if you changed no file"),
+            "and the operator who changed nothing is told where to look, rather than being \
+             sent after an edit that does not exist: {routing}"
+        );
+
+        // A ROTATION IS NOT A DIVERGENCE, said out loud. Credentials
+        // serialise as `"***"` in `config_policy_identity`, so rotating
+        // one cannot move the value — and an operator staring at an
+        // opaque mismatch will suspect their credentials first.
+        assert!(
+            routing.contains("Credentials are not part of this value"),
+            "a credential rotation is explicitly ruled out as a cause: {routing}"
+        );
+
+        // AND IT IS NOT THE CUSTODY REMEDY. These two holds are
+        // adjacent and their instructions are different; borrowing the
+        // custody wording here would tell an operator to restore a
+        // sidecar nobody touched.
+        assert!(
+            !routing.contains("restore the file you changed"),
+            "the routing remedy must not borrow the custody wording — nothing about the \
+             check set is in doubt here: {routing}"
+        );
+
+        for cause in [Some(UnevaluableCause::Unreadable), None] {
+            let d = decide(&rec(FulfillState::Applied), reading(cause.clone()), now());
+            let Decision::AdvanceAndStop { stop, .. } = d else {
+                panic!("expected AdvanceAndStop, got {d:?}");
+            };
+            assert_eq!(
+                stop.next_command.as_deref(),
+                Some("rocky fulfill revenue_daily"),
+                "the warehouse may answer next time, so re-running IS the remedy ({cause:?})"
+            );
+            assert!(
+                !stop.message.contains("restore the file you changed"),
+                "and it must not tell them to undo an edit they did not make: {}",
+                stop.message
+            );
+        }
+
+        // AND THE SCHEME CAUSE GETS A DIFFERENT LANDING, not just
+        // different words. `applied` is the holding pattern for
+        // conditions a later run can resolve, and it is in `rocky
+        // product approve`'s in-flight refusal set — so a cause that
+        // re-running can never resolve must not land there, or the
+        // operator has no exit at all. It goes to `blocked`, whose
+        // `--retry` re-enters at `spec_approved` and pins a fresh
+        // digest at the new generation's own verify.
+        for state in [FulfillState::Applied, FulfillState::ObservedFailing] {
+            let d = decide(
+                &rec(state.clone()),
+                reading(Some(UnevaluableCause::CheckSchemeChanged)),
+                now(),
+            );
+            let Decision::AdvanceAndStop { record, stop, .. } = d else {
+                panic!("expected AdvanceAndStop, got {d:?}");
+            };
+            assert!(
+                matches!(record.state, FulfillState::Blocked { .. }),
+                "a scheme mismatch lands where a human can act, from {state:?}: {:?}",
+                record.state
+            );
+            assert_eq!(
+                stop.next_command.as_deref(),
+                Some("rocky fulfill revenue_daily --retry"),
+                "and the printed command starts the generation that re-pins: {stop:?}"
+            );
+            assert!(
+                !stop.message.contains("restore the file you changed"),
+                "no restore alters a hash algorithm, so the custody remedy must not leak \
+                 into this arm: {}",
+                stop.message
+            );
+            assert!(
+                !stop.message.contains("put the change in the product spec"),
+                "and no spec field carries a digest scheme: {}",
+                stop.message
+            );
+            // AND IT MUST NOT OVER-CORRECT INTO A CLEAN CLAIM. `step.rs`
+            // returns on the scheme question BEFORE loading the check
+            // set, so an edit to unmanifested
+            // `models/test_definitions.toml` is neither detected nor
+            // excluded here. The message once said "nothing on disk
+            // changed", which is the custody assurance this arm is in no
+            // position to give. Both halves are pinned: the false claim
+            // is absent, and the honest one is present — a negative
+            // alone passes for a message that simply says nothing.
+            assert!(
+                !stop.message.contains("nothing on disk changed"),
+                "the expanded check set was never loaded, so this arm cannot certify disk: {}",
+                stop.message
+            );
+            assert!(
+                stop.message.contains("UNKNOWN"),
+                "it names the custody it did not establish: {}",
+                stop.message
+            );
+        }
+    }
+
+    /// The verdict ORDER is the decision. Positive evidence of failure
+    /// outranks an incomplete reading; an incomplete reading outranks a
+    /// clean tally.
+    #[test]
+    fn the_check_verdict_ranks_evidence_above_an_incomplete_reading() {
+        // Failure wins even when the rest of the reading is unusable —
+        // one proven failure is enough to act on.
+        assert_eq!(
+            classify_checks(1, 9, None),
+            CheckVerdict::Failing,
+            "a proven failure is not withheld because other checks errored"
+        );
+        // Incomplete outranks clean: the tally alone looks identical.
+        assert_eq!(classify_checks(0, 1, Some(0)), CheckVerdict::Unevaluable);
+        assert_eq!(classify_checks(0, 0, None), CheckVerdict::Unevaluable);
+        assert_eq!(classify_checks(0, 0, Some(1)), CheckVerdict::Unevaluable);
+        // Clean is the narrow case: everything declared ran, none failed.
+        assert_eq!(classify_checks(0, 0, Some(0)), CheckVerdict::Clean);
+    }
+
+    /// The evidence is warehouse-shaped, so it is capped — and the cap
+    /// is announced, never silent.
+    #[test]
+    fn the_evidence_is_capped_on_a_char_boundary_and_says_so() {
+        let short = "revenue_daily.client_id [unique]: 4 duplicate value(s)";
+        assert_eq!(truncate_detail(short), short, "short evidence is untouched");
+
+        // Multi-byte characters straddling the cut: slicing at the raw
+        // byte index would panic.
+        let long = "é".repeat(MAX_OBSERVATION_DETAIL);
+        let capped = truncate_detail(&long);
+        assert!(capped.contains("evidence truncated"), "the loss is named");
+        assert!(
+            capped.starts_with("éé"),
+            "the head of the evidence survives: {}",
+            &capped[..8]
+        );
+        assert!(capped.len() < long.len());
+
+        // And the cap is what the record actually stores.
+        let mut prior = rec(FulfillState::Applied);
+        prior.data_repair_rounds = 0;
+        let d = decide(
+            &prior,
+            Event::ObservationChecks {
+                failed: 1,
+                errored: 0,
+                warned: 0,
+                deferred: Some(0),
+                detail: "x".repeat(MAX_OBSERVATION_DETAIL + 500),
+                prior_detail: String::new(),
+                cause: None,
+            },
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        let stored = record.observation_detail.expect("evidence recorded");
+        assert!(
+            stored.len() < MAX_OBSERVATION_DETAIL + 100,
+            "the record does not grow without bound: {} bytes",
+            stored.len()
+        );
     }
 
     // =====================================================================
