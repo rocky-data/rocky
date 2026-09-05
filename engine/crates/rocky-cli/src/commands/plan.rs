@@ -1004,10 +1004,39 @@ pub fn plan_preview_output(
     // warning the moment there were two surfaces to keep in step. Parity has
     // no copies to keep in step.
     //
-    // A malformed spec is fatal here, as it already is on both other paths: a
-    // preview of SQL that `rocky run` would refuse to generate is worse than
-    // a refusal.
-    let surrogate_keys = rocky_core::models::load_surrogate_keys_from_tree(models_dir)
+    // A malformed spec on a model this preview renders is fatal here, as it
+    // already is on both other paths: a preview of SQL that `rocky run` would
+    // refuse to generate is worse than a refusal.
+    //
+    // Loaded ONLY for the models this preview will render (#1537). The
+    // whole-tree load meant a malformed `[[surrogate_key]]` on ANY model
+    // failed a preview narrowed to a different one —
+    // `validate_surrogate_key_spec` returns a `ModelError` for the tree, not
+    // for the model asked about. `rocky run` never behaved this way; this core
+    // inherited the unfiltered load from `emit-sql`, which #1556 narrowed the
+    // same way.
+    //
+    // This narrows WHO reports a bad spec, not WHETHER it is reported. The
+    // guard against interpolating an unvalidated spec is
+    // `apply_surrogate_keys` below, which re-validates every spec it renders —
+    // so a spec that reaches the SQL is always validated, whatever the load
+    // selected.
+    //
+    // Selection is by the compiled models' own `file_path`, the same
+    // derivation `run` and `emit-sql` use. Filtering on the filename stem
+    // instead would silently drop the key of a model whose sidecar renames it
+    // with `name = "..."` — wrong SQL rather than a loud refusal.
+    let selected_model_paths: std::collections::HashSet<std::path::PathBuf> = result
+        .project
+        .models
+        .iter()
+        .filter(|m| filter.is_none_or(|f| m.config.name == f))
+        .map(|m| std::path::PathBuf::from(&m.file_path))
+        .collect();
+    let surrogate_keys =
+        rocky_core::models::load_surrogate_keys_from_tree_filtered(models_dir, |path| {
+            selected_model_paths.contains(path)
+        })
         .context("invalid surrogate_key configuration")?;
     if let Some(model) = filter
         && !project_ir
@@ -3161,6 +3190,240 @@ table = "known"
             err.downcast_ref::<ModelNotFound>().is_some(),
             "error must downcast to ModelNotFound"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // #1537 — the surrogate-key load is narrowed to the models the preview
+    // renders. `run` always behaved this way; `emit-sql` was narrowed in
+    // #1556; this core inherited the unfiltered load rather than choosing it.
+    // -----------------------------------------------------------------
+
+    /// A model sidecar with a `[[surrogate_key]]` block appended. The block
+    /// goes last because `[strategy]` / `[target]` are tables — a later
+    /// top-level array-of-tables entry is the only valid placement.
+    fn sidecar_with_key(name: &str, key_block: &str) -> String {
+        format!(
+            r#"name = "{name}"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "c"
+schema = "s"
+table = "{name}"
+{key_block}"#
+        )
+    }
+
+    /// `columns = []` fails `validate_surrogate_key_spec`: a key must hash at
+    /// least one input column.
+    const MALFORMED_KEY: &str = "\n[[surrogate_key]]\nname = \"k\"\ncolumns = []\n";
+    /// A valid key over the `id` column `write_project`'s stub SQL selects.
+    const VALID_KEY: &str = "\n[[surrogate_key]]\nname = \"order_key\"\ncolumns = [\"id\"]\n";
+
+    /// TREATMENT (#1537). A malformed `[[surrogate_key]]` on `customers` must
+    /// not fail a preview narrowed to `orders`. On `main` this refuses,
+    /// because the whole-tree load validated every model's spec before
+    /// rendering any model.
+    #[test]
+    fn plan_preview_narrowed_ignores_a_malformed_key_on_another_model() {
+        let tmp = TempDir::new().unwrap();
+        let (cfg_path, models_dir) = write_project(
+            &tmp,
+            r#"
+[adapter.default]
+type = "duckdb"
+database = ":memory:"
+"#,
+            &[
+                ("orders", &sidecar_with_key("orders", "")),
+                ("customers", &sidecar_with_key("customers", MALFORMED_KEY)),
+            ],
+        );
+
+        let out = plan_preview_output(Some(&cfg_path), &models_dir, Some("orders"), None)
+            .expect("a malformed key on `customers` must not fail a preview of `orders`");
+        assert_eq!(out.statements.len(), 1);
+        assert_eq!(out.statements[0].target, "c.s.orders");
+    }
+
+    /// CONTROL. Narrowing must not become a way to smuggle a bad spec past
+    /// validation: a preview narrowed TO the offending model still refuses,
+    /// and the refusal names the model at fault.
+    #[test]
+    fn plan_preview_narrowed_to_the_bad_model_still_refuses_and_names_it() {
+        let tmp = TempDir::new().unwrap();
+        let (cfg_path, models_dir) = write_project(
+            &tmp,
+            r#"
+[adapter.default]
+type = "duckdb"
+database = ":memory:"
+"#,
+            &[
+                ("orders", &sidecar_with_key("orders", "")),
+                ("customers", &sidecar_with_key("customers", MALFORMED_KEY)),
+            ],
+        );
+
+        let err = plan_preview_output(Some(&cfg_path), &models_dir, Some("customers"), None)
+            .expect_err("narrowing to `customers` must still refuse its own bad key");
+        // `{err:#}` walks the anyhow chain — the outer `.context(...)` alone
+        // does not carry the model name. The binary prints the same chain:
+        // `fn main() -> anyhow::Result<()>` terminates through `Debug`.
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("customers"),
+            "the refusal must name the model at fault:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("surrogate_key"),
+            "the refusal must name the surrogate_key configuration:\n{rendered}"
+        );
+    }
+
+    /// The UNNARROWED preview is unchanged: it renders every compiled model,
+    /// so it still validates every compiled model's spec and still refuses.
+    /// Pinned because narrowing the load could plausibly have been taken all
+    /// the way to "only validate on demand" — it was not.
+    #[test]
+    fn plan_preview_unnarrowed_still_refuses_a_malformed_key_and_names_the_model() {
+        let tmp = TempDir::new().unwrap();
+        let (cfg_path, models_dir) = write_project(
+            &tmp,
+            r#"
+[adapter.default]
+type = "duckdb"
+database = ":memory:"
+"#,
+            &[
+                ("orders", &sidecar_with_key("orders", "")),
+                ("customers", &sidecar_with_key("customers", MALFORMED_KEY)),
+            ],
+        );
+
+        let err = plan_preview_output(Some(&cfg_path), &models_dir, None, None)
+            .expect_err("an unnarrowed preview covers `customers`, so it must still refuse");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("customers") && rendered.contains("surrogate_key"),
+            "the unnarrowed refusal must name the model at fault:\n{rendered}"
+        );
+    }
+
+    /// The over-filtering direction, and the parity bar for #1537: a narrowed
+    /// preview of a model that HAS a valid key must render byte-identically to
+    /// that model's statement in the unnarrowed preview.
+    ///
+    /// This is the assertion that fails if `selected_model_paths.contains`
+    /// misses — e.g. because the compiled model's `file_path` and the loader's
+    /// walk-derived path differ in form. That failure renders a keyed model
+    /// silently WITHOUT its key, which is worse than the refusal being fixed.
+    #[test]
+    fn plan_preview_narrowing_does_not_change_a_keyed_models_sql() {
+        let tmp = TempDir::new().unwrap();
+        let (cfg_path, models_dir) = write_project(
+            &tmp,
+            r#"
+[adapter.default]
+type = "duckdb"
+database = ":memory:"
+"#,
+            &[
+                ("other", &sidecar_with_key("other", "")),
+                ("keyed", &sidecar_with_key("keyed", VALID_KEY)),
+            ],
+        );
+
+        let narrowed = plan_preview_output(Some(&cfg_path), &models_dir, Some("keyed"), None)
+            .expect("a valid key on the selected model must still render");
+        assert_eq!(narrowed.statements.len(), 1);
+
+        let full = plan_preview_output(Some(&cfg_path), &models_dir, None, None).unwrap();
+        let unnarrowed = full
+            .statements
+            .iter()
+            .find(|s| s.target == "c.s.keyed")
+            .expect("the unnarrowed preview must render `keyed` too");
+
+        assert_eq!(
+            narrowed.statements[0].sql, unnarrowed.sql,
+            "narrowing must not change what a keyed model renders"
+        );
+        // Named explicitly so a reader sees WHICH column the equality
+        // protects; equality alone would pass if both dropped the key.
+        assert!(
+            narrowed.statements[0].sql.contains("AS order_key")
+                && narrowed.statements[0].sql.contains("__rocky_keyed"),
+            "the narrowed preview must carry the selected model's own key:\n{}",
+            narrowed.statements[0].sql
+        );
+    }
+
+    /// The same over-filtering guard for a model in a SUBDIRECTORY. Selection
+    /// compares the compiled model's `file_path` string against the paths the
+    /// sidecar tree walk produces; both are built from the same `models_dir`
+    /// root, so they must agree on a nested path too. If they ever diverge in
+    /// form, a nested keyed model renders silently WITHOUT its key.
+    #[test]
+    fn plan_preview_narrowing_keeps_a_nested_models_own_key() {
+        let tmp = TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        let marts = models_dir.join("marts");
+        fs::create_dir_all(&marts).unwrap();
+        fs::write(
+            models_dir.join("other.sql"),
+            "-- model: other\nSELECT 1 AS id",
+        )
+        .unwrap();
+        fs::write(models_dir.join("other.toml"), sidecar_with_key("other", "")).unwrap();
+        fs::write(marts.join("nested.sql"), "-- model: nested\nSELECT 1 AS id").unwrap();
+        fs::write(
+            marts.join("nested.toml"),
+            sidecar_with_key("nested", VALID_KEY),
+        )
+        .unwrap();
+
+        let out = plan_preview_output(None, &models_dir, Some("nested"), None)
+            .expect("a nested model with a valid key must render");
+        assert_eq!(out.statements.len(), 1);
+        assert!(
+            out.statements[0].sql.contains("AS order_key"),
+            "narrowing must not drop a nested model's own key:\n{}",
+            out.statements[0].sql
+        );
+    }
+
+    /// A `--model` that names nothing reports `model_not_found`, not another
+    /// model's bad key. Before #1537 the whole-tree load ran first, so the
+    /// surrogate error masked the real answer.
+    #[test]
+    fn plan_preview_unknown_filter_reports_not_found_not_another_models_bad_key() {
+        let tmp = TempDir::new().unwrap();
+        let (cfg_path, models_dir) = write_project(
+            &tmp,
+            r#"
+[adapter.default]
+type = "duckdb"
+database = ":memory:"
+"#,
+            &[
+                ("orders", &sidecar_with_key("orders", "")),
+                ("customers", &sidecar_with_key("customers", MALFORMED_KEY)),
+            ],
+        );
+
+        // A glob reaches this core as a literal name: the filter is an exact
+        // `==` on the model name, never a pattern.
+        for missing in ["nope", "cust*"] {
+            let err = plan_preview_output(Some(&cfg_path), &models_dir, Some(missing), None)
+                .expect_err("an unknown model filter must fail");
+            assert!(
+                err.downcast_ref::<ModelNotFound>().is_some(),
+                "expected ModelNotFound for {missing:?}, got: {err:#}"
+            );
+        }
     }
 
     /// A `models/` directory with no compiled models (replication-only)
