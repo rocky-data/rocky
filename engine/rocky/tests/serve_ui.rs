@@ -52,6 +52,19 @@ fn http_get(port: u16, path: &str, extra: &str) -> (String, String, String) {
 
 #[test]
 fn real_server_prints_the_token_address_and_serves_the_public_page() {
+    // CI's `--all-features` test job builds this binary with the feature but
+    // without `engine/ui/dist`, so the embed is empty and `--ui` refuses to
+    // start (the flag tests cover that refusal). This test wants the real
+    // page, which only a build made after `npm run build` carries.
+    let dist_index = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui/dist/index.html");
+    if !dist_index.is_file() {
+        eprintln!(
+            "skipping: {} is absent, so the binary embeds no page",
+            dist_index.display()
+        );
+        return;
+    }
+
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("project");
     let out = rocky()
