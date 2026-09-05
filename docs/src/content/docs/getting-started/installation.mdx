@@ -61,6 +61,16 @@ Prefer to download the archive yourself? Take it from the [releases page](https:
 | Linux ARM64 | `rocky-aarch64-unknown-linux-gnu.tar.gz` |
 | Windows x86_64 | `rocky-x86_64-pc-windows-msvc.zip` |
 
+## Container image
+
+Every engine release also publishes `ghcr.io/rocky-data/rocky`, for `linux/amd64` and `linux/arm64`. The image is the CLI, so any command runs the same way:
+
+```bash
+docker run --rm -v "$PWD:/data" ghcr.io/rocky-data/rocky:latest --version
+```
+
+[Run the Container Image](/guides/run-the-image/) covers the server, the volume, the token, the health probe, and upgrades.
+
 ## Build from source
 
 Requires Rust 1.88+ (edition 2024).
