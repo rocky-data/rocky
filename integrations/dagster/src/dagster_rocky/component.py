@@ -1492,8 +1492,13 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         # engine gates its `freshness` CheckResult on `[checks.freshness]`
         # (`run.rs`), so an unconditional spec would leave every materialized
         # table with a placeholder that reads green for a check that never ran
-        # (#1645). Same predicate as the FreshnessPolicy above, so the badge
-        # and the policy cannot disagree.
+        # (#1645). Same predicate as the PIPELINE-LEVEL FreshnessPolicy above,
+        # so the badge and that policy cannot disagree. A per-model
+        # `[freshness]` frontmatter can still put a FreshnessPolicy on one
+        # asset (`model_policies` wins over the default in
+        # `_build_group_contexts`) — that is Dagster's own staleness
+        # evaluation and it never produced a `freshness` CheckResult, so it
+        # does not want a check spec either.
         #
         # Caveat: this reads the CACHED discover state. Adding
         # `[checks.freshness]` to `rocky.toml` without refreshing the state

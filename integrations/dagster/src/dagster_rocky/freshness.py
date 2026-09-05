@@ -36,13 +36,21 @@ def freshness_is_configured(checks: ChecksConfig | None) -> bool:
     This is the single predicate for "the engine will emit a ``freshness``
     ``CheckResult`` for this pipeline". Two consumers depend on it:
 
-    * :func:`freshness_policy_from_checks` attaches a
+    * :func:`freshness_policy_from_checks` returns the pipeline-level
       :class:`dagster.FreshnessPolicy` only when it is ``True``;
     * ``RockyComponent`` pre-declares the ``freshness``
       :class:`dagster.AssetCheckSpec` only when it is ``True``.
 
     Both must agree, so they read the same predicate. ``tests/test_freshness.py``
     pins the equivalence.
+
+    A per-model ``[freshness]`` frontmatter is a separate thing: it can put a
+    :class:`dagster.FreshnessPolicy` on one asset through
+    :func:`freshness_policy_from_model` while this predicate is ``False``. That
+    policy is Dagster's own staleness evaluation. The engine never emits a
+    ``freshness`` ``CheckResult`` for it — per-model ``max_lag_seconds`` is read
+    by ``rocky tick`` and ``rocky validate``, not by the check runner — so it
+    does not change the answer here.
 
     ``checks`` is ``None`` in two cases, and both mean "no freshness":
     the pipeline declares no ``[checks]`` block at all (the engine's
