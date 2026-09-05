@@ -12339,12 +12339,47 @@ async fn process_table(
 
     let table_duration = table_start.elapsed().as_millis() as u64;
 
+    // #1666: compare against the target AS IT IS AFTER THE COPY. `target_cols`
+    // above is the pre-copy probe — the same read that decides `target_exists`
+    // — so on a first run it is empty and every source column reads as
+    // "missing" even though the copy just built that target from the source.
+    // Re-reading here also picks up whatever schema evolution this run applied
+    // (ADD COLUMN, a widening ALTER, a drop-and-recreate). One extra DESCRIBE
+    // per table, and only when the check is on. `target_cols` itself is left
+    // untouched: `target_exists`, drift detection and the pre-drop decision all
+    // have to keep seeing the pre-copy state.
+    //
+    // A probe failure here does NOT fail the table. The copy already succeeded,
+    // so propagating would move a copied table into `tables_failed` over a
+    // metadata read. It records `not_evaluated` instead, which forces
+    // `passed = false` — fail-closed at the check, not at the table (#1602).
     let column_match_check = if task.check_column_match {
-        Some(checks::check_column_match(
-            &source_cols,
-            &target_cols,
-            &task.column_match_exclude,
-        ))
+        if source_cols.is_empty() {
+            // The source probe above collapses a failure to an empty list. A
+            // table with no columns is not a real SQL state, so empty here
+            // means "not read" — comparing it against the populated target the
+            // copy just wrote would report every column as `extra`.
+            Some(checks::column_match_not_evaluated(format!(
+                "source column probe for '{}' returned no columns",
+                source_table.full_name()
+            )))
+        } else {
+            match warehouse.describe_table(&target_table).await {
+                Ok(cols) if !cols.is_empty() => Some(checks::check_column_match(
+                    &source_cols,
+                    &cols,
+                    &task.column_match_exclude,
+                )),
+                Ok(_) => Some(checks::column_match_not_evaluated(format!(
+                    "post-copy column probe for '{}' returned no columns",
+                    target_table.full_name()
+                ))),
+                Err(e) => Some(checks::column_match_not_evaluated(format!(
+                    "post-copy column probe for '{}' failed: {e}",
+                    target_table.full_name()
+                ))),
+            }
+        }
     } else {
         None
     };
@@ -18630,6 +18665,492 @@ timestamp_column = "ts"
             .await
             .unwrap();
         assert_eq!(count.rows[0][0], "3");
+    }
+
+    /// A `src.events` → `tgt.events` task with `column_match` switched on.
+    #[cfg(feature = "duckdb")]
+    fn column_match_task(
+        metadata_columns: Vec<MetadataColumn>,
+        column_match_exclude: Vec<String>,
+    ) -> TableTask {
+        TableTask {
+            source_catalog: String::new(),
+            source_schema: "src".into(),
+            target_catalog: String::new(),
+            target_schema: "tgt".into(),
+            source_table_name: "events".into(),
+            target_table_name: "events".into(),
+            asset_key_prefix: vec!["test".into()],
+            tenant: None,
+            check_column_match: true,
+            check_row_count: false,
+            check_freshness: false,
+            column_match_exclude,
+            metadata_columns,
+            governance_tags: BTreeMap::new(),
+            prefetched_source_cols: None,
+            prefetched_target_cols: None,
+            effective_override: ResolvedTableOverride::default(),
+            auto_apply_gate: None,
+        }
+    }
+
+    /// The `(missing, extra)` a `column_match` result reports, sorted so the
+    /// assertion does not depend on set iteration order.
+    #[cfg(feature = "duckdb")]
+    fn column_match_sets(check: &checks::CheckResult) -> (Vec<String>, Vec<String>) {
+        match &check.details {
+            checks::CheckDetails::ColumnMatch { missing, extra } => {
+                let mut missing = missing.clone();
+                let mut extra = extra.clone();
+                missing.sort();
+                extra.sort();
+                (missing, extra)
+            }
+            other => panic!("column_match must carry ColumnMatch details, got {other:?}"),
+        }
+    }
+
+    /// Regression (#1666): `column_match` reads the target as it stands AFTER
+    /// the copy.
+    ///
+    /// Treatment — a first run, target absent. The pre-copy probe is the same
+    /// read that decides `target_exists`, so it is empty here; comparing
+    /// against it reported every source column as missing on the first run of
+    /// every table, right after Rocky itself built that target from the
+    /// source. Fails before the fix with `missing = [event_id, event_type,
+    /// user_id]`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn column_match_passes_on_the_first_run_that_creates_the_target() {
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (event_id INTEGER, user_id INTEGER, event_type VARCHAR)",
+            "INSERT INTO src.events VALUES (1, 7, 'click'), (2, 8, 'view')",
+            // tgt.events is deliberately absent: this is the first run.
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let pipeline = parse_pipeline(r#"strategy = "full_refresh""#);
+        let task = column_match_task(vec![], vec![]);
+
+        let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+            .await
+            .expect("the first run must copy the table");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+        let check = result
+            .column_match_check
+            .expect("the task enables column_match");
+        assert_eq!(
+            check.not_evaluated, None,
+            "the post-copy probe answered, so the check must be a measurement"
+        );
+        let (missing, extra) = column_match_sets(&check);
+        assert!(
+            check.passed && missing.is_empty() && extra.is_empty(),
+            "the copy created the target from the source, so the column sets \
+             match by construction; got missing={missing:?} extra={extra:?}"
+        );
+    }
+
+    /// #1666, the metadata-column half. The target the copy creates carries
+    /// Rocky's own metadata columns, which the source does not have. The
+    /// pre-copy read never saw them on a first run; the post-copy read does,
+    /// so `column_match_exclude` — built from `metadata_columns` — has to take
+    /// them back out. Without that, reading the post-copy target would trade
+    /// "missing everything" for "extra: _rocky_loaded_at".
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn column_match_excludes_rocky_metadata_columns_on_a_first_run() {
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (event_id INTEGER, user_id INTEGER)",
+            "INSERT INTO src.events VALUES (1, 7), (2, 8)",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let pipeline = parse_pipeline(r#"strategy = "full_refresh""#);
+        let task = column_match_task(
+            vec![
+                MetadataColumn::new("_rocky_loaded_at", "TIMESTAMP", "CURRENT_TIMESTAMP")
+                    .expect("valid metadata column"),
+            ],
+            vec!["_rocky_loaded_at".to_string()],
+        );
+
+        let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+            .await
+            .expect("the first run must copy the table");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+        let target_cols = adapter
+            .describe_table(&TableRef {
+                catalog: String::new(),
+                schema: "tgt".into(),
+                table: "events".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            target_cols.iter().any(|c| c.name == "_rocky_loaded_at"),
+            "the copy must actually have written the metadata column, or this \
+             test proves nothing: {target_cols:?}"
+        );
+        let check = result
+            .column_match_check
+            .expect("the task enables column_match");
+        let (missing, extra) = column_match_sets(&check);
+        assert!(
+            check.passed && missing.is_empty() && extra.is_empty(),
+            "an excluded metadata column must not read as `extra`; got \
+             missing={missing:?} extra={extra:?}"
+        );
+    }
+
+    /// #1666, the existing-target half. A column added to the source since the
+    /// last run is ALTERed into the target by drift repair, and the copy then
+    /// fills it — so after the copy the sets match. The pre-copy read is from
+    /// before that ALTER, so the check reported the new column as missing.
+    /// Fails before the fix with `missing = [region]`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn column_match_sees_the_column_drift_repair_added_this_run() {
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (event_id INTEGER, user_id INTEGER)",
+            "INSERT INTO src.events VALUES (1, 7), (2, 8)",
+            // The target as the previous run left it, then a source change.
+            "CREATE TABLE tgt.events AS SELECT * FROM src.events",
+            "ALTER TABLE src.events ADD COLUMN region VARCHAR",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let pipeline = parse_pipeline(r#"strategy = "full_refresh""#);
+        let task = column_match_task(vec![], vec![]);
+
+        let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+            .await
+            .expect("the second run must copy the table");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+        let check = result
+            .column_match_check
+            .expect("the task enables column_match");
+        let (missing, extra) = column_match_sets(&check);
+        assert!(
+            check.passed && missing.is_empty() && extra.is_empty(),
+            "the run itself added `region` to the target, so nothing is \
+             missing after the copy; got missing={missing:?} extra={extra:?}"
+        );
+    }
+
+    /// The control for #1666: reading the post-copy target must not turn the
+    /// check into a rubber stamp. Here the target genuinely ends the run one
+    /// source column short — the copy is followed by a `DROP COLUMN` the
+    /// runner did not ask for — and the check still fails, naming that column.
+    ///
+    /// The target exists before the run, so the pre-copy read holds the full
+    /// column set: before the fix this reported `passed = true` on a target
+    /// that is really missing a column.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn column_match_still_fails_when_the_post_copy_target_differs() {
+        use async_trait::async_trait;
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::{
+            AdapterResult, ExecutionStats, QueryResult, SqlDialect, WarehouseAdapter,
+        };
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        /// Runs the copy, then drops a column from the target behind the
+        /// runner's back, so the post-copy target really does differ.
+        struct DropColumnAfterCopy<'a> {
+            inner: &'a DuckDbWarehouseAdapter,
+        }
+
+        #[async_trait]
+        impl WarehouseAdapter for DropColumnAfterCopy<'_> {
+            fn dialect(&self) -> &dyn SqlDialect {
+                self.inner.dialect()
+            }
+
+            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+                self.inner.execute_statement(sql).await
+            }
+
+            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+                self.inner.execute_query(sql).await
+            }
+
+            async fn describe_table(
+                &self,
+                table: &rocky_ir::TableRef,
+            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+                self.inner.describe_table(table).await
+            }
+
+            async fn execute_statement_with_stats(
+                &self,
+                sql: &str,
+            ) -> AdapterResult<ExecutionStats> {
+                let stats = self.inner.execute_statement_with_stats(sql).await?;
+                self.inner
+                    .execute_statement("ALTER TABLE tgt.events DROP COLUMN region")
+                    .await?;
+                Ok(stats)
+            }
+        }
+
+        let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (event_id INTEGER, user_id INTEGER, region VARCHAR)",
+            "INSERT INTO src.events VALUES (1, 7, 'eu'), (2, 8, 'us')",
+            "CREATE TABLE tgt.events AS SELECT * FROM src.events",
+        ] {
+            inner.execute_statement(sql).await.unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let pipeline = parse_pipeline(r#"strategy = "full_refresh""#);
+        let task = column_match_task(vec![], vec![]);
+
+        let adapter = DropColumnAfterCopy { inner: &inner };
+        let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+            .await
+            .expect("the copy itself succeeded");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+        let check = result
+            .column_match_check
+            .expect("the task enables column_match");
+        assert_eq!(
+            check.not_evaluated, None,
+            "the probe answered; this is a measured mismatch, not an unread one"
+        );
+        let (missing, extra) = column_match_sets(&check);
+        assert!(
+            !check.passed,
+            "a target that really is a column short must fail the check"
+        );
+        assert_eq!(missing, vec!["region".to_string()]);
+        assert!(extra.is_empty(), "unexpected extra columns: {extra:?}");
+    }
+
+    /// A post-copy probe that will not answer must not fail the table: the
+    /// copy already succeeded, and a metadata read cannot be allowed to move a
+    /// copied table into `tables_failed`. It records the reason and fails the
+    /// check instead — `not_evaluated` set, `passed = false` (#1602).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn column_match_records_a_reason_when_the_post_copy_probe_fails() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use async_trait::async_trait;
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::{
+            AdapterError, AdapterResult, ExecutionStats, QueryResult, SqlDialect, WarehouseAdapter,
+        };
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        struct FailPostCopyDescribe<'a> {
+            inner: &'a DuckDbWarehouseAdapter,
+            copied: AtomicBool,
+        }
+
+        #[async_trait]
+        impl WarehouseAdapter for FailPostCopyDescribe<'_> {
+            fn dialect(&self) -> &dyn SqlDialect {
+                self.inner.dialect()
+            }
+
+            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+                self.inner.execute_statement(sql).await
+            }
+
+            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+                self.inner.execute_query(sql).await
+            }
+
+            async fn describe_table(
+                &self,
+                table: &rocky_ir::TableRef,
+            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+                if table.schema == "tgt" && self.copied.load(Ordering::SeqCst) {
+                    return Err(AdapterError::msg("injected post-copy probe failure"));
+                }
+                self.inner.describe_table(table).await
+            }
+
+            async fn execute_statement_with_stats(
+                &self,
+                sql: &str,
+            ) -> AdapterResult<ExecutionStats> {
+                let stats = self.inner.execute_statement_with_stats(sql).await?;
+                self.copied.store(true, Ordering::SeqCst);
+                Ok(stats)
+            }
+        }
+
+        let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (event_id INTEGER, user_id INTEGER)",
+            "INSERT INTO src.events VALUES (1, 7), (2, 8)",
+        ] {
+            inner.execute_statement(sql).await.unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let pipeline = parse_pipeline(r#"strategy = "full_refresh""#);
+        let task = column_match_task(vec![], vec![]);
+
+        let adapter = FailPostCopyDescribe {
+            inner: &inner,
+            copied: AtomicBool::new(false),
+        };
+        let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+            .await
+            .expect("a failed metadata read must not fail a table that copied");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+        let check = result
+            .column_match_check
+            .expect("the task enables column_match");
+        let reason = check
+            .not_evaluated
+            .as_deref()
+            .expect("an unreadable probe must record a reason");
+        assert!(
+            reason.contains("post-copy column probe")
+                && reason.contains("injected post-copy probe failure"),
+            "unexpected reason: {reason}"
+        );
+        assert!(!check.passed, "an unevaluated check never passes");
+    }
+
+    /// The other side of the same guard. A failed source probe collapses to an
+    /// empty column list, and the copy still runs — so comparing that empty
+    /// list against the target the copy just wrote would report every column
+    /// as `extra`. That would be the #1666 false failure again, wearing the
+    /// opposite sign. An empty source is treated as "not read", not as "no
+    /// columns": the check records the reason and fails.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn column_match_records_a_reason_when_the_source_probe_returns_nothing() {
+        use async_trait::async_trait;
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::{
+            AdapterError, AdapterResult, QueryResult, SqlDialect, WarehouseAdapter,
+        };
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        struct FailSourceDescribe<'a> {
+            inner: &'a DuckDbWarehouseAdapter,
+        }
+
+        #[async_trait]
+        impl WarehouseAdapter for FailSourceDescribe<'_> {
+            fn dialect(&self) -> &dyn SqlDialect {
+                self.inner.dialect()
+            }
+
+            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+                self.inner.execute_statement(sql).await
+            }
+
+            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+                self.inner.execute_query(sql).await
+            }
+
+            async fn describe_table(
+                &self,
+                table: &rocky_ir::TableRef,
+            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+                if table.schema == "src" {
+                    return Err(AdapterError::msg("injected source probe failure"));
+                }
+                self.inner.describe_table(table).await
+            }
+        }
+
+        let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (event_id INTEGER, user_id INTEGER)",
+            "INSERT INTO src.events VALUES (1, 7), (2, 8)",
+        ] {
+            inner.execute_statement(sql).await.unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let pipeline = parse_pipeline(r#"strategy = "full_refresh""#);
+        let task = column_match_task(vec![], vec![]);
+
+        let adapter = FailSourceDescribe { inner: &inner };
+        let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+            .await
+            .expect("a failed source probe is tolerated by the copy path");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+        let check = result
+            .column_match_check
+            .expect("the task enables column_match");
+        let reason = check
+            .not_evaluated
+            .as_deref()
+            .expect("an unread source must record a reason");
+        assert!(
+            reason.contains("source column probe"),
+            "unexpected reason: {reason}"
+        );
+        assert!(!check.passed, "an unevaluated check never passes");
+        let (missing, extra) = column_match_sets(&check);
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "nothing was compared, so neither list is a reading: \
+             missing={missing:?} extra={extra:?}"
+        );
     }
 
     /// Regression: if the target-MAX query fails after a missing-watermark
