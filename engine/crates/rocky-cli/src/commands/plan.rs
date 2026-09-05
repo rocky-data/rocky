@@ -815,6 +815,13 @@ fn preview_merge_shape(model_ir: &ModelIr, dialect: &dyn SqlDialect) -> Result<S
 /// Databricks fallback when the `duckdb` feature is off). See
 /// [`dialect_for_adapter_type`].
 ///
+/// "Otherwise" means **no `rocky.toml`**, not "the config did not load". A
+/// present-but-broken config is refused, carrying the loader's own error
+/// (#1625) — previewing another warehouse's SQL because a config failed to
+/// parse is the defect, not a fallback. Loading is credential-tolerant, so an
+/// unset `${VAR}` in an adapter's connection fields still previews on the
+/// project's own dialect.
+///
 /// ## Replication-only projects
 ///
 /// This core covers compiled (transformation) models only. If the project has
@@ -837,8 +844,12 @@ pub fn plan_preview_output(
     // Resolve the preview dialect from the configured target adapter type.
     // No config / unresolvable target → DuckDB (or the Databricks fallback
     // when the `duckdb` feature is off).
-    let adapter_type = config_path
-        .and_then(|p| rocky_core::config::load_rocky_config(p).ok())
+    //
+    // A `rocky.toml` that is PRESENT but does not load refuses here (#1625).
+    // It used to be `.ok()`-ed away, so a project configured for another
+    // warehouse silently previewed on the DuckDB dialect — the shared loader
+    // makes "absent" the only tolerated case.
+    let adapter_type = rocky_core::config::load_optional_project_config(config_path)?
         .and_then(|cfg| {
             // Prefer the default replication pipeline's target adapter; fall
             // back to the first adapter declared in the config.
@@ -3065,6 +3076,157 @@ table = "m"
         let out = plan_preview_output(None, &models_dir, None, None).unwrap();
         assert_eq!(out.statements.len(), 1);
         assert_eq!(out.statements[0].target, "c.s.m");
+    }
+
+    // ------------------------------------------------------------------
+    // plan_preview_output — an invalid rocky.toml refuses (#1625).
+    // ------------------------------------------------------------------
+
+    /// A merge model, whose emitted SQL differs between the Databricks and
+    /// DuckDB dialects. Used to prove the preview dialect is really sourced
+    /// from the config rather than defaulted.
+    const MERGE_SIDECAR: &str = r#"name = "m"
+
+[strategy]
+type = "merge"
+unique_key = ["id"]
+
+[target]
+catalog = "c"
+schema = "s"
+table = "m"
+"#;
+
+    const DATABRICKS_TOML: &str = r#"
+[adapter.default]
+type = "databricks"
+host = "https://example.cloud.databricks.com"
+http_path = "/sql/1.0/warehouses/abc"
+token = "pat-xxx"
+"#;
+
+    /// An adapter block that PARSES but fails the validator chain: `fivetran`
+    /// is discovery-only and needs `kind = "discovery"`. Appending it to an
+    /// otherwise good config is the "present but broken" case — and it is
+    /// deliberately a semantic failure rather than a TOML syntax error, since
+    /// the validator half is the one a `.ok()` caller also used to erase.
+    const INVALID_TAIL: &str = r#"
+[adapter.ft]
+type = "fivetran"
+api_key = "k"
+api_secret = "s"
+"#;
+
+    /// The dialect really is config-derived here: Databricks qualifies the
+    /// MERGE `UPDATE SET` target (`t.id = s.id`), DuckDB does not (`id =
+    /// s.id`). This anchors the refusal test below — without it, "the preview
+    /// fell back to DuckDB" would be an unfalsifiable claim on this model.
+    #[test]
+    fn plan_preview_dialect_is_sourced_from_the_config() {
+        let tmp = TempDir::new().unwrap();
+        let (cfg_path, models_dir) = write_project(&tmp, DATABRICKS_TOML, &[("m", MERGE_SIDECAR)]);
+        let databricks = plan_preview_output(Some(&cfg_path), &models_dir, None, None).unwrap();
+        assert!(
+            databricks.statements[0]
+                .sql
+                .contains("UPDATE SET t.id = s.id"),
+            "Databricks qualifies the SET target, got: {}",
+            databricks.statements[0].sql
+        );
+
+        let tmp2 = TempDir::new().unwrap();
+        let (duck_cfg, duck_models) = write_project(
+            &tmp2,
+            "[adapter.default]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n",
+            &[("m", MERGE_SIDECAR)],
+        );
+        let duckdb = plan_preview_output(Some(&duck_cfg), &duck_models, None, None).unwrap();
+        assert!(
+            duckdb.statements[0].sql.contains("UPDATE SET id = s.id")
+                && !duckdb.statements[0].sql.contains("UPDATE SET t.id"),
+            "DuckDB leaves the SET target unqualified, got: {}",
+            duckdb.statements[0].sql
+        );
+    }
+
+    /// The #1625 repro. A project configured for one warehouse, with a
+    /// `rocky.toml` that does not load, used to get the DEFAULT (DuckDB)
+    /// dialect and a rendered preview — another warehouse's SQL, with nothing
+    /// said. It must refuse instead, carrying the loader's own error.
+    #[test]
+    fn plan_preview_invalid_config_refuses_instead_of_defaulting_to_duckdb() {
+        let tmp = TempDir::new().unwrap();
+        let (cfg_path, models_dir) = write_project(
+            &tmp,
+            &format!("{DATABRICKS_TOML}{INVALID_TAIL}"),
+            &[("m", MERGE_SIDECAR)],
+        );
+
+        let err = plan_preview_output(Some(&cfg_path), &models_dir, None, None)
+            .expect_err("a present but invalid rocky.toml must refuse the preview");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("discovery-only") || rendered.contains("kind = \"discovery\""),
+            "the loader's own error must reach the caller, got: {rendered}"
+        );
+        // The defect being closed: it must not have rendered SQL at all, and
+        // certainly not the DuckDB form for a Databricks project.
+        assert!(
+            !rendered.contains("MERGE INTO"),
+            "no SQL may be emitted for a config that did not load, got: {rendered}"
+        );
+    }
+
+    /// Absent is NOT invalid. A project with no `rocky.toml` at the given path
+    /// keeps previewing exactly as before, on the default dialect.
+    #[test]
+    fn plan_preview_absent_config_still_previews_on_the_default_dialect() {
+        let tmp = TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(models_dir.join("m.sql"), "-- model: m\nSELECT 1 AS id").unwrap();
+        fs::write(models_dir.join("m.toml"), MERGE_SIDECAR).unwrap();
+        // A path that does not exist — the `--config rocky.toml` default in a
+        // directory that has none.
+        let missing_cfg = tmp.path().join("rocky.toml");
+        assert!(!missing_cfg.exists());
+
+        let out = plan_preview_output(Some(&missing_cfg), &models_dir, None, None)
+            .expect("a missing rocky.toml must not refuse the preview");
+        assert_eq!(out.statements.len(), 1);
+        assert!(
+            out.statements[0].sql.contains("UPDATE SET id = s.id"),
+            "no config → default dialect, unchanged: {}",
+            out.statements[0].sql
+        );
+    }
+
+    /// An unset `${VAR}` in an adapter's CONNECTION fields is not a broken
+    /// config for an offline preview (#1536) — it still renders, and on the
+    /// project's own dialect. Without this the refusal would break every
+    /// project that resolves its host from the environment.
+    #[test]
+    fn plan_preview_tolerates_unset_credential_vars() {
+        let tmp = TempDir::new().unwrap();
+        let (cfg_path, models_dir) = write_project(
+            &tmp,
+            r#"
+[adapter.default]
+type = "databricks"
+host = "${ROCKY_T_1625_PREVIEW_UNSET}"
+http_path = "/sql/1.0/warehouses/abc"
+token = "${ROCKY_T_1625_PREVIEW_UNSET_2}"
+"#,
+            &[("m", MERGE_SIDECAR)],
+        );
+
+        let out = plan_preview_output(Some(&cfg_path), &models_dir, None, None)
+            .expect("an unset credential var must not refuse an offline preview");
+        assert!(
+            out.statements[0].sql.contains("UPDATE SET t.id = s.id"),
+            "the project's own dialect must still be used: {}",
+            out.statements[0].sql
+        );
     }
 
     // ------------------------------------------------------------------
