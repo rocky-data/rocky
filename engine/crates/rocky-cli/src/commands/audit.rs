@@ -920,7 +920,10 @@ fn load_decisions_for_scorecard(state_path: &Path) -> Result<Vec<PolicyDecisionR
 /// fail-closed section and never a panic — an absurd magnitude (`100000000d`)
 /// bails with the same clean error as a syntactic one, never overflowing the
 /// `TimeDelta` / `DateTime` subtraction.
-fn parse_window(window: Option<&str>, now: DateTime<Utc>) -> Result<Option<DateTime<Utc>>> {
+pub(crate) fn parse_window(
+    window: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>> {
     let Some(raw) = window else {
         return Ok(None);
     };

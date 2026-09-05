@@ -285,6 +285,15 @@ struct Resp {
     body: Body,
 }
 
+/// One optional query parameter of a route.
+struct QueryParam {
+    name: &'static str,
+    description: &'static str,
+    /// The closed set of accepted values, or empty when the value is a
+    /// pattern the description states (a duration such as `30d`).
+    allowed: &'static [&'static str],
+}
+
 /// One HTTP operation, mirrored from the axum router in [`crate::api`].
 struct Route {
     method: &'static str,
@@ -294,6 +303,8 @@ struct Route {
     summary: &'static str,
     description: &'static str,
     path_params: &'static [&'static str],
+    /// Optional query parameters, each with its documented values.
+    query_params: &'static [QueryParam],
     /// Advisory request headers (optional), e.g. `X-Rocky-Principal`.
     header_params: &'static [&'static str],
     /// Request-body component name, if the route accepts a body.
@@ -348,6 +359,18 @@ fn route_table() -> Vec<Route> {
              parsed.",
         body: Body::Component("ErrorEnvelope"),
     };
+    const BAD_QUERY: Resp = Resp {
+        status: "400",
+        description: "A query parameter is not one of its documented values, or the subject \
+             is longer than 512 bytes.",
+        body: Body::Component("ErrorEnvelope"),
+    };
+    const GOVERNOR_READ_FAILED: Resp = Resp {
+        status: "500",
+        description: "The state store could not be opened for reading, or a ledger in it \
+             could not be read.",
+        body: Body::Component("ErrorEnvelope"),
+    };
     const JOB_ACCEPTED: Resp = Resp {
         status: "202",
         description: "Job accepted. Poll `GET /api/v1/jobs/{id}` for status.",
@@ -375,6 +398,7 @@ fn route_table() -> Vec<Route> {
             description: "Auth-exempt liveness probe. Server-lifecycle only: it carries no \
                  project state. No CLI counterpart.",
             path_params: &[],
+            query_params: &[],
             header_params: &[],
             request_body: None,
             responses: &[Resp {
@@ -394,6 +418,7 @@ fn route_table() -> Vec<Route> {
                  (engine version, state-schema version, schema-set hash, config \
                  hash, capabilities, routes).",
             path_params: &[],
+            query_params: &[],
             header_params: &[],
             request_body: None,
             responses: &[Resp {
@@ -412,6 +437,7 @@ fn route_table() -> Vec<Route> {
             description: "Every compiled model with its column count and graph edges. \
                  No CLI counterpart. Bounded by the project's model count.",
             path_params: &[],
+            query_params: &[],
             header_params: &[],
             request_body: None,
             responses: &[
@@ -434,6 +460,7 @@ fn route_table() -> Vec<Route> {
                  and graph edges. No CLI counterpart. The SQL text is capped at 256 KiB; \
                  a cut is reported through `sql_truncated` and `sql_bytes`.",
             path_params: &["name"],
+            query_params: &[],
             header_params: &[],
             request_body: None,
             responses: &[
@@ -456,6 +483,7 @@ fn route_table() -> Vec<Route> {
             description: "Canonical lineage for a model. Byte-identical to \
                  `rocky lineage <name> --output json`.",
             path_params: &["name"],
+            query_params: &[],
             header_params: &[],
             request_body: None,
             responses: &[
@@ -478,6 +506,7 @@ fn route_table() -> Vec<Route> {
             description: "Canonical upstream trace for one column. Byte-identical to \
                  `rocky lineage <name> --column <column> --output json`.",
             path_params: &["name", "column"],
+            query_params: &[],
             header_params: &[],
             request_body: None,
             responses: &[
@@ -500,6 +529,7 @@ fn route_table() -> Vec<Route> {
             description: "Canonical per-model run history. Byte-identical to \
                  `rocky history --model <name> --output json`.",
             path_params: &["name"],
+            query_params: &[],
             header_params: &[],
             request_body: None,
             responses: &[
@@ -521,6 +551,7 @@ fn route_table() -> Vec<Route> {
             description: "Canonical per-model quality snapshots. Byte-identical to \
                  `rocky metrics <name> --output json`.",
             path_params: &["name"],
+            query_params: &[],
             header_params: &[],
             request_body: None,
             responses: &[
@@ -542,6 +573,7 @@ fn route_table() -> Vec<Route> {
             description: "Canonical project run history. Byte-identical to \
                  `rocky history --output json`.",
             path_params: &[],
+            query_params: &[],
             header_params: &[],
             request_body: None,
             responses: &[
@@ -564,6 +596,7 @@ fn route_table() -> Vec<Route> {
                  `rocky compile --output json`, except the wall-clock \
                  `compile_timings`, which is inherently non-deterministic.",
             path_params: &[],
+            query_params: &[],
             header_params: &[],
             request_body: None,
             responses: &[
@@ -585,6 +618,7 @@ fn route_table() -> Vec<Route> {
             description: "Server-lifecycle recompile trigger. Outside the `/api/v1` value \
                  contract.",
             path_params: &[],
+            query_params: &[],
             header_params: &[],
             request_body: None,
             responses: &[Resp {
@@ -602,6 +636,7 @@ fn route_table() -> Vec<Route> {
             summary: "Full unified DAG",
             description: "Canonical unified DAG. Byte-identical to `rocky dag --output json`.",
             path_params: &[],
+            query_params: &[],
             header_params: &[],
             request_body: None,
             responses: &[
@@ -623,6 +658,7 @@ fn route_table() -> Vec<Route> {
             description: "Topologically sorted execution layers of the compiled graph. No \
                  CLI counterpart. Bounded by the project's model count.",
             path_params: &[],
+            query_params: &[],
             header_params: &[],
             request_body: None,
             responses: &[
@@ -644,6 +680,7 @@ fn route_table() -> Vec<Route> {
             description: "Latest DAG execution the in-process executor recorded. No CLI \
                  counterpart. Bounded by the node count of that execution.",
             path_params: &[],
+            query_params: &[],
             header_params: &[],
             request_body: None,
             responses: &[
@@ -669,6 +706,7 @@ fn route_table() -> Vec<Route> {
             description: "Submit a mutating `run` job. Takes the single-mutating-job \
                  permit; a second run/apply while one is held returns 409.",
             path_params: &[],
+            query_params: &[],
             header_params: &["X-Rocky-Principal"],
             request_body: Some("JobRequest"),
             responses: &[JOB_ACCEPTED, BAD_REQUEST, MUTATION_IN_PROGRESS],
@@ -683,6 +721,7 @@ fn route_table() -> Vec<Route> {
             description: "Submit a non-mutating `plan` job. Does not take the mutating \
                  permit, so it is never blocked by a running run/apply.",
             path_params: &[],
+            query_params: &[],
             header_params: &["X-Rocky-Principal"],
             request_body: Some("JobRequest"),
             responses: &[JOB_ACCEPTED, BAD_REQUEST],
@@ -697,6 +736,7 @@ fn route_table() -> Vec<Route> {
             description: "Submit a mutating `apply` job. Takes the single-mutating-job \
                  permit; a second run/apply while one is held returns 409.",
             path_params: &[],
+            query_params: &[],
             header_params: &["X-Rocky-Principal"],
             request_body: Some("JobRequest"),
             responses: &[JOB_ACCEPTED, BAD_REQUEST, MUTATION_IN_PROGRESS],
@@ -711,6 +751,7 @@ fn route_table() -> Vec<Route> {
             description: "Job status, with the embedded canonical result once terminal. \
                  Falls back to the durable job table after a sidecar restart.",
             path_params: &["id"],
+            query_params: &[],
             header_params: &[],
             request_body: None,
             responses: &[
@@ -743,6 +784,7 @@ fn route_table() -> Vec<Route> {
                  read-only: a store at the current schema version is never written, an older \
                  one is migrated forward as every read does, a newer one is refused.",
             path_params: &[],
+            query_params: &[],
             header_params: &[],
             request_body: None,
             responses: &[
@@ -768,6 +810,7 @@ fn route_table() -> Vec<Route> {
                  --output json`. A spec that exists but does not parse is `200` with \
                  `spec_error` set.",
             path_params: &["name"],
+            query_params: &[],
             header_params: &[],
             request_body: None,
             responses: &[
@@ -795,6 +838,7 @@ fn route_table() -> Vec<Route> {
                  request instant. Compiles the project once per call to rank by blast \
                  radius, as the CLI does. Reads only.",
             path_params: &[],
+            query_params: &[],
             header_params: &[],
             request_body: None,
             responses: &[
@@ -818,6 +862,7 @@ fn route_table() -> Vec<Route> {
                  approved it and when, and its product binding. The same bytes as \
                  `rocky review <plan-id> --status --output json`. Reads only.",
             path_params: &["plan_id"],
+            query_params: &[],
             header_params: &[],
             request_body: None,
             responses: &[
@@ -835,6 +880,113 @@ fn route_table() -> Vec<Route> {
         },
         Route {
             method: "get",
+            path: "/api/v1/brief",
+            operation_id: "getBrief",
+            tag: "governor",
+            summary: "The governor's estate digest",
+            description: "What happened over the window and what needs a human: agent \
+                 activity by principal, the ranked escalations, runs, drift, freshness, \
+                 quality, cost, autonomy budgets and the scheduler's posture, every line \
+                 citing a ledger id. The same bytes as `rocky brief --since <since> \
+                 --output json`, except `generated_at` and, for the relative windows, \
+                 `since_timestamp`, which derive from the request instant. Never advances \
+                 the digest cursor: `since=last` reads it as it stands. The default is \
+                 `7d`, not the CLI's `last`, because a read cannot advance the cursor. \
+                 Scans at most 10,000 runs and decisions; compiles nothing. Reads only.",
+            path_params: &[],
+            query_params: &[QueryParam {
+                name: "since",
+                description: "The window: `last` (since the stored cursor, read-only), \
+                     `24h` or `7d`. Defaults to `7d`.",
+                allowed: &["last", "24h", "7d"],
+            }],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The digest.",
+                    body: Body::Component("BriefOutput"),
+                },
+                BAD_QUERY,
+                ENGINE_BUSY_OR_NOT_READY,
+                GOVERNOR_READ_FAILED,
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
+            path: "/api/v1/audit/scorecard",
+            operation_id: "getAuditScorecard",
+            tag: "governor",
+            summary: "The trust scorecard",
+            description: "Acceptance, denial and require-review rates per group over the \
+                 policy-decision ledger. The same bytes as `rocky audit --scorecard --by \
+                 <by> --window <window> --output json`, except `window_start` for a \
+                 duration window, which derives from the request instant. Reads the state \
+                 store only, so it needs no bound config. A ledger that cannot be read \
+                 answers `200` with `availability: unavailable` and a note, as the CLI \
+                 prints. Reads only.",
+            path_params: &[],
+            query_params: &[
+                QueryParam {
+                    name: "by",
+                    description: "The grouping: `principal`, `rule` or `scope`. Defaults to \
+                         `principal`.",
+                    allowed: &["principal", "rule", "scope"],
+                },
+                QueryParam {
+                    name: "window",
+                    description: "`all`, or a `<N>d` / `<N>h` duration such as `30d`. \
+                         Defaults to `all`.",
+                    allowed: &[],
+                },
+            ],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The scorecard.",
+                    body: Body::Component("AuditScorecardOutput"),
+                },
+                BAD_QUERY,
+                ENGINE_BUSY_OR_NOT_READY,
+                GOVERNOR_READ_FAILED,
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
+            path: "/api/v1/custody/{subject}",
+            operation_id: "getCustodyChain",
+            tag: "governor",
+            summary: "One subject's custody chain",
+            description: "Who proposed it, what the policy plane decided, what the plan \
+                 changed, which runs materialized it, what verification found, and the \
+                 downstream blast radius, for a model name, a run id, a plan id or a \
+                 decision-only custody id such as `freeze:global`. The same bytes as \
+                 `rocky audit --for <subject> --output json`. A subject nothing references \
+                 is `200` with `resolved: false`, as the CLI. Compiles the project once per \
+                 call for the blast radius, as the CLI does. Reads only.",
+            path_params: &["subject"],
+            query_params: &[],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The custody chain.",
+                    body: Body::Component("AuditForOutput"),
+                },
+                BAD_QUERY,
+                ENGINE_BUSY_OR_NOT_READY,
+                GOVERNOR_READ_FAILED,
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
             path: "/api/v1/schedule",
             operation_id: "getScheduleStatus",
             tag: "schedule",
@@ -845,6 +997,7 @@ fn route_table() -> Vec<Route> {
                  is side-effect free. A `next_fire_at` in the past means overdue, and a \
                  `tick_lock.state` of `free` is the normal state between ticks.",
             path_params: &[],
+            query_params: &[],
             header_params: &[],
             request_body: None,
             responses: &[
@@ -875,6 +1028,7 @@ fn route_table() -> Vec<Route> {
                  before the 202. Fail-closed: 404 without `--scheduler`, or without a secret on \
                  a non-loopback bind.",
             path_params: &["pipeline"],
+            query_params: &[],
             header_params: &["X-Rocky-Signature", "X-Rocky-Delivery"],
             request_body: None,
             responses: &[
@@ -937,6 +1091,20 @@ fn operation_object(route: &Route) -> Value {
             "required": true,
             "schema": { "type": "string" },
             "description": format!("Path parameter `{name}`.")
+        }));
+    }
+    for param in route.query_params {
+        let mut schema = Map::new();
+        schema.insert("type".to_string(), json!("string"));
+        if !param.allowed.is_empty() {
+            schema.insert("enum".to_string(), json!(param.allowed));
+        }
+        params.push(json!({
+            "name": param.name,
+            "in": "query",
+            "required": false,
+            "schema": Value::Object(schema),
+            "description": param.description
         }));
     }
     for name in route.header_params {
@@ -1154,6 +1322,9 @@ mod tests {
             "ProductStatusOutput",
             "ReviewQueueOutput",
             "ReviewStatusOutput",
+            "BriefOutput",
+            "AuditScorecardOutput",
+            "AuditForOutput",
             "ErrorEnvelope",
             "JobRequest",
         ] {
@@ -1217,6 +1388,9 @@ mod tests {
             ("/api/v1/products/{name}", "ProductStatusOutput"),
             ("/api/v1/review/queue", "ReviewQueueOutput"),
             ("/api/v1/review/{plan_id}/status", "ReviewStatusOutput"),
+            ("/api/v1/brief", "BriefOutput"),
+            ("/api/v1/audit/scorecard", "AuditScorecardOutput"),
+            ("/api/v1/custody/{subject}", "AuditForOutput"),
         ] {
             let schema = &doc["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]
                 ["schema"];

@@ -82,16 +82,23 @@ use rocky_server::auth::{build_cors_layer, require_bearer_token};
 use rocky_server::dashboard;
 use rocky_server::state::ServerState;
 
-use crate::commands::audit::plan_file_path;
+use crate::commands::audit::{
+    compute_audit_for, compute_audit_scorecard, parse_window, plan_file_path,
+};
 use crate::commands::product::{
     ProductListOutput, ProductStatusOutput, product_list_in, product_names_in, product_status_in,
 };
 use crate::commands::review::{
     ReviewMarkerState, compute_review_queue, compute_review_status, review_marker_state,
 };
+use crate::commands::{BriefSince, compute_brief};
 use crate::commands::{
     ScheduleStatusError, column_lineage_output, compile_output, dag_output, history_runs_output,
     lineage_output, metrics_output, model_history_output, schedule_status_output, schemas_hash,
+};
+use crate::output::{
+    AuditForOutput, AuditScorecardOutput, BriefOutput, ReviewQueueOutput, ReviewStatusOutput,
+    ScorecardDimension,
 };
 use crate::output::{
     ColumnLineageOutput, CompileOutput, DagExecutionOutput, DagLayersOutput, DagNodeResultOutput,
@@ -100,7 +107,6 @@ use crate::output::{
     ModelDetailOutput, ModelHistoryOutput, ModelListEntry, ModelListOutput, ScheduleStatusOutput,
     TypedColumnOutput, cap_model_sql,
 };
-use crate::output::{ReviewQueueOutput, ReviewStatusOutput};
 
 /// Bind config for [`serve`].
 ///
@@ -177,6 +183,9 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/products/{name}", get(get_product))
         .route("/api/v1/review/queue", get(review_queue))
         .route("/api/v1/review/{plan_id}/status", get(review_status))
+        .route("/api/v1/brief", get(governor_brief))
+        .route("/api/v1/audit/scorecard", get(audit_scorecard))
+        .route("/api/v1/custody/{subject}", get(custody_chain))
         // Webhook ingress. Registered BEFORE the auth layer like every route, but
         // the middleware PREFIX-exempts `/api/v1/hooks/trigger/{pipeline}` from
         // the Bearer token (see `rocky_server::auth`): the handler authenticates
@@ -629,6 +638,31 @@ where
     }
 }
 
+/// Query-string extractor whose rejection is the error envelope (`400
+/// bad_request`) rather than axum's plain-text body, so a malformed query
+/// string fails the same way a malformed path parameter does.
+struct ApiQuery<T>(T);
+
+impl<S, T> FromRequestParts<S> for ApiQuery<T>
+where
+    T: serde::de::DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::extract::Query::<T>::from_request_parts(parts, state).await {
+            Ok(axum::extract::Query(value)) => Ok(Self(value)),
+            Err(rejection) => Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                rejection.body_text(),
+                None,
+            )),
+        }
+    }
+}
+
 /// Map a blocking-task join failure (panic / cancel) onto a `500`.
 fn map_join_err(err: &tokio::task::JoinError) -> ApiError {
     ApiError::internal(format!("blocking task failed: {err}"))
@@ -678,6 +712,9 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "GET /api/v1/products/{name}",
         "GET /api/v1/review/queue",
         "GET /api/v1/review/{plan_id}/status",
+        "GET /api/v1/brief",
+        "GET /api/v1/audit/scorecard",
+        "GET /api/v1/custody/{subject}",
         "POST /api/v1/hooks/trigger/{pipeline}",
     ]
     .into_iter()
@@ -706,6 +743,7 @@ fn capabilities() -> Vec<String> {
         "estate",
         "products",
         "review",
+        "governor",
     ]
     .into_iter()
     .map(String::from)
@@ -1212,6 +1250,157 @@ fn is_plan_id(candidate: &str) -> bool {
         && candidate
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+// --- The governor routes: brief, scorecard, custody ---
+
+/// Query string of `GET /api/v1/brief`.
+#[derive(Debug, Deserialize)]
+struct BriefQuery {
+    /// `last` | `24h` | `7d`. Defaults to `7d`.
+    since: Option<String>,
+}
+
+/// Query string of `GET /api/v1/audit/scorecard`.
+#[derive(Debug, Deserialize)]
+struct ScorecardQuery {
+    /// `principal` | `rule` | `scope`. Defaults to `principal`.
+    by: Option<String>,
+    /// `all`, or a `<N>d` / `<N>h` duration. Defaults to `all`.
+    window: Option<String>,
+}
+
+/// Longest custody subject the route reads. Model names are short
+/// identifiers, run ids and plan ids are fixed-width, and a decision-only
+/// custody id (`freeze:…`, `draft:…`, `autoapply:…`) is one of those with a
+/// prefix; anything longer is not a subject the ledger can hold.
+const MAX_CUSTODY_SUBJECT_BYTES: usize = 512;
+
+/// `GET /api/v1/brief` — canonical [`BriefOutput`].
+///
+/// The same bytes as `rocky brief --since <since> --output json`, except
+/// `generated_at` and, for the relative windows, `since_timestamp`, which
+/// derive from the request instant. The route never advances the digest
+/// cursor: `since=last` reads the cursor as it stands, so a screen that
+/// refreshes does not consume a Slack hook's `--since last` window. The
+/// default is `7d`, the MCP tool's default rather than the CLI's `last`,
+/// because a route that cannot advance the cursor has no window of its own
+/// under `last`, and a first-ever `last` spans all of recorded history.
+async fn governor_brief(
+    State(state): State<Arc<ServerState>>,
+    ApiQuery(query): ApiQuery<BriefQuery>,
+) -> Result<PrettyJson<BriefOutput>, ApiError> {
+    let since = match query.since.as_deref().unwrap_or("7d") {
+        "last" => BriefSince::Last,
+        "24h" => BriefSince::Hours24,
+        "7d" => BriefSince::Days7,
+        other => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                format!("unknown since window '{other}'"),
+                Some("pass since=last, since=24h or since=7d"),
+            ));
+        }
+    };
+    let root = project_root_for(&state)?;
+    let config = state
+        .config_path
+        .clone()
+        .ok_or_else(ApiError::engine_not_ready)?;
+    let state_path = state_path_for(&state);
+    let output = tokio::task::spawn_blocking(move || {
+        compute_brief(&root, &state_path, &config, since, chrono::Utc::now())
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    Ok(PrettyJson(output))
+}
+
+/// `GET /api/v1/audit/scorecard` — canonical [`AuditScorecardOutput`].
+///
+/// The same bytes as `rocky audit --scorecard --by <by> --window <window>
+/// --output json`, except `window_start` for a duration window, which derives
+/// from the request instant. Reads the state store only, so it needs no bound
+/// config. A malformed `window` is `400` with the CLI's own message; a ledger
+/// that cannot be read is `200` with `availability: unavailable`, because the
+/// core fails closed inside the payload and the CLI prints exactly that.
+async fn audit_scorecard(
+    State(state): State<Arc<ServerState>>,
+    ApiQuery(query): ApiQuery<ScorecardQuery>,
+) -> Result<PrettyJson<AuditScorecardOutput>, ApiError> {
+    let by = match query.by.as_deref().unwrap_or("principal") {
+        "principal" => ScorecardDimension::Principal,
+        "rule" => ScorecardDimension::Rule,
+        "scope" => ScorecardDimension::Scope,
+        other => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                format!("unknown scorecard dimension '{other}'"),
+                Some("pass by=principal, by=rule or by=scope"),
+            ));
+        }
+    };
+    // Validated here so a usage error is a 400; the only other failure the
+    // core can return is then a read failure, which stays a 500.
+    parse_window(query.window.as_deref(), chrono::Utc::now()).map_err(|e| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            format!("{e:#}"),
+            Some("pass window=all or a <N>d / <N>h duration such as window=30d"),
+        )
+    })?;
+    let state_path = state_path_for(&state);
+    let window = query.window;
+    let output = tokio::task::spawn_blocking(move || {
+        compute_audit_scorecard(&state_path, by, window.as_deref())
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    Ok(PrettyJson(output))
+}
+
+/// `GET /api/v1/custody/{subject}` — canonical [`AuditForOutput`].
+///
+/// The same bytes as `rocky audit --for <subject> --output json`: the custody
+/// chain for a model name, a run id, a plan id, or a decision-only custody id
+/// such as `freeze:global`. A subject nothing references is `200` with
+/// `resolved: false`, as the CLI. Compiles the project once per request for
+/// the blast radius, as the CLI does. The subject touches disk only when it is
+/// 64 hex characters, through the non-creating plan-path probe.
+async fn custody_chain(
+    State(state): State<Arc<ServerState>>,
+    ApiPath(subject): ApiPath<String>,
+) -> Result<PrettyJson<AuditForOutput>, ApiError> {
+    if subject.len() > MAX_CUSTODY_SUBJECT_BYTES {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            format!(
+                "subject is {} bytes; the limit is {MAX_CUSTODY_SUBJECT_BYTES}",
+                subject.len()
+            ),
+            Some("pass a model name, a run id, a plan id or a custody id"),
+        ));
+    }
+    let root = project_root_for(&state)?;
+    let config = state
+        .config_path
+        .clone()
+        .ok_or_else(ApiError::engine_not_ready)?;
+    let state_path = state_path_for(&state);
+    let models_dir = state.models_dir.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        compute_audit_for(&root, &config, &state_path, &models_dir, &subject)
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    Ok(PrettyJson(output))
 }
 
 /// The rule a product name must satisfy to exist at all: a bare identifier,
@@ -2502,6 +2691,343 @@ mod tests {
         }
     }
 
+    // --- The governor routes: brief, scorecard, custody ---
+
+    /// The review fixture plus what the governor projections need: one run
+    /// an hour ago that executed `orders`, and a decision-only `freeze:global`
+    /// row half an hour ago. Both sit well inside every relative window.
+    fn governor_fixture(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf, [String; 3]) {
+        use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+        use rocky_core::state::{
+            ModelExecution, PolicyDecisionRecord, RunRecord, RunStatus, RunTrigger, SessionSource,
+            StateStore,
+        };
+
+        let (root, config, state_path, plans) = review_fixture(dir);
+        let now = chrono::Utc::now();
+        let started = now - chrono::Duration::hours(1);
+        let store = StateStore::open(&state_path).expect("store");
+        store
+            .record_run(&RunRecord {
+                run_id: "run-orders-1".to_string(),
+                started_at: started,
+                finished_at: started + chrono::Duration::minutes(1),
+                status: RunStatus::Success,
+                models_executed: vec![ModelExecution {
+                    model_name: "orders".to_string(),
+                    started_at: started,
+                    finished_at: started + chrono::Duration::seconds(10),
+                    duration_ms: 10_000,
+                    rows_affected: Some(10),
+                    status: "success".to_string(),
+                    sql_hash: "h".to_string(),
+                    skip_hash: None,
+                    upstream_freshness: None,
+                    bytes_scanned: None,
+                    bytes_written: None,
+                    tenant: None,
+                    recipe_hash: None,
+                    input_hash: None,
+                    input_proof_class: None,
+                    env_hash: None,
+                    hash_scheme: None,
+                    output_column_hashes: None,
+                    attempts: Vec::new(),
+                }],
+                trigger: RunTrigger::Manual,
+                config_hash: "c".to_string(),
+                triggering_identity: None,
+                session_source: SessionSource::Cli,
+                git_commit: None,
+                git_branch: None,
+                idempotency_key: None,
+                target_catalog: None,
+                hostname: "host".to_string(),
+                rocky_version: "0.0.0-test".to_string(),
+                check_outcomes: Vec::new(),
+                pipeline: None,
+                submission_id: None,
+            })
+            .expect("run recorded");
+        store
+            .record_policy_decision(&PolicyDecisionRecord {
+                timestamp: now - chrono::Duration::minutes(30),
+                plan_id: "freeze:global".to_string(),
+                principal: PolicyPrincipal::Human,
+                capability: PolicyCapability::Apply,
+                model: "*".to_string(),
+                effect: PolicyEffect::Deny,
+                rule_id: Some(0),
+                reason: "test freeze".to_string(),
+                verify_after: Vec::new(),
+                auto_apply: None,
+            })
+            .expect("decision recorded");
+        drop(store);
+        (root, config, state_path, plans)
+    }
+
+    /// Strip the clock-derived fields of a digest and return its
+    /// `generated_at` instant, so two digests a moment apart compare exactly
+    /// on everything else.
+    fn brief_without_clock(
+        mut brief: serde_json::Value,
+    ) -> (serde_json::Value, chrono::DateTime<chrono::Utc>) {
+        let obj = brief.as_object_mut().expect("brief object");
+        let generated_at = obj
+            .remove("generated_at")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .expect("generated_at");
+        obj.remove("since_timestamp");
+        let at = chrono::DateTime::parse_from_rfc3339(&generated_at)
+            .expect("rfc3339")
+            .with_timezone(&chrono::Utc);
+        (brief, at)
+    }
+
+    fn rfc3339(value: &serde_json::Value) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(value.as_str().expect("timestamp string"))
+            .expect("rfc3339")
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// `/brief` answers with the CLI's bytes for each window, modulo the two
+    /// clock fields, defaults to `7d`, never advances the cursor, and refuses
+    /// an unknown window with the envelope.
+    #[tokio::test]
+    async fn brief_matches_the_cli_modulo_the_clock_and_never_moves_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path, _) = governor_fixture(dir.path());
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config.clone()),
+            &state_path,
+        ))
+        .await;
+
+        for (since, mode) in [
+            ("last", BriefSince::Last),
+            ("24h", BriefSince::Hours24),
+            ("7d", BriefSince::Days7),
+        ] {
+            let resp = reqwest::get(format!("{base}/api/v1/brief?since={since}"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{since}");
+            let text = resp.text().await.unwrap();
+            assert!(text.ends_with("}\n"), "{text}");
+            let served: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(served["since_mode"], since);
+            assert_eq!(served["runs"]["availability"], "available", "{since}");
+            assert_eq!(
+                served["escalations"]["availability"], "available",
+                "{since}"
+            );
+            let expected =
+                compute_brief(&root, &state_path, &config, mode, chrono::Utc::now()).unwrap();
+            let (served_json, served_at) = brief_without_clock(served);
+            let (expected_json, expected_at) =
+                brief_without_clock(serde_json::to_value(&expected).unwrap());
+            assert_eq!(served_json, expected_json, "{since}");
+            assert!(
+                (expected_at - served_at).num_seconds().abs() <= 5,
+                "{since}: generated_at drifted"
+            );
+        }
+
+        // No query at all is the MCP tool's `7d`, not the CLI's `last`.
+        let served: serde_json::Value = reqwest::get(format!("{base}/api/v1/brief"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(served["since_mode"], "7d");
+
+        // Three reads, one of them `last`: the cursor is still unset.
+        let cursor = rocky_core::state::StateStore::open_read_only(&state_path)
+            .unwrap()
+            .get_last_brief_at()
+            .unwrap();
+        assert!(
+            cursor.is_none(),
+            "a read must never advance the brief cursor: {cursor:?}"
+        );
+
+        let resp = reqwest::get(format!("{base}/api/v1/brief?since=yesterday"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "bad_request");
+        assert!(err.message.contains("yesterday"), "{}", err.message);
+        assert!(err.remediation_hint.is_some());
+    }
+
+    /// `/audit/scorecard` answers with the CLI's bytes for every grouping,
+    /// defaults to `principal` over `all`, differs only in `window_start` for
+    /// a duration window, and refuses the two usage errors with the envelope.
+    #[tokio::test]
+    async fn scorecard_matches_the_cli_bytes_and_refuses_bad_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path, _) = governor_fixture(dir.path());
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config),
+            &state_path,
+        ))
+        .await;
+
+        for (by, dimension) in [
+            ("principal", ScorecardDimension::Principal),
+            ("rule", ScorecardDimension::Rule),
+            ("scope", ScorecardDimension::Scope),
+        ] {
+            let resp = reqwest::get(format!("{base}/api/v1/audit/scorecard?by={by}&window=all"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{by}");
+            let text = resp.text().await.unwrap();
+            let expected = compute_audit_scorecard(&state_path, dimension, Some("all")).unwrap();
+            assert_eq!(text, reference_bytes(&expected), "{by}");
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(json["by"], by);
+            assert_eq!(json["availability"], "available", "{by}");
+        }
+
+        let text = reqwest::get(format!("{base}/api/v1/audit/scorecard"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let expected =
+            compute_audit_scorecard(&state_path, ScorecardDimension::Principal, None).unwrap();
+        assert_eq!(text, reference_bytes(&expected));
+
+        let resp = reqwest::get(format!("{base}/api/v1/audit/scorecard?window=30d"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let mut served: serde_json::Value = resp.json().await.unwrap();
+        let mut expected = serde_json::to_value(
+            compute_audit_scorecard(&state_path, ScorecardDimension::Principal, Some("30d"))
+                .unwrap(),
+        )
+        .unwrap();
+        let served_start = served
+            .as_object_mut()
+            .unwrap()
+            .remove("window_start")
+            .expect("window_start");
+        let expected_start = expected
+            .as_object_mut()
+            .unwrap()
+            .remove("window_start")
+            .expect("window_start");
+        assert_eq!(served, expected);
+        assert!(
+            (rfc3339(&expected_start) - rfc3339(&served_start))
+                .num_seconds()
+                .abs()
+                <= 5
+        );
+
+        for query in ["by=team", "window=fortnight"] {
+            let resp = reqwest::get(format!("{base}/api/v1/audit/scorecard?{query}"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{query}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "bad_request", "{query}");
+            assert!(err.remediation_hint.is_some(), "{query}");
+        }
+        // The window refusal carries the CLI's own message.
+        let err: ErrorEnvelope =
+            reqwest::get(format!("{base}/api/v1/audit/scorecard?window=fortnight"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert!(err.message.contains("fortnight"), "{}", err.message);
+    }
+
+    /// `/custody/{subject}` answers with the CLI's bytes for a model, a run,
+    /// a plan on disk, a decision-only custody id and a subject nothing
+    /// references; an over-long subject is refused before anything is read.
+    #[tokio::test]
+    async fn custody_matches_the_cli_bytes_for_every_subject_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path, [a, _b, _c]) = governor_fixture(dir.path());
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config.clone()),
+            &state_path,
+        ))
+        .await;
+        let models = root.join("models");
+
+        for (subject, kind, resolved) in [
+            ("orders", "model", true),
+            ("run-orders-1", "run", true),
+            (a.as_str(), "plan", true),
+            ("freeze:global", "plan", true),
+            ("nothing_here", "model", false),
+        ] {
+            let resp = reqwest::get(format!("{base}/api/v1/custody/{subject}"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{subject}");
+            let text = resp.text().await.unwrap();
+            let expected =
+                compute_audit_for(&root, &config, &state_path, &models, subject).unwrap();
+            assert_eq!(text, reference_bytes(&expected), "{subject}");
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(json["subject_kind"], kind, "{subject}");
+            assert_eq!(json["resolved"], resolved, "{subject}");
+        }
+
+        let long = "m".repeat(MAX_CUSTODY_SUBJECT_BYTES + 1);
+        let resp = reqwest::get(format!("{base}/api/v1/custody/{long}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "bad_request");
+
+        // No subject at all is no route.
+        let resp = reqwest::get(format!("{base}/api/v1/custody/"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    /// The brief and the custody chain need a project root; the scorecard
+    /// reads the state store only and answers without a config.
+    #[tokio::test]
+    async fn governor_routes_need_a_bound_config_except_the_scorecard() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, _config, state_path, _) = governor_fixture(dir.path());
+        let base = spawn_router(pinned_server(root.join("models"), None, &state_path)).await;
+
+        for path in ["/api/v1/brief", "/api/v1/custody/orders"] {
+            let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+            assert_eq!(resp.status(), 503, "{path}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "engine_not_ready", "{path}");
+        }
+
+        let resp = reqwest::get(format!("{base}/api/v1/audit/scorecard"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let expected =
+            compute_audit_scorecard(&state_path, ScorecardDimension::Principal, None).unwrap();
+        assert_eq!(text, reference_bytes(&expected));
+    }
+
     /// `/dag/status` projects the executor's record field for field, with
     /// the node status rendered in `snake_case` as the executor serializes it.
     #[tokio::test]
@@ -2592,8 +3118,9 @@ mod tests {
             "{:?}",
             body.capabilities
         );
-        // So are the product and review routes, and all four are registered.
-        for capability in ["products", "review"] {
+        // So are the product, review and governor routes, and all seven are
+        // registered.
+        for capability in ["products", "review", "governor"] {
             assert!(
                 body.capabilities.iter().any(|c| c == capability),
                 "{capability}: {:?}",
@@ -2605,6 +3132,9 @@ mod tests {
             "GET /api/v1/products/{name}",
             "GET /api/v1/review/queue",
             "GET /api/v1/review/{plan_id}/status",
+            "GET /api/v1/brief",
+            "GET /api/v1/audit/scorecard",
+            "GET /api/v1/custody/{subject}",
         ] {
             assert!(body.routes.iter().any(|r| r == route), "{route} missing");
         }
