@@ -158,7 +158,7 @@ impl Default for ServeConfig {
 pub fn router(state: Arc<ServerState>) -> Router {
     let cors = build_cors_layer(&state.allowed_origins);
 
-    Router::new()
+    let api = Router::new()
         .route("/", get(dashboard::dashboard))
         .route("/dashboard", get(dashboard::dashboard))
         .route("/api/v1/health", get(health))
@@ -206,7 +206,33 @@ pub fn router(state: Arc<ServerState>) -> Router {
             require_bearer_token,
         ))
         .layer(cors)
-        .with_state(state)
+        .with_state(state.clone());
+
+    // The browser UI's files are public (they carry no data, and the page
+    // must load before it has a token to send), so they sit OUTSIDE the
+    // bearer layer above. They exist only with `--ui`; without it there is
+    // no `/ui` path, and the API fallback answers as before.
+    let app = if state.ui.is_some() {
+        api.merge(crate::ui::ui_router(state.clone()))
+    } else {
+        api
+    };
+
+    app
+        // The `Host`/`Origin` guard is outermost so it precedes routing for
+        // every request, UI files included. It is a no-op without `--ui`.
+        .layer(middleware::from_fn_with_state(
+            state,
+            rocky_server::auth::require_known_host,
+        ))
+        // A body over the limit is refused by the extractors with a bare
+        // `413`; this rewrites it into the envelope. Every mode, every route.
+        .layer(middleware::map_response(
+            crate::ui::envelope_payload_too_large,
+        ))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            crate::ui::MAX_REQUEST_BODY_BYTES,
+        ))
 }
 
 /// Start the HTTP server.
@@ -3339,6 +3365,241 @@ mod tests {
         assert!(body.config_hash.is_none());
     }
 
+    // --- The browser UI: `rocky serve --ui` ---
+
+    /// A `--ui` server: a read-only token, an in-memory file set standing in
+    /// for the embedded one, and the given allowed hosts and origins.
+    fn ui_state(allowed_hosts: &[&str], allowed_origins: &[&str]) -> Arc<ServerState> {
+        use rocky_server::auth::{ServeToken, TokenScope};
+        use rocky_server::ui::{InMemoryAssets, UiConfig};
+
+        let mut files = std::collections::BTreeMap::new();
+        files.insert(
+            "index.html".to_string(),
+            b"<!doctype html><div id=root></div>".to_vec(),
+        );
+        files.insert(
+            "assets/index-abc123.js".to_string(),
+            b"console.log('rocky')".to_vec(),
+        );
+        ServerState::with_auth_and_webhook(
+            simple_project_models(),
+            false,
+            None,
+            None,
+            Some(ServeToken {
+                secret: "s3cret".to_string(),
+                scope: TokenScope::ReadOnly,
+            }),
+            allowed_origins.iter().map(ToString::to_string).collect(),
+            None,
+            None,
+            Some(UiConfig {
+                bind_host: "127.0.0.1".to_string(),
+                allowed_hosts: allowed_hosts.iter().map(ToString::to_string).collect(),
+                assets: Arc::new(InMemoryAssets(files)),
+            }),
+        )
+    }
+
+    /// The UI files are public and carry every security header; a client
+    /// route deep-links to the shell; the API behind them still needs the
+    /// token, and the read-only token still cannot mutate.
+    #[tokio::test]
+    async fn ui_files_are_public_carry_the_headers_and_the_api_stays_behind_the_token() {
+        let base = spawn_router(ui_state(&[], &[])).await;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        let resp = client.get(format!("{base}/ui/")).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers()["content-type"], "text/html; charset=utf-8");
+        assert_eq!(resp.headers()["cache-control"], "no-cache");
+        for (name, value) in rocky_server::ui::UI_SECURITY_HEADERS {
+            assert_eq!(
+                resp.headers().get(*name).and_then(|v| v.to_str().ok()),
+                Some(*value),
+                "{name}"
+            );
+        }
+        assert!(resp.text().await.unwrap().contains("id=root"));
+
+        let resp = client
+            .get(format!("{base}/ui/assets/index-abc123.js"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()["content-type"],
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            resp.headers()["cache-control"],
+            "public, max-age=31536000, immutable"
+        );
+        assert!(resp.headers().contains_key("content-security-policy"));
+
+        let resp = client
+            .get(format!("{base}/ui/estate"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "a client route gets the shell");
+        assert_eq!(resp.headers()["content-type"], "text/html; charset=utf-8");
+
+        let resp = client
+            .get(format!("{base}/ui/assets/missing.js"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "asset_not_found");
+
+        let resp = client.get(format!("{base}/ui")).send().await.unwrap();
+        assert_eq!(resp.status(), 308);
+        assert_eq!(resp.headers()["location"], "/ui/");
+
+        let resp = client
+            .get(format!("{base}/api/v1/meta"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "the API stays behind the token");
+        let resp = client
+            .get(format!("{base}/api/v1/meta"))
+            .bearer_auth("s3cret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let resp = client
+            .post(format!("{base}/api/v1/jobs/run"))
+            .bearer_auth("s3cret")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "the UI token never reaches a mutation");
+    }
+
+    /// Without `--ui` there is no `/ui` path at all.
+    #[tokio::test]
+    async fn without_ui_there_is_no_ui_route() {
+        let base = spawn_router(test_state()).await;
+        let resp = reqwest::get(format!("{base}/ui/")).await.unwrap();
+        assert_eq!(resp.status(), 404);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "route_not_found");
+    }
+
+    /// The host guard: a foreign `Host` is 421 and a foreign or opaque
+    /// `Origin` is 403, on UI files and API alike, before routing; the
+    /// server's own names, an allowed host and an allowed origin pass; a
+    /// request with no `Origin` passes; without `--ui` the guard is off.
+    #[tokio::test]
+    async fn ui_mode_refuses_foreign_hosts_and_origins_before_routing() {
+        let base = spawn_router(ui_state(&["ui.internal"], &["https://app.example"])).await;
+        let client = reqwest::Client::new();
+        for path in ["/ui/", "/api/v1/health"] {
+            let resp = client
+                .get(format!("{base}{path}"))
+                .header("host", "evil.example")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 421, "{path}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "host_not_allowed", "{path}");
+
+            let resp = client
+                .get(format!("{base}{path}"))
+                .header("origin", "http://evil.example")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 403, "{path}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "origin_not_allowed", "{path}");
+
+            let resp = client
+                .get(format!("{base}{path}"))
+                .header("origin", "null")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 403, "{path}: the opaque origin never passes");
+        }
+        for (name, value) in [
+            ("host", "localhost:9"),
+            ("host", "127.0.0.1:9"),
+            ("host", "ui.internal"),
+            ("origin", "https://app.example"),
+            ("origin", "http://127.0.0.1:9"),
+            ("origin", "http://localhost:5173"),
+        ] {
+            let resp = client
+                .get(format!("{base}/api/v1/health"))
+                .header(name, value)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{name}: {value}");
+        }
+        let resp = client
+            .get(format!("{base}/api/v1/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "no Origin is an ordinary request");
+
+        let base = spawn_router(test_state()).await;
+        let resp = client
+            .get(format!("{base}/api/v1/health"))
+            .header("host", "evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "without --ui the guard is off");
+    }
+
+    /// A body over the limit is refused with the envelope before any
+    /// handler; a body under it reaches the handler. Every mode.
+    #[tokio::test]
+    async fn oversized_bodies_are_413_with_the_envelope() {
+        let base = spawn_router(test_state_with_token("s3cret")).await;
+        let client = reqwest::Client::new();
+        let big = vec![b'x'; crate::ui::MAX_REQUEST_BODY_BYTES + 1];
+        let resp = client
+            .post(format!("{base}/api/v1/jobs/run"))
+            .bearer_auth("s3cret")
+            .body(big)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 413);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "payload_too_large");
+        assert!(err.remediation_hint.is_some());
+
+        let small = vec![b'x'; 100 * 1024];
+        let resp = client
+            .post(format!("{base}/api/v1/jobs/run"))
+            .bearer_auth("s3cret")
+            .body(small)
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            413,
+            "a body under the limit reaches the handler"
+        );
+    }
+
     // --- Golden API-vs-CLI parity (the load-bearing contract tests) ---
     //
     // Each asserts the API response bytes are byte-for-byte identical to what
@@ -5323,7 +5584,7 @@ mod tests {
         // Forms this counter cannot classify. Each could mount a mutating
         // method invisibly, so their presence fails the test rather than
         // silently weakening it — someone must come here and decide.
-        for form in [
+        let unclassifiable = [
             ".nest(",
             ".nest_service(",
             ".merge(",
@@ -5332,7 +5593,21 @@ mod tests {
             ".any(",
             ".on(",
             "MethodFilter",
-        ] {
+        ];
+
+        // The one merge this guard understands: the browser UI's router,
+        // merged AFTER the bearer layer because its files are public. It is
+        // counted below by the same rules, and its bar is stricter — zero
+        // mutating registrations, because a `post(` there would be an
+        // unauthenticated mutation, not merely an undeclared one.
+        let ui_merge = ".merge(crate::ui::ui_router(state.clone()))";
+        assert!(
+            body.contains(ui_merge),
+            "router() must merge the UI router by exactly `{ui_merge}` so this \
+             guard can find and check it"
+        );
+        let body = body.replace(ui_merge, "");
+        for form in unclassifiable {
             assert!(
                 !body.contains(form),
                 "router() uses `{form}`, which this guard cannot classify. \
@@ -5340,6 +5615,35 @@ mod tests {
                  teach this test (and re-check the read-scope enumeration)."
             );
         }
+
+        let ui_source = include_str!("ui.rs");
+        let ui_start = ui_source
+            .find("pub(crate) fn ui_router(state: Arc<ServerState>) -> Router {")
+            .expect("ui_router() must be findable by its exact signature");
+        let ui_body = &ui_source[ui_start..];
+        let ui_end = ui_body
+            .find("\n}\n")
+            .expect("ui_router() must end at column 0");
+        let ui_body: String = ui_body[..ui_end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for form in unclassifiable {
+            assert!(
+                !ui_body.contains(form),
+                "ui_router() uses `{form}`, which this guard cannot classify"
+            );
+        }
+        let ui_mutating: usize = ["post(", "put(", "patch(", "delete("]
+            .iter()
+            .map(|verb| ui_body.matches(verb).count())
+            .sum();
+        assert_eq!(
+            ui_mutating, 0,
+            "ui_router() is merged outside the bearer layer, so it may register \
+             safe methods only"
+        );
 
         let registered: usize = ["post(", "put(", "patch(", "delete("]
             .iter()
@@ -5713,6 +6017,7 @@ adapter = "db"
             Vec::new(),
             None,
             Some(ingress),
+            None,
         );
         (state, dir)
     }

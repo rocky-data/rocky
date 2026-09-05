@@ -1714,6 +1714,18 @@ enum Command {
         /// allowlist is empty (same-origin only).
         #[arg(long = "allowed-origin", value_name = "ORIGIN")]
         allowed_origins: Vec<String>,
+        /// Serve the browser UI at `/ui/`. Release binaries carry it; from
+        /// source, build with `--features ui`. Requires a token with
+        /// `--token-scope read-only` (the UI token never reaches a mutating
+        /// route), and `ROCKY_WEBHOOK_SECRET` when combined with
+        /// `--scheduler`. Prints the address to open, token included.
+        #[arg(long)]
+        ui: bool,
+        /// With `--ui`: an extra `Host` header value to accept, for a reverse
+        /// proxy in front of the UI. Repeat for each. Loopback names and the
+        /// bind host are always accepted; any other `Host` is refused `421`.
+        #[arg(long = "allowed-host", value_name = "HOST")]
+        allowed_hosts: Vec<String>,
         /// Run the resident scheduler alongside the API: a timer-driven loop
         /// that evaluates every pipeline's `[schedule]` and runs what is due,
         /// exactly like `rocky tick` on a cron, but in-process (experimental).
@@ -4309,6 +4321,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             token,
             token_scope,
             allowed_origins,
+            ui,
+            allowed_hosts,
             scheduler,
             poll_interval_seconds,
             drain_timeout_seconds,
@@ -4355,6 +4369,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 token,
                 token_scope,
                 allowed_origins,
+                ui,
+                allowed_hosts,
                 scheduler,
                 poll_interval_seconds,
                 drain_timeout_seconds,

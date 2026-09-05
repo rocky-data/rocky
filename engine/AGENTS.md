@@ -145,6 +145,7 @@ engine/                         # this directory, inside the rocky monorepo
 ├── rocky/                      # Binary crate (the `rocky` CLI)
 │   └── src/
 │       └── main.rs
+├── ui/                         # The browser UI `rocky serve --ui` embeds (vite + React + Tailwind Plus); `npm run build` → ui/dist, embedded behind cargo feature `ui`
 └── examples/                   # 15 self-contained example projects (DuckDB, no credentials)
 ```
 
@@ -254,7 +255,7 @@ rocky ai-test <model>                # Generate test assertions from intent
 ```bash
 rocky playground [path]              # Create a sample DuckDB project
 rocky import-dbt --dbt-project <p>   # Convert a dbt project to Rocky
-rocky serve                          # HTTP API server with watch mode
+rocky serve                          # HTTP API server with watch mode; `--ui` serves the browser UI (feature `ui`)
 rocky lsp                            # Language Server Protocol for IDE integration
 rocky mcp                            # Model Context Protocol server over stdio (for AI agents)
 rocky init-adapter <name>            # Scaffold a new warehouse adapter crate

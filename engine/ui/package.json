@@ -1,0 +1,39 @@
+{
+  "name": "rocky-ui",
+  "private": true,
+  "version": "0.1.0",
+  "description": "The browser UI `rocky serve --ui` embeds: a React shell over /api/v1, no external hosts.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build && node scripts/check-no-external.mjs dist",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src/ scripts/"
+  },
+  "dependencies": {
+    "@tailwindplus/elements": "^1.0.22",
+    "@xyflow/react": "^12.11.5",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@tailwindcss/vite": "^4.3.0",
+    "@testing-library/dom": "^10.4.0",
+    "@testing-library/jest-dom": "^7.0.0",
+    "@testing-library/react": "^16.3.3",
+    "@types/node": "^26.4.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "eslint": "^10.9.1",
+    "jsdom": "^30.0.1",
+    "tailwindcss": "^4.3.0",
+    "typescript": "^6.0.3",
+    "@vitejs/plugin-react": "^6.1.1",
+    "typescript-eslint": "^8.68.0",
+    "vite": "^8.2.2",
+    "vitest": "^4.1.11"
+  }
+}

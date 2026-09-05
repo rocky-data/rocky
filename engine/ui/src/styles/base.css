@@ -1,0 +1,17 @@
+/*
+ * Tailwind v4 entry for the Rocky UI. Unlike the VS Code webviews, this page
+ * owns its document, so the full preflight applies and the palette is the
+ * SPA's own (zinc neutrals). `dark:` follows `prefers-color-scheme`, Tailwind's
+ * default variant, so the page follows the operating system with no toggle.
+ * Nothing here loads a font or an image from another host: the server's CSP
+ * forbids it.
+ */
+@import "tailwindcss";
+
+@source "../**/*.{ts,tsx}";
+
+@layer base {
+  :root {
+    color-scheme: light dark;
+  }
+}
