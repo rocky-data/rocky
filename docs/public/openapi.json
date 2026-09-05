@@ -14046,6 +14046,134 @@
         ],
         "type": "object"
       },
+      "ProductListEntry": {
+        "description": "One product's row in `rocky product list`.\n\nA projection of [`ProductStatusOutput`], built by the same function `product status` uses, so the two can never disagree. Missing values are `null`, never invented.",
+        "properties": {
+          "approval": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProductApprovalOutput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The approval record, when one exists."
+          },
+          "artifact_problems": {
+            "description": "Number of committed artifacts whose bytes no longer match the manifest. `0` is clean.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "committed_phase": {
+            "description": "The committed lowering phase, when a manifest exists.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fulfill_state": {
+            "description": "The persisted fulfillment state tag, when one exists.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "journal_rows": {
+            "description": "Number of fulfillment journal rows recorded for this product.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "name": {
+            "description": "Product name: the spec file's stem, or the state store's key.",
+            "type": "string"
+          },
+          "output_model": {
+            "description": "The resolved output model, when the spec parses.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "product_id": {
+            "description": "`product:<name>`, when the spec parses.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "spec_digest": {
+            "description": "The working spec's digest, when it parses.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "spec_error": {
+            "description": "Why the spec failed to load — absent or unparseable — when it did.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "spec_matches_approval": {
+            "description": "Whether the working spec equals the approved revision. `null` when either side is missing.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "spec_present": {
+            "description": "Whether `products/<name>.toml` exists and parses.",
+            "type": "boolean"
+          },
+          "staging_journal_present": {
+            "description": "Whether an uncommitted staging journal is pending.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "artifact_problems",
+          "journal_rows",
+          "name",
+          "spec_present",
+          "staging_journal_present"
+        ],
+        "type": "object"
+      },
+      "ProductListOutput": {
+        "description": "JSON output of `rocky product list`.\n\nOne row per product the project knows, sorted by name. A project with no `products/` directory and no records lists nothing; that is not an error.",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "count": {
+            "description": "`products.len()`, repeated so a consumer can assert it received the whole list.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "products": {
+            "description": "Every product, sorted by name.",
+            "items": {
+              "$ref": "#/components/schemas/ProductListEntry"
+            },
+            "type": "array"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "count",
+          "products",
+          "version"
+        ],
+        "type": "object"
+      },
       "ProductSpec": {
         "additionalProperties": false,
         "description": "The `[product]` table.",
@@ -21815,6 +21943,91 @@
         "summary": "Per-model quality snapshots",
         "tags": [
           "history"
+        ]
+      }
+    },
+    "/api/v1/products": {
+      "get": {
+        "description": "Every product the project knows, sorted by name: the `products/*.toml` specs plus every name the state store holds a fulfillment or approval record for, so a product whose spec file was deleted still lists with `spec_present = false`. The same bytes as `rocky product list --output json`. Reads `products/` under the directory of the bound `rocky.toml`; never writes.",
+        "operationId": "listProducts",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductListOutput"
+                }
+              }
+            },
+            "description": "The product list."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "List products",
+        "tags": [
+          "products"
+        ]
+      }
+    },
+    "/api/v1/products/{name}": {
+      "get": {
+        "description": "One product's spec identity, committed lowering, artifact byte verification, pending staging journal, approval with snapshot integrity, and persisted fulfillment state. The same bytes as `rocky product status <name> --output json`. A spec that exists but does not parse is `200` with `spec_error` set.",
+        "operationId": "getProduct",
+        "parameters": [
+          {
+            "description": "Path parameter `name`.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductStatusOutput"
+                }
+              }
+            },
+            "description": "The product status."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No spec file and no state record exists under this product name."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "Product status",
+        "tags": [
+          "products"
         ]
       }
     },

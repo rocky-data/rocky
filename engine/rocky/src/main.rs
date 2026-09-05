@@ -2582,6 +2582,13 @@ enum ProductSubcommand {
         /// Product name (`products/<name>.toml`).
         product: String,
     },
+    /// List every product the project knows, one status row each.
+    ///
+    /// The union of `products/*.toml` and every name the state store holds
+    /// a fulfillment or approval record for, sorted by name — so a product
+    /// whose spec file was deleted still lists, with `spec_present =
+    /// false`. Read-only. An empty project lists nothing and exits 0.
+    List,
 
     /// Approve the current spec revision — a human authority transition.
     ///
@@ -3394,6 +3401,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             }
             ProductSubcommand::Status { product } => {
                 rocky_cli::commands::run_product_status(&cli.config, &product, &state_path, json)
+            }
+            ProductSubcommand::List => {
+                rocky_cli::commands::run_product_list(&cli.config, &state_path, json)
             }
             ProductSubcommand::Approve { product } => {
                 rocky_cli::commands::run_product_approve(&cli.config, &product, &state_path, json)

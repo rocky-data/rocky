@@ -73,7 +73,7 @@ See [authoring with MCP](/concepts/mcp-authoring/) for the tool surface, and [op
 rocky --config rocky.toml serve --port 8080
 ```
 
-The read routes return the same payloads as the matching CLI command, byte for byte. `GET /api/v1/models/{name}/lineage` returns exactly what `rocky lineage <name> --output json` prints. `GET /api/v1/compile` matches `rocky compile --output json`. A caller on the HTTP API and a caller on the SDK see identical data.
+The read routes return the same payloads as the matching CLI command, byte for byte. `GET /api/v1/models/{name}/lineage` returns exactly what `rocky lineage <name> --output json` prints. `GET /api/v1/compile` matches `rocky compile --output json`. `GET /api/v1/products` matches `rocky product list --output json`, and `GET /api/v1/products/{name}` matches `rocky product status <name> --output json`. A caller on the HTTP API and a caller on the SDK see identical data.
 
 Five routes have no CLI command to match: `GET /api/v1/health`, `/models`, `/models/{name}`, `/dag/layers` and `/dag/status`. They still return typed payloads with published schemas, and `GET /api/v1/meta` lists the `estate` capability when a build serves them that way. Model detail caps the SQL text at 256 KiB. A cut is reported in the body through `sql_truncated` and `sql_bytes`, so a reader never mistakes a cut text for the whole. Each type-checked column carries its structured `data_type`, which keeps a struct field's own nullability, and a `data_type_display` label such as `DECIMAL(10,2)` for showing to a person.
 

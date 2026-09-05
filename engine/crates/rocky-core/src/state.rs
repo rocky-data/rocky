@@ -4116,6 +4116,38 @@ impl StateStore {
         }
     }
 
+    /// Every product name with a fulfillment record, in key order.
+    ///
+    /// Scans the table's `product:<name>` keys and skips the
+    /// `product:<name>#<seq>` journal rows that share it. One record per
+    /// product, so the scan is as cheap as the product count.
+    pub fn fulfill_state_product_names(&self) -> Result<Vec<String>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(FULFILL_STATE)?;
+        let mut names = Vec::new();
+        for entry in table.iter()? {
+            let (key, _) = entry?;
+            if let Some(name) = crate::fulfill::product_name_from_state_key(key.value()) {
+                names.push(name.to_string());
+            }
+        }
+        Ok(names)
+    }
+
+    /// Every product name with a spec-approval record, in key order.
+    pub fn product_approval_product_names(&self) -> Result<Vec<String>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(PRODUCT_APPROVALS)?;
+        let mut names = Vec::new();
+        for entry in table.iter()? {
+            let (key, _) = entry?;
+            if let Some(name) = crate::fulfill::product_name_from_state_key(key.value()) {
+                names.push(name.to_string());
+            }
+        }
+        Ok(names)
+    }
+
     /// A product's fulfillment journal rows, in append order.
     ///
     /// The zero-padded sequence in the key makes the lexicographic range

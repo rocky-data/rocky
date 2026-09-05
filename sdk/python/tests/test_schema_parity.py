@@ -114,6 +114,7 @@ _COMMAND_SCHEMA: dict[str, str] = {
     "product_compile": "product_compile.schema.json",
     "product_approve": "product_approve.schema.json",
     "product_status": "product_status.schema.json",
+    "product_list": "product_list.schema.json",
     "fulfill": "fulfill.schema.json",
 }
 

@@ -319,6 +319,11 @@ fn route_table() -> Vec<Route> {
         description: "The named model is not in the compiled graph.",
         body: Body::Component("ErrorEnvelope"),
     };
+    const PRODUCT_NOT_FOUND: Resp = Resp {
+        status: "404",
+        description: "No spec file and no state record exists under this product name.",
+        body: Body::Component("ErrorEnvelope"),
+    };
     const JOB_ACCEPTED: Resp = Resp {
         status: "202",
         description: "Job accepted. Poll `GET /api/v1/jobs/{id}` for status.",
@@ -700,6 +705,55 @@ fn route_table() -> Vec<Route> {
         },
         Route {
             method: "get",
+            path: "/api/v1/products",
+            operation_id: "listProducts",
+            tag: "products",
+            summary: "List products",
+            description: "Every product the project knows, sorted by name: the `products/*.toml` \
+                 specs plus every name the state store holds a fulfillment or approval record \
+                 for, so a product whose spec file was deleted still lists with \
+                 `spec_present = false`. The same bytes as `rocky product list --output json`. \
+                 Reads `products/` under the directory of the bound `rocky.toml`; never writes.",
+            path_params: &[],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The product list.",
+                    body: Body::Component("ProductListOutput"),
+                },
+                ENGINE_BUSY_OR_NOT_READY,
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
+            path: "/api/v1/products/{name}",
+            operation_id: "getProduct",
+            tag: "products",
+            summary: "Product status",
+            description: "One product's spec identity, committed lowering, artifact byte \
+                 verification, pending staging journal, approval with snapshot integrity, and \
+                 persisted fulfillment state. The same bytes as `rocky product status <name> \
+                 --output json`. A spec that exists but does not parse is `200` with \
+                 `spec_error` set.",
+            path_params: &["name"],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The product status.",
+                    body: Body::Component("ProductStatusOutput"),
+                },
+                PRODUCT_NOT_FOUND,
+                ENGINE_BUSY_OR_NOT_READY,
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
             path: "/api/v1/schedule",
             operation_id: "getScheduleStatus",
             tag: "schedule",
@@ -1015,6 +1069,8 @@ mod tests {
             "ModelDetailOutput",
             "DagLayersOutput",
             "DagStatusOutput",
+            "ProductListOutput",
+            "ProductStatusOutput",
             "ErrorEnvelope",
             "JobRequest",
         ] {
@@ -1074,6 +1130,8 @@ mod tests {
             ("/api/v1/models/{name}", "ModelDetailOutput"),
             ("/api/v1/dag/layers", "DagLayersOutput"),
             ("/api/v1/dag/status", "DagStatusOutput"),
+            ("/api/v1/products", "ProductListOutput"),
+            ("/api/v1/products/{name}", "ProductStatusOutput"),
         ] {
             let schema = &doc["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]
                 ["schema"];

@@ -164,7 +164,8 @@ pub use preview::{
 };
 pub use preview_rows::run_preview_rows;
 pub use product::{
-    run_product_approve, run_product_compile, run_product_status, run_product_verify,
+    run_product_approve, run_product_compile, run_product_list, run_product_status,
+    run_product_verify,
 };
 pub use profile::run_profile;
 pub use profile_storage::run_profile_storage;

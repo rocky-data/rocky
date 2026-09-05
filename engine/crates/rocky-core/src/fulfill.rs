@@ -310,6 +310,20 @@ pub fn fulfill_state_key(product_name: &str) -> String {
     format!("product:{product_name}")
 }
 
+/// The product name a `product:<name>` record key names.
+///
+/// `None` for a journal-row key (`product:<name>#<seq>`, which shares the
+/// table) and for any key outside the `product:` namespace, so a scan over
+/// the table yields each product once.
+pub fn product_name_from_state_key(key: &str) -> Option<&str> {
+    let name = key.strip_prefix("product:")?;
+    if name.is_empty() || name.contains('#') {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 /// The key of one journal row: `product:<name>#<seq:08>`.
 ///
 /// The sequence is zero-padded to 8 digits so a lexicographic key scan

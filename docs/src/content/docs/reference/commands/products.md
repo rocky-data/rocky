@@ -107,6 +107,27 @@ Reports: the spec's identity (or its parse error), the committed lowering phase,
 
 ---
 
+## `rocky product list`
+
+Read-only. One row per product the project knows, sorted by name.
+
+```bash
+rocky product list
+rocky product list --output json
+```
+
+A product is listed when either is true: `products/<name>.toml` exists, or the state store holds a fulfillment or approval record under that name. So a product whose spec file was deleted still appears, with `spec_present = false` and the loader's reason in `spec_error`. A project with no `products/` directory and no records lists nothing and exits `0`.
+
+Each row is a projection of `rocky product status <name>`: spec identity or its error, the committed lowering phase, the count of artifact byte-verification problems, whether a staging journal is pending, the approval record, whether the working spec matches the approved revision, the fulfillment state, and the journal row count. The two commands are built by the same code, so a row can never disagree with the status it summarises.
+
+The same payload is served over HTTP by `rocky serve` at `GET /api/v1/products`, and one product's status at `GET /api/v1/products/{name}`. The server reads `products/` under the directory of the bound `rocky.toml`; the CLI reads it under the working directory.
+
+### JSON output
+
+`ProductListOutput` — `products` (one `ProductListEntry` each) and `count`.
+
+---
+
 ## Validation codes
 
 `rocky validate` checks `products/` offline with its own code band:
