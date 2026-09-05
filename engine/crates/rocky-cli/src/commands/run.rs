@@ -21,8 +21,8 @@ use rocky_core::hooks::{HookContext, HookRegistry};
 use rocky_core::sql_gen;
 use rocky_core::state::{ResumeScope, RunProgress, StateError, StateStore};
 use rocky_core::traits::{
-    BatchCheckAdapter, FreshnessResult as BatchFreshnessResult, GovernanceAdapter, MaskingPolicy,
-    RowCountResult as BatchRowCountResult, TagTarget, WarehouseAdapter,
+    AdapterResult, BatchCheckAdapter, FreshnessResult as BatchFreshnessResult, GovernanceAdapter,
+    MaskingPolicy, RowCountResult as BatchRowCountResult, TagTarget, WarehouseAdapter,
 };
 use rocky_ir::*;
 
@@ -77,6 +77,11 @@ struct TableResult {
     drift_checked: bool,
     drift_detected: Option<DriftActionOutput>,
     column_match_check: Option<rocky_core::checks::CheckResult>,
+    /// A post-copy `column_match` probe failed and the failure looked like a
+    /// warehouse rate limit. The copy itself succeeded, so the table is still
+    /// a success — but the collector must tell the adaptive throttle to back
+    /// off instead of reading the whole task as "the warehouse is happy".
+    probe_rate_limited: bool,
     source_batch_ref: Option<TableRef>,
     target_batch_ref: Option<TableRef>,
     freshness_batch_ref: Option<TableRef>,
@@ -4260,9 +4265,17 @@ pub async fn run(
             }
             Ok((_, Ok(TableOutcome::Materialized(tr)))) => {
                 let tr = *tr;
-                // Signal success to the adaptive throttle
+                // Signal the adaptive throttle. The copy succeeded, but a
+                // post-copy `column_match` probe that came back rate-limited is
+                // still the warehouse asking us to slow down (#1666) — reading
+                // the whole task as a success there would widen the semaphore
+                // while it throttles.
                 if let Some(t) = &throttle {
-                    t.on_success();
+                    if tr.probe_rate_limited {
+                        t.on_rate_limit();
+                    } else {
+                        t.on_success();
+                    }
                     adjust_semaphore(t, &semaphore, &mut semaphore_capacity);
                 }
                 // §P2.6 per-table emit: after_materialize on success.
@@ -12339,47 +12352,38 @@ async fn process_table(
 
     let table_duration = table_start.elapsed().as_millis() as u64;
 
-    // #1666: compare against the target AS IT IS AFTER THE COPY. `target_cols`
-    // above is the pre-copy probe — the same read that decides `target_exists`
-    // — so on a first run it is empty and every source column reads as
-    // "missing" even though the copy just built that target from the source.
-    // Re-reading here also picks up whatever schema evolution this run applied
-    // (ADD COLUMN, a widening ALTER, a drop-and-recreate). One extra DESCRIBE
-    // per table, and only when the check is on. `target_cols` itself is left
-    // untouched: `target_exists`, drift detection and the pre-drop decision all
-    // have to keep seeing the pre-copy state.
+    // #1666: compare the two column sets AS THEY ARE AFTER THE COPY, and read
+    // both of them here so the pair is coherent.
     //
-    // A probe failure here does NOT fail the table. The copy already succeeded,
-    // so propagating would move a copied table into `tables_failed` over a
-    // metadata read. It records `not_evaluated` instead, which forces
-    // `passed = false` — fail-closed at the check, not at the table (#1602).
+    // `target_cols` above is the pre-copy probe — the same read that decides
+    // `target_exists` — so on a first run it is empty and every source column
+    // reads as "missing" even though the copy just built that target from the
+    // source. `source_cols` has the mirror problem: under the batch pre-fetch
+    // it is a snapshot taken before this task was even scheduled, so a source
+    // DDL landing in that window makes the copy's own output read as `extra`.
+    // Reading both sides here narrows that window to the gap between these two
+    // concurrent probes, and picks up whatever schema evolution this run
+    // applied (ADD COLUMN, a widening ALTER, a drop-and-recreate).
+    //
+    // Two extra DESCRIBEs per table, and only when the check is on. Neither
+    // `source_cols` nor `target_cols` is touched: `target_exists`, drift
+    // detection, the pre-drop decision and merge-column resolution all have to
+    // keep reading the pre-copy state.
+    let mut probe_rate_limited = false;
     let column_match_check = if task.check_column_match {
-        if source_cols.is_empty() {
-            // The source probe above collapses a failure to an empty list. A
-            // table with no columns is not a real SQL state, so empty here
-            // means "not read" — comparing it against the populated target the
-            // copy just wrote would report every column as `extra`.
-            Some(checks::column_match_not_evaluated(format!(
-                "source column probe for '{}' returned no columns",
-                source_table.full_name()
-            )))
-        } else {
-            match warehouse.describe_table(&target_table).await {
-                Ok(cols) if !cols.is_empty() => Some(checks::check_column_match(
-                    &source_cols,
-                    &cols,
-                    &task.column_match_exclude,
-                )),
-                Ok(_) => Some(checks::column_match_not_evaluated(format!(
-                    "post-copy column probe for '{}' returned no columns",
-                    target_table.full_name()
-                ))),
-                Err(e) => Some(checks::column_match_not_evaluated(format!(
-                    "post-copy column probe for '{}' failed: {e}",
-                    target_table.full_name()
-                ))),
-            }
-        }
+        let (source_probe, target_probe) = tokio::join!(
+            warehouse.describe_table(&source_table),
+            warehouse.describe_table(&target_table),
+        );
+        let (check, rate_limited) = post_copy_column_match(
+            &source_table,
+            &target_table,
+            source_probe,
+            target_probe,
+            &task.column_match_exclude,
+        );
+        probe_rate_limited = rate_limited;
+        Some(check)
     } else {
         None
     };
@@ -12446,6 +12450,7 @@ async fn process_table(
     }
 
     Ok(TableOutcome::Materialized(Box::new(TableResult {
+        probe_rate_limited,
         materialization: MaterializationOutput {
             asset_key: asset_key.clone(),
             attempts: Vec::new(),
@@ -12766,6 +12771,78 @@ async fn process_completed_result(
 /// errors (which should reduce concurrency) from other transient or
 /// permanent errors. Matches Databricks-specific signals: HTTP 429 and
 /// the Unity Catalog `UC_REQUEST_LIMIT_EXCEEDED` error code.
+/// Build the `column_match` result from the post-copy probes of both sides.
+///
+/// Returns the check plus whether a probe failure looked like a warehouse rate
+/// limit, so a swallowed `429` still reaches the adaptive throttle instead of
+/// reading as "the warehouse is happy".
+///
+/// A probe that will not answer records `not_evaluated` rather than a
+/// comparison against a list that was never read — and never fails the table.
+/// The copy has already succeeded by the time this runs, so propagating would
+/// move a copied table into `tables_failed` over a metadata read, and on
+/// `incremental` the retry would insert the same rows twice. `not_evaluated`
+/// forces `passed = false`, so the check itself is still fail-closed (#1602).
+///
+/// An `Ok` with no columns counts as unread: after a successful copy a target
+/// with zero columns is not a real SQL state, and neither is such a source.
+/// When both sides are unread the source's reason is the one reported.
+fn post_copy_column_match(
+    source_table: &TableRef,
+    target_table: &TableRef,
+    source_probe: AdapterResult<Vec<ColumnInfo>>,
+    target_probe: AdapterResult<Vec<ColumnInfo>>,
+    exclude: &[String],
+) -> (rocky_core::checks::CheckResult, bool) {
+    /// `Ok(columns)`, or the reason it was unread plus whether that reason
+    /// looked like a rate limit.
+    fn read(
+        table: &TableRef,
+        probe: AdapterResult<Vec<ColumnInfo>>,
+    ) -> Result<Vec<ColumnInfo>, (String, bool)> {
+        match probe {
+            Ok(columns) if !columns.is_empty() => Ok(columns),
+            Ok(_) => Err((
+                format!(
+                    "post-copy column probe for '{}' returned no columns",
+                    table.full_name()
+                ),
+                false,
+            )),
+            Err(e) => {
+                let raw = e.to_string();
+                // Reuse the collector's own rate-limit predicate rather than a
+                // second, differently-worded rule.
+                let rate_limited = is_rate_limit_error(&raw);
+                Err((
+                    format!(
+                        "post-copy column probe for '{}' failed: {raw}",
+                        table.full_name()
+                    ),
+                    rate_limited,
+                ))
+            }
+        }
+    }
+
+    match (
+        read(source_table, source_probe),
+        read(target_table, target_probe),
+    ) {
+        (Ok(source_columns), Ok(target_columns)) => (
+            checks::check_column_match(&source_columns, &target_columns, exclude),
+            false,
+        ),
+        (Err((reason, rate_limited)), Ok(_)) | (Ok(_), Err((reason, rate_limited))) => {
+            (checks::column_match_not_evaluated(reason), rate_limited)
+        }
+        (Err((reason, source_rate_limited)), Err((_, target_rate_limited))) => (
+            checks::column_match_not_evaluated(reason),
+            source_rate_limited || target_rate_limited,
+        ),
+    }
+}
+
 fn is_rate_limit_error(error_msg: &str) -> bool {
     let upper = error_msg.to_uppercase();
     upper.contains("429")
@@ -19051,6 +19128,11 @@ timestamp_column = "ts"
         let TableOutcome::Materialized(result) = outcome else {
             panic!("table should be materialized");
         };
+        assert!(
+            !result.probe_rate_limited,
+            "an ordinary probe failure is not a rate limit and must not \
+             throttle the run down"
+        );
         let check = result
             .column_match_check
             .expect("the task enables column_match");
@@ -19066,12 +19148,12 @@ timestamp_column = "ts"
         assert!(!check.passed, "an unevaluated check never passes");
     }
 
-    /// The other side of the same guard. A failed source probe collapses to an
-    /// empty column list, and the copy still runs — so comparing that empty
-    /// list against the target the copy just wrote would report every column
-    /// as `extra`. That would be the #1666 false failure again, wearing the
-    /// opposite sign. An empty source is treated as "not read", not as "no
-    /// columns": the check records the reason and fails.
+    /// The other side of the same read. The source is probed after the copy
+    /// too, so a source that will not answer is "not read", never "no
+    /// columns" — comparing an empty source against the target the copy just
+    /// wrote would report every column as `extra`, which is the #1666 false
+    /// failure again wearing the opposite sign. The check records the reason
+    /// and fails, and the table still succeeds.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn column_match_records_a_reason_when_the_source_probe_returns_nothing() {
@@ -19141,8 +19223,8 @@ timestamp_column = "ts"
             .as_deref()
             .expect("an unread source must record a reason");
         assert!(
-            reason.contains("source column probe"),
-            "unexpected reason: {reason}"
+            reason.contains("post-copy column probe") && reason.contains("src.events"),
+            "the reason must name the side that would not answer: {reason}"
         );
         assert!(!check.passed, "an unevaluated check never passes");
         let (missing, extra) = column_match_sets(&check);
@@ -19150,6 +19232,184 @@ timestamp_column = "ts"
             missing.is_empty() && extra.is_empty(),
             "nothing was compared, so neither list is a reading: \
              missing={missing:?} extra={extra:?}"
+        );
+    }
+
+    /// Red-team finding (Codex, round 1): the two column sets must come from
+    /// the same moment. Under the batch pre-fetch, `source_cols` is a snapshot
+    /// taken before this task was ever scheduled. A source DDL landing between
+    /// that snapshot and the copy makes `SELECT *` write a column the snapshot
+    /// never saw, so comparing the snapshot against the post-copy target
+    /// reported it as `extra` — the same false failure #1666 is about, with
+    /// the sign flipped.
+    ///
+    /// Here the pre-fetch says `{event_id, user_id}` while the live source
+    /// already carries `region`. Both sides are re-read after the copy, so the
+    /// check passes.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn column_match_survives_a_source_ddl_after_the_prefetch_snapshot() {
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (event_id INTEGER, user_id INTEGER)",
+            "INSERT INTO src.events VALUES (1, 7), (2, 8)",
+            // The target as the previous run left it.
+            "CREATE TABLE tgt.events AS SELECT * FROM src.events",
+            // The source DDL that lands after the pre-fetch snapshot below.
+            "ALTER TABLE src.events ADD COLUMN region VARCHAR",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+
+        let stale = |name: &str| ColumnInfo {
+            name: name.to_string(),
+            data_type: "INTEGER".to_string(),
+            nullable: true,
+        };
+        let mut task = column_match_task(vec![], vec![]);
+        // Both pre-fetches present, so `process_table` uses them instead of
+        // probing — exactly the batch path the finding is about.
+        task.prefetched_source_cols = Some(vec![stale("event_id"), stale("user_id")]);
+        task.prefetched_target_cols = Some(vec![stale("event_id"), stale("user_id")]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let pipeline = parse_pipeline(r#"strategy = "full_refresh""#);
+
+        let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+            .await
+            .expect("the copy must succeed");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+        let target_cols = adapter
+            .describe_table(&TableRef {
+                catalog: String::new(),
+                schema: "tgt".into(),
+                table: "events".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            target_cols.iter().any(|c| c.name == "region"),
+            "the copy must have written the new source column, or this test \
+             proves nothing: {target_cols:?}"
+        );
+        let check = result
+            .column_match_check
+            .expect("the task enables column_match");
+        let (missing, extra) = column_match_sets(&check);
+        assert!(
+            check.passed && missing.is_empty() && extra.is_empty(),
+            "a column the copy itself wrote must not read as `extra` against a \
+             stale snapshot; got missing={missing:?} extra={extra:?}"
+        );
+    }
+
+    /// Red-team finding (Codex, round 1): the post-copy probe is an extra
+    /// warehouse call, so it can be rate-limited. Swallowing that error to keep
+    /// the copied table a success must not also tell the adaptive throttle the
+    /// warehouse is happy — that widens the semaphore while it is throttling.
+    /// The table still succeeds; the rate-limit signal rides out separately.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_rate_limited_post_copy_probe_still_reaches_the_throttle() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use async_trait::async_trait;
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::{
+            AdapterError, AdapterResult, ExecutionStats, QueryResult, SqlDialect, WarehouseAdapter,
+        };
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        struct RateLimitPostCopyDescribe<'a> {
+            inner: &'a DuckDbWarehouseAdapter,
+            copied: AtomicBool,
+        }
+
+        #[async_trait]
+        impl WarehouseAdapter for RateLimitPostCopyDescribe<'_> {
+            fn dialect(&self) -> &dyn SqlDialect {
+                self.inner.dialect()
+            }
+
+            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+                self.inner.execute_statement(sql).await
+            }
+
+            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+                self.inner.execute_query(sql).await
+            }
+
+            async fn describe_table(
+                &self,
+                table: &rocky_ir::TableRef,
+            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+                if table.schema == "tgt" && self.copied.load(Ordering::SeqCst) {
+                    return Err(AdapterError::msg(
+                        "429 Too Many Requests: UC_REQUEST_LIMIT_EXCEEDED",
+                    ));
+                }
+                self.inner.describe_table(table).await
+            }
+
+            async fn execute_statement_with_stats(
+                &self,
+                sql: &str,
+            ) -> AdapterResult<ExecutionStats> {
+                let stats = self.inner.execute_statement_with_stats(sql).await?;
+                self.copied.store(true, Ordering::SeqCst);
+                Ok(stats)
+            }
+        }
+
+        let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (event_id INTEGER, user_id INTEGER)",
+            "INSERT INTO src.events VALUES (1, 7), (2, 8)",
+        ] {
+            inner.execute_statement(sql).await.unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let pipeline = parse_pipeline(r#"strategy = "full_refresh""#);
+        let task = column_match_task(vec![], vec![]);
+
+        let adapter = RateLimitPostCopyDescribe {
+            inner: &inner,
+            copied: AtomicBool::new(false),
+        };
+        let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+            .await
+            .expect("a throttled metadata read must not fail a table that copied");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+        assert!(
+            result.probe_rate_limited,
+            "a 429 on the post-copy probe must be carried out to the throttle"
+        );
+        let check = result
+            .column_match_check
+            .expect("the task enables column_match");
+        assert!(!check.passed, "an unevaluated check never passes");
+        assert!(
+            check
+                .not_evaluated
+                .as_deref()
+                .is_some_and(|r| r.contains("429")),
+            "the reason must carry the warehouse's own error: {:?}",
+            check.not_evaluated
         );
     }
 
