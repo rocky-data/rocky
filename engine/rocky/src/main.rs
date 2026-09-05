@@ -614,6 +614,11 @@ enum Command {
         /// like `30d`. Only meaningful with `--scorecard`.
         #[arg(long, requires = "scorecard")]
         window: Option<String>,
+        /// List only the decisions about one product: the rows whose model
+        /// is the product's output model (`product.output.model`, default
+        /// the product name), read from `products/<NAME>.toml`.
+        #[arg(long, conflicts_with_all = ["for_subject", "scorecard"])]
+        product: Option<String>,
         /// Models directory used to compute the downstream blast radius.
         #[arg(long, default_value = "models")]
         models: PathBuf,
@@ -1711,6 +1716,18 @@ enum Command {
         /// allowlist is empty (same-origin only).
         #[arg(long = "allowed-origin", value_name = "ORIGIN")]
         allowed_origins: Vec<String>,
+        /// Serve the browser UI at `/ui/`. Release binaries carry it; from
+        /// source, build with `--features ui`. Requires a token with
+        /// `--token-scope read-only` (the UI token never reaches a mutating
+        /// route), and `ROCKY_WEBHOOK_SECRET` when combined with
+        /// `--scheduler`. Prints the address to open, token included.
+        #[arg(long)]
+        ui: bool,
+        /// With `--ui`: an extra `Host` header value to accept, for a reverse
+        /// proxy in front of the UI. Repeat for each. Loopback names and the
+        /// bind host are always accepted; any other `Host` is refused `421`.
+        #[arg(long = "allowed-host", value_name = "HOST")]
+        allowed_hosts: Vec<String>,
         /// Run the resident scheduler alongside the API: a timer-driven loop
         /// that evaluates every pipeline's `[schedule]` and runs what is due,
         /// exactly like `rocky tick` on a cron, but in-process (experimental).
@@ -2584,6 +2601,25 @@ enum ProductSubcommand {
         /// Product name (`products/<name>.toml`).
         product: String,
     },
+    /// List every product the project knows, one status row each.
+    ///
+    /// The union of `products/*.toml` and every name the state store holds
+    /// a fulfillment or approval record for, sorted by name — so a product
+    /// whose spec file was deleted still lists, with `spec_present =
+    /// false`. Read-only. An empty project lists nothing and exits 0.
+    List,
+
+    /// Print a product's fulfillment journal: every persisted transition,
+    /// in append order.
+    ///
+    /// Read through the same store function the fulfillment loop reads
+    /// through, so this shows what the loop sees. A known product with no
+    /// rows prints an empty journal; a product the project does not know
+    /// (no `products/<name>.toml`, no store record) exits 1. Read-only.
+    Journal {
+        /// Product name (`products/<name>.toml`).
+        product: String,
+    },
 
     /// Approve the current spec revision — a human authority transition.
     ///
@@ -3397,6 +3433,12 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             ProductSubcommand::Status { product } => {
                 rocky_cli::commands::run_product_status(&cli.config, &product, &state_path, json)
             }
+            ProductSubcommand::List => {
+                rocky_cli::commands::run_product_list(&cli.config, &state_path, json)
+            }
+            ProductSubcommand::Journal { product } => {
+                rocky_cli::commands::run_product_journal(&cli.config, &product, &state_path, json)
+            }
             ProductSubcommand::Approve { product } => {
                 rocky_cli::commands::run_product_approve(&cli.config, &product, &state_path, json)
             }
@@ -3448,6 +3490,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             scorecard,
             by,
             window,
+            product,
             models,
         } => {
             if scorecard {
@@ -3466,7 +3509,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         &selector,
                         json,
                     ),
-                    None => rocky_cli::commands::run_audit(&state_path, json),
+                    None => rocky_cli::commands::run_audit(&state_path, product.as_deref(), json),
                 }
             }
         }
@@ -4295,6 +4338,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             token,
             token_scope,
             allowed_origins,
+            ui,
+            allowed_hosts,
             scheduler,
             poll_interval_seconds,
             drain_timeout_seconds,
@@ -4303,6 +4348,26 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 Some(cli.config.as_path())
             } else {
                 None
+            };
+            // The store `serve` reads. An explicit `--state-path` is the hard
+            // override, as everywhere. A resolved namespace — the
+            // `--state-namespace` flag, or the config's `[state] namespacing`
+            // — routes the server to `<its models>/.rocky-state/<key>.redb`,
+            // the same derivation every other command makes against its
+            // models directory, so the server answers from the store the
+            // commands that set the namespace wrote. Before, the server
+            // silently read the default store instead. With neither, the
+            // override stays `None` and serve derives its default from its
+            // own `--models`, not from the global `models` resolution above.
+            let serve_models = models
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new("models"));
+            let serve_state_path: Option<PathBuf> = match (&cli.state_path, &state_namespace) {
+                (Some(explicit), _) => Some(explicit.clone()),
+                (None, Some(ns)) => Some(
+                    rocky_core::state::resolve_state_path_ns(None, serve_models, Some(ns)).path,
+                ),
+                (None, None) => None,
             };
             rocky_cli::commands::run_serve(
                 // Everything else the server does with this path — compiling,
@@ -4321,14 +4386,12 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 token,
                 token_scope,
                 allowed_origins,
+                ui,
+                allowed_hosts,
                 scheduler,
                 poll_interval_seconds,
                 drain_timeout_seconds,
-                // The raw `--state-path` override, not the namespaced resolution
-                // above: serve derives its default from its own `--models`, so
-                // passing the resolved default here would repoint a
-                // `serve --models <dir>` at `models/.rocky-state.redb`.
-                cli.state_path.as_deref(),
+                serve_state_path.as_deref(),
             )
             .await
         }

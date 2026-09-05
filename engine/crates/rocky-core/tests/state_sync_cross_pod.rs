@@ -139,7 +139,7 @@ async fn global_override_visible_across_threads() {
             .enable_all()
             .build()
             .expect("build upload runtime")
-            .block_on(state_sync::upload_state(&cfg, &path))
+            .block_on(state_sync::upload_state(&cfg, &path, false))
     })
     .join()
     .expect("upload thread panicked");
@@ -253,4 +253,300 @@ async fn scheduler_state_and_claims_stay_local_across_sync_cycle() {
         assert!(store.get_schedule_claim(claim_key).unwrap().is_some());
         assert!(store.get_watermark("cat.sch.orders").unwrap().is_some());
     }
+}
+
+// ---------------------------------------------------------------------------
+// `[cache.schemas] replicate` — the schema cache crosses pods only when the
+// project opts in (#1620).
+// ---------------------------------------------------------------------------
+
+/// Seed one schema-cache entry into `pod`'s local store.
+fn seed_schema_cache(harness: &CrossPodHarness, pod: &rocky_core::test_harness::Pod, table: &str) {
+    let store = harness.open_store(pod);
+    let key = rocky_core::schema_cache::schema_cache_key("cat", "staging", table);
+    let entry = rocky_core::schema_cache::SchemaCacheEntry {
+        columns: vec![rocky_core::schema_cache::StoredColumn {
+            name: "id".into(),
+            data_type: "BIGINT".into(),
+            nullable: false,
+        }],
+        cached_at: Utc::now(),
+    };
+    store.write_schema_cache_entry(&key, &entry).unwrap();
+}
+
+/// How many schema-cache rows `pod`'s local store holds.
+fn schema_cache_len(harness: &CrossPodHarness, pod: &rocky_core::test_harness::Pod) -> usize {
+    harness.open_store(pod).list_schema_cache().unwrap().len()
+}
+
+/// THE DEFAULT, UNCHANGED. With `replicate = false` — every project that has
+/// not opted in — the schema cache stays node-local: pod A's cached warehouse
+/// types must not reach pod B, so a fresh clone never inherits another
+/// machine's stale types.
+#[tokio::test]
+async fn schema_cache_stays_local_by_default() {
+    let _serial = remote_testing::serial_guard();
+    let harness = CrossPodHarness::new_s3_like();
+
+    seed_schema_cache(&harness, &harness.pod_a, "orders");
+    harness
+        .upload_replicating(&harness.pod_a, false)
+        .await
+        .expect("pod A upload");
+
+    let _authority = harness
+        .download_replicating(&harness.pod_b, false)
+        .await
+        .expect("pod B download");
+    assert_eq!(
+        schema_cache_len(&harness, &harness.pod_b),
+        0,
+        "the default posture must not replicate the schema cache"
+    );
+}
+
+/// THE FIX. `[cache.schemas] replicate = true` makes the schema cache travel:
+/// pod A's cached types reach pod B through the real upload → remote →
+/// download chain. Before #1620 this test failed — the setting parsed and
+/// changed neither leg.
+#[tokio::test]
+async fn schema_cache_crosses_pods_when_replicate_is_enabled() {
+    let _serial = remote_testing::serial_guard();
+    let harness = CrossPodHarness::new_s3_like();
+
+    seed_schema_cache(&harness, &harness.pod_a, "orders");
+    harness
+        .upload_replicating(&harness.pod_a, true)
+        .await
+        .expect("pod A upload");
+
+    let _authority = harness
+        .download_replicating(&harness.pod_b, true)
+        .await
+        .expect("pod B download");
+    assert_eq!(
+        schema_cache_len(&harness, &harness.pod_b),
+        1,
+        "replicate = true must carry the schema cache across pods"
+    );
+}
+
+/// Both legs are required. Uploading with `replicate = true` but downloading
+/// with it off still leaves pod B empty — the download leg overwrites the
+/// staged remote cache from pod B's own (empty) local table. This pins that
+/// the fix is not accidentally one-sided.
+#[tokio::test]
+async fn replicating_upload_alone_does_not_reach_the_other_pod() {
+    let _serial = remote_testing::serial_guard();
+    let harness = CrossPodHarness::new_s3_like();
+
+    seed_schema_cache(&harness, &harness.pod_a, "orders");
+    harness
+        .upload_replicating(&harness.pod_a, true)
+        .await
+        .expect("pod A upload");
+
+    let _authority = harness
+        .download_replicating(&harness.pod_b, false)
+        .await
+        .expect("pod B download");
+    assert_eq!(
+        schema_cache_len(&harness, &harness.pod_b),
+        0,
+        "a non-replicating download keeps its own local cache"
+    );
+}
+
+/// HONEST FAILURE. A remote object written before anyone opted in carries NO
+/// `schema_cache` table at all. Turning `replicate = true` on must not fail
+/// that download — an absent table is not an error, and pod B simply has an
+/// empty cache afterwards.
+#[tokio::test]
+async fn replicating_download_tolerates_a_remote_with_no_schema_cache_table() {
+    let _serial = remote_testing::serial_guard();
+    let harness = CrossPodHarness::new_s3_like();
+
+    // Pod A uploads under the OLD posture, so the remote has no schema_cache.
+    {
+        let store = harness.open_store(&harness.pod_a);
+        store.set_watermark("cat.sch.orders", &wm_now()).unwrap();
+    }
+    seed_schema_cache(&harness, &harness.pod_a, "orders");
+    harness
+        .upload_replicating(&harness.pod_a, false)
+        .await
+        .expect("pod A upload");
+
+    // Pod B now opts in and downloads that older remote.
+    let authority = harness
+        .download_replicating(&harness.pod_b, true)
+        .await
+        .expect("an absent remote schema_cache table must not fail the download");
+    assert_eq!(authority, StateAuthority::Authoritative);
+
+    let store = harness.open_store(&harness.pod_b);
+    assert!(
+        store.get_watermark("cat.sch.orders").unwrap().is_some(),
+        "the replicated tables must still arrive"
+    );
+    assert_eq!(
+        store.list_schema_cache().unwrap().len(),
+        0,
+        "no remote cache to inherit → empty, not an error"
+    );
+}
+
+/// Replication must never DESTROY a warm local cache. When there is no remote
+/// object at all, the download rebuilds the local file from the local-only
+/// tables — and `schema_cache` stays in that set even under `replicate = true`,
+/// or opting in would wipe this machine's cache every time the remote is
+/// missing.
+#[tokio::test]
+async fn replicating_download_keeps_the_local_cache_when_the_remote_is_absent() {
+    let _serial = remote_testing::serial_guard();
+    let harness = CrossPodHarness::new_s3_like();
+
+    // A local store with a warm cache, and NOTHING uploaded to the remote.
+    seed_schema_cache(&harness, &harness.pod_b, "orders");
+    assert_eq!(schema_cache_len(&harness, &harness.pod_b), 1);
+
+    let authority = harness
+        .download_replicating(&harness.pod_b, true)
+        .await
+        .expect("an absent remote object is not a download failure");
+    assert_eq!(authority, StateAuthority::FreshStart);
+
+    assert_eq!(
+        schema_cache_len(&harness, &harness.pod_b),
+        1,
+        "opting into replication must not discard the local cache when the remote is absent"
+    );
+}
+
+/// The CAS upload leg carries the posture too. `upload_state_cas` is a SECOND
+/// upload path, reached only under `concurrency_control = "cas"`, and it read
+/// the same hard-coded constant. Wiring the plain upload and not this one would
+/// have let a CAS project set `replicate = true` and replicate nothing —
+/// silently, because every other leg would look wired.
+#[tokio::test]
+async fn schema_cache_crosses_pods_through_the_cas_upload_leg() {
+    let _serial = remote_testing::serial_guard();
+    let harness = CrossPodHarness::new_s3_like();
+
+    let cas_cfg = rocky_core::config::StateConfig {
+        concurrency_control: rocky_core::config::ConcurrencyControl::Cas,
+        ..harness.pod_a.cfg.clone()
+    };
+    seed_schema_cache(&harness, &harness.pod_a, "orders");
+
+    let mut session = state_sync::RemoteStateSession::new(
+        &cas_cfg,
+        &harness.pod_a.state_path,
+        state_sync::FinalizeDurability::Durable,
+        true,
+    );
+    let _authority = session.acquire().await.expect("acquire");
+    session.finalize().await.expect("CAS finalize uploads");
+
+    let _authority = harness
+        .download_replicating(&harness.pod_b, true)
+        .await
+        .expect("pod B download");
+    assert_eq!(
+        schema_cache_len(&harness, &harness.pod_b),
+        1,
+        "the CAS upload leg must honour replicate = true"
+    );
+}
+
+/// The CAS leg's default is unchanged: with `replicate = false` the cache
+/// stays local, exactly as before the posture existed.
+#[tokio::test]
+async fn cas_upload_leg_keeps_the_schema_cache_local_by_default() {
+    let _serial = remote_testing::serial_guard();
+    let harness = CrossPodHarness::new_s3_like();
+
+    let cas_cfg = rocky_core::config::StateConfig {
+        concurrency_control: rocky_core::config::ConcurrencyControl::Cas,
+        ..harness.pod_a.cfg.clone()
+    };
+    seed_schema_cache(&harness, &harness.pod_a, "orders");
+
+    let mut session = state_sync::RemoteStateSession::new(
+        &cas_cfg,
+        &harness.pod_a.state_path,
+        state_sync::FinalizeDurability::Durable,
+        false,
+    );
+    let _authority = session.acquire().await.expect("acquire");
+    session.finalize().await.expect("CAS finalize uploads");
+
+    let _authority = harness
+        .download_replicating(&harness.pod_b, true)
+        .await
+        .expect("pod B download");
+    assert_eq!(
+        schema_cache_len(&harness, &harness.pod_b),
+        0,
+        "a non-replicating CAS upload must not publish the schema cache"
+    );
+}
+
+/// The mid-run periodic uploader is the THIRD upload path — it snapshots the
+/// live store on a cadence rather than at the end of the run, and it read the
+/// same hard-coded constant. A run that ends by crashing replicates only what
+/// this leg pushed, so a posture it ignored would be a posture that silently
+/// applied to some uploads and not others.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn schema_cache_crosses_pods_through_the_periodic_uploader() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let _serial = remote_testing::serial_guard();
+    let harness = CrossPodHarness::new_s3_like();
+
+    let store = Arc::new(rocky_core::state::StateStore::open(&harness.pod_a.state_path).unwrap());
+    let key = rocky_core::schema_cache::schema_cache_key("cat", "staging", "orders");
+    let entry = rocky_core::schema_cache::SchemaCacheEntry {
+        columns: vec![rocky_core::schema_cache::StoredColumn {
+            name: "id".into(),
+            data_type: "BIGINT".into(),
+            nullable: false,
+        }],
+        cached_at: Utc::now(),
+    };
+    store.write_schema_cache_entry(&key, &entry).unwrap();
+
+    let mut session = state_sync::RemoteStateSession::new(
+        &harness.pod_a.cfg,
+        &harness.pod_a.state_path,
+        state_sync::FinalizeDurability::ConfigDefault,
+        true,
+    );
+    let _authority = session.acquire().await.expect("acquire");
+    session.start_periodic_uploader(Arc::downgrade(&store), Duration::from_millis(40));
+
+    // Wait for a tick to publish, then drain cooperatively.
+    let mut replicated = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let probe = state_sync::download_state(&harness.pod_b.cfg, &harness.pod_b.state_path, true)
+            .await
+            .expect("pod B download");
+        let _ = probe;
+        if schema_cache_len(&harness, &harness.pod_b) == 1 {
+            replicated = true;
+            break;
+        }
+    }
+    // Consume the session BEFORE asserting, so a failing assertion cannot fire
+    // the Drop tripwire during unwind and abort the process.
+    session.abandon("test complete").await;
+    drop(store);
+
+    assert!(
+        replicated,
+        "the periodic uploader must honour replicate = true"
+    );
 }

@@ -1639,4 +1639,92 @@ mod tests {
             other => panic!("expected DeletionVectorsUnsupported, got {other:?}"),
         }
     }
+
+    /// One `_last_checkpoint` object turns a provable removal into
+    /// `Held(CheckpointPresent)` (#1121).
+    ///
+    /// ```text
+    ///   v0 bootstrap + own add ─┐
+    ///   v1 remove of that add   ├─► no marker  ──► ProvenRemoved { head_version: 1 }
+    ///                           └─► + marker   ──► Held(CheckpointPresent)
+    /// ```
+    ///
+    /// Why the pair and not a single store: a lone "this fixture holds"
+    /// assertion passes on any shape the reader declines for some *other*
+    /// reason (an uncanonicalizable path, a missing own `add`, an unsupported
+    /// protocol). The two stores here differ by exactly one object, so the
+    /// marker is provably the discriminator.
+    ///
+    /// This is the hold `rocky gc` runs into once a table accumulates a
+    /// checkpoint: the JSON tail stops being the whole history, so the
+    /// hand-rolled reader refuses to answer and reclamation stops. Pinning it
+    /// costs nothing today and is the regression net for the Delta Kernel swap
+    /// #1121 tracks, which folds checkpoint state and would lift the hold.
+    #[tokio::test]
+    async fn a_checkpoint_marker_holds_a_history_that_would_otherwise_prove_removal() {
+        use crate::uniform_writer::{RemovalHoldReason, RemovalProof};
+        use bytes::Bytes;
+        use object_store::PutPayload;
+        use object_store::memory::InMemory;
+
+        // v0 is a real bootstrap (supported protocol + metaData at version 0,
+        // both of which `proven_removed` requires) with this target's own
+        // `add` appended; v1 removes it.
+        let mut v0 = EXP04_BOOTSTRAP.to_vec();
+        if !v0.ends_with(b"\n") {
+            v0.push(b'\n');
+        }
+        v0.extend_from_slice(
+            br#"{"add":{"path":"data/h.parquet","partitionValues":{},"size":1,"modificationTime":1,"dataChange":true}}"#,
+        );
+        v0.push(b'\n');
+        let v1 = br#"{"remove":{"path":"data/h.parquet","dataChange":true}}"#.to_vec();
+
+        async fn seed(v0: &[u8], v1: &[u8], with_checkpoint: bool) -> InMemory {
+            let store = InMemory::new();
+            store
+                .put(
+                    &Path::from("tbl/_delta_log/00000000000000000000.json"),
+                    PutPayload::from(Bytes::copy_from_slice(v0)),
+                )
+                .await
+                .unwrap();
+            store
+                .put(
+                    &Path::from("tbl/_delta_log/00000000000000000001.json"),
+                    PutPayload::from(Bytes::copy_from_slice(v1)),
+                )
+                .await
+                .unwrap();
+            if with_checkpoint {
+                store
+                    .put(
+                        &Path::from("tbl/_delta_log/_last_checkpoint"),
+                        PutPayload::from(Bytes::from_static(br#"{"version":1,"size":2}"#)),
+                    )
+                    .await
+                    .unwrap();
+            }
+            store
+        }
+
+        // Control: the same history WITHOUT the marker proves removal. Without
+        // this half the assertion below proves nothing.
+        let control = seed(&v0, &v1, false).await;
+        assert_eq!(
+            proven_removed(&control, "b", "tbl", "data/h.parquet", 0).await,
+            RemovalProof::ProvenRemoved { head_version: 1 },
+            "the checkpoint-free history must prove removal — otherwise the \
+             hold below is not attributable to the marker"
+        );
+
+        // Treatment: one extra object, and the proof becomes a hold.
+        let checkpointed = seed(&v0, &v1, true).await;
+        assert_eq!(
+            proven_removed(&checkpointed, "b", "tbl", "data/h.parquet", 0).await,
+            RemovalProof::Held(RemovalHoldReason::CheckpointPresent),
+            "a `_last_checkpoint` marker must hold: the JSON tail is no longer \
+             the whole history"
+        );
+    }
 }

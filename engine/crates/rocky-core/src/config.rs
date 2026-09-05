@@ -6492,6 +6492,63 @@ pub fn load_rocky_config_credential_tolerant(path: &Path) -> Result<RockyConfig,
     Ok(config)
 }
 
+/// Load the project config for an **offline** path, or `None` when there is
+/// no `rocky.toml` to load.
+///
+/// This is the one answer to "what does an unloadable `rocky.toml` mean?" for
+/// every command that compiles, previews, or renders SQL without opening a
+/// warehouse connection. Absent is `None`; **present but broken refuses**,
+/// carrying the loader's own error so the message matches what a plain
+/// `rocky run` prints.
+///
+/// ```text
+///   no rocky.toml at `path`      -> Ok(None)      standalone models/ dir
+///   loads                        -> Ok(Some(cfg))
+///   unset ${VAR} in adapter creds-> Ok(Some(cfg)) kept literal (#1536)
+///   anything else                -> Err(ConfigError)
+/// ```
+///
+/// # Why the refusal is the point
+///
+/// Each caller used to decide this for itself, and most of them swallowed the
+/// error with `.ok()` or `Err(_) =>` and carried on against defaults. A
+/// Snowflake project with one invalid section therefore got **DuckDB SQL** out
+/// of `rocky mcp`'s `plan_preview`, with nothing said (#1625). One malformed
+/// file also produced an empty mask, no portability lint, no imports check and
+/// a cold schema cache in `rocky compile` (#1521). A new entry point inherited
+/// none of the answer because there was no shared answer to inherit.
+///
+/// # Credential tolerance, and what it does NOT relax
+///
+/// Loading is credential-TOLERANT (see
+/// [`load_rocky_config_credential_tolerant`]): an unset `${VAR}` in an adapter's
+/// connection fields stays literal text rather than refusing. Compiling and
+/// previewing never open a connection, so they must not require warehouse
+/// credentials — a fresh Databricks project with `${DATABRICKS_HOST}` unset
+/// could not be compiled at all (#1536).
+///
+/// Only that one rule is relaxed. A parse error, a permission denial, a
+/// directory sitting where the file should be, an unresolved `${VAR}` anywhere
+/// else, or any validator failure still refuses — we cannot tell what that
+/// config would have changed, and proceeding without it silently answers a
+/// different question. **Do not relax this to a tolerant match.**
+///
+/// `rocky validate` keeps [`load_rocky_config`] and stays the command that
+/// insists every variable resolves. Executing paths (`rocky run`) keep the
+/// strict loader too.
+pub fn load_optional_project_config(
+    path: Option<&Path>,
+) -> Result<Option<RockyConfig>, ConfigError> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    match load_rocky_config_credential_tolerant(path) {
+        Ok(config) => Ok(Some(config)),
+        Err(ConfigError::FileNotFound { .. }) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// A validator in the [`CONFIG_VALIDATORS`] chain: pure, panic-free, and
 /// independent of every other validator's outcome.
 type ConfigValidator = fn(&RockyConfig) -> Vec<ConfigError>;
@@ -6769,6 +6826,106 @@ mod tests {
         let path = dir.path().join("rocky.toml");
         std::fs::write(&path, body).unwrap();
         (dir, path)
+    }
+
+    // ---- the shared offline project loader (#1625) ----
+
+    /// No `rocky.toml` at the path is `Ok(None)`, NOT an error. This is the
+    /// standalone case (`rocky compile --models models/`), and it must keep
+    /// behaving exactly as it did before the refusal landed: absent is not
+    /// invalid.
+    #[test]
+    fn optional_project_config_absent_file_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("rocky.toml");
+        assert!(
+            load_optional_project_config(Some(&missing))
+                .expect("a missing rocky.toml is not an error")
+                .is_none(),
+            "absent must resolve to None, not an error"
+        );
+    }
+
+    /// No path at all (the caller has no config to offer) is `Ok(None)` too.
+    #[test]
+    fn optional_project_config_no_path_is_none() {
+        assert!(
+            load_optional_project_config(None)
+                .expect("no path is not an error")
+                .is_none()
+        );
+    }
+
+    /// A config that loads comes back as `Some`.
+    #[test]
+    fn optional_project_config_healthy_loads() {
+        let (_d, path) = write_cfg("[adapters.wh]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n");
+        let cfg = load_optional_project_config(Some(&path))
+            .expect("a healthy config loads")
+            .expect("a present config is Some");
+        assert!(cfg.adapters.contains_key("wh"));
+    }
+
+    /// The whole point: a present-but-broken config REFUSES, and the error is
+    /// the loader's own so the message matches what `rocky run` prints. Before
+    /// #1625 every offline caller turned this into "no config".
+    #[test]
+    fn optional_project_config_invalid_toml_refuses() {
+        let (_d, path) = write_cfg("[adapters.wh\ntype = \"duckdb\"\n");
+        let err = load_optional_project_config(Some(&path))
+            .expect_err("a present but unparseable config must refuse");
+        assert!(
+            matches!(
+                err,
+                ConfigError::ParseToml(_) | ConfigError::ParseTomlWithEnvContext { .. }
+            ),
+            "the loader's own parse error must survive, got: {err:?}"
+        );
+    }
+
+    /// A semantically invalid config — one that parses but fails the validator
+    /// chain — refuses as well. The parse error is the easy half; this is the
+    /// half a `.ok()` caller also used to erase.
+    #[test]
+    fn optional_project_config_validator_failure_refuses() {
+        // `fivetran` is discovery-only, so omitting `kind = "discovery"` is
+        // refused by `validate_adapter_kinds`.
+        let (_d, path) =
+            write_cfg("[adapters.ft]\ntype = \"fivetran\"\napi_key = \"k\"\napi_secret = \"s\"\n");
+        let err = load_optional_project_config(Some(&path))
+            .expect_err("a config the validator chain rejects must refuse");
+        assert!(
+            matches!(err, ConfigError::AdapterMissingDiscoveryKind { .. }),
+            "the validator's own error must survive, got: {err:?}"
+        );
+    }
+
+    /// Offline paths must not require warehouse credentials: an unset `${VAR}`
+    /// in an adapter's connection fields still loads (#1536). Without this the
+    /// refusal would break every project that resolves its host from the
+    /// environment.
+    #[test]
+    fn optional_project_config_tolerates_unset_credential_var() {
+        let (_d, path) =
+            write_cfg("[adapters.wh]\ntype = \"databricks\"\nhost = \"${ROCKY_T_1625_UNSET}\"\n");
+        assert!(
+            load_optional_project_config(Some(&path))
+                .expect("an unset credential var must not refuse an offline load")
+                .is_some()
+        );
+    }
+
+    /// ...but an unset `${VAR}` outside adapter connection fields still
+    /// refuses. Tolerance is scoped, and the shared loader does not widen it.
+    #[test]
+    fn optional_project_config_refuses_unset_var_outside_credentials() {
+        let (_d, path) = write_cfg(
+            "[adapters.wh]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n\n[imports]\npath = \"${ROCKY_T_1625_UNSET}\"\n",
+        );
+        assert!(
+            load_optional_project_config(Some(&path)).is_err(),
+            "an unset var outside adapter credentials must still refuse"
+        );
     }
 
     /// The scope rule, both directions, in one place. Tolerance covers an

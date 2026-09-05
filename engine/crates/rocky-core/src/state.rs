@@ -294,6 +294,56 @@ pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &[
     "product_approvals",
 ];
 
+/// [`LOCAL_ONLY_TABLE_NAMES`] without `schema_cache` — the set used when
+/// `[cache.schemas] replicate = true`.
+///
+/// Kept as its own const rather than built at runtime so both postures are
+/// visible here, next to the table definitions.
+///
+/// Duplicating the list does not by itself prevent the two from drifting — it
+/// permits exactly that. `the_two_local_only_sets_differ_by_exactly_one_table`
+/// is what enforces it: adding a local-only table here and forgetting it there
+/// (or the reverse) fails that test rather than silently replicating a table
+/// that must stay node-local.
+pub const LOCAL_ONLY_TABLE_NAMES_REPLICATING_SCHEMA_CACHE: &[&str] = &[
+    "jobs",
+    "schedule_state",
+    "schedule_claims",
+    "fulfill_state",
+    "product_approvals",
+];
+
+/// The local-only table set for a given `[cache.schemas] replicate` posture.
+///
+/// `replicate_schema_cache = false` (the default, and every project that has
+/// not opted in) returns [`LOCAL_ONLY_TABLE_NAMES`] unchanged, so the byte
+/// content of every sync leg is exactly what it was before this function
+/// existed. `true` drops `schema_cache` from the set, which is what makes the
+/// cache travel: a table is replicated precisely by NOT being local-only.
+///
+/// ```text
+///   replicate = false   ->  schema_cache stripped on upload,
+///                           overwritten from local on download   (default)
+///   replicate = true    ->  schema_cache uploaded and accepted from remote
+/// ```
+///
+/// # This is not the whole answer for the download leg
+///
+/// The download's `Absent` arm — no remote object, but a local store exists —
+/// rebuilds the local file from the local-only set alone. Passing the
+/// replicating set THERE would delete the local schema cache whenever the
+/// remote object is missing, which is not what opting into replication asks
+/// for. That arm deliberately keeps [`LOCAL_ONLY_TABLE_NAMES`]. See
+/// `state_sync::publish_merged`.
+#[must_use]
+pub fn local_only_table_names(replicate_schema_cache: bool) -> &'static [&'static str] {
+    if replicate_schema_cache {
+        LOCAL_ONLY_TABLE_NAMES_REPLICATING_SCHEMA_CACHE
+    } else {
+        LOCAL_ONLY_TABLE_NAMES
+    }
+}
+
 /// The redb key/value shape of a state table, for the logical snapshot export.
 ///
 /// The full table set is a **closed 2-type split**: exactly two tables are
@@ -4165,6 +4215,38 @@ impl StateStore {
         }
     }
 
+    /// Every product name with a fulfillment record, in key order.
+    ///
+    /// Scans the table's `product:<name>` keys and skips the
+    /// `product:<name>#<seq>` journal rows that share it. One record per
+    /// product, so the scan is as cheap as the product count.
+    pub fn fulfill_state_product_names(&self) -> Result<Vec<String>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(FULFILL_STATE)?;
+        let mut names = Vec::new();
+        for entry in table.iter()? {
+            let (key, _) = entry?;
+            if let Some(name) = crate::fulfill::product_name_from_state_key(key.value()) {
+                names.push(name.to_string());
+            }
+        }
+        Ok(names)
+    }
+
+    /// Every product name with a spec-approval record, in key order.
+    pub fn product_approval_product_names(&self) -> Result<Vec<String>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(PRODUCT_APPROVALS)?;
+        let mut names = Vec::new();
+        for entry in table.iter()? {
+            let (key, _) = entry?;
+            if let Some(name) = crate::fulfill::product_name_from_state_key(key.value()) {
+                names.push(name.to_string());
+            }
+        }
+        Ok(names)
+    }
+
     /// A product's fulfillment journal rows, in append order.
     ///
     /// The zero-padded sequence in the key makes the lexicographic range
@@ -6427,6 +6509,66 @@ mod tests {
 
     use super::*;
 
+    // ---- `[cache.schemas] replicate` table sets (#1620) ----
+
+    /// The default posture returns the pre-existing list, IDENTICALLY. This is
+    /// the guard that wiring the setting changed nothing for anyone who did not
+    /// opt in: every sync leg asks this function, so if `false` returns the same
+    /// slice, the uploaded and downloaded table sets are byte-identical.
+    #[test]
+    fn local_only_table_names_default_is_the_unchanged_list() {
+        assert_eq!(
+            local_only_table_names(false),
+            LOCAL_ONLY_TABLE_NAMES,
+            "replicate = false must not move the local-only set"
+        );
+        assert!(
+            local_only_table_names(false).contains(&"schema_cache"),
+            "the schema cache is local-only by default"
+        );
+    }
+
+    /// Opting in drops `schema_cache` and NOTHING else — a table is replicated
+    /// precisely by not being local-only, so this set difference IS the feature.
+    /// A stray removal here would silently start replicating another pod's
+    /// `jobs` rows or scheduler claims.
+    #[test]
+    fn local_only_table_names_replicating_drops_only_the_schema_cache() {
+        let replicating = local_only_table_names(true);
+        assert!(
+            !replicating.contains(&"schema_cache"),
+            "replicate = true must let the schema cache travel"
+        );
+
+        let expected: Vec<&str> = LOCAL_ONLY_TABLE_NAMES
+            .iter()
+            .copied()
+            .filter(|t| *t != "schema_cache")
+            .collect();
+        assert_eq!(
+            replicating.to_vec(),
+            expected,
+            "exactly one table may differ between the two postures"
+        );
+    }
+
+    /// The two consts cannot drift apart: adding a local-only table to one list
+    /// and forgetting the other would silently replicate it.
+    #[test]
+    fn the_two_local_only_sets_differ_by_exactly_one_table() {
+        assert_eq!(
+            LOCAL_ONLY_TABLE_NAMES.len(),
+            LOCAL_ONLY_TABLE_NAMES_REPLICATING_SCHEMA_CACHE.len() + 1,
+            "the replicating set is the default set minus schema_cache"
+        );
+        for table in LOCAL_ONLY_TABLE_NAMES_REPLICATING_SCHEMA_CACHE {
+            assert!(
+                LOCAL_ONLY_TABLE_NAMES.contains(table),
+                "'{table}' is in the replicating set but not the default one"
+            );
+        }
+    }
+
     fn temp_store() -> (StateStore, TempDir) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.redb");
@@ -7106,6 +7248,78 @@ mod tests {
         let rows = store.fulfill_journal_rows("revenue").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].event, "approved revenue");
+    }
+
+    /// The two name scans read their own table only, and neither reports a
+    /// journal row as a product: a fulfillment-only name shows in one, an
+    /// approved name in both, and the journal rows the CAS appended are
+    /// skipped.
+    #[test]
+    fn product_name_scans_split_by_table_and_skip_journal_rows() {
+        use crate::fulfill::{
+            FulfillCas, FulfillJournalRow, FulfillState, FulfillStateRecord, ProductApprovalRecord,
+        };
+        let (store, _dir) = temp_store();
+        let row = |event: &str, to: &str| FulfillJournalRow {
+            seq: 0,
+            at: None,
+            event: event.to_string(),
+            from_state: None,
+            to_state: to.to_string(),
+            spec_digest: None,
+            plan_id: None,
+            idempotency_key: None,
+        };
+
+        // `alpha`: a fulfillment record only (and its journal row).
+        let alpha =
+            FulfillStateRecord::new(FulfillState::Init, "product:alpha".to_string(), None, None);
+        assert_eq!(
+            store
+                .fulfill_state_cas("alpha", None, &alpha, &row("loop started", "init"))
+                .unwrap(),
+            FulfillCas::Won
+        );
+
+        // `beta`: an approval, which also writes the fulfillment record.
+        let beta_state = FulfillStateRecord::new(
+            FulfillState::SpecApproved,
+            "product:beta".to_string(),
+            Some("sha256:bb".to_string()),
+            None,
+        );
+        let beta_approval = ProductApprovalRecord {
+            product_id: "product:beta".to_string(),
+            spec_digest: "sha256:bb".to_string(),
+            approver: "tester".to_string(),
+            approved_at: None,
+            snapshot_path: ".rocky/fulfillment/beta/approved-bb.toml".to_string(),
+        };
+        assert_eq!(
+            store
+                .product_approval_cas(
+                    "beta",
+                    None,
+                    &beta_approval,
+                    None,
+                    &beta_state,
+                    &row("approved", "spec_approved"),
+                )
+                .unwrap(),
+            FulfillCas::Won
+        );
+
+        assert_eq!(
+            store.fulfill_state_product_names().unwrap(),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+        assert_eq!(
+            store.product_approval_product_names().unwrap(),
+            vec!["beta".to_string()]
+        );
+        // The journal rows exist and were not counted as products.
+        assert_eq!(store.fulfill_journal_rows("alpha").unwrap().len(), 1);
+        assert_eq!(store.fulfill_journal_rows("beta").unwrap().len(), 1);
     }
 
     #[test]

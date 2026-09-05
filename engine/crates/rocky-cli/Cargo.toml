@@ -56,6 +56,8 @@ object_store = { workspace = true }
 bytes = { workspace = true }
 url = { workspace = true }
 async-trait = { workspace = true }
+# The browser UI, embedded at build time. Optional: plain `cargo build` needs no node toolchain.
+include_dir = { workspace = true, optional = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
@@ -91,6 +93,10 @@ duckdb = ["dep:rocky-duckdb", "rocky-engine/duckdb"]
 # feature set; at runtime the CLI auto-initialises `OtelExporter` only
 # when the OTEL_EXPORTER_OTLP_ENDPOINT env var is set.
 otel = ["rocky-observe/otel"]
+# Embed the browser UI (`engine/ui/dist`, built with `npm run build`) so
+# `rocky serve --ui` can serve it. Release binaries carry it; `build.rs` says
+# what to run when the directory is missing.
+ui = ["dep:include_dir"]
 
 [lints]
 workspace = true

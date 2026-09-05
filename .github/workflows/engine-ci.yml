@@ -257,7 +257,7 @@ jobs:
   # `failed to build [adapter.fivetran.cache] backend` (gold-dev 2026-05-20).
   release-build-smoke:
     name: Release-build smoke (valkey feature)
-    needs: changes
+    needs: [changes, ui]
     if: ${{ !cancelled() && needs.changes.outputs.engine != 'false' }}
     runs-on: ubuntu-latest
     steps:
@@ -286,9 +286,15 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           sudo fallocate -l 4G /mnt/swapfile && sudo chmod 600 /mnt/swapfile && sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile || true
       - run: sudo apt-get update && sudo apt-get install -y cmake
-      # Mirror engine-release.yml exactly: default features only, no --features flags.
+      # Mirror engine-release.yml exactly: the browser UI built by the `ui` job
+      # is embedded with `--features ui`; every other feature stays default.
+      - name: Fetch the browser UI build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rocky-ui-dist
+          path: engine/ui/dist
       - name: Build rocky with release flags
-        run: cargo build --release --bin rocky
+        run: cargo build --release --bin rocky --features ui
       - name: Doctor must build tiered cache backend
         run: |
           set -euo pipefail
@@ -319,5 +325,51 @@ jobs:
             echo "::error::valkey feature is missing from the shipped binary. Check engine/crates/rocky-cli/Cargo.toml for features=[\"valkey\"] on rocky-fivetran and rocky-cache."
             exit 1
           fi
+      # The embedded UI answers from the shipped binary: the printed address
+      # carries the token, the page is public with its CSP, the API is not.
+      - name: Serve the embedded UI
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          ./target/release/rocky playground "$tmp/play" >/dev/null
+          ./target/release/rocky --config "$tmp/play/rocky.toml" serve --ui --models "$tmp/play/models" --token t --token-scope read-only --port 18080 > "$tmp/serve.log" 2>&1 &
+          server=$!
+          for _ in $(seq 1 50); do curl -fsS -o /dev/null http://127.0.0.1:18080/api/v1/health && break; sleep 0.2; done
+          grep -q "http://127.0.0.1:18080/ui/#token=t" "$tmp/serve.log"
+          curl -fsS -D - -o /dev/null http://127.0.0.1:18080/ui/ | grep -qi "content-security-policy"
+          test "$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18080/api/v1/meta)" = "401"
+          test "$(curl -s -o /dev/null -w "%{http_code}" -H "Host: evil.example" http://127.0.0.1:18080/ui/)" = "421"
+          kill "$server"
+
+  # The browser UI `rocky serve --ui` embeds: lint, typecheck, test, build,
+  # and hand `dist/` to the release-build smoke so the embedding compiles.
+  ui:
+    name: Browser UI
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.engine != 'false' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine/ui
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: engine/ui/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      # `npm run build` also refuses a bundle that loads from another host.
+      - run: npm run build
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rocky-ui-dist
+          path: engine/ui/dist
+          if-no-files-found: error
 
   # Coverage and audit moved to engine-weekly.yml to reduce per-PR cost.

@@ -76,6 +76,8 @@ from rocky_sdk.types import (
     PlanResult,
     ProductApproveOutput,
     ProductCompileOutput,
+    ProductJournalOutput,
+    ProductListOutput,
     ProductStatusOutput,
     ProductVerifyOutput,
     PromotePlan,
@@ -1136,6 +1138,35 @@ class RockyClient:
             self.run_cli(["product", "status", product]),
             ProductStatusOutput,
             command="product_status",
+        )
+
+    def product_list(self) -> ProductListOutput:
+        """Run ``rocky product list`` — every product, one status row each.
+
+        The union of ``products/*.toml`` and every name the state store
+        holds a fulfillment or approval record for, sorted by name. A
+        project with no products returns an empty list, not an error.
+        Never mutates.
+        """
+        return _parse_rocky_json(
+            self.run_cli(["product", "list"]),
+            ProductListOutput,
+            command="product_list",
+        )
+
+    def product_journal(self, product: str) -> ProductJournalOutput:
+        """Run ``rocky product journal <name>`` — the product's fulfillment
+        journal, every persisted transition in append order.
+
+        Read through the same store function the fulfillment loop reads
+        through. A known product with no rows returns an empty journal; a
+        product the project does not know fails with ``RockyCommandError``
+        (exit 1). Never mutates.
+        """
+        return _parse_rocky_json(
+            self.run_cli(["product", "journal", product]),
+            ProductJournalOutput,
+            command="product_journal",
         )
 
     def run(

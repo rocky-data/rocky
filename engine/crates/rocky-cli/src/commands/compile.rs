@@ -95,46 +95,26 @@ fn compile_inner(
     // therefore produced an empty mask, no portability lint, no imports
     // check and a cold schema cache, with nothing said (#1521).
     //
-    // `FileNotFound` is the only error tolerated HERE, and deliberately so: it
-    // is the standalone case, `rocky compile --models …` against a directory
-    // with no project file. (An unset `${VAR}` is also tolerated, but by the
-    // loader below rather than by this match — see the next comment.)
-    // Credential-TOLERANT: an unset `${VAR}` is kept as literal text rather
-    // than refusing the load (#1536). Compiling never opens a warehouse
-    // connection, so it must not require warehouse credentials — a fresh
-    // Databricks project with `${DATABRICKS_HOST}` unset could not be compiled
-    // at all, while `rocky emit-sql` on the same project rendered SQL and
-    // exited 0. Compilation is offline, so it now matches the preview.
-    //
-    // Only that one rule is relaxed. A parse error, a permission denial, a
-    // directory sitting where the file should be, or any validator failure
-    // still refuses, because we cannot tell what that config would have changed
-    // and compiling without it would silently answer a different question.
-    // Do not relax this back to a tolerant match.
-    //
-    // `rocky validate` keeps the strict loader and stays the command that
-    // insists every variable resolves.
+    // The rule that fixed it now lives in `load_optional_project_config`, which
+    // every offline entry point shares (#1625) rather than restating: absent is
+    // `None`, an unset `${VAR}` in adapter credentials is tolerated (#1536),
+    // and every other failure refuses. Read that function before changing what
+    // an unloadable config means here.
     //
     // Note `--config` defaults to `rocky.toml`, so this path runs even when
     // the user passed no flag.
-    // SIXTEENTH ROUND — the refusal now NAMES the file. `ConfigError`'s own
-    // `Display` is "failed to parse TOML: …", and model sidecars are TOML
-    // too, so an agent reading the bare message cannot tell whether to fix
-    // `rocky.toml` or a `<model>.toml` and will go and edit the wrong one.
-    // `plan_preview`'s sibling refusal (`plan::preview_dialect`) carries the
-    // same context, so the two paths now say the same thing about the same
-    // file.
-    let project_config = match config_path {
-        Some(path) => match rocky_config::load_rocky_config_credential_tolerant(path) {
-            Ok(config) => Some(config),
-            Err(rocky_config::ConfigError::FileNotFound { .. }) => None,
-            Err(error) => {
-                return Err(anyhow::Error::from(error)
-                    .context(format!("failed to load config from {}", path.display())));
-            }
-        },
-        None => None,
-    };
+    // The refusal NAMES the file. `ConfigError`'s own `Display` is
+    // "failed to parse TOML: …", and model sidecars are TOML too, so a bare
+    // message cannot tell the reader whether to fix `rocky.toml` or a
+    // `<model>.toml`. The shared loader (#1625) decides WHAT refuses — only a
+    // missing file is tolerated; this context says WHICH file refused.
+    let project_config = rocky_config::load_optional_project_config(config_path)
+        .with_context(|| {
+            format!(
+                "failed to load config from {}",
+                config_path.map(|p| p.display().to_string()).unwrap_or_default()
+            )
+        })?;
 
     // `source_schemas` precedence:
     //   1. `--with-seed` wins -> seed loader (explicit user intent,

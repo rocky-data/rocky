@@ -11,6 +11,14 @@ build: build-engine build-sdk build-dagster build-vscode
 build-engine:
     cd engine && cargo build --release
 
+# The browser UI `rocky serve --ui` embeds. Plain `cargo build` needs none of this.
+build-ui:
+    cd engine/ui && npm ci && npm run build
+
+# The release shape: the SPA built, then the binary with it embedded.
+build-engine-ui: build-ui
+    cd engine && cargo build --release --features ui
+
 # rocky-sdk is built before dagster-rocky, which depends on it.
 build-sdk:
     cd sdk/python && uv build --wheel
@@ -24,7 +32,7 @@ build-vscode:
 # --- Test ---
 
 # Run all test suites
-test: test-engine test-sdk test-dagster test-vscode
+test: test-engine test-sdk test-dagster test-vscode test-ui
 
 test-engine:
     cd engine && cargo test
@@ -44,6 +52,9 @@ test-vscode:
 test-vscode-electron:
     cd editors/vscode && npm test
 
+test-ui:
+    cd engine/ui && npm run typecheck && npm test
+
 # --- Agent conformance evals ---
 
 # Run the agent conformance eval suite (needs a `rocky` build + $ANTHROPIC_API_KEY
@@ -57,7 +68,7 @@ evals-selftest:
 
 # --- Lint ---
 
-lint: lint-engine lint-sdk lint-dagster lint-vscode
+lint: lint-engine lint-sdk lint-dagster lint-vscode lint-ui
 
 lint-engine:
     cd engine && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -70,6 +81,9 @@ lint-dagster:
 
 lint-vscode:
     cd editors/vscode && npm run lint
+
+lint-ui:
+    cd engine/ui && npm run lint
 
 # --- Phase 2 schema codegen ---
 

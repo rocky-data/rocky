@@ -1,6 +1,5 @@
 //! `rocky lineage` — column-level lineage explorer.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -46,16 +45,16 @@ pub fn run_lineage(
     output_json: bool,
     cache_ttl_override: Option<u64>,
 ) -> Result<()> {
-    // Load cached warehouse schemas so lineage edges inherit real
-    // types instead of `RockyType::Unknown` on the leaves. Degrades to
-    // empty on cold cache / missing config.
-    let source_schemas = match rocky_core::config::load_rocky_config(config_path) {
-        Ok(cfg) => {
-            let schema_cfg = cfg.cache.schemas.with_ttl_override(cache_ttl_override);
-            crate::source_schemas::load_cached_source_schemas(&schema_cfg, state_path)
-        }
-        Err(_) => HashMap::new(),
-    };
+    // Load cached warehouse schemas so lineage edges inherit real types
+    // instead of `RockyType::Unknown` on the leaves. Degrades to empty on a
+    // cold cache or a project with no `rocky.toml`; a `rocky.toml` that is
+    // present and does not load REFUSES (#1625) rather than quietly producing
+    // the same lineage a config-less project would.
+    let source_schemas = crate::source_schemas::load_project_source_schemas(
+        config_path,
+        state_path,
+        cache_ttl_override,
+    )?;
 
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
@@ -349,6 +348,7 @@ pub fn column_lineage_output(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
     use std::path::Path;
 
