@@ -3479,7 +3479,7 @@ adapter = "db"
             found.len(),
             1,
             "expected exactly one tombstone in {}",
-            spool.as_path().display()
+            spool.display()
         );
         found.pop().unwrap()
     }
@@ -3546,7 +3546,7 @@ adapter = "db"
         assert!(
             !tombstone.exists(),
             "a tick must sweep an expired tombstone out of {}",
-            spool_path.as_path().display()
+            spool_path.display()
         );
         assert!(
             std::fs::read_dir(&spool_path).unwrap().next().is_none(),

@@ -157,9 +157,10 @@ impl SpoolJournal for NoopJournal {
 /// Every function that resolves the spool for itself — [`accept`],
 /// [`accept_journaled`], [`list_pending_files`], [`count_corrupt`],
 /// [`sweep_tombstones`] — takes the **`.rocky` dir**; [`spool_dir`] returns the
-/// **resolved spool dir**. (The rest — [`dispose`], [`is_tombstoned`],
-/// [`read_pending`], [`quarantine`], [`drop_pending`] — take one file's path and
-/// are not part of this confusion.) Passing the resolved spool dir where the
+/// **resolved spool dir**. (The rest — [`dispose`], [`dispose_journaled`],
+/// [`is_tombstoned`], [`read_pending`], [`quarantine`], [`drop_pending`] — take
+/// one file's path and are not part of this confusion.) Passing the resolved
+/// spool dir where the
 /// `.rocky` dir is wanted resolves twice, giving
 /// `.rocky/pending-demands/pending-demands` — a directory that never exists, so
 /// the read returns `NotFound` and the caller sees an empty, successful scan.
@@ -169,7 +170,8 @@ impl SpoolJournal for NoopJournal {
 /// The distinct type makes that mistake a compile error. It deliberately does
 /// **not** implement `Deref<Target = Path>`: a deref coercion would let a
 /// `SpoolDir` slide back into a `&Path` parameter and re-arm the confusion. Use
-/// [`SpoolDir::as_path`] or [`SpoolDir::join`] to get a plain path out.
+/// [`SpoolDir::as_path`], [`SpoolDir::join`] or [`SpoolDir::display`] to get a
+/// plain path out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpoolDir(PathBuf);
 
