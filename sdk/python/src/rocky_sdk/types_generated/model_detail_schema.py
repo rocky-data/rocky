@@ -24,6 +24,14 @@ class RockyType1(StrEnum):
     Rocky's unified column type.
 
     Derives `JsonSchema` because it is served verbatim on the HTTP model detail route (`TypedColumnOutput::data_type`): the structured form is the only lossless one — the `Display` rendering drops a struct field's nullability.
+
+    # Wire contract
+
+    The serde shape — externally tagged, with these exact variant names — is published in `schemas/model_detail.schema.json` and the generated Python and TypeScript bindings. From engine 1.74.0 it is a public contract:
+
+    - **Adding** a variant is additive. Consumers must treat an unknown tag as "a type this build does not know", never as an error. - **Renaming or removing** a variant, or changing a variant's payload, is a breaking change to the model-detail route and every binding. It needs a `Changed` changelog entry that names the old and new tags, and the codegen cascade in the same PR.
+
+    The `Display` rendering (`data_type_display`) is a label and carries no such promise.
     """
 
     Boolean = "Boolean"
@@ -48,6 +56,14 @@ class RockyType2(BaseModel):
     Rocky's unified column type.
 
     Derives `JsonSchema` because it is served verbatim on the HTTP model detail route (`TypedColumnOutput::data_type`): the structured form is the only lossless one — the `Display` rendering drops a struct field's nullability.
+
+    # Wire contract
+
+    The serde shape — externally tagged, with these exact variant names — is published in `schemas/model_detail.schema.json` and the generated Python and TypeScript bindings. From engine 1.74.0 it is a public contract:
+
+    - **Adding** a variant is additive. Consumers must treat an unknown tag as "a type this build does not know", never as an error. - **Renaming or removing** a variant, or changing a variant's payload, is a breaking change to the model-detail route and every binding. It needs a `Changed` changelog entry that names the old and new tags, and the codegen cascade in the same PR.
+
+    The `Display` rendering (`data_type_display`) is a label and carries no such promise.
     """
 
     model_config = ConfigDict(
@@ -124,6 +140,14 @@ class RockyType5(BaseModel):
     Rocky's unified column type.
 
     Derives `JsonSchema` because it is served verbatim on the HTTP model detail route (`TypedColumnOutput::data_type`): the structured form is the only lossless one — the `Display` rendering drops a struct field's nullability.
+
+    # Wire contract
+
+    The serde shape — externally tagged, with these exact variant names — is published in `schemas/model_detail.schema.json` and the generated Python and TypeScript bindings. From engine 1.74.0 it is a public contract:
+
+    - **Adding** a variant is additive. Consumers must treat an unknown tag as "a type this build does not know", never as an error. - **Renaming or removing** a variant, or changing a variant's payload, is a breaking change to the model-detail route and every binding. It needs a `Changed` changelog entry that names the old and new tags, and the codegen cascade in the same PR.
+
+    The `Display` rendering (`data_type_display`) is a label and carries no such promise.
     """
 
     model_config = ConfigDict(
@@ -142,6 +166,14 @@ class RockyType5(BaseModel):
     Rocky's unified column type.
 
     Derives `JsonSchema` because it is served verbatim on the HTTP model detail route (`TypedColumnOutput::data_type`): the structured form is the only lossless one — the `Display` rendering drops a struct field's nullability.
+
+    # Wire contract
+
+    The serde shape — externally tagged, with these exact variant names — is published in `schemas/model_detail.schema.json` and the generated Python and TypeScript bindings. From engine 1.74.0 it is a public contract:
+
+    - **Adding** a variant is additive. Consumers must treat an unknown tag as "a type this build does not know", never as an error. - **Renaming or removing** a variant, or changing a variant's payload, is a breaking change to the model-detail route and every binding. It needs a `Changed` changelog entry that names the old and new tags, and the codegen cascade in the same PR.
+
+    The `Display` rendering (`data_type_display`) is a label and carries no such promise.
     """
 
 
@@ -150,6 +182,14 @@ class RockyType6(BaseModel):
     Rocky's unified column type.
 
     Derives `JsonSchema` because it is served verbatim on the HTTP model detail route (`TypedColumnOutput::data_type`): the structured form is the only lossless one — the `Display` rendering drops a struct field's nullability.
+
+    # Wire contract
+
+    The serde shape — externally tagged, with these exact variant names — is published in `schemas/model_detail.schema.json` and the generated Python and TypeScript bindings. From engine 1.74.0 it is a public contract:
+
+    - **Adding** a variant is additive. Consumers must treat an unknown tag as "a type this build does not know", never as an error. - **Renaming or removing** a variant, or changing a variant's payload, is a breaking change to the model-detail route and every binding. It needs a `Changed` changelog entry that names the old and new tags, and the codegen cascade in the same PR.
+
+    The `Display` rendering (`data_type_display`) is a label and carries no such promise.
     """
 
     model_config = ConfigDict(
@@ -171,6 +211,14 @@ class RockyType7(BaseModel):
     Rocky's unified column type.
 
     Derives `JsonSchema` because it is served verbatim on the HTTP model detail route (`TypedColumnOutput::data_type`): the structured form is the only lossless one — the `Display` rendering drops a struct field's nullability.
+
+    # Wire contract
+
+    The serde shape — externally tagged, with these exact variant names — is published in `schemas/model_detail.schema.json` and the generated Python and TypeScript bindings. From engine 1.74.0 it is a public contract:
+
+    - **Adding** a variant is additive. Consumers must treat an unknown tag as "a type this build does not know", never as an error. - **Renaming or removing** a variant, or changing a variant's payload, is a breaking change to the model-detail route and every binding. It needs a `Changed` changelog entry that names the old and new tags, and the codegen cascade in the same PR.
+
+    The `Display` rendering (`data_type_display`) is a label and carries no such promise.
     """
 
     model_config = ConfigDict(
@@ -197,6 +245,14 @@ class StructField(BaseModel):
     Rocky's unified column type.
 
     Derives `JsonSchema` because it is served verbatim on the HTTP model detail route (`TypedColumnOutput::data_type`): the structured form is the only lossless one — the `Display` rendering drops a struct field's nullability.
+
+    # Wire contract
+
+    The serde shape — externally tagged, with these exact variant names — is published in `schemas/model_detail.schema.json` and the generated Python and TypeScript bindings. From engine 1.74.0 it is a public contract:
+
+    - **Adding** a variant is additive. Consumers must treat an unknown tag as "a type this build does not know", never as an error. - **Renaming or removing** a variant, or changing a variant's payload, is a breaking change to the model-detail route and every binding. It needs a `Changed` changelog entry that names the old and new tags, and the codegen cascade in the same PR.
+
+    The `Display` rendering (`data_type_display`) is a label and carries no such promise.
     """
     name: str
     nullable: bool
