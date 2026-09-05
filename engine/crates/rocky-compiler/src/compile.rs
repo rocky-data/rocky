@@ -778,6 +778,12 @@ fn validate_all_contracts(
 }
 
 /// Convert warehouse type strings to RockyType (default mapper).
+///
+/// Shares its decimal grammar with `rocky_core::contracts::warehouse_type_to_rocky`,
+/// the load gate's normaliser, so the two gates read one spelling the same
+/// way. That function knows more *names* than this one — BigQuery's scalars,
+/// `BIGNUMERIC`, Snowflake's `NUMBER` — and they stay [`RockyType::Unknown`]
+/// here (#1646).
 pub fn default_type_mapper(warehouse_type: &str) -> RockyType {
     let upper = warehouse_type.trim().to_uppercase();
     match upper.as_str() {
@@ -792,30 +798,56 @@ pub fn default_type_mapper(warehouse_type: &str) -> RockyType {
         "TIMESTAMP" => RockyType::Timestamp,
         "TIMESTAMP_NTZ" => RockyType::TimestampNtz,
         "VARIANT" => RockyType::Variant,
-        _ if upper.starts_with("DECIMAL") || upper.starts_with("NUMERIC") => {
-            // Try to parse precision and scale
-            if let Some(params) = upper
-                .strip_prefix("DECIMAL(")
-                .or_else(|| upper.strip_prefix("NUMERIC("))
-                .and_then(|s| s.strip_suffix(')'))
-            {
-                let parts: Vec<&str> = params.split(',').collect();
-                if parts.len() == 2
-                    && let (Ok(p), Ok(s)) = (parts[0].trim().parse(), parts[1].trim().parse())
-                {
-                    return RockyType::Decimal {
-                        precision: p,
-                        scale: s,
-                    };
-                }
-            }
-            RockyType::Decimal {
-                precision: 38,
-                scale: 0,
-            }
-        }
-        _ => RockyType::Unknown,
+        _ => decimal_family_type(&upper),
     }
+}
+
+/// The decimal family as this mapper reads it: `DECIMAL` and `NUMERIC`.
+///
+/// `NAME(p,s)` is those digits. `NAME(p)` is precision `p` and scale 0 —
+/// the reading `contracts::decimal_type_matches` already gives a contract
+/// written `Decimal(p)`, and the one the load gate settled on in #1614.
+///
+/// A bare `DECIMAL` or `NUMERIC` carries no digits, and the warehouses
+/// disagree about which digits it stands for: `DECIMAL` is `(18,3)` on
+/// DuckDB and `(10,0)` on Databricks, and `NUMERIC` is `(38,9)` on
+/// BigQuery but a synonym of `NUMBER` on Snowflake. This mapper is handed a
+/// source table's type string with no dialect attached, so it cannot pick
+/// one. Both are [`RockyType::Unknown`], as is any string that starts with
+/// one of the names but does not parse — `DECIMAL(a,b)`, `NUMERICWANG`.
+/// Every one of these used to be read as `DECIMAL(38,0)`, a type no
+/// warehouse had reported (#1646).
+///
+/// `Unknown` is a safe outcome here: `contracts::validate_contract` branches
+/// on it and reports `I003` ("not checked") instead of `E011`, and
+/// `is_assignable` treats it as assignable, so inference stays best-effort
+/// rather than failing.
+fn decimal_family_type(upper: &str) -> RockyType {
+    const NAMES: [&str; 2] = ["DECIMAL", "NUMERIC"];
+    for name in NAMES {
+        if upper == name {
+            return RockyType::Unknown;
+        }
+        // `DECIMAL (10,2)` is valid SQL; the space is trimmed rather than
+        // making the type unreadable, as the load gate's normaliser does.
+        let Some(params) = upper
+            .strip_prefix(name)
+            .map(str::trim_start)
+            .and_then(|rest| rest.strip_prefix('('))
+            .and_then(|rest| rest.strip_suffix(')'))
+        else {
+            continue;
+        };
+        let (precision, scale) = match params.split_once(',') {
+            Some((precision, scale)) => (precision.trim(), scale.trim()),
+            None => (params.trim(), "0"),
+        };
+        if let (Ok(precision), Ok(scale)) = (precision.parse(), scale.parse()) {
+            return RockyType::Decimal { precision, scale };
+        }
+        return RockyType::Unknown;
+    }
+    RockyType::Unknown
 }
 
 #[cfg(test)]
@@ -1095,6 +1127,125 @@ mod tests {
             }
         );
         assert_eq!(default_type_mapper("unknown_type"), RockyType::Unknown);
+    }
+
+    /// The decimal family has a grammar here too (#1646). Until this change
+    /// every string that merely started with `DECIMAL` or `NUMERIC` and did
+    /// not parse as `NAME(p,s)` became `DECIMAL(38,0)` — a type no warehouse
+    /// had reported, fed into inference and into the contract gate as if it
+    /// were true.
+    #[test]
+    fn test_default_type_mapper_decimal_family_grammar() {
+        // A bare name carries no digits, and the warehouses disagree about
+        // which digits it stands for, so it is not read.
+        for bare in ["DECIMAL", "NUMERIC", "decimal", "  numeric  "] {
+            assert_eq!(
+                default_type_mapper(bare),
+                RockyType::Unknown,
+                "bare {bare} names no digits and no one warehouse"
+            );
+        }
+        // A string that starts with a family name but does not parse.
+        for malformed in [
+            "DECIMAL(a,b)",
+            "DECIMAL(10,2,3)",
+            "NUMERIC()",
+            "NUMERICWANG",
+            "DECIMALX",
+            "NUMERIC(300,0)",
+        ] {
+            assert_eq!(
+                default_type_mapper(malformed),
+                RockyType::Unknown,
+                "{malformed} must not become a made-up decimal"
+            );
+        }
+        // `NAME(p)` is precision p, scale 0 — the reading
+        // `contracts::decimal_type_matches` gives `Decimal(p)` and the load
+        // gate settled on in #1614.
+        assert_eq!(
+            default_type_mapper("DECIMAL(10)"),
+            RockyType::Decimal {
+                precision: 10,
+                scale: 0
+            }
+        );
+    }
+
+    /// Honest-failure control for #1646: the exact strings the DuckDB,
+    /// Databricks and Snowflake adapters emit from a live `DESCRIBE` today,
+    /// through the compiler's mapper. The new `Unknown` must not fire on a
+    /// healthy run. `NUMBER(38,0)` is Snowflake's canonical spelling and this
+    /// mapper does not know the name — that gap predates #1646 and is
+    /// asserted here so it cannot change unnoticed.
+    #[test]
+    fn test_default_type_mapper_healthy_describe_decimals_stay_concrete() {
+        for (describe_output, precision, scale) in [
+            ("DECIMAL(10,2)", 10, 2),
+            ("decimal(10,2)", 10, 2),
+            ("DECIMAL(18,3)", 18, 3),
+            ("NUMERIC(38,9)", 38, 9),
+            ("DECIMAL (10,2)", 10, 2),
+        ] {
+            assert_eq!(
+                default_type_mapper(describe_output),
+                RockyType::Decimal { precision, scale },
+                "{describe_output} is a live DESCRIBE string and must stay concrete"
+            );
+        }
+        assert_eq!(default_type_mapper("NUMBER(38,0)"), RockyType::Unknown);
+        assert_eq!(default_type_mapper("BIGNUMERIC(76,38)"), RockyType::Unknown);
+    }
+
+    /// Drift guard between the two normalisers. `warehouse_type_to_rocky`
+    /// (the load gate) and `default_type_mapper` (the compiler) must read
+    /// every string in the decimal family the same way, or one gate accepts
+    /// what the other refuses. The exception is the set of names only the
+    /// load gate knows — `NUMBER`, `BIGNUMERIC` and BigQuery's scalars —
+    /// which is listed here so adding one to this mapper is a deliberate act
+    /// (#1646).
+    #[test]
+    fn test_two_normalisers_agree_on_the_decimal_family() {
+        use rocky_core::contracts::warehouse_type_to_rocky;
+
+        for shared in [
+            "DECIMAL",
+            "NUMERIC",
+            "decimal",
+            "DECIMAL(10,2)",
+            "decimal(10,2)",
+            "DECIMAL (10,2)",
+            "NUMERIC(38,9)",
+            "DECIMAL(10)",
+            "DECIMAL(a,b)",
+            "DECIMAL(10,2,3)",
+            "NUMERIC()",
+            "NUMERICWANG",
+            "DECIMALX",
+            "NUMERIC(300,0)",
+            "not_a_type",
+        ] {
+            assert_eq!(
+                default_type_mapper(shared),
+                warehouse_type_to_rocky(shared),
+                "the compile gate and the load gate must read {shared} the same way"
+            );
+        }
+
+        // Names only the load gate knows. Each is `Unknown` here, so the
+        // compile gate reports `I003` rather than checking it.
+        for load_only in ["NUMBER", "NUMBER(38,0)", "BIGNUMERIC(76,38)"] {
+            assert_eq!(
+                default_type_mapper(load_only),
+                RockyType::Unknown,
+                "{load_only} is not in this mapper's name set"
+            );
+            assert_ne!(
+                warehouse_type_to_rocky(load_only),
+                RockyType::Unknown,
+                "{load_only} is in the load gate's name set"
+            );
+        }
     }
 
     /// #1291: every model in a colliding group gets its own **E036 error**
