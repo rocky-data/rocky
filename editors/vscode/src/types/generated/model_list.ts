@@ -8,7 +8,7 @@
 /**
  * The compiled model list for `GET /api/v1/models`.
  *
- * One entry per model in the in-memory compile result, in the semantic graph's iteration order (model name, ascending). Bounded by the project's model count: the whole list is what an estate screen renders, so there is no pagination and no per-request cap beyond that.
+ * One entry per model in the in-memory compile result, sorted by model name (the graph itself iterates in topological order). Bounded by the project's model count: the whole list is what an estate screen renders, so there is no pagination and no per-request cap beyond that.
  */
 export interface ModelListOutput {
   /**

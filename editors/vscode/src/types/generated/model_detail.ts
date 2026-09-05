@@ -6,6 +6,36 @@
  */
 
 /**
+ * Rocky's unified column type.
+ *
+ * Derives `JsonSchema` because it is served verbatim on the HTTP model detail route (`TypedColumnOutput::data_type`): the structured form is the only lossless one — the `Display` rendering drops a struct field's nullability.
+ */
+export type RockyType =
+  | ("Boolean" | "Int32" | "Int64" | "Float32" | "Float64" | "String" | "Date" | "Binary" | "Variant" | "Unknown")
+  | {
+      Decimal: {
+        precision: number;
+        scale: number;
+        [k: string]: unknown;
+      };
+    }
+  | "Timestamp"
+  | "TimestampNtz"
+  | {
+      Array: RockyType;
+    }
+  | {
+      /**
+       * @minItems 2
+       * @maxItems 2
+       */
+      Map: [RockyType, RockyType];
+    }
+  | {
+      Struct: StructField[];
+    };
+
+/**
  * One model's detail for `GET /api/v1/models/{name}`.
  */
 export interface ModelDetailOutput {
@@ -42,7 +72,7 @@ export interface ModelDetailOutput {
    */
   sql_truncated: boolean;
   /**
-   * Type-checked columns, or `null` when the type checker produced none for this model.
+   * Type-checked columns, or `null` when the type checker produced none for this model. Each carries the structured type and its label.
    */
   typed_columns?: TypedColumnOutput[] | null;
   /**
@@ -66,9 +96,13 @@ export interface ModelColumnOutput {
  */
 export interface TypedColumnOutput {
   /**
-   * Rocky's rendering of the inferred type, e.g. `INT64` or `DECIMAL(10,2)`.
+   * The inferred type, structured and lossless — a struct field keeps its own nullability, which the display string drops.
    */
-  data_type: string;
+  data_type: RockyType;
+  /**
+   * Rocky's human rendering of `data_type`, e.g. `INT64`, `DECIMAL(10,2)` or `STRUCT<a:INT64>`. A label, not a parser input.
+   */
+  data_type_display: string;
   /**
    * Column name.
    */
@@ -76,6 +110,15 @@ export interface TypedColumnOutput {
   /**
    * Whether the column may be `NULL`.
    */
+  nullable: boolean;
+  [k: string]: unknown;
+}
+/**
+ * A field in a struct type.
+ */
+export interface StructField {
+  data_type: RockyType;
+  name: string;
   nullable: boolean;
   [k: string]: unknown;
 }

@@ -1010,6 +1010,11 @@ mod tests {
             "CompileOutput",
             "DagOutput",
             "JobStatus",
+            "HealthOutput",
+            "ModelListOutput",
+            "ModelDetailOutput",
+            "DagLayersOutput",
+            "DagStatusOutput",
             "ErrorEnvelope",
             "JobRequest",
         ] {
@@ -1057,6 +1062,29 @@ mod tests {
 
     /// The generated output is byte-stable across runs — the drift gate relies
     /// on this.
+    /// The five estate routes answer `200` with their typed component, not
+    /// an out-of-contract body. The path-set test cannot see a body change,
+    /// so this pins each mapping by name.
+    #[test]
+    fn estate_routes_reference_their_typed_components() {
+        let doc = build_document().expect("document");
+        for (path, component) in [
+            ("/api/v1/health", "HealthOutput"),
+            ("/api/v1/models", "ModelListOutput"),
+            ("/api/v1/models/{name}", "ModelDetailOutput"),
+            ("/api/v1/dag/layers", "DagLayersOutput"),
+            ("/api/v1/dag/status", "DagStatusOutput"),
+        ] {
+            let schema = &doc["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"];
+            assert_eq!(
+                schema["$ref"],
+                json!(format!("#/components/schemas/{component}")),
+                "{path} must answer with {component}, got {schema}"
+            );
+        }
+    }
+
     #[test]
     fn generation_is_deterministic() {
         let a = serde_json::to_string_pretty(&build_document().unwrap()).unwrap();

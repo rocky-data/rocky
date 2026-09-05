@@ -10,10 +10,16 @@
 //! `rocky-compiler::types` re-exports these names so existing call sites
 //! continue to compile unchanged.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Rocky's unified column type.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Derives `JsonSchema` because it is served verbatim on the HTTP model
+/// detail route (`TypedColumnOutput::data_type`): the structured form is the
+/// only lossless one — the `Display` rendering drops a struct field's
+/// nullability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum RockyType {
     // Numeric
     Boolean,
@@ -52,7 +58,7 @@ pub enum RockyType {
 }
 
 /// A field in a struct type.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct StructField {
     pub name: std::string::String,
     pub data_type: RockyType,

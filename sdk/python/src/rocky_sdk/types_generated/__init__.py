@@ -342,6 +342,7 @@ _LAZY: dict[str, tuple[str, str]] = {
     "TickCounts": ("tick_schema", "TickCounts"),
     "TickOutput": ("tick_schema", "TickOutput"),
     "TraceModelEntry": ("trace_schema", "TraceModelEntry"),
+    "StructField": ("model_detail_schema", "StructField"),
     "TraceOutput": ("trace_schema", "TraceOutput"),
     "TypedColumnOutput": ("model_detail_schema", "TypedColumnOutput"),
     "UnitTestResult": ("test_schema", "UnitTestResult"),
@@ -405,6 +406,7 @@ if TYPE_CHECKING:
     from .model_detail_schema import (
         ModelColumnOutput,
         ModelDetailOutput,
+        StructField,
         TypedColumnOutput,
     )
     from .dag_layers_schema import DagLayersOutput
@@ -1068,6 +1070,7 @@ __all__ = [
     "ModelEstimate",
     "ProfileOutput",
     "ProfileColumnStats",
+    "StructField",
     "TraceOutput",
     "TypedColumnOutput",
     "TraceModelEntry",

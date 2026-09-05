@@ -5948,6 +5948,42 @@ mod model_detail_sql_cap_tests {
     }
 
     #[test]
+    fn typed_column_keeps_nested_struct_nullability_and_renders_a_label() {
+        use rocky_ir::types::{RockyType, StructField, TypedColumn};
+
+        let column = TypedColumn {
+            name: "address".to_string(),
+            data_type: RockyType::Struct(vec![
+                StructField {
+                    name: "street".to_string(),
+                    data_type: RockyType::String,
+                    nullable: true,
+                },
+                StructField {
+                    name: "zip".to_string(),
+                    data_type: RockyType::Decimal {
+                        precision: 5,
+                        scale: 0,
+                    },
+                    nullable: false,
+                },
+            ]),
+            nullable: false,
+        };
+        let out = TypedColumnOutput::from_typed_column(&column);
+        // The label drops the inner nullability; the structured type keeps it.
+        assert_eq!(
+            out.data_type_display,
+            "STRUCT<street:STRING,zip:DECIMAL(5,0)>"
+        );
+        assert_eq!(out.data_type, column.data_type);
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(json["data_type"]["Struct"][0]["nullable"], true);
+        assert_eq!(json["data_type"]["Struct"][1]["nullable"], false);
+        assert_eq!(json["nullable"], false);
+    }
+
+    #[test]
     fn long_sql_is_cut_on_a_char_boundary() {
         // Fill up to one byte short of the cap, then a 2-byte character
         // straddles it: the cut must fall back to the boundary before it.
@@ -9881,8 +9917,8 @@ pub struct HealthOutput {
 
 /// The compiled model list for `GET /api/v1/models`.
 ///
-/// One entry per model in the in-memory compile result, in the semantic
-/// graph's iteration order (model name, ascending). Bounded by the project's
+/// One entry per model in the in-memory compile result, sorted by model name
+/// (the graph itself iterates in topological order). Bounded by the project's
 /// model count: the whole list is what an estate screen renders, so there is
 /// no pagination and no per-request cap beyond that.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -9948,7 +9984,7 @@ pub struct ModelDetailOutput {
     /// Inferred output columns.
     pub columns: Vec<ModelColumnOutput>,
     /// Type-checked columns, or `null` when the type checker produced none
-    /// for this model.
+    /// for this model. Each carries the structured type and its label.
     pub typed_columns: Option<Vec<TypedColumnOutput>>,
     /// Whether the model uses `SELECT *`, so its schema depends on upstream.
     pub has_star: bool,
@@ -9970,11 +10006,27 @@ pub struct ModelColumnOutput {
 pub struct TypedColumnOutput {
     /// Column name.
     pub name: String,
-    /// Rocky's rendering of the inferred type, e.g. `INT64` or
-    /// `DECIMAL(10,2)`.
-    pub data_type: String,
+    /// The inferred type, structured and lossless — a struct field keeps its
+    /// own nullability, which the display string drops.
+    pub data_type: rocky_ir::types::RockyType,
+    /// Rocky's human rendering of `data_type`, e.g. `INT64`,
+    /// `DECIMAL(10,2)` or `STRUCT<a:INT64>`. A label, not a parser input.
+    pub data_type_display: String,
     /// Whether the column may be `NULL`.
     pub nullable: bool,
+}
+
+impl TypedColumnOutput {
+    /// Project one type-checked column, keeping the structured type and
+    /// rendering the label beside it.
+    pub fn from_typed_column(column: &rocky_ir::types::TypedColumn) -> Self {
+        Self {
+            name: column.name.clone(),
+            data_type: column.data_type.clone(),
+            data_type_display: column.data_type.to_string(),
+            nullable: column.nullable,
+        }
+    }
 }
 
 /// The execution layers for `GET /api/v1/dag/layers`.

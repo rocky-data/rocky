@@ -700,14 +700,14 @@ async fn meta(State(state): State<Arc<ServerState>>) -> PrettyJson<MetaOutput> {
 /// `GET /api/v1/models` — the compiled model list, typed [`ModelListOutput`].
 ///
 /// No CLI counterpart: no verb lists compiled models with their graph edges.
-/// Bounded by the project's model count.
+/// Sorted by model name; bounded by the project's model count.
 async fn list_models(
     State(state): State<Arc<ServerState>>,
 ) -> Result<PrettyJson<ModelListOutput>, ApiError> {
     let lock = state.compile_result.read().await;
     let result = lock.as_ref().ok_or_else(ApiError::engine_not_ready)?;
 
-    let models: Vec<ModelListEntry> = result
+    let mut models: Vec<ModelListEntry> = result
         .semantic_graph
         .models
         .iter()
@@ -719,6 +719,8 @@ async fn list_models(
             downstream: schema.downstream.clone(),
         })
         .collect();
+    // The graph iterates in topological order; the list contract is by name.
+    models.sort_by(|a, b| a.name.cmp(&b.name));
 
     let count = models.len();
     Ok(PrettyJson(ModelListOutput { models, count }))
@@ -743,11 +745,7 @@ async fn get_model(
 
     let typed_columns = result.type_check.typed_models.get(&name).map(|cols| {
         cols.iter()
-            .map(|c| TypedColumnOutput {
-                name: c.name.clone(),
-                data_type: c.data_type.to_string(),
-                nullable: c.nullable,
-            })
+            .map(TypedColumnOutput::from_typed_column)
             .collect()
     });
 
@@ -1755,13 +1753,15 @@ mod tests {
     async fn test_get_model_detail() {
         let state = test_state();
         state.recompile().await;
+        let state_for_detail = state.clone();
         let base = spawn_router(state).await;
 
         let resp = reqwest::get(format!("{base}/api/v1/models/raw_orders"))
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        let body: ModelDetailOutput = resp.json().await.unwrap();
+        let text = resp.text().await.unwrap();
+        let body: ModelDetailOutput = serde_json::from_str(&text).unwrap();
         assert_eq!(body.name, "raw_orders");
         assert!(body.sql.contains("SELECT"));
         assert!(!body.sql_truncated, "a fixture-sized model is never cut");
@@ -1771,6 +1771,30 @@ mod tests {
             body.columns.iter().any(|c| c.name == "order_id"),
             "inferred columns carry the projection: {:?}",
             body.columns
+        );
+        // Pretty-printed like every canonical route.
+        assert_eq!(text, reference_bytes(&body));
+        // The typed columns carry the structured type and its label together,
+        // and the label is exactly the type's own rendering.
+        let typed = body
+            .typed_columns
+            .as_ref()
+            .expect("the type checker produces columns for a fixture model");
+        assert!(!typed.is_empty());
+        for column in typed {
+            assert_eq!(column.data_type_display, column.data_type.to_string());
+        }
+        // The served type is the checker's own, field for field.
+        let state_cols: Vec<TypedColumnOutput> = {
+            let lock = state_for_detail.compile_result.read().await;
+            lock.as_ref().unwrap().type_check.typed_models["raw_orders"]
+                .iter()
+                .map(TypedColumnOutput::from_typed_column)
+                .collect()
+        };
+        assert_eq!(
+            serde_json::to_value(typed).unwrap(),
+            serde_json::to_value(&state_cols).unwrap()
         );
     }
 
@@ -1858,6 +1882,68 @@ mod tests {
         );
     }
 
+    /// The model list is sorted by name, whatever order the graph iterates in.
+    #[tokio::test]
+    async fn model_list_is_sorted_by_name() {
+        let state = test_state();
+        state.recompile().await;
+        let base = spawn_router(state).await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/models")).await.unwrap();
+        let body: ModelListOutput = resp.json().await.unwrap();
+        let names: Vec<&str> = body.models.iter().map(|m| m.name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "{names:?}");
+    }
+
+    /// `/dag/status` projects the executor's record field for field: the
+    /// served JSON equals the executor's own serialization of the same
+    /// record, across every node status.
+    #[test]
+    fn dag_status_projection_equals_the_executor_serialization() {
+        use rocky_core::dag_executor::{DagExecutionResult, NodeResult, NodeStatus};
+        use rocky_core::dag_status::DagStatus;
+
+        let statuses = [
+            NodeStatus::Pending,
+            NodeStatus::Running,
+            NodeStatus::Completed,
+            NodeStatus::Failed,
+            NodeStatus::Skipped,
+        ];
+        let nodes = statuses
+            .iter()
+            .enumerate()
+            .map(|(i, status)| NodeResult {
+                id: format!("n{i}"),
+                kind: "model".into(),
+                label: format!("node {i}"),
+                status: status.clone(),
+                layer: i,
+                duration_ms: i as u64 * 7,
+                error: matches!(status, NodeStatus::Failed).then(|| "boom".to_string()),
+            })
+            .collect();
+        let status = DagStatus {
+            completed_at: chrono::Utc::now(),
+            result: DagExecutionResult {
+                nodes,
+                total_layers: 5,
+                total_nodes: 5,
+                completed: 1,
+                failed: 1,
+                skipped: 1,
+                duration_ms: 70,
+            },
+        };
+
+        assert_eq!(
+            serde_json::to_value(dag_status_output(&status)).unwrap(),
+            serde_json::to_value(&status).unwrap()
+        );
+    }
+
     /// `/dag/status` projects the executor's record field for field, with
     /// the node status rendered in `snake_case` as the executor serializes it.
     #[tokio::test]
@@ -1942,6 +2028,12 @@ mod tests {
         assert_eq!(body.schemas_hash, schemas_hash());
         assert!(!body.schemas_hash.is_empty());
         assert!(body.routes.iter().any(|r| r == "GET /api/v1/meta"));
+        // The five typed estate routes are advertised as one capability.
+        assert!(
+            body.capabilities.iter().any(|c| c == "estate"),
+            "{:?}",
+            body.capabilities
+        );
         // No config bound in this fixture (models-only ServerState).
         assert!(body.config_hash.is_none());
     }

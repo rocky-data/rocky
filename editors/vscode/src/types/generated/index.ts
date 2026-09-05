@@ -68,6 +68,8 @@ export type {
   ModelDetailOutput,
   ModelColumnOutput,
   TypedColumnOutput,
+  RockyType,
+  StructField,
 } from "./model_detail";
 export type { DagLayersOutput } from "./dag_layers";
 export type {

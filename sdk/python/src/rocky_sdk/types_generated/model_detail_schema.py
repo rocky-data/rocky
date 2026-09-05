@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, conint
+from enum import StrEnum
+
+from pydantic import BaseModel, ConfigDict, Field, conint
 
 
 class ModelColumnOutput(BaseModel):
@@ -17,23 +19,57 @@ class ModelColumnOutput(BaseModel):
     """
 
 
-class TypedColumnOutput(BaseModel):
+class RockyType1(StrEnum):
     """
-    One type-checked column of a model.
+    Rocky's unified column type.
+
+    Derives `JsonSchema` because it is served verbatim on the HTTP model detail route (`TypedColumnOutput::data_type`): the structured form is the only lossless one — the `Display` rendering drops a struct field's nullability.
     """
 
-    data_type: str
+    Boolean = "Boolean"
+    Int32 = "Int32"
+    Int64 = "Int64"
+    Float32 = "Float32"
+    Float64 = "Float64"
+    String = "String"
+    Date = "Date"
+    Binary = "Binary"
+    Variant = "Variant"
+    Unknown = "Unknown"
+
+
+class Decimal(BaseModel):
+    precision: conint(ge=0)
+    scale: conint(ge=0)
+
+
+class RockyType2(BaseModel):
     """
-    Rocky's rendering of the inferred type, e.g. `INT64` or `DECIMAL(10,2)`.
+    Rocky's unified column type.
+
+    Derives `JsonSchema` because it is served verbatim on the HTTP model detail route (`TypedColumnOutput::data_type`): the structured form is the only lossless one — the `Display` rendering drops a struct field's nullability.
     """
-    name: str
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    Decimal_1: Decimal = Field(..., alias="Decimal")
+
+
+class RockyType3(StrEnum):
     """
-    Column name.
+    Timestamp with timezone.
     """
-    nullable: bool
+
+    Timestamp = "Timestamp"
+
+
+class RockyType4(StrEnum):
     """
-    Whether the column may be `NULL`.
+    Timestamp without timezone (common in Databricks).
     """
+
+    TimestampNtz = "TimestampNtz"
 
 
 class ModelDetailOutput(BaseModel):
@@ -75,9 +111,129 @@ class ModelDetailOutput(BaseModel):
     """
     typed_columns: list[TypedColumnOutput] | None = None
     """
-    Type-checked columns, or `null` when the type checker produced none for this model.
+    Type-checked columns, or `null` when the type checker produced none for this model. Each carries the structured type and its label.
     """
     upstream: list[str]
     """
     Direct upstream model names.
     """
+
+
+class RockyType5(BaseModel):
+    """
+    Rocky's unified column type.
+
+    Derives `JsonSchema` because it is served verbatim on the HTTP model detail route (`TypedColumnOutput::data_type`): the structured form is the only lossless one — the `Display` rendering drops a struct field's nullability.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    Array: (
+        RockyType1
+        | RockyType2
+        | RockyType3
+        | RockyType4
+        | RockyType5
+        | RockyType6
+        | RockyType7
+    )
+    """
+    Rocky's unified column type.
+
+    Derives `JsonSchema` because it is served verbatim on the HTTP model detail route (`TypedColumnOutput::data_type`): the structured form is the only lossless one — the `Display` rendering drops a struct field's nullability.
+    """
+
+
+class RockyType6(BaseModel):
+    """
+    Rocky's unified column type.
+
+    Derives `JsonSchema` because it is served verbatim on the HTTP model detail route (`TypedColumnOutput::data_type`): the structured form is the only lossless one — the `Display` rendering drops a struct field's nullability.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    Map: list[
+        RockyType1
+        | RockyType2
+        | RockyType3
+        | RockyType4
+        | RockyType5
+        | RockyType6
+        | RockyType7
+    ]
+
+
+class RockyType7(BaseModel):
+    """
+    Rocky's unified column type.
+
+    Derives `JsonSchema` because it is served verbatim on the HTTP model detail route (`TypedColumnOutput::data_type`): the structured form is the only lossless one — the `Display` rendering drops a struct field's nullability.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    Struct: list[StructField]
+
+
+class StructField(BaseModel):
+    """
+    A field in a struct type.
+    """
+
+    data_type: (
+        RockyType1
+        | RockyType2
+        | RockyType3
+        | RockyType4
+        | RockyType5
+        | RockyType6
+        | RockyType7
+    )
+    """
+    Rocky's unified column type.
+
+    Derives `JsonSchema` because it is served verbatim on the HTTP model detail route (`TypedColumnOutput::data_type`): the structured form is the only lossless one — the `Display` rendering drops a struct field's nullability.
+    """
+    name: str
+    nullable: bool
+
+
+class TypedColumnOutput(BaseModel):
+    """
+    One type-checked column of a model.
+    """
+
+    data_type: (
+        RockyType1
+        | RockyType2
+        | RockyType3
+        | RockyType4
+        | RockyType5
+        | RockyType6
+        | RockyType7
+    )
+    """
+    The inferred type, structured and lossless — a struct field keeps its own nullability, which the display string drops.
+    """
+    data_type_display: str
+    """
+    Rocky's human rendering of `data_type`, e.g. `INT64`, `DECIMAL(10,2)` or `STRUCT<a:INT64>`. A label, not a parser input.
+    """
+    name: str
+    """
+    Column name.
+    """
+    nullable: bool
+    """
+    Whether the column may be `NULL`.
+    """
+
+
+ModelDetailOutput.model_rebuild()
+RockyType5.model_rebuild()
+RockyType6.model_rebuild()
+RockyType7.model_rebuild()
