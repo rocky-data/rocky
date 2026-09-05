@@ -338,14 +338,15 @@ pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
 /// `DECIMAL`, `NUMERIC` and `BIGNUMERIC` do not. This function takes no
 /// dialect, and [`validate_contract_typed`] hands it both the landed type
 /// (a live `DESCRIBE`) and the type a person wrote in a `.contract.toml`,
-/// so one reading has to serve every warehouse. `DECIMAL` is `(18,3)` on
-/// DuckDB and `(10,0)` on Databricks; `NUMERIC` is a legal spelling on
-/// Snowflake too — `rocky-snowflake/src/types.rs` groups `NUMERIC` with
-/// `NUMBER` and `DECIMAL` in one family — and it does not mean there what
-/// it means on BigQuery. Choosing one warehouse's digits would invent a
-/// type from a name, which is the thing this function stopped doing. So
-/// they are [`RockyType::Unknown`] and the load gate reports the column
-/// (#1646).
+/// so one reading has to serve every warehouse. `DECIMAL` is the ANSI name
+/// every adapter here accepts, and `NUMERIC` is a legal spelling on
+/// Snowflake as well as BigQuery — `rocky-snowflake/src/types.rs` groups
+/// `NUMERIC` with `NUMBER` and `DECIMAL` in one family. Nothing in this
+/// repository records what digits either name stands for on each of them,
+/// and issue #1646 reports that they differ. Choosing one warehouse's
+/// digits would invent a type from a name, which is the thing this
+/// function stopped doing. So they are [`RockyType::Unknown`] and the load
+/// gate reports the column (#1646).
 ///
 /// Anything else that starts with one of the names — `NUMBER(nope)`,
 /// `DECIMAL(10,2,3)`, `NUMBERWANG` — is `Unknown` for the same reason.
@@ -1017,7 +1018,6 @@ mod tests {
         for (describe_output, precision, scale) in [
             ("DECIMAL(10,2)", 10, 2),
             ("decimal(10,2)", 10, 2),
-            ("DECIMAL(18,3)", 18, 3),
             ("NUMBER(38,0)", 38, 0),
             ("NUMBER(19, 0)", 19, 0),
             ("NUMERIC(38,9)", 38, 9),

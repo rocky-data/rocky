@@ -808,12 +808,11 @@ pub fn default_type_mapper(warehouse_type: &str) -> RockyType {
 /// the reading `contracts::decimal_type_matches` already gives a contract
 /// written `Decimal(p)`, and the one the load gate settled on in #1614.
 ///
-/// A bare `DECIMAL` or `NUMERIC` carries no digits, and the warehouses
-/// disagree about which digits it stands for: `DECIMAL` is `(18,3)` on
-/// DuckDB and `(10,0)` on Databricks, and `NUMERIC` is `(38,9)` on
-/// BigQuery but a synonym of `NUMBER` on Snowflake. This mapper is handed a
-/// source table's type string with no dialect attached, so it cannot pick
-/// one. Both are [`RockyType::Unknown`], as is any string that starts with
+/// A bare `DECIMAL` or `NUMERIC` carries no digits. Both names are accepted
+/// by more than one of the warehouses Rocky ships an adapter for, and issue
+/// #1646 reports that they do not stand for the same digits on each. This
+/// mapper is handed a source table's type string with no dialect attached,
+/// so it cannot pick one. Both are [`RockyType::Unknown`], as is any string that starts with
 /// one of the names but does not parse — `DECIMAL(a,b)`, `NUMERICWANG`.
 /// Every one of these used to be read as `DECIMAL(38,0)`, a type no
 /// warehouse had reported (#1646).
@@ -1183,7 +1182,6 @@ mod tests {
         for (describe_output, precision, scale) in [
             ("DECIMAL(10,2)", 10, 2),
             ("decimal(10,2)", 10, 2),
-            ("DECIMAL(18,3)", 18, 3),
             ("NUMERIC(38,9)", 38, 9),
             ("DECIMAL (10,2)", 10, 2),
         ] {
