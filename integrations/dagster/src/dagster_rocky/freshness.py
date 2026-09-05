@@ -37,8 +37,9 @@ def freshness_is_configured(checks: ChecksConfig | None) -> bool:
     This reads a PROJECTION, not the engine. It answers "the discover output in
     front of me says freshness is configured", which is the best available
     stand-in for "the engine will emit a ``freshness`` ``CheckResult``" — but it
-    is not the same statement. It is wrong whenever the projection and the live
-    ``rocky.toml`` disagree.
+    is not the same statement. It is wrong exactly when the projection and the
+    live ``rocky.toml`` disagree ABOUT FRESHNESS. They can differ in other ways
+    — a custom check added or removed — without changing this answer.
 
     ``RockyComponent`` caches ``rocky discover``, and its state key is
     ``RockyComponent[<config_path>]`` — the PATH, not the file's contents — so
