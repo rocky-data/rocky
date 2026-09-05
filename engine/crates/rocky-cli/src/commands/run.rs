@@ -30843,6 +30843,7 @@ value = "'{source}'"
     /// would not produce.
     #[cfg(feature = "duckdb")]
     fn run_status_for(
+        fx: &BatchedCheckFixture,
         pending: &HashMap<String, PendingCheck>,
     ) -> (bool, rocky_core::state::RunStatus) {
         let mut out = crate::output::RunOutput::new(String::new(), 0, 1);
@@ -30853,9 +30854,16 @@ value = "'{source}'"
                 checks: bag.checks.clone(),
             });
         }
-        // `fail_on_error` defaults to true when `[checks]` is present.
-        out.check_gate_failed =
-            super::replication_check_gate_failed(&out, &checks_config("row_count = false"));
+        // The FIXTURE's own checks config, which is what the runner reads at
+        // `output.check_gate_failed = replication_check_gate_failed(&output,
+        // &pipeline.checks)`. Reparsing a different config here would let this
+        // helper answer a question the runner never asks. `fail_on_error`
+        // defaults to `true`, so this is the default gate.
+        assert!(
+            fx.pipeline.checks.fail_on_error,
+            "these tests are about the DEFAULT gate; fail_on_error must be on"
+        );
+        out.check_gate_failed = super::replication_check_gate_failed(&out, &fx.pipeline.checks);
         out.status = out.derive_run_status();
         (out.check_gate_failed, out.status)
     }
@@ -30911,7 +30919,7 @@ value = "'{source}'"
             "overlap_count stays a placeholder, not a measurement: {result:?}"
         );
 
-        let (gated, status) = run_status_for(&pending);
+        let (gated, status) = run_status_for(&fx, &pending);
         assert!(!gated, "a tolerated sibling must not trip the check gate");
         assert!(
             matches!(status, rocky_core::state::RunStatus::Success),
@@ -30959,7 +30967,7 @@ value = "'{source}'"
             "{result:?}"
         );
 
-        let (gated, status) = run_status_for(&pending);
+        let (gated, status) = run_status_for(&fx, &pending);
         assert!(gated, "a failed error-severity check still gates (#1671)");
         assert!(
             matches!(status, rocky_core::state::RunStatus::PartialFailure),
@@ -31067,7 +31075,7 @@ value = "'{source}'"
             result.not_evaluated.is_none(),
             "a measured violation is not a not-evaluated check: {result:?}"
         );
-        let (gated, _) = run_status_for(&pending);
+        let (gated, _) = run_status_for(&fx, &pending);
         assert!(gated, "a real overlap gates the run");
     }
 
