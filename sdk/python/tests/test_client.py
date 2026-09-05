@@ -958,6 +958,53 @@ def test_product_list_argv_and_typed_parse():
         assert client.product_list().products == []
 
 
+def test_product_journal_argv_and_typed_parse():
+    """``product_journal`` shells ``product journal <name>`` and parses the
+    rows in append order; a known product with no rows is an empty journal."""
+    from rocky_sdk.types import ProductJournalOutput
+
+    journal_json = json.dumps(
+        {
+            "version": "1.74.0",
+            "command": "product_journal",
+            "product": "revenue_daily",
+            "product_id": "product:revenue_daily",
+            "rows": [
+                {
+                    "seq": 1,
+                    "at": "2026-08-19T00:00:00Z",
+                    "event": "spec approved",
+                    "to_state": "spec_approved",
+                    "spec_digest": "sha256:" + "a" * 64,
+                }
+            ],
+            "count": 1,
+        }
+    )
+    client = _client()
+    with patch.object(client, "run_cli", return_value=journal_json) as run_cli:
+        journal = client.product_journal("revenue_daily")
+    assert run_cli.call_args[0][0] == ["product", "journal", "revenue_daily"]
+    assert isinstance(journal, ProductJournalOutput)
+    assert journal.count == 1
+    assert journal.rows[0].event == "spec approved"
+    assert journal.rows[0].from_state is None
+    assert journal.rows[0].plan_id is None
+
+    empty_json = json.dumps(
+        {
+            "version": "1.74.0",
+            "command": "product_journal",
+            "product": "revenue_daily",
+            "product_id": "product:revenue_daily",
+            "rows": [],
+            "count": 0,
+        }
+    )
+    with patch.object(client, "run_cli", return_value=empty_json):
+        assert client.product_journal("revenue_daily").rows == []
+
+
 def test_review_status_argv_and_typed_parse():
     """``review_status`` shells ``review <plan-id> --status`` and parses the
     typed marker oracle, including the product pair the applier echoes back

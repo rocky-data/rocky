@@ -2595,6 +2595,18 @@ enum ProductSubcommand {
     /// false`. Read-only. An empty project lists nothing and exits 0.
     List,
 
+    /// Print a product's fulfillment journal: every persisted transition,
+    /// in append order.
+    ///
+    /// Read through the same store function the fulfillment loop reads
+    /// through, so this shows what the loop sees. A known product with no
+    /// rows prints an empty journal; a product the project does not know
+    /// (no `products/<name>.toml`, no store record) exits 1. Read-only.
+    Journal {
+        /// Product name (`products/<name>.toml`).
+        product: String,
+    },
+
     /// Approve the current spec revision — a human authority transition.
     ///
     /// Writes the immutable digest-addressed snapshot
@@ -3409,6 +3421,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             }
             ProductSubcommand::List => {
                 rocky_cli::commands::run_product_list(&cli.config, &state_path, json)
+            }
+            ProductSubcommand::Journal { product } => {
+                rocky_cli::commands::run_product_journal(&cli.config, &product, &state_path, json)
             }
             ProductSubcommand::Approve { product } => {
                 rocky_cli::commands::run_product_approve(&cli.config, &product, &state_path, json)
