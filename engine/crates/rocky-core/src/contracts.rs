@@ -281,10 +281,17 @@ pub fn validate_contract_typed(
 
 /// Normalize a raw warehouse type string into a [`RockyType`].
 ///
-/// Mirrors the compiler's `default_type_mapper` so the load gate compares
-/// types in the same vocabulary the rest of Rocky uses. Lives in rocky-core
-/// (not rocky-compiler) so the runtime load path can reach it without a
-/// dependency cycle; [`RockyType`] is shared via rocky-ir.
+/// Shares the compiler's `default_type_mapper` vocabulary so the load gate
+/// compares types the way the rest of Rocky does, and reads the decimal
+/// family by the same grammar. It is not a full mirror: this function also
+/// knows BigQuery's scalar names (`INT64`, `FLOAT64`, `BYTES`, `DATETIME`),
+/// `BIGNUMERIC` and Snowflake's `NUMBER`, which `default_type_mapper` maps
+/// to [`RockyType::Unknown`]. Bringing those names to the compiler would
+/// give a source column a concrete type where it has none today, which can
+/// turn an `I003` into an `E011`, so it is deliberately not done here
+/// (#1646). Lives in rocky-core (not rocky-compiler) so the runtime load
+/// path can reach it without a dependency cycle; [`RockyType`] is shared
+/// via rocky-ir.
 ///
 /// Unrecognized types map to [`RockyType::Unknown`]. [`validate_contract_typed`]
 /// reports such a column in its warnings instead of comparing it, so a type
@@ -315,22 +322,50 @@ pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
 }
 
 /// The decimal family: `DECIMAL`, `NUMERIC`, `BIGNUMERIC` (ANSI, Databricks,
-/// BigQuery) and `NUMBER` (Snowflake). Three spellings are a type Rocky
-/// understands: the exact bare name, read as `(38, 0)`; `NAME(p,s)`; and
-/// `NAME(p)`, which means scale 0 exactly as the compile-time gate reads
-/// `Decimal(p)`. Anything else that starts with one of the names —
-/// `NUMBER(nope)`, `DECIMAL(10,2,3)`, `NUMBERWANG` — is
-/// [`RockyType::Unknown`], so the load gate reports it instead of comparing
-/// a made-up `(38, 0)`. Until #1614 every such string was read as
-/// `(38, 0)`; the bare BigQuery names are still read as `(38, 0)` when
-/// their real default is wider (#1646).
+/// BigQuery) and `NUMBER` (Snowflake).
+///
+/// Two spellings carry their own digits, so they mean the same thing on
+/// every warehouse: `NAME(p,s)`, and `NAME(p)`, which means scale 0 exactly
+/// as the compile-time gate reads `Decimal(p)`.
+///
+/// A *bare* name carries no digits. It only means something if the name
+/// itself names one warehouse. `NUMBER` does: no other adapter Rocky ships
+/// has that type, and on Snowflake it is `NUMBER(38, 0)` — see
+/// `rocky-snowflake/src/adapter.rs`, where `INTEGER` is documented as an
+/// "alias for `NUMBER(38, 0)`", and `rocky-snowflake/src/loader.rs`, which
+/// writes `NUMBER(38,0)` for an inferred `BIGINT`.
+///
+/// `DECIMAL`, `NUMERIC` and `BIGNUMERIC` do not. This function takes no
+/// dialect, and [`validate_contract_typed`] hands it both the landed type
+/// (a live `DESCRIBE`) and the type a person wrote in a `.contract.toml`,
+/// so one reading has to serve every warehouse. `DECIMAL` is the ANSI name
+/// every adapter here accepts, and `NUMERIC` is a legal spelling on
+/// Snowflake as well as BigQuery — `rocky-snowflake/src/types.rs` groups
+/// `NUMERIC` with `NUMBER` and `DECIMAL` in one family. Nothing in this
+/// repository records what digits either name stands for on each of them,
+/// and issue #1646 reports that they differ. Choosing one warehouse's
+/// digits would invent a type from a name, which is the thing this
+/// function stopped doing. So they are [`RockyType::Unknown`] and the load
+/// gate reports the column (#1646).
+///
+/// Anything else that starts with one of the names — `NUMBER(nope)`,
+/// `DECIMAL(10,2,3)`, `NUMBERWANG` — is `Unknown` for the same reason.
+/// Until #1614 every such string was read as `(38, 0)` and compared as if
+/// that were true.
 fn decimal_family_type(upper: &str) -> RockyType {
     const NAMES: [&str; 4] = ["DECIMAL", "BIGNUMERIC", "NUMERIC", "NUMBER"];
     for name in NAMES {
         if upper == name {
-            return RockyType::Decimal {
-                precision: 38,
-                scale: 0,
+            // Snowflake's `NUMBER` is the one bare name a single warehouse
+            // pins; the others disagree across warehouses, so they are not
+            // read at all rather than read as one warehouse's answer.
+            return if name == "NUMBER" {
+                RockyType::Decimal {
+                    precision: 38,
+                    scale: 0,
+                }
+            } else {
+                RockyType::Unknown
             };
         }
         // `DECIMAL (10,2)` is valid SQL, and a `.contract.toml` is written by
@@ -855,17 +890,27 @@ mod tests {
     }
 
     /// The decimal family has a grammar. A string that starts with one of its
-    /// names but is neither the bare name nor `NAME(p,s)` is not a type Rocky
+    /// names but is neither a bare name nor `NAME(p,s)` is not a type Rocky
     /// understands; until #1614 it was read as `DECIMAL(38,0)` and compared
-    /// as if that were true.
+    /// as if that were true. A bare name is only a type when one warehouse
+    /// fixes its digits, which is `NUMBER` and nothing else (#1646).
     #[test]
     fn test_warehouse_type_to_rocky_decimal_family_grammar() {
         let d38 = RockyType::Decimal {
             precision: 38,
             scale: 0,
         };
-        for bare in ["NUMBER", "DECIMAL", "NUMERIC", "BIGNUMERIC", "number"] {
+        // Snowflake's `NUMBER` is the one bare name a single warehouse pins.
+        for bare in ["NUMBER", "number", "  NUMBER  "] {
             assert_eq!(warehouse_type_to_rocky(bare), d38, "{bare}");
+        }
+        // The rest carry no digits and no single warehouse (#1646).
+        for bare in ["DECIMAL", "NUMERIC", "BIGNUMERIC", "numeric", "decimal"] {
+            assert_eq!(
+                warehouse_type_to_rocky(bare),
+                RockyType::Unknown,
+                "bare {bare} names no digits and no one warehouse"
+            );
         }
         for spelled in ["NUMERIC(10, 2)", "NUMERIC (10,2)", "  numeric(10,2)  "] {
             assert_eq!(
@@ -898,6 +943,90 @@ mod tests {
                 warehouse_type_to_rocky(malformed),
                 RockyType::Unknown,
                 "{malformed} must not become a made-up decimal"
+            );
+        }
+    }
+
+    /// The bare BigQuery case (#1646). `INFORMATION_SCHEMA.COLUMNS.data_type`
+    /// reports a default-precision column as a bare `NUMERIC` — the live
+    /// sweep in `rocky-bigquery/tests/dialect_sweep_live.rs` asserts exactly
+    /// that string after an `ALTER ... SET DATA TYPE NUMERIC`. Read as
+    /// `DECIMAL(38,0)` it refused a correct load, because
+    /// `is_assignable(Decimal(38,0), Decimal(38,9))` fails on integer digits.
+    /// It is now unread, so the column is reported and the load promotes.
+    #[test]
+    fn test_typed_bare_numeric_is_reported_not_refused() {
+        let contract = ContractConfig {
+            required_columns: vec![RequiredColumn {
+                name: "amount".into(),
+                data_type: "NUMERIC(38,9)".into(),
+                nullable: true,
+            }],
+            ..Default::default()
+        };
+        let result = validate_contract_typed(&contract, &[col_n("amount", "NUMERIC", true)]);
+
+        assert!(
+            result.passed,
+            "a bare NUMERIC must not refuse a NUMERIC(38,9) contract: {:?}",
+            result.violations
+        );
+        assert!(result.violations.is_empty());
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        let w = &result.warnings[0];
+        assert!(
+            w.contains("'amount'") && w.contains("'NUMERIC'") && w.contains("'NUMERIC(38,9)'"),
+            "the warning must name the column and both type strings: {w}"
+        );
+    }
+
+    /// The other half of #1646: a contract written `NUMERIC(38,0)` used to
+    /// accept a landed bare `NUMERIC`, which on BigQuery holds nine decimal
+    /// places. It is still not refused — `passed` is computed from
+    /// violations only — but it is no longer silent.
+    #[test]
+    fn test_typed_bare_numeric_against_narrow_contract_is_reported() {
+        let contract = ContractConfig {
+            required_columns: vec![RequiredColumn {
+                name: "amount".into(),
+                data_type: "NUMERIC(38,0)".into(),
+                nullable: true,
+            }],
+            ..Default::default()
+        };
+        let result = validate_contract_typed(&contract, &[col_n("amount", "NUMERIC", true)]);
+
+        assert!(result.violations.is_empty());
+        assert_eq!(
+            result.warnings.len(),
+            1,
+            "the landed bare NUMERIC must be reported, not accepted silently: {:?}",
+            result.warnings
+        );
+    }
+
+    /// Honest-failure control for #1646: the exact strings the DuckDB,
+    /// Databricks and Snowflake adapters emit from a live `DESCRIBE` today
+    /// must still read as concrete decimals, so the new `Unknown` cannot
+    /// fire on a healthy run. Sources for each string:
+    /// `rocky-duckdb/src/adapter.rs` (`DECIMAL(10,2)`),
+    /// `rocky-databricks/src/adapter.rs` (lowercase `decimal(10,2)`),
+    /// `rocky-snowflake/src/loader.rs` and `src/dialect.rs` (`NUMBER(38,0)`),
+    /// and BigQuery's parameterized spellings.
+    #[test]
+    fn test_healthy_describe_decimals_stay_concrete() {
+        for (describe_output, precision, scale) in [
+            ("DECIMAL(10,2)", 10, 2),
+            ("decimal(10,2)", 10, 2),
+            ("NUMBER(38,0)", 38, 0),
+            ("NUMBER(19, 0)", 19, 0),
+            ("NUMERIC(38,9)", 38, 9),
+            ("BIGNUMERIC(76,38)", 76, 38),
+        ] {
+            assert_eq!(
+                warehouse_type_to_rocky(describe_output),
+                RockyType::Decimal { precision, scale },
+                "{describe_output} is a live DESCRIBE string and must stay concrete"
             );
         }
     }
