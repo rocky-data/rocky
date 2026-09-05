@@ -919,6 +919,45 @@ def test_product_compile_approve_status_argv_and_typed_parse():
     assert status.journal_rows == 1
 
 
+def test_product_list_argv_and_typed_parse():
+    """``product_list`` shells ``product list`` with no positional and parses
+    the sorted row set; an empty project is an empty list, not an error."""
+    from rocky_sdk.types import ProductListOutput
+
+    list_json = json.dumps(
+        {
+            "version": "1.74.0",
+            "command": "product_list",
+            "products": [
+                {
+                    "name": "revenue_daily",
+                    "spec_present": True,
+                    "product_id": "product:revenue_daily",
+                    "committed_phase": "merged",
+                    "artifact_problems": 0,
+                    "staging_journal_present": False,
+                    "fulfill_state": "spec_approved",
+                    "journal_rows": 1,
+                }
+            ],
+            "count": 1,
+        }
+    )
+    client = _client()
+    with patch.object(client, "run_cli", return_value=list_json) as run_cli:
+        listed = client.product_list()
+    assert run_cli.call_args[0][0] == ["product", "list"]
+    assert isinstance(listed, ProductListOutput)
+    assert listed.count == 1
+    assert listed.products[0].fulfill_state == "spec_approved"
+
+    empty_json = json.dumps(
+        {"version": "1.74.0", "command": "product_list", "products": [], "count": 0}
+    )
+    with patch.object(client, "run_cli", return_value=empty_json):
+        assert client.product_list().products == []
+
+
 def test_review_status_argv_and_typed_parse():
     """``review_status`` shells ``review <plan-id> --status`` and parses the
     typed marker oracle, including the product pair the applier echoes back

@@ -154,6 +154,7 @@ pub(crate) fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<crate::commands::product::ProductCompileOutput>("product_compile"),
         entry::<crate::commands::product::ProductApproveOutput>("product_approve"),
         entry::<crate::commands::product::ProductStatusOutput>("product_status"),
+        entry::<crate::commands::product::ProductListOutput>("product_list"),
         entry::<crate::output::FulfillOutput>("fulfill"),
         entry::<PolicyTestOutput>("policy_test"),
         entry::<PolicyFreezeOutput>("policy_freeze"),

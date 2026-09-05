@@ -12,6 +12,8 @@
 //! GET  /api/v1/models/:name/history             → per-model run history
 //! GET  /api/v1/models/:name/metrics             → per-model quality snapshots
 //! GET  /api/v1/runs                             → project run history
+//! GET  /api/v1/products                         → every product (= rocky product list)
+//! GET  /api/v1/products/:name                   → one product (= rocky product status)
 //! GET  /api/v1/compile                          → full compile result
 //! GET  /api/v1/dag                              → full unified DAG
 //! GET  /api/v1/dag/layers                       → execution layers (typed, no CLI twin)
@@ -78,6 +80,9 @@ use rocky_server::auth::{build_cors_layer, require_bearer_token};
 use rocky_server::dashboard;
 use rocky_server::state::ServerState;
 
+use crate::commands::product::{
+    ProductListOutput, ProductStatusOutput, product_list_in, product_names_in, product_status_in,
+};
 use crate::commands::{
     ScheduleStatusError, column_lineage_output, compile_output, dag_output, history_runs_output,
     lineage_output, metrics_output, model_history_output, schedule_status_output, schemas_hash,
@@ -161,6 +166,8 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/jobs/apply", post(submit_apply))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/schedule", get(schedule_status))
+        .route("/api/v1/products", get(list_products))
+        .route("/api/v1/products/{name}", get(get_product))
         // Webhook ingress. Registered BEFORE the auth layer like every route, but
         // the middleware PREFIX-exempts `/api/v1/hooks/trigger/{pipeline}` from
         // the Bearer token (see `rocky_server::auth`): the handler authenticates
@@ -358,6 +365,16 @@ impl ApiError {
             "model_not_found",
             format!("model '{name}' not found"),
             Some("check the model name against GET /api/v1/models"),
+        )
+    }
+
+    /// `404` — no spec file and no state record under this product name.
+    fn product_not_found(name: &str) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "product_not_found",
+            format!("product '{name}' not found"),
+            Some("list the products this project knows at GET /api/v1/products"),
         )
     }
 
@@ -626,6 +643,8 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "POST /api/v1/jobs/apply",
         "GET /api/v1/jobs/{id}",
         "GET /api/v1/schedule",
+        "GET /api/v1/products",
+        "GET /api/v1/products/{name}",
         "POST /api/v1/hooks/trigger/{pipeline}",
     ]
     .into_iter()
@@ -652,6 +671,7 @@ fn capabilities() -> Vec<String> {
         "schedule",
         "webhooks",
         "estate",
+        "products",
     ]
     .into_iter()
     .map(String::from)
@@ -1010,6 +1030,86 @@ fn dag_status_output(status: &rocky_core::dag_status::DagStatus) -> DagStatusOut
             duration_ms: result.duration_ms,
         },
     }
+}
+
+/// The project root the product routes read `products/` under: the directory
+/// of the bound `rocky.toml`. `503 engine_not_ready` when no config is bound —
+/// a models-only sidecar has no product surface.
+fn project_root_for(state: &ServerState) -> Result<std::path::PathBuf, ApiError> {
+    let config = state
+        .config_path
+        .as_deref()
+        .ok_or_else(ApiError::engine_not_ready)?;
+    Ok(match config.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    })
+}
+
+/// `GET /api/v1/products` — canonical [`ProductListOutput`].
+///
+/// The same bytes as `rocky product list --output json` for the project the
+/// bound config names. Reads `products/` and the state store; never writes.
+async fn list_products(
+    State(state): State<Arc<ServerState>>,
+) -> Result<PrettyJson<ProductListOutput>, ApiError> {
+    let root = project_root_for(&state)?;
+    let state_path = state_path_for(&state);
+    let output = tokio::task::spawn_blocking(move || product_list_in(&root, Some(&state_path)))
+        .await
+        .map_err(|e| map_join_err(&e))?
+        .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    Ok(PrettyJson(output))
+}
+
+/// `GET /api/v1/products/:name` — canonical [`ProductStatusOutput`].
+///
+/// The same bytes as `rocky product status <name> --output json`. A name
+/// with neither a spec file nor a state record is `404 product_not_found`;
+/// a spec that exists but does not parse is `200` with `spec_error` set,
+/// exactly as the CLI reports it.
+async fn get_product(
+    State(state): State<Arc<ServerState>>,
+    ApiPath(name): ApiPath<String>,
+) -> Result<PrettyJson<ProductStatusOutput>, ApiError> {
+    // A name is only ever looked up in the computed product set before any
+    // path is built from it, so a traversal cannot reach the filesystem.
+    // This guard refuses anything that is not a bare identifier before
+    // opening anything: a spec's own `product.name` must be one to exist.
+    if !is_bare_product_name(&name) {
+        return Err(ApiError::product_not_found(&name));
+    }
+    let root = project_root_for(&state)?;
+    let state_path = state_path_for(&state);
+    let lookup = name.clone();
+    let output = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<_>> {
+        let known = product_names_in(&root, Some(&state_path))?;
+        if !known.iter().any(|known| known == &lookup) {
+            return Ok(None);
+        }
+        product_status_in(&root, Some(&state_path), &lookup).map(Some)
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    match output {
+        Some(status) => Ok(PrettyJson(status)),
+        None => Err(ApiError::product_not_found(&name)),
+    }
+}
+
+/// The rule a product name must satisfy to exist at all: a bare identifier,
+/// ASCII letter or `_` first, then ASCII letters, digits or `_`. It is the
+/// spec parser's `product-name-invalid` rule, so a name that fails it can
+/// name no spec file and no state record, and the route can answer 404
+/// without touching the filesystem or the store.
+fn is_bare_product_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    match bytes.next() {
+        Some(b) if b.is_ascii_alphabetic() || b == b'_' => {}
+        _ => return false,
+    }
+    bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// `GET /api/v1/schedule` — a read-only scheduler snapshot.
@@ -1944,6 +2044,161 @@ mod tests {
         );
     }
 
+    // --- /products ---
+
+    /// Both product routes answer with the CLI's bytes for the same project:
+    /// `rocky product list --output json` and `rocky product status <name>
+    /// --output json`, pretty-printed. An unknown name is the documented 404.
+    #[tokio::test]
+    async fn product_routes_match_the_cli_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) =
+            crate::commands::product::tests::api_fixture_project(dir.path());
+        // Approve once so the store holds records beside the spec file.
+        crate::commands::product::product_approve_in(&root, &state_path, "revenue_daily")
+            .expect("approves");
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config),
+            &state_path,
+        ))
+        .await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/products"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let expected = product_list_in(&root, Some(&state_path)).unwrap();
+        assert_eq!(text, reference_bytes(&expected));
+        let list: ProductListOutput = serde_json::from_str(&text).unwrap();
+        assert_eq!(list.count, 1);
+        assert_eq!(list.products[0].name, "revenue_daily");
+        assert_eq!(
+            list.products[0].fulfill_state.as_deref(),
+            Some("spec_approved")
+        );
+
+        let resp = reqwest::get(format!("{base}/api/v1/products/revenue_daily"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let expected = product_status_in(&root, Some(&state_path), "revenue_daily").unwrap();
+        assert_eq!(text, reference_bytes(&expected));
+
+        let resp = reqwest::get(format!("{base}/api/v1/products/nope"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "product_not_found");
+        assert!(err.remediation_hint.is_some());
+
+        // A traversal-shaped or non-identifier name is a 404 before any path
+        // is built from it: the router refuses shapes that do not match one
+        // segment (`route_not_found`), and the handler's identifier guard
+        // refuses the rest (`product_not_found`). Either way nothing on
+        // disk is touched.
+        for shape in [
+            "..",
+            "..%2F..%2Fetc%2Fpasswd",
+            "a%5Cb",
+            "a.b",
+            "-x",
+            "a%23b",
+        ] {
+            let resp = reqwest::get(format!("{base}/api/v1/products/{shape}"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 404, "{shape}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert!(
+                err.code == "product_not_found" || err.code == "route_not_found",
+                "{shape}: {}",
+                err.code
+            );
+        }
+    }
+
+    /// A product the store knows but whose spec file is gone is still a
+    /// product: listed, and served, with `spec_present = false`.
+    #[tokio::test]
+    async fn product_routes_serve_a_product_only_the_store_knows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) =
+            crate::commands::product::tests::api_fixture_project(dir.path());
+        crate::commands::product::product_approve_in(&root, &state_path, "revenue_daily")
+            .expect("approves");
+        std::fs::remove_file(root.join("products/revenue_daily.toml")).unwrap();
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config),
+            &state_path,
+        ))
+        .await;
+
+        let list: ProductListOutput = reqwest::get(format!("{base}/api/v1/products"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(list.count, 1);
+        assert!(!list.products[0].spec_present);
+
+        let resp = reqwest::get(format!("{base}/api/v1/products/revenue_daily"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let status: ProductStatusOutput = resp.json().await.unwrap();
+        assert!(!status.spec_present);
+        assert!(status.approval.is_some());
+    }
+
+    /// A store that cannot be opened for reading — here, a file that is not
+    /// a redb database at all — is the documented 500, with the envelope, on
+    /// both routes. Nothing is repaired or rewritten on the way.
+    #[tokio::test]
+    async fn product_routes_report_an_unreadable_store_as_500() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) =
+            crate::commands::product::tests::api_fixture_project(dir.path());
+        std::fs::write(&state_path, b"this is not a redb database").unwrap();
+        let before = std::fs::read(&state_path).unwrap();
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config),
+            &state_path,
+        ))
+        .await;
+
+        for path in ["/api/v1/products", "/api/v1/products/revenue_daily"] {
+            let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+            assert_eq!(resp.status(), 500, "{path}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "internal_error", "{path}");
+        }
+        assert_eq!(
+            std::fs::read(&state_path).unwrap(),
+            before,
+            "the file is left alone"
+        );
+    }
+
+    /// A models-only sidecar has no bound config, so it has no product
+    /// surface: the documented 503, with the envelope.
+    #[tokio::test]
+    async fn product_routes_need_a_bound_config() {
+        let base = spawn_router(test_state()).await;
+        for path in ["/api/v1/products", "/api/v1/products/anything"] {
+            let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+            assert_eq!(resp.status(), 503, "{path}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "engine_not_ready", "{path}");
+        }
+    }
+
     /// `/dag/status` projects the executor's record field for field, with
     /// the node status rendered in `snake_case` as the executor serializes it.
     #[tokio::test]
@@ -2034,6 +2289,15 @@ mod tests {
             "{:?}",
             body.capabilities
         );
+        // So are the product routes, and both are registered.
+        assert!(
+            body.capabilities.iter().any(|c| c == "products"),
+            "{:?}",
+            body.capabilities
+        );
+        for route in ["GET /api/v1/products", "GET /api/v1/products/{name}"] {
+            assert!(body.routes.iter().any(|r| r == route), "{route} missing");
+        }
         // No config bound in this fixture (models-only ServerState).
         assert!(body.config_hash.is_none());
     }

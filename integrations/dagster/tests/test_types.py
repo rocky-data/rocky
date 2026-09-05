@@ -806,3 +806,18 @@ def test_parse_product_status(product_status_json: str):
     assert result.fulfill_state == "spec_approved"
     assert result.journal_rows == 1
     assert isinstance(parse_rocky_output(product_status_json), ProductStatusOutput)
+
+
+def test_parse_product_list(product_list_json: str):
+    from dagster_rocky.types import ProductListOutput
+
+    result = ProductListOutput.model_validate_json(product_list_json)
+    assert result.command == "product_list"
+    assert result.count == 2
+    assert [p.name for p in result.products] == ["orders_archive", "revenue_daily"]
+    # A product only the store knows: no spec, but the approval survives.
+    gone = result.products[0]
+    assert gone.spec_present is False
+    assert gone.approval is not None
+    assert gone.spec_error is not None
+    assert isinstance(parse_rocky_output(product_list_json), ProductListOutput)

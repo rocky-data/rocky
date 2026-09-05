@@ -2621,3 +2621,39 @@ def test_non_timeout_failures_stay_retryable():
     failure = _rocky_error_to_failure(RockyCommandError(1, stderr_tail="boom", duration_ms=12))
 
     assert failure.allow_retries is not False
+
+
+# ---------------------------------------------------------------------------
+# product_list — delegation to the SDK client
+# ---------------------------------------------------------------------------
+
+
+def test_product_list_delegates_to_the_client():
+    """``RockyResource.product_list()`` is a thin delegate: it calls the
+    client's ``product_list()`` with no arguments and hands the typed result
+    back unchanged."""
+    from rocky_sdk.types import ProductListOutput
+
+    listed = ProductListOutput.model_validate(
+        {"version": "1.74.0", "command": "product_list", "products": [], "count": 0}
+    )
+    rocky = RockyResource()
+    with patch.object(RockyResource, "_get_client") as get_client:
+        get_client.return_value.product_list.return_value = listed
+        result = rocky.product_list()
+    assert result is listed
+    get_client.return_value.product_list.assert_called_once_with()
+
+
+def test_product_list_translates_client_errors_to_failure():
+    """A client error inside ``product_list()`` surfaces as ``dagster.Failure``,
+    like every other delegating method."""
+    rocky = RockyResource()
+    with (
+        patch.object(RockyResource, "_get_client") as get_client,
+        pytest.raises(dg.Failure),
+    ):
+        get_client.return_value.product_list.side_effect = RockyCommandError(
+            2, stderr_tail="state store locked", duration_ms=5
+        )
+        rocky.product_list()

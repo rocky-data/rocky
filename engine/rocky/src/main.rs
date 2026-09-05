@@ -2582,6 +2582,13 @@ enum ProductSubcommand {
         /// Product name (`products/<name>.toml`).
         product: String,
     },
+    /// List every product the project knows, one status row each.
+    ///
+    /// The union of `products/*.toml` and every name the state store holds
+    /// a fulfillment or approval record for, sorted by name — so a product
+    /// whose spec file was deleted still lists, with `spec_present =
+    /// false`. Read-only. An empty project lists nothing and exits 0.
+    List,
 
     /// Approve the current spec revision — a human authority transition.
     ///
@@ -3394,6 +3401,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             }
             ProductSubcommand::Status { product } => {
                 rocky_cli::commands::run_product_status(&cli.config, &product, &state_path, json)
+            }
+            ProductSubcommand::List => {
+                rocky_cli::commands::run_product_list(&cli.config, &state_path, json)
             }
             ProductSubcommand::Approve { product } => {
                 rocky_cli::commands::run_product_approve(&cli.config, &product, &state_path, json)
@@ -4302,6 +4312,26 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             } else {
                 None
             };
+            // The store `serve` reads. An explicit `--state-path` is the hard
+            // override, as everywhere. A resolved namespace — the
+            // `--state-namespace` flag, or the config's `[state] namespacing`
+            // — routes the server to `<its models>/.rocky-state/<key>.redb`,
+            // the same derivation every other command makes against its
+            // models directory, so the server answers from the store the
+            // commands that set the namespace wrote. Before, the server
+            // silently read the default store instead. With neither, the
+            // override stays `None` and serve derives its default from its
+            // own `--models`, not from the global `models` resolution above.
+            let serve_models = models
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new("models"));
+            let serve_state_path: Option<PathBuf> = match (&cli.state_path, &state_namespace) {
+                (Some(explicit), _) => Some(explicit.clone()),
+                (None, Some(ns)) => Some(
+                    rocky_core::state::resolve_state_path_ns(None, serve_models, Some(ns)).path,
+                ),
+                (None, None) => None,
+            };
             rocky_cli::commands::run_serve(
                 // Everything else the server does with this path — compiling,
                 // watching, deriving the default state path — is unchanged by
@@ -4322,11 +4352,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 scheduler,
                 poll_interval_seconds,
                 drain_timeout_seconds,
-                // The raw `--state-path` override, not the namespaced resolution
-                // above: serve derives its default from its own `--models`, so
-                // passing the resolved default here would repoint a
-                // `serve --models <dir>` at `models/.rocky-state.redb`.
-                cli.state_path.as_deref(),
+                serve_state_path.as_deref(),
             )
             .await
         }
