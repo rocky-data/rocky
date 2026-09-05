@@ -954,6 +954,35 @@ PRODUCT_LIST: dict[str, Any] = {
     "count": 2,
 }
 
+# `rocky product journal <name>` — the product's fulfillment journal, in
+# append order: an approval, then the loop's proposal carrying a plan id.
+PRODUCT_JOURNAL: dict[str, Any] = {
+    "version": "1.74.0",
+    "command": "product_journal",
+    "product": "revenue_daily",
+    "product_id": "product:revenue_daily",
+    "rows": [
+        {
+            "seq": 1,
+            "at": "2026-08-19T00:00:00Z",
+            "event": "spec approved",
+            "to_state": "spec_approved",
+            "spec_digest": "sha256:" + "a" * 64,
+        },
+        {
+            "seq": 2,
+            "at": "2026-08-19T00:05:00Z",
+            "event": "plan proposed",
+            "from_state": "spec_approved",
+            "to_state": "proposed",
+            "spec_digest": "sha256:" + "a" * 64,
+            "plan_id": "b" * 64,
+            "idempotency_key": "revenue_daily:" + "b" * 64,
+        },
+    ],
+    "count": 2,
+}
+
 # ---------------------------------------------------------------------------
 # catalog — project-wide column-lineage snapshot covering one source and
 # two derived models. Mirrors what `rocky catalog` would emit against the

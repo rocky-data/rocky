@@ -169,7 +169,10 @@ pub fn compute_catalog_output(
 
     // 1. Load cached source schemas (mirrors lineage.rs's bootstrap so
     //    leaf models inherit real types when the cache is warm).
-    let rocky_cfg = rocky_core::config::load_rocky_config(config_path).ok();
+    // Absent `rocky.toml` -> None (unchanged); present but unloadable refuses
+    // (#1625). `rocky_cfg` drives both the schema cache and `project_name`, so
+    // swallowing the error mislabelled the catalog as well as cooling it.
+    let rocky_cfg = rocky_core::config::load_optional_project_config(Some(config_path))?;
     let source_schemas = match &rocky_cfg {
         Some(cfg) => {
             let schema_cfg = cfg

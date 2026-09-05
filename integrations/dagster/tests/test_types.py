@@ -821,3 +821,19 @@ def test_parse_product_list(product_list_json: str):
     assert gone.approval is not None
     assert gone.spec_error is not None
     assert isinstance(parse_rocky_output(product_list_json), ProductListOutput)
+
+
+def test_parse_product_journal(product_journal_json: str):
+    from dagster_rocky.types import ProductJournalOutput
+
+    result = ProductJournalOutput.model_validate_json(product_journal_json)
+    assert result.command == "product_journal"
+    assert result.product_id == "product:revenue_daily"
+    assert result.count == 2
+    assert [row.seq for row in result.rows] == [1, 2]
+    # The approval row has no prior state and no plan; the proposal has both.
+    assert result.rows[0].from_state is None
+    assert result.rows[0].plan_id is None
+    assert result.rows[1].from_state == "spec_approved"
+    assert result.rows[1].plan_id == "b" * 64
+    assert isinstance(parse_rocky_output(product_journal_json), ProductJournalOutput)

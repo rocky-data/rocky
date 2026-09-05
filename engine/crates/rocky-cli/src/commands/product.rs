@@ -799,6 +799,56 @@ pub struct ProductListOutput {
     pub count: usize,
 }
 
+/// One persisted fulfillment journal row, as `rocky product journal`
+/// prints it: the loop's own record of a transition, field for field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProductJournalEntry {
+    /// Sequence number, also encoded in the row's store key.
+    pub seq: u64,
+    /// RFC 3339 instant of the transition, when recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+    /// What happened, in the loop's plain language (`spec approved`, …).
+    /// A label to render, not an enum to switch on.
+    pub event: String,
+    /// The state tag before the transition, when one existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_state: Option<String>,
+    /// The state tag after the transition.
+    pub to_state: String,
+    /// The spec digest involved, when the event concerns one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_digest: Option<String>,
+    /// The plan involved, when the event concerns one (propose, apply).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    /// The idempotency key pinned by this event, when it pinned one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+/// JSON output of `rocky product journal <name>`.
+///
+/// The product's fulfillment journal, whole and in append order, read
+/// through the same store function the fulfillment loop reads through. A
+/// known product with no rows is an empty journal; a product the project
+/// does not know (no spec file, no store record) is a refusal, never an
+/// empty journal.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ProductJournalOutput {
+    pub version: String,
+    pub command: String,
+    /// The product name as given.
+    pub product: String,
+    /// `product:<name>`, the store key every record of the product hangs off.
+    pub product_id: String,
+    /// Every journal row, in append order.
+    pub rows: Vec<ProductJournalEntry>,
+    /// `rows.len()`, repeated so a consumer can assert it received the
+    /// whole journal.
+    pub count: usize,
+}
+
 // ---------------------------------------------------------------------------
 // verify
 // ---------------------------------------------------------------------------
@@ -1647,6 +1697,91 @@ pub fn run_product_list(_config_path: &Path, state_path: &Path, output_json: boo
             },
             product.fulfill_state.as_deref().unwrap_or("none"),
             product.journal_rows,
+        );
+    }
+    Ok(())
+}
+
+/// The journal of one product, or `None` when the project does not know
+/// the name: no `products/<name>.toml` and no fulfillment or approval
+/// record in the store. The same rule `product status` and the product
+/// routes use for "known".
+///
+/// Rows come from [`StateStore::fulfill_journal_rows`], the function the
+/// fulfillment loop's own driver reads through, so what this shows is what
+/// the loop sees. The store is opened read-only; an absent store is an
+/// empty journal.
+pub(crate) fn product_journal_in(
+    root: &Path,
+    state_path: Option<&Path>,
+    product_name: &str,
+) -> Result<Option<ProductJournalOutput>> {
+    let known = product_names_in(root, state_path)?;
+    if !known.iter().any(|name| name == product_name) {
+        return Ok(None);
+    }
+    let rows: Vec<ProductJournalEntry> = match state_path {
+        Some(path) if path.exists() => open_state_store_read_only(path)?
+            .fulfill_journal_rows(product_name)?
+            .into_iter()
+            .map(|row| ProductJournalEntry {
+                seq: row.seq,
+                at: row.at,
+                event: row.event,
+                from_state: row.from_state,
+                to_state: row.to_state,
+                spec_digest: row.spec_digest,
+                plan_id: row.plan_id,
+                idempotency_key: row.idempotency_key,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    Ok(Some(ProductJournalOutput {
+        version: VERSION.to_string(),
+        command: "product_journal".to_string(),
+        product: product_name.to_string(),
+        product_id: rocky_core::fulfill::fulfill_state_key(product_name),
+        count: rows.len(),
+        rows,
+    }))
+}
+
+/// Execute `rocky product journal <name>`.
+pub fn run_product_journal(
+    _config_path: &Path,
+    product_name: &str,
+    state_path: &Path,
+    output_json: bool,
+) -> Result<()> {
+    let root = std::env::current_dir().context("failed to get current working directory")?;
+    let Some(output) = product_journal_in(&root, Some(state_path), product_name)? else {
+        anyhow::bail!(
+            "product '{product_name}' is not known: no products/{product_name}.toml, and no \
+             fulfillment or approval record in the state store"
+        );
+    };
+    if output_json {
+        print_json(&output)?;
+        return Ok(());
+    }
+    println!(
+        "product {} journal: {} row(s)",
+        output.product, output.count
+    );
+    for row in &output.rows {
+        let plan = row
+            .plan_id
+            .as_deref()
+            .map(|plan_id| format!("  plan={plan_id}"))
+            .unwrap_or_default();
+        println!(
+            "  #{:08}  {}  {}  {} -> {}{plan}",
+            row.seq,
+            row.at.as_deref().unwrap_or("-"),
+            row.event,
+            row.from_state.as_deref().unwrap_or("(none)"),
+            row.to_state,
         );
     }
     Ok(())

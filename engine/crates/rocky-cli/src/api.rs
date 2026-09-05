@@ -87,7 +87,8 @@ use crate::commands::audit::{
     resolve_product_scope,
 };
 use crate::commands::product::{
-    ProductListOutput, ProductStatusOutput, product_list_in, product_names_in, product_status_in,
+    ProductJournalOutput, ProductListOutput, ProductStatusOutput, product_journal_in,
+    product_list_in, product_names_in, product_status_in,
 };
 use crate::commands::review::{
     ReviewMarkerState, compute_review_queue, compute_review_status, review_marker_state,
@@ -182,6 +183,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/schedule", get(schedule_status))
         .route("/api/v1/products", get(list_products))
         .route("/api/v1/products/{name}", get(get_product))
+        .route("/api/v1/products/{name}/journal", get(product_journal))
         .route("/api/v1/review/queue", get(review_queue))
         .route("/api/v1/review/{plan_id}/status", get(review_status))
         .route("/api/v1/brief", get(governor_brief))
@@ -750,6 +752,7 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "GET /api/v1/schedule",
         "GET /api/v1/products",
         "GET /api/v1/products/{name}",
+        "GET /api/v1/products/{name}/journal",
         "GET /api/v1/review/queue",
         "GET /api/v1/review/{plan_id}/status",
         "GET /api/v1/brief",
@@ -786,6 +789,7 @@ fn capabilities() -> Vec<String> {
         "review",
         "governor",
         "audit",
+        "journal",
     ]
     .into_iter()
     .map(String::from)
@@ -1208,6 +1212,35 @@ async fn get_product(
     .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
     match output {
         Some(status) => Ok(PrettyJson(status)),
+        None => Err(ApiError::product_not_found(&name)),
+    }
+}
+
+/// `GET /api/v1/products/{name}/journal` — canonical [`ProductJournalOutput`].
+///
+/// The same bytes as `rocky product journal <name> --output json`: the
+/// product's fulfillment journal rows in append order, read through the
+/// store function the loop reads through. A name that is not a bare
+/// identifier, or that neither a spec file nor a store record knows, is
+/// `404 product_not_found`. A known product with no rows is an empty
+/// journal, not a refusal.
+async fn product_journal(
+    State(state): State<Arc<ServerState>>,
+    ApiPath(name): ApiPath<String>,
+) -> Result<PrettyJson<ProductJournalOutput>, ApiError> {
+    if !is_bare_product_name(&name) {
+        return Err(ApiError::product_not_found(&name));
+    }
+    let root = project_root_for(&state)?;
+    let state_path = state_path_for(&state);
+    let lookup = name.clone();
+    let output =
+        tokio::task::spawn_blocking(move || product_journal_in(&root, Some(&state_path), &lookup))
+            .await
+            .map_err(|e| map_join_err(&e))?
+            .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    match output {
+        Some(journal) => Ok(PrettyJson(journal)),
         None => Err(ApiError::product_not_found(&name)),
     }
 }
@@ -3202,6 +3235,84 @@ mod tests {
         assert!(err.message.contains("broken"), "{}", err.message);
     }
 
+    /// `/products/{name}/journal` answers with the CLI's bytes: empty for a
+    /// product known by its spec alone, one row after an approval; an
+    /// unknown or traversal-shaped name is 404.
+    #[tokio::test]
+    async fn product_journal_matches_the_cli_bytes_and_refuses_unknown_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) =
+            crate::commands::product::tests::api_fixture_project(dir.path());
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config),
+            &state_path,
+        ))
+        .await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/products/revenue_daily/journal"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let expected = product_journal_in(&root, Some(&state_path), "revenue_daily")
+            .unwrap()
+            .expect("known by its spec");
+        assert_eq!(text, reference_bytes(&expected));
+        let empty: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(empty["count"], 0, "{text}");
+        assert_eq!(empty["product_id"], "product:revenue_daily");
+
+        // One approval appends one row, which the route shows byte for byte.
+        crate::commands::product::product_approve_in(&root, &state_path, "revenue_daily")
+            .expect("approved");
+        let resp = reqwest::get(format!("{base}/api/v1/products/revenue_daily/journal"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let expected = product_journal_in(&root, Some(&state_path), "revenue_daily")
+            .unwrap()
+            .expect("known");
+        assert_eq!(text, reference_bytes(&expected));
+        let one: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(one["count"], 1, "{text}");
+        assert_eq!(one["rows"][0]["seq"], 1);
+        assert_eq!(one["rows"][0]["to_state"], "spec_approved");
+        assert!(
+            one["rows"][0]["spec_digest"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:"),
+            "{text}"
+        );
+
+        for name in ["nope", "..%2F..", "not%20a%20name"] {
+            let resp = reqwest::get(format!("{base}/api/v1/products/{name}/journal"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 404, "{name}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert!(
+                err.code == "product_not_found" || err.code == "route_not_found",
+                "{name}: {}",
+                err.code
+            );
+        }
+    }
+
+    /// Without a bound config there is no `products/` to know a name by.
+    #[tokio::test]
+    async fn product_journal_needs_a_bound_config() {
+        let base = spawn_router(test_state()).await;
+        let resp = reqwest::get(format!("{base}/api/v1/products/revenue_daily/journal"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "engine_not_ready");
+    }
+
     /// Unfiltered, the ledger needs no config; a product filter needs the
     /// project root the config names.
     #[tokio::test]
@@ -3342,7 +3453,7 @@ mod tests {
         );
         // So are the product, review and governor routes, and all seven are
         // registered.
-        for capability in ["products", "review", "governor", "audit"] {
+        for capability in ["products", "review", "governor", "audit", "journal"] {
             assert!(
                 body.capabilities.iter().any(|c| c == capability),
                 "{capability}: {:?}",
@@ -3352,6 +3463,7 @@ mod tests {
         for route in [
             "GET /api/v1/products",
             "GET /api/v1/products/{name}",
+            "GET /api/v1/products/{name}/journal",
             "GET /api/v1/review/queue",
             "GET /api/v1/review/{plan_id}/status",
             "GET /api/v1/brief",

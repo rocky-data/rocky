@@ -42,32 +42,6 @@ use tracing::{debug, info};
 use super::plan::dialect_for_adapter_type;
 use crate::registry;
 
-/// Load the project config, or `None` when there is no `rocky.toml` to load.
-///
-/// The same derivation `rocky compile` uses (`commands::compile`): the
-/// credential-tolerant loader, so an unset `${VAR}` in an adapter's
-/// connection fields does not stop a command that needs no credentials;
-/// a missing file is `None`; **every other failure refuses**.
-///
-/// The refusal matters. The previous form swallowed every config error with
-/// `.ok()` and fell back to the DuckDB dialect, so a project whose config
-/// did not load got another warehouse's SQL and no word about it. It also
-/// meant a config that every other command rejects — one still declaring the
-/// removed `[schema_evolution]` section (#1435) — emitted SQL here as if
-/// nothing were wrong.
-fn load_project_config(
-    config_path: Option<&Path>,
-) -> Result<Option<rocky_core::config::RockyConfig>> {
-    let Some(path) = config_path else {
-        return Ok(None);
-    };
-    match rocky_core::config::load_rocky_config_credential_tolerant(path) {
-        Ok(config) => Ok(Some(config)),
-        Err(rocky_core::config::ConfigError::FileNotFound { .. }) => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
 /// Resolve the project's target dialect from the loaded config, falling back
 /// to DuckDB when there is none. Mirrors the resolution in
 /// [`super::plan::plan_preview_output`] so emitted SQL matches the plan preview.
@@ -129,7 +103,7 @@ fn emit_models(
 ) -> Result<EmitResult> {
     use rocky_compiler::compile::{self, CompilerConfig};
 
-    let project_config = load_project_config(config_path)?;
+    let project_config = rocky_core::config::load_optional_project_config(config_path)?;
     let dialect = resolve_dialect(project_config.as_ref());
 
     let config = CompilerConfig {

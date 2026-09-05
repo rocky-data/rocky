@@ -2657,3 +2657,46 @@ def test_product_list_translates_client_errors_to_failure():
             2, stderr_tail="state store locked", duration_ms=5
         )
         rocky.product_list()
+
+
+# ---------------------------------------------------------------------------
+# product_journal — delegation to the SDK client
+# ---------------------------------------------------------------------------
+
+
+def test_product_journal_delegates_to_the_client():
+    """``RockyResource.product_journal(name)`` is a thin delegate: it calls the
+    client's ``product_journal(name)`` and hands the typed result back
+    unchanged."""
+    from rocky_sdk.types import ProductJournalOutput
+
+    journal = ProductJournalOutput.model_validate(
+        {
+            "version": "1.74.0",
+            "command": "product_journal",
+            "product": "revenue_daily",
+            "product_id": "product:revenue_daily",
+            "rows": [],
+            "count": 0,
+        }
+    )
+    rocky = RockyResource()
+    with patch.object(RockyResource, "_get_client") as get_client:
+        get_client.return_value.product_journal.return_value = journal
+        result = rocky.product_journal("revenue_daily")
+    assert result is journal
+    get_client.return_value.product_journal.assert_called_once_with("revenue_daily")
+
+
+def test_product_journal_translates_client_errors_to_failure():
+    """An unknown product exits 1 in the CLI; the client raises, and the
+    resource surfaces it as ``dagster.Failure`` like every delegating method."""
+    rocky = RockyResource()
+    with (
+        patch.object(RockyResource, "_get_client") as get_client,
+        pytest.raises(dg.Failure),
+    ):
+        get_client.return_value.product_journal.side_effect = RockyCommandError(
+            1, stderr_tail="product 'nope' is not known", duration_ms=5
+        )
+        rocky.product_journal("nope")

@@ -75,13 +75,14 @@ fn compile_project(
     models_dir: &str,
     cache_ttl_override: Option<u64>,
 ) -> Result<CompileResult> {
-    let source_schemas = match rocky_core::config::load_rocky_config(config_path) {
-        Ok(cfg) => {
-            let schema_cfg = cfg.cache.schemas.with_ttl_override(cache_ttl_override);
-            crate::source_schemas::load_cached_source_schemas(&schema_cfg, state_path)
-        }
-        Err(_) => std::collections::HashMap::new(),
-    };
+    // A `rocky.toml` that is present and does not load refuses (#1625) — the
+    // AI commands ground their prompts in these types, so a silently cold map
+    // is a silently worse answer.
+    let source_schemas = crate::source_schemas::load_project_source_schemas(
+        config_path,
+        state_path,
+        cache_ttl_override,
+    )?;
 
     let config = CompilerConfig {
         models_dir: PathBuf::from(models_dir),

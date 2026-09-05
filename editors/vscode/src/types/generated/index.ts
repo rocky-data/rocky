@@ -334,3 +334,5 @@ export type {
   ProductApprovalOutput,
 } from "./product_list";
 export type { ProductStatusOutput } from "./product_status";
+// `rocky product journal <name>`, also served at `GET /api/v1/products/{name}/journal`.
+export type { ProductJournalOutput, ProductJournalEntry } from "./product_journal";
