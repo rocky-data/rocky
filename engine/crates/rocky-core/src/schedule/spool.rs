@@ -45,6 +45,8 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::path_presence::{PathPresence, classify_not_found};
+
 /// How long a consumed [`WebhookKind::Id`] demand's `.done` tombstone is kept so
 /// a redelivery of the same id is deduplicated instead of re-run.
 pub const TOMBSTONE_TTL: chrono::Duration = chrono::Duration::hours(24);
@@ -359,14 +361,39 @@ pub fn accept_journaled(
 }
 
 /// List the pending demand files in the spool directory: regular files that are
-/// not temp scratch, tombstones, or quarantined corruptions. Missing directory
-/// yields an empty list.
+/// not temp scratch, tombstones, or quarantined corruptions.
+///
+/// A spool directory that is genuinely absent yields an empty list — the
+/// ordinary state of a project that has taken no webhook demand yet. A spool
+/// path that HAS an entry but still cannot be read is an error, never an empty
+/// list: `read_dir` on a symlink whose target is gone fails with `NotFound`,
+/// exactly as it does for a directory that was never created, and reporting
+/// that as "no demand is pending" makes the scheduler idle through a spool it
+/// simply could not open (#1707).
+///
+/// # Errors
+///
+/// Returns the underlying `read_dir`/`DirEntry` error, or — for a spool path
+/// that exists but reads as missing — an [`io::ErrorKind::Other`] error naming
+/// the path and, for a symlink, its target. The kind is deliberately not
+/// `NotFound`, so a caller matching on the kind cannot reinstate the
+/// conflation this branch closes.
 pub fn list_pending_files(rocky_dir: &Path) -> io::Result<Vec<PathBuf>> {
     let dir = spool_dir(rocky_dir);
     let mut out = Vec::new();
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
+        // `NotFound` has two meanings here and only one of them is "no demand
+        // is pending". Ask the shared discriminator which one this is.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => match classify_not_found(&dir) {
+            PathPresence::Absent => return Ok(out),
+            PathPresence::Present { detail } => {
+                return Err(io::Error::other(format!(
+                    "the webhook spool at '{}' cannot be read: {detail}",
+                    dir.display()
+                )));
+            }
+        },
         Err(e) => return Err(e),
     };
     for entry in entries {
@@ -963,6 +990,99 @@ mod tests {
         assert!(
             pending[0].exists(),
             "a failed stamp leaves the pending file intact for the next tick to retry"
+        );
+    }
+
+    /// A spool directory that was never created is the ordinary state of a
+    /// project that has taken no webhook demand. It stays an empty list — this
+    /// is the control for the refusal below, and the case every tick hits.
+    #[test]
+    fn an_absent_spool_directory_is_still_no_pending_demand() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            list_pending_files(dir.path())
+                .expect("an absent spool is not an error")
+                .is_empty(),
+            "a spool that was never created must read as no pending demand"
+        );
+    }
+
+    /// A `.rocky` directory that does not exist either — the path's PARENT is
+    /// missing, so both the read and the stat report `NotFound`. Still absence.
+    #[test]
+    fn a_spool_whose_parent_is_missing_is_still_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let never_made = dir.path().join("no-such-rocky-dir");
+        assert!(
+            list_pending_files(&never_made)
+                .expect("a missing parent is absence, not a broken spool")
+                .is_empty()
+        );
+    }
+
+    /// A spool symlink whose target is gone must REFUSE, not read as empty.
+    /// `read_dir` fails with `NotFound` here exactly as it does for a spool
+    /// that was never created; before #1707 the scheduler saw no demand and
+    /// ticked on. The error names the path and the target so the operator can
+    /// fix the link without a second look at the disk.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_spool_symlink_refuses_instead_of_reading_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone-spool");
+        let link = spool_dir(dir.path());
+        std::os::unix::fs::symlink(&gone, &link).unwrap();
+
+        let err = list_pending_files(dir.path())
+            .expect_err("a dangling spool symlink must not read as no pending demand");
+        assert_ne!(
+            err.kind(),
+            io::ErrorKind::NotFound,
+            "the refusal must not wear the kind it is distinguishing itself from"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(&link.display().to_string()),
+            "the message names the spool path, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(&gone.display().to_string()),
+            "the message names the link target, got: {rendered}"
+        );
+    }
+
+    /// A spool symlink that RESOLVES is an ordinary spool and keeps listing.
+    /// The refusal is about the dangling case only.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_real_spool_directory_lists_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-spool");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, spool_dir(dir.path())).unwrap();
+
+        assert!(
+            list_pending_files(dir.path())
+                .expect("a resolvable spool symlink is an ordinary spool")
+                .is_empty(),
+            "an empty spool behind a good link is still no pending demand"
+        );
+
+        accept(
+            dir.path(),
+            "orders",
+            WebhookKind::Id,
+            "evt-1",
+            "hash",
+            now(),
+        )
+        .unwrap();
+        let pending = list_pending_files(dir.path())
+            .expect("a resolvable spool symlink is an ordinary spool");
+        assert_eq!(
+            pending.len(),
+            1,
+            "the demand written through the link must be listed"
         );
     }
 }

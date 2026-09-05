@@ -67,3 +67,13 @@ export function useLane(): Lane {
 export function useSubpath(): string | null {
   return subpathFromPath(usePathname());
 }
+
+/** Every segment after `/ui`, following the address bar: `[lane, screen, ...rest]`. */
+export function useSegments(): string[] {
+  return segmentsFromPath(usePathname());
+}
+
+/** The custody screen for a subject: a model name, a run id, a plan id or a custody id. */
+export function custodyPath(subject: string): string {
+  return `${UI_BASE}/governor/custody/${encodeURIComponent(subject)}`;
+}
