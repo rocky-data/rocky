@@ -398,6 +398,84 @@ mod tests {
         }
     }
 
+    /// The one compile this change can newly fail (#1646), asserted rather
+    /// than described. A source column the warehouse reports as `DECIMAL(10)`
+    /// used to reach the compiler as `Decimal(38,0)`, so a contract declaring
+    /// `Decimal(38,0)` matched it. `DECIMAL(10)` means precision 10 and scale
+    /// 0 — how SQL reads it, and how this file's `decimal_type_matches`
+    /// already read a contract written `Decimal(10)` — so it is now an
+    /// `E011`. The contract was never enforcing the 38 digits it named.
+    #[test]
+    fn precision_only_source_decimal_no_longer_satisfies_a_38_digit_contract() {
+        use crate::compile::default_type_mapper;
+
+        let inferred = default_type_mapper("DECIMAL(10)");
+        assert_eq!(
+            inferred,
+            RockyType::Decimal {
+                precision: 10,
+                scale: 0
+            },
+            "the mapper must read the digits the string names"
+        );
+
+        let schema = vec![typed_col("amount", inferred.clone(), true)];
+        let contract = CompilerContract {
+            columns: vec![ContractColumn {
+                name: "amount".to_string(),
+                type_name: Some("Decimal(38,0)".to_string()),
+                nullable: None,
+                description: None,
+            }],
+            rules: ContractRules::default(),
+        };
+
+        let diags = validate_contract("m", &schema, &contract);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(&*diags[0].code, E011);
+        assert_eq!(diags[0].severity, Severity::Error);
+
+        // The same contract over a source column that really is 38 digits
+        // still passes, so this is a narrower reading, not a broken one.
+        let wide = vec![typed_col(
+            "amount",
+            default_type_mapper("DECIMAL(38,0)"),
+            true,
+        )];
+        assert!(validate_contract("m", &wide, &contract).is_empty());
+    }
+
+    /// A bare `DECIMAL` or `NUMERIC` source column is now unread, so the
+    /// contract gate says "not checked" (`I003`) instead of comparing it to a
+    /// fabricated `Decimal(38,0)`. This direction only ever softens a
+    /// diagnostic: an `E011` becomes an `I003` (#1646).
+    #[test]
+    fn bare_source_decimal_reports_i003_not_a_fabricated_match() {
+        use crate::compile::default_type_mapper;
+
+        for bare in ["DECIMAL", "NUMERIC"] {
+            let schema = vec![typed_col("amount", default_type_mapper(bare), true)];
+            let contract = CompilerContract {
+                columns: vec![ContractColumn {
+                    name: "amount".to_string(),
+                    type_name: Some("Decimal(38,0)".to_string()),
+                    nullable: None,
+                    description: None,
+                }],
+                rules: ContractRules::default(),
+            };
+
+            let diags = validate_contract("m", &schema, &contract);
+            assert_eq!(diags.len(), 1, "{bare}: {diags:?}");
+            assert_eq!(&*diags[0].code, I003, "{bare}");
+            assert_ne!(
+                diags[0].severity,
+                Severity::Error,
+                "{bare}: an unread type must not fail the compile"
+            );
+        }
+    }
+
     #[test]
     fn test_valid_contract() {
         let schema = vec![
