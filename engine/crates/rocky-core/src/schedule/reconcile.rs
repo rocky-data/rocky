@@ -31,9 +31,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use thiserror::Error;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::RockyConfig;
 use crate::state::{StateError, StateStore};
@@ -110,6 +112,18 @@ pub struct TickOptions {
     /// behavior: every pipeline in scope is evaluated. Shared (an `Arc` clone)
     /// with the serve loop and its [`SubprocessSpawner`].
     pub drain: Drain,
+    /// The process-wide state-store gate of a resident scheduler (`rocky serve`);
+    /// `None` for `rocky tick`.
+    ///
+    /// The server queues every one of its own store opens, its HTTP reads and
+    /// this tick alike, on one permit, so they take turns instead of racing for
+    /// redb's exclusive file lock. Without it a tick under sustained UI reads
+    /// polled that lock a few times and gave up as `state_busy`: measured at
+    /// eight polling clients, 43 of 67 ticks. The permit is held only while the
+    /// tick holds the store, and released around each child's window exactly as
+    /// the store itself is; a child, another process, contends the way it
+    /// always did.
+    pub store_gate: Option<Arc<Semaphore>>,
 }
 
 /// How many times the reconciler re-opens the state store after a child before
@@ -146,6 +160,16 @@ fn open_tick_store(state_path: &Path) -> Result<Option<StateStore>, TickError> {
     }
 }
 
+/// Take the resident server's store gate, when there is one. Waits its turn
+/// behind the server's own reads; never polls. A closed gate (the server is
+/// shutting down) behaves as no gate, so a tick never faults on it.
+async fn acquire_gate(gate: Option<&Arc<Semaphore>>) -> Option<OwnedSemaphorePermit> {
+    match gate {
+        Some(gate) => Arc::clone(gate).acquire_owned().await.ok(),
+        None => None,
+    }
+}
+
 /// Outcome of re-opening the store after a child's window.
 enum StoreReopen {
     /// The store is open again; the tick continues.
@@ -167,6 +191,11 @@ enum StoreReopen {
 struct PhaseStore {
     path: PathBuf,
     inner: Option<StateStore>,
+    /// The resident server's store gate, when there is one; taken before every
+    /// open and dropped with every close, so the tick and the server's reads
+    /// take turns.
+    gate: Option<Arc<Semaphore>>,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl PhaseStore {
@@ -183,12 +212,21 @@ impl PhaseStore {
     /// the `StateStore` value releases them.
     fn close(&mut self) {
         self.inner = None;
+        self.permit = None;
     }
 
     /// Re-open the store read-write after a child, retrying briefly on
     /// contention. A genuine fault propagates as [`TickError::State`]; exhausted
     /// contention is [`StoreReopen::Busy`], never an error.
     async fn reopen(&mut self) -> Result<StoreReopen, TickError> {
+        // Drop any permit still held BEFORE waiting for one. `close` already
+        // clears it on every real path, but `self.permit = acquire(..).await`
+        // evaluates its right-hand side first: called while a permit is held,
+        // that waits for a permit only its own holder can release — a silent
+        // hang rather than a failure. Clearing first makes the method safe
+        // whatever the caller did.
+        self.permit = None;
+        self.permit = acquire_gate(self.gate.as_ref()).await;
         for attempt in 1..=REOPEN_RETRY_ATTEMPTS {
             match StateStore::open(&self.path) {
                 Ok(store) => {
@@ -393,6 +431,7 @@ pub async fn tick_once(
     //    store is a whole-tick busy-skip (exit 0), not a fault. The store is owned
     //    (not borrowed) so it can be released around each child spawn — the child
     //    opens the same file and must find both locks free.
+    let permit = acquire_gate(opts.store_gate.as_ref()).await;
     let Some(store) = open_tick_store(state_path)? else {
         report.state_busy = true;
         return Ok(report);
@@ -400,6 +439,8 @@ pub async fn tick_once(
     let mut phase = PhaseStore {
         path: state_path.to_path_buf(),
         inner: Some(store),
+        gate: opts.store_gate.clone(),
+        permit,
     };
 
     // 3. Resolve schedules in scope; invalid ones fail closed to skips.
@@ -1726,6 +1767,7 @@ cron = "also invalid"
             member_budgets: BTreeMap::new(),
             state_path: state_path.clone(),
             drain: Drain::default(),
+            store_gate: None,
         };
         (state_path, dir, opts)
     }
@@ -1825,6 +1867,35 @@ cron = "also invalid"
         captured: Mutex<Vec<SpawnRequest>>,
         exit_code: i32,
         finished_at: DateTime<Utc>,
+    }
+
+    /// A spawner that takes the store gate during the child's window, the way
+    /// the resident server's job-record write does
+    /// (`JobsModelSpawner::record`). It must succeed: the tick releases its
+    /// permit with the store at `PhaseStore::close`, and if a future edit ever
+    /// held the permit across the spawn instead, this waits forever — a hung
+    /// scheduler, not a failed one. The bounded wait turns that into a failure.
+    struct GateProbingSpawner {
+        gate: Arc<Semaphore>,
+        acquired: Mutex<bool>,
+    }
+
+    #[async_trait]
+    impl Spawner for GateProbingSpawner {
+        async fn run(&self, _request: &SpawnRequest) -> RunOutcome {
+            let got = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                Arc::clone(&self.gate).acquire_owned(),
+            )
+            .await
+            .is_ok();
+            *self.acquired.lock().unwrap() = got;
+            RunOutcome {
+                exit_code: 0,
+                pid: Some(4243),
+                drain_interrupted: false,
+            }
+        }
     }
 
     #[async_trait]
@@ -2838,6 +2909,99 @@ freshness = true
         );
         assert_eq!(spawner.run_count(), 0, "no child runs over a busy store");
         drop(held);
+    }
+
+    // --- the store gate: a resident server's reads and ticks take turns --------
+
+    #[test]
+    fn tick_waits_at_the_store_gate_instead_of_busy_skipping() {
+        let (state_path, _dir, mut opts) = temp_env();
+        let config = cfg(CRON_ONLY);
+        let gate = Arc::new(Semaphore::new(1));
+        opts.store_gate = Some(gate.clone());
+        let rt = rt();
+        // A server read holds the gate. The tick must wait for its turn, not
+        // poll the store's file lock and give up as `state_busy`.
+        let held = rt.block_on(gate.clone().acquire_owned()).unwrap();
+        let spawner = CapturingSpawner::new(0);
+        let started = std::time::Instant::now();
+        let report = rt
+            .block_on(async {
+                let release = async {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    drop(held);
+                };
+                let (report, ()) = tokio::join!(
+                    tick_once(&config, &state_path, at(2026, 5, 2, 4, 0), &spawner, &opts),
+                    release
+                );
+                report
+            })
+            .unwrap();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(300),
+            "the tick ran before the gate was released"
+        );
+        assert!(
+            !report.state_busy,
+            "a held gate is a wait, never a busy skip: {report:?}"
+        );
+        assert_eq!(
+            report.evaluated.len(),
+            1,
+            "the pipeline was evaluated once the gate opened"
+        );
+        assert_eq!(
+            gate.available_permits(),
+            1,
+            "the tick returned its permit with the store"
+        );
+    }
+
+    #[test]
+    fn the_store_gate_is_free_during_a_child_window() {
+        let (state_path, _dir, mut opts) = temp_env();
+        let config = cfg(CRON_ONLY);
+        let gate = Arc::new(Semaphore::new(1));
+        opts.store_gate = Some(gate.clone());
+
+        // First sight anchors raw's cron and fires nothing.
+        let anchor = CapturingSpawner::new(0);
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            at(2026, 5, 1, 12, 0),
+            &anchor,
+            &opts,
+        ))
+        .unwrap();
+
+        // The occurrence fires. The spawner takes the gate mid-child, exactly as
+        // the server's job-record write does.
+        let spawner = GateProbingSpawner {
+            gate: gate.clone(),
+            acquired: Mutex::new(false),
+        };
+        let report = rt()
+            .block_on(tick_once(
+                &config,
+                &state_path,
+                at(2026, 5, 2, 4, 0),
+                &spawner,
+                &opts,
+            ))
+            .unwrap();
+
+        assert_eq!(report.executed.len(), 1, "the occurrence fired");
+        assert!(
+            *spawner.acquired.lock().unwrap(),
+            "the gate must be free while a child runs, or the scheduler deadlocks"
+        );
+        assert_eq!(
+            gate.available_permits(),
+            1,
+            "the tick returned its permit with the store"
+        );
     }
 
     // --- owned-store lifecycle: the child can open the released store ----------

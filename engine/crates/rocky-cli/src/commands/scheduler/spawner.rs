@@ -53,7 +53,10 @@ impl JobsModelSpawner {
     /// authoritative for the live session and embedders reconcile via `/runs`.
     async fn record(&self, job: PersistedJob) {
         self.state.jobs.upsert(job.clone()).await;
-        if let Err(e) = persist_job(self.state_path.clone(), job.clone()).await {
+        // The tick has released the store, and its gate permit with it, for
+        // the child's window (see `PhaseStore::close`), so taking the gate here
+        // waits only for the server's reads, never for the tick itself.
+        if let Err(e) = persist_job(&self.state, self.state_path.clone(), job.clone()).await {
             tracing::warn!(error = %e, job_id = %job.job_id,
                 "could not persist scheduler job record; in-memory only until it settles");
         }

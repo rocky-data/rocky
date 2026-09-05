@@ -60,7 +60,7 @@ Three rules follow from how the image is built:
 
 - **Keep `--host 0.0.0.0`** when you pass your own `serve` arguments. Rocky binds loopback by default, and a loopback bind inside the container is unreachable through a published port. The default command sets it for you.
 - **A token is required.** A non-loopback bind needs one, so the default command fails fast without `ROCKY_SERVE_TOKEN` or `--token`. `--ui` also needs `--token-scope read-only` (or `ROCKY_SERVE_TOKEN_SCOPE=read-only`), so a leaked browser token cannot reach a mutating route.
-- **Publish the port on loopback** (`-p 127.0.0.1:8080:8080`) unless you mean to serve the network. To reach the UI by another name or address, add `--allowed-host <name>`; the server answers `421` to any `Host` it was not told about.
+- **Publish the port on loopback** (`-p 127.0.0.1:8080:8080`) unless you mean to serve the network. To reach the UI by another name or address, add `--allowed-host <name>`; the server answers `421` to any `Host` it was not told about, except on the health route.
 
 The server reads `rocky.toml` from `/data` and the models from `/data/models`. Every path the CLI takes, `--config`, `--models`, `--state-path`, works the same way inside the container, relative to `/data`.
 
@@ -98,7 +98,7 @@ The state store is written under `/data/models`, so the next run picks up the wa
 curl -fsS http://127.0.0.1:8080/api/v1/health
 ```
 
-The image carries no `HEALTHCHECK` instruction, and you cannot add one: a Docker health check runs inside the container, and the image has no shell or HTTP client. The same limit applies to a Compose `healthcheck`. A Kubernetes `httpGet` probe comes from the kubelet, outside the container, so it works; the example below uses it.
+The image carries no `HEALTHCHECK` instruction, and you cannot add one: a Docker health check runs inside the container, and the image has no shell or HTTP client. The same limit applies to a Compose `healthcheck`. A Kubernetes `httpGet` probe comes from the kubelet, outside the container, so it works; the example below uses it. The health route answers whatever `Host` the probe sends, so `--ui` needs no `--allowed-host` for a probe; every other route holds the rule.
 
 ## Stop and drain
 

@@ -114,6 +114,8 @@ pub async fn run_tick(
     let opts = TickOptions {
         dry_run,
         pipeline_filter: pipeline,
+        // One-shot: no resident server, so no gate to share with its reads.
+        store_gate: None,
         config_path: config_path.to_path_buf(),
         rocky_dir,
         // Deliberately `None`, unlike `serve --scheduler`. A one-shot tick has
