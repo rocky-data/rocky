@@ -2,14 +2,9 @@ import { Component, useEffect, useState, type ErrorInfo, type ReactNode } from "
 import type { MetaOutput } from "@rocky-types/meta";
 import { ApiError, apiGet } from "./api";
 import { EmptyState, StatusCard } from "./components";
+import { EstateScreen } from "./estate/EstateScreen";
+import { LANES, navigate, pathForLane, useLane, type Lane } from "./router";
 import { currentToken } from "./token";
-
-/** The three lanes the U-series builds. Only the shell exists in U2-P1. */
-const LANES = [
-  { id: "estate", label: "Estate" },
-  { id: "review", label: "Review" },
-  { id: "governor", label: "Governor" },
-] as const;
 
 interface ErrorBoundaryState {
   error: Error | undefined;
@@ -47,9 +42,9 @@ type EngineState =
   | { kind: "unreachable"; message: string };
 
 /**
- * The engine panel: `GET /api/v1/meta` with the tab's token. It is the one
- * screen of the scaffold, and it proves the whole path: embedded assets,
- * token bootstrap, bearer header, typed payload, envelope on refusal.
+ * The engine panel: `GET /api/v1/meta` with the tab's token. It proves the
+ * whole path on every load: embedded assets, token bootstrap, bearer
+ * header, typed payload, envelope on refusal.
  */
 export function EnginePanel({
   fetchMeta = () => apiGet<MetaOutput>("meta"),
@@ -122,7 +117,30 @@ export function EnginePanel({
   }
 }
 
-export function App({ engine }: { engine?: ReactNode }) {
+/** What each lane shows. The review and governor screens are U3 and U4. */
+function LaneScreen({ lane, estate }: { lane: Lane; estate: ReactNode }) {
+  switch (lane) {
+    case "estate":
+      return <>{estate}</>;
+    case "review":
+      return (
+        <EmptyState
+          title="The review screen is not built yet"
+          detail="U3: the pending plan, its diff, samples, blast radius and policy verdict."
+        />
+      );
+    case "governor":
+      return (
+        <EmptyState
+          title="The governor screen is not built yet"
+          detail="U4: the brief, the scorecard, custody and the audit ledger."
+        />
+      );
+  }
+}
+
+export function App({ engine, estate }: { engine?: ReactNode; estate?: ReactNode }) {
+  const lane = useLane();
   return (
     <ErrorBoundary>
       <div className="min-h-screen bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
@@ -130,23 +148,35 @@ export function App({ engine }: { engine?: ReactNode }) {
           <div className="mx-auto flex max-w-6xl items-center gap-6 px-4 py-3">
             <span className="text-base font-semibold tracking-tight">Rocky</span>
             <nav aria-label="Lanes" className="flex gap-4 text-sm">
-              {LANES.map((lane) => (
+              {LANES.map((entry) => (
                 <a
-                  key={lane.id}
-                  href={`/ui/${lane.id}`}
-                  className="text-zinc-600 hover:text-zinc-900 dark:text-zinc-300 dark:hover:text-white"
+                  key={entry.id}
+                  href={pathForLane(entry.id)}
+                  aria-current={entry.id === lane ? "page" : undefined}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    navigate(entry.id);
+                  }}
+                  className={
+                    entry.id === lane
+                      ? "font-medium text-zinc-900 dark:text-white"
+                      : "text-zinc-600 hover:text-zinc-900 dark:text-zinc-300 dark:hover:text-white"
+                  }
                 >
-                  {lane.label}
+                  {entry.label}
                 </a>
               ))}
             </nav>
           </div>
         </header>
-        <main className="mx-auto max-w-6xl px-4 py-6">
-          <h1 className="mb-3 text-sm font-medium uppercase tracking-wide text-zinc-500">
-            Engine
-          </h1>
-          {engine ?? <EnginePanel />}
+        <main className="mx-auto max-w-6xl space-y-6 px-4 py-6">
+          <section aria-label="Engine">
+            <h1 className="mb-3 text-sm font-medium uppercase tracking-wide text-zinc-500">
+              Engine
+            </h1>
+            {engine ?? <EnginePanel />}
+          </section>
+          <LaneScreen lane={lane} estate={estate ?? <EstateScreen />} />
         </main>
       </div>
     </ErrorBoundary>

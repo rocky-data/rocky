@@ -10,6 +10,11 @@ import tailwindcss from "@tailwindcss/vite";
 const generatedTypes = fileURLToPath(
   new URL("../../editors/vscode/src/types/generated", import.meta.url),
 );
+// The live-binary captures the dagster tests keep (`just regen-fixtures`), read
+// by this package's render tests so "the playground renders" is a test.
+const capturedFixtures = fileURLToPath(
+  new URL("../../integrations/dagster/tests/fixtures_generated", import.meta.url),
+);
 
 // The SPA is served by `rocky serve --ui` under `/ui/`, from files embedded
 // in the binary at build time (`engine/crates/rocky-cli/src/ui.rs`). Every
@@ -18,7 +23,9 @@ const generatedTypes = fileURLToPath(
 export default defineConfig({
   base: "/ui/",
   plugins: [react(), tailwindcss()],
-  resolve: { alias: { "@rocky-types": generatedTypes } },
+  resolve: {
+    alias: { "@rocky-types": generatedTypes, "@rocky-fixtures": capturedFixtures },
+  },
   build: {
     outDir: "dist",
     emptyOutDir: true,
@@ -33,6 +40,8 @@ export default defineConfig({
     proxy: { "/api": "http://127.0.0.1:8080" },
   },
   test: {
+    // `globals` lets testing-library register its per-test cleanup.
+    globals: true,
     environment: "jsdom",
     setupFiles: ["./src/test/setup.ts"],
     include: ["src/**/*.test.{ts,tsx}", "scripts/**/*.test.mjs"],
