@@ -39,8 +39,8 @@
 //! operator looks for the secret and where they look for its scope.
 //!
 //! Cross-origin clients must be enumerated via `--allowed-origin`. The
-//! default allowlist is empty (same-origin only); the dashboard at `/`
-//! is server-rendered HTML and doesn't need cross-origin XHR.
+//! default allowlist is empty (same-origin only); the browser UI is served
+//! from this origin and needs none.
 
 use std::path::Path;
 

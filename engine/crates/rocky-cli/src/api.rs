@@ -5,6 +5,7 @@
 //! ```text
 //! GET  /api/v1/health                          → liveness (auth-exempt)
 //! GET  /api/v1/meta                             → engine + config fingerprint
+//! GET  /api/v1/project                          → the project served (typed, no CLI twin)
 //! GET  /api/v1/models                           → list all models (dashboard-only)
 //! GET  /api/v1/models/:name                     → model details (dashboard-only)
 //! GET  /api/v1/models/:name/lineage             → column-level lineage
@@ -79,7 +80,6 @@ use serde::{Deserialize, Serialize};
 
 use rocky_core::state::PersistedJob;
 use rocky_server::auth::{build_cors_layer, require_bearer_token};
-use rocky_server::dashboard;
 use rocky_server::state::ServerState;
 
 use crate::commands::audit::{
@@ -99,8 +99,8 @@ use crate::commands::{
     lineage_output, metrics_output, model_history_output, schedule_status_output, schemas_hash,
 };
 use crate::output::{
-    AuditForOutput, AuditOutput, AuditScorecardOutput, BriefOutput, ReviewQueueOutput,
-    ReviewStatusOutput, ScorecardDimension,
+    AuditForOutput, AuditOutput, AuditScorecardOutput, BriefOutput, ProjectOutput,
+    ReviewQueueOutput, ReviewStatusOutput, ScorecardDimension,
 };
 use crate::output::{
     ColumnLineageOutput, CompileOutput, DagExecutionOutput, DagLayersOutput, DagNodeResultOutput,
@@ -160,10 +160,9 @@ pub fn router(state: Arc<ServerState>) -> Router {
     let cors = build_cors_layer(&state.allowed_origins);
 
     let api = Router::new()
-        .route("/", get(dashboard::dashboard))
-        .route("/dashboard", get(dashboard::dashboard))
         .route("/api/v1/health", get(health))
         .route("/api/v1/meta", get(meta))
+        .route("/api/v1/project", get(project))
         .route("/api/v1/models", get(list_models))
         .route("/api/v1/models/{name}", get(get_model))
         .route("/api/v1/models/{name}/lineage", get(model_lineage))
@@ -769,6 +768,7 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
     [
         "GET /api/v1/health",
         "GET /api/v1/meta",
+        "GET /api/v1/project",
         "GET /api/v1/models",
         "GET /api/v1/models/{name}",
         "GET /api/v1/models/{name}/lineage",
@@ -840,6 +840,125 @@ async fn health() -> PrettyJson<HealthOutput> {
         status: "ok".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
+}
+
+/// `GET /api/v1/project` — canonical [`ProjectOutput`]: the project this
+/// sidecar serves, as the retired dashboard at `/` used to show it.
+///
+/// Config-derived fields come from the bound `rocky.toml` (empty lists and
+/// `config_error` when it does not load; `config_path: null` when none is
+/// bound), the counts from the in-memory compile result, and `last_run`
+/// from the state store the server resolved, namespace included. Bounded by
+/// construction: no model names, one run. Reads only.
+async fn project(
+    State(state): State<Arc<ServerState>>,
+) -> Result<PrettyJson<ProjectOutput>, ApiError> {
+    let (name, config_path, pipelines, adapters, config_error) = match state.config_path.as_deref()
+    {
+        None => ("rocky".to_string(), None, Vec::new(), Vec::new(), None),
+        Some(path) => {
+            let name = path
+                .parent()
+                .and_then(|dir| dir.file_name())
+                .map(|dir| dir.to_string_lossy().to_string())
+                .unwrap_or_else(|| "rocky".to_string());
+            let shown = Some(path.display().to_string());
+            match rocky_core::config::load_rocky_config(path) {
+                Ok(config) => {
+                    let pipelines = config
+                        .pipelines
+                        .iter()
+                        .map(|(pipeline, cfg)| crate::output::ProjectPipelineOutput {
+                            name: pipeline.clone(),
+                            pipeline_type: pipeline_type_label(cfg).to_string(),
+                        })
+                        .collect();
+                    let adapters = config
+                        .adapters
+                        .iter()
+                        .map(|(adapter, cfg)| crate::output::ProjectAdapterOutput {
+                            name: adapter.clone(),
+                            adapter_type: cfg.adapter_type.clone(),
+                        })
+                        .collect();
+                    (name, shown, pipelines, adapters, None)
+                }
+                Err(e) => (name, shown, Vec::new(), Vec::new(), Some(format!("{e:#}"))),
+            }
+        }
+    };
+
+    let (models_compiled, diagnostics) = {
+        let lock = state.compile_result.read().await;
+        match lock.as_ref() {
+            Some(result) => (
+                Some(result.semantic_graph.models.len() as u64),
+                crate::output::ProjectDiagnosticsOutput {
+                    total: result.diagnostics.len() as u64,
+                    warnings: result
+                        .diagnostics
+                        .iter()
+                        .filter(|d| d.severity == rocky_compiler::diagnostic::Severity::Warning)
+                        .count() as u64,
+                    has_errors: result.has_errors,
+                },
+            ),
+            None => (
+                None,
+                crate::output::ProjectDiagnosticsOutput {
+                    total: 0,
+                    warnings: 0,
+                    has_errors: false,
+                },
+            ),
+        }
+    };
+
+    let state_path = state_path_for(&state);
+    let last_run =
+        store_read(
+            &state,
+            move || -> anyhow::Result<Option<crate::output::ProjectRunOutput>> {
+                if !state_path.exists() {
+                    return Ok(None);
+                }
+                let store = rocky_core::state::StateStore::open_read_only(&state_path)?;
+                Ok(store.list_runs(1)?.into_iter().next().map(|run| {
+                    crate::output::ProjectRunOutput {
+                        run_id: run.run_id,
+                        started_at: run.started_at.to_rfc3339(),
+                        finished_at: run.finished_at.to_rfc3339(),
+                        status: format!("{:?}", run.status),
+                        models_executed: run.models_executed.len() as u64,
+                        trigger: format!("{:?}", run.trigger),
+                    }
+                }))
+            },
+        )
+        .await?
+        .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+
+    Ok(PrettyJson(ProjectOutput {
+        name,
+        config_path,
+        config_error,
+        pipelines,
+        adapters,
+        models_compiled,
+        diagnostics,
+        last_run,
+    }))
+}
+
+/// A pipeline's kind by its config variant, without exposing the enum.
+fn pipeline_type_label(cfg: &rocky_core::config::PipelineConfig) -> &'static str {
+    match cfg {
+        rocky_core::config::PipelineConfig::Replication(_) => "replication",
+        rocky_core::config::PipelineConfig::Transformation(_) => "transformation",
+        rocky_core::config::PipelineConfig::Quality(_) => "quality",
+        rocky_core::config::PipelineConfig::Snapshot(_) => "snapshot",
+        rocky_core::config::PipelineConfig::Load(_) => "load",
+    }
 }
 
 /// `GET /api/v1/meta` — engine + config fingerprint for feature detection.
@@ -3543,6 +3662,7 @@ mod tests {
             "GET /api/v1/audit/scorecard",
             "GET /api/v1/custody/{subject}",
             "GET /api/v1/audit",
+            "GET /api/v1/project",
         ] {
             assert!(body.routes.iter().any(|r| r == route), "{route} missing");
         }
@@ -3669,6 +3789,115 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 403, "the UI token never reaches a mutation");
+    }
+
+    /// `/api/v1/project` reads the bound config, the compile result and the
+    /// state store the server resolved: the run recorded under the pinned
+    /// store shows, and the lists carry the config's pipelines and adapters.
+    #[tokio::test]
+    async fn project_route_reads_the_config_the_compile_and_the_resolved_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path, _) = governor_fixture(dir.path());
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config.clone()),
+            &state_path,
+        ))
+        .await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/project"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        assert!(text.ends_with("}\n"), "{text}");
+        let project: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            project["name"],
+            root.file_name().unwrap().to_string_lossy().as_ref()
+        );
+        assert_eq!(project["config_path"], config.display().to_string());
+        assert!(project.get("config_error").is_none(), "{text}");
+        assert!(
+            !project["pipelines"].as_array().unwrap().is_empty(),
+            "the fixture config declares a pipeline: {text}"
+        );
+        assert!(
+            !project["adapters"].as_array().unwrap().is_empty(),
+            "the fixture config declares an adapter: {text}"
+        );
+        assert_eq!(project["last_run"]["run_id"], "run-orders-1", "{text}");
+        assert_eq!(project["last_run"]["status"], "Success");
+        assert_eq!(project["last_run"]["models_executed"], 1);
+        assert!(project["diagnostics"]["total"].is_number());
+
+        // No config bound: still 200, with nothing config-derived.
+        let base = spawn_router(test_state()).await;
+        let project: serde_json::Value = reqwest::get(format!("{base}/api/v1/project"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(project["name"], "rocky");
+        assert!(project.get("config_path").is_none());
+        assert_eq!(project["pipelines"], serde_json::json!([]));
+        assert_eq!(project["adapters"], serde_json::json!([]));
+
+        // A config that does not load: the reason, and empty lists.
+        let bad = dir.path().join("broken").join("rocky.toml");
+        std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
+        std::fs::write(&bad, "this = [is not toml").unwrap();
+        let base = spawn_router(pinned_server(root.join("models"), Some(bad), &state_path)).await;
+        let project: serde_json::Value = reqwest::get(format!("{base}/api/v1/project"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(project["name"], "broken");
+        assert!(project["config_error"].is_string(), "{project}");
+        assert_eq!(project["pipelines"], serde_json::json!([]));
+    }
+
+    /// The server-rendered dashboard is retired: `/dashboard` is no route in
+    /// any mode, `/` redirects to the page with `--ui` and is no route
+    /// without it.
+    #[tokio::test]
+    async fn the_dashboard_is_retired_and_root_redirects_only_with_ui() {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let base = spawn_router(test_state()).await;
+        for path in ["/dashboard", "/"] {
+            let resp = client.get(format!("{base}{path}")).send().await.unwrap();
+            assert_eq!(resp.status(), 404, "{path}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "route_not_found", "{path}");
+        }
+        let base = spawn_router(ui_state(&[], &[])).await;
+        let resp = client.get(format!("{base}/")).send().await.unwrap();
+        assert_eq!(resp.status(), 308);
+        assert_eq!(resp.headers()["location"], "/ui/");
+        // `/dashboard` is no route in `--ui` mode either; this state holds a
+        // token, so the auth-wrapped fallback answers 401 to a token-less
+        // probe rather than confirming the path's absence.
+        let resp = client
+            .get(format!("{base}/dashboard"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let resp = client
+            .get(format!("{base}/dashboard"))
+            .bearer_auth("s3cret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "route_not_found");
     }
 
     /// Without `--ui` there is no `/ui` path at all.
