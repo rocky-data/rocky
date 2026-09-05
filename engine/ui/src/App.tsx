@@ -3,6 +3,7 @@ import type { MetaOutput } from "@rocky-types/meta";
 import { ApiError, apiGet } from "./api";
 import { EmptyState, StatusCard } from "./components";
 import { EstateScreen } from "./estate/EstateScreen";
+import { GovernorScreen } from "./governor/GovernorScreen";
 import { LANES, navigate, pathForLane, useLane, type Lane } from "./router";
 import { currentToken } from "./token";
 
@@ -118,7 +119,7 @@ export function EnginePanel({
 }
 
 /** What each lane shows. The review and governor screens are U3 and U4. */
-function LaneScreen({ lane, estate }: { lane: Lane; estate: ReactNode }) {
+function LaneScreen({ lane, estate, governor }: { lane: Lane; estate: ReactNode; governor: ReactNode }) {
   switch (lane) {
     case "estate":
       return <>{estate}</>;
@@ -130,16 +131,19 @@ function LaneScreen({ lane, estate }: { lane: Lane; estate: ReactNode }) {
         />
       );
     case "governor":
-      return (
-        <EmptyState
-          title="The governor screen is not built yet"
-          detail="U4: the brief, the scorecard, custody and the audit ledger."
-        />
-      );
+      return <>{governor}</>;
   }
 }
 
-export function App({ engine, estate }: { engine?: ReactNode; estate?: ReactNode }) {
+export function App({
+  engine,
+  estate,
+  governor,
+}: {
+  engine?: ReactNode;
+  estate?: ReactNode;
+  governor?: ReactNode;
+}) {
   const lane = useLane();
   return (
     <ErrorBoundary>
@@ -176,7 +180,11 @@ export function App({ engine, estate }: { engine?: ReactNode; estate?: ReactNode
             </h1>
             {engine ?? <EnginePanel />}
           </section>
-          <LaneScreen lane={lane} estate={estate ?? <EstateScreen />} />
+          <LaneScreen
+            lane={lane}
+            estate={estate ?? <EstateScreen />}
+            governor={governor ?? <GovernorScreen />}
+          />
         </main>
       </div>
     </ErrorBoundary>
