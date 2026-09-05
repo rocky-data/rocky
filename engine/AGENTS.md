@@ -266,6 +266,8 @@ rocky product verify <name>      # Frozen propose_only posture + tag resolution 
 rocky product compile <name>     # Verify, then lower: Phase A contract / Phase B sidecar merge (staged commit)
 rocky product approve <name>     # Human authority transition: immutable snapshot + one state-store txn
 rocky product status <name>      # Read-only: spec, lowering, artifact verification, approval, loop state
+rocky product list               # Read-only: one status row per product (spec dir ∪ state-store records), sorted
+rocky product journal <name>     # Read-only: the fulfillment journal, every persisted transition in append order
 ```
 
 Product specs live at `products/<name>.toml`; `rocky validate` checks them offline (V050–V053). Reference: `../docs/src/content/docs/reference/commands/products.md`.

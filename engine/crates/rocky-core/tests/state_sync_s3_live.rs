@@ -124,13 +124,15 @@ async fn live_round_trip() {
         let store = StateStore::open(&up_path).unwrap();
         store.set_watermark("cat.sch.live", &wm_now()).unwrap();
     }
-    upload_state(&cfg, &up_path).await.expect("live upload");
+    upload_state(&cfg, &up_path, false)
+        .await
+        .expect("live upload");
 
     // "Pod B": download into a fresh dir and read it back.
     let down_dir = tempfile::tempdir().unwrap();
     let down_path = down_dir.path().join(".rocky-state.redb");
     assert_eq!(
-        download_state(&cfg, &down_path)
+        download_state(&cfg, &down_path, false)
             .await
             .expect("live download"),
         rocky_core::state_sync::StateAuthority::Authoritative,
