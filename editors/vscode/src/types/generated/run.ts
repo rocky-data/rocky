@@ -13,7 +13,9 @@ export type CheckResult = CheckResult1 & {
   /**
    * Set when the engine could not run the check, carrying the reason.
    *
-   * A check that never ran must not read as a measurement. Whenever this is set, `passed` is `false` and the numeric fields of the flattened details (`source_count`, `target_count`, `lag_seconds`, `null_rate`, `failing_rows`, `result_value`, `overlap_count`) are placeholders, not readings. A query error, an unreadable result cell, a refused SQL fragment and a misconfigured key all land here, so the check stays in the tally instead of vanishing or passing on a default.
+   * A check that never ran must not read as a measurement. Whenever this is set, the numeric fields of the flattened details (`source_count`, `target_count`, `lag_seconds`, `null_rate`, `failing_rows`, `result_value`, `overlap_count`) are placeholders, not readings. A query error, an unreadable result cell, a refused SQL fragment and a misconfigured key all land here, so the check stays in the tally instead of vanishing or passing on a default.
+   *
+   * `passed` is `false` for all of those — a check Rocky tried and could not complete is a failure. The single exception is a check the configuration does not apply to, which passes: a cross-source overlap group holding a sibling with no key column, a shape the FR accepts (#1654). Read `passed` to decide whether a check failed; it is what the run gate reads. Read this field to learn whether the numbers next to it were measured.
    */
   not_evaluated?: string | null;
   passed: boolean;
@@ -122,7 +124,9 @@ export interface RunOutput {
    */
   budget_breaches?: BudgetBreachOutput[];
   /**
-   * `true` when this run's declared checks failed in a way that must fail the run: at least one **error-severity** check failed (a check the engine could not evaluate counts as a failure — `not_evaluated` always carries `passed: false`) **and** the pipeline's `[pipeline.<name>.checks] fail_on_error` gate is on.
+   * `true` when this run's declared checks failed in a way that must fail the run: at least one **error-severity** check failed **and** the pipeline's `[pipeline.<name>.checks] fail_on_error` gate is on.
+   *
+   * A check the engine could not evaluate counts as a failure: every `not_evaluated` result carries `passed: false`, except a check the configuration does not apply to, which passes and does not gate (a cross-source overlap group holding a sibling with no key column, #1654). This reads `passed`, never `not_evaluated`.
    *
    * Deliberately NOT folded into `tables_failed`, which stays a count of tables and models and never counts checks. This is a gate, not a tally: it is `false` when every failed check is warning-severity, and `false` whenever the pipeline sets `fail_on_error = false`. The raw per-check outcomes are in `check_results` either way — count those if you want the number of failed checks.
    *

@@ -5772,6 +5772,69 @@ pub async fn run(
     run_result.map(|()| RunTermination::Completed)
 }
 
+/// Names the sibling that makes a configured `keys` tuple inapplicable to a
+/// cross-source overlap group, and why — or `None` when the key applies to
+/// every sibling, or when the question cannot be answered.
+///
+/// The overlap query selects the key columns from *every* sibling, so one
+/// sibling without them fails the whole query. A keyless sibling is a shape
+/// the FR accepts, but the query error alone cannot say whether the cause was
+/// a missing column, a syntax error or a denied permission, so both came out
+/// as one failed check (#1654). This decides it positively, before the query
+/// runs, instead of inferring a cause from an error string afterwards.
+///
+/// Deliberately bounded — it classifies only what it can prove:
+///
+/// - **`keys` only.** A `key_expr` is free-text SQL over arbitrary columns
+///   (`md5(a || b)`, a literal, a subquery), and a column list cannot say
+///   whether it applies. A `key_expr` group is never classified here, so its
+///   query failure keeps the failing `not_evaluated` it has today.
+/// - **A `describe_table` that will not answer classifies nothing.** An error
+///   (permission denied, transport) or an empty column list leaves the group
+///   alone: it falls through and runs the query exactly as before. "Rocky
+///   could not read the schema" must never become "the operator's key is
+///   tolerated" — that direction fails open on a key that really is there.
+///
+/// Costs one `DESCRIBE` per sibling of a qualifying (≥2 member) group, and
+/// only when `cross_source_overlap` is configured with `keys`. The schemas the
+/// copy path prefetches live on `TableTask` and are not in scope here.
+async fn overlap_group_missing_key(
+    warehouse: &dyn WarehouseAdapter,
+    siblings: &[TableRef],
+    keys: &[String],
+) -> Option<String> {
+    if keys.is_empty() {
+        return None;
+    }
+    let no_exclusions = std::collections::HashSet::new();
+    for sibling in siblings {
+        let Ok(columns) = warehouse.describe_table(sibling).await else {
+            continue;
+        };
+        if columns.is_empty() {
+            continue;
+        }
+        // Folded with the same lowercase derivation `column_match` compares
+        // with, so a sibling holding `CUSTOMER_ID` against a configured
+        // `customer_id` MATCHES. Reading that as keyless would silently stop
+        // checking a key that is really there.
+        let present = rocky_core::column_map::build_column_name_set(&columns, &no_exclusions);
+        let missing: Vec<&str> = keys
+            .iter()
+            .filter(|k| !present.contains(&k.to_lowercase()))
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            return Some(format!(
+                "{} carries no {} column, so the configured cross_source_overlap key does not apply to this group",
+                sibling.full_name(),
+                missing.join(", ")
+            ));
+        }
+    }
+    None
+}
+
 /// Runs the batched replication checks against the tables copied this run
 /// and appends the results to `pending_checks`.
 ///
@@ -6340,9 +6403,10 @@ async fn run_batched_checks(
     // downstream, doubling rows). Generic — groups by the discovered source
     // type (asset_key[0]) + table name, with no schema-pattern-component
     // assumptions. Self-limiting: only groups of ≥2 siblings are checked, so a
-    // single-target pipeline runs nothing. Surfaced advisorily like the other
-    // replication checks; a missing-key/keyless table is skipped with a logged
-    // reason rather than failing.
+    // single-target pipeline runs nothing. A group holding a sibling with no
+    // key column is reported as a passing check that says so, and does not
+    // gate the run (#1654); a group whose query fails is reported as a failed
+    // one, and does.
     if let Some(ref overlap_cfg) = pipeline.checks.cross_source_overlap {
         // Resolved once, but NOT unwrapped here: a `keys`/`key_expr`
         // misconfiguration used to be logged and skipped, which left the run
@@ -6400,6 +6464,33 @@ async fn run_batched_checks(
                             continue;
                         }
                     };
+                    // Settle the tolerated case BEFORE running a query that
+                    // would fail: a sibling with no key column is a shape the
+                    // FR accepts, and it must not read as a failed check.
+                    if let Some(reason) =
+                        overlap_group_missing_key(warehouse, &siblings, &overlap_cfg.keys).await
+                    {
+                        info!(
+                            source_type,
+                            table, %reason,
+                            "cross_source_overlap does not apply to this group — reporting it as passed and not measured"
+                        );
+                        let entry = pending_checks
+                            .entry(siblings[0].full_name())
+                            .or_insert_with(|| PendingCheck {
+                                asset_key: members[0].1.clone(),
+                                checks: Vec::new(),
+                            });
+                        entry
+                            .checks
+                            .push(rocky_core::checks::cross_source_overlap_not_applicable(
+                                name,
+                                contributing,
+                                reason,
+                                overlap_cfg.severity,
+                            ));
+                        continue;
+                    }
                     let sql = match rocky_core::checks::generate_cross_source_overlap_sql(
                         &siblings, key_exprs, dialect,
                     ) {
@@ -6408,8 +6499,7 @@ async fn run_batched_checks(
                             // A check that will not run must stay in the tally.
                             // Skipping silently let `after_checks` and the JSON
                             // `check_results` claim a clean group that was never
-                            // evaluated. (The QUERY-error arm below still skips
-                            // by design — that is the keyless-table case.)
+                            // evaluated.
                             warn!(source_type, table, error = %e, "cross_source_overlap SQL generation failed — reporting the check as not evaluated");
                             let entry = pending_checks
                                 .entry(siblings[0].full_name())
@@ -6468,18 +6558,21 @@ async fn run_batched_checks(
                             entry.checks.push(check);
                         }
                         Err(e) => {
-                            // A missing key column / keyless table surfaces as a
-                            // query error, and that case is tolerated by design
-                            // (FR acceptance criterion) — but the ERROR TYPE does
-                            // not say which case this is. Syntax, permission and
-                            // transport failures arrive here too, and skipping
-                            // silently dropped the check from `check_results`,
-                            // the `after_checks` tally and the JSON entirely, so
-                            // a group that was never evaluated read as a group
-                            // with nothing to report. Record the same explicit
-                            // not-evaluated state the generation arm above uses:
-                            // still not a hard failure, but never invisible.
-                            warn!(source_type, table, error = %e, "cross_source_overlap query failed (missing key column / keyless table?) — reporting the check as not evaluated");
+                            // A real query failure: syntax, permission,
+                            // transport. The tolerated keyless-sibling case no
+                            // longer reaches here — `overlap_group_missing_key`
+                            // settles it above, positively, from the sibling's
+                            // own columns. What is left is a check Rocky tried
+                            // and could not complete, so it fails and carries
+                            // the reason (#1654).
+                            //
+                            // A `key_expr` group is the exception the
+                            // classifier declines to judge: its query failure
+                            // still lands here, keyless sibling or not, because
+                            // a column list cannot say whether free-text SQL
+                            // applies. Fail-closed is the right default — a
+                            // reported failure is visible and correctable.
+                            warn!(source_type, table, error = %e, "cross_source_overlap query failed — reporting the check as not evaluated");
                             let entry = pending_checks
                                 .entry(siblings[0].full_name())
                                 .or_insert_with(|| PendingCheck {
@@ -30662,6 +30755,419 @@ value = "'{source}'"
             "the refusal issued warehouse statements; the guard is no longer \
              ahead of the setup loop. calls: {:?}",
             treat_log.calls()
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Cross-source overlap: a keyless sibling is tolerated by design, so it
+    // must not read as a failed check and must not gate the run (#1654).
+    // ---------------------------------------------------------------------
+
+    /// A DuckDB adapter whose `describe_table` always fails. Everything else
+    /// runs for real.
+    ///
+    /// The keyless classifier reads the sibling's columns; this is the
+    /// warehouse that will not tell it what they are.
+    #[cfg(feature = "duckdb")]
+    struct DescribeFailingDuckDb<'a> {
+        inner: &'a rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[async_trait::async_trait]
+    impl WarehouseAdapter for DescribeFailingDuckDb<'_> {
+        fn dialect(&self) -> &dyn rocky_core::traits::SqlDialect {
+            self.inner.dialect()
+        }
+
+        async fn execute_statement(&self, sql: &str) -> rocky_core::traits::AdapterResult<()> {
+            self.inner.execute_statement(sql).await
+        }
+
+        async fn execute_query(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::QueryResult> {
+            self.inner.execute_query(sql).await
+        }
+
+        async fn describe_table(
+            &self,
+            _table: &TableRef,
+        ) -> rocky_core::traits::AdapterResult<Vec<ColumnInfo>> {
+            Err(rocky_core::traits::AdapterError::msg(
+                "injected DESCRIBE permission failure",
+            ))
+        }
+    }
+
+    /// The overlap check groups `assertion_targets` by
+    /// `(asset_key[0], table)`, so a qualifying group needs two targets with
+    /// the SAME table name in DIFFERENT schemas. `plus_table` adds a
+    /// differently-named table and cannot make one.
+    #[cfg(feature = "duckdb")]
+    impl BatchedCheckFixture {
+        fn plus_overlap_sibling(mut self, schema: &str, table: &str) -> Self {
+            let sibling = TableRef {
+                catalog: String::new(),
+                schema: schema.into(),
+                table: table.into(),
+            };
+            let asset_key = vec!["test".to_string(), table.to_string()];
+            self.assertion_targets.push((sibling, asset_key));
+            self
+        }
+    }
+
+    /// `tgt2.orders`, the overlap sibling, built with the given column list.
+    #[cfg(feature = "duckdb")]
+    async fn seed_overlap_sibling(
+        inner: &rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+        select: &str,
+    ) {
+        inner.execute_statement("CREATE SCHEMA tgt2").await.unwrap();
+        inner
+            .execute_statement(&format!("CREATE TABLE tgt2.orders AS {select}"))
+            .await
+            .unwrap();
+    }
+
+    /// The overlap check name both siblings' group reports under.
+    #[cfg(feature = "duckdb")]
+    const OVERLAP_CHECK: &str = "cross_source_overlap:test.orders";
+
+    /// Does this bag of check results fail the run under the DEFAULT gate?
+    ///
+    /// Reads the real gate (`replication_check_gate_failed`) and the real
+    /// status derivation, so a test cannot claim an exit code the runner
+    /// would not produce.
+    #[cfg(feature = "duckdb")]
+    fn run_status_for(
+        fx: &BatchedCheckFixture,
+        pending: &HashMap<String, PendingCheck>,
+    ) -> (bool, rocky_core::state::RunStatus) {
+        let mut out = crate::output::RunOutput::new(String::new(), 0, 1);
+        out.tables_copied = 1;
+        for (table, bag) in pending {
+            out.check_results.push(crate::output::TableCheckOutput {
+                asset_key: vec![table.clone()],
+                checks: bag.checks.clone(),
+            });
+        }
+        // The FIXTURE's own checks config, which is what the runner reads at
+        // `output.check_gate_failed = replication_check_gate_failed(&output,
+        // &pipeline.checks)`. Reparsing a different config here would let this
+        // helper answer a question the runner never asks. `fail_on_error`
+        // defaults to `true`, so this is the default gate.
+        assert!(
+            fx.pipeline.checks.fail_on_error,
+            "these tests are about the DEFAULT gate; fail_on_error must be on"
+        );
+        out.check_gate_failed = super::replication_check_gate_failed(&out, &fx.pipeline.checks);
+        out.status = out.derive_run_status();
+        (out.check_gate_failed, out.status)
+    }
+
+    /// (a) The tolerated case. `tgt2.orders` has no `customer_id`, which the
+    /// FR accepts. Before #1654 the query failed, the group was reported
+    /// `not_evaluated` with `passed = false`, and — since #1671 — that failed
+    /// a healthy run with exit 2.
+    ///
+    /// FAILS ON `main`: `result.passed` is false, `gated` is true and the
+    /// status is `PartialFailure`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_keyless_overlap_sibling_is_not_a_failed_check_and_does_not_gate_the_run() {
+        let inner = seeded_duckdb().await;
+        // `tgt.orders` HAS the key; only `tgt2.orders` is keyless. One
+        // sibling without the column is enough to make the group
+        // inapplicable, and the reason must name THAT sibling.
+        inner
+            .execute_statement("ALTER TABLE tgt.orders ADD COLUMN customer_id INTEGER")
+            .await
+            .unwrap();
+        seed_overlap_sibling(&inner, "SELECT 1 AS id").await;
+        let fx = BatchedCheckFixture::new(
+            "row_count = false\n\n[pipeline.bronze.checks.cross_source_overlap]\nkeys = [\"customer_id\"]\n",
+        )
+        .plus_overlap_sibling("tgt2", "orders");
+
+        let (pending, _) = fx.run(&inner, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
+
+        assert!(
+            result.passed,
+            "a keyless sibling is tolerated by design and must not fail: {result:?}"
+        );
+        let reason = result
+            .not_evaluated
+            .as_deref()
+            .expect("the group was never measured, so it must say so");
+        assert!(
+            reason.contains("tgt2.orders") && reason.contains("customer_id"),
+            "the reason must name the KEYLESS sibling (tgt2.orders), not the one \
+             that carries the key: {reason}"
+        );
+        assert!(
+            matches!(
+                result.details,
+                rocky_core::checks::CheckDetails::CrossSourceOverlap {
+                    overlap_count: 0,
+                    ..
+                }
+            ),
+            "overlap_count stays a placeholder, not a measurement: {result:?}"
+        );
+
+        let (gated, status) = run_status_for(&fx, &pending);
+        assert!(!gated, "a tolerated sibling must not trip the check gate");
+        assert!(
+            matches!(status, rocky_core::state::RunStatus::Success),
+            "the run stays Success (exit 0), not PartialFailure: {status:?}"
+        );
+    }
+
+    /// (b) A real query failure is unchanged: `not_evaluated`,
+    /// `passed = false`, and it still gates the run. The discriminator must
+    /// not have widened into a way of hiding broken checks.
+    ///
+    /// Passes on `main` too — it is the control that proves the fix is
+    /// narrow.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_failing_overlap_query_still_fails_and_still_gates_the_run() {
+        let inner = seeded_duckdb().await;
+        // The key IS present on both siblings, so the classifier declines and
+        // the query runs — and then fails.
+        seed_overlap_sibling(&inner, "SELECT 1 AS id, 7 AS customer_id").await;
+        inner
+            .execute_statement("ALTER TABLE tgt.orders ADD COLUMN customer_id INTEGER")
+            .await
+            .unwrap();
+        let fx = BatchedCheckFixture::new(
+            "row_count = false\n\n[pipeline.bronze.checks.cross_source_overlap]\nkeys = [\"customer_id\"]\n",
+        )
+        .plus_overlap_sibling("tgt2", "orders");
+
+        let failing = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT customer_id, COUNT(DISTINCT _src)",
+            reply: Intercept::Fail("injected overlap query failure"),
+        };
+        let (pending, _) = fx.run(&failing, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
+
+        assert!(
+            !result.passed,
+            "a real query failure must still fail: {result:?}"
+        );
+        assert_eq!(
+            result.not_evaluated.as_deref(),
+            Some("injected overlap query failure"),
+            "{result:?}"
+        );
+
+        let (gated, status) = run_status_for(&fx, &pending);
+        assert!(gated, "a failed error-severity check still gates (#1671)");
+        assert!(
+            matches!(status, rocky_core::state::RunStatus::PartialFailure),
+            "{status:?}"
+        );
+    }
+
+    /// (c) The honest-failure case the fix must NOT swallow: both siblings
+    /// carry the key, the query runs, and no key is shared. That is a
+    /// measured pass, not a tolerated skip.
+    ///
+    /// FAILS ON `main` at the `not_evaluated` assertion only if the fix were
+    /// to route a healthy group through the not-applicable arm; on `main` it
+    /// passes, which is the point — this pins behaviour the fix must keep.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn an_overlap_query_that_finds_no_shared_key_is_a_measured_pass() {
+        let inner = seeded_duckdb().await;
+        seed_overlap_sibling(&inner, "SELECT 1 AS id, 99 AS customer_id").await;
+        inner
+            .execute_statement("ALTER TABLE tgt.orders ADD COLUMN customer_id INTEGER")
+            .await
+            .unwrap();
+        inner
+            .execute_statement("UPDATE tgt.orders SET customer_id = 5")
+            .await
+            .unwrap();
+        let fx = BatchedCheckFixture::new(
+            "row_count = false\n\n[pipeline.bronze.checks.cross_source_overlap]\nkeys = [\"customer_id\"]\n",
+        )
+        .plus_overlap_sibling("tgt2", "orders");
+
+        let (pending, _) = fx.run(&inner, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
+
+        assert!(result.passed, "5 and 99 do not overlap: {result:?}");
+        assert!(
+            result.not_evaluated.is_none(),
+            "this group WAS measured — it must not carry a not-evaluated reason: {result:?}"
+        );
+    }
+
+    /// (c, sharper) A key column that is present but entirely NULL is NOT the
+    /// keyless case. The column exists, the query runs, `IS NOT NULL` filters
+    /// every row, and zero rows back is an honest measured pass.
+    ///
+    /// The trap this pins: classifying "no usable key values" as "no key
+    /// column" would stop measuring a group the engine can measure.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn an_all_null_overlap_key_column_is_measured_not_treated_as_keyless() {
+        let inner = seeded_duckdb().await;
+        seed_overlap_sibling(
+            &inner,
+            "SELECT 1 AS id, CAST(NULL AS INTEGER) AS customer_id",
+        )
+        .await;
+        inner
+            .execute_statement("ALTER TABLE tgt.orders ADD COLUMN customer_id INTEGER")
+            .await
+            .unwrap();
+        let fx = BatchedCheckFixture::new(
+            "row_count = false\n\n[pipeline.bronze.checks.cross_source_overlap]\nkeys = [\"customer_id\"]\n",
+        )
+        .plus_overlap_sibling("tgt2", "orders");
+
+        let (pending, _) = fx.run(&inner, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
+
+        assert!(result.passed, "no non-NULL key is shared: {result:?}");
+        assert!(
+            result.not_evaluated.is_none(),
+            "an all-NULL key column is a MEASUREMENT, not a keyless sibling: {result:?}"
+        );
+    }
+
+    /// (d) A real overlap still fails. The fix must not turn a genuine
+    /// duplicate-key finding into a tolerated skip.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_real_overlap_still_fails_the_check() {
+        let inner = seeded_duckdb().await;
+        seed_overlap_sibling(&inner, "SELECT 1 AS id, 5 AS customer_id").await;
+        inner
+            .execute_statement("ALTER TABLE tgt.orders ADD COLUMN customer_id INTEGER")
+            .await
+            .unwrap();
+        inner
+            .execute_statement("UPDATE tgt.orders SET customer_id = 5")
+            .await
+            .unwrap();
+        let fx = BatchedCheckFixture::new(
+            "row_count = false\n\n[pipeline.bronze.checks.cross_source_overlap]\nkeys = [\"customer_id\"]\n",
+        )
+        .plus_overlap_sibling("tgt2", "orders");
+
+        let (pending, _) = fx.run(&inner, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
+
+        assert!(
+            !result.passed,
+            "customer_id 5 is in both siblings: {result:?}"
+        );
+        assert!(
+            result.not_evaluated.is_none(),
+            "a measured violation is not a not-evaluated check: {result:?}"
+        );
+        let (gated, _) = run_status_for(&fx, &pending);
+        assert!(gated, "a real overlap gates the run");
+    }
+
+    /// The case-fold the classifier must get right. `tgt2.orders` carries
+    /// `CUSTOMER_ID`; the config says `customer_id`. Comparing case-sensitively
+    /// would read the sibling as keyless and silently STOP CHECKING a key that
+    /// is really there — a fail-open strictly worse than #1654.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn an_overlap_key_column_differing_only_in_case_is_still_the_key() {
+        let inner = seeded_duckdb().await;
+        seed_overlap_sibling(&inner, "SELECT 1 AS id, 5 AS \"CUSTOMER_ID\"").await;
+        inner
+            .execute_statement("ALTER TABLE tgt.orders ADD COLUMN customer_id INTEGER")
+            .await
+            .unwrap();
+        inner
+            .execute_statement("UPDATE tgt.orders SET customer_id = 5")
+            .await
+            .unwrap();
+        let fx = BatchedCheckFixture::new(
+            "row_count = false\n\n[pipeline.bronze.checks.cross_source_overlap]\nkeys = [\"customer_id\"]\n",
+        )
+        .plus_overlap_sibling("tgt2", "orders");
+
+        let (pending, _) = fx.run(&inner, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
+
+        assert!(
+            result.not_evaluated.is_none(),
+            "CUSTOMER_ID matches the configured customer_id — the group must be \
+             MEASURED, not written off as keyless: {result:?}"
+        );
+        assert!(
+            !result.passed,
+            "the shared key 5 must still be found: {result:?}"
+        );
+    }
+
+    /// The classifier declines what it cannot prove: a `key_expr` is free-text
+    /// SQL, and a column list cannot say whether it applies. Its query failure
+    /// keeps the failing `not_evaluated` — fail-closed, unchanged by #1654.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_key_expr_overlap_group_is_never_classified_as_keyless() {
+        let inner = seeded_duckdb().await;
+        // The sibling has NO `customer_id`; with `keys` this would be the
+        // tolerated case. With `key_expr` it is not classified at all.
+        seed_overlap_sibling(&inner, "SELECT 1 AS id").await;
+        let fx = BatchedCheckFixture::new(
+            "row_count = false\n\n[pipeline.bronze.checks.cross_source_overlap]\nkey_expr = \"md5(customer_id)\"\n",
+        )
+        .plus_overlap_sibling("tgt2", "orders");
+
+        let (pending, _) = fx.run(&inner, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
+
+        assert!(
+            !result.passed,
+            "a key_expr group keeps the failing not_evaluated: {result:?}"
+        );
+        assert!(
+            result.not_evaluated.is_some(),
+            "the reason must still be carried: {result:?}"
+        );
+    }
+
+    /// A `describe_table` that will not answer classifies NOTHING. A
+    /// permission-denied DESCRIBE must never become "the sibling is keyless
+    /// and therefore tolerated" — that direction fails open. The group falls
+    /// through and runs the query exactly as it did before.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn an_unreadable_overlap_sibling_schema_is_not_treated_as_keyless() {
+        let inner = seeded_duckdb().await;
+        seed_overlap_sibling(&inner, "SELECT 1 AS id").await;
+        let fx = BatchedCheckFixture::new(
+            "row_count = false\n\n[pipeline.bronze.checks.cross_source_overlap]\nkeys = [\"customer_id\"]\n",
+        )
+        .plus_overlap_sibling("tgt2", "orders");
+
+        let blind = DescribeFailingDuckDb { inner: &inner };
+        let (pending, _) = fx.run(&blind, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
+
+        assert!(
+            !result.passed,
+            "an unreadable schema must not be reported as a tolerated sibling: {result:?}"
+        );
+        assert!(
+            result.not_evaluated.is_some(),
+            "the group ran the query and it failed, so it carries that reason: {result:?}"
         );
     }
 }
