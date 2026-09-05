@@ -1982,4 +1982,62 @@ mod tests {
             "default posture"
         );
     }
+
+    // ------------------------------------------------------------------
+    // #1680: caller-coupled fail-before for #1667's conversion at this site.
+    // `compile_project` here also backs `rocky backfill` and the review queue.
+    // ------------------------------------------------------------------
+
+    /// Parses as TOML, fails a validator: `fivetran` is discovery-only and
+    /// needs `kind = "discovery"`. Present-and-broken, never absent.
+    const BROKEN_CONFIG_1680: &str =
+        "[adapter.ft]\ntype = \"fivetran\"\napi_key = \"k\"\napi_secret = \"s\"\n";
+
+    /// A present-but-unloadable `rocky.toml` refuses the blast-radius compile,
+    /// naming the file.
+    #[test]
+    fn audit_compile_project_refuses_a_present_but_unloadable_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("m.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("m.toml"),
+            "name = \"m\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+        let cfg = tmp.path().join("rocky.toml");
+        std::fs::write(&cfg, BROKEN_CONFIG_1680).unwrap();
+
+        // `let ... else` rather than `expect_err`: `CompileResult` is not `Debug`.
+        let Err(err) = compile_project(&cfg, &tmp.path().join("state.redb"), &models_dir) else {
+            panic!("a present but unloadable rocky.toml must refuse the audit compile");
+        };
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failed to load config from") && rendered.contains("rocky.toml"),
+            "the refusal must name the config file, got: {rendered}"
+        );
+    }
+
+    /// Honest-failure guard: no `rocky.toml` still compiles.
+    #[test]
+    fn audit_compile_project_still_runs_without_any_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("m.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("m.toml"),
+            "name = \"m\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+        let cfg = tmp.path().join("rocky.toml");
+        assert!(!cfg.exists());
+
+        compile_project(&cfg, &tmp.path().join("state.redb"), &models_dir)
+            .expect("a missing rocky.toml must not refuse the audit compile");
+    }
 }

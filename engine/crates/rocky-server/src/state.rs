@@ -76,6 +76,16 @@ pub struct ServerState {
     /// emits once per server start, not once per recompile. Keyed on
     /// `models_dir`, which stays constant.
     schema_cache_throttle: SchemaCacheThrottle,
+    /// The one permit every request-local read of the state store takes.
+    ///
+    /// redb holds an exclusive `flock` on the store file for the life of a
+    /// handle, and a concurrent open polls that lock a few times before it
+    /// gives up with a busy error. Two of this process's own reads racing for
+    /// the file therefore turned into `503 engine_busy` at two concurrent
+    /// clients, before any other process was involved. Reads that go through
+    /// this permit queue instead of racing; the busy error is left to mean
+    /// what it says, another process holding the store.
+    pub store_reads: Arc<tokio::sync::Semaphore>,
 }
 
 impl ServerState {
@@ -159,6 +169,7 @@ impl ServerState {
             auth,
             allowed_origins,
             schema_cache_throttle: SchemaCacheThrottle::new(),
+            store_reads: Arc::new(tokio::sync::Semaphore::new(1)),
         });
 
         // Initial compile

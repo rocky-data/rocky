@@ -20,12 +20,29 @@
 //! The marker is written even when breaking changes exist: approving over a
 //! reported break is allowed.
 //!
-//! The marker is ALSO written when the classifier could not run. Compiling
-//! either tree can fail, and `compute_review_findings` then returns `None`;
+//! The marker is ALSO written when the classifier could not run for a
+//! RECOVERABLE reason: a missing models directory, or either tree failing to
+//! compile. `compute_review_findings` returns `Ok(None)` there,
 //! `breaking_change_count` falls back to 0 and `--approve` still writes the
 //! marker. So the count on a marker is not evidence that a delta was computed,
 //! and the emitted output does not always carry one. The approver identity
 //! falls back to `unknown` when the git identity cannot be read.
+//!
+//! One case is NOT recoverable and refuses instead (#1680): a `rocky.toml`
+//! that is PRESENT and does not load. The schema cache the classifier types
+//! against is gated on that config, so an unloadable one turns a real type
+//! change into `Unknown`-vs-`Unknown` and reports zero breaking changes.
+//! Approving on that is weaker informed approval than the loaded path, so
+//! `compute_review_findings` returns `Err` and `compute_review` propagates it
+//! before the `--approve` branch — **no marker is written**. A project with no
+//! `rocky.toml` at all is unchanged; so is an unset `${VAR}` in an adapter's
+//! connection fields, which this path now tolerates (#1536) where the strict
+//! loader it used before silently cooled the cache.
+//!
+//! The marker-only kinds (gc / restore / compact / archive) short-circuit in
+//! `compute_review_marker_only` before any config read, so they still approve
+//! on an unloadable config. There is no breaking-change gate on them to
+//! degrade — reviewing is purely the human sign-off.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -232,7 +249,10 @@ pub async fn compute_review(
     // breaking-change gate there.
     let (models_dir, state_path) = review_gate_paths(root, run_plan.models_dir.as_deref());
 
-    let findings = compute_review_findings(config_path, &models_dir, &state_path, base_ref);
+    // `?` here is the whole point of the change: a present-but-unloadable
+    // `rocky.toml` propagates BEFORE the `--approve` branch below, so no marker
+    // is written and no zero count is recorded.
+    let findings = compute_review_findings(config_path, &models_dir, &state_path, base_ref)?;
     let breaking_count = findings
         .as_ref()
         .map(|f| f.iter().filter(|x| x.is_breaking()).count())
@@ -451,18 +471,38 @@ fn review_gate_paths(root: &Path, plan_models_dir: Option<&str>) -> (PathBuf, Pa
 /// and the branch-promote gate use.
 ///
 /// Returns:
-/// - `Some(findings)` when both refs compiled cleanly and the typed-IR diff
+/// - `Ok(Some(findings))` when both refs compiled cleanly and the typed-IR diff
 ///   ran. `findings` is the full classified list including `Info`-severity
 ///   entries; callers filter on [`BreakingFinding::is_breaking`].
-/// - `None` when the gate was skipped because the models directory was
-///   unavailable or either side failed to compile.
+/// - `Ok(None)` when the gate was skipped because the models directory was
+///   unavailable or either side failed to compile. Those are recoverable
+///   conditions the approver can see; the marker is still written.
+/// - `Err` when a `rocky.toml` is PRESENT and does not load (#1680). That is
+///   not a skip: the schema cache the classifier types against is gated on the
+///   config, so an unloadable config silently downgrades a type change to "no
+///   breaking changes" — and `--approve` used to record that as a signed-off
+///   zero. Refusing here is what keeps the marker's count honest, because the
+///   caller propagates before any marker is written.
 fn compute_review_findings(
     config_path: &Path,
     models_dir: &Path,
     state_path: &Path,
     base_ref: &str,
-) -> Option<Vec<BreakingFinding>> {
+) -> Result<Option<Vec<BreakingFinding>>> {
     use rocky_compiler::compile::{self, CompilerConfig};
+
+    // The config is read BEFORE the models-dir check so a broken `rocky.toml`
+    // refuses whether or not the project also has a models directory — the
+    // refusal must not depend on which degradation is hit first.
+    //
+    // Credential-TOLERANT (`load_optional_project_config`): `rocky review`
+    // compiles and diffs, it opens no warehouse connection, so an unset
+    // `${DATABRICKS_HOST}` must not block a review (#1536). Under the strict
+    // loader this site used before, that unset variable failed the load and
+    // silently cooled the cache — the review then classified against `Unknown`
+    // leaf types.
+    let loaded_cfg = rocky_core::config::load_optional_project_config(Some(config_path))
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
 
     if !models_dir.is_dir() {
         tracing::warn!(
@@ -470,19 +510,19 @@ fn compute_review_findings(
             models_dir = %models_dir.display(),
             "models directory missing — breaking-change gate skipped"
         );
-        return None;
+        return Ok(None);
     }
 
     // Seed both compiles with the cached source schemas so the resulting IR
-    // uses real types rather than `Unknown`. Mirrors the branch-promote
-    // gate: degrade to an empty map on config / cache failure rather than
-    // blocking the review on a configuration issue.
-    let source_schemas = match rocky_core::config::load_rocky_config(config_path) {
-        Ok(cfg) => {
+    // uses real types rather than `Unknown`. A project with NO `rocky.toml`
+    // still degrades to an empty map, and so does a cold or unreadable cache:
+    // those cost only type precision and are not the approver's to fix.
+    let source_schemas = match loaded_cfg {
+        Some(cfg) => {
             let schema_cfg = cfg.cache.schemas.with_ttl_override(None);
             crate::source_schemas::load_cached_source_schemas(&schema_cfg, state_path)
         }
-        Err(_) => std::collections::HashMap::new(),
+        None => std::collections::HashMap::new(),
     };
 
     let head_compile = {
@@ -500,7 +540,7 @@ fn compute_review_findings(
                     error = %e,
                     "HEAD compile failed — breaking-change gate skipped"
                 );
-                return None;
+                return Ok(None);
             }
         }
     };
@@ -514,13 +554,13 @@ fn compute_review_findings(
                     reason = %reason,
                     "base compile failed — breaking-change gate skipped"
                 );
-                return None;
+                return Ok(None);
             }
         };
 
     let base_ir = super::ci_diff::project_ir_from_compile(&base_compile);
     let head_ir = super::ci_diff::project_ir_from_compile(&head_compile);
-    Some(breaking_change::diff_project_ir(&base_ir, &head_ir))
+    Ok(Some(breaking_change::diff_project_ir(&base_ir, &head_ir)))
 }
 
 /// Write the review marker to `<root>/.rocky/plans/<plan_id>.reviewed.json`.
@@ -1508,6 +1548,178 @@ mod tests {
         assert!(out.is_empty(), "a reviewed plan never re-lists: {out:?}");
         assert_eq!(excluded, 0);
     }
+
+    // ------------------------------------------------------------------
+    // #1680 — the priority case.
+    //
+    // `rocky review <plan> --approve` on a PRESENT-but-unloadable
+    // `rocky.toml` used to fold every config error into an empty schema map,
+    // classify a real type change as `Unknown`-vs-`Unknown`, find nothing,
+    // and then write a marker recording `breaking_change_count = 0`. That is
+    // a signed-off zero for a gate that never ran.
+    // ------------------------------------------------------------------
+
+    /// Parses as TOML, fails a validator: `fivetran` is discovery-only and
+    /// needs `kind = "discovery"`. Present-and-broken, never absent.
+    const BROKEN_CONFIG_1680: &str =
+        "[adapter.ft]\ntype = \"fivetran\"\napi_key = \"k\"\napi_secret = \"s\"\n";
+
+    /// Loads under the credential-TOLERANT loader (#1536), refuses under the
+    /// strict one this site used before.
+    const UNSET_CREDENTIAL_CONFIG_1680: &str = "[adapters.wh]\ntype = \"databricks\"\n\
+         host = \"${ROCKY_T_1680_REVIEW_UNSET}\"\n";
+
+    /// Build a reviewable AI-authored plan in `root`, with a real models tree
+    /// so the refusal cannot be confused with the missing-models-dir skip.
+    fn seed_reviewable_plan(root: &Path) -> anyhow::Result<String> {
+        let models_dir = root.join("models");
+        std::fs::create_dir_all(&models_dir)?;
+        std::fs::write(models_dir.join("m.sql"), "SELECT id FROM src.raw.t")?;
+        let payload = serde_json::json!({ "parallel": 1, "models_dir": "models" });
+        crate::plan_store::write_plan(root, PlanKind::AiAuthored, &payload)
+    }
+
+    /// FAIL-BEFORE: with a broken config, `--approve` must refuse and write NO
+    /// marker. On unmodified production code this returns `Ok`, reports
+    /// "no breaking changes", and leaves a marker on disk.
+    #[tokio::test]
+    async fn review_approve_refuses_an_unloadable_config_and_writes_no_marker() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let plan_id = seed_reviewable_plan(root)?;
+        let config_path = root.join("rocky.toml");
+        std::fs::write(&config_path, BROKEN_CONFIG_1680)?;
+
+        let marker_path = review_marker_path(root, &plan_id);
+        assert!(!marker_path.exists(), "no marker before the approve");
+
+        let err = compute_review(root, &config_path, &plan_id, "HEAD", true)
+            .await
+            .expect_err("--approve on an unloadable rocky.toml must refuse");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failed to load config from") && rendered.contains("rocky.toml"),
+            "the refusal must name the config file, got: {rendered}"
+        );
+
+        // The load-bearing half: nothing was recorded.
+        assert!(
+            !marker_path.exists(),
+            "a refused review must leave NO approval marker on disk"
+        );
+        assert!(
+            !ai_plan_is_reviewed(root, &plan_id),
+            "a refused review must not unblock `rocky apply`"
+        );
+        Ok(())
+    }
+
+    /// The dry run refuses too — the report it would print carries the same
+    /// bogus zero, so `--approve` is not the only surface that must not lie.
+    #[tokio::test]
+    async fn review_dry_run_refuses_an_unloadable_config() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let plan_id = seed_reviewable_plan(root)?;
+        let config_path = root.join("rocky.toml");
+        std::fs::write(&config_path, BROKEN_CONFIG_1680)?;
+
+        assert!(
+            compute_review(root, &config_path, &plan_id, "HEAD", false)
+                .await
+                .is_err(),
+            "the dry run must refuse an unloadable config too"
+        );
+        Ok(())
+    }
+
+    /// HONEST FAILURE (a): a project with NO `rocky.toml` reviews exactly as
+    /// before — the gate is skipped for want of a git base, and `--approve`
+    /// still writes the marker.
+    #[tokio::test]
+    async fn review_approve_still_works_without_any_config() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let plan_id = seed_reviewable_plan(root)?;
+        let config_path = root.join("rocky.toml");
+        assert!(!config_path.exists());
+
+        // Discriminate: the gate itself must SKIP on an absent config and
+        // REFUSE on a broken one. Without this the assertion below would pass
+        // for the wrong reason — the marker is written here anyway, because
+        // the base compile has no git repo to read.
+        let (models_dir, state_path) = review_gate_paths(root, Some("models"));
+        assert!(
+            compute_review_findings(&config_path, &models_dir, &state_path, "HEAD").is_ok(),
+            "an absent rocky.toml must skip the gate, never refuse it"
+        );
+        let broken = root.join("broken.toml");
+        std::fs::write(&broken, BROKEN_CONFIG_1680)?;
+        assert!(
+            compute_review_findings(&broken, &models_dir, &state_path, "HEAD").is_err(),
+            "a present-but-broken rocky.toml must refuse the gate"
+        );
+
+        let out = compute_review(root, &config_path, &plan_id, "HEAD", true)
+            .await
+            .expect("a missing rocky.toml must not refuse a review");
+        assert!(out.marker_written, "the marker must still be written");
+        assert!(review_marker_path(root, &plan_id).exists());
+        Ok(())
+    }
+
+    /// HONEST FAILURE (b): a VALID config whose adapter connection field holds
+    /// an unset `${VAR}` must not refuse. This site used the STRICT loader, so
+    /// that config used to fail the load and silently cool the schema cache —
+    /// the classifier then typed every source leaf as `Unknown`. The tolerant
+    /// loader accepts it, and the review proceeds.
+    #[tokio::test]
+    async fn review_approve_tolerates_an_unset_credential_var() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let plan_id = seed_reviewable_plan(root)?;
+        let config_path = root.join("rocky.toml");
+        std::fs::write(&config_path, UNSET_CREDENTIAL_CONFIG_1680)?;
+
+        // Pin that the loader swap is what decides this, in both directions.
+        assert!(
+            rocky_core::config::load_rocky_config(&config_path).is_err(),
+            "fixture must fail the STRICT loader, or this proves nothing"
+        );
+        assert!(
+            rocky_core::config::load_optional_project_config(Some(&config_path))
+                .expect("the tolerant loader must accept an unset adapter credential")
+                .is_some()
+        );
+
+        let out = compute_review(root, &config_path, &plan_id, "HEAD", true)
+            .await
+            .expect("an unset credential var must not refuse a review");
+        assert!(out.marker_written, "the marker must still be written");
+        Ok(())
+    }
+
+    /// The marker-only kinds short-circuit before any config read, so they
+    /// still approve on a broken config. Deliberate: they change no model
+    /// definitions, so there is no breaking-change gate to degrade. Pinned so
+    /// the carve-out is a decision on the record, not an oversight.
+    #[tokio::test]
+    async fn marker_only_kinds_still_approve_on_an_unloadable_config() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let plan_id =
+            crate::plan_store::write_plan(root, PlanKind::Gc, &serde_json::json!({ "a": 1 }))?;
+        let config_path = root.join("rocky.toml");
+        std::fs::write(&config_path, BROKEN_CONFIG_1680)?;
+
+        let out = compute_review(root, &config_path, &plan_id, "HEAD", true)
+            .await
+            .expect("a gc plan carries no breaking-change gate to degrade");
+        assert!(out.marker_written);
+        Ok(())
+    }
+
     // ------------------------------------------------------------------
     // `rocky review --queue` — the config leg (#1702)
     //

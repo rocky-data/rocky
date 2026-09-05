@@ -3264,19 +3264,54 @@ impl RockyMcpServer {
         }))
     }
 
+    /// The `[ai] max_tokens` ceiling for this project.
+    ///
+    /// Absent `rocky.toml` -> [`DEFAULT_MAX_TOKENS`](rocky_ai::client::DEFAULT_MAX_TOKENS);
+    /// present but unloadable -> `Err`, naming the file (#1680). It used to be
+    /// `load_rocky_config(..).unwrap_or(DEFAULT)`, which discarded a configured
+    /// ceiling whenever any `${VAR}` in the config was unset.
+    ///
+    /// Split out of [`Self::make_ai_client`] so the refusal is unit-testable:
+    /// `make_ai_client` returns `Ok(None)` before this read when
+    /// `ANTHROPIC_API_KEY` is unset, and setting a process-wide environment
+    /// variable inside a test is `unsafe` on edition 2024.
+    fn ai_max_tokens(&self) -> anyhow::Result<u32> {
+        use anyhow::Context;
+        Ok(
+            rocky_core::config::load_optional_project_config(Some(&self.config_path))
+                .with_context(|| {
+                    format!("failed to load config from {}", self.config_path.display())
+                })?
+                .map(|cfg| cfg.ai.max_tokens)
+                .unwrap_or(rocky_ai::client::DEFAULT_MAX_TOKENS),
+        )
+    }
+
     /// Build an [`LlmClient`](rocky_ai::client::LlmClient) for the generator
     /// tools, BYOK via `ANTHROPIC_API_KEY`. Returns `Ok(None)` when the key is
     /// unset so each tool degrades to a null draft + explanatory message (the
-    /// same graceful no-op as `suggest_freshness_block`). `[ai] max_tokens`
-    /// from `rocky.toml` is honoured when the config loads.
+    /// same graceful no-op as `suggest_freshness_block`).
+    ///
+    /// `[ai] max_tokens` from `rocky.toml` is honoured when the config loads. A
+    /// project with NO `rocky.toml` uses the default; one that is PRESENT and
+    /// does not load REFUSES (#1680) instead of quietly using the default.
+    ///
+    /// This is the FIRST config read on all three callers (`ai_contract`,
+    /// `ai_test`, `explain_model` each call it before their compile), so the
+    /// refusal is what those tools surface — not a later, vaguer failure.
+    ///
+    /// Credential-TOLERANT: the MCP generator tools call the Anthropic API, not
+    /// the warehouse, so an unset `${VAR}` in an adapter's connection field
+    /// must not block them (#1536).
     fn make_ai_client(&self) -> anyhow::Result<Option<rocky_ai::client::LlmClient>> {
+        // The key check stays FIRST. A server with no key never builds a client
+        // at all, so the token ceiling is moot there and refusing on the config
+        // would be a new failure on a healthy keyless server.
         let api_key = match std::env::var(rocky_ai::client::AI_API_KEY_ENV) {
             Ok(v) if !v.is_empty() => v,
             _ => return Ok(None),
         };
-        let max_tokens = rocky_core::config::load_rocky_config(&self.config_path)
-            .map(|cfg| cfg.ai.max_tokens)
-            .unwrap_or(rocky_ai::client::DEFAULT_MAX_TOKENS);
+        let max_tokens = self.ai_max_tokens()?;
         let ai_config = rocky_ai::client::AiConfig {
             provider: "anthropic".to_string(),
             model: "claude-sonnet-4-6".to_string(),
@@ -5491,8 +5526,11 @@ impl RockyMcpServer {
 
         // Write the sign-off marker (the artifact `rocky apply` checks),
         // attributed to the operator running this server. Reuses the exact
-        // `rocky review --approve` core; the breaking-change gate is best-effort
-        // and the marker writes regardless.
+        // `rocky review --approve` core. The breaking-change gate is
+        // best-effort — a missing models dir or a failed compile skips it and
+        // the marker still writes — EXCEPT on a present-but-unloadable
+        // `rocky.toml`, which `compute_review` refuses before writing anything
+        // (#1680). That refusal surfaces here as the `ToolError` below.
         let review = commands::compute_review(&self.root, &self.config_path, plan_id, "HEAD", true)
             .await
             .map_err(|e| {
@@ -10341,6 +10379,61 @@ database = ":memory:"
         assert!(
             !worker_tools.iter().any(|t| t == "review_queue"),
             "the worker profile still serves no `review_queue` at all"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // #1680 — the `[ai]` secondary read behind the generator tools
+    // (`ai_contract`, `ai_test`, `explain_model`). Each calls
+    // `make_ai_client` BEFORE its compile, so this is the first config read
+    // those tools make.
+    // ------------------------------------------------------------------
+
+    /// A present-but-unloadable `rocky.toml` refuses, naming the file, instead
+    /// of silently falling back to `DEFAULT_MAX_TOKENS`.
+    #[test]
+    fn ai_max_tokens_refuses_a_present_but_unloadable_config() {
+        let (_tmp, server) = write_mcp_project(Some(INVALID_MCP_TOML));
+        let err = server
+            .ai_max_tokens()
+            .expect_err("a present but unloadable rocky.toml must refuse");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failed to load config from") && rendered.contains("rocky.toml"),
+            "the refusal must name the config file, got: {rendered}"
+        );
+    }
+
+    /// Honest failure: no `rocky.toml` at all still yields the default
+    /// ceiling, and a valid config whose adapter credentials do not resolve
+    /// still yields its CONFIGURED ceiling — the strict loader this site used
+    /// before discarded that value.
+    #[test]
+    fn ai_max_tokens_tolerates_an_absent_config_and_an_unset_credential_var() {
+        let (_tmp, server) = write_mcp_project(None);
+        assert_eq!(
+            server
+                .ai_max_tokens()
+                .expect("absent config is not a refusal"),
+            rocky_ai::client::DEFAULT_MAX_TOKENS
+        );
+
+        let with_creds = format!(
+            "[adapters.wh]\ntype = \"databricks\"\nhost = \"${{ROCKY_T_1680_MCP_UNSET}}\"\n\n\
+             [ai]\nmax_tokens = {}\n",
+            rocky_ai::client::DEFAULT_MAX_TOKENS + 7
+        );
+        let (_tmp2, server2) = write_mcp_project(Some(&with_creds));
+        assert!(
+            rocky_core::config::load_rocky_config(&server2.config_path).is_err(),
+            "fixture must fail the STRICT loader, or this proves nothing"
+        );
+        assert_eq!(
+            server2
+                .ai_max_tokens()
+                .expect("an unset credential var is not a refusal"),
+            rocky_ai::client::DEFAULT_MAX_TOKENS + 7,
+            "the CONFIGURED ceiling must survive an unset adapter credential"
         );
     }
 
