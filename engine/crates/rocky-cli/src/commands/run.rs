@@ -12603,8 +12603,15 @@ async fn process_completed_result(
         }
         Ok((_, Ok(TableOutcome::Materialized(tr)))) => {
             let tr = *tr;
+            // Same rule as the inline collector in `run()`: the copy succeeded,
+            // but a post-copy `column_match` probe that came back rate-limited
+            // is still the warehouse asking us to slow down (#1666).
             if let Some(t) = &throttle {
-                t.on_success();
+                if tr.probe_rate_limited {
+                    t.on_rate_limit();
+                } else {
+                    t.on_success();
+                }
                 adjust_semaphore(t, semaphore, semaphore_capacity);
             }
             output.tables_copied += 1;
@@ -12771,6 +12778,14 @@ async fn process_completed_result(
 /// errors (which should reduce concurrency) from other transient or
 /// permanent errors. Matches Databricks-specific signals: HTTP 429 and
 /// the Unity Catalog `UC_REQUEST_LIMIT_EXCEEDED` error code.
+fn is_rate_limit_error(error_msg: &str) -> bool {
+    let upper = error_msg.to_uppercase();
+    upper.contains("429")
+        || upper.contains("UC_REQUEST_LIMIT_EXCEEDED")
+        || upper.contains("RATE LIMIT")
+        || upper.contains("TOO MANY REQUESTS")
+}
+
 /// Build the `column_match` result from the post-copy probes of both sides.
 ///
 /// Returns the check plus whether a probe failure looked like a warehouse rate
@@ -12841,14 +12856,6 @@ fn post_copy_column_match(
             source_rate_limited || target_rate_limited,
         ),
     }
-}
-
-fn is_rate_limit_error(error_msg: &str) -> bool {
-    let upper = error_msg.to_uppercase();
-    upper.contains("429")
-        || upper.contains("UC_REQUEST_LIMIT_EXCEEDED")
-        || upper.contains("RATE LIMIT")
-        || upper.contains("TOO MANY REQUESTS")
 }
 
 #[cfg(test)]
@@ -19401,6 +19408,7 @@ timestamp_column = "ts"
         );
         let check = result
             .column_match_check
+            .as_ref()
             .expect("the task enables column_match");
         assert!(!check.passed, "an unevaluated check never passes");
         assert!(
@@ -19410,6 +19418,66 @@ timestamp_column = "ts"
                 .is_some_and(|r| r.contains("429")),
             "the reason must carry the warehouse's own error: {:?}",
             check.not_evaluated
+        );
+
+        // The flag has to reach the throttle, not just ride on the result.
+        // `process_completed_result` is the collector `run()` drains through
+        // while adaptive concurrency is on; it must slow down, and it must
+        // still count the table as copied.
+        let throttle = Some(AdaptiveThrottle::new(8, 1, 1));
+        let semaphore = Semaphore::new(8);
+        let mut semaphore_capacity = 8;
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        let mut pending_checks = HashMap::new();
+        let (mut source_refs, mut target_refs, mut freshness_refs) =
+            (Vec::new(), Vec::new(), Vec::new());
+        let mut batch_asset_keys = Vec::new();
+        let mut table_errors = Vec::new();
+        let (mut deferred_tags, mut deferred_watermarks) = (Vec::new(), Vec::new());
+        let mut total_completed = 0;
+        let tasks = vec![task.clone()];
+        state
+            .init_run_progress("run-1", tasks.len(), Some(&test_resume_scope("p1")))
+            .unwrap();
+        process_completed_result(
+            Ok((0, Ok(TableOutcome::Materialized(result)))),
+            &tasks,
+            &throttle,
+            &semaphore,
+            &mut semaphore_capacity,
+            &mut output,
+            &mut pending_checks,
+            &mut source_refs,
+            &mut target_refs,
+            &mut freshness_refs,
+            &mut batch_asset_keys,
+            &mut table_errors,
+            &mut deferred_tags,
+            &mut deferred_watermarks,
+            &state,
+            "run-1",
+            &mut total_completed,
+        )
+        .await;
+
+        assert_eq!(
+            throttle.as_ref().map(AdaptiveThrottle::rate_limits_total),
+            Some(1),
+            "the collector must report the throttled probe as a rate limit"
+        );
+        let current = throttle.as_ref().map(AdaptiveThrottle::current);
+        assert!(
+            current.is_some_and(|c| c < 8),
+            "the throttle must back off, not widen: {current:?}"
+        );
+        assert_eq!(
+            output.tables_copied, 1,
+            "the copy still succeeded — backing off must not un-count the table"
+        );
+        assert_eq!(
+            table_errors.len(),
+            0,
+            "a throttled metadata read is not a table failure"
         );
     }
 
