@@ -68,7 +68,8 @@ async fn download_publish_waits_for_writer_release() {
     // held-writer scope: the download must OUTLIVE the lock to prove it waits.
     #[allow(clippy::async_yields_async)]
     let download = with_held_writer(&harness.pod_b.state_path, async move {
-        let download = tokio::spawn(async move { state_sync::download_state(&cfg, &path).await });
+        let download =
+            tokio::spawn(async move { state_sync::download_state(&cfg, &path, false).await });
         // Handshake: wait for the download's remote GET to land on the shared
         // store, then keep the lock a beat longer so at least one publish-lock
         // attempt fails while we hold it.
@@ -122,7 +123,7 @@ async fn download_fails_closed_when_writer_never_releases() {
     let cfg = harness.pod_b.cfg.clone();
     let path = harness.pod_b.state_path.clone();
     let result = with_held_writer(&harness.pod_b.state_path, async move {
-        state_sync::download_state(&cfg, &path).await
+        state_sync::download_state(&cfg, &path, false).await
     })
     .await;
     assert!(

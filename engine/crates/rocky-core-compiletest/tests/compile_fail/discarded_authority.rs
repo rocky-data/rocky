@@ -12,7 +12,7 @@ use rocky_core::state_sync::StateSyncError;
 
 #[allow(dead_code)]
 async fn seam(cfg: &StateConfig, state_path: &Path) -> Result<(), StateSyncError> {
-    rocky_core::state_sync::download_state(cfg, state_path).await?;
+    rocky_core::state_sync::download_state(cfg, state_path, false).await?;
     Ok(())
 }
 

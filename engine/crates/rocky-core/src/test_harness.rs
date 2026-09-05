@@ -100,14 +100,40 @@ impl CrossPodHarness {
     /// Run the real [`state_sync::download_state`] for `pod` (staging file,
     /// writer-lock publish serialization, local-only merge — the whole path),
     /// propagating the typed [`StateAuthority`] the download resolved.
+    ///
+    /// Uses the DEFAULT `[cache.schemas] replicate = false` posture. Every
+    /// pre-#1620 caller keeps this shape, so an unchanged test is evidence the
+    /// default table set did not move.
     pub async fn download(&self, pod: &Pod) -> Result<StateAuthority, StateSyncError> {
-        state_sync::download_state(&pod.cfg, &pod.state_path).await
+        self.download_replicating(pod, false).await
+    }
+
+    /// [`download`][Self::download] under an explicit `[cache.schemas]
+    /// replicate` posture (#1620).
+    pub async fn download_replicating(
+        &self,
+        pod: &Pod,
+        replicate_schema_cache: bool,
+    ) -> Result<StateAuthority, StateSyncError> {
+        state_sync::download_state(&pod.cfg, &pod.state_path, replicate_schema_cache).await
     }
 
     /// Run the real [`state_sync::upload_state`] for `pod` (local-only strip,
     /// dispatch, schema-qualified remote key derivation — the whole path).
+    ///
+    /// Default posture, as [`download`][Self::download].
     pub async fn upload(&self, pod: &Pod) -> Result<(), StateSyncError> {
-        state_sync::upload_state(&pod.cfg, &pod.state_path).await
+        self.upload_replicating(pod, false).await
+    }
+
+    /// [`upload`][Self::upload] under an explicit `[cache.schemas] replicate`
+    /// posture (#1620).
+    pub async fn upload_replicating(
+        &self,
+        pod: &Pod,
+        replicate_schema_cache: bool,
+    ) -> Result<(), StateSyncError> {
+        state_sync::upload_state(&pod.cfg, &pod.state_path, replicate_schema_cache).await
     }
 
     /// Open `pod`'s local state store — acquiring the advisory writer lock,
