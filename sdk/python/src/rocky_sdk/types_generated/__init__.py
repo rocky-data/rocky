@@ -202,6 +202,11 @@ _LAZY: dict[str, tuple[str, str]] = {
     "HealthCheck": ("doctor_schema", "HealthCheck"),
     "HealthStatus": ("doctor_schema", "HealthStatus"),
     "HealthOutput": ("health_schema", "HealthOutput"),
+    "ProjectAdapterOutput": ("project_schema", "ProjectAdapterOutput"),
+    "ProjectDiagnosticsOutput": ("project_schema", "ProjectDiagnosticsOutput"),
+    "ProjectOutput": ("project_schema", "ProjectOutput"),
+    "ProjectPipelineOutput": ("project_schema", "ProjectPipelineOutput"),
+    "ProjectRunOutput": ("project_schema", "ProjectRunOutput"),
     "HistoryOutput": ("history_schema", "HistoryOutput"),
     "HookEntry": ("hooks_list_schema", "HookEntry"),
     "HooksListOutput": ("hooks_list_schema", "HooksListOutput"),
@@ -407,6 +412,13 @@ if TYPE_CHECKING:
     from .job_status_schema import JobStatus
     from .meta_schema import MetaOutput
     from .health_schema import HealthOutput
+    from .project_schema import (
+        ProjectAdapterOutput,
+        ProjectDiagnosticsOutput,
+        ProjectOutput,
+        ProjectPipelineOutput,
+        ProjectRunOutput,
+    )
     from .model_list_schema import ModelListEntry, ModelListOutput
     from .model_detail_schema import (
         ModelColumnOutput,
@@ -852,6 +864,11 @@ __all__ = [
     "DriftSummary",
     "DriftActionOutput",
     "HealthOutput",
+    "ProjectOutput",
+    "ProjectPipelineOutput",
+    "ProjectAdapterOutput",
+    "ProjectDiagnosticsOutput",
+    "ProjectRunOutput",
     "HistoryOutput",
     "RunHistoryRecord",
     "ModelColumnOutput",

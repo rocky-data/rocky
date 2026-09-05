@@ -63,6 +63,13 @@ export type {
 
 // serve HTTP API — the five estate routes (typed, no CLI counterpart)
 export type { HealthOutput } from "./health";
+export type {
+  ProjectOutput,
+  ProjectPipelineOutput,
+  ProjectAdapterOutput,
+  ProjectDiagnosticsOutput,
+  ProjectRunOutput,
+} from "./project";
 export type { ModelListOutput, ModelListEntry } from "./model_list";
 export type {
   ModelDetailOutput,
