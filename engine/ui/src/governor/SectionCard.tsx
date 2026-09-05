@@ -70,7 +70,7 @@ export function Rows({
   ariaLabel,
 }: {
   columns: string[];
-  rows: (string | number)[][];
+  rows: ReactNode[][];
   ariaLabel: string;
 }) {
   return (

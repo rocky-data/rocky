@@ -4,6 +4,7 @@ import { apiGet } from "../api";
 import { StatusCard } from "../components";
 import { useResource } from "../estate/useResource";
 import { formatDuration, formatInstant, orNotRecorded } from "../format";
+import { CustodyLink } from "./links";
 import { Rows, SectionCard } from "./SectionCard";
 
 export type BriefLoader = (since: BriefSinceMode) => Promise<BriefOutput>;
@@ -123,7 +124,7 @@ function BriefBody({ brief, now }: { brief: BriefOutput; now?: number }) {
           ariaLabel="Pending escalations"
           columns={["plan", "model", "capability", "principal", "reason", "decision", "when"]}
           rows={escalations.pending.map((entry) => [
-            entry.plan_id,
+            <CustodyLink key={entry.decision_ref} subject={entry.plan_id} />,
             entry.model,
             entry.capability,
             entry.principal,
@@ -182,7 +183,7 @@ function BriefBody({ brief, now }: { brief: BriefOutput; now?: number }) {
             ariaLabel="Runs needing attention"
             columns={["run", "status", "trigger", "started", "finished", "failed models"]}
             rows={runs.attention.map((run) => [
-              run.run_id,
+              <CustodyLink key={run.run_id} subject={run.run_id} />,
               run.status,
               run.trigger,
               formatInstant(run.started_at, now),
@@ -218,7 +219,7 @@ function BriefBody({ brief, now }: { brief: BriefOutput; now?: number }) {
               freeze.scope,
               freeze.principal,
               formatInstant(freeze.frozen_at, now),
-              freeze.plan_id,
+              <CustodyLink key={freeze.plan_id} subject={freeze.plan_id} />,
             ])}
           />
         </div>
@@ -253,7 +254,7 @@ function BriefBody({ brief, now }: { brief: BriefOutput; now?: number }) {
             ariaLabel="Cost per run"
             columns={["run", "duration", "bytes scanned", "cost"]}
             rows={cost.per_run.map((run) => [
-              run.run_id,
+              <CustodyLink key={run.run_id} subject={run.run_id} />,
               formatDuration(run.duration_ms),
               bytes(run.bytes_scanned),
               usd(run.cost_usd),

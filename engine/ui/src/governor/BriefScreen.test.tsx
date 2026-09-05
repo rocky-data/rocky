@@ -121,7 +121,10 @@ describe("BriefScreen", () => {
     const load = vi.fn(async () => BRIEF);
     render(<BriefScreen load={load} now={NOW} />);
     const needs = await screen.findByRole("region", { name: "Needs you" });
-    expect(within(needs).getByText(PLAN)).toBeInTheDocument();
+    expect(within(needs).getByRole("link", { name: PLAN })).toHaveAttribute(
+      "href",
+      `/ui/governor/custody/${PLAN}`,
+    );
     expect(within(needs).getByText("decision:esc-1")).toBeInTheDocument();
 
     const activity = screen.getByRole("region", { name: "Agent activity" });
