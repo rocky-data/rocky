@@ -1031,7 +1031,12 @@ pub fn plan_preview_output(
         {
             Some(specs) => {
                 let mut keyed = model_ir.clone();
-                rocky_core::models::apply_surrogate_keys(&mut keyed, specs, dialect.as_ref());
+                // The `Err` is the validate-before-interpolation guard: an
+                // unvalidated spec is a SQL-injection vector, and main's other
+                // call sites (`emit_sql`, `run`) all refuse on it. Silently
+                // previewing such a spec would be the plan preview alone
+                // rendering what every other path refuses.
+                rocky_core::models::apply_surrogate_keys(&mut keyed, specs, dialect.as_ref())?;
                 std::borrow::Cow::Owned(keyed)
             }
             None => std::borrow::Cow::Borrowed(model_ir),

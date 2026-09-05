@@ -383,7 +383,12 @@ fn check_set_digest(models: &[rocky_core::models::Model], model: &str) -> Result
 /// problem punished as a custody failure.
 #[cfg(feature = "duckdb")]
 pub fn declarative_check_digest(models_dir: &Path, model: &str) -> Result<String> {
-    check_set_digest(&load_all_models(models_dir)?, model)
+    // `None` = declared-only freshness. Safe here because the digest hashes
+    // `tests` and `target` only, and project-freshness inheritance writes
+    // `freshness` alone (pinned by
+    // `the_check_digest_ignores_the_project_freshness_block`). Reading the
+    // project block would need `rocky.toml`, which this side must not open.
+    check_set_digest(&load_all_models(models_dir, None)?, model)
 }
 
 /// Why [`LoadedCheckSet::bind`] could not hand back a runnable handle.
@@ -522,10 +527,15 @@ impl LoadedCheckSet {
         config_path: &Path,
         pipeline_name: Option<&str>,
     ) -> std::result::Result<Self, BindFailure> {
-        let models = load_all_models(models_dir).map_err(BindFailure::CheckSet)?;
+        // The SAME load as `declarative_check_digest`, freshness `None`
+        // included, so the observation-time digest compares like for like
+        // with the verify-time one. Nothing executed from this set reads
+        // the freshness field, so declared-only freshness changes no check.
+        let models = load_all_models(models_dir, None).map_err(BindFailure::CheckSet)?;
         let digest = check_set_digest(&models, model).map_err(BindFailure::CheckSet)?;
-        let (warehouse, routing_identity) = resolve_warehouse_adapter(config_path, pipeline_name)
-            .map_err(BindFailure::Warehouse)?;
+        let (warehouse, routing_identity, _project_freshness) =
+            resolve_warehouse_adapter(config_path, pipeline_name)
+                .map_err(BindFailure::Warehouse)?;
         Ok(Self {
             model: model.to_string(),
             digest,
@@ -651,11 +661,12 @@ pub(crate) async fn declarative_run(
     // 1. Load config + adapter registry.
     // The identity is for the custody comparison at observation; a plain
     // `rocky test --declarative` pins nothing and has nothing to compare.
-    let (warehouse_adapter, _routing_identity) =
+    let (warehouse_adapter, _routing_identity, project_freshness) =
         resolve_warehouse_adapter(config_path, pipeline_name)?;
 
-    // 2. Load all models.
-    let all_models = load_all_models(models_dir, Some(&rocky_cfg.freshness))?;
+    // 2. Load all models, with the project `[freshness]` block threaded down
+    // so a model that declares none of its own inherits it (#1435).
+    let all_models = load_all_models(models_dir, Some(&project_freshness))?;
 
     execute_declarative(&all_models, models_dir, &warehouse_adapter, model_filter).await
 }
@@ -686,7 +697,11 @@ pub(crate) async fn declarative_run(
 fn resolve_warehouse_adapter(
     config_path: &Path,
     pipeline_name: Option<&str>,
-) -> Result<(Arc<dyn WarehouseAdapter>, String)> {
+) -> Result<(
+    Arc<dyn WarehouseAdapter>,
+    String,
+    rocky_core::config::ProjectFreshnessConfig,
+)> {
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
         "failed to load config from {}",
         config_path.display()
@@ -695,7 +710,7 @@ fn resolve_warehouse_adapter(
     let (_, pipeline) = registry::resolve_pipeline(&rocky_cfg, pipeline_name)?;
     let adapter_registry = AdapterRegistry::from_config(&rocky_cfg)?;
     let warehouse = adapter_registry.warehouse_adapter(pipeline.target_adapter())?;
-    Ok((warehouse, routing_identity))
+    Ok((warehouse, routing_identity, rocky_cfg.freshness))
 }
 
 /// Select and execute the declarative checks of an ALREADY-LOADED
@@ -1207,6 +1222,45 @@ mod tests {
     /// names a check whose SQL lives in that file, which no manifest
     /// hashes — and a digest that did not move here would be a gate that
     /// reports clean while the executed SQL changed.
+    /// The custody digest is computed at verify WITHOUT `rocky.toml` and at
+    /// observation with it available, so the two loads differ in whether
+    /// the project `[freshness]` block is threaded down. The digest must
+    /// not see that difference, or every project with a `[freshness]`
+    /// block would fail custody on its first observation. Exhibit the
+    /// condition first: the inherited load really does carry a freshness
+    /// block the bare load lacks.
+    #[test]
+    fn the_check_digest_ignores_the_project_freshness_block() {
+        let (_tmp, models) = project_with_use_test("amount > 0");
+        let project = rocky_core::config::ProjectFreshnessConfig {
+            expected_lag_seconds: Some(3600),
+            ..Default::default()
+        };
+        let bare = load_all_models(&models, None).expect("load without project freshness");
+        let inherited = load_all_models(&models, Some(&project)).expect("load with it");
+        let find = |set: &[rocky_core::models::Model]| {
+            set.iter()
+                .find(|m| m.config.name == "orders")
+                .expect("orders model")
+                .config
+                .freshness
+                .clone()
+        };
+        assert!(
+            find(&bare).is_none(),
+            "control: the model declares no freshness of its own"
+        );
+        assert!(
+            find(&inherited).is_some(),
+            "treatment: the project block was inherited"
+        );
+        assert_eq!(
+            super::check_set_digest(&bare, "orders").expect("digest"),
+            super::check_set_digest(&inherited, "orders").expect("digest"),
+            "the digest must hash tests and target only, never the inherited freshness block"
+        );
+    }
+
     #[test]
     fn the_check_digest_is_stable_across_loads_and_moves_with_the_definitions() {
         let (_tmp, models) = project_with_use_test("amount > 0");
