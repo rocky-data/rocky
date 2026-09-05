@@ -37,18 +37,29 @@ def freshness_is_configured(checks: ChecksConfig | None) -> bool:
     This reads a PROJECTION, not the engine. It answers "the discover output in
     front of me says freshness is configured", which is the best available
     stand-in for "the engine will emit a ``freshness`` ``CheckResult``" — but it
-    is not the same statement. It is wrong in two known cases, both of which
-    make it say ``False`` while the engine emits a result:
+    is not the same statement. It is wrong whenever the projection and the live
+    ``rocky.toml`` disagree.
 
-    * **Stale state.** ``RockyComponent`` caches ``rocky discover``. Adding
-      ``[checks.freshness]`` to ``rocky.toml`` without refreshing the state
-      leaves this ``False``.
-    * **An old binary.** A ``rocky`` that predates the ``checks`` projection
-      emits no ``checks`` field at all, which parses as ``None``.
+    ``RockyComponent`` caches ``rocky discover``, and its state key is
+    ``RockyComponent[<config_path>]`` — the PATH, not the file's contents — so
+    editing ``rocky.toml`` never invalidates the cache on its own. **Stale state
+    is wrong in BOTH directions:**
 
-    In both cases the emitted result meets no declared spec: the streaming path
-    drops it (``_emit_results``) and the Pipes path fails the step. Refresh the
-    state after changing ``[checks]``.
+    * **Freshness added, state not refreshed.** This says ``False``, the engine
+      emits a result, and no spec is declared for it. The streaming path drops
+      the result (``_emit_results``); the Pipes path fails the step with
+      ``DagsterInvariantViolationError``.
+    * **Freshness removed, state not refreshed.** This says ``True``, the engine
+      emits nothing, and the declared spec gets the placeholder — which reports
+      ``passed=True`` on a materialized table. That is #1645 itself, surviving
+      through the cache. Gating on the projection cannot close this half; only
+      refreshing the state can.
+
+    An old binary looks like the first case: a ``rocky`` that predates the
+    ``checks`` projection emits no ``checks`` field at all, which parses as
+    ``None``.
+
+    Refresh the state after changing ``[checks]``.
 
     Two consumers depend on it:
 

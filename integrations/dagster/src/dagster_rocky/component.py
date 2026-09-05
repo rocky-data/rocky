@@ -1500,10 +1500,15 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         # evaluation and it never produced a `freshness` CheckResult, so it
         # does not want a check spec either.
         #
-        # Caveat: this reads the CACHED discover state. Adding
-        # `[checks.freshness]` to `rocky.toml` without refreshing the state
-        # leaves the spec undeclared, and `_emit_results` drops an undeclared
-        # check — refresh the state after changing `[checks]`. The
+        # Caveat: this reads the CACHED discover state, and the state key is
+        # the config PATH, not the file's contents — so editing `rocky.toml`
+        # never refreshes it on its own. Stale state is wrong BOTH ways.
+        # Freshness ADDED without a refresh: the spec is not declared and
+        # `_emit_results` drops the engine's result (Pipes fails the step
+        # instead). Freshness REMOVED without a refresh: the spec is still
+        # declared, nothing is emitted, and the placeholder reports the green
+        # verdict #1645 is about. Gating on the projection cannot close that
+        # half — refresh the state after changing `[checks]`. The
         # `configured_checks` surface below has the same property.
         check_specs = _build_check_specs(
             groups,
