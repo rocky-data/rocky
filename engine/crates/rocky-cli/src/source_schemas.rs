@@ -112,6 +112,45 @@ pub(crate) fn load_cached_source_schemas(
     map
 }
 
+/// Load `source_schemas` for a command that seeds its compile from the project
+/// config: read `rocky.toml`, apply `[cache.schemas]`, and scan the cache.
+///
+/// This is the shared answer for the "compile with real leaf types" bootstrap
+/// that a dozen commands repeat. It exists so the **config failure** has one
+/// answer instead of one per caller (#1625):
+///
+/// ```text
+///   no rocky.toml            -> empty map   (cold, unchanged)
+///   rocky.toml does not load -> Err         (the loader's own error)
+///   loads                    -> TTL-filtered cache scan
+/// ```
+///
+/// Each caller used to write this inline as `Err(_) => HashMap::new()`, so a
+/// malformed `rocky.toml` produced the same cold map as no config at all and
+/// the command carried on typing every source leaf as `Unknown`. Absent and
+/// invalid are not the same thing, and the difference is not the caller's to
+/// re-decide.
+///
+/// Cache failures below the config — a cold cache, a disabled cache, an
+/// unreadable state store — still degrade to an empty map, deliberately: those
+/// are recoverable and cost only type precision. See
+/// [`load_cached_source_schemas`].
+pub(crate) fn load_project_source_schemas(
+    config_path: &Path,
+    state_path: &Path,
+    cache_ttl_override: Option<u64>,
+) -> anyhow::Result<HashMap<String, Vec<TypedColumn>>> {
+    let Some(config) = rocky_core::config::load_optional_project_config(Some(config_path))? else {
+        return Ok(HashMap::new());
+    };
+    let schema_cfg = config
+        .cache
+        .schemas
+        .clone()
+        .with_ttl_override(cache_ttl_override);
+    Ok(load_cached_source_schemas(&schema_cfg, state_path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +169,120 @@ mod tests {
             cached_at,
         };
         store.write_schema_cache_entry(&key, &entry).unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // load_project_source_schemas — the config leg (#1625).
+    //
+    // `rocky lineage`, `rocky catalog`, `rocky ci-diff`, `rocky audit`,
+    // `rocky ai` and `rocky ai-contract` all seed their compile through this
+    // one function, so the "what does an unloadable rocky.toml mean" answer is
+    // asserted here once rather than six times.
+    // ------------------------------------------------------------------
+
+    /// Absent is not invalid: a project with no `rocky.toml` gets the cold map
+    /// it always got, and the compile carries on with `Unknown` leaf types.
+    #[test]
+    fn project_source_schemas_absent_config_is_a_cold_map() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("rocky.toml");
+        let state = tmp.path().join("state.redb");
+        assert!(!cfg.exists());
+
+        let map = load_project_source_schemas(&cfg, &state, None)
+            .expect("a missing rocky.toml must not refuse");
+        assert!(map.is_empty(), "absent config → cold map, unchanged");
+    }
+
+    /// A present `rocky.toml` that does not load REFUSES, carrying the
+    /// loader's own error. It used to produce the same empty map as the absent
+    /// case, so a malformed config and no config were indistinguishable.
+    #[test]
+    fn project_source_schemas_invalid_config_refuses() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("rocky.toml");
+        // Parses, but `fivetran` is discovery-only and needs
+        // `kind = "discovery"` — a validator failure, not a syntax error.
+        std::fs::write(
+            &cfg,
+            "[adapter.ft]\ntype = \"fivetran\"\napi_key = \"k\"\napi_secret = \"s\"\n",
+        )
+        .unwrap();
+        let state = tmp.path().join("state.redb");
+
+        let err = load_project_source_schemas(&cfg, &state, None)
+            .expect_err("a present but invalid rocky.toml must refuse");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("discovery-only") || rendered.contains("kind = \"discovery\""),
+            "the loader's own error must survive, got: {rendered}"
+        );
+    }
+
+    /// A healthy config still loads, and the cache below it still degrades on
+    /// its own terms — a cold cache is an empty map, not a refusal.
+    #[test]
+    fn project_source_schemas_healthy_config_with_cold_cache_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &cfg,
+            "[adapter.default]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n",
+        )
+        .unwrap();
+        let state = tmp.path().join("state.redb");
+
+        let map = load_project_source_schemas(&cfg, &state, None)
+            .expect("a healthy config must not refuse");
+        assert!(map.is_empty(), "cold cache → empty map");
+        assert!(
+            !state.exists(),
+            "a cold read must not create the state store as a side effect"
+        );
+    }
+
+    /// A warm cache is actually read through the shared helper — the config
+    /// leg must not have broken the thing the helper exists for.
+    #[test]
+    fn project_source_schemas_reads_a_warm_cache() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &cfg,
+            "[adapter.default]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n",
+        )
+        .unwrap();
+        let state = tmp.path().join("state.redb");
+        {
+            let store = StateStore::open(&state).unwrap();
+            seed_cache(&store, "staging", "orders", Utc::now());
+        }
+
+        let map = load_project_source_schemas(&cfg, &state, None)
+            .expect("a healthy config must not refuse");
+        assert_eq!(map.len(), 1, "the warm entry must come through: {map:?}");
+    }
+
+    /// An unset `${VAR}` in an adapter's connection fields is not a broken
+    /// config for an offline compile (#1536) — the cache still loads.
+    #[test]
+    fn project_source_schemas_tolerates_unset_credential_vars() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &cfg,
+            "[adapter.default]\ntype = \"databricks\"\nhost = \"${ROCKY_T_1625_SS_UNSET}\"\n",
+        )
+        .unwrap();
+        let state = tmp.path().join("state.redb");
+        {
+            let store = StateStore::open(&state).unwrap();
+            seed_cache(&store, "staging", "orders", Utc::now());
+        }
+
+        let map = load_project_source_schemas(&cfg, &state, None)
+            .expect("an unset credential var must not refuse an offline load");
+        assert_eq!(map.len(), 1, "the warm entry must still come through");
     }
 
     #[test]

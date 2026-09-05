@@ -1096,13 +1096,14 @@ fn compute_ci_diff_in(
     // type diffs measure real schema drift rather than
     // `Unknown`-vs-`Unknown` noise. Degrades to empty when the cache is
     // cold or `[cache.schemas] enabled = false`.
-    let source_schemas = match rocky_core::config::load_rocky_config(config_path) {
-        Ok(cfg) => {
-            let schema_cfg = cfg.cache.schemas.with_ttl_override(cache_ttl_override);
-            crate::source_schemas::load_cached_source_schemas(&schema_cfg, state_path)
-        }
-        Err(_) => HashMap::new(),
-    };
+    // Present-but-unloadable `rocky.toml` refuses (#1625): a cold map turns
+    // real type diffs into `Unknown`-vs-`Unknown` noise, which is the opposite
+    // of what this command is for.
+    let source_schemas = crate::source_schemas::load_project_source_schemas(
+        config_path,
+        state_path,
+        cache_ttl_override,
+    )?;
 
     let changed_files = git_changed_files(base_ref, repo_dir)?;
     let changed_file_count = changed_files.len();
