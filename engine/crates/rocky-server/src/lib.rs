@@ -1,7 +1,7 @@
 //! Rocky server infrastructure for `rocky serve` and the IDE LSP.
 //!
 //! This crate holds the shared server state, auth/CORS middleware, the
-//! server-rendered dashboard, the filesystem watcher, and the LSP. The
+//! host guard and UI contract, the filesystem watcher, and the LSP. The
 //! HTTP router and `/api/v1` handlers themselves live in `rocky-cli`
 //! (`rocky_cli::api`), where they can serve the canonical typed output
 //! cores that back `rocky <verb> --output json`.
@@ -22,8 +22,6 @@
 //! See [`auth`] for the middleware and CORS helpers.
 
 pub mod auth;
-pub mod dag_viz;
-pub mod dashboard;
 pub mod jobs;
 pub mod lsp;
 pub(crate) mod schema_cache_throttle;

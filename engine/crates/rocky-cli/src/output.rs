@@ -10121,6 +10121,79 @@ pub struct HealthOutput {
     pub version: String,
 }
 
+/// The project a sidecar serves, for `GET /api/v1/project`: what the
+/// server-rendered dashboard at `/` used to show, as a typed payload.
+///
+/// Server-only, no CLI twin. Bounded by construction: names of pipelines
+/// and adapters (a handful), counts for models and diagnostics, and the one
+/// newest run. The model names are on `GET /api/v1/models` and the DAG.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectOutput {
+    /// The directory the bound `rocky.toml` lives in, or `rocky` when no
+    /// config is bound.
+    pub name: String,
+    /// The bound config's path; `null` when the sidecar has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
+    /// Why the config could not be loaded, when it could not. The lists
+    /// below are then empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_error: Option<String>,
+    /// Every `[pipeline.<name>]`, in config order.
+    pub pipelines: Vec<ProjectPipelineOutput>,
+    /// Every `[adapter.<name>]`, in config order.
+    pub adapters: Vec<ProjectAdapterOutput>,
+    /// Models in the in-memory compile result; `null` before the first
+    /// compile finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_compiled: Option<u64>,
+    /// The compile's diagnostics, counted.
+    pub diagnostics: ProjectDiagnosticsOutput,
+    /// The newest run in the state store the server resolved; `null` when
+    /// none was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run: Option<ProjectRunOutput>,
+}
+
+/// One pipeline of the bound config.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectPipelineOutput {
+    pub name: String,
+    /// `replication`, `transformation`, `quality`, `snapshot` or `load`.
+    pub pipeline_type: String,
+}
+
+/// One adapter of the bound config.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectAdapterOutput {
+    pub name: String,
+    /// The adapter's `type` as configured (`duckdb`, `databricks`, …).
+    pub adapter_type: String,
+}
+
+/// The compile's diagnostics, counted. All zero before the first compile.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectDiagnosticsOutput {
+    pub total: u64,
+    pub warnings: u64,
+    pub has_errors: bool,
+}
+
+/// The newest run, as the dashboard summarised it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectRunOutput {
+    pub run_id: String,
+    /// RFC 3339.
+    pub started_at: String,
+    /// RFC 3339.
+    pub finished_at: String,
+    /// The run's recorded status (`Success`, `PartialFailure`, `Failure`, …).
+    pub status: String,
+    pub models_executed: u64,
+    /// What started it (`Manual`, `Schedule`, `Webhook`, …).
+    pub trigger: String,
+}
+
 /// The compiled model list for `GET /api/v1/models`.
 ///
 /// One entry per model in the in-memory compile result, sorted by model name
