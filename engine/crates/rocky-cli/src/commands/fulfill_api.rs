@@ -405,9 +405,13 @@ pub async fn propose_governed_run_plan(
         && !touched.is_empty()
         && !matches!(cfg.state.backend, rocky_core::config::StateBackend::Local)
     {
-        let _authority = rocky_core::state_sync::download_state(&cfg.state, state_path)
-            .await
-            .map_err(|e| ProposeError::LedgerDownload(format!("{e:#}")))?;
+        let _authority = rocky_core::state_sync::download_state(
+            &cfg.state,
+            state_path,
+            cfg.cache.schemas.replicate,
+        )
+        .await
+        .map_err(|e| ProposeError::LedgerDownload(format!("{e:#}")))?;
     }
     // Durable freeze-marker LIST, hoisted beside the ledger download — a
     // marker-only freeze (its ledger row erased by a concurrent state

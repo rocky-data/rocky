@@ -24,6 +24,71 @@ from .types import ChecksConfig
 if TYPE_CHECKING:
     from .types import CompileResult, ModelFreshnessConfig
 
+#: Name of the built-in freshness check. The engine emits a ``CheckResult``
+#: under this exact name, and only when the pipeline declares
+#: ``[checks.freshness]`` — see :func:`freshness_is_configured`.
+FRESHNESS_CHECK_NAME: str = "freshness"
+
+
+def freshness_is_configured(checks: ChecksConfig | None) -> bool:
+    """Return ``True`` when the given ``rocky discover`` projection reports a
+    ``[checks.freshness]`` config.
+
+    This reads a PROJECTION, not the engine. It answers "the discover output in
+    front of me says freshness is configured", which is the best available
+    stand-in for "the engine will emit a ``freshness`` ``CheckResult``" — but it
+    is not the same statement. It is wrong exactly when the projection and the
+    live ``rocky.toml`` disagree on WHETHER FRESHNESS IS CONFIGURED — the
+    boolean, not the settings. A changed ``threshold_seconds``, or any other
+    edit that preserves whether ``[checks.freshness]`` is present, leaves this
+    answer correct.
+
+    ``RockyComponent`` caches ``rocky discover``, and its state key is
+    ``RockyComponent[<config_path>]`` — the PATH, not the file's contents — so
+    editing ``rocky.toml`` never invalidates the cache on its own. **Stale state
+    is wrong in BOTH directions:**
+
+    * **Freshness added, state not refreshed.** This says ``False``, the engine
+      emits a result, and no spec is declared for it. The streaming path drops
+      the result (``_emit_results``); the Pipes path fails the step with
+      ``DagsterInvariantViolationError``.
+    * **Freshness removed, state not refreshed.** This says ``True``, the engine
+      emits nothing, and the declared spec gets the placeholder — which reports
+      ``passed=True`` on a materialized table. That is #1645 itself, surviving
+      through the cache. Gating on the projection cannot close this half; only
+      refreshing the state can.
+
+    An old binary looks like the first case: a ``rocky`` that predates the
+    ``checks`` projection emits no ``checks`` field at all, which parses as
+    ``None``.
+
+    Refresh the state after changing ``[checks]``.
+
+    Two consumers depend on it:
+
+    * :func:`freshness_policy_from_checks` returns the pipeline-level
+      :class:`dagster.FreshnessPolicy` only when it is ``True``;
+    * ``RockyComponent`` pre-declares the ``freshness``
+      :class:`dagster.AssetCheckSpec` only when it is ``True``.
+
+    Both must agree, so they read the same predicate. ``tests/test_freshness.py``
+    pins the equivalence.
+
+    A per-model ``[freshness]`` frontmatter is a separate thing: it can put a
+    :class:`dagster.FreshnessPolicy` on one asset through
+    :func:`freshness_policy_from_model` while this predicate is ``False``. That
+    policy is Dagster's own staleness evaluation. The engine never emits a
+    ``freshness`` ``CheckResult`` for it — per-model ``max_lag_seconds`` is read
+    by ``rocky tick`` and ``rocky validate``, not by the check runner — so it
+    does not change the answer here.
+
+    ``checks`` is ``None`` when the pipeline declares no ``[checks]`` block at
+    all — the engine's ``ChecksConfigOutput::from_engine`` returns ``None`` when
+    there is neither a freshness config nor a configured check — and also in the
+    old-binary case above. The two are indistinguishable here.
+    """
+    return checks is not None and checks.freshness is not None
+
 
 def freshness_policy_from_checks(checks: ChecksConfig | None) -> dg.FreshnessPolicy | None:
     """Build a Dagster ``FreshnessPolicy`` from Rocky's projected checks config.

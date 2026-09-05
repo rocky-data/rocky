@@ -3293,7 +3293,7 @@
           "type": "boolean"
         },
         "type": {
-          "description": "Expected type, written in warehouse vocabulary (e.g. `BIGINT`, `VARCHAR`, `NUMBER(38,0)`). It is normalized to a portable Rocky type before comparison, so the same contract ports across warehouses (DuckDB `VARCHAR` and Snowflake `STRING` both match). A type the normalizer doesn't recognize is treated as unknown and never fails the type check — presence and nullability still apply.",
+          "description": "Expected type, written in warehouse vocabulary (e.g. `BIGINT`, `VARCHAR`, `NUMBER(38,0)`). It is normalized to a portable Rocky type before comparison, so the same contract ports across warehouses (DuckDB `VARCHAR` and Snowflake `STRING` both match). A type the normalizer does not recognise is never compared: the load gate reports the column in `ContractResult::warnings` instead, and the type check neither passes nor fails it — presence and nullability still apply.",
           "type": "string"
         }
       },

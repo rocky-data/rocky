@@ -61,6 +61,24 @@ export type {
   TickLockState,
 } from "./schedule_status";
 
+// serve HTTP API — the five estate routes (typed, no CLI counterpart)
+export type { HealthOutput } from "./health";
+export type { ModelListOutput, ModelListEntry } from "./model_list";
+export type {
+  ModelDetailOutput,
+  ModelColumnOutput,
+  TypedColumnOutput,
+  RockyType,
+  StructField,
+} from "./model_detail";
+export type { DagLayersOutput } from "./dag_layers";
+export type {
+  DagStatusOutput,
+  DagExecutionOutput,
+  DagNodeResultOutput,
+  DagNodeStatusOutput,
+} from "./dag_status";
+
 // Lineage (model-level shape)
 export type {
   LineageOutput,
