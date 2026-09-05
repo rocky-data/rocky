@@ -29,14 +29,24 @@ const DOMAIN_FETCH_LIMIT: u64 = LOW_CARDINALITY_CAP;
 
 /// Create an LLM client from environment + project config. Mirrors the helper
 /// in `commands/ai.rs` — reads `[ai] max_tokens` when the config loads, falls
-/// back to the default otherwise.
+/// back to the default when there is no `rocky.toml`, and REFUSES a
+/// `rocky.toml` that is present and does not load (#1680).
+///
+/// Credential-TOLERANT here, deliberately, even though `rocky ai-contract` DOES
+/// connect: the warehouse leg has its own strict load below
+/// (`resolve_target` → `load_rocky_config(config_path)?`), which is where the
+/// credentials have to resolve. This read only picks a token ceiling, so
+/// failing it on an unset `${VAR}` would refuse a command the strict leg would
+/// have accepted.
 fn make_client(config_path: &Path) -> Result<LlmClient> {
-    let api_key = std::env::var(ANTHROPIC_API_KEY_VAR)
-        .context("ANTHROPIC_API_KEY not set. Set it to use `rocky ai-contract`.")?;
-
-    let max_tokens = rocky_core::config::load_rocky_config(config_path)
+    // Config first, API key second — same reasoning as `commands::ai`.
+    let max_tokens = rocky_core::config::load_optional_project_config(Some(config_path))
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?
         .map(|cfg| cfg.ai.max_tokens)
         .unwrap_or(DEFAULT_MAX_TOKENS);
+
+    let api_key = std::env::var(ANTHROPIC_API_KEY_VAR)
+        .context("ANTHROPIC_API_KEY not set. Set it to use `rocky ai-contract`.")?;
 
     let config = AiConfig {
         provider: "anthropic".to_string(),
@@ -906,5 +916,121 @@ type = "full_refresh"
             root.join("models/orders.contract.toml").exists(),
             "contract file should be written with --save"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #1680 — the two config reads `rocky ai-contract` makes offline.
+    // ------------------------------------------------------------------
+
+    /// Parses as TOML, fails a validator: `fivetran` is discovery-only and
+    /// needs `kind = "discovery"`. Present-and-broken, never absent.
+    const BROKEN_CONFIG_1680: &str =
+        "[adapter.ft]\ntype = \"fivetran\"\napi_key = \"k\"\napi_secret = \"s\"\n";
+
+    /// Loads under the credential-TOLERANT loader (#1536), refuses under the
+    /// strict one: `${...}` is unset and sits in an adapter connection field.
+    const UNSET_CREDENTIAL_CONFIG_1680: &str = "[adapters.wh]\ntype = \"databricks\"\n\
+         host = \"${ROCKY_T_1680_UNSET}\"\n";
+
+    /// The converted caller (#1667): a present-but-unloadable `rocky.toml`
+    /// refuses the grounding compile, naming the file.
+    #[test]
+    fn ai_contract_compile_project_refuses_a_present_but_unloadable_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("m.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("m.toml"),
+            "name = \"m\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+        let cfg = tmp.path().join("rocky.toml");
+        std::fs::write(&cfg, BROKEN_CONFIG_1680).unwrap();
+
+        // `let ... else` rather than `expect_err`: `CompileResult` is not `Debug`.
+        let Err(err) = compile_project(
+            &cfg,
+            &tmp.path().join("state.redb"),
+            models_dir.to_str().unwrap(),
+            None,
+        ) else {
+            panic!("a present but unloadable rocky.toml must refuse the ai-contract compile");
+        };
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failed to load config from") && rendered.contains("rocky.toml"),
+            "the refusal must name the config file, got: {rendered}"
+        );
+    }
+
+    /// Honest-failure guard for the converted caller.
+    #[test]
+    fn ai_contract_compile_project_still_runs_without_any_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("m.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("m.toml"),
+            "name = \"m\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+        let cfg = tmp.path().join("rocky.toml");
+        assert!(!cfg.exists());
+
+        compile_project(
+            &cfg,
+            &tmp.path().join("state.redb"),
+            models_dir.to_str().unwrap(),
+            None,
+        )
+        .expect("a missing rocky.toml must not refuse the ai-contract compile");
+    }
+
+    /// The `[ai]` secondary read refuses a present-but-unloadable config.
+    #[test]
+    fn ai_contract_make_client_refuses_a_present_but_unloadable_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("rocky.toml");
+        std::fs::write(&cfg, BROKEN_CONFIG_1680).unwrap();
+
+        let Err(err) = make_client(&cfg) else {
+            panic!("a present but unloadable rocky.toml must refuse the ai-contract client");
+        };
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failed to load config from") && rendered.contains("rocky.toml"),
+            "the refusal must name the config file, got: {rendered}"
+        );
+    }
+
+    /// Honest-failure, case (b): a VALID config whose adapter connection field
+    /// holds an unset `${VAR}` must not refuse this read. `rocky ai-contract`
+    /// DOES connect to the warehouse, but the strict load that has to resolve
+    /// those credentials is `resolve_target`, further down — failing here would
+    /// refuse a command the strict leg would have accepted.
+    #[test]
+    fn ai_contract_make_client_tolerates_an_unset_credential_var() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("rocky.toml");
+        std::fs::write(&cfg, UNSET_CREDENTIAL_CONFIG_1680).unwrap();
+
+        assert!(
+            rocky_core::config::load_rocky_config(&cfg).is_err(),
+            "fixture must fail the STRICT loader, or this proves nothing"
+        );
+        match make_client(&cfg) {
+            Ok(_) => {}
+            Err(e) => {
+                let rendered = format!("{e:#}");
+                assert!(
+                    rendered.contains("ANTHROPIC_API_KEY"),
+                    "an unset credential var must not refuse the client: {rendered}"
+                );
+            }
+        }
     }
 }

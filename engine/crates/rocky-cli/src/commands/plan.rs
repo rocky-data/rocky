@@ -1306,8 +1306,25 @@ pub fn compute_embedded_capabilities(
     let identity = config_identity.clone().unwrap_or_default();
 
     // Seed both compiles with cached source schemas so types are real (mirrors
-    // `rocky review`). Degrade to empty on any failure — a poorer classification
-    // only ever fails *closed* (more models look breaking), never open.
+    // `rocky review`). Degrade to empty on any failure — an unloadable
+    // `rocky.toml` (the `.ok()` above), a cold cache, a disabled cache, an
+    // unreadable state store.
+    //
+    // This used to claim the degrade "only ever fails *closed* (more models look
+    // breaking), never open." That is FALSE and #1680 corrected it. An empty map
+    // types both sides' leaves as `Unknown`, so a real `BIGINT -> VARCHAR` change
+    // on a source column produces `Unknown` vs `Unknown` — no finding at all. The
+    // model is then ABSENT from `changed`, and `EmbeddedCapabilities::touched`
+    // maps an absent model to the bare `PolicyCapability::Apply`, not
+    // `SchemaChangeBreaking` (see `plan_store.rs`). A `schema_change.breaking`
+    // deny rule therefore does not fire on a model whose type really did change.
+    // That is fail-OPEN, in the one direction the comment promised was safe.
+    //
+    // Left as-is on purpose in #1680, which fixed only the comment. Refusing here
+    // changes what a governed `rocky plan` does on a config that never loaded,
+    // and the same question is open for the `rocky branch promote` gate
+    // (`branch.rs`) and `plan.rs`'s `--semantic` leg. #1667 deferred those three
+    // together and they should move together.
     let source_schemas = match (state_path, loaded_cfg.as_ref()) {
         (Some(sp), Some(cfg)) => {
             let schema_cfg = cfg.cache.schemas.clone().with_ttl_override(None);

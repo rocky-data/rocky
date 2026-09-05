@@ -448,4 +448,86 @@ mod tests {
             "empty consumer set must be omitted from JSON"
         );
     }
+
+    // ------------------------------------------------------------------
+    // #1680: the caller-coupled half of #1667's conversion.
+    //
+    // The shared-loader test in `source_schemas.rs` stays green if someone
+    // puts `.ok()` back HERE, so it does not defend this command. These two
+    // drive `run_lineage` itself.
+    // ------------------------------------------------------------------
+
+    /// Parses as TOML, fails a validator: `fivetran` is discovery-only and
+    /// needs `kind = "discovery"`. Present-and-broken, never absent.
+    const BROKEN_CONFIG_1680: &str =
+        "[adapter.ft]\ntype = \"fivetran\"\napi_key = \"k\"\napi_secret = \"s\"\n";
+
+    /// A present-but-unloadable `rocky.toml` refuses `rocky lineage`, and the
+    /// error NAMES the file. Restoring `.ok()` at the config leg makes this
+    /// fail.
+    #[test]
+    fn lineage_refuses_a_present_but_unloadable_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("m.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("m.toml"),
+            "name = \"m\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+        let cfg = tmp.path().join("rocky.toml");
+        std::fs::write(&cfg, BROKEN_CONFIG_1680).unwrap();
+
+        let err = run_lineage(
+            &cfg,
+            &tmp.path().join("state.redb"),
+            &models_dir,
+            "m",
+            None,
+            None,
+            false,
+            true,
+            None,
+        )
+        .expect_err("a present but unloadable rocky.toml must refuse `rocky lineage`");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failed to load config from") && rendered.contains("rocky.toml"),
+            "the refusal must name the config file, got: {rendered}"
+        );
+    }
+
+    /// Absent is not invalid: a standalone `models/` directory with no
+    /// `rocky.toml` still traces lineage. This is the honest-failure guard —
+    /// the new refusal must not fire on a project that never had a config.
+    #[test]
+    fn lineage_still_runs_without_any_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("m.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("m.toml"),
+            "name = \"m\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+        let cfg = tmp.path().join("rocky.toml");
+        assert!(!cfg.exists());
+
+        run_lineage(
+            &cfg,
+            &tmp.path().join("state.redb"),
+            &models_dir,
+            "m",
+            None,
+            None,
+            false,
+            true,
+            None,
+        )
+        .expect("a missing rocky.toml must not refuse `rocky lineage`");
+    }
 }
