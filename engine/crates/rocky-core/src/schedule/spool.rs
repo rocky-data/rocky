@@ -153,9 +153,60 @@ impl SpoolJournal for NoopJournal {
     fn record(&self, _step: SpoolStep) {}
 }
 
+/// The `pending-demands` directory under `.rocky`, as its own type.
+///
+/// This module has two path conventions and they look identical as `&Path`.
+/// Every function that resolves the spool for itself — [`accept`],
+/// [`accept_journaled`], [`list_pending_files`], [`count_corrupt`],
+/// [`sweep_tombstones`] — takes the **`.rocky` dir**; [`spool_dir`] returns the
+/// **resolved spool dir**. (The rest — [`dispose`], [`dispose_journaled`],
+/// [`is_tombstoned`], [`read_pending`], [`quarantine`], [`drop_pending`] — take
+/// one file's path and are not part of this confusion.) Passing the resolved
+/// spool dir where the
+/// `.rocky` dir is wanted resolves twice, giving
+/// `.rocky/pending-demands/pending-demands` — a directory that never exists, so
+/// the read returns `NotFound` and the caller sees an empty, successful scan.
+/// That is exactly how the tombstone sweep silently did nothing on every real
+/// tick (#1711).
+///
+/// The distinct type makes that mistake a compile error. It deliberately does
+/// **not** implement `Deref<Target = Path>`: a deref coercion would let a
+/// `SpoolDir` slide back into a `&Path` parameter and re-arm the confusion. Use
+/// [`SpoolDir::as_path`], [`SpoolDir::join`] or [`SpoolDir::display`] to get a
+/// plain path out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpoolDir(PathBuf);
+
+impl SpoolDir {
+    /// The spool directory as a plain path.
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    /// The path of `name` inside the spool directory.
+    pub fn join(&self, name: impl AsRef<Path>) -> PathBuf {
+        self.0.join(name)
+    }
+
+    /// The directory, formatted for a message. Mirrors [`Path::display`].
+    pub fn display(&self) -> std::path::Display<'_> {
+        self.0.display()
+    }
+}
+
+impl AsRef<Path> for SpoolDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
 /// The `pending-demands` directory under `.rocky`.
-pub fn spool_dir(rocky_dir: &Path) -> PathBuf {
-    rocky_dir.join("pending-demands")
+///
+/// `rocky_dir` is the `.rocky` directory. The result is a [`SpoolDir`], not a
+/// `PathBuf`, so it cannot be fed back into a function that resolves the spool
+/// itself.
+pub fn spool_dir(rocky_dir: &Path) -> SpoolDir {
+    SpoolDir(rocky_dir.join("pending-demands"))
 }
 
 /// The on-disk dedup filename: the hex `blake3` of the canonical
@@ -291,7 +342,7 @@ pub fn accept_journaled(
             // directory before we ack a `202`: a duplicate ack must never be more
             // durable than the original entry it deduplicates against.
             journal.record(SpoolStep::FsyncDir);
-            fsync_dir(&dir)?;
+            fsync_dir(dir.as_path())?;
             return Ok(AcceptOutcome::Duplicate);
         }
         Err(e) => {
@@ -301,7 +352,7 @@ pub fn accept_journaled(
     }
 
     journal.record(SpoolStep::FsyncDir);
-    fsync_dir(&dir)?;
+    fsync_dir(dir.as_path())?;
 
     journal.record(SpoolStep::RemoveTmp);
     let _ = std::fs::remove_file(&tmp_path);
@@ -334,7 +385,7 @@ pub fn list_pending_files(rocky_dir: &Path) -> io::Result<Vec<PathBuf>> {
         Ok(e) => e,
         // `NotFound` has two meanings here and only one of them is "no demand
         // is pending". Ask the shared discriminator which one this is.
-        Err(e) if e.kind() == io::ErrorKind::NotFound => match classify_not_found(&dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => match classify_not_found(dir.as_path()) {
             PathPresence::Absent => return Ok(out),
             PathPresence::Present { detail } => {
                 return Err(io::Error::other(format!(
@@ -462,8 +513,16 @@ pub fn quarantine(pending: &Path, now: DateTime<Utc>) -> io::Result<PathBuf> {
     Ok(dest)
 }
 
-/// Count quarantined-corrupt files in the spool directory (for a `rocky doctor`
-/// warning). Missing directory yields `0`.
+/// Count quarantined-corrupt files in the spool directory. Missing directory
+/// yields `0`.
+///
+/// `rocky_dir` is the `.rocky` directory, not the spool directory (see
+/// [`SpoolDir`]).
+///
+/// **No production code calls this today** — only tests do. `rocky doctor` does
+/// not surface the spool at all, so a quarantined demand is invisible outside a
+/// directory listing. Wiring a caller needs a decision this function cannot
+/// make on its own: see #1712.
 pub fn count_corrupt(rocky_dir: &Path) -> io::Result<usize> {
     let dir = spool_dir(rocky_dir);
     let entries = match std::fs::read_dir(&dir) {
@@ -484,6 +543,16 @@ pub fn count_corrupt(rocky_dir: &Path) -> io::Result<usize> {
 /// Sweep `.done` tombstones older than [`TOMBSTONE_TTL`], so the id-dedup window
 /// is bounded and the spool directory does not grow without limit. Returns the
 /// number swept. A tombstone whose age cannot be read is left in place.
+///
+/// `rocky_dir` is the `.rocky` directory, not the spool directory (see
+/// [`SpoolDir`]) — this function resolves the spool itself. Handing it an
+/// already-resolved spool path resolved twice and swept a directory that never
+/// exists, which is why no real tick ever removed a tombstone (#1711). The
+/// [`SpoolDir`] type now refuses that at compile time.
+///
+/// Ages are read from each tombstone's mtime, which [`dispose`] stamps at
+/// consumption. `now` is the caller's instant: a test that ages a tombstone must
+/// age it relative to the `now` it will pass here, not to wall-clock.
 pub fn sweep_tombstones(rocky_dir: &Path, now: DateTime<Utc>) -> io::Result<usize> {
     let dir = spool_dir(rocky_dir);
     let entries = match std::fs::read_dir(&dir) {
@@ -632,7 +701,7 @@ mod tests {
         // The file is INSIDE the spool dir — no traversal — and its name carries
         // no path separator.
         let spool = spool_dir(dir.path());
-        assert_eq!(pending[0].parent().unwrap(), spool);
+        assert_eq!(pending[0].parent().unwrap(), spool.as_path());
         let name = pending[0].file_name().unwrap().to_string_lossy();
         assert!(!name.contains('/'));
         // The dirty token was hashed, not embedded verbatim.
