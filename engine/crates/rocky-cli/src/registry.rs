@@ -497,6 +497,22 @@ impl AdapterRegistry {
                     let adapter = Arc::new(TrinoAdapter::new(cfg, auth));
                     warehouse.insert(name.clone(), adapter as Arc<dyn WarehouseAdapter>);
                 }
+                // Test-only. Compiled out of every released binary, and
+                // deliberately absent from `KNOWN_ADAPTER_TYPES` — `rocky
+                // validate`'s V017 and the "did you mean?" suggester read that
+                // list, so a user's `type = "recording"` still fails with the
+                // ordinary unsupported-adapter message below.
+                //
+                // Registers a `WarehouseAdapter` that records every call and
+                // executes nothing, keyed by `path` so concurrent tests never
+                // share one log. See `crate::testing` for why the tree needs
+                // one (#1609).
+                #[cfg(test)]
+                "recording" => {
+                    let key = adapter_cfg.path.as_deref().unwrap_or_default();
+                    let adapter = Arc::new(crate::testing::RecordingWarehouseAdapter::new(key));
+                    warehouse.insert(name.clone(), adapter as Arc<dyn WarehouseAdapter>);
+                }
                 other => {
                     let mut msg = format!(
                         "adapters.{name}: unsupported adapter type '{other}'. \

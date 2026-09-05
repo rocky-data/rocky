@@ -209,7 +209,9 @@ def test_collapse_skips_source_missing_tenant_component(caplog):
 def test_collapsed_asset_with_partitioned_checks_builds():
     discover = _discover(_source("coca_cola", ["orders"]), _source("pepsi", ["orders"]))
     groups, pdef = _collapse(discover)
-    check_specs = _build_check_specs(groups, surface_compliance=True, partitions_def=pdef)
+    check_specs = _build_check_specs(
+        groups, declare_freshness=True, surface_compliance=True, partitions_def=pdef
+    )
     assert check_specs and all(c.partitions_def is pdef for c in check_specs)
 
     rocky = RockyResource(binary_path="rocky", config_path="rocky.toml")

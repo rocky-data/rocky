@@ -25,7 +25,7 @@ class ContractResult(BaseModel):
     violations: list[ContractViolation]
     warnings: list[str] | None = []
     """
-    Non-fatal warnings — e.g. a contract clause that can't be meaningfully enforced in this context. Does not affect `passed`.
+    Non-fatal warnings — e.g. a contract clause that can't be meaningfully enforced in this context, or a required column whose type Rocky could not compare because the landed or the declared type string is outside its type map. Does not affect `passed`.
     """
 
 

@@ -28676,4 +28676,213 @@ table = "fct_events"
             "{custom:?}"
         );
     }
+
+    // ---------------------------------------------------------------------
+    // #1609: what a config refusal promises, stated as a warehouse CALL LOG
+    // rather than as one schema lookup.
+    // ---------------------------------------------------------------------
+
+    /// A refused `metadata_columns[].value` (#1594) issues **zero** warehouse
+    /// statements.
+    ///
+    /// ```text
+    ///   no metadata column   ──► preflight passes ──► CREATE CATALOG, CREATE SCHEMA, …
+    ///   with metadata column ──► preflight REFUSES ──► (no statement at all)
+    /// ```
+    ///
+    /// `rocky/tests/metadata_column_refusal.rs` already pins this against a
+    /// real DuckDB fixture, but all it can observe is *the target schema does
+    /// not exist*. DuckDB's `create_catalog_sql` returns `None`, so on that
+    /// adapter a guard sitting BETWEEN catalog creation and schema creation
+    /// would pass the same assertion. The recording adapter's dialect does
+    /// answer `create_catalog_sql`, and the control below asserts the catalog
+    /// statement is the FIRST one the run issues — so an empty treatment log
+    /// rules that placement out as well.
+    ///
+    /// Scope, stated plainly: this counts SQL the run hands to
+    /// `WarehouseAdapter::execute_statement`, which is every catalog, schema,
+    /// pre-drop, CTAS, INSERT and MERGE. Tag / workspace-binding / grant
+    /// emission on a real warehouse also lands there, but the recording
+    /// adapter resolves to the no-op governance adapter (as DuckDB does), so
+    /// those three are absent from the control log rather than proven-absent
+    /// from the treatment log.
+    ///
+    /// The control run is load-bearing twice: it shows this fixture reaches
+    /// the setup loop at all, and it names the statement the treatment must
+    /// not have issued. The `ListTables` assertion is the third guard — it
+    /// proves the recording adapter was actually wired in, so an empty
+    /// statement log cannot pass by the adapter never having been reached.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_refused_metadata_value_issues_no_warehouse_statement() {
+        use crate::testing::{AdapterCall, recorder};
+
+        /// Source schema `raw__ship-it` parses fine — `SchemaPattern::parse`
+        /// splits on the separator and checks nothing — so `{source}`
+        /// resolves to `ship-it`, which is not a plain SQL identifier. The
+        /// TARGET templates deliberately do not use `{source}`, so the
+        /// metadata column is the only thing that differs between the two
+        /// runs.
+        const SOURCE_SCHEMA: &str = "raw__ship-it";
+
+        const CONFIG: &str = r#"
+[adapter.default]
+type = "duckdb"
+path = "__FIXTURE__"
+
+[adapter.rec]
+type = "recording"
+path = "__KEY__"
+
+[pipeline.ingest]
+strategy = "full_refresh"
+__METADATA__
+[pipeline.ingest.source.discovery]
+adapter = "default"
+
+[pipeline.ingest.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.ingest.target]
+adapter = "rec"
+catalog_template = "fixture"
+schema_template = "staging"
+
+[pipeline.ingest.target.governance]
+auto_create_catalogs = true
+auto_create_schemas = true
+"#;
+
+        const HOSTILE_METADATA: &str = r#"
+[[pipeline.ingest.metadata_columns]]
+name = "_src"
+type = "VARCHAR"
+value = "'{source}'"
+"#;
+
+        async fn drive(dir: &std::path::Path, metadata: &str, key: &str) -> Result<RunTermination> {
+            let fixture = dir.join("fixture.duckdb");
+            // Seed the SOURCE through a real DuckDB handle, then drop it:
+            // DuckDB allows a single writer per file, and `run()` opens the
+            // same path through the registry.
+            {
+                let seed = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&fixture)
+                    .expect("open the duckdb fixture");
+                for sql in [
+                    format!("CREATE SCHEMA \"{SOURCE_SCHEMA}\""),
+                    format!("CREATE TABLE \"{SOURCE_SCHEMA}\".orders AS SELECT 1 AS id"),
+                ] {
+                    seed.execute_statement(&sql).await.expect("seed the source");
+                }
+            }
+
+            let config_path = dir.join("rocky.toml");
+            std::fs::write(
+                &config_path,
+                CONFIG
+                    .replace("__FIXTURE__", &fixture.display().to_string())
+                    .replace("__KEY__", key)
+                    .replace("__METADATA__", metadata),
+            )
+            .expect("write rocky.toml");
+
+            let state_path = dir.join("state.redb");
+            let opts = PartitionRunOptions::default();
+            super::run(
+                &config_path,
+                std::sync::Arc::new(
+                    rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+                ),
+                None,
+                None,
+                &state_path,
+                None,
+                false,
+                None,
+                false,
+                None,
+                false,
+                None,
+                &opts,
+                None,
+                None,
+                None,
+                None,
+                &DeferOptions::default(),
+                &SkipRunOptions::default(),
+                &rocky_core::run_vars::RunVars::new(),
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+        }
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+
+        // --- Control: no metadata column. The preflight passes and the setup
+        // loop issues its statements.
+        let control_dir = tmp.path().join("control");
+        std::fs::create_dir_all(&control_dir).unwrap();
+        let control_key = control_dir.join("calls").display().to_string();
+        let control_log = recorder(&control_key);
+        let control = drive(&control_dir, "", &control_key).await;
+
+        let control_stmts = control_log.statements();
+        assert!(
+            !control_stmts.is_empty(),
+            "control: the run must reach the setup loop, otherwise the \
+             treatment's empty log proves nothing. run result: {control:?}, \
+             calls: {:?}",
+            control_log.calls()
+        );
+        assert!(
+            control_stmts[0].contains("CREATE CATALOG"),
+            "control: the catalog statement must be the FIRST statement — \
+             that ordering is what makes an empty treatment log rule out a \
+             guard placed after catalog creation. statements: {control_stmts:?}"
+        );
+        assert!(
+            control_stmts.iter().any(|s| s.contains("CREATE SCHEMA")),
+            "control: the setup loop must also create the target schema; \
+             statements: {control_stmts:?}"
+        );
+
+        // --- Treatment: the same fixture plus a metadata column whose value
+        // resolves to a non-identifier component.
+        let treat_dir = tmp.path().join("treatment");
+        std::fs::create_dir_all(&treat_dir).unwrap();
+        let treat_key = treat_dir.join("calls").display().to_string();
+        let treat_log = recorder(&treat_key);
+        let refused = drive(&treat_dir, HOSTILE_METADATA, &treat_key)
+            .await
+            .expect_err("a non-identifier schema component in a metadata value must be refused");
+
+        // The refusal must be THE metadata-columns refusal. Without this the
+        // empty log below would also pass on an unrelated earlier bail.
+        let msg = format!("{refused:#}");
+        assert!(
+            msg.contains("metadata_columns") && msg.contains("ship-it"),
+            "the refusal must name the field and the offending component; got: {msg}"
+        );
+
+        assert!(
+            treat_log
+                .calls()
+                .iter()
+                .any(|c| matches!(c, AdapterCall::ListTables { .. })),
+            "the recording adapter was never reached — an empty statement log \
+             would then prove nothing. calls: {:?}",
+            treat_log.calls()
+        );
+        assert!(
+            treat_log.statements().is_empty(),
+            "the refusal issued warehouse statements; the guard is no longer \
+             ahead of the setup loop. calls: {:?}",
+            treat_log.calls()
+        );
+    }
 }
