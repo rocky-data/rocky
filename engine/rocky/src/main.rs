@@ -4307,22 +4307,30 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             poll_interval_seconds,
             drain_timeout_seconds,
         } => {
-            // `serve` reads the store at `--state-path`, or the default under
-            // its own `--models`. `--state-namespace` routes a single
-            // invocation to `<models>/.rocky-state/<key>.redb`; a server that
-            // silently ignored it would answer from a different store than
-            // the commands that set it. Refuse, and name the flag that works.
-            if cli.state_namespace.is_some() {
-                anyhow::bail!(
-                    "rocky serve does not support --state-namespace: the server reads one \
-                     store for every route, at --state-path or <models>/.rocky-state.redb. \
-                     Pass --state-path <file> to point it at a namespaced store explicitly."
-                );
-            }
             let config = if cli.config.exists() {
                 Some(cli.config.as_path())
             } else {
                 None
+            };
+            // The store `serve` reads. An explicit `--state-path` is the hard
+            // override, as everywhere. A resolved namespace — the
+            // `--state-namespace` flag, or the config's `[state] namespacing`
+            // — routes the server to `<its models>/.rocky-state/<key>.redb`,
+            // the same derivation every other command makes against its
+            // models directory, so the server answers from the store the
+            // commands that set the namespace wrote. Before, the server
+            // silently read the default store instead. With neither, the
+            // override stays `None` and serve derives its default from its
+            // own `--models`, not from the global `models` resolution above.
+            let serve_models = models
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new("models"));
+            let serve_state_path: Option<PathBuf> = match (&cli.state_path, &state_namespace) {
+                (Some(explicit), _) => Some(explicit.clone()),
+                (None, Some(ns)) => Some(
+                    rocky_core::state::resolve_state_path_ns(None, serve_models, Some(ns)).path,
+                ),
+                (None, None) => None,
             };
             rocky_cli::commands::run_serve(
                 // Everything else the server does with this path — compiling,
@@ -4344,11 +4352,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 scheduler,
                 poll_interval_seconds,
                 drain_timeout_seconds,
-                // The raw `--state-path` override, not the namespaced resolution
-                // above: serve derives its default from its own `--models`, so
-                // passing the resolved default here would repoint a
-                // `serve --models <dir>` at `models/.rocky-state.redb`.
-                cli.state_path.as_deref(),
+                serve_state_path.as_deref(),
             )
             .await
         }

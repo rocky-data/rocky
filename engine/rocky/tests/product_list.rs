@@ -240,24 +240,111 @@ fn real_server_answers_the_real_cli_bytes() {
     assert_eq!(body, String::from_utf8_lossy(&cli_status.stdout));
 }
 
-/// `rocky serve` refuses `--state-namespace` instead of answering from a
-/// different store than the commands that set it.
+/// `rocky serve --state-namespace <key>` reads the store the other commands
+/// write under that namespace, not the default one.
+///
+/// The CLI approves the product under the namespace `acme`, which lands in
+/// `models/.rocky-state/acme.redb`. A server started with the same
+/// namespace and the same models directory must show that approval; the
+/// default store has none, so a server that ignored the namespace would
+/// answer with `fulfill_state` absent.
 #[test]
-fn serve_refuses_a_state_namespace() {
+fn serve_reads_the_namespaced_store_the_cli_uses() {
     let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("project");
     let out = rocky()
-        .current_dir(dir.path())
-        .args(["--state-namespace", "acme", "serve", "--port", "0"])
+        .args(["playground", root.to_str().unwrap()])
         .output()
-        .expect("spawn rocky serve");
-    assert_eq!(out.status.code(), Some(1), "{:?}", out.status);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+        .expect("spawn rocky playground");
     assert!(
-        stderr.contains("does not support --state-namespace"),
-        "stderr: {stderr}"
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::create_dir_all(root.join("products")).expect("mkdir");
+    std::fs::write(root.join("products/revenue_daily.toml"), SPEC_FIXTURE).expect("write spec");
+    let config = root.join("rocky.toml");
+
+    // Approve under the namespace: the record lives in the namespaced store.
+    let approve = rocky()
+        .current_dir(&root)
+        .args([
+            "-o",
+            "json",
+            "--state-namespace",
+            "acme",
+            "product",
+            "approve",
+            "revenue_daily",
+        ])
+        .output()
+        .expect("spawn rocky product approve");
+    assert!(
+        approve.status.success(),
+        "{}",
+        String::from_utf8_lossy(&approve.stderr)
     );
     assert!(
-        stderr.contains("--state-path"),
-        "names the flag that works: {stderr}"
+        root.join("models/.rocky-state/acme.redb").is_file(),
+        "the approval landed in the namespaced store"
+    );
+
+    let port = TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port();
+    let server = Server(
+        rocky()
+            .current_dir(&root)
+            .args([
+                "--config",
+                config.to_str().unwrap(),
+                "--state-namespace",
+                "acme",
+                "serve",
+                "--models",
+                root.join("models").to_str().unwrap(),
+                "--port",
+                &port.to_string(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn rocky serve"),
+    );
+    let _keep_alive = &server;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            let (status, _) = http_get(port, "/api/v1/health");
+            if status.contains("200") {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rocky serve did not come up on {port}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let cli_list = rocky()
+        .current_dir(&root)
+        .args(["-o", "json", "--state-namespace", "acme", "product", "list"])
+        .output()
+        .expect("spawn rocky product list");
+    assert!(
+        cli_list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli_list.stderr)
+    );
+    let (status, body) = http_get(port, "/api/v1/products");
+    assert!(status.contains("200"), "{status}");
+    assert_eq!(body, String::from_utf8_lossy(&cli_list.stdout));
+    let listed: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(
+        listed["products"][0]["fulfill_state"], "spec_approved",
+        "the server read the namespaced store, not the default: {body}"
     );
 }
