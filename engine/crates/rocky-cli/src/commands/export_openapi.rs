@@ -721,8 +721,9 @@ fn route_table() -> Vec<Route> {
                  `spec_present = false`. The same bytes as `rocky product list --output json` \
                  run from the project root against the same state store. Reads `products/` \
                  under the directory of the bound `rocky.toml` and the store `--state-path` \
-                 names (or the default under the models directory); opens it read-only and \
-                 never writes.",
+                 names (or the default under the models directory). The store is opened \
+                 read-only: a store at the current schema version is never written, an older \
+                 one is migrated forward as every read does, a newer one is refused.",
             path_params: &[],
             header_params: &[],
             request_body: None,

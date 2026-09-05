@@ -314,10 +314,11 @@ pub fn fulfill_state_key(product_name: &str) -> String {
 ///
 /// `None` for a journal-row key and for any key outside the `product:`
 /// namespace, so a scan over the table yields each product once. A journal
-/// row is recognised by the exact shape [`fulfill_journal_key`] writes —
-/// `#` followed by eight ASCII digits at the end — not by the presence of
-/// `#`, so a product name that happens to contain `#` is not mistaken for
-/// one.
+/// row is recognised by the shape [`fulfill_journal_key`] writes — `#`
+/// followed by the sequence in at least eight ASCII digits at the end. The
+/// `{seq:08}` there is a minimum width, so a sequence past 99,999,999 is
+/// nine digits or more; the check is "eight or more digits", not "exactly
+/// eight". A bare `#` in a name does not make it a journal row.
 pub fn product_name_from_state_key(key: &str) -> Option<&str> {
     let name = key.strip_prefix("product:")?;
     if name.is_empty() {
@@ -325,7 +326,7 @@ pub fn product_name_from_state_key(key: &str) -> Option<&str> {
     }
     let is_journal_row = name
         .rsplit_once('#')
-        .is_some_and(|(_, seq)| seq.len() == 8 && seq.bytes().all(|b| b.is_ascii_digit()));
+        .is_some_and(|(_, seq)| seq.len() >= 8 && seq.bytes().all(|b| b.is_ascii_digit()));
     if is_journal_row { None } else { Some(name) }
 }
 
@@ -377,7 +378,16 @@ mod tests {
             product_name_from_state_key(&fulfill_journal_key("revenue_daily", 99_999_999)),
             None
         );
-        // A `#` that is not followed by exactly eight digits is part of a name.
+        // `{seq:08}` is a minimum width: past eight digits the key is
+        // still a journal row, up to the widest u64.
+        for seq in [100_000_000u64, 1_234_567_890, u64::MAX] {
+            assert_eq!(
+                product_name_from_state_key(&fulfill_journal_key("revenue_daily", seq)),
+                None,
+                "seq {seq}"
+            );
+        }
+        // A `#` that is not followed by eight or more digits is part of a name.
         assert_eq!(product_name_from_state_key("product:a#b"), Some("a#b"));
         assert_eq!(product_name_from_state_key("product:a#123"), Some("a#123"));
         assert_eq!(

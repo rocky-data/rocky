@@ -2156,6 +2156,36 @@ mod tests {
         assert!(status.approval.is_some());
     }
 
+    /// A store that cannot be opened for reading — here, a file that is not
+    /// a redb database at all — is the documented 500, with the envelope, on
+    /// both routes. Nothing is repaired or rewritten on the way.
+    #[tokio::test]
+    async fn product_routes_report_an_unreadable_store_as_500() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) =
+            crate::commands::product::tests::api_fixture_project(dir.path());
+        std::fs::write(&state_path, b"this is not a redb database").unwrap();
+        let before = std::fs::read(&state_path).unwrap();
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config),
+            &state_path,
+        ))
+        .await;
+
+        for path in ["/api/v1/products", "/api/v1/products/revenue_daily"] {
+            let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+            assert_eq!(resp.status(), 500, "{path}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "internal_error", "{path}");
+        }
+        assert_eq!(
+            std::fs::read(&state_path).unwrap(),
+            before,
+            "the file is left alone"
+        );
+    }
+
     /// A models-only sidecar has no bound config, so it has no product
     /// surface: the documented 503, with the envelope.
     #[tokio::test]

@@ -4307,6 +4307,18 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             poll_interval_seconds,
             drain_timeout_seconds,
         } => {
+            // `serve` reads the store at `--state-path`, or the default under
+            // its own `--models`. `--state-namespace` routes a single
+            // invocation to `<models>/.rocky-state/<key>.redb`; a server that
+            // silently ignored it would answer from a different store than
+            // the commands that set it. Refuse, and name the flag that works.
+            if cli.state_namespace.is_some() {
+                anyhow::bail!(
+                    "rocky serve does not support --state-namespace: the server reads one \
+                     store for every route, at --state-path or <models>/.rocky-state.redb. \
+                     Pass --state-path <file> to point it at a namespaced store explicitly."
+                );
+            }
             let config = if cli.config.exists() {
                 Some(cli.config.as_path())
             } else {

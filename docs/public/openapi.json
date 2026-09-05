@@ -21948,7 +21948,7 @@
     },
     "/api/v1/products": {
       "get": {
-        "description": "Every product the project knows, sorted by name: the `products/*.toml` specs plus every name the state store holds a fulfillment or approval record for, so a product whose spec file was deleted still lists with `spec_present = false`. The same bytes as `rocky product list --output json` run from the project root against the same state store. Reads `products/` under the directory of the bound `rocky.toml` and the store `--state-path` names (or the default under the models directory); opens it read-only and never writes.",
+        "description": "Every product the project knows, sorted by name: the `products/*.toml` specs plus every name the state store holds a fulfillment or approval record for, so a product whose spec file was deleted still lists with `spec_present = false`. The same bytes as `rocky product list --output json` run from the project root against the same state store. Reads `products/` under the directory of the bound `rocky.toml` and the store `--state-path` names (or the default under the models directory). The store is opened read-only: a store at the current schema version is never written, an older one is migrated forward as every read does, a newer one is refused.",
         "operationId": "listProducts",
         "responses": {
           "200": {

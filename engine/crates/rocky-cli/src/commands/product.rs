@@ -1569,11 +1569,18 @@ pub(crate) fn product_names_in(root: &Path, state_path: Option<&Path>) -> Result
             // FIFO, a socket or a dangling link is not a product — and a
             // FIFO would block a reader that opened it. `metadata()` follows
             // a link to a regular file, the same way `product status` reads
-            // one.
-            let is_regular_file = entry
-                .metadata()
-                .map(|meta| meta.file_type().is_file())
-                .unwrap_or(false);
+            // one: the project tree is the operator's, and links inside it
+            // are followed as every command follows them. A dangling link
+            // is skipped; any other failure to stat an entry is reported,
+            // never turned into a silently shorter list.
+            let is_regular_file = match entry.metadata() {
+                Ok(meta) => meta.file_type().is_file(),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("reading the type of {}", path.display()));
+                }
+            };
             if !is_regular_file {
                 continue;
             }
