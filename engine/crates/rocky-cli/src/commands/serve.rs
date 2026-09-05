@@ -75,6 +75,12 @@ pub async fn run_serve(
     // `ROCKY_SERVE_TOKEN_SCOPE`, then to `TokenScope::Full`.
     token_scope: Option<String>,
     allowed_origins: Vec<String>,
+    // `--ui`: serve the embedded browser UI at `/ui/`. Validated in
+    // `build_serve_state` (token present and read-only; webhook secret with
+    // `--scheduler`; the feature compiled in).
+    ui: bool,
+    // `--allowed-host`: extra `Host` values the `--ui` guard accepts.
+    allowed_hosts: Vec<String>,
     scheduler: bool,
     poll_interval_seconds: Option<u64>,
     drain_timeout_seconds: Option<u64>,
@@ -103,9 +109,26 @@ pub async fn run_serve(
         auth_token,
         token_scope,
         allowed_origins,
+        ui,
+        allowed_hosts,
         scheduler,
         state_path,
     )?;
+
+    // The one address a person needs: the page, with the token in the
+    // fragment. The fragment never reaches the server, and the page clears it
+    // after reading it once. Printed on stdout so a script can capture it.
+    if let (true, Some(token)) = (ui, state.auth.as_ref()) {
+        let shown_host = if host == "0.0.0.0" || host == "::" {
+            "localhost"
+        } else {
+            host.as_str()
+        };
+        println!(
+            "Rocky UI: http://{shown_host}:{port}/ui/#token={}",
+            token.secret
+        );
+    }
 
     // Start filesystem watcher if requested
     let _watcher = if watch {
@@ -342,6 +365,8 @@ fn build_serve_state(
     auth_token: Option<String>,
     token_scope: Option<String>,
     allowed_origins: Vec<String>,
+    ui: bool,
+    allowed_hosts: Vec<String>,
     scheduler: bool,
     state_path: Option<&Path>,
 ) -> Result<std::sync::Arc<rocky_server::state::ServerState>> {
@@ -354,6 +379,38 @@ fn build_serve_state(
     // Blank from either source — the flag or the env var — is refused.
     let secret = reject_blank_secret("ROCKY_SERVE_TOKEN", secret)?;
     let token = resolve_serve_token(secret, token_scope)?;
+
+    // The webhook secret is read once, here, because two decisions hang on
+    // it: the ingress below, and the `--ui --scheduler` refusal.
+    let webhook_secret = if scheduler {
+        webhook_secret_fail_closed()?
+    } else {
+        None
+    };
+
+    validate_ui_flags(
+        ui,
+        token.as_ref(),
+        scheduler,
+        webhook_secret.is_some(),
+        crate::ui::built_with_ui(),
+    )?;
+    let ui_config = if ui {
+        let Some(assets) = crate::ui::embedded_assets() else {
+            anyhow::bail!(
+                "this build of rocky was made with the `ui` feature but embeds no page: \
+                 engine/ui/dist had no index.html at build time. Run `npm ci && npm run \
+                 build` in engine/ui and rebuild with `cargo build --features ui`."
+            );
+        };
+        Some(rocky_server::ui::UiConfig {
+            bind_host: host.to_string(),
+            allowed_hosts,
+            assets,
+        })
+    } else {
+        None
+    };
 
     // The config file the scheduler reads (falls back to the conventional
     // `rocky.toml`); the webhook spool is anchored under its `.rocky` directory,
@@ -381,7 +438,7 @@ fn build_serve_state(
             // filtered to `None`: "" is a configured secret that cannot
             // authenticate anything, so treating it as absent silently opens
             // the same path.
-            secret: webhook_secret_fail_closed()?,
+            secret: webhook_secret,
             bind_is_loopback: crate::api::is_loopback(host),
             rocky_dir: crate::commands::scheduler::rocky_dir_for_config(&resolved_config),
             rate_limiter: rocky_server::webhook_ingress::WebhookRateLimiter::new(
@@ -401,12 +458,93 @@ fn build_serve_state(
         allowed_origins,
         state_path.map(std::path::Path::to_path_buf),
         webhook,
+        ui_config,
     ))
+}
+
+/// The `--ui` rules, checked before anything binds. Each refusal names the
+/// fix. Without `--ui` nothing here applies.
+///
+/// - The build must carry the UI (cargo feature `ui`).
+/// - A token must be configured: every UI request presents one.
+/// - The token must be read-only: the UI token must not reach a mutation.
+///   One server has one token, so `--ui` makes it read-only; a job
+///   submission needs a second sidecar without `--ui`, or the CLI.
+/// - With `--scheduler`, `ROCKY_WEBHOOK_SECRET` must be set: a browser can
+///   reach the webhook route, and without a secret a loopback bind accepts
+///   unsigned requests.
+pub(crate) fn validate_ui_flags(
+    ui: bool,
+    token: Option<&ServeToken>,
+    scheduler: bool,
+    webhook_secret_present: bool,
+    built_with_ui: bool,
+) -> Result<()> {
+    if !ui {
+        return Ok(());
+    }
+    if !built_with_ui {
+        anyhow::bail!(
+            "this build of rocky carries no browser UI (built without the `ui` feature). \
+             Release binaries carry it; from source, run `npm ci && npm run build` in \
+             engine/ui and build with `cargo build --features ui`."
+        );
+    }
+    let Some(token) = token else {
+        anyhow::bail!(
+            "rocky serve --ui refuses to start without a token: every UI request presents \
+             one. Pass `--token <secret> --token-scope read-only`, or set ROCKY_SERVE_TOKEN \
+             and ROCKY_SERVE_TOKEN_SCOPE=read-only."
+        );
+    };
+    if token.scope != TokenScope::ReadOnly {
+        anyhow::bail!(
+            "rocky serve --ui requires `--token-scope read-only`: the UI token must not \
+             reach a mutating route. For job submissions run a second sidecar without \
+             --ui, or use the CLI."
+        );
+    }
+    if scheduler && !webhook_secret_present {
+        anyhow::bail!(
+            "rocky serve --ui --scheduler refuses to start without ROCKY_WEBHOOK_SECRET: a \
+             browser can reach the webhook route, and without a secret a loopback bind \
+             accepts unsigned requests. Set the variable, or drop --scheduler."
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The four `--ui` refusals, each naming its fix, and the one shape that
+    /// starts. Without `--ui` every combination passes.
+    #[test]
+    fn ui_flags_refuse_a_missing_or_full_token_a_bare_scheduler_and_a_build_without_the_ui() {
+        let read_only = ServeToken {
+            secret: "s3cret".into(),
+            scope: TokenScope::ReadOnly,
+        };
+        let full = ServeToken::full("s3cret");
+
+        assert!(validate_ui_flags(false, None, true, false, false).is_ok());
+
+        let err = validate_ui_flags(true, Some(&read_only), false, false, false).unwrap_err();
+        assert!(err.to_string().contains("--features ui"), "{err}");
+
+        let err = validate_ui_flags(true, None, false, false, true).unwrap_err();
+        assert!(err.to_string().contains("without a token"), "{err}");
+
+        let err = validate_ui_flags(true, Some(&full), false, false, true).unwrap_err();
+        assert!(err.to_string().contains("read-only"), "{err}");
+
+        let err = validate_ui_flags(true, Some(&read_only), true, false, true).unwrap_err();
+        assert!(err.to_string().contains("ROCKY_WEBHOOK_SECRET"), "{err}");
+
+        assert!(validate_ui_flags(true, Some(&read_only), true, true, true).is_ok());
+        assert!(validate_ui_flags(true, Some(&read_only), false, false, true).is_ok());
+    }
 
     /// A token with no scope named keeps the historical behaviour.
     #[test]
@@ -521,6 +659,8 @@ mod tests {
                 "127.0.0.1",
                 Some("s3cret".to_string()),
                 raw.clone(),
+                Vec::new(),
+                false,
                 Vec::new(),
                 false,
                 None,

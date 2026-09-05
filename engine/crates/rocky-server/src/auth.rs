@@ -367,6 +367,62 @@ fn forbidden_read_only_response() -> Response {
     (StatusCode::FORBIDDEN, Json(body)).into_response()
 }
 
+/// The `Host` and `Origin` guard of `rocky serve --ui`, applied before
+/// routing to every request, UI files and API alike.
+///
+/// A browser reaches the sidecar by a name, and a name can be made to point
+/// at `127.0.0.1` by an attacker's DNS (rebinding). The bearer token still
+/// protects the API, but the UI files are public, and defence in depth is
+/// cheap here: a `Host` that is not one of this server's names is answered
+/// `421`, and a present `Origin` that is neither the server's own nor an
+/// `--allowed-origin` entry is answered `403`. Both carry the envelope.
+/// Without `--ui` the guard is off, so existing embedders see no change.
+pub async fn require_known_host(
+    State(state): State<Arc<ServerState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(ui) = state.ui.as_ref() else {
+        return next.run(request).await;
+    };
+    if let Some(host) = request.headers().get(header::HOST) {
+        let accepted = host.to_str().is_ok_and(|h| ui.host_allowed(h));
+        if !accepted {
+            return envelope_response(
+                StatusCode::MISDIRECTED_REQUEST,
+                "host_not_allowed",
+                "the request's Host header does not name this server",
+                "reach the UI by a loopback name, the bind host, or a name passed with --allowed-host",
+            );
+        }
+    }
+    if let Some(origin) = request.headers().get(header::ORIGIN) {
+        let accepted = origin
+            .to_str()
+            .is_ok_and(|o| ui.origin_allowed(o, &state.allowed_origins));
+        if !accepted {
+            return envelope_response(
+                StatusCode::FORBIDDEN,
+                "origin_not_allowed",
+                "the request's Origin is neither this server's own nor an allowed origin",
+                "open the UI at the address the server printed, or pass the origin with --allowed-origin",
+            );
+        }
+    }
+    next.run(request).await
+}
+
+/// A refusal in the `{code, message, remediation_hint}` envelope shape the
+/// `/api/v1` handlers use, for middleware that must answer before a handler.
+fn envelope_response(status: StatusCode, code: &str, message: &str, hint: &str) -> Response {
+    let body = serde_json::json!({
+        "code": code,
+        "message": message,
+        "remediation_hint": hint,
+    });
+    (status, Json(body)).into_response()
+}
+
 /// Constant-time byte comparison. Returns `true` only if both slices have
 /// the same length *and* every byte matches; runtime is independent of
 /// the position of the first mismatch.

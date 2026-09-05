@@ -107,6 +107,10 @@ Router-level failures use the same envelope. An unknown path answers `404` with 
 
 The full route reference, request and response schemas, and status codes are published as a generated OpenAPI 3.1 document: **[openapi.json](/openapi.json)**. It is generated from the same typed schemas that back the CLI, so it cannot drift from what the server returns. Load it into any OpenAPI tool to explore the surface or generate a client.
 
+### The browser UI
+
+`rocky serve --ui` serves a browser UI at `/ui/`, from files built into the release binaries. It needs a read-only token: `rocky serve --ui --token <secret> --token-scope read-only`. The server prints one address, `http://127.0.0.1:8080/ui/#token=<secret>`; the page reads the token from the fragment once, clears it, and sends it on every API call. The page itself is public. With `--ui` the server refuses a foreign `Host` (`421`) and a foreign `Origin` (`403`) before routing; a reverse proxy names itself with `--allowed-host`, and a page on another origin with `--allowed-origin`. The UI token cannot start a run: run a second sidecar without `--ui` for job submissions.
+
 For the command flags, see [`rocky serve`](/reference/commands/development/). For where the server sits in the engine, see the [architecture overview](/concepts/architecture/).
 
 ## Pinning and upgrades
