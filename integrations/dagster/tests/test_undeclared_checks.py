@@ -338,12 +338,8 @@ def test_failed_overlap_check_is_a_named_failed_check_on_the_engines_asset(tmp_p
     assert "us_east__shopify.orders" in evaluation.metadata["contributing_tables"].value
 
 
-def test_sibling_the_engine_did_not_evaluate_gets_no_passing_placeholder(tmp_path: Path):
-    """The other sibling was materialized, so the old placeholder would have
-    reported the group check as ``passed=True``. It now reports an explicit
-    not-evaluated result instead."""
-    defs = _build_defs(_discover_with_siblings(), tmp_path, surface_configured_checks=True)
-    run_result = _run_result(
+def _overlap_run_result() -> RunResult:
+    return _run_result(
         materialized=[ORDERS_KEY, SIBLING_KEY],
         checks={
             ORDERS_KEY: [
@@ -359,15 +355,86 @@ def test_sibling_the_engine_did_not_evaluate_gets_no_passing_placeholder(tmp_pat
         },
     )
 
-    exec_result = _materialize_streaming(defs, run_result, [ORDERS_KEY, SIBLING_KEY])
 
-    evaluation = _check_evaluations(exec_result)[
-        ("fivetran/acme/us_east/shopify/orders", OVERLAP_CHECK)
-    ]
-    assert evaluation.passed is False, "a check that never ran here must not read green"
-    assert evaluation.severity == dg.AssetCheckSeverity.WARN
-    assert "not evaluated on this asset" in evaluation.metadata["status"].value
-    assert evaluation.metadata["rocky/group_check"].value is True
+def test_unevaluated_sibling_yields_no_result_and_the_step_succeeds(tmp_path: Path):
+    """The sibling the engine did not evaluate gets NO result for the group
+    check — not a passing placeholder (a green verdict for a check that never
+    ran), and not a failing one either (two permanent warnings on every run of
+    a three-sibling group reads as a broken pipeline).
+
+    Yielding nothing is Dagster's own "planned, did not run": the declared
+    check keeps its ``ASSET_CHECK_EVALUATION_PLANNED`` record at status
+    ``PLANNED``, which ``AssetCheckExecutionRecord.resolve_status`` maps to
+    ``SKIPPED`` once the run finishes without failing."""
+    defs = _build_defs(_discover_with_siblings(), tmp_path, surface_configured_checks=True)
+
+    exec_result = _materialize_streaming(defs, _overlap_run_result(), [ORDERS_KEY, SIBLING_KEY])
+
+    assert exec_result.success
+    evaluations = _check_evaluations(exec_result)
+    # The engine's own sibling still carries the real verdict.
+    assert ("fivetran/acme/us_west/shopify/orders", OVERLAP_CHECK) in evaluations
+    # The other sibling reports nothing at all for that check.
+    assert ("fivetran/acme/us_east/shopify/orders", OVERLAP_CHECK) not in evaluations
+    # Its own per-asset checks are unaffected.
+    assert ("fivetran/acme/us_east/shopify/orders", "row_count") in evaluations
+
+
+def test_unevaluated_sibling_logs_where_the_group_was_evaluated(tmp_path: Path):
+    """One INFO line names the sibling with no verdict and the asset the group
+    was evaluated on, so the skip is explained rather than merely silent."""
+    from dagster_rocky.component import _emit_placeholder_checks
+
+    log = MagicMock(spec=logging.Logger)
+    spec = dg.AssetCheckSpec(
+        name=OVERLAP_CHECK,
+        asset=SIBLING_KEY,
+        metadata={"rocky/group_check": True},
+    )
+
+    events = list(
+        _emit_placeholder_checks(
+            check_specs=[spec],
+            selected_keys={ORDERS_KEY, SIBLING_KEY},
+            yielded_checks={(ORDERS_KEY, OVERLAP_CHECK)},
+            materialized_keys={ORDERS_KEY, SIBLING_KEY},
+            log=log,
+        )
+    )
+
+    assert events == []
+    log.info.assert_called_once()
+    message = log.info.call_args.args[0]
+    assert OVERLAP_CHECK in message
+    assert "fivetran/acme/us_east/shopify/orders" in message
+    assert "this run evaluated it on fivetran/acme/us_west/shopify/orders" in message
+    assert "skipped for this run" in message
+
+
+def test_unevaluated_group_check_with_no_carrier_says_so(tmp_path: Path):
+    """A subset that copies fewer than two siblings runs the group check on
+    nobody. The INFO line must say that, not name a carrier."""
+    from dagster_rocky.component import _emit_placeholder_checks
+
+    log = MagicMock(spec=logging.Logger)
+    spec = dg.AssetCheckSpec(
+        name=OVERLAP_CHECK,
+        asset=SIBLING_KEY,
+        metadata={"rocky/group_check": True},
+    )
+
+    events = list(
+        _emit_placeholder_checks(
+            check_specs=[spec],
+            selected_keys={SIBLING_KEY},
+            yielded_checks=set(),
+            materialized_keys={SIBLING_KEY},
+            log=log,
+        )
+    )
+
+    assert events == []
+    assert "it was not evaluated in this run" in log.info.call_args.args[0]
 
 
 def test_not_evaluated_overlap_result_carries_the_engines_reason(tmp_path: Path):

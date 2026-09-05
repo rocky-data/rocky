@@ -3705,6 +3705,7 @@ def _emit_results(
         pruned_keys=pruned_keys,
         contained_by_key=contained_by_key,
         instance=instance,
+        log=log or _log,
     )
 
 
@@ -3866,6 +3867,7 @@ def _emit_placeholder_checks(
     pruned_keys: AbstractSet[dg.AssetKey] = frozenset(),
     contained_by_key: Mapping[dg.AssetKey, ContainedModel] = MappingProxyType({}),
     instance: dg.DagsterInstance | None = None,
+    log: logging.Logger | dg.DagsterLogManager | None = None,
 ) -> Iterator[dg.AssetCheckResult]:
     """Emit placeholders for declared checks Rocky did not produce.
 
@@ -3890,17 +3892,30 @@ def _emit_placeholder_checks(
     sibling it copied in that run (``run.rs`` attaches it to
     ``siblings[0]``). Which member that is depends on run order and on the
     subset, so it cannot be predicted when the specs are built — and the
-    group does not run at all when fewer than two siblings are copied. Every
-    other member therefore gets an explicit ``passed=False`` / WARN "not
-    evaluated on this asset" result rather than the ``passed=materialized``
-    placeholder, which would have been a green verdict for a check that never
-    ran there (#1669). ``passed=False`` for a check that did not run is the
-    engine's own convention (``cross_source_overlap_not_evaluated``); WARN,
-    not ERROR, because the asset is not broken — the check simply has no
-    verdict here. This branch runs BEFORE the pruned / contained branches:
-    those explain why the ASSET was skipped, which is not why this CHECK has
-    no verdict, and carrying a prior verdict forward would carry forward one
-    of these very placeholders.
+    group does not run at all when fewer than two siblings are copied.
+
+    Every other member gets **no result at all**, plus one INFO line naming
+    the sibling that carried the verdict. Not a passing placeholder (that is
+    the green verdict for a check that never ran, #1645/#1669), and not a
+    failing one either: a three-sibling group would then show two warning
+    failures on every run, for ever — the same "placeholder that reflects no
+    evaluation" the original exclusion existed to avoid, only amber instead
+    of green.
+
+    Yielding nothing is Dagster's own way to say "planned, did not run".
+    Dagster writes an ``ASSET_CHECK_EVALUATION_PLANNED`` record for every
+    declared check in the step; a check with no evaluation keeps status
+    ``PLANNED``, and ``AssetCheckExecutionRecord.resolve_status`` maps
+    ``PLANNED`` on a finished, non-failed run to
+    ``AssetCheckExecutionResolvedStatus.SKIPPED`` — "the run finished, didn't
+    fail, but the check didn't execute". So the run records a SKIP for this
+    check, and the last real verdict stays attached to the earlier run id it
+    came from. Verified by probe on Dagster 1.13.17, not assumed.
+
+    This branch runs BEFORE the pruned / contained branches: those explain
+    why the ASSET was skipped, which is not why this CHECK has no verdict,
+    and the pruned branch would otherwise carry a prior verdict forward as
+    though it were this run's.
 
     A check on a model in ``contained_by_key`` was withheld by failure
     containment (its upstream failed). It is unmaterialized, so it would
@@ -3911,6 +3926,12 @@ def _emit_placeholder_checks(
     / WARN — the model was not built and the check did not run; the hard error
     lives on the root-cause asset in ``errors``.
     """
+    # Which asset carried each check's verdict this run — the sibling the
+    # engine reported a group check on. Built once, not scanned per spec.
+    carriers_by_check_name: dict[str, list[dg.AssetKey]] = defaultdict(list)
+    for yielded_key, yielded_name in yielded_checks:
+        carriers_by_check_name[yielded_name].append(yielded_key)
+
     for cs in check_specs:
         if cs.asset_key not in selected_keys:
             continue
@@ -3918,25 +3939,23 @@ def _emit_placeholder_checks(
             continue
 
         if cs.metadata.get(GROUP_CHECK_METADATA_KEY):
-            yield dg.AssetCheckResult(
-                asset_key=cs.asset_key,
-                check_name=cs.name,
-                passed=False,
-                severity=dg.AssetCheckSeverity.WARN,
-                description=(
-                    "Group check with no verdict for this asset in this run. "
-                    "Rocky evaluates it once for the whole sibling group and "
-                    "reports it on the sibling it copied first; it does not "
-                    "run at all when fewer than two siblings are copied."
-                ),
-                metadata={
-                    "status": dg.MetadataValue.text(
-                        f"not evaluated on this asset: {cs.name} is a group "
-                        f"check — look for it on the sibling asset that "
-                        f"carries this run's verdict"
-                    ),
-                    GROUP_CHECK_METADATA_KEY: dg.MetadataValue.bool(True),
-                },
+            carriers = sorted(
+                key.to_user_string()
+                for key in carriers_by_check_name.get(cs.name, ())
+                if key != cs.asset_key
+            )
+            where = (
+                f"this run evaluated it on {', '.join(carriers)}"
+                if carriers
+                else "it was not evaluated in this run"
+            )
+            (log or _log).info(
+                f"Group check {cs.name!r} has no verdict for "
+                f"{cs.asset_key.to_user_string()!r}: {where}. Rocky evaluates "
+                f"a cross-source overlap once for the whole sibling group and "
+                f"reports it on the sibling it copied first; it does not run "
+                f"at all when fewer than two siblings are copied. Dagster "
+                f"records the check as skipped for this run."
             )
             continue
 
