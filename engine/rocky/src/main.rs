@@ -4979,6 +4979,21 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         std::process::exit(2);
     }
 
+    // Same exit-2 partial-success contract for a replication run that copied
+    // its data and then failed its declared check gate (#1598). A separate
+    // sentinel type because the operator advice differs — a failed copy is
+    // resumable, a failed check is not — but the code is the same: real work
+    // landed, and a real problem was reported. The `RunOutput` JSON (carrying
+    // `status: "PartialFailure"` and `check_gate_failed: true`) is already on
+    // stdout, so dagster's `allow_partial=True` path parses it as usual.
+    if let Err(ref err) = result
+        && err
+            .downcast_ref::<rocky_cli::commands::CheckGateFailure>()
+            .is_some()
+    {
+        std::process::exit(2);
+    }
+
     // In text mode, try to upgrade config errors to rich miette diagnostics
     // with source spans and suggestions. JSON mode returns structured errors
     // unchanged for orchestrators (e.g., Dagster).
