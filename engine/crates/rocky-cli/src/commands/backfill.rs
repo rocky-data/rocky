@@ -13,6 +13,13 @@
 //! 5. estimates the rebuild cost from historical observations (offline),
 //! 6. persists the plan as a `PlanKind::Backfill` and emits it.
 //!
+//! Step 6 binds the project's **routing identity** (adapters + pipelines) into
+//! the plan, and `rocky apply` re-derives it and refuses on any mismatch — or
+//! on its absence, because a backfill is governed by kind. So this command
+//! REFUSES a `rocky.toml` it cannot load strictly, including one that is not
+//! there at all (#1680): without it the identity cannot be produced and the
+//! composed plan could only ever be refused at apply.
+//!
 //! The plan is **always** review-gated: `rocky apply <plan-id>` refuses to run
 //! it until `rocky review <plan-id> --approve` has recorded a sign-off marker,
 //! regardless of any configured policy. Backfills are where blast radius
@@ -203,8 +210,40 @@ pub(crate) fn run_backfill_in(
         })
         .collect();
 
+    // The project config, loaded ONCE for everything below.
+    //
+    // REFUSE rather than `.ok()` (#1680). A backfill plan is always governed
+    // (`PlanKind::Backfill` forces the `Agent` principal by kind — see
+    // `plan_store::default_principal_for_kind` — so a human apply cannot escape
+    // it) and is stamped `CURRENT_FINGERPRINT_VERSION`, which makes
+    // `GovernedRunContext::require_fingerprint` true. A plan whose
+    // `config_identity` is `None` therefore hits `verify_routing_identity`'s
+    // `None if self.require_fingerprint` arm and is refused at apply, always.
+    // Composing it writes an artifact nobody can use and a review-queue
+    // escalation nobody can clear.
+    //
+    // The STRICT loader is deliberate, and it is the one exception to the
+    // "offline command → tolerant loader" rule. The identity is
+    // `config_policy_identity`, which serializes the whole adapter struct
+    // INCLUDING connection fields, and apply recomputes it from a strict load.
+    // A tolerant load that kept a literal `${DATABRICKS_HOST}` would bind an
+    // identity apply could never match — a false refusal at apply instead of an
+    // honest one here. The comparison must be strict on both sides.
+    //
+    // Loaded HERE, above the cost estimate, on purpose: `estimate_cost` used to
+    // do its own `.ok()` load, so the refusal's position was what kept that
+    // second swallow unreachable. One load, passed down, cannot drift.
+    let backfill_cfg = rocky_core::config::load_rocky_config(config_path).with_context(|| {
+        format!(
+            "failed to load config from {} — a backfill plan binds the routing identity \
+             (adapters + pipelines) that `rocky apply` verifies before it executes, so a config \
+             that does not load here could only produce a plan apply would refuse",
+            config_path.display()
+        )
+    })?;
+
     // 6. Cost estimate from historical observations (offline).
-    let cost_estimate = estimate_cost(&ordered, store.as_ref(), config_path);
+    let cost_estimate = estimate_cost(&ordered, store.as_ref(), &backfill_cfg);
     // The read handle drops here so the escalation write below can open its
     // own handle on the same store.
     drop(store);
@@ -214,24 +253,15 @@ pub(crate) fn run_backfill_in(
     // A backfill executes the same on-disk models it plans; bind their
     // compiled-IR fingerprint + routing identity so the apply-time TOCTOU gate
     // rejects a change.
-    let backfill_cfg = rocky_core::config::load_rocky_config(config_path).ok();
-    let config_identity = backfill_cfg
-        .as_ref()
-        .map(crate::commands::apply::config_policy_identity);
-    let identity = config_identity.clone().unwrap_or_default();
+    let identity = crate::commands::apply::config_policy_identity(&backfill_cfg);
+    let config_identity = Some(identity.clone());
     // A backfill runs with no `--env`, so the governance identity + mask resolve
     // the env defaults (roles + cache-selection are env-invariant).
-    let governance_identity = backfill_cfg
-        .as_ref()
-        .map(crate::commands::apply::governance_policy_identity)
-        .unwrap_or_default();
+    let governance_identity = crate::commands::apply::governance_policy_identity(&backfill_cfg);
     // Execution-control identity (#1095(a)): `[run]`/`[reuse]`/`[resilience]`,
     // symmetric with the apply choke-point. (Hooks are refused under a governed
     // apply, #1095(c), not bound here.)
-    let exec_control_identity = backfill_cfg
-        .as_ref()
-        .map(crate::commands::apply::execution_control_identity)
-        .unwrap_or_default();
+    let exec_control_identity = crate::commands::apply::execution_control_identity(&backfill_cfg);
     // Finding #4: a backfill is selection-scoped (`model_set`) and reconciles
     // ONLY tags, never masks (run.rs `execute_backfill_set` → tags), so the mask
     // is NOT bound — matching the apply choke-point, which sees `model_set` and
@@ -244,17 +274,12 @@ pub(crate) fn run_backfill_in(
     // authoritative even when empty (a cold cache → apply types from empty).
     let reviewed_source_schemas: Option<
         std::collections::BTreeMap<String, Vec<rocky_compiler::types::TypedColumn>>,
-    > = Some(
-        backfill_cfg
-            .as_ref()
-            .map(|cfg| {
-                let schema_cfg = cfg.cache.schemas.clone().with_ttl_override(None);
-                crate::source_schemas::load_cached_source_schemas(&schema_cfg, state_path)
-            })
-            .unwrap_or_default()
+    > = Some({
+        let schema_cfg = backfill_cfg.cache.schemas.clone().with_ttl_override(None);
+        crate::source_schemas::load_cached_source_schemas(&schema_cfg, state_path)
             .into_iter()
-            .collect(),
-    );
+            .collect()
+    });
     // Fold the seeding-independent extras (surrogate-key sidecars #1, contract
     // presence/contents #3, effective mask C) into the bound fingerprint so the
     // apply-time TOCTOU gate rejects a post-plan swap of any, built from the SAME
@@ -578,9 +603,9 @@ fn build_run_plan(
 fn estimate_cost(
     ordered: &[String],
     store: Option<&StateStore>,
-    config_path: &Path,
+    cfg: &rocky_core::config::RockyConfig,
 ) -> BackfillCostEstimate {
-    let warehouse = resolve_warehouse(config_path);
+    let warehouse = resolve_warehouse(cfg);
     let latest_exec = latest_success_executions(store, ordered);
 
     let mut per_model = Vec::with_capacity(ordered.len());
@@ -653,10 +678,12 @@ fn latest_success_executions(
     out
 }
 
-/// Resolve `(warehouse, dbu_per_hour, cost_per_dbu)` from config, or `None`
-/// when the config can't be read or names no billed warehouse.
-fn resolve_warehouse(config_path: &Path) -> Option<(WarehouseType, f64, f64)> {
-    let cfg = rocky_core::config::load_rocky_config(config_path).ok()?;
+/// Resolve `(warehouse, dbu_per_hour, cost_per_dbu)` from the ALREADY-LOADED
+/// config, or `None` when it names no billed warehouse.
+///
+/// Takes the config rather than a path (#1680): it used to re-load with
+/// `.ok()?`, a second swallow of the same error the caller now refuses on.
+fn resolve_warehouse(cfg: &rocky_core::config::RockyConfig) -> Option<(WarehouseType, f64, f64)> {
     let preferred = cfg
         .adapters
         .get("default")
@@ -703,6 +730,15 @@ fn print_table(out: &BackfillOutput) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The smallest `rocky.toml` the strict loader accepts. `rocky backfill`
+    /// needs one because the plan binds the routing identity.
+    const MINIMAL_CONFIG: &str = "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n";
+
+    /// Parses as TOML but fails a validator: `fivetran` is discovery-only and
+    /// needs `kind = "discovery"`. Present-and-broken, not absent.
+    const BROKEN_CONFIG: &str =
+        "[adapter.ft]\ntype = \"fivetran\"\napi_key = \"k\"\napi_secret = \"s\"\n";
 
     fn deps(pairs: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
         pairs
@@ -828,7 +864,11 @@ mod tests {
     fn estimate_cost_unavailable_without_history() {
         let models = vec!["m1".to_string(), "m2".to_string()];
         // No store, and a config path that does not exist ⇒ no warehouse.
-        let est = estimate_cost(&models, None, Path::new("/does/not/exist/rocky.toml"));
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("rocky.toml");
+        std::fs::write(&cfg_path, MINIMAL_CONFIG).unwrap();
+        let cfg = rocky_core::config::load_rocky_config(&cfg_path).unwrap();
+        let est = estimate_cost(&models, None, &cfg);
         assert!(est.is_estimate);
         assert_eq!(est.basis, "unavailable");
         assert!(est.total_cost_usd.is_none());
@@ -863,7 +903,12 @@ mod tests {
             .unwrap();
         }
         let state_path = root.join("state.redb");
-        let config_path = root.join("rocky.toml"); // absent — fine, degrades
+        // A loadable `rocky.toml` is now REQUIRED (#1680): the plan binds the
+        // routing identity apply verifies, and a plan without one is refused at
+        // apply. This fixture used to leave it absent, which composed a plan
+        // that could never be applied.
+        let config_path = root.join("rocky.toml");
+        std::fs::write(&config_path, MINIMAL_CONFIG).unwrap();
 
         run_backfill_in(
             root,
@@ -981,6 +1026,152 @@ mod tests {
             "a composed backfill carries both resume selectors, the shape that the backfill \
              apply arm does not validate — add validate_run_plan_execution_shape to \
              run_apply_backfill_plan"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // #1680 — a backfill plan must carry a routing identity or not exist.
+    // ------------------------------------------------------------------
+
+    /// Loads under the credential-TOLERANT loader, refuses under the strict
+    /// one this site keeps on purpose.
+    const UNSET_CREDENTIAL_CONFIG_1680: &str = "[adapters.wh]\ntype = \"databricks\"\n\
+         host = \"${ROCKY_T_1680_BACKFILL_UNSET}\"\n";
+
+    /// Two models and a state store, ready for `run_backfill_in`.
+    fn seed_backfill_project(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let models_dir = root.join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        for (name, sql) in [
+            ("a", "SELECT id FROM source.raw.t"),
+            ("b", "SELECT id FROM a"),
+        ] {
+            std::fs::write(models_dir.join(format!("{name}.sql")), sql).unwrap();
+            std::fs::write(
+                models_dir.join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                     [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{name}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        (models_dir, root.join("state.redb"))
+    }
+
+    fn compose(root: &Path, config_path: &Path) -> Result<()> {
+        let (models_dir, state_path) = seed_backfill_project(root);
+        run_backfill_in(
+            root,
+            config_path,
+            &state_path,
+            &models_dir,
+            &["a".to_string()],
+            false,
+            None,
+            None,
+            true,
+            true,
+        )
+    }
+
+    /// FAIL-BEFORE: with NO `rocky.toml` the routing identity cannot be
+    /// produced, and `rocky apply` refuses such a plan unconditionally
+    /// (`PlanKind::Backfill` forces the agent principal, so
+    /// `require_fingerprint` is always true). Composing it writes an artifact
+    /// nobody can use and an escalation nobody can clear. On unmodified
+    /// production code this returns `Ok` and persists that plan.
+    #[test]
+    fn backfill_refuses_when_the_routing_identity_cannot_be_produced() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let config_path = root.join("rocky.toml");
+        assert!(!config_path.exists());
+
+        let err = compose(root, &config_path)
+            .expect_err("a backfill with no loadable config must refuse");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failed to load config from") && rendered.contains("rocky.toml"),
+            "the refusal must name the config file, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("routing identity"),
+            "the refusal must say WHY a backfill needs the config: {rendered}"
+        );
+        assert!(
+            !root.join(".rocky").join("plans").exists(),
+            "a refused backfill must persist no plan"
+        );
+    }
+
+    /// The credential-placeholder case, which is why this ONE site keeps the
+    /// strict loader. `config_policy_identity` serializes the whole adapter
+    /// struct, connection fields included, and `rocky apply` recomputes it
+    /// from a strict load. A tolerant load holding a literal `${VAR}` would
+    /// bind an identity apply can never match — a false refusal at apply
+    /// instead of an honest one here.
+    #[test]
+    fn backfill_refuses_a_config_whose_credentials_do_not_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let config_path = root.join("rocky.toml");
+        std::fs::write(&config_path, UNSET_CREDENTIAL_CONFIG_1680).unwrap();
+
+        assert!(
+            rocky_core::config::load_optional_project_config(Some(&config_path))
+                .expect("the tolerant loader accepts it")
+                .is_some(),
+            "the fixture must be one the TOLERANT loader accepts, or this proves nothing"
+        );
+        assert!(
+            compose(root, &config_path).is_err(),
+            "the identity the apply gate compares must come from a STRICT load"
+        );
+    }
+
+    /// The healthy path, and the invariant behind the refusal: a composed
+    /// backfill plan ALWAYS carries a `config_identity`.
+    #[test]
+    fn a_composed_backfill_always_binds_a_routing_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let config_path = root.join("rocky.toml");
+        std::fs::write(&config_path, MINIMAL_CONFIG).unwrap();
+
+        compose(root, &config_path).expect("a loadable config composes a backfill");
+
+        let plans_dir = root.join(".rocky").join("plans");
+        let plan_id = std::fs::read_dir(&plans_dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                name.strip_suffix(".json").map(str::to_string)
+            })
+            .next()
+            .expect("a plan file");
+        let plan = crate::plan_store::read_plan(root, &plan_id).unwrap();
+        assert!(
+            plan.embedded_capabilities().config_identity.is_some(),
+            "every composed backfill binds the identity apply verifies"
+        );
+    }
+
+    /// The broken-config case already refuses UPSTREAM, at the step-1 compile
+    /// (`audit::compile_project`, converted by #1667). Pinned so a later
+    /// refactor that moves the compile cannot silently reopen it.
+    #[test]
+    fn backfill_refuses_a_present_but_unloadable_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let config_path = root.join("rocky.toml");
+        std::fs::write(&config_path, BROKEN_CONFIG).unwrap();
+
+        let err = compose(root, &config_path).expect_err("a broken config must refuse");
+        assert!(
+            format!("{err:#}").contains("failed to load config from"),
+            "the refusal must name the config file, got: {err:#}"
         );
     }
 }

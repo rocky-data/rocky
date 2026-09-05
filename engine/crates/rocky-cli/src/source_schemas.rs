@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
+use anyhow::Context;
 use chrono::Utc;
 use tracing::{debug, info};
 
@@ -121,7 +122,7 @@ pub(crate) fn load_cached_source_schemas(
 ///
 /// ```text
 ///   no rocky.toml            -> empty map   (cold, unchanged)
-///   rocky.toml does not load -> Err         (the loader's own error)
+///   rocky.toml does not load -> Err         (the loader's error, + the path)
 ///   loads                    -> TTL-filtered cache scan
 /// ```
 ///
@@ -140,7 +141,15 @@ pub(crate) fn load_project_source_schemas(
     state_path: &Path,
     cache_ttl_override: Option<u64>,
 ) -> anyhow::Result<HashMap<String, Vec<TypedColumn>>> {
-    let Some(config) = rocky_core::config::load_optional_project_config(Some(config_path))? else {
+    // Name the file in the refusal. `ConfigError`'s own Display carries the
+    // path only for `FileNotFound`; a parse error renders "failed to parse
+    // TOML: ..." and a validator error names the offending section, neither of
+    // which says WHICH config failed. Every caller of this helper takes
+    // `config_path` from a flag or a default, so the reader cannot infer it.
+    // Matches `rocky compile` / `rocky emit-sql`, which write the same context.
+    let loaded = rocky_core::config::load_optional_project_config(Some(config_path))
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    let Some(config) = loaded else {
         return Ok(HashMap::new());
     };
     let schema_cfg = config
