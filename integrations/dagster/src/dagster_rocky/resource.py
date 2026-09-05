@@ -66,6 +66,8 @@ from .types import (
     PlanResult,
     ProductApproveOutput,
     ProductCompileOutput,
+    ProductJournalOutput,
+    ProductListOutput,
     ProductStatusOutput,
     ProductVerifyOutput,
     PromotePlan,
@@ -891,6 +893,18 @@ class RockyResource(dg.ConfigurableResource):
         (never mutates, never recovers)."""
         with _translating():
             return self._get_client().product_status(product)
+
+    def product_list(self) -> ProductListOutput:
+        """Run ``rocky product list`` — every product the project knows,
+        one status row each, sorted by name. Read-only."""
+        with _translating():
+            return self._get_client().product_list()
+
+    def product_journal(self, product: str) -> ProductJournalOutput:
+        """Run ``rocky product journal <name>`` — the product's fulfillment
+        journal, every persisted transition in append order. Read-only."""
+        with _translating():
+            return self._get_client().product_journal(product)
 
     def run(
         self,

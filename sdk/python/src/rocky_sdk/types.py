@@ -1327,6 +1327,10 @@ from .types_generated import (  # noqa: E402, F401
     ProductApproveOutput,
     ProductArtifactOutput,
     ProductCompileOutput,
+    ProductJournalEntry,
+    ProductJournalOutput,
+    ProductListEntry,
+    ProductListOutput,
     ProductStatusOutput,
     ProductVerifyOutput,
     PromotePlan,
@@ -1482,6 +1486,8 @@ RockyOutput = (
     | ArchiveApplyOutput
     | ProductApproveOutput
     | ProductCompileOutput
+    | ProductListOutput
+    | ProductJournalOutput
     | ProductStatusOutput
     | ProductVerifyOutput
     | FulfillOutput
@@ -1529,6 +1535,8 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "product_compile": ProductCompileOutput,
     "product_approve": ProductApproveOutput,
     "product_status": ProductStatusOutput,
+    "product_list": ProductListOutput,
+    "product_journal": ProductJournalOutput,
     "fulfill": FulfillOutput,
 }
 

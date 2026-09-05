@@ -310,6 +310,26 @@ pub fn fulfill_state_key(product_name: &str) -> String {
     format!("product:{product_name}")
 }
 
+/// The product name a `product:<name>` record key names.
+///
+/// `None` for a journal-row key and for any key outside the `product:`
+/// namespace, so a scan over the table yields each product once. A journal
+/// row is recognised by the shape [`fulfill_journal_key`] writes — `#`
+/// followed by the sequence in at least eight ASCII digits at the end. The
+/// `{seq:08}` there is a minimum width, so a sequence past 99,999,999 is
+/// nine digits or more; the check is "eight or more digits", not "exactly
+/// eight". A bare `#` in a name does not make it a journal row.
+pub fn product_name_from_state_key(key: &str) -> Option<&str> {
+    let name = key.strip_prefix("product:")?;
+    if name.is_empty() {
+        return None;
+    }
+    let is_journal_row = name
+        .rsplit_once('#')
+        .is_some_and(|(_, seq)| seq.len() >= 8 && seq.bytes().all(|b| b.is_ascii_digit()));
+    if is_journal_row { None } else { Some(name) }
+}
+
 /// The key of one journal row: `product:<name>#<seq:08>`.
 ///
 /// The sequence is zero-padded to 8 digits so a lexicographic key scan
@@ -340,6 +360,44 @@ pub enum FulfillCas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The name scan must invert exactly the two key writers: a record key
+    /// yields its name, a journal key yields nothing, and a `#` inside a
+    /// name does not turn the record into a journal row.
+    #[test]
+    fn product_name_from_state_key_inverts_the_key_writers() {
+        assert_eq!(
+            product_name_from_state_key(&fulfill_state_key("revenue_daily")),
+            Some("revenue_daily")
+        );
+        assert_eq!(
+            product_name_from_state_key(&fulfill_journal_key("revenue_daily", 1)),
+            None
+        );
+        assert_eq!(
+            product_name_from_state_key(&fulfill_journal_key("revenue_daily", 99_999_999)),
+            None
+        );
+        // `{seq:08}` is a minimum width: past eight digits the key is
+        // still a journal row, up to the widest u64.
+        for seq in [100_000_000u64, 1_234_567_890, u64::MAX] {
+            assert_eq!(
+                product_name_from_state_key(&fulfill_journal_key("revenue_daily", seq)),
+                None,
+                "seq {seq}"
+            );
+        }
+        // A `#` that is not followed by eight or more digits is part of a name.
+        assert_eq!(product_name_from_state_key("product:a#b"), Some("a#b"));
+        assert_eq!(product_name_from_state_key("product:a#123"), Some("a#123"));
+        assert_eq!(
+            product_name_from_state_key("product:a#0000000x"),
+            Some("a#0000000x")
+        );
+        // Outside the namespace, or empty: nothing.
+        assert_eq!(product_name_from_state_key("run:abc"), None);
+        assert_eq!(product_name_from_state_key("product:"), None);
+    }
 
     /// `drafting_round` (#1493) must be readable in BOTH directions
     /// across the version that added it, because the record is persisted

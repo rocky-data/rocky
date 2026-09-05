@@ -8,6 +8,23 @@ from enum import StrEnum
 from pydantic import BaseModel, conint
 
 
+class AuditProductScope(BaseModel):
+    """
+    The product filter of `rocky audit --product <name>`, resolved from the product's spec before the ledger is read.
+
+    A product owns exactly one output model (`product.output.model`, which defaults to the product name), and the ledger records one row per plan per model, so the product's rows are the rows about that model. No plan file or journal is consulted.
+    """
+
+    name: str
+    """
+    The product name as given.
+    """
+    output_model: str
+    """
+    The output model the rows were filtered to.
+    """
+
+
 class PolicyCapability1(StrEnum):
     """
     Read model output / metadata. Always allowed.
@@ -206,6 +223,10 @@ class AuditOutput(BaseModel):
     command: str
     decisions: list[AuditDecisionEntry]
     """
-    Every recorded policy decision, oldest first.
+    Every recorded policy decision, oldest first. Under `product`, only the rows whose `model` is that product's output model.
+    """
+    product: AuditProductScope | None = None
+    """
+    The product the ledger was filtered to (`--product <name>`), absent when the whole ledger is listed.
     """
     version: str

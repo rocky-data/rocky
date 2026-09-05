@@ -26,9 +26,10 @@ use rocky_core::state::{PolicyDecisionRecord, RunRecord, StateStore};
 
 use crate::output::{
     AuditChainBlastRadius, AuditChainDecisions, AuditChainPlan, AuditChainRuns, AuditChainVerify,
-    AuditDecisionEntry, AuditForOutput, AuditOutput, AuditPlanChange, AuditRunEntry,
-    AuditScorecardOutput, AuditSubjectKind, AuditVerifyEntry, ScorecardDimension, ScorecardGroup,
-    ScorecardUnavailableMetric, ScorecardVerifyAfter, SectionAvailability, print_json,
+    AuditDecisionEntry, AuditForOutput, AuditOutput, AuditPlanChange, AuditProductScope,
+    AuditRunEntry, AuditScorecardOutput, AuditSubjectKind, AuditVerifyEntry, ScorecardDimension,
+    ScorecardGroup, ScorecardUnavailableMetric, ScorecardVerifyAfter, SectionAvailability,
+    print_json,
 };
 use crate::plan_store::read_plan;
 
@@ -42,7 +43,50 @@ const MAX_HISTORY_SCAN: usize = 10_000;
 /// Opens the state store read-only and lists the policy-decision ledger. An
 /// absent state file is not an error — it renders an empty ledger (no plan has
 /// been applied against a `[policy]` block yet).
-pub fn run_audit(state_path: &Path, output_json: bool) -> Result<()> {
+pub fn run_audit(state_path: &Path, product: Option<&str>, output_json: bool) -> Result<()> {
+    let scope = match product {
+        Some(name) => {
+            let root =
+                std::env::current_dir().context("failed to get current working directory")?;
+            Some(resolve_product_scope(&root, name).map_err(|reject| anyhow::anyhow!("{reject}"))?)
+        }
+        None => None,
+    };
+    let output = compute_audit(state_path, scope)?;
+
+    if output_json {
+        print_json(&output)?;
+    } else {
+        render_text(&output);
+    }
+    Ok(())
+}
+
+/// Resolve `--product <name>` to the filter the ledger is scoped by: the
+/// product's one output model, read from `products/<name>.toml` under `root`
+/// through the same loader `rocky product status` uses.
+///
+/// # Errors
+///
+/// The loader's rejection: `spec-file-missing` when no spec exists under the
+/// name, or the parse or name-mismatch rejection for a spec that does.
+pub fn resolve_product_scope(
+    root: &Path,
+    product: &str,
+) -> rocky_core::product::spec::SpecResult<AuditProductScope> {
+    let parsed = crate::commands::product::load_spec(root, product)?;
+    Ok(AuditProductScope {
+        name: product.to_string(),
+        output_model: parsed.product().output_model().to_string(),
+    })
+}
+
+/// Compose the ledger without rendering it: every recorded decision, oldest
+/// first, or under `product` only the rows about that product's output model.
+///
+/// The reusable core behind `rocky audit` and `GET /api/v1/audit`. Opens the
+/// store read-only; an absent store is an empty ledger, not an error.
+pub fn compute_audit(state_path: &Path, product: Option<AuditProductScope>) -> Result<AuditOutput> {
     let decisions = if state_path.exists() {
         let store = StateStore::open_read_only(state_path)
             .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
@@ -53,20 +97,22 @@ pub fn run_audit(state_path: &Path, output_json: bool) -> Result<()> {
         Vec::new()
     };
 
-    let entries: Vec<AuditDecisionEntry> = decisions.into_iter().map(to_decision_entry).collect();
+    let entries: Vec<AuditDecisionEntry> = decisions
+        .into_iter()
+        .filter(|d| {
+            product
+                .as_ref()
+                .is_none_or(|scope| d.model == scope.output_model)
+        })
+        .map(to_decision_entry)
+        .collect();
 
-    let output = AuditOutput {
+    Ok(AuditOutput {
         version: VERSION.to_string(),
         command: "audit".to_string(),
+        product,
         decisions: entries,
-    };
-
-    if output_json {
-        print_json(&output)?;
-    } else {
-        render_text(&output);
-    }
-    Ok(())
+    })
 }
 
 /// Map a ledger record to its serializable entry.
@@ -917,7 +963,10 @@ fn load_decisions_for_scorecard(state_path: &Path) -> Result<Vec<PolicyDecisionR
 /// fail-closed section and never a panic — an absurd magnitude (`100000000d`)
 /// bails with the same clean error as a syntactic one, never overflowing the
 /// `TimeDelta` / `DateTime` subtraction.
-fn parse_window(window: Option<&str>, now: DateTime<Utc>) -> Result<Option<DateTime<Utc>>> {
+pub(crate) fn parse_window(
+    window: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>> {
     let Some(raw) = window else {
         return Ok(None);
     };
@@ -1270,6 +1319,75 @@ mod tests {
         assert!(ld.is_empty() && lt.is_empty());
         // An unknown model is absent from the graph.
         assert!(blast_radius_of(&result, "nope").is_none());
+    }
+
+    /// The answer key's spec fixture: product `revenue_daily`, output model
+    /// `revenue_daily`.
+    const SPEC_FIXTURE: &str =
+        include_str!("../../../rocky-core/src/product/testdata/revenue_daily.spec.toml");
+
+    /// `compute_audit` lists the whole ledger oldest first, and under a
+    /// product scope keeps only the rows about the product's output model,
+    /// which is the spec's `output.model`, not its name.
+    #[test]
+    fn compute_audit_scopes_the_ledger_to_the_products_output_model() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let state_path = root.join("state.redb");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            for (secs, plan, model, effect) in [
+                (1, "plan-a", "revenue_daily", PolicyEffect::Allow),
+                (2, "plan-b", "orders", PolicyEffect::Deny),
+                (3, "plan-c", "revenue_daily", PolicyEffect::RequireReview),
+            ] {
+                store
+                    .record_policy_decision(&decision(secs, plan, model, effect))
+                    .unwrap();
+            }
+        }
+        let plan_ids = |out: &AuditOutput| -> Vec<String> {
+            out.decisions.iter().map(|d| d.plan_id.clone()).collect()
+        };
+
+        let whole = compute_audit(&state_path, None).unwrap();
+        assert!(whole.product.is_none());
+        assert_eq!(plan_ids(&whole), ["plan-a", "plan-b", "plan-c"]);
+
+        // `daily_revenue` names `revenue_daily` as its output model.
+        fs::create_dir_all(root.join("products")).unwrap();
+        fs::write(
+            root.join("products/daily_revenue.toml"),
+            SPEC_FIXTURE.replace("name   = \"revenue_daily\"", "name   = \"daily_revenue\""),
+        )
+        .unwrap();
+        let scope = resolve_product_scope(root, "daily_revenue").unwrap();
+        assert_eq!(
+            scope,
+            AuditProductScope {
+                name: "daily_revenue".to_string(),
+                output_model: "revenue_daily".to_string(),
+            }
+        );
+        let scoped = compute_audit(&state_path, Some(scope.clone())).unwrap();
+        assert_eq!(scoped.product, Some(scope));
+        assert_eq!(plan_ids(&scoped), ["plan-a", "plan-c"]);
+
+        // No spec under the name, and a spec that declares another name:
+        // the loader's own codes, which the route maps to 404 and 409.
+        assert_eq!(
+            resolve_product_scope(root, "nope").unwrap_err().code,
+            "spec-file-missing"
+        );
+        fs::write(root.join("products/other.toml"), SPEC_FIXTURE).unwrap();
+        assert_eq!(
+            resolve_product_scope(root, "other").unwrap_err().code,
+            "product-name-mismatch"
+        );
+
+        // An absent store is an empty ledger, scoped or not.
+        let empty = compute_audit(&root.join("missing.redb"), None).unwrap();
+        assert!(empty.decisions.is_empty());
     }
 
     /// FIX: a selector that matches ledger plan_ids must resolve as a Plan
