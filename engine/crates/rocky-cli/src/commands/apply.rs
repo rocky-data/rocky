@@ -1311,14 +1311,17 @@ pub(crate) async fn sync_remote_ledger_before_gate(
     // WP-01 PR-B (2b): the session half-seam owns the download shape; a
     // successful download of either usable variant means the local ledger now
     // mirrors remote truth; failure still `?`-bails fail-closed (unchanged).
-    let _authority =
-        rocky_core::state_sync::RemoteStateSession::download_only(&state_cfg, state_path)
-            .await
-            .with_context(|| {
-                "failed to download remote state before the agent-policy gate; a remote-backend \
+    let _authority = rocky_core::state_sync::RemoteStateSession::download_only(
+        &state_cfg,
+        state_path,
+        cfg.cache.schemas.replicate,
+    )
+    .await
+    .with_context(|| {
+        "failed to download remote state before the agent-policy gate; a remote-backend \
              governed apply requires the state backend reachable so a cross-pod freeze/budget \
              decision is enforced"
-            })?;
+    })?;
     Ok(())
 }
 
@@ -1339,7 +1342,11 @@ fn sync_remote_ledger_before_gate_blocking(
     };
     // WP-01 PR-B (2b): half-seam download — see `sync_remote_ledger_before_gate`.
     let _authority = crate::commands::policy::block_on_state_sync(
-        rocky_core::state_sync::RemoteStateSession::download_only(&state_cfg, state_path),
+        rocky_core::state_sync::RemoteStateSession::download_only(
+            &state_cfg,
+            state_path,
+            cfg.cache.schemas.replicate,
+        ),
     )
     .with_context(|| {
         "failed to download remote state before the promote policy gate; a remote-backend \
@@ -1442,16 +1449,19 @@ pub(crate) async fn download_remote_ledger_unconditional(
         return Ok(());
     }
     // WP-01 PR-B (2b): half-seam download — see `sync_remote_ledger_before_gate`.
-    let _authority =
-        rocky_core::state_sync::RemoteStateSession::download_only(&cfg.state, state_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to download remote state before {context_label}; a remote-backend \
+    let _authority = rocky_core::state_sync::RemoteStateSession::download_only(
+        &cfg.state,
+        state_path,
+        cfg.cache.schemas.replicate,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to download remote state before {context_label}; a remote-backend \
                  {context_label} requires the state backend reachable to read the authoritative \
                  ledger"
-                )
-            })?;
+        )
+    })?;
     Ok(())
 }
 
@@ -1477,6 +1487,7 @@ pub(crate) async fn upload_remote_ledger_fail_closed(
         &cfg.state,
         state_path,
         context_label,
+        cfg.cache.schemas.replicate,
     )
     .await
     .with_context(|| {
@@ -3778,10 +3789,15 @@ async fn run_apply_backfill_plan(
         .as_ref()
         .map(|l| l.config.state.clone())
         .unwrap_or_default();
+    // Absent config → false, i.e. the pre-existing local-only table set (#1620).
+    let backfill_replicate = cfg
+        .as_ref()
+        .is_some_and(|l| l.config.cache.schemas.replicate);
     let mut session = rocky_core::state_sync::RemoteStateSession::new(
         &backfill_state_cfg,
         state_path,
         rocky_core::state_sync::FinalizeDurability::Durable,
+        backfill_replicate,
     );
     if let Err(e) = session.acquire().await {
         // Unreachable on a fresh session (`Err` = double-acquire misuse);

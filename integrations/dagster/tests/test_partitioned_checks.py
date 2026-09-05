@@ -116,7 +116,9 @@ def test_build_check_specs_threads_partitions_def_to_every_spec():
     groups = _build_group_contexts(_discover_two_tables(), RockyDagsterTranslator())
     pdef = dg.DynamicPartitionsDefinition(name="tenants")
 
-    specs = _build_check_specs(groups, surface_compliance=True, partitions_def=pdef)
+    specs = _build_check_specs(
+        groups, declare_freshness=True, surface_compliance=True, partitions_def=pdef
+    )
 
     assert specs, "expected default + compliance check specs"
     assert all(s.partitions_def is pdef for s in specs)
@@ -125,7 +127,7 @@ def test_build_check_specs_threads_partitions_def_to_every_spec():
 def test_build_check_specs_defaults_to_unpartitioned():
     groups = _build_group_contexts(_discover_two_tables(), RockyDagsterTranslator())
 
-    specs = _build_check_specs(groups)
+    specs = _build_check_specs(groups, declare_freshness=True)
 
     assert specs
     assert all(s.partitions_def is None for s in specs)
