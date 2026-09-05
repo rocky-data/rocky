@@ -1197,6 +1197,10 @@
       },
       "type": "array"
     },
+    "check_gate_failed": {
+      "description": "`true` when this run's declared checks failed in a way that must fail the run: at least one **error-severity** check failed (a check the engine could not evaluate counts as a failure — `not_evaluated` always carries `passed: false`) **and** the pipeline's `[pipeline.<name>.checks] fail_on_error` gate is on.\n\nDeliberately NOT folded into `tables_failed`, which stays a count of tables and models and never counts checks. This is a gate, not a tally: it is `false` when every failed check is warning-severity, and `false` whenever the pipeline sets `fail_on_error = false`. The raw per-check outcomes are in `check_results` either way — count those if you want the number of failed checks.\n\n`derive_run_status` reads it, so a run whose only failure is the check gate still reports `partial_failure` / `failure` here, in the persisted run record, and in the process exit code. Omitted from the JSON when `false`, so a run that did not trip the gate is unchanged on the wire.",
+      "type": "boolean"
+    },
     "check_results": {
       "items": {
         "$ref": "#/definitions/TableCheckOutput"

@@ -6691,8 +6691,10 @@ mod run_record_tests {
     fn derive_run_status_check_gate_on_a_fully_copied_run_is_partial() {
         let mut out = RunOutput::new(String::new(), 0, 1);
         out.tables_copied = 2;
-        out.check_results
-            .push(checks_for("orders", vec![rocky_core::checks::check_row_count(10, 7)]));
+        out.check_results.push(checks_for(
+            "orders",
+            vec![rocky_core::checks::check_row_count(10, 7)],
+        ));
         out.check_gate_failed = true;
         assert!(matches!(out.derive_run_status(), RunStatus::PartialFailure));
         assert_eq!(
@@ -6709,8 +6711,10 @@ mod run_record_tests {
     fn derive_run_status_ignores_failed_checks_without_the_gate() {
         let mut out = RunOutput::new(String::new(), 0, 1);
         out.tables_copied = 2;
-        out.check_results
-            .push(checks_for("orders", vec![rocky_core::checks::check_row_count(10, 7)]));
+        out.check_results.push(checks_for(
+            "orders",
+            vec![rocky_core::checks::check_row_count(10, 7)],
+        ));
         assert!(!out.check_gate_failed);
         assert!(matches!(out.derive_run_status(), RunStatus::Success));
     }
@@ -6749,8 +6753,10 @@ mod run_record_tests {
     fn a_check_gated_run_records_partial_failure_and_no_failed_model() {
         let mut out = RunOutput::new(String::new(), 0, 1);
         out.tables_copied = 1;
-        out.check_results
-            .push(checks_for("orders", vec![rocky_core::checks::check_row_count(10, 7)]));
+        out.check_results.push(checks_for(
+            "orders",
+            vec![rocky_core::checks::check_row_count(10, 7)],
+        ));
         out.check_gate_failed = true;
 
         let started = fixed_start();

@@ -460,6 +460,12 @@ class RunResult(BaseModel):
     duration_ms: int
     tables_copied: int
     tables_failed: int = 0
+    #: ``True`` when the run's error-severity checks failed and the pipeline's
+    #: ``fail_on_error`` gate is on, so the check outcome failed the run. A gate,
+    #: not a tally — it is ``False`` when every failed check is warning-severity
+    #: and when ``fail_on_error = false``. Count :attr:`check_results` for the
+    #: number of failed checks. Omitted from the wire when ``False``.
+    check_gate_failed: bool = False
     #: Tables short-circuited via the idempotency key. Defaults to 0.
     tables_skipped: int = 0
     materializations: list[MaterializationInfo]

@@ -141,7 +141,10 @@ fn a_failed_error_severity_check_fails_the_run_on_every_surface() {
     // Both resume entry points refuse: every table copied, so a resume would
     // copy nothing, run no check, and exit 0 on still-violating data.
     let run_id = latest["run_id"].as_str().expect("run_id");
-    for args in [vec!["run", "--resume", run_id], vec!["run", "--resume-latest"]] {
+    for args in [
+        vec!["run", "--resume", run_id],
+        vec!["run", "--resume-latest"],
+    ] {
         let resumed = rocky(dir, &args);
         assert!(
             !resumed.status.success(),

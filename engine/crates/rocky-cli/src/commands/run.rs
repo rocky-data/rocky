@@ -13720,10 +13720,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             store.init_run_progress("run-1", 2, Some(&scope)).unwrap();
             complete_tables(&store, "run-1", 1);
             store
-                .record_table_progress(
-                    "run-1",
-                    &table_entry(1, "wh.staging_p1__acme.t1", status),
-                )
+                .record_table_progress("run-1", &table_entry(1, "wh.staging_p1__acme.t1", status))
                 .unwrap();
             seed_run_record(&store, "run-1", "PartialFailure");
 
@@ -15160,7 +15157,14 @@ auto_create_schemas = true
         // checkpoint with no record. (The complete-checkpoint crash, a kill
         // after the last table, is
         // `resume_latest_resumes_a_run_that_crashed_after_its_last_table`.)
-        for (run_record_status, planned_tables) in [(None, 2), (Some("Failure"), 1)] {
+        //
+        // The `Failure` case plans two as well, because #1598 refuses a
+        // *complete* checkpoint whose run failed with no failed model: a
+        // resume of that copies nothing and runs no check. A failed run that
+        // left a table behind is the shape this test is about, and it stays
+        // resumable. The refusal has its own coverage in
+        // `resume_refuses_a_complete_checkpoint_whose_failure_was_not_a_copy_or_a_model`.
+        for (run_record_status, planned_tables) in [(None, 2), (Some("Failure"), 2)] {
             let dir = tempfile::tempdir().unwrap();
             let (config_path, state_path, db_path) = write_two_pipeline_project(
                 dir.path(),
@@ -15489,7 +15493,13 @@ auto_create_schemas = true
         );
 
         // A resumable checkpoint against warehouse A: the run completed its
-        // table, and its record says Failure (so #1548 does not refuse it).
+        // table, and its record says PartialFailure with a failed model (so
+        // neither #1548 nor #1598 refuses it). The failed-model half matters:
+        // this run copied everything it planned, and #1598 refuses a complete
+        // checkpoint whose failure was neither a copy nor a model, because a
+        // resume of that would copy nothing. A failed model phase re-runs on a
+        // resume, so it is genuinely resumable — which is what this test needs
+        // to reach its real subject, the endpoint scope.
         drive_resume_test_run(&config_path, &state_path, "p2", None, false)
             .await
             .expect("p2 runs fresh against warehouse A");
@@ -15497,7 +15507,7 @@ auto_create_schemas = true
         let run_id = {
             let store = StateStore::open(&state_path).unwrap();
             let run_id = store.get_latest_run_progress().unwrap().unwrap().run_id;
-            seed_run_record(&store, &run_id, "Failure");
+            seed_run_record_with_a_failed_model(&store, &run_id, "PartialFailure");
             run_id
         };
         let endpoint_a = std::fs::canonicalize(&db_a).unwrap().display().to_string();
@@ -19590,9 +19600,15 @@ backend = "local"
 
     /// One failing check bag for a table, as the replication runner
     /// assembles it.
-    fn failing_check_bag(check: rocky_core::checks::CheckResult) -> crate::output::TableCheckOutput {
+    fn failing_check_bag(
+        check: rocky_core::checks::CheckResult,
+    ) -> crate::output::TableCheckOutput {
         crate::output::TableCheckOutput {
-            asset_key: vec!["wh".to_string(), "staging".to_string(), "orders".to_string()],
+            asset_key: vec![
+                "wh".to_string(),
+                "staging".to_string(),
+                "orders".to_string(),
+            ],
             checks: vec![check],
         }
     }
@@ -19623,11 +19639,36 @@ backend = "local"
         let passed = rocky_core::checks::check_row_count(10, 10);
 
         let cases: Vec<(&str, rocky_core::checks::CheckResult, &str, bool)> = vec![
-            ("row_count = true", failed_error.clone(), "an error-severity failure gates by default", true),
-            ("fail_on_error = false", failed_error, "fail_on_error = false keeps every check advisory", false),
-            ("row_count = true", failed_warning, "a warning-severity failure never gates", false),
-            ("row_count = true", not_evaluated_error, "a check that could not be evaluated gates", true),
-            ("row_count = true", passed, "a passing check never gates", false),
+            (
+                "row_count = true",
+                failed_error.clone(),
+                "an error-severity failure gates by default",
+                true,
+            ),
+            (
+                "fail_on_error = false",
+                failed_error,
+                "fail_on_error = false keeps every check advisory",
+                false,
+            ),
+            (
+                "row_count = true",
+                failed_warning,
+                "a warning-severity failure never gates",
+                false,
+            ),
+            (
+                "row_count = true",
+                not_evaluated_error,
+                "a check that could not be evaluated gates",
+                true,
+            ),
+            (
+                "row_count = true",
+                passed,
+                "a passing check never gates",
+                false,
+            ),
         ];
 
         for (config, check, why, expected) in cases {
@@ -19652,7 +19693,9 @@ backend = "local"
         let mut out = RunOutput::new(String::new(), 0, 1);
         out.tables_copied = 2;
         out.check_results
-            .push(failing_check_bag(rocky_core::checks::check_row_count(10, 7)));
+            .push(failing_check_bag(rocky_core::checks::check_row_count(
+                10, 7,
+            )));
         out.check_gate_failed = true;
         let no_errors: Vec<TableError> = Vec::new();
 
