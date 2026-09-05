@@ -515,7 +515,11 @@ pub async fn tick_once(
     if !opts.dry_run {
         sweep_orphan_claims(&schedules, phase.store(), &opts.rocky_dir, now)?;
         // Bound the id-dedup window: drop `.done` tombstones past their TTL.
-        if let Err(e) = spool::sweep_tombstones(&spool::spool_dir(&opts.rocky_dir), now) {
+        // `sweep_tombstones` resolves the spool itself, so it takes the `.rocky`
+        // dir — the same argument `list_pending_files` takes above. Passing
+        // `spool_dir(..)` resolved it twice and swept a path that never exists
+        // (#1711); `SpoolDir` now makes that a compile error.
+        if let Err(e) = spool::sweep_tombstones(&opts.rocky_dir, now) {
             tracing::warn!(error = %e, "webhook tombstone sweep failed");
         }
     }
@@ -3457,6 +3461,202 @@ adapter = "db"
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    // --- tombstone sweep, through the production tick (#1711) ----------------
+
+    /// The one `.done` tombstone in `spool`. Fails loudly if there is not
+    /// exactly one — the on-disk name is a hash, so a test must never hand-write
+    /// it.
+    fn only_tombstone(spool: &spool::SpoolDir) -> std::path::PathBuf {
+        let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(spool)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().ends_with(".done"))
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "expected exactly one tombstone in {}",
+            spool.as_path().display()
+        );
+        found.pop().unwrap()
+    }
+
+    /// Stamp `at` onto a tombstone's mtime.
+    ///
+    /// The sweep compares the mtime against the `now` handed to the tick, while
+    /// `dispose` stamps real wall-clock. `webhook_now()` is a fixed past
+    /// instant, so ageing a tombstone against wall-clock would leave it in the
+    /// tick's FUTURE and nothing would expire. Age relative to the tick instant.
+    fn age_tombstone(path: &std::path::Path, at: DateTime<Utc>) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::from(at))
+            .unwrap();
+    }
+
+    /// #1711: the tick's tombstone sweep must run on the spool directory the
+    /// scheduler actually writes to.
+    ///
+    /// The caller handed `sweep_tombstones` an already-resolved spool path,
+    /// which the callee resolved again, so every real tick swept
+    /// `.rocky/pending-demands/pending-demands`. That directory never exists,
+    /// so the sweep returned `Ok(0)` and the tombstone stayed forever. The
+    /// unit test in `spool.rs` could not see it: it calls `sweep_tombstones`
+    /// directly with the right path, proving the callee and not the caller.
+    #[test]
+    fn a_tick_sweeps_an_expired_tombstone_from_the_spool_the_scheduler_writes() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(WEBHOOK_TARGETS);
+        accept_and_read_uid(&opts.rocky_dir, "raw", spool::WebhookKind::Id, "evt-1");
+
+        // Tick 1 consumes the demand; id disposal leaves a `.done` tombstone.
+        let spawner = CapturingSpawner::new(0);
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            webhook_now(),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        assert_eq!(spawner.run_count(), 1);
+
+        let spool_path = spool::spool_dir(&opts.rocky_dir);
+        let tombstone = only_tombstone(&spool_path);
+        age_tombstone(
+            &tombstone,
+            webhook_now() - spool::TOMBSTONE_TTL - chrono::Duration::hours(1),
+        );
+
+        // Tick 2 must sweep it. This is the assertion that fails on an
+        // unfixed tree: the file is still there.
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            webhook_now(),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        assert!(
+            !tombstone.exists(),
+            "a tick must sweep an expired tombstone out of {}",
+            spool_path.as_path().display()
+        );
+        assert!(
+            std::fs::read_dir(&spool_path).unwrap().next().is_none(),
+            "the swept spool is empty — the sweep left nothing behind"
+        );
+        assert_eq!(spawner.run_count(), 1, "the sweep tick runs nothing");
+    }
+
+    /// Honest-failure control: a sweep with nothing to expire removes nothing.
+    ///
+    /// A tombstone still inside [`spool::TOMBSTONE_TTL`] keeps the id-dedup
+    /// window closed, and a quarantined corruption is not a tombstone at all —
+    /// the sweep must leave both exactly where they are.
+    #[test]
+    fn a_tick_sweep_keeps_a_fresh_tombstone_and_never_touches_another_file() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(WEBHOOK_TARGETS);
+        accept_and_read_uid(&opts.rocky_dir, "raw", spool::WebhookKind::Id, "evt-1");
+
+        let spawner = CapturingSpawner::new(0);
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            webhook_now(),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+
+        let spool_path = spool::spool_dir(&opts.rocky_dir);
+        let tombstone = only_tombstone(&spool_path);
+        // One hour INSIDE the window, measured from the tick's own instant.
+        age_tombstone(
+            &tombstone,
+            webhook_now() - spool::TOMBSTONE_TTL + chrono::Duration::hours(1),
+        );
+        // A quarantined corruption sits alongside it. `list_pending_files`
+        // skips it, and the sweep must too.
+        let corrupt = spool_path.join("deadbeef.corrupt-1746154800");
+        std::fs::write(&corrupt, b"not json").unwrap();
+
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            webhook_now(),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        assert!(
+            tombstone.exists(),
+            "a tombstone inside the TTL closes the dedup window and must survive"
+        );
+        assert!(
+            corrupt.exists(),
+            "the sweep must not touch a file that is not a tombstone"
+        );
+    }
+
+    /// Honest-failure control: the sweep never removes a PENDING demand.
+    ///
+    /// A paused pipeline's deferred delivery is an accepted 202 that has not
+    /// run yet. It shares the directory with an expired tombstone, so the tick
+    /// that sweeps one must leave the other.
+    #[test]
+    fn a_tick_sweep_keeps_a_pending_demand_while_removing_an_expired_tombstone() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(WEBHOOK_TARGETS);
+        accept_and_read_uid(&opts.rocky_dir, "raw", spool::WebhookKind::Id, "evt-1");
+
+        let spawner = CapturingSpawner::new(0);
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            webhook_now(),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        assert_eq!(spawner.run_count(), 1);
+
+        let spool_path = spool::spool_dir(&opts.rocky_dir);
+        let tombstone = only_tombstone(&spool_path);
+        age_tombstone(
+            &tombstone,
+            webhook_now() - spool::TOMBSTONE_TTL - chrono::Duration::hours(1),
+        );
+
+        // A second delivery lands while the pipeline is paused, so the next
+        // tick defers it and leaves the file pending.
+        with_store(&state_path, |store| {
+            store.set_schedule_paused("raw", true).unwrap();
+        });
+        accept_and_read_uid(&opts.rocky_dir, "raw", spool::WebhookKind::Id, "evt-2");
+
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            webhook_now(),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        assert!(!tombstone.exists(), "the expired tombstone is swept");
+        assert_eq!(
+            spool::list_pending_files(&opts.rocky_dir).unwrap().len(),
+            1,
+            "the deferred delivery is still pending — the sweep left it alone"
+        );
+        assert_eq!(spawner.run_count(), 1, "the paused pipeline did not run");
     }
 
     /// A delivery id shaped like a reserved control affix (`x.corrupt-9`) is

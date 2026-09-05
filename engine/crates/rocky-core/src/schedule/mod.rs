@@ -43,4 +43,4 @@ pub use spawn::{
     CapturingSpawner, DEFAULT_DRAIN_TIMEOUT, Drain, RunOutcome, RunTriggerKind, SpawnRequest,
     Spawner, SubprocessSpawner, TraceContext,
 };
-pub use spool::{AcceptOutcome, PendingDemand, WebhookKind, accept, spool_dir};
+pub use spool::{AcceptOutcome, PendingDemand, SpoolDir, WebhookKind, accept, spool_dir};
