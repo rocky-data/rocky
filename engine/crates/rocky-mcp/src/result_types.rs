@@ -59,10 +59,22 @@ pub struct PlannedStatementLite {
     pub sql: String,
 }
 
-/// `plan_preview` result — the SQL the runner would emit for the model(s).
+/// `plan_preview` result — the SQL that renders offline for the model(s).
+///
+/// NOT the whole plan, and the distinction is the whole reason this doc
+/// comment is worded carefully. `commands::plan_preview_output` renders with
+/// no warehouse and SKIPS any model `sql_gen` cannot render that way; there
+/// is no field here that names one, so a skipped model leaves no trace and a
+/// short `statements` list is not a short plan.
+///
+/// This is not served text today — rmcp emits no `output_schema`, and
+/// `worker_result_text_names_no_excluded_tool` pins that absence — but it is
+/// kept true for the same reason `draft_check_next_steps` is: it is what
+/// would be wrong first if the schema were ever opted in.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PlanPreviewResult {
-    /// Generated statements, in execution order.
+    /// Statements Rocky could render offline, in execution order. A model
+    /// whose SQL needs a live warehouse is absent and unnamed.
     pub statements: Vec<PlannedStatementLite>,
 }
 
@@ -103,18 +115,67 @@ pub struct LineageResult {
 }
 
 /// One failing test in a `test` result.
+///
+/// `name` is the model name for a model-execution failure, and
+/// `<model>::<test>` for a fixture `[[test]]` failure. `suite` says which of
+/// the two produced it, so a caller never has to guess from the name shape.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct TestFailureLite {
     pub name: String,
     pub error: String,
+    /// `"model"` or `"unit"` — which suite this failure came from.
+    pub suite: String,
 }
 
-/// `test` result — DuckDB-backed local assertions.
+/// Pass/fail counts for one of the two suites `rocky test` runs.
 #[derive(Debug, Serialize, JsonSchema)]
-pub struct TestResult {
+pub struct TestSuiteCounts {
     pub total: usize,
     pub passed: usize,
+    pub failed: usize,
+}
+
+/// `test` result — BOTH DuckDB-backed local suites, in one shape.
+///
+/// `rocky test` runs two things, and this result used to report one of them.
+/// `commands::test_output` returns model-execution counts (`total`, `passed`,
+/// `failures`) AND a separate `unit_tests` summary for the fixture-driven
+/// `[[test]]` blocks in model sidecars. This struct read only the first
+/// three. A project whose models all execute but whose fixture test FAILS
+/// came back as `failures: []` — byte-identical to a clean run.
+///
+/// That is a vacuous pass, and the worker prompt made it worse than
+/// harmless: `fix_failing_test` promises unit-test results and tells the
+/// worker to stop when the tests pass. A worker read the empty list, saw
+/// green, and stopped with a failing test on disk.
+///
+/// So the two suites are AGGREGATED here, not just exposed side by side:
+///
+/// - `total` / `passed` are the sum across both suites.
+/// - `failures` carries failures from both, tagged by `suite`.
+/// - `all_passed` is the single field to branch on. It is true only when
+///   both suites are clean.
+/// - `models` and `unit_tests` break the totals back down, so nothing is
+///   lost by summing them.
+///
+/// `unit_tests` is always present. A project that declares no `[[test]]`
+/// block reports `{total: 0, passed: 0, failed: 0}` rather than omitting
+/// the field — "none declared" and "all passed" are different facts, and an
+/// absent field states neither.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct TestResult {
+    /// Model executions plus fixture unit tests.
+    pub total: usize,
+    /// Model executions plus fixture unit tests that passed.
+    pub passed: usize,
+    /// Every failure from both suites.
     pub failures: Vec<TestFailureLite>,
+    /// True only when both suites are clean. Branch on this.
+    pub all_passed: bool,
+    /// The model-execution suite on its own.
+    pub models: TestSuiteCounts,
+    /// The fixture `[[test]]` suite on its own.
+    pub unit_tests: TestSuiteCounts,
 }
 
 /// One row in a `list` result. Each `kind` populates a distinct subset of

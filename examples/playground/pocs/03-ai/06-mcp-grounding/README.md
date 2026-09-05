@@ -105,7 +105,7 @@ The MCP grounding tools read the **warehouse**, so the source data must exist in
 3. **`profile_column`** on `seeds.orders` / `amount_cents` — sees the scale: values like 12500, 30000, 45000. Integer cents, not dollars. On `status`, the result's `top_values` lists the exact literals (`COMPLETE`, `PENDING`, `CANCELLED`) that a `min`/`max` pair would hide.
 4. **Writes the model** — `WHERE status = 'COMPLETE'`, `SUM(amount_cents) / 100.0 AS revenue_usd`. Equivalent to `revenue_correct.sql`.
 5. **`compile`** — type-checks clean. So would the naive model; compile is necessary, not sufficient.
-6. **`plan_preview`** — reads the exact SQL that would run and confirms it matches intent.
+6. **`plan_preview`** — reads the SQL Rocky generates offline and confirms it matches intent. It is not the whole plan: a model it cannot render offline is skipped and is not named in the result. This model is a plain `full_refresh`, so it renders.
 7. **`propose`** — records an AI-authored plan and returns a `plan_id`. The agent stops here. It does not apply.
 8. **Human review** — you run `rocky review <plan-id>` to read the breaking-change report, then `rocky review <plan-id> --approve` to sign off, then `rocky apply <plan-id>` to materialize.
 9. **`rocky test --declarative`** — the `SUM(revenue_usd) = 1000` assertion reconciles green.

@@ -611,6 +611,89 @@ pub(crate) fn dialect_for_adapter_type(
     }
 }
 
+/// Resolve the dialect an OFFLINE renderer previews SQL in, refusing a
+/// malformed `rocky.toml` instead of silently defaulting to DuckDB.
+///
+/// # Why this is one function and not two
+///
+/// SIXTEENTH ROUND, finding 1. `plan_preview_output` and
+/// `emit_sql::resolve_dialect` each carried their own copy of this resolution,
+/// and `emit_sql`'s doc comment asserted the two "mirror" each other. Both
+/// swallowed EVERY config error with `.ok()` and fell through to DuckDB.
+/// `main`'s #1521/#1522 had already made `rocky compile` refuse a malformed
+/// config on the sibling path, so a broken Snowflake `rocky.toml` failed
+/// `compile` while `plan_preview` cheerfully returned DUCKDB-rendered SQL for
+/// a project whose config cannot even load. Two aligned reads, one of them
+/// fixed, is how that gap opened; sharing the body is what keeps "mirrors"
+/// true by construction rather than by assertion.
+///
+/// # What is tolerated, and what is not
+///
+/// Three tolerant paths are deliberate and must stay:
+///
+/// - `config_path == None` — the standalone `--models <dir>` case, no project
+///   file was named at all. Resolves DuckDB.
+/// - [`ConfigError::FileNotFound`](rocky_core::config::ConfigError::FileNotFound)
+///   — `--config` defaults to `rocky.toml`, so this path runs even when the
+///   user passed no flag and no project file exists. Resolves DuckDB.
+/// - An unset `${CREDENTIAL}` in an adapter's connection fields. Both
+///   callers are OFFLINE renderers whose published contract is "without a
+///   warehouse connection" and "resolved from `rocky.toml` without
+///   credentials", so the load runs under
+///   [`load_rocky_config_credential_tolerant`](rocky_core::config::load_rocky_config_credential_tolerant)
+///   and the placeholder survives as literal text. The tolerance is scoped
+///   to those fields (#1558): an unset variable anywhere else — an adapter
+///   `type`, an `[imports]` path — still refuses, because it selects
+///   behaviour rather than describing an endpoint.
+///
+/// SEVENTEENTH ROUND, finding 1: the round-sixteen version of this function
+/// used the full `load_rocky_config`, which expands env vars. An initialized
+/// Databricks project with `${DATABRICKS_HOST}` unset therefore failed BOTH
+/// `rocky emit-sql` and MCP `plan_preview` before either touched a warehouse
+/// — a user-facing regression against the documented no-credentials contract.
+/// Refusing a MALFORMED config is the fix that round wanted; refusing an
+/// UNRESOLVED credential was a separate behaviour change riding along with it.
+///
+/// Every OTHER `ConfigError` still propagates: a parse error, a validator
+/// rejection, a permission denial, a directory where the file should be. The
+/// same rule `compile_inner` applies, and for the same reason — we cannot tell
+/// what that config would have selected, and rendering in the default dialect
+/// answers a different question than the one asked.
+///
+/// An unresolvable *pipeline* stays tolerant, which is a different thing from
+/// an unloadable *config*: the preview falls back to the first declared
+/// adapter, then to DuckDB. A transformation-only project has no replication
+/// pipeline to resolve and must still preview.
+pub(crate) fn preview_dialect(
+    config_path: Option<&Path>,
+) -> Result<Box<dyn rocky_core::traits::SqlDialect>> {
+    // The shared loader (#1625) decides what refuses: only a missing file is
+    // tolerated. The context names the file, which the loader's own error
+    // does not.
+    let config =
+        rocky_core::config::load_optional_project_config(config_path).with_context(|| {
+            format!(
+                "failed to load config from {} for the offline SQL preview",
+                config_path
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            )
+        })?;
+    let adapter_type = config
+        .and_then(|cfg| {
+            // Prefer the default replication pipeline's target adapter; fall
+            // back to the first adapter declared in the config.
+            let target_adapter_name = registry::resolve_replication_pipeline(&cfg, None)
+                .ok()
+                .map(|(_, pipeline)| pipeline.target.adapter.clone());
+            target_adapter_name
+                .and_then(|name| cfg.adapters.get(&name).map(|a| a.adapter_type.clone()))
+                .or_else(|| cfg.adapters.values().next().map(|a| a.adapter_type.clone()))
+        })
+        .unwrap_or_else(|| "duckdb".to_string());
+    Ok(dialect_for_adapter_type(&adapter_type))
+}
+
 /// Resolve the configured target adapter's standalone [`SqlDialect`] from a
 /// `rocky.toml` path, without building a live adapter (no credentials needed).
 ///
@@ -619,6 +702,11 @@ pub(crate) fn dialect_for_adapter_type(
 /// [`dialect_for_adapter_type`]. Used by `compact` / `archive` so their
 /// maintenance generators see the real dialect and can fail fast off
 /// Databricks at plan time.
+///
+/// Stricter than [`preview_dialect`] on purpose: this one also refuses an
+/// unresolvable pipeline or an undeclared target adapter, because a
+/// maintenance generator that guessed the dialect would template Delta-only
+/// SQL at a warehouse that cannot run it.
 pub(crate) fn resolve_configured_dialect(
     config_path: &Path,
 ) -> Result<Box<dyn rocky_core::traits::SqlDialect>> {
@@ -813,7 +901,15 @@ fn preview_merge_shape(model_ir: &ModelIr, dialect: &dyn SqlDialect) -> Result<S
 /// The dialect is sourced from the project's configured target adapter type
 /// (via `config_path`) when available; otherwise it defaults to DuckDB (or the
 /// Databricks fallback when the `duckdb` feature is off). See
-/// [`dialect_for_adapter_type`].
+/// [`preview_dialect`] and [`dialect_for_adapter_type`].
+///
+/// A `rocky.toml` that exists but does NOT LOAD is an error, not a fallback:
+/// previewing a broken Snowflake project in DuckDB would answer a question
+/// nobody asked. Only a missing file resolves the default dialect.
+///
+/// An unset `${CREDENTIAL}` is NOT "does not load" here. This core opens no
+/// connection, so a value it will never send is not a precondition for
+/// picking a dialect — see [`preview_dialect`].
 ///
 /// "Otherwise" means **no `rocky.toml`**, not "the config did not load". A
 /// present-but-broken config is refused, carrying the loader's own error
@@ -842,26 +938,10 @@ pub fn plan_preview_output(
     output.env = env.map(str::to_string);
 
     // Resolve the preview dialect from the configured target adapter type.
-    // No config / unresolvable target → DuckDB (or the Databricks fallback
-    // when the `duckdb` feature is off).
-    //
-    // A `rocky.toml` that is PRESENT but does not load refuses here (#1625).
-    // It used to be `.ok()`-ed away, so a project configured for another
-    // warehouse silently previewed on the DuckDB dialect — the shared loader
-    // makes "absent" the only tolerated case.
-    let adapter_type = rocky_core::config::load_optional_project_config(config_path)?
-        .and_then(|cfg| {
-            // Prefer the default replication pipeline's target adapter; fall
-            // back to the first adapter declared in the config.
-            let target_adapter_name = registry::resolve_replication_pipeline(&cfg, None)
-                .ok()
-                .map(|(_, pipeline)| pipeline.target.adapter.clone());
-            target_adapter_name
-                .and_then(|name| cfg.adapters.get(&name).map(|a| a.adapter_type.clone()))
-                .or_else(|| cfg.adapters.values().next().map(|a| a.adapter_type.clone()))
-        })
-        .unwrap_or_else(|| "duckdb".to_string());
-    let dialect = dialect_for_adapter_type(&adapter_type);
+    // No config file / unresolvable target → DuckDB (or the Databricks
+    // fallback when the `duckdb` feature is off). A config that EXISTS but
+    // does not load refuses — see [`preview_dialect`].
+    let dialect = preview_dialect(config_path)?;
 
     // Compile the project in-process (offline — no source schemas, no cache).
     let config = CompilerConfig {
@@ -906,6 +986,29 @@ pub fn plan_preview_output(
     // Project the compile result to typed IR, reusing the shared
     // `project_ir_from_compile` helper so we don't re-derive IR by hand.
     let project_ir = super::ci_diff::project_ir_from_compile(&result);
+
+    // SEVENTEENTH ROUND, finding 2 — declared surrogate-key specs, applied
+    // below exactly as `emit_sql::emit_models` and the run path apply them.
+    //
+    // Until now this core was the ONLY consumer of a compiled model that did
+    // not. `rocky run` wraps the SELECT at materialization
+    // (`commands::run`), `rocky emit-sql` wraps it at render
+    // (`commands::emit_sql`), and this preview did neither — so it showed a
+    // reviewer SQL that was missing a column the run WILL materialize. On the
+    // MCP surface that reviewer is an agent approving a model, which is the
+    // shape of gap this branch exists to close.
+    //
+    // The alternative was to keep the divergence and carry a warning on every
+    // surface that serves the preview. Rejected: round seventeen's finding 2
+    // IS that alternative failing — the worker-profile projection dropped the
+    // warning the moment there were two surfaces to keep in step. Parity has
+    // no copies to keep in step.
+    //
+    // A malformed spec is fatal here, as it already is on both other paths: a
+    // preview of SQL that `rocky run` would refuse to generate is worse than
+    // a refusal.
+    let surrogate_keys = rocky_core::models::load_surrogate_keys_from_tree(models_dir)
+        .context("invalid surrogate_key configuration")?;
     if let Some(model) = filter
         && !project_ir
             .models
@@ -925,6 +1028,26 @@ pub fn plan_preview_output(
         {
             continue;
         }
+
+        // Borrowed unless this model actually declares a key. `ModelIr::clone`
+        // is a deep copy of the SQL string plus several owned `Vec`s, and most
+        // models declare none, so the clone is paid only where it buys
+        // something.
+        let model_ir: std::borrow::Cow<'_, rocky_ir::ModelIr> = match surrogate_keys.get(model_name)
+        {
+            Some(specs) => {
+                let mut keyed = model_ir.clone();
+                // The `Err` is the validate-before-interpolation guard: an
+                // unvalidated spec is a SQL-injection vector, and main's other
+                // call sites (`emit_sql`, `run`) all refuse on it. Silently
+                // previewing such a spec would be the plan preview alone
+                // rendering what every other path refuses.
+                rocky_core::models::apply_surrogate_keys(&mut keyed, specs, dialect.as_ref())?;
+                std::borrow::Cow::Owned(keyed)
+            }
+            None => std::borrow::Cow::Borrowed(model_ir),
+        };
+        let model_ir = model_ir.as_ref();
 
         let target_label = if model_ir.target.catalog.is_empty() {
             format!("{}.{}", model_ir.target.schema, model_ir.target.table)
@@ -3091,6 +3214,165 @@ table = "m"
         .unwrap();
 
         let out = plan_preview_output(None, &models_dir, None, None).unwrap();
+        assert_eq!(out.statements.len(), 1);
+        assert_eq!(out.statements[0].target, "c.s.m");
+    }
+
+    /// SIXTEENTH ROUND, finding 1 — a `rocky.toml` that EXISTS but does not
+    /// LOAD used to be swallowed by `.ok()`, and the preview fell through to
+    /// the DuckDB default.
+    ///
+    /// The concrete gap that made this a defect rather than a tidy-up: `main`'s
+    /// #1522 made `rocky compile` refuse the same file (`compile_inner` tolerates
+    /// `FileNotFound` and nothing else), and the MCP server exposes BOTH tools
+    /// off the same `config_path`. So one malformed Snowflake config failed
+    /// `compile` while `plan_preview` returned confident DUCKDB-rendered SQL for
+    /// a project whose config cannot be read — the strictness landed on one path
+    /// and not its sibling.
+    ///
+    /// The models here are VALID and the target dialect is Snowflake, so the
+    /// only thing that can make this fail is the config. A preview that
+    /// swallowed the error would return exactly one statement and pass every
+    /// other assertion in this module.
+    #[test]
+    fn plan_preview_refuses_a_malformed_config_instead_of_defaulting_to_duckdb() {
+        let tmp = TempDir::new().unwrap();
+        let (cfg_path, models_dir) = write_project(
+            &tmp,
+            r#"
+[adapter.default]
+type = "snowflake"
+account = "acct"
+"#,
+            &[(
+                "users",
+                r#"name = "users"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "c"
+schema = "s"
+table = "users"
+"#,
+            )],
+        );
+
+        // Baseline: the SAME project previews fine while the config parses.
+        // Without this the test could pass on a project that never rendered.
+        let ok = plan_preview_output(Some(&cfg_path), &models_dir, None, None)
+            .expect("a well-formed config previews");
+        assert_eq!(ok.statements.len(), 1, "baseline must render one statement");
+
+        // Now break the file — unterminated string, so TOML parsing fails.
+        fs::write(&cfg_path, "[adapter.default\ntype = \"snowflake\"\n").unwrap();
+
+        let err = plan_preview_output(Some(&cfg_path), &models_dir, None, None)
+            .expect_err("a malformed rocky.toml must refuse, not default to DuckDB");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failed to load config"),
+            "the refusal must name the config as the cause so a caller can act \
+             on it, got: {rendered}"
+        );
+    }
+
+    /// SEVENTEENTH ROUND, finding 1 — the regression pin.
+    ///
+    /// Round sixteen routed `preview_dialect` through the FULL config load,
+    /// which expands `${VAR}`. That made an unset credential fatal for two
+    /// commands documented as needing none: `rocky emit-sql` and MCP
+    /// `plan_preview`. An operator who had run `rocky init` for Databricks and
+    /// not yet exported `DATABRICKS_HOST` could no longer read their own
+    /// generated SQL.
+    ///
+    /// Two-sided on purpose. Succeeding is half the claim; the other half is
+    /// that the preview still picks the CONFIGURED dialect. A tolerant load
+    /// that silently fell back to DuckDB would pass a "it did not fail" test
+    /// while answering in the wrong dialect — the exact defect round sixteen
+    /// was fixing. So this asserts `snowflake`, which DuckDB-fallback and
+    /// Databricks-fallback both fail.
+    #[test]
+    fn plan_preview_tolerates_an_unset_credential_placeholder() {
+        let tmp = TempDir::new().unwrap();
+        // Never set, by construction — no `set_var` here. Mutating the
+        // process environment is global and racy under `cargo test`'s
+        // parallel threads, and a flaky pin is worse than no pin.
+        assert!(
+            std::env::var("ROCKY_DEFINITELY_NOT_SET_PREVIEW_ACCOUNT").is_err(),
+            "this test's premise is that the var is unset"
+        );
+        let (cfg_path, models_dir) = write_project(
+            &tmp,
+            r#"
+[adapter.default]
+type = "snowflake"
+account = "${ROCKY_DEFINITELY_NOT_SET_PREVIEW_ACCOUNT}"
+"#,
+            &[(
+                "users",
+                r#"name = "users"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "c"
+schema = "s"
+table = "users"
+"#,
+            )],
+        );
+
+        // The dialect is the CONFIGURED one, not the default.
+        let dialect = preview_dialect(Some(&cfg_path))
+            .expect("an unset credential must not fail an offline preview");
+        assert_eq!(
+            dialect.name(),
+            "snowflake",
+            "the preview must still resolve the configured adapter's dialect"
+        );
+
+        // And the whole offline preview runs end to end.
+        let out = plan_preview_output(Some(&cfg_path), &models_dir, None, None)
+            .expect("the offline preview opens no connection, so it needs no credential");
+        assert_eq!(out.statements.len(), 1);
+        assert_eq!(out.statements[0].target, "c.s.users");
+    }
+
+    /// The tolerated half of the rule above, pinned so a later tightening
+    /// cannot quietly remove it: `--config` DEFAULTS to `rocky.toml`, so the
+    /// standalone `--models <dir>` case reaches `preview_dialect` with a path
+    /// that does not exist. That is `FileNotFound`, and it must still resolve
+    /// the default dialect rather than refuse.
+    #[test]
+    fn plan_preview_tolerates_an_absent_config_file() {
+        let tmp = TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(models_dir.join("m.sql"), "-- model: m\nSELECT 1 AS id").unwrap();
+        fs::write(
+            models_dir.join("m.toml"),
+            r#"name = "m"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "c"
+schema = "s"
+table = "m"
+"#,
+        )
+        .unwrap();
+
+        // A path that was never written — the `--config` default against a
+        // directory with no project file.
+        let absent = tmp.path().join("rocky.toml");
+        assert!(!absent.exists());
+        let out = plan_preview_output(Some(&absent), &models_dir, None, None)
+            .expect("an ABSENT config is the standalone case, not a malformed one");
         assert_eq!(out.statements.len(), 1);
         assert_eq!(out.statements[0].target, "c.s.m");
     }

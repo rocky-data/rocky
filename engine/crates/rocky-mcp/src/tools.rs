@@ -36,18 +36,666 @@ use crate::result_types::*;
 /// untouched.
 const INSTRUCTIONS: &str = include_str!("../../../../.claude/skills/rocky-ai-workflow/SKILL.md");
 
-/// Prepended to the served `instructions` under the worker profile (FF-WP1
-/// fix round 2, item 5a). The skill text below the banner is the FULL
-/// authoring workflow — including verbs this profile does not serve — so the
-/// banner re-frames it up front: name what is absent, and redirect every
-/// ending to the typed hand-off to the trusted runner.
-const WORKER_INSTRUCTIONS_BANNER: &str = "WORKER PROFILE ACTIVE: this server serves the minimal \
-drafting allowlist. The propose, review_queue, draft_contract, draft_metadata, and \
-pause_schedule tools are NOT available in this session, and the workflow below is the full \
-authoring map, parts of which belong to the trusted runner. Where it reaches contract or \
-metadata authorship, or the propose -> review -> apply chain, STOP: end every workflow at the \
-typed hand-off to the trusted runner instead — report the drafted files, the invariants you \
-encoded, and anything you flagged. The runner records, reviews, and applies.\n\n";
+/// Prepended to the served `instructions` under the worker profile.
+///
+/// DERIVED from the excluded set, not written out. The old banner named six
+/// tools by hand while the profile excluded nineteen — the same hand-picked
+/// literal this round removed from the wire test one surface over. A tool
+/// that leaves [`WORKER_PROFILE_TOOLS`] now appears here automatically.
+///
+/// The banner is the ONE worker surface that names excluded tools on
+/// purpose: saying "`propose` is not available" is the opposite of steering
+/// at it. Everything below the banner is the projected skill body, which
+/// names none of them ([`WORKER_INSTRUCTIONS_REWRITES`]).
+///
+/// It leads with what is absent, then states the two things the projection
+/// cannot state as forcefully in flowing prose: checks / contracts /
+/// metadata are spec-owned by ANY route, and every workflow ends at the
+/// typed hand-off.
+fn worker_instructions_banner(excluded: &[String]) -> String {
+    let names = excluded.join(", ");
+    format!(
+        "WORKER PROFILE ACTIVE. This server serves the minimal drafting allowlist. These \
+         tools are NOT available in this session: {names}. The workflow below has been \
+         rewritten for this profile. CHECKS, CONTRACTS AND METADATA ARE SPEC-OWNED HERE: \
+         do not author one, and do not append one to a sidecar by any other route either. \
+         Report what you would assert — name the column, the invariant, and the evidence \
+         — and let the trusted runner encode it. Where the workflow reaches recording a \
+         plan, reviewing it, approving it, or applying it, STOP. End every workflow at \
+         the typed hand-off to the trusted runner: report the drafted files, what you \
+         verified, and anything you flagged. The runner records, reviews, and applies.\n\n"
+    )
+}
+
+/// The worker-profile projection of the served [`INSTRUCTIONS`], as
+/// `(sentence to replace, replacement)`.
+///
+/// WHY THIS EXISTS. The instructions were the one surface left EXEMPT from
+/// the excluded-name sweep, on the argument that a disclaiming banner over
+/// verbatim text is honest. The F3 red team round 2 rejected that, and was
+/// right: the banner stopped the worker at contract authorship, metadata
+/// authorship, and the record/review/apply chain — but NOT at CHECK
+/// authorship, while the text below it actively told the worker to
+/// strengthen assertions, append tests through the draft tools, and encode
+/// invariants as checks. So the largest guidance surface instructed exactly
+/// the thing removing `draft_check` from the allowlist exists to stop, and a
+/// worker-written check is raw SQL the fulfillment loop later runs with
+/// warehouse credentials.
+///
+/// Two facts make it worse than a stale sentence. `rocky mcp --profile
+/// worker` is directly invocable, and the driver's task brief is
+/// out-of-band and optional — so the served instructions are the ONLY
+/// guidance surface GUARANTEED to reach a worker session. And "honest, not
+/// safe" is not a status this list should ever carry: every other row is
+/// held to what the text SAYS, not to whether a disclaimer precedes it.
+///
+/// WHAT THE NINTH ROUND ADDED, and the reason it is the most useful entry
+/// in this table's history. The first pass rewrote every passage that NAMED
+/// an excluded tool, and a name-based sweep then read the result as clean.
+/// It was not: two sentences that name no tool at all still told the worker
+/// to write a model's `.toml` sidecar "for materialization", strategy and
+/// target included. That contradicts the banner's spec-owned-metadata
+/// prohibition sitting three paragraphs above it, and it routes around
+/// `draft_model`, which deliberately writes only a minimal `name` + `intent`
+/// document and never invents routing.
+///
+/// THE LESSON, stated because it generalises past this table: a rewrite that
+/// strips a tool NAME while leaving the INSTRUCTION passes every name-based
+/// sweep and changes nothing. Read each entry by asking what the served text
+/// now tells the worker to DO — not which words it no longer contains. The
+/// three further entries that came out of re-reading on that lens are the
+/// evidence it is not a one-off: the umbrella sentence granted the whole
+/// `rocky` CLI, the sampling step sent the worker at a raw database query,
+/// and the product section handed it the runner's posture verbs. One of
+/// those three quotes `propose_only`, which is exactly the string the
+/// identifier rule was fixed NOT to match — a name-based sweep could never
+/// have reached it.
+///
+/// WHAT THE TENTH ROUND ADDED — the CONTRADICTION, which is a different
+/// failure from a stale steer. The ninth round's umbrella rewrite forbids
+/// shell routes CATEGORICALLY ("a shell, a file you write yourself, a
+/// direct warehouse connection — is out of bounds, even where nothing stops
+/// you"), and four `rocky <verb>` imperatives were then deliberately KEPT,
+/// on the argument that they name actions this profile serves and only the
+/// ROUTE differs. That discriminator is true and it does not survive its
+/// own banner: served text that forbids a route and then instructs it four
+/// times is not followable, whichever half is right.
+///
+/// It is closed by REWRITING them to the served action rather than by
+/// narrowing the banner, and the reason is the reader again. A banner that
+/// forbade shell routes only to WITHHELD actions would make the worker
+/// classify each route at read time, and nothing served to it supports that
+/// classification: the banner lists withheld TOOLS, not withheld CLI verbs,
+/// and the mapping between the two is not served at all. Rewriting needs no
+/// judgement from the reader. The projected body now carries NO `rocky
+/// <verb>` invocation, which is what makes the banner true rather than
+/// nearly true, and a derived scan asserts it.
+///
+/// WHAT THE SCAN CHECKS, stated here because the eleventh round's finding 3
+/// was that this paragraph out-claimed it. It takes every
+/// identifier-bounded `rocky` in the lowercased body — so unbackticked and
+/// any case — and refuses the word that follows unless a reviewed prose
+/// list exempts it. It does NOT know the CLI's verb set: that enum is
+/// private to the `rocky` binary crate, which depends on this one. The
+/// guarantee is therefore "no unexempted word follows `rocky`", which is
+/// wider than the old literal and still not the same sentence as "the CLI
+/// is unreachable".
+///
+/// A PROJECTION, NOT A FORK. The canonical `.claude/skills/rocky-ai-workflow`
+/// file is untouched — it is correct guidance for the default profile, where
+/// the record/review/apply chain is the real workflow, and it is mirrored
+/// byte-identically into `.agents/skills/` under a CI drift gate. What
+/// changes is what the WORKER is served. Twenty-seven passages are rewritten
+/// out of a 74-line document; the authoring loop itself — inspect, sample,
+/// write, compile-loop, preview, read the JSON, the anti-patterns — is
+/// served unchanged, because that part is the same job in both profiles.
+/// What the worker may no longer do is reach any of those steps by a route
+/// this server does not serve.
+///
+/// Both drift directions REFUSE at CONSTRUCTION, exactly like
+/// [`WORKER_TOOL_DESCRIPTIONS`]: a needle that no longer matches aborts
+/// startup rather than silently serving the default sentence to a worker,
+/// and a needle that matches more than once aborts rather than rewriting a
+/// passage nobody reviewed. An edit to the skill therefore forces a
+/// conscious re-projection instead of quietly re-opening this hole.
+///
+/// CONSTRUCTION, not compile time. The operands are compile-time constants,
+/// so nothing here depends on user input — but nothing verifies the match
+/// until a server is built. An edit to the skill compiles and then refuses
+/// at `rocky mcp --profile worker` startup. A TEST is what keeps the frozen
+/// constants lined up; see [`RockyMcpServer::try_new_with_profile`].
+///
+/// # The rule a replacement has to satisfy
+///
+/// A needle usually spans a WHOLE passage, so a replacement inherits every
+/// sentence in it — including the ones that WARN. Round seventeen, finding 2
+/// is what this rule is made of: the step-5 passage carried "the preview
+/// omits declared surrogate-key columns", the worker replacement did not,
+/// and a table built to remove FALSE claims had silently removed a TRUE
+/// warning. A worker then approved preview SQL with no caveat at all.
+///
+/// So, per pair: a caveat in the needle that still applies to the worker
+/// must appear in the replacement. Only a caveat about something the worker
+/// cannot reach may be dropped, and dropping it is then not a loss.
+///
+/// The whole table was swept against that rule when the rule was written.
+/// Every remaining drop is a caveat about a surface this profile does not
+/// serve — `rocky review`'s approval marker, `rocky product verify`,
+/// `draft_metadata`'s parse guard, `rocky plan`'s replication-only preview
+/// artefacts. The one real loss was step 5's, and it was fixed by removing
+/// the divergence rather than by copying the sentence.
+const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
+    // The frontmatter `description` — the first thing in the served text.
+    (
+        "compile-loop → plan → propose → review → apply workflow",
+        "compile-loop → plan → hand-off workflow",
+    ),
+    // The umbrella licence. It grants the CLI, and the CLI is every verb
+    // this profile withholds — so the sentence hands back by one route what
+    // the allowlist removed by another.
+    (
+        "It assumes you can run the `rocky` CLI (or call the equivalent tools) and read its \
+         `--output json`.",
+        "It assumes you call the tools this server serves and read their JSON results. Those \
+         tools are your whole surface here. Reaching the same effect by another route — a \
+         shell, a file you write yourself, a direct warehouse connection — is out of bounds, \
+         even where nothing stops you.",
+    ),
+    // TENTH ROUND, finding 1D — the CLI pointer the umbrella rewrite above
+    // left standing. That rewrite now says a shell is out of bounds; the
+    // very next clause sent the worker off to read the full CLI command
+    // surface.
+    (
+        "For the config format see the `rocky-config` skill; for the full command surface \
+         see the `rocky` skill.",
+        "For the config format see the `rocky-config` skill.",
+    ),
+    // The thesis sentence.
+    (
+        "The shape of the job: **you propose, Rocky's compiler verifies, an approval marker \
+         gates the apply.**",
+        "The shape of the job: **you draft, Rocky's compiler verifies, and the trusted runner \
+         takes it from there.**",
+    ),
+    // NINTH ROUND, finding 1 — the first of two sidecar-authorship steers,
+    // and the reason the round blocked. Every rewrite above strips a tool
+    // NAME; this sentence names none and still tells the worker to write a
+    // sidecar "for materialization". It contradicts the banner's
+    // spec-owned-metadata prohibition and bypasses `draft_model`, which
+    // deliberately writes only a minimal `name` + `intent` document and
+    // never invents routing.
+    (
+        "Write models as **raw SQL** (`models/<name>.sql` + a `<name>.toml` sidecar for \
+         materialization).",
+        "Write models as **raw SQL**, and write them with the `draft_model` tool rather than \
+         by editing files yourself. It writes `models/<name>.sql` for you, and creates only a \
+         minimal `name` + `intent` sidecar — it never invents a strategy or a target, because \
+         routing is spec-owned here.",
+    ),
+    // TENTH ROUND, finding 1D — the four surviving CLI imperatives, and
+    // the reason they are REWRITTEN rather than excused.
+    //
+    // The previous round kept them on the argument that `rocky compile`,
+    // `rocky plan` and `rocky test` name actions this profile SERVES, so
+    // only the ROUTE differed. That discriminator is real, and it is not
+    // available here: the umbrella rewrite four entries up forbids shell
+    // routes CATEGORICALLY — "a shell, a file you write yourself, a direct
+    // warehouse connection — is out of bounds, even where nothing stops
+    // you". Text that forbids a route and then instructs it four times is
+    // not a projection a worker can follow, whichever half is right.
+    //
+    // Of the two ways to close it, this is the one that REMOVES the
+    // contradiction. Narrowing the banner to forbid shell routes only to
+    // WITHHELD actions relocates it: the worker would have to classify
+    // each route at read time, and the served text gives it nothing to
+    // classify against — the banner names withheld TOOLS, not withheld
+    // CLI verbs, and the mapping between them is not served at all.
+    // Rewriting to the served action needs no such judgement, and it is
+    // the rule every other entry in this table already follows.
+    //
+    // The projected body now contains NO `rocky <verb>` invocation at all,
+    // which is what makes the banner true rather than nearly true. That is
+    // asserted as a derived scan, not as a per-string check — see
+    // `worker_instructions_are_projected_and_default_stays_verbatim`, and
+    // read the bound stated there: the scan refuses any unexempted word
+    // after `rocky`, in any case and backticked or not, but it does not
+    // know the CLI's verb set.
+    (
+        "Run `rocky compile --output json`. The result gives you every existing model and \
+         source table with its typed columns.",
+        "Call the `inspect_schema` tool. It returns every existing model and source table \
+         with its typed columns.",
+    ),
+    // The sampling route. The named alternatives are a direct database
+    // connection and a raw SQL shell, which is the capability the whole
+    // allowlist exists to withhold — `sample_rows` and `profile_column` are
+    // the bounded reads this profile serves instead.
+    (
+        "On the DuckDB playground that's a direct query (`duckdb <path> \"SELECT * FROM \
+         <table> USING SAMPLE 20 ROWS\"`) or `rocky shell`; against a warehouse, sample \
+         through the adapter.",
+        "Use the `sample_rows` tool for that, and `profile_column` to measure one column's \
+         null rate, distinct count, and range. Those two are the whole sampling surface here: \
+         do not open a database connection of your own, and do not run SQL you wrote against \
+         the warehouse.",
+    ),
+    // NINTH ROUND, finding 1 — the second sidecar-authorship steer, and the
+    // more explicit of the two: it names the strategy and the target.
+    (
+        "3. **Write the model.** Author the SQL and its `.toml` sidecar (materialization \
+         strategy, target). Keep it minimal and readable.",
+        "3. **Write the model.** Author the SQL, and hand it to `draft_model`. The SQL is your \
+         whole surface — do not write the `.toml` sidecar, and do not choose a materialization \
+         strategy or a target. Both are spec-owned here, and `draft_model` resolves them from \
+         the project's conventions. Keep the SQL minimal and readable.",
+    ),
+    // TENTH ROUND, finding 1D — imperatives two and three.
+    (
+        "Run `rocky compile --output json` and read `diagnostics`",
+        "Call the `compile` tool and read its `diagnostics`",
+    ),
+    // FIFTEENTH ROUND, finding 1 — the round-fourteen sweep narrowed
+    // `plan_preview`'s exactness claim on the tool description, both
+    // `build_model` bodies and the published tool table, and MISSED this
+    // one. The rewrite carried "exactly what would execute" straight from
+    // the CLI sentence onto the tool, which is the surface the claim is
+    // least true of: `commands::plan_preview_output` renders offline and
+    // DROPS any model `sql_gen` cannot render, and `PlanPreviewResult` has
+    // no field that names one.
+    //
+    // The needle is now the whole step, because the default sentence it
+    // replaces carries three CLI routes (`rocky emit-sql`, `rocky plan` and
+    // `rocky apply`) and a partial rewrite would leave one standing for the
+    // verb scan in
+    // `worker_instructions_are_projected_and_default_stays_verbatim`.
+    //
+    // SIXTEENTH ROUND, finding 2 — the DEFAULT sentence changed under this
+    // needle, and the change is bigger than the wording. The old step told
+    // every default and approver client to "Run `rocky plan`", called the
+    // result offline, and said a model it cannot render is skipped. Three
+    // things were wrong at once, and only the first was reported:
+    //
+    //  - `rocky plan` is NOT offline. `commands::plan` builds an
+    //    `AdapterRegistry`, calls `discovery_adapter.discover()`, and its
+    //    own budget-check comment says plan "already performs live
+    //    warehouse I/O (discovery, governance)".
+    //  - Bare `rocky plan` never prints a TRANSFORMATION model's SQL at
+    //    all. Every `output.statements` push in `plan()` is in the
+    //    replication loop; the one transformation site is gated behind
+    //    `if let Some(model) = run_options.model`.
+    //  - On a transformation-only project — the shape steps 1-4 teach you
+    //    to build — `rocky plan` REFUSES, with or without `--model`:
+    //    `registry::resolve_replication_pipeline` rejects a non-replication
+    //    pipeline. So the step sent an agent at a command that exits 1.
+    //
+    // Verified by running the binary against
+    // `examples/playground/pocs/00-foundations/00-playground-default`, not
+    // by reading the call graph. The skipping claim was true of the OFFLINE
+    // preview core the step never actually invoked.
+    //
+    // `rocky emit-sql` is the verb that does what the step asks: offline,
+    // the models in dependency order, works on a transformation-only
+    // project, and reports what it could not render on stderr instead of
+    // dropping it silently. The default profile has no `emit_sql` TOOL, so
+    // the sentence naming the MCP equivalent sits directly beside it.
+    //
+    // AND THE FIRST DRAFT OF THAT SENTENCE CALLED THEM EQUIVALENT, which
+    // was a fresh over-claim inside the commit removing one. They did NOT
+    // render the same SQL: `emit_sql::emit_models` called
+    // `rocky_core::models::apply_surrogate_keys` per model and
+    // `plan_preview_output` never did, so on a model with
+    // `[[surrogate_key]] name = "order_key"`:
+    //
+    //   emit-sql      SELECT *, CAST(md5(...) AS VARCHAR) AS order_key
+    //                 FROM ( SELECT ... ) AS __rocky_keyed
+    //   plan_preview  SELECT ...                     (no order_key)
+    //
+    // SEVENTEENTH ROUND, finding 2 — that divergence is now FIXED at the
+    // source rather than described here. `plan_preview_output` applies the
+    // declared keys, like `emit-sql` and like the run, and
+    // `emit_sql::tests::plan_preview_and_emit_sql_render_the_same_keyed_sql`
+    // asserts the two renderings are EQUAL. The warning sentence this
+    // comment justified is gone from the served text.
+    //
+    // Why parity rather than a warning: the warning lasted one round. It
+    // sat inside the block this table replaces for workers, and the
+    // replacement did not carry it — so a worker approved preview SQL with
+    // no caveat at all. Any true statement about a divergence has to be
+    // repeated on every surface that serves the preview; removing the
+    // divergence has nothing to repeat.
+    (
+        "Read your model's generated SQL before you ship it. `rocky emit-sql` renders it \
+         offline: no live source schema, no compute warehouse. It prints the models in \
+         dependency order and reports on stderr any it could not render. Over MCP the nearest \
+         tool is `plan_preview`. It renders offline too, but it drops what it cannot render \
+         without naming it. `rocky plan` is a different command, not this step. It \
+         needs a replication pipeline, connects to the source to discover tables, and prints \
+         replication SQL. It refuses a transformation-only project. Bare `rocky plan` never \
+         prints a transformation model's SQL; `rocky plan --model <name>` does, through that \
+         same preview core. In replication SQL an incremental table previews the 1970 sentinel \
+         watermark, not the real one. A `MERGE` on any dialect but Databricks previews a \
+         canonical shape, not the column list the runner resolves at execute time. And `rocky \
+         apply` recompiles the project rather than replaying the file. Confirm the SQL you read \
+         matches your intent.",
+        "Call the `plan_preview` tool and read the SQL it returns. It renders offline. It \
+         is not the whole plan: a model whose SQL cannot be rendered offline is SKIPPED, \
+         and the result does not name it. So a model missing from the statements means \
+         'not renderable offline', never 'nothing to do'. Three are skipped by \
+         construction: a Snowflake dynamic table needs a live compute warehouse, a \
+         time-interval model needs a runtime window, and a content-addressed model never \
+         goes through SQL generation. Confirm the SQL it does return matches your intent.",
+    ),
+    // TENTH ROUND, findings 1B and 1D together — the fourth imperative,
+    // whose replacement also has to be exact about WHICH suite it runs.
+    // `rocky test` and the `test` tool are the same code path
+    // (`commands::test_output` → `rocky_engine::test_runner`): `run_tests`
+    // compiles the project and materializes every model against an
+    // in-memory DuckDB, and `run_unit_tests` runs the fixture-driven
+    // `[[test]]` blocks. The declarative check set is
+    // `rocky test --declarative`, a different runner, and its checks need
+    // an applied table besides.
+    //
+    // The needle used to read "Run `rocky test` to exercise assertions
+    // (uniqueness, not-null, accepted values, ranges)" — a claim that was
+    // simply false, and the reason this pair carried such a long argument.
+    // The skill has since been corrected upstream to split the two runners
+    // itself, so what is left to rewrite is only the ROUTE: the corrected
+    // sentence hands the worker two `rocky` invocations, and
+    // `--declarative` additionally names a suite that needs an applied
+    // table this profile never reaches. The replacement is unchanged
+    // because it was already accurate about both.
+    (
+        "**Test.** Run `rocky test` to compile, seed and materialize the models, and to run \
+         any `[[test]]` fixture blocks. Then run `rocky test --declarative` to evaluate the \
+         declared assertions (uniqueness, not-null, accepted values, ranges) — plain `rocky \
+         test` does not run those.",
+        "**Test.** Call the `test` tool. It compiles the project, materializes every model \
+         against a local DuckDB, and runs the fixture-driven `[[test]]` blocks. That local \
+         suite is the only one you can run here — the checks the product spec declares are \
+         evaluated by the trusted runner after an apply.",
+    ),
+    // Step 6 — the first of the three check-authorship steers.
+    (
+        "Add or strengthen assertions that encode what you learned from sampling — they become \
+         the contract that protects the model from future drift.",
+        "Do NOT add or strengthen assertions here — checks are spec-owned in this session, and \
+         the spec's grain and `checks` already lower into the sidecar for you. Report the \
+         assertions your sampling justifies instead: the column, the invariant, and the \
+         evidence.",
+    ),
+    (
+        "## Shipping safely: propose → review → apply",
+        "## Shipping safely: draft → verify → hand off",
+    ),
+    // TENTH ROUND, finding 1D — the section's opening paragraph, which
+    // survived every previous pass because it names no excluded tool and
+    // reads as a PROHIBITION. It still carries a `rocky <verb>` route, and
+    // its last clause ("treat the review as yours to surface") casts the
+    // worker as the one who surfaces the review — a role the three
+    // rewrites below take away from it.
+    (
+        "**Never apply an AI-authored change directly.** A bare `rocky apply` of an \
+         AI-authored plan is refused by design — an agent can confidently write a model \
+         that drops a column or rewrites a result, so the apply waits on a review step. The \
+         engine checks that an approval marker parses and names that exact plan. It does \
+         not check who wrote the marker, so treat the review as yours to surface, not yours \
+         to satisfy.",
+        "**Nothing you draft is applied from this session.** An AI-authored change is \
+         refused a bare apply by design — an agent can confidently write a model that drops \
+         a column or rewrites a result, so the change waits on a human approval marker. The \
+         engine checks that the marker parses and names that exact plan; it does not check \
+         who wrote it. Obtaining that marker, and everything after it, belongs to the \
+         trusted runner and happens outside this session.",
+    ),
+    // The numbered chain. Replaced whole: every step of it is the runner's.
+    (
+        "1. **Propose.** Generate the plan that materializes your change (it is recorded as an \
+         *AI-authored* plan with a `plan_id`). A propose can also bind the plan to a product \
+         identity — `product_id` plus `spec_digest`, both together or neither. A product-bound \
+         plan refuses a bare `rocky apply`; the applier must pass `rocky apply <plan-id> \
+         --expect-spec-digest <digest>` with the digest of the approved spec. When you do not \
+         work for a product runner, omit both fields.",
+        "1. **Hand off.** Report the drafted files, the compile result, the SQL you previewed, \
+         and every invariant you would have encoded. That report is your last step.",
+    ),
+    (
+        "2. **Review.** Run `rocky review <plan-id>`. This compiles your working tree against \
+         the base ref and runs the semantic breaking-change classifier, then reports the delta \
+         — added/removed/retyped columns, anything downstream consumers depend on. Read it.",
+        "2. **The runner takes it from there.** Recording the plan, running the breaking-change \
+         classifier over it, obtaining the human approval marker, and executing the change all \
+         happen outside this session.",
+    ),
+    (
+        "3. **Approve.** `rocky review <plan-id> --approve` writes the approval marker. \
+         Approving over breaking changes is allowed. The marker is written even when the \
+         classifier could not run: if either tree fails to compile, findings are absent and \
+         `breaking_change_count` falls back to 0. So a marker is not evidence a delta was \
+         computed — raise the findings explicitly.\n4. **Apply.** Only after the approval marker \
+         exists does `rocky apply <plan-id>` execute.",
+        "3. **Nothing you can do stands in for that.** A clean compile is not approval, and no \
+         report you write is a sign-off. If you believe a change is urgent, say so in the \
+         report.",
+    ),
+    (
+        "Your job ends at *propose* and at *surfacing the review report clearly*. The approval \
+         is a human decision; do not approve on the user's behalf unless they explicitly tell \
+         you to.",
+        "Your job ends at the typed hand-off, and at surfacing what you found clearly. The \
+         approval is a human decision made outside this session.",
+    ),
+    // The second check-authorship steer — and the most direct one.
+    (
+        "Hand-editing them is detected as tampering. Your surface is the SQL, plus tests you \
+         append through the draft tools.",
+        "Hand-editing them is detected as tampering. Your surface is the SQL, and only the SQL. \
+         Checks are spec-owned the same way: the spec's declared grain and `checks` lower into \
+         the sidecar's `[[tests]]`, so there is nothing for you to append, by this server or by \
+         any file you can write. An invariant the spec does not state belongs in your report.",
+    ),
+    // TENTH ROUND, finding 1D — the section's own opening sentence names a
+    // CLI verb family. Descriptive rather than imperative, and rewritten
+    // anyway: the derived scan below admits no `rocky <verb>` in the
+    // projected body, and an exception "because this one is only context"
+    // is the shape of argument the round rejected.
+    (
+        "drive fulfillment through `rocky product <verb>`.",
+        "drive fulfillment through the product verbs.",
+    ),
+    // The product-posture verbs. Both are the runner's, neither is served
+    // here, and the sentence is a live demonstration of the lesson this
+    // round is about: `propose_only` does NOT match the identifier rule
+    // (`_` is an identifier byte), so it passed every name-based sweep
+    // while telling the worker to go inspect the gate posture.
+    (
+        "- `rocky product verify <name>` tells you (and the runner) whether the frozen \
+         `propose_only` posture is in place before any drafting starts; `rocky product status \
+         <name>` reports the lowering, approval, and state without writing.",
+        "- The runner checks the frozen posture and the lowering state before your drafting \
+         starts. Neither check is yours to run, and neither is served here. Work from the \
+         files and the tool results in front of you.",
+    ),
+    (
+        "- A product-bound propose carries `product_id` + `spec_digest` of the **approved** \
+         revision, and the apply requires `--expect-spec-digest`. If the spec moves after your \
+         draft, the generation is superseded — expect a refusal, not a merge of generations.",
+        "- The runner binds its plan to the `spec_digest` of the **approved** revision. If the \
+         spec moves after your draft, the generation is superseded — expect a refusal, not a \
+         merge of generations.",
+    ),
+    // TENTH ROUND, finding 1D — "Every command takes `--output json`" is
+    // the CLI framing of the machine-readable section, and the sentence
+    // stops parsing once no CLI command is reachable.
+    (
+        "Every command takes `--output json`, backed by a typed schema.",
+        "Every tool returns typed JSON, backed by a schema.",
+    ),
+    // TENTH ROUND, finding 1C — the retry instruction. It tells the worker
+    // to branch on a run error's `failure_kind` and RETRY a `Transient`,
+    // which presumes materializing a pipeline through a route this profile
+    // does not serve: no worker tool runs one, so no run error can occur to
+    // retry. Naming an outcome that cannot occur is the same defect class
+    // as naming a tool that is not served, and the remedy is the same —
+    // say what is actually true here.
+    //
+    // ELEVENTH ROUND, finding 2 — and the tenth round's replacement said
+    // something ELSE that is not true. It read "no tool this profile serves
+    // executes against the warehouse". Three do: `sample_rows` and
+    // `profile_column` both require live credentials and issue queries, and
+    // `inspect_schema` lists the warehouse's tables best-effort to ground a
+    // source the project never declared. The correction to a contradiction
+    // reached for a stronger claim than the contradiction needed, which is
+    // this branch's signature defect.
+    //
+    // HAND-REVIEWED FROM THE ALLOWLIST, entry by entry, not read off the
+    // sentence it replaces — and NOT derived, which the word "derived" here
+    // used to imply. The same review now lives as a checked table,
+    // [`WORKER_TOOL_EFFECTS`], so this prose has something to drift AGAINST
+    // rather than being the only copy. Nine of the twelve reach no adapter —
+    // `breaking_change` (git + an in-process compile), `catalog`,
+    // `compile`, `dependents`, `draft_model`, `lineage`, `list`,
+    // `plan_preview` (offline; it reads the config only to pick a dialect)
+    // and `test` (its own in-memory DuckDB). The other three read. None of
+    // the twelve runs or materializes a PIPELINE, and that — not "no
+    // warehouse access" — is what makes a run error unreachable here.
+    // (`sample_rows` and `profile_column` do run QUERIES; an earlier draft of
+    // this note said "runs or materializes anything", which the served
+    // sentence below had already been corrected away from.)
+    //
+    // TWELFTH ROUND, finding 2 — this enumeration stays; the COUNT that used
+    // to open the served sentence does not. "Three tools do READ the
+    // warehouse" asserts exhaustivity over the allowlist, and whether a tool
+    // opens an adapter is a fact about its body, not about this list. It was
+    // guarded with `WORKER_PROFILE_TOOLS.len() == 12`, which passes through
+    // any behaviour change and any one-for-one swap. The sentence now says
+    // "Some tools DO read the warehouse" and then names the ones a worker
+    // actually reaches for, which is everything the number bought.
+    //
+    // THIRTEENTH ROUND, finding 2 — and deleting that length check left the
+    // bullet's LEADING sentence, "No tool this profile serves runs or
+    // materializes a pipeline", with no tripwire at all. The check held
+    // nothing, but it did fail when the surface grew. [`WORKER_TOOL_EFFECTS`]
+    // replaces it with a reviewed effect per served tool, cross-checked
+    // against the router: a thirteenth tool fails the test until someone
+    // reads its body and classifies it. Hand-reviewed, and labelled as such
+    // — the opposite mistake to the three lists on this branch that looked
+    // derived and were not.
+    //
+    // TWELFTH ROUND, finding 1 — and the round-eleven replacement then said
+    // something ELSE that is not true, one sentence later. It promised that
+    // a failed read "comes back as that tool's own error", which is a
+    // universal over the three readers it had just named. Two of them keep
+    // it: `sample_rows` and `profile_column` both propagate a failed read as
+    // `ToolError::warehouse_error` — though only for their PRIMARY query;
+    // see the thirteenth-round note below, which narrows this sentence.
+    // `inspect_schema` does not. It is best-effort by design: a warehouse
+    // Rocky cannot reach must not fail the tool, because `models` and the
+    // compile-derived `sources` are exact on their own. Until #1565 it was
+    // also SILENT — the call site discarded the `Err` arm and
+    // `discover_source_tables` returned `Vec::new()` on a failed query, so a
+    // worker holding the old promise read an empty `sources` as "no such
+    // table". Since #1565 the result carries `discovery_incomplete` and
+    // `discovery_error`, so the degradation is REPORTED; the tool still
+    // returns success, so the served text still has to tell the worker to
+    // read the flag rather than the list.
+    //
+    // THE CLAIM IS WHAT MOVES HERE, NOT THE TOOL. The text describes the
+    // tool honestly — inconclusive, not authoritative, when the flag is set
+    // — and points at the reader that DOES fail loudly for the same table.
+    //
+    // THE REMEDY SENTENCE RESTS ON A BEHAVIOUR, so name where that behaviour
+    // is proven. "Ask `sample_rows` for that table" only works because
+    // `prepare_table_query` routes a DOTTED target down the qualified-raw-ref
+    // branch with no compile — a bare name would be looked up as a model and
+    // refused. That is covered live over the wire by
+    // `sample_rows_reaches_raw_source_by_qualified_ref` (tests/roundtrip.rs),
+    // which samples `seeds.orders` when no model declares it. If that test
+    // goes, or `sample_rows` starts requiring a compiled model name, this
+    // sentence becomes wrong advice at the exact moment a worker needs it —
+    // worse than the promise it replaced, because it is the fallback.
+    //
+    // THIRTEENTH ROUND, finding 1 — and the sentence that replaced the
+    // over-claim carried a smaller one of its own. It said `sample_rows` and
+    // `profile_column` BOTH "surface a failed read as that tool's own
+    // error". True of `profile_column`'s counts; false of its `top_values`,
+    // which is a SECOND warehouse query taking `Err(_) => Vec::new()` before
+    // the tool returns success. So the same shape a third time, on the tool
+    // named as the counter-example to it:
+    //
+    //   sample_rows      read fails ─▶ ToolError::warehouse_error
+    //   profile_column   counts fail ─▶ ToolError::warehouse_error
+    //                    top_values fail ─▶ empty list, Ok(success)
+    //   inspect_schema   adapter or discovery fails ─▶ no tables, Ok(success),
+    //                                                 discovery_incomplete = true
+    //
+    // Same scope rule as the round above: the CLAIM moves, not the tool.
+    // `ProfileColumnResult` already carries `unavailable`/`reason`, so wiring
+    // this one would be cheap — and it is still a change to the tool's
+    // contract, which is not what this branch does. The text now calls
+    // `top_values` best-effort and names the three states an empty list does
+    // not tell apart, so a worker cannot read it as a fact about the column.
+    (
+        "Run **errors** carry a `failure_kind` (`Transient`, `AuthFailed`, `QueryRejected`, \
+         `QuotaExceeded`, …) and sometimes a `cooldown_seconds`. Branch on *why* something \
+         failed: retry a `Transient`, stop and surface an `AuthFailed`.",
+        "Run **errors** are not something you will see. No tool this profile serves runs or \
+         materializes a pipeline, so there is no run to retry and no `failure_kind` to branch \
+         on. Some tools DO read the warehouse. `sample_rows` and `profile_column` query it \
+         directly, and `inspect_schema` lists its tables when it can. Not every one of those \
+         reads reports its own failure. `sample_rows` does: a read it cannot complete comes \
+         back as that tool's own error, not as a run outcome. `profile_column` does for the \
+         counts it returns, but its `top_values` is a second query and is best-effort — when \
+         that query fails the tool still returns success with an empty list, and nothing in \
+         the result says so. An empty `top_values` does not distinguish a high-cardinality \
+         column, an all-null one, and a failed query. `inspect_schema` is best-effort too, \
+         but it says so: when the warehouse cannot be read it reports none of its physical \
+         tables, still returns success, and sets `discovery_incomplete` with the reason in \
+         `discovery_error`. When that flag is set, a table missing from `sources` is \
+         inconclusive, not proof the table is absent. Ask `sample_rows` for that table before \
+         you conclude it is absent — it either reads the table or fails with a readable \
+         error. A tool \
+         result that reports a failure is a finding for your report — read it, name it, and \
+         do not work around it.",
+    ),
+    // The third check-authorship steer.
+    (
+        "encode it as a **contract** (`required`/`protected` columns) or a **check** \
+         (assertion), not just as a `WHERE` clause. That moves the invariant into the typed \
+         substrate, so the human reviews *the invariant* and the compiler enforces it on every \
+         future run.",
+        "REPORT it. Name the column, the invariant, and the evidence. Do not bury it in a \
+         `WHERE` clause, and do not encode it yourself: contracts and checks are spec-owned in \
+         this session. The runner moves the invariant into the typed substrate, where the human \
+         reviews *the invariant* and the compiler enforces it on every future run.",
+    ),
+    // The metadata section. Replaced WHOLE — the paragraph is a how-to for
+    // a tool this profile does not serve, so trimming its first sentence
+    // would leave the rest dangling off a tool that is no longer named.
+    (
+        "## Metadata is a governed write too\n\nFreshness expectations and column \
+         classifications live in the model's sidecar (`models/<model>.toml`). To author them as \
+         an agent, use the `draft_metadata` MCP tool — never string-append to the sidecar. It \
+         takes a structured patch: a `freshness` block (`expected_lag_seconds`, optional \
+         `time_column` and `severity`), a `classifications` map (column → tag, e.g. `email = \
+         \"pii\"`), or both. The tool parses the sidecar as TOML and merges the patch \
+         (`freshness` replaces the whole table; `classifications` merges per column), compiles \
+         with the write, and checks your policy rules against the model **as patched** — a \
+         patch that adds the first `pii` tag is judged by that tag. A denied patch restores the \
+         prior sidecar exactly. A sidecar the tool cannot parse is never overwritten. Note the \
+         trade: comments in the sidecar are dropped when it is re-serialized.",
+        "## Metadata is spec-owned here\n\nFreshness expectations and column classifications \
+         live in the model's sidecar (`models/<model>.toml`). They are lowered from the product \
+         spec, so they are not yours to write in this session — not through this server, and \
+         not by editing the file. If a column looks like it carries personal data, or a table \
+         looks staler than the spec assumes, put that in your report and name the column. The \
+         runner owns the write.",
+    ),
+    (
+        "- Applying without review, or approving your own AI-authored plan.",
+        "- Doing anything past the hand-off: recording, reviewing, approving, or applying.\n- \
+         Writing a check, a contract, or a metadata block. Report the invariant instead.",
+    ),
+];
 
 /// Worker-profile `prompts/list` descriptions (FF-WP1 fix round 2, item 5b):
 /// the static `#[prompt(description = ...)]` strings instruct the DEFAULT
@@ -61,19 +709,24 @@ const WORKER_PROMPT_DESCRIPTIONS: &[(&str, &str)] = &[
         "build_model",
         "Guide the authoring of one Rocky model from a plain-language intent: inspect schema -> \
          sample rows -> profile columns -> draft_model -> compile-loop -> plan preview -> \
-         draft_check + test. Worker profile: ends at the typed hand-off to the trusted runner.",
+         test. Worker profile: checks are spec-owned here, so report what you would assert \
+         rather than writing it; ends at the typed hand-off to the trusted runner.",
     ),
     (
         "find_untested_models",
-        "Find models with no declarative tests and draft tests for them: catalog -> identify \
-         untested models -> ground with sample_rows / profile_column -> author the checks -> \
-         draft_check -> test. Worker profile: ends at the typed hand-off to the trusted runner.",
+        "Find models with no declarative tests: catalog -> identify untested models -> ground \
+         with sample_rows / profile_column -> describe the checks each one needs. Worker \
+         profile: checks are spec-owned here, so this ends in a REPORT, not a write — name \
+         the models, the columns, and the assertion each needs, and end at the typed \
+         hand-off to the trusted runner.",
     ),
     (
         "add_tests_to_pks",
-        "Add uniqueness + not-null tests to a model's primary-key / unique columns: \
-         inspect_schema -> confirm the keys with profile_column -> author the checks -> \
-         draft_check -> test. Worker profile: ends at the typed hand-off to the trusted runner.",
+        "Identify a model's primary-key / unique columns and the uniqueness + not-null tests \
+         they need: inspect_schema -> confirm the keys with profile_column. Worker profile: \
+         checks are spec-owned here, so this ends in a REPORT, not a write — name the keys \
+         you confirmed and the assertions they need, and end at the typed hand-off to the \
+         trusted runner.",
     ),
     (
         "summarize_project",
@@ -81,12 +734,19 @@ const WORKER_PROMPT_DESCRIPTIONS: &[(&str, &str)] = &[
          grouped overview of models, their grain, governance, tests, and DAG shape. Read-only — \
          no edits, nothing recorded.",
     ),
+    // TENTH ROUND, finding 1. This said "failing declarative tests: run
+    // `test`", and the `test` tool does not run them — it runs the project's
+    // LOCAL model and unit tests (`commands::test_output`). The declarative
+    // check set is `rocky test --declarative`, a different path this profile
+    // does not serve. Same false promise `WORKER_DRAFT_NEXT_STEPS` already
+    // corrects one surface over; see that constant for the full reasoning.
     (
         "fix_failing_test",
-        "Diagnose and fix failing declarative tests: run `test` -> for each failure \
-         profile_column the implicated columns to ground the cause -> redraft the model SQL \
-         with draft_model where the SQL is wrong. Worker profile: ends at the typed hand-off \
-         to the trusted runner.",
+        "Diagnose and fix failing local tests: run `test` — the project's LOCAL model and \
+         unit tests, the only suite served here — then for each failure profile_column the \
+         implicated columns to ground the cause -> redraft the model SQL with draft_model \
+         where the SQL is wrong. Worker profile: ends at the typed hand-off to the trusted \
+         runner.",
     ),
 ];
 
@@ -102,6 +762,14 @@ pub struct RockyMcpServer {
     /// prompts: the worker profile serves variants that end at the handoff to
     /// the trusted runner instead of instructing tools the profile excludes.
     profile: McpProfile,
+    /// The `instructions` this profile serves, resolved at construction.
+    ///
+    /// Built here rather than in [`RockyMcpServer::get_info`] because the
+    /// worker projection is a CHECKED rewrite that panics on drift, and it
+    /// belongs at the same point as the prompt- and tool-description
+    /// rewrites: one place where every profile's guidance is decided, and
+    /// `get_info` stays a plain read.
+    instructions: String,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
 }
@@ -125,8 +793,9 @@ pub enum McpProfile {
     Approver,
     /// The minimal drafting-worker allowlist (`--profile worker`): read /
     /// inspect grounding tools, the compile/test/breaking-change/dependents
-    /// verification loop, `draft_model` + `draft_check`, and the prompts.
-    /// Everything else — including `draft_contract`, `draft_metadata`,
+    /// verification loop, `draft_model`, and the prompts.
+    /// Everything else — including `draft_contract`, `draft_check`,
+    /// `draft_metadata`,
     /// `review_queue`, `pause_schedule`, `propose`, and any FUTURE tool not
     /// explicitly allowlisted — is absent from the listing and returns
     /// tool-not-found when called.
@@ -138,19 +807,61 @@ pub enum McpProfile {
 /// consciously opt in here (the golden profile tests pin both surfaces).
 ///
 /// Rationale (FF-DESIGN D7 ⟦RTL-1,3⟧): the untrusted drafting worker needs
-/// grounding reads and the compile/test loop for `models/<model>.sql` plus
-/// append-only checks. Contracts and metadata are spec-owned in the
-/// fulfillment loop — a worker-writable contract detaches artifacts from the
-/// spec — and approval/propose/schedule surfaces must never reach it. The
-/// in-engine LLM generator tools (`ai_*`, `suggest_freshness_block`,
-/// `explain_model`) are omitted too: the worker brings its own model, and the
-/// governed metadata path is the runner's, not the worker's.
+/// grounding reads and the compile/test loop for `models/<model>.sql`.
+/// Contracts and metadata are spec-owned in the fulfillment loop — a
+/// worker-writable contract detaches artifacts from the spec — and
+/// approval/propose/schedule surfaces must never reach it. The in-engine LLM
+/// generator tools (`ai_*`, `suggest_freshness_block`, `explain_model`) are
+/// omitted too: the worker brings its own model, and the governed metadata
+/// path is the runner's, not the worker's.
+///
+/// `draft_check` is DELIBERATELY absent, and the reason is worth stating
+/// because the tool is harmless on the Default profile and was allowlisted
+/// here originally. A `[[tests]]` block's `expression` is raw-interpolated
+/// into `SELECT COUNT(*) FROM t WHERE NOT (<expression>)`
+/// (`rocky_core::tests`), whose own comment says the caller is responsible
+/// for sandboxing execution. That was satisfiable while the only caller was
+/// a human typing `rocky test --declarative`. It is not satisfiable now that
+/// the fulfillment loop evaluates the declared checks automatically after
+/// every apply (FF-WP-F3), holding warehouse credentials with no human in
+/// the loop — an untrusted worker able to append checks would be able to
+/// author SQL the loop then runs unattended.
+///
+/// **What this closes, exactly.** Removing `draft_check` closes the MCP
+/// route it was served over. It does NOT make a worker unable to author a
+/// check: the subprocess driver runs an arbitrary command with the project
+/// root as its working directory and no filesystem confinement, and Phase B
+/// PRESERVES a worker-added `[[tests]]` block rather than discarding it
+/// (`rocky_core::product::lowering`). A worker with a file writer can still
+/// write the sidecar. That is the conceded local-process boundary, tracked
+/// by #1491 (an OS sandbox for the worker) and #1515 (trusted custody) —
+/// not something this allowlist claims to solve.
+///
+/// Nothing is lost by removing it: the product spec's declared grain and
+/// `checks` already lower into the sidecar's `[[tests]]`, so the worker has
+/// no need to append one. Hand-appending them was redundant.
+///
+/// Note what that does NOT say. It does not say the evaluated checks are
+/// only the ones the operator approved — the paragraph above is the reason
+/// why. A check written straight to the sidecar is PINNED, not rejected:
+/// Phase B preserves it, and the digest the loop pins at `verifying` is
+/// taken AFTER that merge, so the worker's check is inside the set the
+/// generation verifies and is evaluated like any other.
+///
+/// The post-apply custody digest does not close that either, and claiming
+/// it does would be the same over-claim one paragraph later. It compares
+/// what is on disk against what the generation verified, so it catches a
+/// set that MOVED after verification — not one that was already wrong when
+/// the digest was taken. The allowlist closes a route; the digest closes a
+/// window. Neither judges a check's content; that is #1515.
+///
+/// The tool remains on the Default profile, where the caller is an
+/// operator-driven session rather than an untrusted drafting worker.
 const WORKER_PROFILE_TOOLS: &[&str] = &[
     "breaking_change",
     "catalog",
     "compile",
     "dependents",
-    "draft_check",
     "draft_model",
     "inspect_schema",
     "lineage",
@@ -160,6 +871,782 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
     "sample_rows",
     "test",
 ];
+
+/// What a worker-served tool does to the CONFIGURED TARGET warehouse.
+///
+/// The axis is the warehouse only. `Offline` does not mean "no side effects":
+/// `draft_model` writes files under the models directory, and `test` runs a
+/// DuckDB of its own. It means the tool never opens the adapter the project's
+/// `rocky.toml` points at.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerToolEffect {
+    /// Never opens the target adapter — compile, file, local-state or
+    /// in-memory work only.
+    Offline,
+    /// Opens the target adapter and runs a READ query. No writes, no DDL.
+    ReadsWarehouse,
+    /// Executes or materializes a pipeline node against the target.
+    RunsPipeline,
+}
+
+/// The reviewed effect of every tool the worker profile serves.
+///
+/// THIRTEENTH ROUND, finding 2. The worker instructions open with a
+/// universal — "No tool this profile serves runs or materializes a pipeline"
+/// — over twelve hand-chosen names. Round twelve guarded it with
+/// `WORKER_PROFILE_TOOLS.len() == 12`, which held nothing (a swap or a
+/// behaviour change keeps the length), and deleting that guard left the
+/// universal with no tripwire at all. This is the replacement: a classified
+/// entry per served tool, cross-checked against the ROUTER by
+/// `every_worker_served_tool_is_classified_and_none_runs_a_pipeline`. A
+/// thirteenth tool reaching the worker surface fails that test until someone
+/// classifies it.
+///
+/// HAND-REVIEWED, AND SAYING SO IS THE POINT. Nothing derives this. Each
+/// entry was read against its tool body: the three `ReadsWarehouse` ones
+/// reach `warehouse_adapter()` / `prepare_table_query()`; the nine `Offline`
+/// ones call a sync `commands::*_output` helper over the models directory,
+/// the config, or the local state store. The sync signature is NOT the
+/// argument — the `duckdb` crate is synchronous, so sync does not imply
+/// offline. The bodies are.
+///
+/// WHAT THIS GUARD DOES NOT HOLD, stated rather than left to be found: that
+/// each classification is TRUE. It holds that nothing served is
+/// unclassified. If `commands::test_output` ever executes against the
+/// configured target instead of its own in-memory DuckDB, this table is
+/// silently wrong and the test stays green. Deriving the answer would take a
+/// call graph over this file, which is a fourth thing that would look
+/// derived and go wrong at the first indirection.
+#[cfg(test)]
+const WORKER_TOOL_EFFECTS: &[(&str, WorkerToolEffect)] = &[
+    // Compile + `breaking_change` classifier over the models directory.
+    ("breaking_change", WorkerToolEffect::Offline),
+    // `compute_catalog_output` — models directory plus the local state store.
+    ("catalog", WorkerToolEffect::Offline),
+    ("compile", WorkerToolEffect::Offline),
+    ("dependents", WorkerToolEffect::Offline),
+    // Writes `models/<name>.sql` and its sidecar. A file effect, not a
+    // warehouse one.
+    ("draft_model", WorkerToolEffect::Offline),
+    // `warehouse_adapter()` then `discover_source_tables` — both best-effort,
+    // which is the defect the worker text discloses rather than fixes.
+    ("inspect_schema", WorkerToolEffect::ReadsWarehouse),
+    ("lineage", WorkerToolEffect::Offline),
+    // `list_{models,pipelines,adapters,sources}_output` — config and files.
+    ("list", WorkerToolEffect::Offline),
+    // Reads the config only to pick a dialect; generates SQL, submits none.
+    ("plan_preview", WorkerToolEffect::Offline),
+    // `prepare_table_query` plus TWO reads: the aggregate, then `top_values`.
+    ("profile_column", WorkerToolEffect::ReadsWarehouse),
+    // `prepare_table_query` plus one `SELECT ... LIMIT` read.
+    ("sample_rows", WorkerToolEffect::ReadsWarehouse),
+    // `commands::test_output` — the compiled model tests and the fixture
+    // tests, in a DuckDB of its own, not the configured target.
+    ("test", WorkerToolEffect::Offline),
+];
+
+/// The entries in `table` that execute or materialize a pipeline.
+///
+/// Split out so the test can show the check BITES — running it over a
+/// deliberately bad table is the difference between a guard and another
+/// assertion that only looks like one.
+#[cfg(test)]
+fn worker_tools_that_run_a_pipeline<'a>(table: &[(&'a str, WorkerToolEffect)]) -> Vec<&'a str> {
+    table
+        .iter()
+        .filter(|(_, effect)| *effect == WorkerToolEffect::RunsPipeline)
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+/// The entries in `table` that read the target warehouse.
+#[cfg(test)]
+fn worker_tools_that_read_the_warehouse<'a>(table: &[(&'a str, WorkerToolEffect)]) -> Vec<&'a str> {
+    table
+        .iter()
+        .filter(|(_, effect)| *effect == WorkerToolEffect::ReadsWarehouse)
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Worker-profile guidance surfaces — the enumeration, the rewrite table,
+// and the matching rule (F3 red team, finding 3)
+// ---------------------------------------------------------------------------
+
+/// Every guidance surface an MCP worker session is served, counted —
+/// because this defect class has now been found SIX times, and every fix
+/// was believed complete when it shipped.
+///
+/// The history is the reason this is a list rather than a habit. Round 1
+/// fixed the prompt `description`s. Round 2 found the prompt BODIES.
+/// Round 2's own follow-up found the draft `next_steps`. The F3 red team
+/// then found `tools/list` TOOL DESCRIPTIONS, three of them still
+/// steering the worker at `propose`. Extending the sweep to cover those
+/// found a fifth instance on a surface swept since round 2: the
+/// `add_tests_to_pks` worker prompt body said "Proposing", which an
+/// exact-name rule cannot see. And F3 round 2 found the sixth in the one
+/// place this list did not look at all — the text a tool carries when it
+/// SUCCEEDS. Four E027 budget constructors suggested "or optimize the
+/// query", and `optimize` is a tool this profile does not serve.
+///
+/// ```text
+///   #  surface                                    status
+///   1  initialize   -> THE WHOLE RESULT            swept: worker_instructions_are_
+///        (protocolVersion, capabilities,            projected_and_default_stays_verbatim
+///         serverInfo, instructions, _meta —
+///         the banner is spliced out, being
+///         the one surface that names
+///         excluded tools on purpose)
+///   2  prompts/list -> THE WHOLE Prompt            swept: worker_profile_guidance_
+///        (name, title, description,                 surfaces_name_no_excluded_tool
+///         arguments, icons, _meta)
+///   3  prompts/get  -> THE WHOLE RESULT             swept: worker_profile_prompts_end_
+///        (resultType, description, messages,         at_the_runner_handoff
+///         _meta)
+///   4  tools/list   -> tool description            swept: worker_profile_guidance_
+///   5  tools/list   -> input_schema text            surfaces_name_no_excluded_tool,
+///        (4 and 5 are two FIELDS of one             as THE WHOLE Tool — which also
+///         channel; the sweep takes the whole        covers title, annotations,
+///         Tool, so both are covered at once)       icons and _meta
+///   6  tools/list   -> output_schema text          NOT SERVED — pinned absent by
+///                                                   worker_result_text_names_no_
+///                                                   excluded_tool
+///   7  tools/call   -> ok: result next_steps       swept: draft_next_steps_are_
+///        (a FIELD of row 8's channel)               profile_selected; also GOLDEN
+///                                                   (worker) under its own key
+///   8  tools/call   -> ok: THE WHOLE CallToolResult PARTIAL — two DIFFERENT
+///        (structured_content AND content AND        reasons, split below;
+///         is_error AND result_type AND _meta)       all 12 worker tools GOLDEN
+///   9  tools/call   -> err: THE WHOLE CallToolResult PARTIAL — argument arms
+///        (the ToolError body — message,             swept AND GOLDEN (worker),
+///         remediation_hint, policy_rule, the        the rest OPEN
+///         plan fields — AND the envelope)
+/// ```
+///
+/// THE ROWS ARE NOT ALL CHANNELS, and pretending they are is what the
+/// heading below used to do. Rows 4 and 5 are two FIELDS of one `tools/list`
+/// entry, and row 7 is one field of row 8's result. They keep their numbers,
+/// because `WORKER_GUIDANCE_SURFACES` counts the places a worker is served
+/// text and renumbering would break every reference to "surface 9" in this
+/// crate for no safety gain. What changed is the SWEEP: each of those field
+/// rows is now covered by a sweep over its whole channel, so the guarantee
+/// holds even where the row label does not.
+///
+/// NINE SURFACES: SIX SWEPT, TWO PARTIAL, ONE NOT SERVED. Not "all swept" —
+/// that sentence has now been believed five times about a set that was
+/// incomplete, which is the whole reason for the count.
+///
+/// EVERY ROW'S SWEEP READS A WHOLE CHANNEL, NOT A FIELD, and the ninth
+/// round is why. Rows 3
+/// and 9 used to name one field each — `prompts/get`'s message bodies, and
+/// `ToolError`'s `remediation_hint`. Both were wrong by omission.
+/// `GetPromptResult` also carries a `description`, which no sweep read, and
+/// which is where two worker prompts went on promising a write their bodies
+/// withheld. `ToolError` also carries `message`, `policy_rule` and the
+/// flattened plan-handoff fields, all of them served text.
+///
+/// The fix is structural rather than additive. A row now covers everything
+/// its channel returns, and its sweep matches the WHOLE serialized payload,
+/// so a field added later is covered without any test knowing the shape.
+/// Adding a "surface 10" for `description` would have bought a surface 11
+/// for the next field: enumerating fields is precisely what lost here.
+///
+/// WHAT THE PARENTHESISED FIELD LISTS ARE, and are not. They are a reading
+/// aid for rmcp 3.1.2's shapes, not the coverage rule — the sweep is the
+/// serialized value, and it reads whatever serde emits. The eleventh
+/// round's finding 4 was that three of them had gone stale against the
+/// crate: row 1 omitted `_meta`, row 2 omitted `name`, and row 3 omitted
+/// both `resultType` and `_meta`. No coverage hole, because the sweeps
+/// already read the whole value; the LISTS were wrong, which is the same
+/// defect class as a claim that out-runs its check.
+///
+/// Most of those fields carry `skip_serializing_if = "Option::is_none"`, so
+/// while they are `None` they are absent from the payload and the sweep
+/// reads nothing there. That is the intended behaviour rather than a gap:
+/// an absent field serves a worker no text, and the first populated value
+/// is swept without anyone editing a test. `Prompt::name` and
+/// `GetPromptResult::messages` are the two that are always present.
+///
+/// `resultType` IS STRIPPED PER PEER, not absent from this server. rmcp's
+/// constructors set `Some(ResultType::COMPLETE)`, and the server handler
+/// then calls `strip_result_type_for_legacy_peer()` for any peer whose
+/// NEGOTIATED protocol version is older than `2026-07-28`. It applies to
+/// row 8's `result_type` as well, for the same reason and by the same call.
+/// Reading a field off the struct is not evidence it reaches a worker.
+///
+/// The first attempt at this correction wrote the opposite of the strip —
+/// caught by pinning the value rather than by reading the type.
+///
+/// "FOR ANY CLIENT TODAY", NOT "BY CONSTRUCTION", and the fifteenth round
+/// is why the qualifier is here. This used to argue that
+/// [`RockyMcpServer::get_info`] "pins `ProtocolVersion::V_2024_11_05`, so
+/// every result this server sends is stripped". `get_info` does not pin the
+/// wire version. It supplies the server's FALLBACK, and rmcp's
+/// `serve_server` then overwrites `init_response.protocol_version` with
+/// `negotiate_protocol_version(client_requested, server_fallback,
+/// supported)` — which returns the CLIENT's request whenever the server
+/// supports it. `RockyMcpServer` does not override
+/// `Service::supported_protocol_versions`, so it advertises rmcp's whole
+/// `KNOWN_VERSIONS` list, `V_2026_07_28` included. A client that asks for
+/// `2026-07-28` is given it, `sep_2322_supported` is then true, the strip
+/// call is skipped, and `resultType` DOES reach that client.
+///
+/// The stripping therefore holds because no PRODUCTION client asks for
+/// `2026-07-28` yet, not because this server refuses to speak it. The
+/// negotiated version is `2025-11-25` against rmcp 3.1.2's own client —
+/// which is now BLESSED, as part of row 1's `initialize` payload in
+/// `served_text_golden_pins_every_worded_surface`, so the day it moves the
+/// golden moves with it and this paragraph gets re-read. Closing the gap by
+/// construction would mean narrowing `supported_protocol_versions`, which is
+/// a behaviour change to what this server speaks and is not made here.
+///
+/// SIXTEENTH ROUND, finding 3 — THAT IS NOW GUARDED, NOT MERELY OBSERVED.
+/// The two paragraphs above were correct and completely unexercised: every
+/// roundtrip connected with rmcp's default `()` handler, so the branch they
+/// describe — a peer that DOES negotiate `2026-07-28` — was reached by no
+/// test. `result_type_reaches_a_2026_07_28_client_and_no_other` (in
+/// `tests/roundtrip.rs`) now drives both peers and asserts the negotiated
+/// version on each before reading `result_type`, so "stripped for the
+/// default client, served to a modern one" is a checked claim.
+///
+/// It asserts BOTH directions on purpose, and each one covers the extreme
+/// the other cannot see. Present-only survives the field being ON
+/// EVERYWHERE — drop the strip call and every peer keeps `resultType`, and
+/// that half still passes. Absent-only survives the field being OFF
+/// EVERYWHERE — serde emitting nothing, or this server narrowing
+/// `supported_protocol_versions` so no peer can negotiate `2026-07-28`, and
+/// that half still passes. Only the pair distinguishes "negotiated per peer"
+/// from either extreme.
+///
+/// The value is the fixed string `complete`, so a modern client learns
+/// nothing from it — this is about the CLAIM, as everything on this list is.
+///
+/// The value of `resultType` is the fixed string `complete`, so nothing
+/// about this is a guidance LEAK. The defect was the CLAIM — a justification
+/// that named a mechanism the code does not have — which is the same class
+/// every round of this branch has found in served text.
+///
+/// THAT SENTENCE WAS TRUE OF ROW 3 AND OF NO OTHER ROW, and the tenth round
+/// is why it is worth writing down twice. Row 3 did serialise the whole
+/// `GetPromptResult`. Rows 1, 2, 4, 5, 8 and 9 kept SELECTING fields under
+/// the same heading: `initialize` read `instructions`, `prompts/list` read
+/// `description`, `tools/list` read `description` + `input_schema`, and both
+/// call sweeps read `structured_content` and dropped the `CallToolResult`
+/// around it. Against frozen rmcp 3.1.2 the omitted fields are real —
+/// `InitializeResult` also carries `protocolVersion` / `capabilities` /
+/// `serverInfo` / `_meta` (and its `Implementation` carries `title` /
+/// `description` / `icons` / `websiteUrl`), `Prompt` also carries `title` /
+/// `arguments` / `icons` / `_meta`, `Tool` also carries `title` /
+/// `output_schema` / `annotations` / `icons` / `_meta`, and
+/// `CallToolResult` also carries `content` / `is_error` / `result_type` /
+/// `_meta`. No leak was demonstrated in any of them; the FALSE GUARANTEE
+/// was the finding, and a guarantee is exactly the kind of claim this list
+/// exists to keep honest.
+///
+/// ROW 1 WAS FOUND LAST AND BY THE AUTHOR, on the work the other rows'
+/// correction produced — writing "every row is covered by a sweep over the
+/// whole payload of its channel" and then checking row 1 against it. That
+/// ordering is the point, not a boast: the general defence on this list has
+/// always been "read what the served text DOES", and the sibling defence is
+/// to read every claim this file makes back against the code it describes,
+/// including a claim written five minutes ago.
+///
+/// One of those omissions was not merely theoretical. `content` is filled by
+/// `CallToolResult::structured` with `value.to_string()` — a second
+/// rendering of the same guidance, and the one a client that ignores
+/// structured output shows the worker. It is now swept, and asserted
+/// non-empty so the sweep cannot degrade into reading an empty vector.
+///
+/// AND THE HONEST LIMIT OF THAT: because rmcp derives `content` from the
+/// same `Value`, the bytes are identical today, so widening rows 8 and 9
+/// found nothing and could not have. What it buys is the guarantee the
+/// heading claims — a field added to the envelope, or a result constructed
+/// with `content` that is NOT a copy of the structured half, is covered
+/// without this test being edited. Rows 2 and 4/5 are different: their
+/// omitted fields (`title`, `arguments[].description`, `annotations`) are
+/// independently settable, and a mutation into `title` is caught by the
+/// widened sweep and was invisible to the field-selecting one. Row 1 sits
+/// with rows 8 and 9 on this axis rather than with 2 and 4/5: its newly
+/// covered fields are all `None` under
+/// `Implementation::from_build_env()`, so widening it found nothing either.
+/// The mutation that proves the sweep works has to POPULATE one first.
+///
+/// So the honest form of the guarantee is about the SWEEPS, not the row
+/// labels: every row is covered by a sweep over the whole serialized payload
+/// of the channel that carries it. Rows 4, 5 and 7 name fields; their
+/// channels (`Tool`, and row 8's `CallToolResult`) are what the sweeps read.
+/// Row 1 removes exactly one thing before matching — the banner, which names
+/// excluded tools deliberately — and nothing else.
+///
+/// (1) WAS EXEMPT AND IS NOW SWEPT, and how it fell is worth keeping. The
+/// argument for exempting it was that the instructions are the canonical
+/// authoring skill served VERBATIM under a disclaiming banner, so forking
+/// them would let the guidance drift from the canonical file. That made the
+/// row HONEST. It did not make it SAFE, and the F3 red team round 2 said so:
+/// the banner stopped the worker at contract authorship, metadata
+/// authorship and the record/review/apply chain, but NOT at CHECK
+/// authorship — while the skill below it told the worker to strengthen
+/// assertions, append tests through the draft tools, and encode invariants
+/// as checks. The largest guidance surface instructed exactly the thing
+/// removing `draft_check` exists to stop.
+///
+/// The fix keeps what the exemption was protecting. The canonical skill is
+/// untouched and still correct for the default profile; what forks is what
+/// the WORKER is served, through [`WORKER_INSTRUCTIONS_REWRITES`] — the
+/// same checked-rewrite mechanism as rows 2 and 4, where a needle that
+/// stops matching panics at construction instead of silently serving the
+/// default sentence.
+///
+/// The banner stays, and it is the ONE worker surface that names excluded
+/// tools on purpose — saying "`propose` is not available" is the opposite
+/// of steering at it. It is derived from the routers now, so it can no
+/// longer name six of nineteen.
+///
+/// (6) IS NOT SERVED, and is listed precisely because it nearly was. rmcp
+/// emits no `output_schema` for any tool here, so the result-type doc
+/// comments schemars would put there never reach a worker — and those doc
+/// comments name excluded tools freely (`DraftModelResult::next_steps`
+/// spells out the whole `propose` chain). Opting in would turn all of
+/// `result_types.rs` into worker-served text in one commit. Pinned absent
+/// so that commit fails a test.
+///
+/// (8) IS PARTIAL, and the word is chosen carefully. It covers the free
+/// text a SUCCESSFUL result carries besides `next_steps`: diagnostic
+/// `message`/`suggestion` (from `compile` AND `draft_model` — two routes
+/// to the same text), breaking-change finding messages, `skipped_reason`,
+/// test-failure text, unavailability `reason`s. Its sweep drives all 12
+/// worker-served tools and serialises each WHOLE result, with the compile
+/// forced RED so the diagnostic path is really exercised.
+///
+/// What it CANNOT claim is completeness — for two reasons that are NOT the
+/// same kind of thing, and the ninth review round asked for them split
+/// because the second was laundering the first:
+///
+///  - UNFINISHED AUDIT COVERAGE (fixable, nobody has done it). Rocky-authored
+///    STATIC templates are written per call site across rocky-compiler,
+///    rocky-core and rocky-cli, for consumers that are mostly not this
+///    worker. There is no table to audit, so reaching all of them means
+///    driving every constructor — which this harness does not. That is work
+///    not yet done, the same shape as (9). It is not a property of the
+///    problem, and it must not inherit the next bullet's excuse.
+///  - A REAL LEXICAL BOUNDARY (unfixable by any rule Rocky ships). A
+///    diagnostic interpolates the user's own model and column names. If a
+///    project contains an identifier that IS an excluded tool name —
+///    a model literally called `propose` — the diagnostic quoting it names
+///    an excluded tool, and no rule Rocky ships can reword someone's model.
+///
+///    The collision is narrower than it was, and the example this comment
+///    used to give was WRONG: `propose_v2` does NOT collide, because `_` is
+///    an identifier byte, so `contains_identifier` rejects it at the
+///    boundary exactly as it rejects `proposal_id` and `propose_only`. Only
+///    an EXACT identifier collides. A wrong example makes a true boundary
+///    look invented, which is why it is corrected rather than dropped.
+///
+/// The distinction matters operationally: the first bullet closes by doing
+/// the audit, the second never closes. Reporting them as one PARTIAL let
+/// the unfinished half borrow the finished half's excuse.
+///
+/// (9) IS PARTIAL, and was previously inventoried as one field of an
+/// envelope that has four. A `ToolError` carries `message` AND
+/// `remediation_hint`, plus `policy_rule` and the flattened plan-handoff
+/// fields; all of them are guidance, and all of them reach the worker.
+///
+/// What is swept is the ARGUMENT-VALIDATION arm of the NINE worker-served
+/// tools that have one, each as a WHOLE serialized envelope, with the
+/// failure asserted first so a call that silently succeeded cannot pass as
+/// coverage.
+///
+/// NINE, not eight, and the correction matters more than the number. The
+/// list of tools EXCUSED from this row said `inspect_schema`, `catalog`,
+/// `test` and `breaking_change` "ignore their arguments (or take none)".
+/// `test` does not: it takes an optional `model` and rejects an unknown one
+/// as `model_not_found`, through `commands::test_output`'s
+/// `reject_unknown_model`. A written-out excuse read as coverage for a
+/// reachable arm nobody drove — which is the failure mode the excuse itself
+/// was added to prevent. The other three were re-verified rather than
+/// inherited: `inspect_schema` and `catalog` bind `_params` and never read
+/// them, and `breaking_change`'s bad-`base` path returns a SUCCESSFUL result
+/// with `skipped_reason` set, not an error.
+///
+/// What is NOT swept is every other arm — policy denials,
+/// warehouse failures, internal errors — because reaching them means
+/// driving every error path of every served tool, which no harness here
+/// does, and the hints are written per call site so there is no table to
+/// audit instead. That residue is UNFINISHED AUDIT COVERAGE, the same
+/// category as (8)'s first bullet: it closes by doing the work.
+///
+/// THE CHANNELS ARE CLOSED AT THE PROTOCOL LEVEL; THE FIELDS ARE NOT.
+/// [`RockyMcpServer::get_info`] enables `tools` and `prompts` and nothing
+/// else, so there is no `resources/read`, no completion and no logging
+/// channel able to carry a tenth KIND of text, and
+/// `the_server_opens_no_guidance_channel_beyond_tools_and_prompts` pins
+/// that — enabling one fails a test and forces a revisit of this comment
+/// instead of silently opening surface 10.
+///
+/// That bound is real and it is narrower than it once read here. A
+/// capability gate closes the set of CHANNELS. It cannot close the set of
+/// FIELDS inside a channel: `GetPromptResult` grew a `description` this
+/// enumeration never counted, and no capability flag would have announced
+/// it. Nothing at the protocol level stops a struct gaining a field.
+///
+/// Which is exactly why every row above matches the WHOLE serialized
+/// payload of its channel rather than a field it went looking for. The
+/// capability bound and the whole-payload sweeps are two halves of one
+/// argument: the first closes the channels, the second is what covers the
+/// fields the first cannot see.
+///
+/// SCOPE: this counts the MCP SESSION. A worker MAY also receive the
+/// driver's TASK BRIEF, which is out-of-band — written to the task outbox,
+/// not served over this protocol — and has its own gate in
+/// `rocky_fulfill::briefs`: an override naming an excluded tool is
+/// REFUSED, not swept.
+///
+/// "MAY" is load-bearing, and it is why row 1 could not stay exempt. The
+/// worker profile is directly invocable as `rocky mcp --profile worker`,
+/// and no brief is guaranteed to accompany it. So the served instructions
+/// are the ONLY guidance surface a worker session is certain to read, and
+/// "the brief also says not to" was never a defense available to this list.
+///
+/// The two rules now agree on identifier boundaries and differ on ONE axis:
+/// the brief gate matches EXACT names, this one derives inflections. The
+/// jobs differ, and so does the cost of a false positive — here it costs a
+/// reword of text Rocky owns, there it rejects a legitimate operator
+/// config. The shipped default brief texts carry no inflection of an
+/// excluded name.
+///
+/// Surface 7 has one worker-served producer: `draft_model`. `draft_check`
+/// also carries `next_steps`, but it left [`WORKER_PROFILE_TOOLS`], so a
+/// worker session cannot reach it — its worker text is still kept correct
+/// (see [`RockyMcpServer::draft_check_next_steps`]) because it is what
+/// would be wrong first if the tool were re-admitted.
+///
+/// A GOLDEN NOW SITS UNDER ROWS 1–5, 7, 8 AND 9, and it is a new CHECK over
+/// existing rows — NOT a tenth row. The count below stays 9.
+///
+/// `served_text_golden_pins_every_worded_surface` (in `tests/roundtrip.rs`)
+/// digests the whole serialized payload of rows 1, 2, 3, 4 and 5, for the
+/// DEFAULT and WORKER profiles, plus rows 7, 8 and 9 for the WORKER
+/// profile, into `tests/fixtures/served_text.golden`. Any edit to any of
+/// that text fails the test until someone re-blesses the file.
+///
+/// ROWS 7–9 WERE EXCLUDED FROM IT, and the fifteenth round is why they are
+/// not. The exclusion read: "their payloads embed run-dependent values, so a
+/// digest over them would drift every run and get blessed reflexively." That
+/// is true of `tools/call` in general. It is not true of the WORKER set, and
+/// checking that was the step the exclusion skipped — the plan- and
+/// timestamp-producing tools are `propose`, `optimize` and the rest of the
+/// withheld list, and this profile serves none of them.
+///
+/// Grounded rather than argued: all 21 worker call payloads (12 successes,
+/// 9 argument failures) were dumped and read. Not one carries an absolute
+/// path, a timestamp, a duration or an id. `draft_model` reports a bare
+/// model NAME, `test` reports counts with no timings, and
+/// `breaking_change`'s `skipped_reason` names no path. The temp-root
+/// normalizer in the harness is defence for a field not yet added, not
+/// something that fires today.
+///
+/// WORKER ONLY for those three, and the asymmetry is deliberate: the
+/// DEFAULT profile serves the plan-producing tools the exclusion was really
+/// about, so pinning its call results would import the drift that is
+/// genuinely absent here. Row 9 also stays PARTIAL in the golden for the
+/// same reason it is partial in the sweep — only the argument-validation
+/// arm is reachable offline.
+///
+/// "WHOLE SERIALIZED PAYLOAD" WAS NOT TRUE OF ROW 1 WHEN IT WAS FIRST
+/// WRITTEN, and the fifteenth round is why it is called out rather than
+/// quietly corrected. The golden hashed `instructions` alone — one field of
+/// an `InitializeResult` that also carries `protocolVersion`,
+/// `capabilities`, `serverInfo` and `_meta` — while its heading claimed the
+/// channel. That is the SAME field-selection defect the eleventh round
+/// found in rows 1, 2, 4, 5, 8 and 9 of the sweeps above, reproduced inside
+/// the guard built to catch it. It now hashes the serialized
+/// `InitializeResult`.
+///
+/// The reason it exists is the limit of every other rule on this list. All
+/// of them are LEXICAL — they look for a word. An arbitrary paraphrase
+/// defeats a negative-substring pin, and no lexical rule can catch a
+/// reworded semantic overclaim without pretending to understand meaning.
+/// The golden does not read the text at all, so a paraphrase cannot dodge
+/// it.
+///
+/// AND ITS OWN LIMIT, stated here so it is not read as more: it catches
+/// UNREVIEWED wording changes, not FALSE ones. It cannot tell a true
+/// sentence from a false one, and a wrong claim blessed once stays
+/// blessed. It converts "is every served sentence true?" — unbounded —
+/// into "is this one changed sentence true?" — bounded, and still a
+/// person's job. What remains outside it is stated above: the default
+/// profile's call results, and every error arm of row 9 that an offline
+/// harness cannot reach.
+///
+/// Test-gated because nothing in the server reads the number — the value
+/// is the enumeration above it and the anchor it gives the capability
+/// test. It is a constant rather than a comment so that grepping
+/// `WORKER_GUIDANCE_SURFACES` reaches the list from either end.
+#[cfg(test)]
+const WORKER_GUIDANCE_SURFACES: usize = 9;
+
+/// The worker-profile rewrites of `#[tool(description = ...)]` text, as
+/// `(tool, sentence to replace, replacement)`.
+///
+/// A REWRITE, not a second copy of the description. The prompt side
+/// duplicates whole strings ([`WORKER_PROMPT_DESCRIPTIONS`]), which works
+/// there because those strings are one sentence each; `draft_model`'s
+/// description is a paragraph, and a duplicated paragraph is a paragraph
+/// that will drift. Only the steering sentence is stated here.
+///
+/// Both drift directions REFUSE at CONSTRUCTION, not at review:
+///
+///  - a tool that leaves [`WORKER_PROFILE_TOOLS`] (or is renamed) orphans
+///    its entry, and the lookup refuses;
+///  - an edit to the steering sentence makes the needle miss, and the
+///    replacement refuses rather than silently serving the default text to
+///    a worker — which is exactly how a checked `replace` differs from a
+///    plain one.
+///
+/// "BOTH DIRECTIONS" WAS TRUE OF ZERO MATCHES ONLY, until the tenth round.
+/// This path tested `contains` and then replaced EVERY occurrence, while
+/// [`WORKER_INSTRUCTIONS_REWRITES`] one surface over required exactly one
+/// match. So a duplicated needle here silently rewrote a second passage
+/// nobody reviewed — the failure the instruction path refuses — and the
+/// sentence above described a guarantee only one of the two surfaces had.
+/// [`worker_tool_description`] now enforces the same exactly-once rule, and
+/// it is a free function so a test can drive the duplicate case.
+///
+/// Construction, not compile time — the same correction as
+/// [`WORKER_INSTRUCTIONS_REWRITES`]. Drift here compiles and then aborts
+/// `rocky mcp --profile worker` at startup.
+///
+/// The direction neither guard covers is a NEW worker-served tool whose
+/// description names an excluded verb. That is what the sweep is for.
+const WORKER_TOOL_DESCRIPTIONS: &[(&str, &str, &str)] = &[
+    (
+        "breaking_change",
+        "Self-check blast radius BEFORE propose.",
+        "Self-check blast radius BEFORE you hand off to the trusted runner.",
+    ),
+    (
+        "plan_preview",
+        "before proposing a materialization.",
+        "before you hand off to the trusted runner.",
+    ),
+    (
+        "draft_model",
+        "a draft is inert until you `propose` it and a human reviews it.",
+        "a draft is inert until the trusted runner records a plan for it and a human \
+         reviews it.",
+    ),
+];
+
+/// The forms of an excluded tool name that no worker-served guidance
+/// string may contain: the exact name plus mechanically derived English
+/// inflections (`propose` → `proposing`, `proposed`, `proposes`,
+/// `proposal`).
+///
+/// DERIVED, not listed. A hand-written variant table would be the same
+/// defect as a hand-written excluded-tool list, one level down — and that
+/// list is precisely how `draft_check` slipped past a green sweep.
+///
+/// The inflections are what made this rule find anything. `plan_preview`
+/// said "before proposing a materialization" and the `add_tests_to_pks`
+/// worker prompt said "Proposing a wrong key invariant"; both steer at a
+/// verb the profile does not serve, and an exact-name sweep read both as
+/// clean.
+///
+/// IT IS A WORD RULE, NOT A SEMANTIC ONE, and it can fire on ordinary
+/// English — that "Proposing" meant "suggesting". The remedy when it does
+/// is to REWORD, never to relax the rule, and the reason is the reader
+/// rather than the matcher: a worker that has just been told `propose` is
+/// not available cannot tell the two senses apart either.
+///
+/// A BLANK tool name yields NO forms. It cannot arrive over MCP — both
+/// routers are built from `#[tool]` attributes — but this is a `pub fn` on
+/// a library crate, so a caller can pass one. Deriving from `""` would
+/// otherwise hand the sweep `"ing"`, `"ed"`, `"es"`, `"s"` and `"al"` as
+/// live matchers, and `"s"` is an identifier in plenty of ordinary English.
+/// A name that names nothing must match nothing.
+pub fn excluded_mention_forms(tool: &str) -> Vec<String> {
+    if tool.trim().is_empty() {
+        return Vec::new();
+    }
+    let stem = tool.strip_suffix('e').unwrap_or(tool);
+    let mut forms = vec![tool.to_string()];
+    forms.extend(
+        ["ing", "ed", "es", "s", "al"]
+            .into_iter()
+            .map(|suffix| format!("{stem}{suffix}"))
+            .filter(|form| form != tool),
+    );
+    forms
+}
+
+/// The `instructions` a worker session is served: the derived banner, then
+/// the skill body with [`WORKER_INSTRUCTIONS_REWRITES`] applied.
+///
+/// REFUSES if any needle does not match exactly once. Both halves matter:
+///
+///  - ZERO matches means the skill was edited under the projection. A
+///    silent no-op replace would serve the DEFAULT sentence to a worker,
+///    which is the hole this whole table closes.
+///  - MORE THAN ONE match means `replace` would rewrite a second passage
+///    nobody reviewed. A projection that edits text its author did not read
+///    is not a projection.
+///
+/// WHEN THE CHECK RUNS, corrected. Every operand is a compile-time constant
+/// — [`INSTRUCTIONS`] is an `include_str!` of the skill file — but the
+/// match itself is never verified at compile time. It runs at server
+/// CONSTRUCTION, on the live `rocky mcp --profile worker` path. An edit to
+/// the skill compiles cleanly and then refuses at startup. The guarantee
+/// that the frozen constants still line up is a TEST, not a build
+/// invariant, and calling it one overstated it.
+///
+/// The refusal aborts startup; it never serves a partial projection. See
+/// [`RockyMcpServer::try_new_with_profile`] for why that is the fail-closed
+/// choice and not the softened one.
+///
+/// `rewrites` is a parameter rather than a direct read of
+/// [`WORKER_INSTRUCTIONS_REWRITES`] so a test can hand it a table that HAS
+/// drifted. Otherwise the refusal is unreachable in-process — the real
+/// table matches, which is the point — and "it refuses on drift" would be
+/// an untested claim about a path this round exists to correct claims on.
+fn worker_instructions(excluded: &[String], rewrites: &[(&str, &str)]) -> Result<String, String> {
+    let mut body = INSTRUCTIONS.to_string();
+    for (needle, replacement) in rewrites {
+        let hits = body.matches(needle).count();
+        if hits != 1 {
+            return Err(format!(
+                "WORKER_INSTRUCTIONS_REWRITES needle matched {hits} times, not once — the \
+                 rocky-ai-workflow skill changed under the worker projection. Re-project it \
+                 deliberately; this refuses at construction so a worker is never served the \
+                 default sentence. Needle: {needle:?}"
+            ));
+        }
+        body = body.replace(needle, replacement);
+    }
+    Ok(format!("{}{body}", worker_instructions_banner(excluded)))
+}
+
+/// One [`WORKER_TOOL_DESCRIPTIONS`] rewrite applied to a tool's served
+/// description.
+///
+/// REFUSES unless the needle matches EXACTLY ONCE — the same rule
+/// [`worker_instructions`] enforces, and the tenth round's finding 3 is that
+/// the two did not agree. This path required only `contains` and then
+/// replaced EVERY occurrence, so a needle that appeared twice silently
+/// rewrote a second passage nobody reviewed. Instruction rewrites refused
+/// that and tool-description rewrites did not, which made "the projections
+/// fail closed" true of one of the two surfaces it was claimed for.
+///
+/// Both directions, and both matter for the same reason as one surface over:
+///
+///  - ZERO matches means the description was edited under the projection. A
+///    silent no-op replace serves the DEFAULT text — which names `propose` —
+///    to a worker.
+///  - MORE THAN ONE means `replace` edits a passage the table's author did
+///    not read. A projection that rewrites text nobody reviewed is not a
+///    projection.
+///
+/// A FREE FUNCTION rather than an inline loop body, for the reason
+/// [`worker_instructions`] takes its table as a parameter: the real
+/// descriptions match once, so the refusal is unreachable in-process and
+/// "it fails closed" would be an untested claim about the very path this
+/// round exists to correct claims on. Taking `current` as an argument lets a
+/// test hand it a description that HAS drifted.
+fn worker_tool_description(
+    tool: &str,
+    current: &str,
+    needle: &str,
+    replacement: &str,
+) -> Result<String, String> {
+    let hits = current.matches(needle).count();
+    if hits != 1 {
+        return Err(format!(
+            "WORKER_TOOL_DESCRIPTIONS rewrite for '{tool}' matched {hits} times, not once — \
+             zero means the default description was edited under the projection and a \
+             no-op replace would serve the DEFAULT text to a worker; more than one means \
+             the replace would rewrite a passage nobody reviewed. Re-project it \
+             deliberately. Needle: {needle:?}"
+        ));
+    }
+    Ok(current.replace(needle, replacement))
+}
+
+/// Whether `needle` occurs in `haystack` at IDENTIFIER BOUNDARIES — neither
+/// neighbouring byte is `[a-z0-9_]`. Both arguments must already be
+/// lowercase.
+///
+/// This is the F3 round-2 fix. The rule was a raw `contains`, which is not
+/// an identifier detector: it read `proposal` inside a user's column named
+/// `proposal_id` and `propose` inside the config literal `propose_only`.
+/// That matters more the wider the swept surface gets — a compiler
+/// diagnostic quotes the user's own model and column names back at the
+/// worker, so a raw-substring rule turns every unlucky identifier in the
+/// user's project into a guidance violation Rocky cannot reword.
+///
+/// What it does NOT buy: a legitimate English word that IS the tool name
+/// still matches, because it is byte-identical at both boundaries. The
+/// E027 budget diagnostic said "or optimize the query" and `optimize` is
+/// an excluded tool; boundaries left that hit exactly where it was, and it
+/// was closed by rewording E027 (`rocky_compiler::diagnostic`), which is
+/// the remedy the rule's own doc prescribes — not a narrower matcher.
+///
+/// Deliberately a SECOND implementation of the same primitive
+/// `rocky_fulfill::briefs` uses, and not a shared one — see the SCOPE
+/// paragraph on [`WORKER_GUIDANCE_SURFACES`] for why the two rules stay
+/// separate. (The dependency runs rocky-fulfill → rocky-mcp, so sharing
+/// would mean this crate importing that one, backwards.) The two now agree
+/// on boundaries and still differ on inflections: refusing a valid
+/// operator config costs more than rewording a sentence Rocky owns.
+///
+/// An EMPTY needle returns `false`, and the guard is a panic fix rather
+/// than a taste call. `"".find("")` succeeds at every byte offset, so the
+/// scan advanced `from` past the end of `haystack` and the next
+/// `haystack[from..]` panicked with an out-of-range index — but only when
+/// the last byte was an identifier byte, which is why it read as a
+/// harmless edge case. `contains_identifier("abc ", "")` returned `true`;
+/// `contains_identifier("abc", "")` aborted the process.
+///
+/// It is not reachable over MCP (every excluded name comes from a router),
+/// but [`names_excluded_tool`] is public API and a caller can supply the
+/// empty string. An empty needle is not an identifier, so it matches
+/// nothing.
+fn contains_identifier(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let bytes = haystack.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_';
+    let mut from = 0;
+    while let Some(offset) = haystack[from..].find(needle) {
+        let start = from + offset;
+        let end = start + needle.len();
+        let before_ok = start == 0 || !is_ident(bytes[start - 1]);
+        let after_ok = end == bytes.len() || !is_ident(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// The excluded tool a guidance string names, and the form it used —
+/// `None` when the string names none of them.
+///
+/// Case-insensitive: a sentence-initial "Proposing" is the same steer as
+/// a mid-sentence one, and only the second would survive an exact match.
+/// Matched at identifier boundaries ([`contains_identifier`]), so the rule
+/// detects an identifier rather than a byte run.
+pub fn names_excluded_tool(haystack: &str, excluded: &[String]) -> Option<(String, String)> {
+    let lower = haystack.to_lowercase();
+    excluded.iter().find_map(|tool| {
+        excluded_mention_forms(tool)
+            .into_iter()
+            .find(|form| contains_identifier(&lower, &form.to_lowercase()))
+            .map(|form| (tool.clone(), form))
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Tool input parameter structs (schemars 1.x — rmcp's `Parameters<T>` bound).
@@ -605,6 +2092,46 @@ impl RockyMcpServer {
     /// descriptions are rewritten here to the
     /// [`WORKER_PROMPT_DESCRIPTIONS`] variants for the same reason.
     pub fn new_with_profile(config_path: PathBuf, profile: McpProfile) -> Self {
+        Self::try_new_with_profile(config_path, profile).unwrap_or_else(|drift| {
+            panic!(
+                "the {profile:?} profile's guidance projection no longer matches its source: \
+                 {drift}"
+            )
+        })
+    }
+
+    /// [`Self::new_with_profile`], refusing instead of panicking when the
+    /// worker projection has drifted from its source.
+    ///
+    /// WHY THIS EXISTS, stated precisely because the claim it corrects was
+    /// wrong. The three worker projections are CHECKED rewrites: a needle
+    /// that stops matching, or matches twice, or names a route that is no
+    /// longer served, must never be applied silently — a no-op replace
+    /// serves the DEFAULT sentence to a worker, which is the hole the whole
+    /// [`WORKER_INSTRUCTIONS_REWRITES`] table closes.
+    ///
+    /// The comments here used to call that a build invariant. It is not.
+    /// Every operand IS a compile-time constant — [`INSTRUCTIONS`] is an
+    /// `include_str!` of the skill file — but nothing verifies the match at
+    /// compile time. The check runs at server CONSTRUCTION, which
+    /// [`crate::serve_stdio`] reaches on the live `rocky mcp --profile
+    /// worker` path. An edit to the skill therefore COMPILES, and then
+    /// fails when the server starts. What actually guarantees the frozen
+    /// constants still line up is a TEST
+    /// (`worker_instructions_are_projected_and_default_stays_verbatim`),
+    /// which is a weaker guarantee than the word "invariant" implies. They
+    /// match today; nothing triggers this at runtime as things stand.
+    ///
+    /// Both failure modes ABORT STARTUP. That is deliberate and is not the
+    /// part being softened: a server that starts with degraded guidance is
+    /// strictly worse than one that does not start, because the degradation
+    /// is quiet and this defect class has been found nine times. What
+    /// changes is only the diagnostic — an operator gets a named refusal
+    /// instead of a Rust backtrace.
+    ///
+    /// [`Self::new_with_profile`] keeps panicking, and every test builds
+    /// through it, so the drift still fails loudly wherever it is checked.
+    pub fn try_new_with_profile(config_path: PathBuf, profile: McpProfile) -> Result<Self, String> {
         let root = config_path
             .parent()
             .map(Path::to_path_buf)
@@ -612,41 +2139,74 @@ impl RockyMcpServer {
         let models_dir = root.join("models");
         let mut tool_router = Self::tool_router();
         let mut prompt_router = Self::prompt_router();
+        let mut instructions = INSTRUCTIONS.to_string();
         if profile == McpProfile::Worker {
-            let all: Vec<String> = tool_router
+            let mut all: Vec<String> = tool_router
                 .list_all()
                 .into_iter()
                 .map(|t| t.name.to_string())
+                .collect();
+            all.sort();
+            // DERIVED here, from the full router, before anything is
+            // removed — this is the only point where both surfaces exist at
+            // once. The banner reads it, so a tool that leaves the
+            // allowlist is named as unavailable without anyone editing a
+            // literal.
+            let excluded: Vec<String> = all
+                .iter()
+                .filter(|name| !WORKER_PROFILE_TOOLS.contains(&name.as_str()))
+                .cloned()
                 .collect();
             for name in all {
                 if !WORKER_PROFILE_TOOLS.contains(&name.as_str()) {
                     tool_router.remove_route(&name);
                 }
             }
+            // F3 red team round 2 (finding 1): the served `instructions`
+            // were EXEMPT from the sweep on the argument that a disclaiming
+            // banner over verbatim text is honest. It was honest and not
+            // safe — the banner never stopped the worker at CHECK
+            // authorship, and the text below it told the worker to
+            // strengthen assertions and append tests. Projected now, by the
+            // same checked-rewrite mechanism as the descriptions above.
+            instructions = worker_instructions(&excluded, WORKER_INSTRUCTIONS_REWRITES)?;
             // FF-WP1 fix round 2 (item 5b): the static prompt descriptions
             // instruct the default workflow (they name tools this profile
             // excludes) — swap in the worker descriptions. A rename that
-            // orphans an entry panics HERE, at construction, so every test
-            // that builds a worker server catches the drift.
+            // orphans an entry is refused HERE, at construction, so every
+            // test that builds a worker server catches the drift.
             for (name, description) in WORKER_PROMPT_DESCRIPTIONS {
-                prompt_router
-                    .map
-                    .get_mut(*name)
-                    .unwrap_or_else(|| {
-                        panic!("WORKER_PROMPT_DESCRIPTIONS names unrouted prompt '{name}'")
-                    })
-                    .attr
-                    .description = Some((*description).to_string());
+                let route = prompt_router.map.get_mut(*name).ok_or_else(|| {
+                    format!("WORKER_PROMPT_DESCRIPTIONS names unrouted prompt '{name}'")
+                })?;
+                route.attr.description = Some((*description).to_string());
+            }
+            // F3 red team (finding 3): the same problem one surface over.
+            // `tools/list` descriptions are static too, and three of them
+            // steered the worker at `propose`. Rewritten AFTER the removals
+            // above, so the table can only name a tool this profile still
+            // serves — an entry for a removed tool orphans and is refused
+            // here.
+            for (name, needle, replacement) in WORKER_TOOL_DESCRIPTIONS {
+                let route = tool_router.map.get_mut(*name).ok_or_else(|| {
+                    format!("WORKER_TOOL_DESCRIPTIONS names unserved tool '{name}'")
+                })?;
+                let current = route.attr.description.as_deref().ok_or_else(|| {
+                    format!("WORKER_TOOL_DESCRIPTIONS names undescribed tool '{name}'")
+                })?;
+                route.attr.description =
+                    Some(worker_tool_description(name, current, needle, replacement)?.into());
             }
         }
-        Self {
+        Ok(Self {
             config_path,
             models_dir,
             root,
             profile,
+            instructions,
             tool_router,
             prompt_router,
-        }
+        })
     }
 
     fn state_path(&self) -> PathBuf {
@@ -681,6 +2241,13 @@ impl RockyMcpServer {
 
     /// The `next_steps` reminder a successful `draft_check` result carries —
     /// profile-selected like [`Self::draft_model_next_steps`].
+    ///
+    /// The worker arm is unreachable in practice: `draft_check` left
+    /// `WORKER_PROFILE_TOOLS`, so a worker session cannot call the tool that
+    /// would produce this text. Kept, and kept correct, because the arm is
+    /// the thing that would be wrong first if the tool were ever
+    /// re-allowlisted — a defaulted or stale arm is how a re-admitted tool
+    /// would ship worker-facing text naming excluded verbs.
     fn draft_check_next_steps(&self) -> &'static str {
         match self.profile {
             McpProfile::Default | McpProfile::Approver => DRAFT_CHECK_NEXT_STEPS,
@@ -858,9 +2425,25 @@ impl RockyMcpServer {
         Ok(Json(project_compile_result(&output)))
     }
 
+    // FOURTEENTH ROUND, finding 1 — this said "the exact SQL Rocky would
+    // execute", and the preview is offline: it passes no warehouse to
+    // `sql_gen::generate_transformation_sql_with_warehouse`, and
+    // `commands::plan_preview_output` logs and SKIPS any model whose SQL
+    // that call cannot render. `PlanPreviewResult` carries `statements` and
+    // nothing else, so a skipped model leaves no trace in the result at
+    // all. Three strategies are skipped by construction — a Snowflake
+    // `DynamicTable` needs a compute warehouse, a `TimeInterval` model
+    // needs a runtime window that static planning leaves `None`, and
+    // `ContentAddressed` never reaches SQL generation — and any other
+    // render failure is swallowed the same way.
     #[tool(
-        description = "Preview the exact SQL Rocky would execute for the project's \
-         transformation models (offline, no warehouse connection). Read it to confirm the \
+        description = "Render the SQL Rocky generates for the project's transformation models, \
+         offline and with no warehouse connection. It is not the whole plan: a model whose SQL \
+         cannot be rendered offline is SKIPPED, and the result does not name it, so a short or \
+         empty statement list is not proof the project has nothing else to do. Skipped by \
+         construction: a Snowflake dynamic table (it needs a live compute warehouse), a \
+         time-interval model (it needs a runtime window), and a content-addressed model (it \
+         never goes through SQL generation). Read the statements it does return to confirm the \
          generated SQL matches intent before proposing a materialization."
     )]
     async fn plan_preview(
@@ -933,9 +2516,12 @@ impl RockyMcpServer {
     }
 
     #[tool(
-        description = "Run the project's DuckDB-backed local tests (contracts + assertions) and \
-         return pass/fail counts plus per-failure detail. Use after writing or changing a model. \
-         Pass `model` to scope the run to one model's tests."
+        description = "Run the project's DuckDB-backed local tests and return pass/fail counts \
+         plus per-failure detail. Covers BOTH local suites: executing each model, and the \
+         fixture-driven `[[test]]` blocks declared in model sidecars. `failures` carries both, \
+         each tagged with its `suite`; `models` and `unit_tests` hold the per-suite counts. \
+         Branch on `all_passed` — it is true only when both suites are clean. Use after writing \
+         or changing a model. Pass `model` to scope the run to one model's tests."
     )]
     async fn test(&self, params: Parameters<TestArgs>) -> ToolResult<TestResult> {
         let output = commands::test_output(&self.models_dir, None, params.0.model.as_deref())
@@ -953,18 +2539,68 @@ impl RockyMcpServer {
                     ),
                 }
             })?;
-        let failures = output
+        // BOTH suites, aggregated. `test_output` records the fixture
+        // `[[test]]` run in a SEPARATE `unit_tests` summary, and this result
+        // used to drop it: a project whose models all execute but whose
+        // fixture test fails came back as `failures: []`, which is the
+        // vacuous pass this work package exists to remove. The worker prompt
+        // tells a worker to stop when the tests pass, so the empty list
+        // stopped it on a failing test.
+        let models = TestSuiteCounts {
+            total: output.total,
+            passed: output.passed,
+            failed: output.failures.len(),
+        };
+        let mut failures: Vec<TestFailureLite> = output
             .failures
             .into_iter()
             .map(|f| TestFailureLite {
                 name: f.name,
                 error: f.error,
+                suite: "model".to_string(),
             })
             .collect();
+        // Absent `unit_tests` means the project declares no `[[test]]`
+        // block. That is zero tests, not zero failures of an unrun suite,
+        // and the counts say so rather than the field going missing.
+        let unit_tests = match &output.unit_tests {
+            Some(summary) => TestSuiteCounts {
+                total: summary.total,
+                passed: summary.passed,
+                failed: summary.failed,
+            },
+            None => TestSuiteCounts {
+                total: 0,
+                passed: 0,
+                failed: 0,
+            },
+        };
+        if let Some(summary) = output.unit_tests {
+            for result in summary.results.into_iter().filter(|r| !r.passed) {
+                // `run_one_unit_test` sets `error` on every failure path, so
+                // the fallback is unreachable today. It is here because a
+                // failure that reports no reason at all is worse than one
+                // that reports a row count — the worker has to see SOMETHING
+                // to act on.
+                let mismatches = result.mismatches.len();
+                let error = result
+                    .error
+                    .unwrap_or_else(|| format!("{mismatches} row(s) did not match `expect`"));
+                failures.push(TestFailureLite {
+                    name: format!("{}::{}", result.model, result.test),
+                    error,
+                    suite: "unit".to_string(),
+                });
+            }
+        }
+        let all_passed = failures.is_empty();
         Ok(Json(TestResult {
-            total: output.total,
-            passed: output.passed,
+            total: models.total + unit_tests.total,
+            passed: models.passed + unit_tests.passed,
             failures,
+            all_passed,
+            models,
+            unit_tests,
         }))
     }
 
@@ -1043,8 +2679,8 @@ impl RockyMcpServer {
          Use this to learn what's available to select from and the upstream types — never guess \
          column names. Models and declared sources are exact; physical warehouse tables are \
          appended best-effort, so CHECK `discovery_incomplete` before concluding the warehouse \
-         holds nothing else — when it is true the append did not run and `discovery_error` says \
-         why."
+         holds nothing else — when it is true the append did not run, `discovery_error` says \
+         why, and a table missing from `sources` is inconclusive, not absent."
     )]
     async fn inspect_schema(
         &self,
@@ -2075,7 +3711,9 @@ impl RockyMcpServer {
          source: row count, nulls, null rate, distinct count, min, max — and, for a \
          low-cardinality column (≤25 distinct), the distinct values with their counts \
          (`top_values`), which surfaces exact literals (e.g. a status string) that min/max hide. \
-         Requires live warehouse credentials in the target adapter (rocky.toml)."
+         `top_values` comes from a second query and is best-effort: when that query fails the \
+         list is empty and this still succeeds. Requires live warehouse credentials in the \
+         target adapter (rocky.toml)."
     )]
     async fn profile_column(
         &self,
@@ -2154,6 +3792,26 @@ impl RockyMcpServer {
         // counts — what `min`/`max` alone can't reveal (e.g. that `status`
         // holds 'COMPLETE', not 'completed'). One extra grouped query, run only
         // when the cardinality makes it cheap.
+        //
+        // THIS SECOND READ IS BEST-EFFORT, AND SAYS SO NOWHERE IN THE RESULT.
+        // The primary query above surfaces its failure as
+        // `ToolError::warehouse_error`. This one takes `Err(_) => Vec::new()`
+        // and the tool then returns SUCCESS: a transient failure here yields a
+        // non-zero `distinct` beside an empty `top_values`, which is also what
+        // a high-cardinality column and an all-null one produce. `unavailable`
+        // and `reason` below are set to `false`/`None` unconditionally, so
+        // nothing distinguishes the three.
+        //
+        // That made this the THIRD best-effort warehouse read on these tools
+        // that reported success on failure — the two in `inspect_schema` were
+        // the others, until #1565 made those two REPORT it
+        // (`discovery_incomplete` / `discovery_error`). This one is still
+        // silent. It is a product pattern, not three accidents, and it is
+        // filed as one defect. NOT fixed here: wiring `unavailable`/`reason`
+        // is cheap but it is a change to the tool's contract, and this branch
+        // corrects CLAIMS about behaviour rather than behaviour. The worker
+        // guidance in `WORKER_INSTRUCTIONS_REWRITES` describes `top_values` as
+        // best-effort instead of promising an error it does not raise.
         let top_values = if distinct > 0 && distinct <= PROFILE_TOP_VALUES_MAX as u64 {
             let q = format!(
                 "SELECT CAST({col} AS {string_type}) AS v, COUNT(*) AS c FROM {} \
@@ -3941,6 +5599,15 @@ impl RockyMcpServer {
     /// `Err` arm with `if let Ok(Some(_))`, which is what made a resolution
     /// failure look like an empty warehouse (#1533). Callers must now handle
     /// every arm.
+    ///
+    /// `prepare_table_query` — the path `sample_rows` and `profile_column`
+    /// take — propagates a resolution failure. Read that as a claim about
+    /// `prepare_table_query`, not about those two tools end to end:
+    /// `profile_column` runs a SECOND query after it, and that one takes
+    /// `Err(_) => Vec::new()` before the tool returns success (see the note
+    /// at its `top_values` block). Spelled out because this sentence sits one
+    /// clause from the swallow it contrasts with, and the same over-reading
+    /// is what round thirteen came back for.
     fn warehouse_adapter(
         &self,
     ) -> anyhow::Result<Option<std::sync::Arc<dyn rocky_core::traits::WarehouseAdapter>>> {
@@ -4038,9 +5705,12 @@ impl RockyMcpServer {
                     format!(
                         "Build a Rocky model for this intent:\n\n  {intent}\n\n\
                          Follow Rocky's authoring loop, using the MCP tools at each step:\n\n\
-                         1. inspect_schema — read every existing model and source table with \
-                         its typed columns. Never guess column names; select only what's \
-                         actually there.\n\
+                         1. inspect_schema — read the project's models and source tables with \
+                         their typed columns. Never guess column names; select only what it \
+                         shows. Its physical warehouse tables are best-effort: when the result's \
+                         `discovery_incomplete` is true, a table missing from `sources` is \
+                         inconclusive, not absent. Ask sample_rows for that table before you \
+                         conclude it does not exist.\n\
                          2. sample_rows — look at real rows before writing any filter or cast. \
                          The schema tells you a column exists; it does not tell you its literal \
                          values, its units, or its null rate.\n\
@@ -4052,23 +5722,30 @@ impl RockyMcpServer {
                          the sidecar's spec-owned metadata.\n\
                          5. compile — read the diagnostics (each carries a code, a span, and \
                          often a suggestion), fix against them, and loop until clean.\n\
-                         6. plan_preview — read the exact SQL Rocky would execute and confirm \
-                         it matches the intent.\n\
-                         7. draft_check — encode what you learned while sampling as append-only \
-                         `[[tests]]` assertions (grain uniqueness, not-null, value domains), \
-                         then run them with the `test` tool. Contracts and metadata are \
-                         SPEC-OWNED in this profile — do not author them; note a \
-                         contract-shaped invariant in your handoff instead.\n\n\
+                         6. plan_preview — read the SQL Rocky generates offline and confirm \
+                         it matches the intent. It is not the whole plan: any model it \
+                         cannot render offline is skipped, and the result does not name it. \
+                         A model missing from the statements means 'not renderable offline', \
+                         never 'nothing to do'.\n\
+                         7. test — run the project's LOCAL tests (the compiled model tests \
+                         and unit tests). That is the only suite you can run here. The \
+                         checks the product spec declares — its grain, its not-null columns, \
+                         its `checks` list — are lowered into the sidecar for you and need \
+                         the applied table to run against, so they are deferred until after \
+                         the apply and cannot pass or fail during drafting. They are \
+                         SPEC-OWNED, and so are the contract and the model metadata: do not \
+                         author any of them. Report an assertion you believe is missing in \
+                         your handoff instead.\n\n\
                          RECONCILE DISCIPLINE (the step that separates a model that compiles \
                          from a model that is correct): check literal values and units against \
                          the sampled data, not just the schema. A `WHERE status = 'completed'` \
                          that returns zero rows because the data actually holds 'COMPLETE' \
                          compiles perfectly and is wrong.\n\n\
-                         STOP when the draft compiles clean and its checks pass, and HAND OFF \
-                         to the trusted runner: report the drafted files, the invariants you \
-                         encoded, and anything you flagged. Do not record plans, approve \
-                         changes, or apply anything on your own — those verbs belong to the \
-                         trusted runner and are not served in this profile."
+                         STOP when the draft compiles clean and the local tests pass, and \
+                         HAND OFF to the trusted runner: report the drafted files, what you \
+                         verified in the data, and anything you flagged. Do not record plans, \
+                         approve changes, or apply anything on your own — those verbs belong \
+                         to the trusted runner and are not served in this profile."
                     ),
                 ),
             ];
@@ -4090,8 +5767,12 @@ impl RockyMcpServer {
                 format!(
                     "Build a Rocky model for this intent:\n\n  {intent}\n\n\
                      Follow Rocky's authoring loop, using the MCP tools at each step:\n\n\
-                     1. inspect_schema — read every existing model and source table with its \
-                     typed columns. Never guess column names; select only what's actually there.\n\
+                     1. inspect_schema — read the project's models and source tables with their \
+                     typed columns. Never guess column names; select only what it shows. Its \
+                     physical warehouse tables are best-effort: when the result's \
+                     `discovery_incomplete` is true, a table missing from `sources` is \
+                     inconclusive, not absent. Ask sample_rows for that table before you conclude \
+                     it does not exist.\n\
                      2. sample_rows — look at real rows before writing any filter or cast. The \
                      schema tells you a column exists; it does not tell you its literal values, \
                      its units, or its null rate.\n\
@@ -4104,8 +5785,11 @@ impl RockyMcpServer {
                      span, and often a suggestion. Fix against the diagnostic and recompile; \
                      loop until clean. The compiler is your fast feedback loop — lean on it \
                      instead of reasoning about correctness in your head.\n\
-                     6. plan_preview — read the exact SQL Rocky would execute and confirm it \
-                     matches the intent before proposing.\n\
+                     6. plan_preview — read the SQL Rocky generates offline and confirm it \
+                     matches the intent before proposing. It is not the whole plan: any model \
+                     it cannot render offline is skipped, and the result does not name it. A \
+                     model missing from the statements means 'not renderable offline', never \
+                     'nothing to do'.\n\
                      7. Encode what you learned while sampling as a contract (required/protected \
                      columns) or a check (assertion), not just a WHERE clause — that moves the \
                      invariant into the typed substrate so the compiler enforces it on every \
@@ -4151,14 +5835,14 @@ impl RockyMcpServer {
             let messages = vec![
                 PromptMessage::new_text(
                     Role::Assistant,
-                    "I'll find the models that carry no declarative tests, author tests \
-                     grounded in their real data, and end with the drafted checks handed off \
-                     to the trusted runner. I draft; the runner reviews and applies.",
+                    "I'll find the models that carry no declarative tests and say exactly \
+                     what each one needs, grounded in its real data. Checks are spec-owned \
+                     here, so I report; I do not write them.",
                 ),
                 PromptMessage::new_text(
                     Role::User,
-                    "Find the untested models in this Rocky project and draft tests for them, \
-                     using the MCP tools at each step:\n\n\
+                    "Find the untested models in this Rocky project and REPORT what each one \
+                     needs, using the MCP tools at each step:\n\n\
                      1. catalog — enumerate every model with its declared tests, checks, and \
                      contract. Treat a model with no checks, no contract, and no test files as \
                      untested. Prioritise leaf/marts models and anything carrying a primary key \
@@ -4168,28 +5852,33 @@ impl RockyMcpServer {
                      learn its null rate, distinct count, and domain. The schema says a column \
                      exists; only the data tells you whether it is unique, non-null, or \
                      bounded.\n\
-                     3. Author the checks YOURSELF from what you observed — grain uniqueness, \
-                     not-null, value ranges, referential integrity — and write them with \
-                     draft_check: it appends the `[[tests]]` blocks to the model and compiles \
-                     in the same call. Contracts are SPEC-OWNED in this profile — when an \
-                     invariant is contract-shaped (required/protected columns), note it in \
-                     your handoff instead of authoring it.\n\
-                     4. Run the new checks via the `test` tool. Fix against any diagnostic and \
-                     re-run until clean.\n\n\
-                     RECONCILE DISCIPLINE: a test that asserts the wrong invariant passes and \
-                     is still wrong. Confirm the grain, the not-null columns, and the value \
-                     domain against the sampled data before you encode them — do not assume \
-                     `id` is unique or `status` is non-null without checking.\n\n\
-                     STOP when the checks pass, and HAND OFF to the trusted runner: report \
-                     which models you covered, the invariants you encoded, and anything you \
-                     flagged as contract-shaped. Do not record plans, approve changes, or \
-                     apply anything on your own — those verbs belong to the trusted runner and \
-                     are not served in this profile.",
+                     3. Write down, per model, the assertion the data supports — grain \
+                     uniqueness, not-null, value ranges, referential integrity — and the \
+                     numbers you saw. Do NOT write any of it into the project. Checks, \
+                     contracts, and model metadata are all SPEC-OWNED in this profile: they \
+                     come from the product spec, and an assertion nobody approved would run \
+                     unattended against the warehouse after every apply.\n\
+                     4. Use the `test` tool to run the project's LOCAL tests, so your report \
+                     says whether the project is green as it stands today.\n\n\
+                     RECONCILE DISCIPLINE: an invariant you name that is wrong is worse than \
+                     none — someone will approve it. Confirm the grain, the not-null columns, \
+                     and the value domain against the sampled data before you name them; do \
+                     not assume `id` is unique or `status` is non-null without checking.\n\n\
+                     STOP when the report is complete, and HAND OFF to the trusted runner: \
+                     name the models you covered, the assertion each one needs with the \
+                     evidence behind it, and anything you flagged as contract-shaped. Do not \
+                     record plans, approve changes, or apply anything on your own — those \
+                     verbs belong to the trusted runner and are not served in this profile.",
                 ),
             ];
+            // NINTH ROUND, finding 2. This said "draft tests" while the
+            // body above it is report-only — the description promised a
+            // write the prompt withholds. It names no excluded tool, so
+            // the name-based sweep read it as clean, and the sweep did not
+            // read this field at all.
             return Ok(GetPromptResult::new(messages).with_description(
-                "Find untested Rocky models and draft tests (worker profile, ends at the \
-                 runner handoff)",
+                "Find untested Rocky models and REPORT the assertions each one needs \
+                 (worker profile, ends at the runner handoff)",
             ));
         }
         let messages = vec![
@@ -4265,16 +5954,17 @@ impl RockyMcpServer {
             let messages = vec![
                 PromptMessage::new_text(
                     Role::Assistant,
-                    "I'll identify the primary-key and unique columns, author uniqueness and \
-                     not-null tests grounded in the real data, and end with the drafted checks \
-                     handed off to the trusted runner. A declared key is a claim; the data is \
-                     what proves it.",
+                    "I'll identify the primary-key and unique columns and prove them against \
+                     the real data, then report the uniqueness and not-null assertions they \
+                     need. Checks are spec-owned here, so I report; I do not write them. A \
+                     declared key is a claim; the data is what proves it.",
                 ),
                 PromptMessage::new_text(
                     Role::User,
                     format!(
-                        "Add uniqueness + not-null tests to the key columns of {scope} in this \
-                         Rocky project, using the MCP tools at each step:\n\n\
+                        "Identify the key columns of {scope} in this Rocky project and REPORT \
+                         the uniqueness + not-null assertions they need, using the MCP tools \
+                         at each step:\n\n\
                          1. inspect_schema — read the typed columns. Identify the primary-key / \
                          unique / grain columns: an explicit key in the sidecar, an `id`-shaped \
                          column, or the columns that define the model's grain.\n\
@@ -4282,24 +5972,32 @@ impl RockyMcpServer {
                          actually unique (distinct count == row count) and non-null before you \
                          assert it. A column named `id` that has duplicates or nulls is not a \
                          key — find that out now, from the data.\n\
-                         3. Author a uniqueness check and a not-null check for each confirmed \
-                         key column yourself, then write them with draft_check — it merges the \
-                         `[[tests]]` blocks into the model and compiles in the same call, \
-                         policy-gated.\n\
-                         4. Run the new checks via the `test` tool. Loop until clean.\n\n\
-                         RECONCILE DISCIPLINE: only assert uniqueness/not-null on columns the \
-                         profile actually shows to be unique/non-null. Encoding a wrong key \
-                         invariant is worse than none — it green-lights a future run that \
-                         should have failed.\n\n\
-                         STOP when the checks pass, and HAND OFF to the trusted runner: report \
-                         the key columns you confirmed and the tests you encoded. Do not \
-                         record plans, approve changes, or apply anything on your own — those \
-                         verbs belong to the trusted runner and are not served in this profile."
+                         3. Write down the uniqueness and not-null assertion each confirmed \
+                         key column needs, with the distinct count, row count, and null count \
+                         you measured. Do NOT write any of it into the project: checks are \
+                         SPEC-OWNED in this profile, they come from the product spec, and an \
+                         assertion nobody approved would run unattended against the warehouse \
+                         after every apply.\n\
+                         4. Use the `test` tool to run the project's LOCAL tests, so your \
+                         report says whether the project is green as it stands today.\n\n\
+                         RECONCILE DISCIPLINE: only name uniqueness/not-null on columns the \
+                         profile actually shows to be unique/non-null. Naming a wrong key \
+                         invariant is worse than naming none — someone will approve it, and \
+                         it green-lights a future run that should have failed.\n\n\
+                         STOP when the report is complete, and HAND OFF to the trusted \
+                         runner: report the key columns you confirmed, the evidence behind \
+                         each one, and the assertions they need. Do not record plans, approve \
+                         changes, or apply anything on your own — those verbs belong to the \
+                         trusted runner and are not served in this profile."
                     ),
                 ),
             ];
+            // NINTH ROUND, finding 2 — the sibling of the one on
+            // `find_untested_models`. "Add key tests to X" promised the
+            // write; the body reports the assertions and stops.
             return Ok(GetPromptResult::new(messages).with_description(format!(
-                "Add key tests to {scope} (worker profile, ends at the runner handoff)"
+                "REPORT the key assertions {scope} needs (worker profile, ends at the \
+                 runner handoff)"
             )));
         }
         let messages = vec![
@@ -4362,7 +6060,8 @@ impl RockyMcpServer {
             PromptMessage::new_text(
                 Role::Assistant,
                 "I'll summarize this Rocky project from the catalog and lineage. This is a \
-                 read-only orientation — I will not edit, propose, or apply anything.",
+                 read-only orientation — I will not edit anything, record a plan, or apply \
+                 anything.",
             ),
             PromptMessage::new_text(
                 Role::User,
@@ -4379,7 +6078,7 @@ impl RockyMcpServer {
                  4. Call out gaps an owner would care about: untested leaf models, PII columns \
                  with no mask, models with no contract, or long undocumented dependency chains. \
                  Frame these as observations, not actions.\n\n\
-                 This is purely informational — do NOT write SQL, draft tests, propose a plan, or \
+                 This is purely informational — do NOT write SQL, draft tests, record a plan, or \
                  apply anything. If the user then wants to act on a gap, the find_untested_models \
                  or build_model trajectory is the next step.",
             ),
@@ -4389,13 +6088,24 @@ impl RockyMcpServer {
             .with_description("Read-only structured summary of the Rocky project"))
     }
 
-    /// Diagnose and fix failing declarative tests: run the tests, ground each
+    /// Diagnose and fix failing LOCAL tests: run the tests, ground each
     /// failure with profile_column, propose a fix. Stops at *propose*.
+    ///
+    /// FOURTEENTH ROUND — "declarative" was wrong here, and round ten fixed
+    /// it on the worker surface ONLY. The `test` tool calls
+    /// `commands::test_output` on EVERY profile, which runs
+    /// `test_runner::run_tests` (model execution) plus
+    /// `test_runner::run_unit_tests` (sidecar fixture `[[test]]` blocks). It
+    /// never calls `run_declarative_tests` — the `rocky test --declarative`
+    /// path that evaluates sidecar `[[tests]]` against the WAREHOUSE. No
+    /// profile reaches it, so this was never a profile-shaped defect and
+    /// round ten's profile-shaped fix left the default half standing.
     #[prompt(
         name = "fix_failing_test",
-        description = "Diagnose and fix failing declarative tests: run `test` -> for each failure \
-         profile_column the implicated columns to ground the cause -> propose a fix. Stops at the \
-         human approval gate."
+        description = "Diagnose and fix failing LOCAL tests: run `test` — the project's model \
+         and unit tests, not the warehouse-run `--declarative` set — then for each failure \
+         profile_column the implicated columns to ground the cause -> propose a fix. Stops at \
+         the human approval gate."
     )]
     async fn fix_failing_test(
         &self,
@@ -4423,28 +6133,45 @@ impl RockyMcpServer {
                     format!(
                         "Diagnose and fix the failing tests in {scope}, using the MCP tools at \
                          each step:\n\n\
-                         1. test — run the declarative tests and read which assertions fail, on \
-                         which model, and the failing-row count.\n\
+                         1. test — run the project's LOCAL model and unit tests, and read \
+                         `failures`: each entry gives the failing test's `name`, its `error` \
+                         text, and the `suite` it came from. That is everything it carries. \
+                         There is no failing-row count field, and several failure paths — a \
+                         compile error, a seed that will not load, a model that will not \
+                         execute — report no row numbers in the error text either. \
+                         That local suite is the only one you can run here: the checks the \
+                         product spec declares are evaluated by the trusted runner after an \
+                         apply, not by this tool.\n\
                          2. For each failure, ground the cause before deciding the fix: \
                          profile_column the implicated columns to see their actual null rate, \
-                         distinct count, and value domain, and sample_rows to look at offending \
-                         rows. The failure tells you WHAT broke; the data tells you WHY.\n\
+                         distinct count, and value domain, and sample_rows to look at \
+                         representative rows. sample_rows takes no predicate — it returns an \
+                         unfiltered sample, so it is NOT failure-local evidence and a sparse \
+                         bad row can be missing from it. Rows it does not show are not rows \
+                         that do not exist; profile_column's whole-column counts are the \
+                         stronger signal. The failure tells you WHAT broke; the data tells \
+                         you WHY.\n\
                          3. Decide which side is wrong. If the model SQL is wrong (it produces \
                          duplicates / nulls / out-of-domain values it shouldn't), redraft it \
                          with draft_model — on an existing model it replaces the SQL and \
                          preserves the sidecar's metadata. If the TEST encodes a wrong \
-                         invariant, do NOT weaken or rewrite it in this profile: test edits \
-                         beyond append-only checks are the trusted runner's — record the \
+                         invariant, do NOT weaken it, rewrite it, or append a new one: EVERY \
+                         test edit is the trusted runner's here, and checks are spec-owned \
+                         by any route, this server or a file you can write. Record the \
                          finding (which assertion, what the data actually holds) in your \
                          handoff.\n\
-                         4. compile, then re-run the `test` tool. Loop until the failure is \
-                         genuinely resolved, not silenced.\n\n\
+                         4. compile, then re-run the `test` tool. Read `all_passed`, not the \
+                         model counts: it is true only when the model runs AND the fixture \
+                         `[[test]]` blocks are both clean, and each entry in `failures` says \
+                         which suite it came from. Loop until the failure is genuinely \
+                         resolved, not silenced.\n\n\
                          RECONCILE DISCIPLINE: the whole point is to check the data, not just \
                          the schema. A uniqueness test failing because the grain is actually \
                          composite (two columns, not one) is a real finding you can only see \
                          in the rows.\n\n\
-                         STOP when the tests pass (or the remaining failures are diagnosed as \
-                         wrong tests), and HAND OFF to the trusted runner: report what you \
+                         STOP when `all_passed` is true (or the remaining failures are \
+                         diagnosed as wrong tests), and HAND OFF to the trusted runner: \
+                         report what you \
                          fixed and what you diagnosed. Do not record plans, approve changes, \
                          or apply anything on your own — those verbs belong to the trusted \
                          runner and are not served in this profile."
@@ -4469,21 +6196,26 @@ impl RockyMcpServer {
                 format!(
                     "Diagnose and fix the failing tests in {scope}, using the MCP tools at each \
                      step:\n\n\
-                     1. test — run the declarative tests and read which assertions fail, on which \
-                     model, and the failing-row count. Each failure names the invariant it \
-                     checks.\n\
+                     1. test — run the project's LOCAL suites and read which ones fail, on which \
+                     model. The tool runs each model against DuckDB AND the fixture `[[test]]` \
+                     blocks in the sidecars; every entry in `failures` says which suite it came \
+                     from.\n\
                      2. For each failure, ground the cause before deciding the fix: profile_column \
                      the implicated columns (the ones the assertion references) to see their \
                      actual null rate, distinct count, and value domain, and sample_rows to look \
-                     at offending rows. The failure tells you WHAT broke; the data tells you \
-                     WHY.\n\
+                     at representative rows. sample_rows takes no predicate — it returns an \
+                     unfiltered sample, so it is NOT failure-local evidence and a sparse bad row \
+                     can be missing from it. Rows it does not show are not rows that do not \
+                     exist; profile_column's whole-column counts are the stronger signal. The \
+                     failure tells you WHAT broke; the data tells you WHY.\n\
                      3. Decide which side is wrong. Either the model SQL is wrong (it produces \
                      duplicates / nulls / out-of-domain values it shouldn't) — fix the SQL — or \
                      the test encodes an invariant the data was never meant to hold — fix the \
                      assertion. Do not weaken a test just to make it pass; that hides the \
                      defect.\n\
-                     4. compile, then re-run the `test` tool. Loop until the failure is genuinely \
-                     resolved, not silenced.\n\
+                     4. compile, then re-run the `test` tool. Read `all_passed`, not the model \
+                     counts: it is true only when both suites are clean. Loop until the failure \
+                     is genuinely resolved, not silenced.\n\
                      5. propose — generate the plan recording the fix. It is an AI-authored plan \
                      with a plan_id.\n\n\
                      RECONCILE DISCIPLINE: the whole point is to check the data, not just the \
@@ -4516,10 +6248,10 @@ impl ServerHandler for RockyMcpServer {
         // announcing "you may approve here" to the agent would push the wrong
         // way (#1517). The capability is discoverable where it is used — in
         // `review_queue`'s own description.
-        let instructions = match self.profile {
-            McpProfile::Default | McpProfile::Approver => INSTRUCTIONS.to_string(),
-            McpProfile::Worker => format!("{WORKER_INSTRUCTIONS_BANNER}{INSTRUCTIONS}"),
-        };
+        // Resolved at construction (see the `instructions` field): the
+        // default and approver profiles carry the skill text byte-unchanged,
+        // the worker carries the derived banner + the projected body.
+        let instructions = self.instructions.clone();
         ServerInfo::new(
             ServerCapabilities::builder()
                 .enable_tools()
@@ -4842,10 +6574,38 @@ fn breaking_finding_lite(f: &rocky_core::breaking_change::BreakingFinding) -> Br
     }
 }
 
-/// Discover the physical tables in the DuckDB warehouse as schema-qualified
+/// Discover the physical tables in the target warehouse as schema-qualified
 /// source entries (best-effort — returns empty on any query error). Excludes
 /// the system schemas. Lets `inspect_schema` show an agent the raw sources the
 /// project never declared, including at cold start.
+///
+/// # The query is unqualified, and that is not portable
+///
+/// This said "the DuckDB warehouse", but the only caller hands it whatever
+/// its `warehouse_adapter` resolved — any of DuckDB, Snowflake, BigQuery,
+/// Databricks or Trino. The `FROM information_schema.columns` below carries
+/// no catalog, and THREE of those five qualify that view when they build the
+/// equivalent query themselves: `rocky-snowflake/src/batch.rs` scopes it to
+/// `<database>.`, `rocky-databricks/src/batch.rs` to `<catalog>.`, and
+/// `rocky-bigquery/src/dialect.rs` states outright that a bare
+/// `INFORMATION_SCHEMA.COLUMNS` does not resolve there. The other two do not,
+/// for their own reasons: DuckDB's catalog is flat and un-prefixed on purpose
+/// (`rocky-duckdb/src/dialect.rs` pushes the catalog into a `WHERE` filter),
+/// and Trino never reads `information_schema` at all — it describes columns
+/// with `DESCRIBE` (`rocky-trino/src/adapter.rs`).
+///
+/// So the honest reading is NON-PORTABLE AND MAY FAIL off DuckDB — not
+/// "returns empty on every non-DuckDB target", which is a step too strong.
+/// Snowflake submits the adapter's configured `database` and `schema` with
+/// every statement (`rocky-snowflake/src/connector.rs`, `SubmitRequest`), so
+/// where those are set a bare `information_schema.columns` can resolve there.
+/// Only the DuckDB path is verified; what the other four do with THIS exact
+/// statement is untested, and the resolved-vs-failed distinction is the part
+/// that varies. What does NOT vary is the caller: empty rows and a failed
+/// query both leave it reporting success with no physical tables.
+///
+/// Named here rather than fixed: widening the query is a product change, and
+/// it belongs with the silent-degradation defect the caller's note points at.
 async fn discover_source_tables(
     adapter: &dyn rocky_core::traits::WarehouseAdapter,
 ) -> Result<Vec<SchemaEntry>, String> {
@@ -4921,24 +6681,55 @@ fn render_cell(v: serde_json::Value) -> String {
 /// the agent never mistakes a written draft for a materialized change.
 /// Default profile only; the worker profile serves
 /// [`WORKER_DRAFT_NEXT_STEPS`].
+///
+/// FIFTEENTH ROUND, finding 1 — this said `plan_preview` reads "the SQL
+/// Rocky would run", on BOTH variants, and the round-fourteen sweep did not
+/// reach either. The harm is concrete and this is the surface that delivers
+/// it: a dynamic-table draft SUCCEEDS, receives this guidance, and is then
+/// absent from the preview it was just told to read, because
+/// `commands::plan_preview_output` skips what it cannot render offline and
+/// `PlanPreviewResult` carries no field naming a skipped model. The agent
+/// is holding a successful draft and an empty preview with nothing to tell
+/// it the two are about the same model.
 const DRAFT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or touched the \
      warehouse. Continue the authoring loop: fix any error diagnostics above and re-draft (or \
-     `compile`) until it is clean, `plan_preview` to read the SQL Rocky would run, then `propose` \
-     to record an AI-authored plan for a human to `rocky review <plan_id> --approve` and \
-     `rocky apply`. Never apply a draft directly.";
+     `compile`) until it is clean, `plan_preview` to read the SQL that renders offline, then \
+     `propose` to record an AI-authored plan for a human to `rocky review <plan_id> --approve` \
+     and `rocky apply`. The preview is not the whole plan: a model it cannot render offline is \
+     skipped and is not named, so a draft that succeeded here and is missing from the preview \
+     is unrenderable offline, not absent from the project. Never apply a draft directly.";
 
 /// The worker-profile variant of [`DRAFT_NEXT_STEPS`] (FF-WP1 fix round 2,
 /// item 5c): the default reminder instructs `propose`, a tool this profile
 /// does not serve — the worker's loop ends at the typed hand-off to the
 /// trusted runner instead.
+///
+/// It also has to be exact about which suite the `test` tool runs, because
+/// the two are easy to conflate and only one is reachable here. The `test`
+/// tool runs `commands::test_output`, i.e. `rocky_engine::test_runner`'s
+/// compiled model tests plus the unit tests. It does NOT run the
+/// declarative check set — that is `rocky test --declarative`, a different
+/// path, and the product's declared checks live there. Those checks also
+/// need the applied table to exist, so the fulfillment loop reports them
+/// DEFERRED at verify and evaluates them only at post-apply observation
+/// (FF-WP-F3). Telling the worker to loop until they pass names an
+/// outcome that cannot occur during drafting, which is the same defect
+/// class as naming a tool the profile does not serve.
 const WORKER_DRAFT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or touched \
      the warehouse. Continue the drafting loop: fix any error diagnostics above and re-draft \
-     (or `compile`) until it is clean, `plan_preview` to read the SQL Rocky would run, and \
-     encode what you verified as append-only checks with `draft_check`, executed via the `test` \
-     tool. When the draft is clean and its checks pass, STOP and end at the typed hand-off to \
-     the trusted runner: report the drafted files, the invariants you encoded, and anything you \
-     flagged. Recording, review, and apply belong to the trusted runner — never act on them \
-     yourself.";
+     (or `compile`) until it is clean, `plan_preview` to read the SQL that renders offline \
+     (the preview is not the whole plan — a model it cannot render offline is skipped and is \
+     not named, so a draft that succeeded here and is missing from the preview is \
+     unrenderable offline, not absent from the project), and the \
+     `test` tool to run the project's LOCAL tests. Those local tests are the only suite you \
+     can run here. The checks the product spec declares — its grain, its not-null columns, its \
+     `checks` list — are lowered into the sidecar for you and need the applied table to run \
+     against, so they are deferred until after the apply and cannot pass or fail while you are \
+     drafting. They are spec-owned: do not add one of your own. If the data needs an invariant \
+     the spec does not state, say so in the SQL's comments. When the draft compiles clean and \
+     the local tests pass, STOP and end at the typed hand-off to the trusted runner: report the \
+     drafted files, what you verified, and anything you flagged. Recording, review, and apply \
+     belong to the trusted runner — never act on them yourself.";
 
 /// The authoring-loop reminder every successful `draft_contract` response
 /// carries. The contract is written and compile-validated, never applied.
@@ -5586,6 +7377,83 @@ fn rel_display(root: &Path, path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every word that may follow the word "rocky" in the projected worker
+    /// instructions WITHOUT being a CLI route.
+    ///
+    /// Each one is the second half of a phrase in the skill, and none is an
+    /// invocation:
+    ///
+    /// - `and` — "SQL is first-class in Rocky **and** you are fluent in it."
+    /// - `data` — "…build or change a Rocky **data** model."
+    /// - `dsl` — "the `.rocky` **DSL** exists and is fully supported". The
+    ///   file extension, not the CLI name.
+    /// - `model` — "…asked to build or change a Rocky **model**."
+    /// - `models` — "# Authoring Rocky **models** as an agent"
+    /// - `rather` — "…authoring on Rocky **rather** than emitting bare SQL."
+    ///
+    /// A PROSE LIST, NOT A VERB LIST — see the scan's own comment in
+    /// `worker_instructions_are_projected_and_default_stays_verbatim` for
+    /// why the verb set is unreachable from this crate. The consequence to
+    /// keep in mind when this test fails: the fix is usually to rewrite the
+    /// sentence as a served action, and only sometimes to add a word here.
+    /// Add one only after reading the sentence it came from.
+    ///
+    /// The list is kept as bare strings on purpose. Per-entry comments here
+    /// get reflowed onto the wrong neighbour by rustfmt, which turns the
+    /// justification into a lie about the word above it.
+    const ROCKY_PROSE_FOLLOWERS: &[&str] = &["and", "data", "dsl", "model", "models", "rather"];
+
+    /// Every word that follows an identifier-bounded `rocky` in `lower`, in
+    /// order of appearance. `lower` must already be lowercase.
+    ///
+    /// Identifier-bounded on both sides, by the same rule
+    /// [`contains_identifier`] uses, so `rocky_sdk` and `unrocky` do not
+    /// match. "Follows" skips the markup that sits between a word and its
+    /// neighbour — spaces, backticks, asterisks — then takes the leading
+    /// run of `[a-z-]`. A `rocky` followed by punctuation or by the end of
+    /// the text contributes nothing: there is no word to judge.
+    ///
+    /// THE RIGHT BOUNDARY ALSO COUNTS `-`, and only the right one. A
+    /// hyphen binds the next word into a compound NAME — `rocky-config`,
+    /// `rocky-ai-workflow`, both skills this document cites — and a
+    /// compound name is not an invocation: the CLI form is always
+    /// `rocky<space><verb>`. Without this the scan reported `-config` as a
+    /// route. The left boundary keeps the plain identifier rule, so a
+    /// hyphenated word ENDING in "rocky" cannot hide a route behind it.
+    ///
+    /// Backtick-agnostic and, because the input is lowercased, also
+    /// case-insensitive. Those are exactly the two holes the eleventh
+    /// round's finding 3 named in the literal `` "`rocky " `` scan this
+    /// replaces.
+    fn rocky_followers(lower: &str) -> Vec<&str> {
+        let bytes = lower.as_bytes();
+        let is_ident = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_';
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(offset) = lower[from..].find("rocky") {
+            let start = from + offset;
+            let end = start + "rocky".len();
+            from = start + 1;
+            let before_ok = start == 0 || !is_ident(bytes[start - 1]);
+            let after_ok = end == bytes.len() || !(is_ident(bytes[end]) || bytes[end] == b'-');
+            if !before_ok || !after_ok {
+                continue;
+            }
+            let rest = &lower[end..];
+            let skipped = rest
+                .find(|c: char| !matches!(c, ' ' | '\t' | '\n' | '\r' | '`' | '*'))
+                .unwrap_or(rest.len());
+            let rest = &rest[skipped..];
+            let word_end = rest
+                .find(|c: char| !(c.is_ascii_lowercase() || c == '-'))
+                .unwrap_or(rest.len());
+            if word_end > 0 {
+                out.push(&rest[..word_end]);
+            }
+        }
+        out
+    }
 
     // ------------------------------------------------------------------
     // An invalid rocky.toml refuses instead of reading as absent (#1625).
@@ -6961,15 +8829,27 @@ database = ":memory:"
     /// Tools the worker profile does not serve — no worker-served guidance
     /// surface may name them (the instructions BANNER is the one deliberate
     /// exception: naming them as absent is its job).
-    const WORKER_EXCLUDED_TOOL_MENTIONS: &[&str] = &[
-        "propose",
-        "review_queue",
-        "draft_contract",
-        "draft_metadata",
-        "pause_schedule",
-        "ai_test",
-        "ai_contract",
-    ];
+    ///
+    /// DERIVED from the two real routers, not hand-picked. It used to be a
+    /// literal list, and that is exactly how `draft_check` slipped: this
+    /// work package removed it from `WORKER_PROFILE_TOOLS` while
+    /// `WORKER_DRAFT_NEXT_STEPS` still told the worker to call it, and the
+    /// hand-picked list did not name it, so the sweep below went green over
+    /// a message instructing a tool that answers tool-not-found. A list that
+    /// has to be edited in lockstep with the allowlist is a list that will
+    /// not be. `briefs.rs` already derives its twin the same way and for the
+    /// same reason.
+    fn worker_excluded_tool_mentions() -> Vec<String> {
+        let served: std::collections::BTreeSet<String> = server_with(McpProfile::Worker)
+            .tool_names()
+            .into_iter()
+            .collect();
+        server_with(McpProfile::Default)
+            .tool_names()
+            .into_iter()
+            .filter(|name| !served.contains(name))
+            .collect()
+    }
 
     fn server_with(profile: McpProfile) -> RockyMcpServer {
         // `get_info` and the routers never touch the filesystem, so an
@@ -6977,11 +8857,6 @@ database = ":memory:"
         RockyMcpServer::new_with_profile(PathBuf::from("rocky.toml"), profile)
     }
 
-    /// Item 5a — served `instructions` per profile: the worker profile
-    /// prepends the banner (worker profile named, the five excluded tools
-    /// named as NOT available, the hand-off named as the ending) and serves
-    /// the skill text below it UNCHANGED; the default profile serves the
-    /// skill text verbatim, byte-identical to the compiled file.
     /// Every `paths:` list in a workflow, as its quoted entries. Enough YAML
     /// to check a trigger filter without taking a parser dependency: a
     /// `paths:` line, then the `- '...'` entries indented under it.
@@ -7107,54 +8982,684 @@ database = ":memory:"
         );
     }
 
+    /// Surface 1 — the served `instructions`, per profile.
+    ///
+    /// The default and approver profiles get the skill text byte-identical
+    /// to the compiled file. The worker gets a DERIVED banner plus a
+    /// PROJECTED body.
+    ///
+    /// This asserts the PROPERTY, not the presence of words, and the
+    /// distinction is the finding it replaces. The old version looped five
+    /// hardcoded names — omitting `draft_check`, the one tool whose removal
+    /// started this round — and its per-name assertion was
+    /// `contains(tool) && contains("not available")`, whose second conjunct
+    /// does not move with `tool`. It proved the phrase "not available"
+    /// appeared once, anywhere. Both halves are derived from the routers
+    /// now, so no name can be omitted and no conjunct is loop-invariant.
     #[test]
-    fn instructions_carry_the_worker_banner_and_stay_verbatim_by_default() {
-        let default_info = server_with(McpProfile::Default).get_info();
-        assert_eq!(
-            default_info.instructions.as_deref(),
-            Some(INSTRUCTIONS),
-            "default-profile instructions are the skill text, byte-unchanged"
+    fn worker_instructions_are_projected_and_default_stays_verbatim() {
+        for profile in [McpProfile::Default, McpProfile::Approver] {
+            assert_eq!(
+                server_with(profile).get_info().instructions.as_deref(),
+                Some(INSTRUCTIONS),
+                "{profile:?}-profile instructions are the skill text, byte-unchanged"
+            );
+        }
+
+        // FIFTEENTH ROUND, finding 1, and the half the finding did not name.
+        // The worker rewrite carried "exactly what would execute" onto
+        // `plan_preview`; the sentence it was rewriting made the SAME claim
+        // about `rocky plan`, and the DEFAULT and APPROVER profiles serve
+        // that sentence verbatim. `INSTRUCTIONS` is an `include_str!` of the
+        // authoring skill, so the skill file IS a served surface.
+        //
+        // The claim is false for the CLI too, on the same grounding the
+        // reviewer used against `docs/reference/glossary.md`: `rocky plan`
+        // renders its replication SQL STATICALLY, before any of it runs
+        // (`plan.rs::replication_copy_sql` degrades a non-Databricks
+        // `MERGE` to a canonical shape via `preview_merge_shape`, and an
+        // incremental table previews the 1970 sentinel watermark),
+        // `rocky plan --model` routes through `plan_preview_output` and
+        // skips what it cannot render, and `rocky apply` RECOMPILES the
+        // project rather than replaying the persisted plan (`plan.rs`'s
+        // run-plan blueprint doc).
+        //
+        // SIXTEENTH ROUND, finding 2 — this justification USED TO SAY
+        // "`rocky plan` renders offline", and that is the over-correction
+        // the finding names. `commands::plan` builds an `AdapterRegistry`
+        // and calls `discovery_adapter.discover()`; its own budget-check
+        // comment says plan "already performs live warehouse I/O
+        // (discovery, governance)". Statically-rendered is the property
+        // that makes the canonical `MERGE` and the 1970 sentinel true.
+        // Offline is a different property, and `rocky plan` does not have
+        // it. Correcting an over-claim is where this branch keeps
+        // manufacturing the opposite one.
+        //
+        // Pinned on the served text rather than on the file, because the
+        // file is only a defect while the server serves it.
+        assert!(
+            !INSTRUCTIONS.contains("exactly what would execute"),
+            "the served instructions promise `rocky plan` shows EXACTLY what would execute; \
+             the plan renders offline and `rocky apply` recompiles rather than replaying it"
         );
 
+        let excluded = worker_excluded_tool_mentions();
+        let banner = worker_instructions_banner(&excluded);
         let worker_info = server_with(McpProfile::Worker).get_info();
         let worker = worker_info
             .instructions
             .as_deref()
             .expect("worker profile serves instructions");
         assert!(
-            worker.starts_with(WORKER_INSTRUCTIONS_BANNER),
+            worker.starts_with(&banner),
             "worker instructions start with the banner"
         );
+        let body = &worker[banner.len()..];
+
+        // ROW 1 IS THE WHOLE `initialize` RESULT, not the `instructions`
+        // field. Found while correcting finding 2, on the work that
+        // correction produced — the enumeration's new sentence says every
+        // row is covered by a sweep over the whole serialized payload of
+        // its channel, and this row read one field of five.
+        //
+        // rmcp 3.1.2's `InitializeResult` also carries `protocolVersion`,
+        // `capabilities`, `serverInfo` and `_meta`, and `Implementation`
+        // carries `title`, `description`, `icons` and `websiteUrl` besides
+        // `name` and `version` — four free-text fields on the channel a
+        // worker reads at handshake, before it reads anything else.
+        // `Implementation::from_build_env()` leaves all four `None`, so
+        // nothing leaks today. The UNBACKED GUARANTEE was the defect, the
+        // same shape as rows 2 and 4/5: no leak, a claim the sweep did not
+        // support.
+        //
+        // THE BANNER IS SPLICED OUT, and it is the only thing removed. The
+        // banner names every excluded tool ON PURPOSE — saying `propose` is
+        // not available is the opposite of steering at it — so sweeping it
+        // would fire on the one surface designed to name them. Everything
+        // else the handshake serves is swept as-is, so a `title` or a
+        // `description` set on `Implementation` later is covered without
+        // this test knowing the shape.
+        let mut handshake =
+            serde_json::to_value(&worker_info).expect("initialize result serializes");
+        handshake["instructions"] = serde_json::Value::String(body.to_string());
         assert!(
-            worker.ends_with(INSTRUCTIONS),
-            "the skill text below the banner is byte-unchanged"
+            handshake.get("serverInfo").is_some() && handshake.get("capabilities").is_some(),
+            "the handshake must carry serverInfo and capabilities, or this sweeps an \
+             envelope with the newly-covered fields missing: {handshake}"
         );
+        let handshake = handshake.to_string();
         assert_eq!(
-            worker.len(),
-            WORKER_INSTRUCTIONS_BANNER.len() + INSTRUCTIONS.len(),
-            "banner + skill text and nothing else"
+            names_excluded_tool(&handshake, &excluded),
+            None,
+            "the worker `initialize` result must not name an excluded tool anywhere \
+             outside the banner: {handshake}"
         );
-        let banner_lower = WORKER_INSTRUCTIONS_BANNER.to_lowercase();
+
+        // PROPERTY 1 — the projected body names NO excluded tool, in any
+        // inflection. This is the same assertion every other swept surface
+        // runs, and it is why the row moved from EXEMPT to swept. It fails
+        // on the unprojected skill, which names `propose` six times and
+        // `draft_metadata` once.
+        assert_eq!(
+            names_excluded_tool(body, &excluded),
+            None,
+            "the projected instructions body must not name an excluded tool in any form"
+        );
+        assert_ne!(
+            body, INSTRUCTIONS,
+            "the body must actually BE projected — an unchanged body means the rewrites \
+             silently no-opped"
+        );
+
+        // PROPERTY 2 — the body stops the worker at CHECK authorship, which
+        // is the specific hole. The old banner stopped it at contract and
+        // metadata authorship and at the record/review/apply chain, while
+        // the text below told it to strengthen assertions and append tests.
+        let body_lower = body.to_lowercase();
         assert!(
-            banner_lower.contains("worker profile"),
-            "the banner says which profile is active"
+            body_lower.contains("checks are spec-owned"),
+            "the projected body must say checks are spec-owned: {body}"
         );
-        for tool in [
-            "propose",
-            "review_queue",
-            "draft_contract",
-            "draft_metadata",
-            "pause_schedule",
+        assert!(
+            body_lower.contains("do not add or strengthen assertions"),
+            "the projected body must reverse the `strengthen assertions` steer: {body}"
+        );
+        assert!(
+            !body_lower.contains("tests you append"),
+            "the `tests you append through the draft tools` steer must be gone: {body}"
+        );
+        assert!(
+            body_lower.contains("hand-off") || body_lower.contains("hand off"),
+            "the projected body ends at the hand-off: {body}"
+        );
+
+        // PROPERTY 3 — the body does not INSTRUCT a withheld action, even
+        // where it names no withheld tool. This is the ninth round's
+        // finding, and it is a different assertion from PROPERTY 1 on
+        // purpose: every needle below names no tool at all, so PROPERTY 1
+        // read the unprojected text as clean while it told the worker to
+        // write a model's `.toml` sidecar including strategy and target —
+        // contradicting the banner three paragraphs up, and routing around
+        // `draft_model`, which writes only a minimal `name` + `intent`
+        // document and never invents routing.
+        //
+        // Asserted as the ABSENCE of the steer plus the PRESENCE of the
+        // redirect, because absence alone is satisfiable by deleting the
+        // paragraph, and a worker with no instruction is not the outcome
+        // wanted here.
+        for steer in [
+            // Finding 1: the two sidecar-authorship sentences.
+            "sidecar for materialization",
+            "author the sql and its `.toml` sidecar",
+            // Re-reading the whole body on the same lens found three more.
+            // Each licenses a route this profile withholds, and each named
+            // no excluded tool — the last one quotes `propose_only`, the
+            // exact string the identifier rule was fixed NOT to match.
+            "you can run the `rocky` cli",
+            "`rocky shell`",
+            "rocky product verify",
         ] {
             assert!(
-                banner_lower.contains(tool) && banner_lower.contains("not available"),
-                "the banner names `{tool}` as not available"
+                !body_lower.contains(steer),
+                "the projected body still instructs `{steer}` — a withheld action the \
+                 name-based sweep cannot see: {body}"
             );
         }
         assert!(
-            banner_lower.contains("hand-off") && banner_lower.contains("trusted runner"),
-            "the banner redirects every ending to the trusted-runner hand-off"
+            body_lower.contains("do not write the `.toml` sidecar"),
+            "the body must redirect sidecar authorship at `draft_model`, not merely drop \
+             the sentence: {body}"
         );
+        assert!(
+            body_lower.contains("hand it to `draft_model`"),
+            "the body must name the tool that performs the write it just withheld: {body}"
+        );
+        assert!(
+            body_lower.contains("do not open a database connection of your own"),
+            "the body must replace the raw-query sampling route with the served tools: \
+             {body}"
+        );
+        // TENTH ROUND, finding 1D — this assertion is INVERTED, and the
+        // comment it replaces argued the opposite.
+        //
+        // It used to pin `rocky compile` as PRESENT, on the argument that
+        // `rocky compile` / `rocky plan` / `rocky test` name actions this
+        // profile SERVES and only the ROUTE differs. That is true, and it
+        // does not survive the banner sitting above it: the umbrella
+        // rewrite forbids shell routes CATEGORICALLY. Text that forbids a
+        // route and then instructs it four times is not followable.
+        //
+        // DERIVED, not per-string, and that is the whole upgrade. The old
+        // pin named one sentence, so the other three imperatives — and any
+        // fifth the skill grows — were invisible to it.
+        //
+        // ELEVENTH ROUND, finding 3 — the tenth round's scan matched the
+        // literal "`rocky ": lowercase, and backticked. `Run rocky compile`
+        // and ``Run `Rocky compile` `` both preserve every needle above and
+        // pass it clean. No leak today, and the bound was stated honestly;
+        // the defect was the sentence around it, which claimed any new CLI
+        // invocation fails here. It did not. Widened rather than narrowed,
+        // because the scan is cheap and it is the CLAIM that keeps going
+        // stale.
+        //
+        // WHAT THE WIDENED SCAN ACTUALLY DOES, so the claim and the code
+        // say the same thing: it finds every identifier-bounded `rocky` in
+        // the lowercased body — case-insensitive and backtick-agnostic —
+        // takes the word that follows, and refuses any word not on
+        // `ROCKY_PROSE_FOLLOWERS`.
+        //
+        // A PROSE ALLOWLIST, NOT A VERB LIST, and the reason is a
+        // dependency direction rather than a preference. The clap `Command`
+        // enum is private to the `rocky` binary crate
+        // (`engine/rocky/src/main.rs`), and that crate depends on this one.
+        // Deriving the verb set here would invert the dependency. So the
+        // rule fails CLOSED on an unknown follower instead: a new
+        // `rocky <verb>` fails without anyone listing the verb, and a new
+        // English phrase after "Rocky" fails until someone reads it and
+        // adds the word deliberately. The cost is a test edit on an
+        // innocent rewording; the alternative is a hand-maintained verb
+        // list that goes stale silently, which is the failure this round
+        // exists to stop repeating.
+        let followers = rocky_followers(&body_lower);
+        let routes: Vec<&str> = followers
+            .iter()
+            .copied()
+            .filter(|word| !ROCKY_PROSE_FOLLOWERS.contains(word))
+            .collect();
+        assert!(
+            routes.is_empty(),
+            "the projected body still routes the worker through the CLI ({routes:?}), \
+             while the umbrella rewrite above it forbids shell routes categorically — \
+             rewrite each one as the served action, or, if the word is prose rather than a \
+             verb, add it to ROCKY_PROSE_FOLLOWERS after reading the sentence: {body}"
+        );
+        // The scan must actually SEE the word — a body where "rocky" never
+        // occurs would satisfy the assertion above vacuously, and so would
+        // a broken matcher.
+        assert!(
+            !followers.is_empty(),
+            "the scan found no `rocky` at all in the projected body, so the assertion above \
+             proved nothing: {body}"
+        );
+        // NO DEAD ENTRIES. Every allowed word must still occur in the body.
+        // Two things fall out of this, and the second is the point:
+        //
+        //  - A sentence the skill drops takes its exemption with it,
+        //    instead of leaving a hole for a later route of the same word.
+        //  - A CLI verb cannot be PRE-AUTHORIZED. Adding "compile" here to
+        //    smooth a future edit fails immediately, because no such
+        //    follower exists yet. The exemption and the sentence have to
+        //    arrive together, where a reviewer sees both.
+        for allowed in ROCKY_PROSE_FOLLOWERS {
+            assert!(
+                followers.contains(allowed),
+                "ROCKY_PROSE_FOLLOWERS still exempts `{allowed}`, which no longer follows \
+                 `rocky` anywhere in the projected body — drop the entry rather than \
+                 leaving a standing exemption: {followers:?}"
+            );
+        }
+        // And it must catch what the old literal scan missed. Both forms
+        // preserve every needle in this test; only the widened rule sees
+        // them.
+        for missed in [
+            "Run rocky compile to check your work.",
+            "Run `Rocky compile` to check your work.",
+            "ROCKY COMPILE is the fast feedback loop.",
+        ] {
+            let probe = format!("{body}\n\n{missed}").to_lowercase();
+            let probe_followers = rocky_followers(&probe);
+            assert!(
+                probe_followers.contains(&"compile"),
+                "the widened scan must see `{missed}` — the literal it replaced did not"
+            );
+        }
+        // And the served actions REPLACED them, rather than the sentences
+        // being deleted: a worker with no instruction is not the outcome
+        // wanted here, exactly as in PROPERTY 3 above.
+        for served in [
+            "call the `inspect_schema` tool",
+            "call the `compile` tool and read its `diagnostics`",
+            "call the `plan_preview` tool",
+            "call the `test` tool",
+        ] {
+            assert!(
+                body_lower.contains(served),
+                "the body must name the served action that replaced the CLI route \
+                 (`{served}`): {body}"
+            );
+        }
+        // FIFTEENTH ROUND, finding 1 — and the served action is not enough
+        // on its own. The rewrite that named `plan_preview` also carried
+        // the CLI sentence's exactness claim onto it, which is the surface
+        // it is least true of: the preview renders with no warehouse and
+        // DROPS what it cannot render, unnamed. Pinned in both directions
+        // so neither the removal nor the disclosure can be undone alone.
+        assert!(
+            !body_lower.contains("exactly what would execute"),
+            "the projected body promises `plan_preview` shows EXACTLY what would execute; \
+             it renders offline and silently drops what it cannot render: {body}"
+        );
+        assert!(
+            body.contains("SKIPPED, and the result does not name it"),
+            "the projected body must say a model the preview cannot render offline is \
+             dropped WITHOUT being named, or an empty preview reads as an empty project: \
+             {body}"
+        );
+        // FINDING 1C — the retry steer. It presumed materializing a pipeline
+        // through a route this profile does not serve; no worker tool runs
+        // one, so no run error can occur to retry.
+        assert!(
+            !body_lower.contains("retry a `transient`"),
+            "the projected body must not tell the worker to retry a run error it cannot \
+             produce: {body}"
+        );
+        assert!(
+            body_lower.contains("there is no run to retry"),
+            "and it must say why, rather than dropping the bullet: {body}"
+        );
+        // ELEVENTH ROUND, finding 2 — and the reason it says must be the
+        // TRUE one. The tenth round's replacement justified the bullet with
+        // "no tool this profile serves executes against the warehouse",
+        // which is false: `sample_rows`, `profile_column` and
+        // `inspect_schema` are all on the allowlist and all read it. Pinned
+        // in BOTH directions, because dropping the over-claim without
+        // stating what replaces it would let the next rewrite reinstate it.
+        assert!(
+            !body_lower.contains("serves executes against the warehouse"),
+            "the projected body must not claim no served tool reaches the warehouse — \
+             `sample_rows`, `profile_column` and `inspect_schema` all do: {body}"
+        );
+        //
+        // THIRTEENTH ROUND, finding 2 — the three names were a literal here.
+        // They come from [`WORKER_TOOL_EFFECTS`] now, so a thirteenth tool
+        // classified as a reader has to be NAMED in this bullet before this
+        // test goes green. That is the half of the reader claim that can be
+        // held mechanically; which tools read is hand-reviewed, over there.
+        let readers = worker_tools_that_read_the_warehouse(WORKER_TOOL_EFFECTS);
+        assert!(
+            !readers.is_empty(),
+            "the classification must name at least one reader or the sweep below proves \
+             nothing: {WORKER_TOOL_EFFECTS:?}"
+        );
+        for reader in readers {
+            assert!(
+                WORKER_PROFILE_TOOLS.contains(&reader),
+                "`{reader}` must still be on the allowlist, or the sentence naming it as a \
+                 warehouse reader is stale"
+            );
+            assert!(
+                body_lower.contains(reader),
+                "the body must name `{reader}` as a tool that reads the warehouse, rather \
+                 than denying that any tool does: {body}"
+            );
+        }
+        // TWELFTH ROUND, finding 1 — and the REASON the bullet gives has to
+        // hold for every reader it names. It did not. `sample_rows` and
+        // `profile_column` propagate a failed read as
+        // `ToolError::warehouse_error`; `inspect_schema` returns SUCCESS with
+        // no physical tables (since #1565 it also sets `discovery_incomplete`
+        // and says why in `discovery_error` — reported, but still not an
+        // error). A worker holding the old universal reads an empty `sources`
+        // as "no such table".
+        //
+        // Pinned in BOTH directions, for the reason the pair above is:
+        // dropping the caveat is the cheap edit, and it re-promises
+        // silently.
+        assert!(
+            !body_lower.contains("a read that fails comes back as that tool's own error"),
+            "the projected body must not promise EVERY named reader surfaces a failed read \
+             as its own error — `inspect_schema` reports no physical tables and still \
+             returns success: {body}"
+        );
+        assert!(
+            body_lower.contains("not proof the table is absent"),
+            "and it must say what that costs the worker: a table missing from \
+             `inspect_schema`'s `sources` is inconclusive, not absent. Dropping the caveat \
+             re-promises what the tool does not do: {body}"
+        );
+        // AND IT MUST HAND THE WORKER A WAY OUT. A caveat with no remedy
+        // leaves a worker stuck at the exact point it needs to act, so the
+        // discriminator is pinned as its own assertion rather than left to
+        // the reader loop above — that loop is satisfied by the earlier
+        // mention of `sample_rows` and cannot see this sentence.
+        //
+        // The behaviour under it is proven elsewhere, not here:
+        // `prepare_table_query` routes a DOTTED target down the
+        // qualified-raw-ref branch with no compile, covered live over the
+        // wire by `sample_rows_reaches_raw_source_by_qualified_ref`
+        // (tests/roundtrip.rs). This assertion pins the ADVICE; that test
+        // pins the behaviour the advice depends on.
+        assert!(
+            body_lower.contains("ask `sample_rows` for that table"),
+            "the body must name the reader that DOES fail loudly for the same table, or the \
+             caveat above leaves the worker with no way to tell inconclusive from absent: \
+             {body}"
+        );
+        // THIRTEENTH ROUND, finding 1 — the same defect one tool over, in the
+        // sentence that fixed the one above it. `profile_column` was named as
+        // a counter-example to `inspect_schema`, and it is one only for its
+        // PRIMARY query. Its `top_values` is a second warehouse query taking
+        // `Err(_) => Vec::new()`, after which the tool returns success — so a
+        // worker reading an empty list as a fact about the column is reading
+        // a possible failure as data. Pinned in both directions, like the
+        // pair above: dropping the caveat is the cheap edit, and the
+        // over-claim came back the moment nothing held it.
+        assert!(
+            !body_lower.contains(
+                "`sample_rows` and `profile_column` surface a failed read as that tool's own \
+                 error"
+            ),
+            "the projected body must not promise `profile_column` surfaces EVERY failed read \
+             as its own error — its `top_values` query returns an empty list and the tool \
+             still succeeds: {body}"
+        );
+        assert!(
+            body_lower.contains("`top_values` is a second query and is best-effort"),
+            "the body must disclose `profile_column`'s optional second read as best-effort, \
+             or the worker has no reason to distrust an empty `top_values`: {body}"
+        );
+        // AND the caveat has to say what the empty list fails to tell apart.
+        // "Best-effort" alone reads as "sometimes missing"; the actionable
+        // fact is that a failure is indistinguishable from two ordinary
+        // outcomes, because nothing in the result separates them.
+        assert!(
+            body_lower.contains("an empty `top_values` does not distinguish"),
+            "and it must say what an empty `top_values` does NOT tell apart — a \
+             high-cardinality column, an all-null one, and a failed query all produce it: \
+             {body}"
+        );
+        // TWELFTH ROUND, finding 2 — NO COUNT IS PINNED HERE, DELIBERATELY.
+        //
+        // The bullet used to open "Three tools do READ the warehouse", and
+        // that number was guarded with `WORKER_PROFILE_TOOLS.len() == 12`.
+        // The assertion READS as semantic assurance and is not: changing an
+        // existing tool's body to open an adapter, or swapping one
+        // allowlisted tool for another, preserves the length and passes. A
+        // guard that looks derived and proves nothing is the exact defect
+        // this branch has produced three times, so the CLAIM went instead of
+        // the guard being propped up. The loop above still holds what is
+        // holdable — each named reader is on the allowlist AND named in the
+        // body — and it never claimed exhaustivity.
+        //
+        // WHAT ROUND TWELVE LEFT UNGUARDED — and what now holds it. The
+        // bullet's leading sentence, "No tool this profile serves runs or
+        // materializes a pipeline", is a universal over twelve hand-chosen
+        // names. PROPERTY 4 below derives the EXCLUDED set — the complement
+        // of the allowlist — so it cannot see the interior, and a thirteenth
+        // allowlisted tool that ran a pipeline would falsify the sentence
+        // with every assertion in this test green.
+        //
+        // Round twelve deleted the length check and volunteered that gap
+        // rather than replacing it. The reviewer ruled the universal is not
+        // acceptable uninstrumented, and it was right: the length check held
+        // nothing, but it WAS an extension tripwire, and dropping it left
+        // the sentence with none.
+        //
+        // [`WORKER_TOOL_EFFECTS`] is the replacement — a reviewed effect per
+        // served tool, cross-checked against the router by
+        // `every_worker_served_tool_is_classified_and_none_runs_a_pipeline`.
+        // It is hand-reviewed and says so, which is the distinction this
+        // branch keeps getting wrong in the other direction: it does not
+        // pretend to derive what a call graph would have to answer.
+        assert!(
+            worker_tools_that_run_a_pipeline(WORKER_TOOL_EFFECTS).is_empty(),
+            "the bullet opens by denying any served tool runs or materializes a pipeline, \
+             and the reviewed classification now contradicts it: {WORKER_TOOL_EFFECTS:?}"
+        );
+
+        // PROPERTY 4 — the banner names EVERY excluded tool, derived. The
+        // banner is the one worker surface that names them deliberately:
+        // saying a tool is unavailable is the opposite of steering at it.
+        let banner_lower = banner.to_lowercase();
+        let (prohibition, _) = banner_lower
+            .split_once("not available in this session:")
+            .expect("the banner states the prohibition once, before the name list");
+        assert!(
+            prohibition.contains("worker profile"),
+            "the banner says which profile is active: {banner}"
+        );
+        assert!(
+            !excluded.is_empty(),
+            "the derived excluded set must be non-empty or this proves nothing"
+        );
+        for tool in &excluded {
+            assert!(
+                banner_lower.contains(&tool.to_lowercase()),
+                "the banner must name `{tool}` — derived from the routers, so a tool that \
+                 leaves the allowlist cannot be omitted by forgetting to list it: {banner}"
+            );
+        }
+        assert!(
+            banner_lower.contains("spec-owned"),
+            "the banner names checks/contracts/metadata as spec-owned: {banner}"
+        );
+        assert!(
+            banner_lower.contains("hand-off") && banner_lower.contains("trusted runner"),
+            "the banner redirects every ending to the trusted-runner hand-off: {banner}"
+        );
+    }
+
+    /// THIRTEENTH ROUND, finding 2 — the extension tripwire under the worker
+    /// bullet's leading universal, "No tool this profile serves runs or
+    /// materializes a pipeline".
+    ///
+    /// Cross-checks [`WORKER_TOOL_EFFECTS`] against the ROUTER, not against
+    /// [`WORKER_PROFILE_TOOLS`]. The allowlist is a list of strings and a
+    /// name that matches no route is silently inert; the router is what a
+    /// worker session can actually call. Both directions, so a thirteenth
+    /// served tool fails here until someone classifies it, and a stale entry
+    /// for a tool that left the surface fails too.
+    ///
+    /// What it does NOT prove is that a classification is correct — see the
+    /// note on the table. It proves nothing served is unclassified, and that
+    /// no reviewed entry contradicts the sentence.
+    #[test]
+    fn every_worker_served_tool_is_classified_and_none_runs_a_pipeline() {
+        use std::collections::BTreeSet;
+
+        let server = server_with(McpProfile::Worker);
+        let served: BTreeSet<String> = server
+            .tool_router
+            .list_all()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let classified: BTreeSet<String> = WORKER_TOOL_EFFECTS
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect();
+        assert_eq!(
+            WORKER_TOOL_EFFECTS.len(),
+            classified.len(),
+            "a tool is classified twice, and the duplicate could disagree with itself: \
+             {WORKER_TOOL_EFFECTS:?}"
+        );
+        assert_eq!(
+            served, classified,
+            "every tool the worker router SERVES carries a reviewed effect, and nothing else \
+             does. Add the new tool to WORKER_TOOL_EFFECTS — after reading its body — or \
+             drop the stale entry"
+        );
+
+        // THE CLAIM the worker instructions make about this surface.
+        assert!(
+            worker_tools_that_run_a_pipeline(WORKER_TOOL_EFFECTS).is_empty(),
+            "the worker bullet denies that any served tool runs or materializes a pipeline: \
+             {WORKER_TOOL_EFFECTS:?}"
+        );
+
+        // AND THE READER SET IS PINNED to the three that were audited.
+        // Feeding the body sweep from this table removed a stale literal and
+        // added a RELAXATION in its place: reclassify `inspect_schema` to
+        // `Offline` and the bullet no longer has to name it, with every
+        // assertion green. Narrowing the set now takes a deliberate two-line
+        // edit — the table AND this line — which is the "someone has to
+        // look" property the guard exists for. Not circular: this pins the
+        // SHAPE of the reviewed answer, the table holds the answer.
+        assert_eq!(
+            worker_tools_that_read_the_warehouse(WORKER_TOOL_EFFECTS),
+            vec!["inspect_schema", "profile_column", "sample_rows"],
+            "the three audited warehouse readers. Re-read the tool body before changing this \
+             — the worker bullet has to NAME every reader, and dropping one here drops it \
+             from that sweep too"
+        );
+
+        // AND THE CHECK HAS TO BITE. Round twelve's guard read as semantic
+        // assurance and passed through the thing it claimed to hold, so this
+        // one is run over a table that DOES violate the sentence. Without
+        // this, `is_empty()` above is green on a filter that never matches —
+        // indistinguishable from a guard that works.
+        assert_eq!(
+            worker_tools_that_run_a_pipeline(&[
+                ("compile", WorkerToolEffect::Offline),
+                ("run_pipeline", WorkerToolEffect::RunsPipeline),
+                ("sample_rows", WorkerToolEffect::ReadsWarehouse),
+            ]),
+            vec!["run_pipeline"],
+            "the classification check must catch a tool that runs a pipeline, or the \
+             assertion above proves only that the filter never matches"
+        );
+    }
+
+    /// THIRTEENTH ROUND — the SIBLING SURFACE to finding 1. The served
+    /// instructions now describe both best-effort reads honestly, and the
+    /// `tools/list` descriptions of the same two tools did not.
+    ///
+    /// `inspect_schema` was the worse of the pair: "the typed columns of
+    /// every model and source table in the project" is an unqualified
+    /// universal, and "never guess column names" tells the worker to treat
+    /// the answer as complete — over a tool whose physical-table half is
+    /// best-effort. Since #1565 its two failure paths are REPORTED
+    /// (`discovery_incomplete` / `discovery_error`), but the call still
+    /// succeeds, so the description still has to say what a missing table
+    /// means.
+    ///
+    /// Swept on BOTH profiles because neither description is rewritten for
+    /// the worker (`WORKER_TOOL_DESCRIPTIONS` covers `breaking_change`,
+    /// `plan_preview` and `draft_model` only), so one string serves both and
+    /// a default-profile caller reads the same promise.
+    #[test]
+    fn the_reader_tool_descriptions_disclose_their_best_effort_reads() {
+        for profile in [McpProfile::Default, McpProfile::Worker] {
+            let server = server_with(profile);
+            let description = |name: &str| -> String {
+                server
+                    .tool_router
+                    .map
+                    .get(name)
+                    .unwrap_or_else(|| panic!("{profile:?} serves '{name}'"))
+                    .attr
+                    .description
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let inspect = description("inspect_schema");
+            assert!(
+                inspect.contains("best-effort"),
+                "{profile:?}: `inspect_schema` promises the project's tables without saying \
+                 its physical-table discovery can report none of them and still succeed: \
+                 {inspect}"
+            );
+            assert!(
+                inspect.contains("inconclusive, not absent"),
+                "{profile:?}: and it must say what that costs the caller, or 'best-effort' \
+                 reads as 'sometimes slow': {inspect}"
+            );
+            let profile_column = description("profile_column");
+            assert!(
+                profile_column.contains("second query and is best-effort"),
+                "{profile:?}: `profile_column`'s description offers `top_values` without \
+                 saying the query behind it can fail into an empty list on a successful \
+                 call: {profile_column}"
+            );
+            // FOURTEENTH ROUND, finding 1 — the same defect on a tool that
+            // RENDERS rather than reads, which is why it sat outside this
+            // test's original family. `plan_preview` called its output "the
+            // exact SQL Rocky would execute" while
+            // `commands::plan_preview_output` passes no warehouse and skips
+            // every model `sql_gen` cannot render offline, and
+            // `PlanPreviewResult` has no field that names a skipped model.
+            //
+            // Pinned in BOTH directions and on BOTH profiles: the removed
+            // exactness claim must stay gone, and the disclosure that
+            // replaced it must stay present. Only the trailing sentence
+            // differs per profile ([`WORKER_TOOL_DESCRIPTIONS`]), so the
+            // disclosure is shared text and a one-sided edit fails here.
+            let plan_preview = description("plan_preview");
+            assert!(
+                !plan_preview.contains("exact SQL Rocky would execute"),
+                "{profile:?}: `plan_preview`'s description promises the EXACT execution SQL; \
+                 the preview is offline and silently drops what it cannot render: \
+                 {plan_preview}"
+            );
+            assert!(
+                plan_preview.contains("SKIPPED, and the result does not name it"),
+                "{profile:?}: `plan_preview`'s description must say that a model it cannot \
+                 render offline is dropped WITHOUT being named, or an empty preview reads as \
+                 an empty project: {plan_preview}"
+            );
+        }
     }
 
     /// Item 5b — the worker `prompts/list` surface: EVERY listed prompt
@@ -7171,14 +9676,13 @@ database = ":memory:"
                 .description
                 .as_deref()
                 .unwrap_or_else(|| panic!("prompt '{}' has a description", prompt.name));
-            for excluded in WORKER_EXCLUDED_TOOL_MENTIONS {
-                assert!(
-                    !description.contains(excluded),
-                    "worker-profile description of '{}' must not name excluded tool \
-                     `{excluded}`: {description}",
-                    prompt.name
-                );
-            }
+            assert_eq!(
+                names_excluded_tool(description, &worker_excluded_tool_mentions()),
+                None,
+                "worker-profile description of '{}' must not name an excluded tool in any \
+                 form: {description}",
+                prompt.name
+            );
             if prompt.name != "summarize_project" {
                 assert!(
                     description.contains("hand-off to the trusted runner"),
@@ -7187,6 +9691,56 @@ database = ":memory:"
                     prompt.name
                 );
             }
+            // The same write-promise backstop the `prompts/get` description
+            // carries (ninth round, finding 2). These two surfaces are one
+            // field apart and say nearly the same thing; guarding only the
+            // one that was caught is how the next round finds the sibling.
+            //
+            // Hand-written, and deliberately so: deriving the promises from
+            // the withheld capabilities (`draft_check` ⇒ "draft a check")
+            // was tried against the two strings that shipped and matched
+            // NEITHER — `draft_check` writes a `[[tests]]` block, so the
+            // tool noun and the artifact noun are different words, and
+            // "Add key tests" uses a verb no tool name carries. The full
+            // reasoning is on the sibling sweep in
+            // `worker_profile_prompts_end_at_the_runner_handoff`; keep the
+            // two lists identical.
+            let description_lower = description.to_lowercase();
+            for promise in [
+                "draft tests",
+                "draft the tests",
+                "add tests",
+                "add key tests",
+                "write tests",
+                "draft checks",
+                "add checks",
+                "write checks",
+                "draft a contract",
+                "add a contract",
+                "write metadata",
+            ] {
+                assert!(
+                    !description_lower.contains(promise),
+                    "worker-profile `prompts/list` description of '{}' promises \
+                     `{promise}`, which is spec-owned in this profile: {description}",
+                    prompt.name
+                );
+            }
+            // TENTH ROUND, finding 1 — the same false promise about which
+            // suite `test` runs, on the LIST description rather than the
+            // body. `fix_failing_test` said "failing declarative tests: run
+            // `test`", and `test` calls `commands::test_output` — the
+            // compiled model tests plus the unit tests. The declarative set
+            // is `rocky test --declarative`, a path this profile does not
+            // serve. Pinned here because this field is one hop from the
+            // prompt body and was fixed separately from it.
+            assert!(
+                !description_lower.contains("declarative tests: run `test`"),
+                "worker-profile `prompts/list` description of '{}' claims the `test` tool \
+                 runs the declarative check set; it runs the LOCAL model + unit tests: \
+                 {description}",
+                prompt.name
+            );
         }
     }
 
@@ -7215,10 +9769,28 @@ database = ":memory:"
                  draft_contract -> propose. Stops at the human approval gate.",
             ),
             (
+                // FOURTEENTH ROUND — the one entry on this list that is NOT
+                // byte-unchanged from the pre-worker-profile string, and the
+                // reason is written down so it is not read as a leak.
+                //
+                // The old text said "declarative tests: run `test`". The
+                // `test` tool runs `commands::test_output` — model execution
+                // plus sidecar fixture `[[test]]` blocks — on every profile,
+                // and never `run_declarative_tests`. Round ten found that and
+                // fixed the WORKER copy, pinning its absence in
+                // `worker_prompt_descriptions_name_no_excluded_tool`; the
+                // defect was never profile-shaped, so the default copy stayed
+                // false for four rounds.
+                //
+                // This test's job is to stop the worker rewrite LEAKING into
+                // the default surface, not to freeze a false sentence. A
+                // deliberate correctness fix updates the literal here, in the
+                // same commit, on purpose.
                 "fix_failing_test",
-                "Diagnose and fix failing declarative tests: run `test` -> for each failure \
-                 profile_column the implicated columns to ground the cause -> propose a fix. \
-                 Stops at the human approval gate.",
+                "Diagnose and fix failing LOCAL tests: run `test` — the project's model and \
+                 unit tests, not the warehouse-run `--declarative` set — then for each \
+                 failure profile_column the implicated columns to ground the cause -> \
+                 propose a fix. Stops at the human approval gate.",
             ),
             (
                 "summarize_project",
@@ -7242,6 +9814,427 @@ database = ":memory:"
                 "default-profile description of '{name}' is byte-unchanged"
             );
         }
+        // FOURTEENTH ROUND — the byte pin above already covers this, and it
+        // is asserted separately anyway because a byte pin records WHAT, not
+        // WHY. Someone re-blessing the literal to make a build pass would
+        // put the false sentence back and this line is what stops them.
+        //
+        // The claim: no default-profile description may say the `test` tool
+        // runs the declarative set. It does not, on any profile —
+        // `commands::test_output` runs model execution plus sidecar fixture
+        // `[[test]]` blocks, never `run_declarative_tests`. The mirror of
+        // this assertion has guarded the worker surface since round ten;
+        // the defect was never profile-shaped, so the guard should not be
+        // either.
+        for (name, description) in &listed {
+            let lower = description.as_deref().unwrap_or_default().to_lowercase();
+            assert!(
+                !lower.contains("declarative tests: run `test`"),
+                "default-profile description of '{name}' claims the `test` tool runs the \
+                 declarative check set; it runs the LOCAL model + unit tests: {description:?}"
+            );
+        }
+    }
+
+    /// F3 red team, finding 3 — SURFACE 4: every `tools/list` description
+    /// the worker profile serves. Swept over the whole filtered router, so
+    /// a tool added to [`WORKER_PROFILE_TOOLS`] later cannot dodge it.
+    ///
+    /// This is the surface the previous three rounds missed. Three served
+    /// descriptions steered at `propose`: `breaking_change` and
+    /// `draft_model` by name, and `plan_preview` as "proposing" — which
+    /// only the inflection half of [`names_excluded_tool`] can see.
+    #[test]
+    fn worker_tool_descriptions_name_no_excluded_tool() {
+        let server = server_with(McpProfile::Worker);
+        let excluded = worker_excluded_tool_mentions();
+        let tools = server.tool_router.list_all();
+        assert_eq!(
+            tools.len(),
+            WORKER_PROFILE_TOOLS.len(),
+            "the sweep covers the whole worker surface, not a sample"
+        );
+        for tool in &tools {
+            let description = tool
+                .description
+                .as_deref()
+                .unwrap_or_else(|| panic!("tool '{}' has a description", tool.name));
+            assert_eq!(
+                names_excluded_tool(description, &excluded),
+                None,
+                "worker-profile description of '{}' must not name an excluded tool in any \
+                 form: {description}",
+                tool.name
+            );
+        }
+    }
+
+    /// The other half of the rewrite — the DEFAULT descriptions keep the
+    /// sentences the worker profile replaces, and never gain the
+    /// replacements.
+    ///
+    /// Asserted as needle-present + replacement-absent rather than as a
+    /// byte pin of three paragraphs. A byte pin of prose that long rots
+    /// into a copy nobody rereads; this checks the two facts that matter
+    /// and stays true across an unrelated edit. The construction-time
+    /// `assert!` in `new_with_profile` covers the same needle from the
+    /// other side, so a reworded sentence cannot silently become a no-op.
+    #[test]
+    fn the_worker_description_rewrites_do_not_leak_into_the_default_surface() {
+        let default_server = server_with(McpProfile::Default);
+        for (name, needle, replacement) in WORKER_TOOL_DESCRIPTIONS {
+            let route = default_server
+                .tool_router
+                .map
+                .get(*name)
+                .unwrap_or_else(|| panic!("default profile serves '{name}'"));
+            let description = route.attr.description.as_deref().unwrap_or_default();
+            assert!(
+                description.contains(needle),
+                "the default description of '{name}' still carries the sentence the worker \
+                 profile rewrites: {description}"
+            );
+            assert!(
+                !description.contains(replacement),
+                "and never the worker replacement: {description}"
+            );
+        }
+    }
+
+    /// The guidance-surface count is closed at the PROTOCOL level.
+    ///
+    /// [`WORKER_GUIDANCE_SURFACES`] enumerates nine places a worker is
+    /// served text. That enumeration is only trustworthy if no tenth
+    /// CHANNEL can open without anyone noticing — so this pins the served
+    /// capabilities: `tools` and `prompts`, and nothing else. Enabling
+    /// resources, completions or logging fails here and forces a revisit
+    /// of the count instead of quietly invalidating it.
+    ///
+    /// TENTH ROUND, finding 3 — asserted as the whole serialized KEY SET,
+    /// not as three `is_none()` checks. Those named `resources`,
+    /// `completions` and `logging` and stopped there, while rmcp 3.1.2's
+    /// `ServerCapabilities` also carries `experimental` and `extensions`
+    /// (SEP-1724, keyed by extension id — the tasks extension lives there).
+    /// Enumerating the fields a test knows about is the same defect as
+    /// enumerating the fields a sweep knows about, one struct over, so the
+    /// fix is the same: read what the value actually serializes. Every
+    /// field is `skip_serializing_if = "Option::is_none"`, so an absent
+    /// capability contributes no key and a NEW one added by a future rmcp
+    /// fails here the moment it is enabled.
+    #[test]
+    fn the_server_opens_no_guidance_channel_beyond_tools_and_prompts() {
+        let next = WORKER_GUIDANCE_SURFACES + 1;
+        for profile in [
+            McpProfile::Default,
+            McpProfile::Approver,
+            McpProfile::Worker,
+        ] {
+            let capabilities = server_with(profile).get_info().capabilities;
+            let serialized = serde_json::to_value(&capabilities).expect("capabilities serialize");
+            let mut keys: Vec<&str> = serialized
+                .as_object()
+                .expect("capabilities serialize as an object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                ["prompts", "tools"],
+                "the {profile:?} profile declares a capability beyond tools and prompts. \
+                 Any other channel — resources, completions, logging, experimental, an \
+                 SEP-1724 extension — carries a tenth KIND of served text and would be \
+                 guidance surface {next}; extend WORKER_GUIDANCE_SURFACES and its sweeps \
+                 rather than this assertion: {serialized}"
+            );
+        }
+    }
+
+    /// The matching rule itself, in both directions — the exact name and
+    /// the inflections, and no match on an unrelated word.
+    ///
+    /// Driven on the two strings that were actually wrong, so this test
+    /// fails if the rule is ever narrowed back to an exact-name compare.
+    #[test]
+    fn the_mention_rule_reads_inflections_not_just_the_bare_name() {
+        let excluded = vec!["propose".to_string()];
+        assert_eq!(
+            names_excluded_tool("then `propose` to record a plan", &excluded),
+            Some(("propose".to_string(), "propose".to_string())),
+            "the exact name still matches"
+        );
+        let (tool, form) = names_excluded_tool("before proposing a materialization", &excluded)
+            .expect(
+                "`proposing` steers at `propose`; an exact-name sweep read this as clean and \
+                 shipped it to the worker",
+            );
+        assert_eq!((tool.as_str(), form.as_str()), ("propose", "proposing"));
+        assert!(
+            names_excluded_tool("Proposing a wrong key invariant", &excluded).is_some(),
+            "and case-insensitively, or a sentence-initial verb slips through"
+        );
+        assert_eq!(
+            names_excluded_tool("preview the generated SQL", &excluded),
+            None,
+            "unrelated prose does not match"
+        );
+    }
+
+    /// The rule is an IDENTIFIER detector, not a byte-run detector (F3
+    /// round 2, finding 3).
+    ///
+    /// The raw `contains` it replaces read every excluded name inside any
+    /// longer identifier. That was tolerable while the swept surface was
+    /// text Rocky writes, and is not now that the sweep reaches compiler
+    /// diagnostics, which quote the USER's model and column names back at
+    /// the worker — Rocky cannot reword someone's column.
+    ///
+    /// Both directions are asserted, because a matcher that stops firing
+    /// is the failure mode the sweep exists to catch.
+    #[test]
+    fn the_mention_rule_matches_identifiers_not_byte_runs() {
+        let excluded = vec!["propose".to_string(), "optimize".to_string()];
+
+        for user_text in [
+            "column `proposal_id` not found on model `orders`",
+            "unknown column: proposed_amount",
+            "model `proposer` has no unique key",
+            "the config literal propose_only is frozen",
+            // The corrected boundary example. Two review rounds cited
+            // `propose_v2` as the collision no rule can fix; `_` is an
+            // identifier byte, so it never collided. Pinned here so the
+            // comment that now says so cannot drift back.
+            "column not found on model `propose_v2`",
+            "unoptimized scan on `events`",
+        ] {
+            assert_eq!(
+                names_excluded_tool(user_text, &excluded),
+                None,
+                "'{user_text}' names no tool — the name is inside a longer identifier"
+            );
+        }
+
+        for steering in [
+            "then `propose` to record a plan",
+            "before proposing a materialization",
+            "a plan you already proposed",
+            "write the proposal, then stop",
+            "or optimize the query to reduce scan volume",
+            // The collision that IS real: an EXACT user identifier. This is
+            // what the boundary paragraph on `WORKER_GUIDANCE_SURFACES`
+            // describes, and it fires because there is nothing lexical left
+            // to tell it apart from the tool name.
+            "column not found on model `propose`",
+        ] {
+            assert!(
+                names_excluded_tool(steering, &excluded).is_some(),
+                "'{steering}' names an excluded tool at identifier boundaries and must fire"
+            );
+        }
+    }
+
+    /// The boundary rule is byte-exact about the neighbours, including the
+    /// ends of the string and non-identifier punctuation.
+    #[test]
+    fn identifier_boundaries_are_the_neighbouring_bytes() {
+        assert!(contains_identifier("propose", "propose"), "whole string");
+        assert!(contains_identifier("`propose`", "propose"), "backticks");
+        assert!(contains_identifier("propose.", "propose"), "trailing stop");
+        assert!(contains_identifier("(propose)", "propose"), "parenthesised");
+        assert!(contains_identifier("re-propose", "propose"), "hyphen");
+        assert!(!contains_identifier("propose_only", "propose"), "suffix _");
+        assert!(!contains_identifier("xpropose", "propose"), "prefix alpha");
+        assert!(!contains_identifier("propose2", "propose"), "suffix digit");
+        // A later occurrence still matches when an earlier one is embedded:
+        // the scan advances rather than stopping at the first byte run.
+        assert!(
+            contains_identifier("propose_only, then propose", "propose"),
+            "the scan does not stop at the first embedded occurrence"
+        );
+    }
+
+    /// The projection REFUSES on drift, in both directions, and every
+    /// profile builds cleanly today (ninth review round).
+    ///
+    /// This check is not a build invariant, and the comments that called it
+    /// one were wrong. Every operand is a compile-time constant, but
+    /// nothing verifies the match until a server is CONSTRUCTED — which
+    /// `serve_stdio` does on the live `rocky mcp --profile worker` path. An
+    /// edit to the skill compiles and then fails at startup. This test is
+    /// the guarantee that the frozen constants still line up, so it is
+    /// worth stating that a test is all it is.
+    ///
+    /// Driven through a deliberately-drifted table, because the real one
+    /// matches: without that, "it refuses on drift" would be an untested
+    /// claim on the exact path this round is correcting claims about.
+    #[test]
+    fn the_worker_projection_refuses_on_drift_rather_than_panicking() {
+        let excluded = worker_excluded_tool_mentions();
+
+        // ZERO matches — the skill was edited under the projection. The
+        // silent no-op replace this prevents would serve the DEFAULT
+        // sentence to a worker.
+        let gone = worker_instructions(
+            &excluded,
+            &[("a sentence the skill file does not contain", "…")],
+        )
+        .expect_err("a needle that matches nothing must refuse");
+        assert!(
+            gone.contains("matched 0 times"),
+            "the refusal says how many times it matched: {gone}"
+        );
+
+        // MORE THAN ONE match — `replace` would rewrite a passage nobody
+        // reviewed. `SQL` occurs many times in the skill body.
+        let many = worker_instructions(&excluded, &[("SQL", "…")])
+            .expect_err("a needle that matches more than once must refuse");
+        assert!(
+            !many.contains("matched 0 times") && many.contains("not once"),
+            "the refusal distinguishes the two directions: {many}"
+        );
+
+        // And the real tables build every profile, today. `try_*` is the
+        // live path; `new_with_profile` keeps panicking so tests still fail
+        // loudly, and both must agree that nothing has drifted.
+        for profile in [
+            McpProfile::Default,
+            McpProfile::Approver,
+            McpProfile::Worker,
+        ] {
+            RockyMcpServer::try_new_with_profile(PathBuf::from("rocky.toml"), profile)
+                .unwrap_or_else(|e| panic!("{profile:?} profile must build today: {e}"));
+        }
+    }
+
+    /// TENTH ROUND, finding 3 — the OTHER rewrite path refuses the same
+    /// way, and this test is the reason the check moved into a free
+    /// function.
+    ///
+    /// The tool-description rewrite required only `contains` and then
+    /// replaced EVERY occurrence, while the instruction rewrite one surface
+    /// over required exactly one match. So "both projections fail closed"
+    /// was true of one of them: a duplicated needle here rewrote a second
+    /// passage nobody reviewed, silently.
+    ///
+    /// Driven on a synthetic description rather than a real one, for the
+    /// same reason the sibling test above drives a synthetic table: the
+    /// shipped descriptions match once, so the refusal is unreachable
+    /// in-process and the claim would be untested on exactly the path this
+    /// round exists to correct claims about.
+    #[test]
+    fn the_tool_description_projection_refuses_on_drift_in_both_directions() {
+        // ZERO — the default description was edited under the projection.
+        let gone = worker_tool_description(
+            "plan_preview",
+            "Preview the SQL Rocky would run.",
+            "before proposing a materialization.",
+            "before you hand off to the trusted runner.",
+        )
+        .expect_err("a needle that matches nothing must refuse");
+        assert!(
+            gone.contains("matched 0 times"),
+            "the refusal says how many times it matched: {gone}"
+        );
+
+        // MORE THAN ONE — the failure this path used to take silently. The
+        // old code called `contains`, saw true, and then replaced BOTH
+        // occurrences; the second one is a passage the table's author never
+        // read.
+        let many = worker_tool_description(
+            "plan_preview",
+            "Read the SQL first. Read the SQL after the fix too.",
+            "Read the SQL",
+            "Call `plan_preview`",
+        )
+        .expect_err("a needle that matches more than once must refuse");
+        assert!(
+            many.contains("matched 2 times") && many.contains("not once"),
+            "the refusal distinguishes the two directions: {many}"
+        );
+
+        // EXACTLY ONE — the live shape, and it rewrites only that
+        // occurrence.
+        let ok = worker_tool_description(
+            "plan_preview",
+            "Preview the SQL before proposing a materialization.",
+            "before proposing a materialization.",
+            "before you hand off to the trusted runner.",
+        )
+        .expect("the matching case still rewrites");
+        assert_eq!(
+            ok,
+            "Preview the SQL before you hand off to the trusted runner."
+        );
+
+        // And the two paths now agree. Neither table may carry a needle
+        // that matches its source more than once — this drives the real
+        // tables, so an entry added later with a duplicated needle fails
+        // here rather than at a worker's startup.
+        let default = RockyMcpServer::new(PathBuf::from("rocky.toml"));
+        for (name, needle, _) in WORKER_TOOL_DESCRIPTIONS {
+            let description = default
+                .tool_router
+                .map
+                .get(*name)
+                .unwrap_or_else(|| panic!("default profile serves '{name}'"))
+                .attr
+                .description
+                .as_deref()
+                .unwrap_or_default();
+            assert_eq!(
+                description.matches(needle).count(),
+                1,
+                "the WORKER_TOOL_DESCRIPTIONS needle for '{name}' must match its default \
+                 description exactly once, or the rewrite edits a passage nobody reviewed: \
+                 {needle:?}"
+            );
+        }
+    }
+
+    /// An EMPTY needle matches nothing and, more to the point, does not
+    /// abort the process (ninth review round).
+    ///
+    /// `"".find("")` succeeds at every offset, so the unguarded scan walked
+    /// `from` one past the end and indexed `haystack[from..]` out of range.
+    /// The shape matters: the run-off only happens when NO offset satisfies
+    /// the boundary test, which needs a haystack whose LAST byte is an
+    /// identifier byte. `"abc "` returned `true` at the space and never
+    /// reached the end; `"abc"` panicked. A probe on the first shape would
+    /// have reported the bug absent.
+    ///
+    /// Not reachable over MCP — both routers supply real tool names — but
+    /// [`names_excluded_tool`] is exported from the crate root, so a caller
+    /// can hand it one.
+    #[test]
+    fn an_empty_needle_matches_nothing_and_does_not_panic() {
+        // The shape that PANICKED: every byte fails the boundary test, so
+        // the scan ran off the end.
+        assert!(
+            !contains_identifier("abc", ""),
+            "an empty needle is not an identifier"
+        );
+        // The shape that did NOT panic, kept so a future narrowing cannot
+        // reintroduce the run-off by only fixing the loud case.
+        assert!(
+            !contains_identifier("abc ", ""),
+            "and it does not match at a non-identifier byte either"
+        );
+        assert!(!contains_identifier("", ""), "empty haystack, empty needle");
+
+        // One level up: a blank tool name derives NO forms. Without this,
+        // the stem-plus-suffix rule yields `ing`/`ed`/`es`/`s`/`al`, and
+        // `s` is an identifier in ordinary English — every swept surface
+        // would start failing on prose.
+        assert!(
+            excluded_mention_forms("").is_empty(),
+            "a blank tool name names nothing"
+        );
+        assert!(excluded_mention_forms("  ").is_empty(), "whitespace too");
+        assert_eq!(
+            names_excluded_tool("the s in this sentence", &["".to_string()]),
+            None,
+            "a blank excluded name matches no prose, and does not panic"
+        );
     }
 
     /// Item 5c — the profile-selected draft `next_steps`: the worker variants
@@ -7255,10 +10248,13 @@ database = ":memory:"
             default_server.draft_model_next_steps(),
             "This is a draft — Rocky has NOT applied it or touched the warehouse. Continue the \
              authoring loop: fix any error diagnostics above and re-draft (or `compile`) until \
-             it is clean, `plan_preview` to read the SQL Rocky would run, then `propose` to \
-             record an AI-authored plan for a human to `rocky review <plan_id> --approve` and \
-             `rocky apply`. Never apply a draft directly.",
-            "default draft_model next_steps are byte-unchanged"
+             it is clean, `plan_preview` to read the SQL that renders offline, then `propose` \
+             to record an AI-authored plan for a human to `rocky review <plan_id> --approve` \
+             and `rocky apply`. The preview is not the whole plan: a model it cannot render \
+             offline is skipped and is not named, so a draft that succeeded here and is \
+             missing from the preview is unrenderable offline, not absent from the project. \
+             Never apply a draft directly.",
+            "default draft_model next_steps are pinned byte-for-byte"
         );
         assert_eq!(
             default_server.draft_check_next_steps(),
@@ -7275,15 +10271,50 @@ database = ":memory:"
             worker_server.draft_model_next_steps(),
             worker_server.draft_check_next_steps(),
         ] {
-            for excluded in WORKER_EXCLUDED_TOOL_MENTIONS {
-                assert!(
-                    !next_steps.contains(excluded),
-                    "worker next_steps must not name excluded tool `{excluded}`: {next_steps}"
-                );
-            }
+            assert_eq!(
+                names_excluded_tool(next_steps, &worker_excluded_tool_mentions()),
+                None,
+                "worker next_steps must not name an excluded tool in any form: {next_steps}"
+            );
             assert!(
                 next_steps.contains("hand-off to the trusted runner"),
                 "worker next_steps end at the runner hand-off: {next_steps}"
+            );
+        }
+
+        // FIFTEENTH ROUND, finding 1 — the `plan_preview` exactness claim
+        // on BOTH `draft_model` variants, which the round-fourteen sweep of
+        // the description, the two prompt bodies and the docs table did not
+        // reach.
+        //
+        // Pinned in BOTH directions and on BOTH profiles, for the reason
+        // this whole test exists: the two bodies are near-identical, and a
+        // one-sided edit is how round thirteen's `build_model` variants
+        // nearly slipped. The default variant's byte-pin above already
+        // catches its half; this catches the worker's, and it states WHICH
+        // property is being held rather than leaving it to a diff.
+        //
+        // The harm is specific to this surface. A dynamic-table draft
+        // SUCCEEDS, carries this text, and is then absent from the preview
+        // it names — `commands::plan_preview_output` passes no warehouse and
+        // skips what `sql_gen` cannot render, and `PlanPreviewResult` has no
+        // field that names a skipped model.
+        for (profile, next_steps) in [
+            (McpProfile::Default, default_server.draft_model_next_steps()),
+            (McpProfile::Worker, worker_server.draft_model_next_steps()),
+        ] {
+            assert!(
+                !next_steps.contains("SQL Rocky would run"),
+                "{profile:?}: `draft_model`'s next_steps call the preview the SQL Rocky WOULD \
+                 RUN; it renders offline and silently drops what it cannot render: \
+                 {next_steps}"
+            );
+            assert!(
+                next_steps.contains("skipped and is not named"),
+                "{profile:?}: `draft_model`'s next_steps must say a model the preview cannot \
+                 render offline is dropped WITHOUT being named — a draft can succeed here \
+                 and then be missing from the preview this text sends the agent to read: \
+                 {next_steps}"
             );
         }
     }
@@ -7404,5 +10435,69 @@ database = ":memory:"
             rocky_ai::client::DEFAULT_MAX_TOKENS + 7,
             "the CONFIGURED ceiling must survive an unset adapter credential"
         );
+    }
+
+    /// FF-WP-F3 — no worker-profile MCP route authors a declarative
+    /// check, and nothing worker-facing invites the worker to try.
+    ///
+    /// This is a SECURITY boundary, not tidiness. A `[[tests]]` block's
+    /// `expression` is raw-interpolated into `SELECT COUNT(*) FROM t WHERE
+    /// NOT (<expression>)`, and `rocky_core::tests` says in so many words
+    /// that the caller must sandbox execution. That contract held while the
+    /// only caller was a human typing `rocky test --declarative`. F3 made
+    /// the caller an unattended loop holding warehouse credentials, which
+    /// no sandbox backs — so a check served to an untrusted worker is SQL
+    /// the loop later executes after every apply.
+    ///
+    /// BE EXACT ABOUT THE SCOPE. This proves the MCP route is gone. It
+    /// does not prove a worker cannot author a check: the subprocess
+    /// driver runs an arbitrary command in the project root with no
+    /// filesystem confinement, and Phase B preserves a worker-added
+    /// `[[tests]]` block. A worker holding a file writer can still write
+    /// the sidecar — the conceded local-process boundary, tracked by
+    /// #1491 and #1515. The post-apply custody digest is what catches a
+    /// sidecar edited after the generation was verified.
+    ///
+    /// Asserted on the ROUTED surface rather than on the allowlist constant,
+    /// because the allowlist is an input to route removal and asserting it
+    /// against itself would prove nothing.
+    #[test]
+    fn the_worker_profile_neither_serves_draft_check_nor_names_it() {
+        let worker_tools = server_with(McpProfile::Worker).tool_names();
+        assert!(
+            !worker_tools.iter().any(|t| t == "draft_check"),
+            "no worker-profile route may serve check authorship (a file writer still \
+             can — #1491/#1515); served tools were {worker_tools:?}"
+        );
+        // Still served where the caller is an operator, not an untrusted
+        // worker — the fix narrows a profile, it does not delete a tool.
+        for profile in [McpProfile::Default, McpProfile::Approver] {
+            assert!(
+                server_with(profile)
+                    .tool_names()
+                    .iter()
+                    .any(|t| t == "draft_check"),
+                "{profile:?} keeps `draft_check`"
+            );
+        }
+
+        // And no worker-facing TEXT steers toward it. A tool that is absent
+        // from the listing but still named in the instructions or a prompt
+        // description is the drift the brief validator exists to catch, one
+        // layer earlier.
+        let info = server_with(McpProfile::Worker).get_info();
+        let instructions = info.instructions.unwrap_or_default();
+        assert!(
+            instructions.contains("draft_check"),
+            "the worker banner must NAME the tool as absent, so a worker reading \
+             the full authoring map knows where it stops"
+        );
+        for (name, description) in WORKER_PROMPT_DESCRIPTIONS {
+            assert!(
+                !description.contains("draft_check"),
+                "worker prompt `{name}` steers toward a tool this profile does not \
+                 serve: {description}"
+            );
+        }
     }
 }

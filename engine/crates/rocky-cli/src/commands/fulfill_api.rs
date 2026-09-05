@@ -40,6 +40,52 @@ pub use crate::commands::test::test_output;
 // runner's own loader so the counted set is the executed set.
 #[cfg(feature = "duckdb")]
 pub use crate::commands::test::declarative_test_count;
+// A digest over the EXPANDED check set — the vector the runner iterates,
+// after `[[use_test]]` references are resolved. Hashing the expansion
+// rather than the files it came from is what makes the custody check
+// cover `models/test_definitions.toml`, which is not a lowering artifact
+// and is hashed nowhere. This is the VERIFY-time entry: it pins a value
+// and nothing is about to run.
+#[cfg(feature = "duckdb")]
+pub use crate::commands::test::declarative_check_digest;
+// The digest's SCHEME predicate. A persisted digest is opaque, so the
+// loop cannot tell "the checks moved" from "this binary hashes a
+// different preimage than the build that pinned this" without asking.
+// The two need different remedies: the first is a restore, the second
+// no restore can ever fix, and reporting the second as the first is a
+// custody hold with an instruction that cannot resolve it.
+#[cfg(feature = "duckdb")]
+pub use crate::commands::test::{CHECK_SET_DIGEST_SCHEME, check_set_digest_scheme_is_current};
+// The OBSERVATION-time entry: one owned, digested snapshot of the check
+// set, with the warehouse it runs against already bound. The custody
+// gate compares `digest()` and then hands this same handle to
+// `observe_declarative_checks`, which consumes it — so the set that was
+// compared is the set that runs, against the warehouse the handle
+// already holds.
+//
+// THE ORDER, as it actually is. `bind` digests the check set FIRST and
+// resolves the adapter SECOND. So the warehouse is NOT "resolved before
+// the digest existed" — this comment said that and had the two lines of
+// `LoadedCheckSet::bind` in the wrong order. What holds is EXPOSURE
+// order, which is the property the reroute argument needs anyway: `bind`
+// is the only constructor and returns both halves or neither, so no
+// caller can read `digest()` from a handle whose warehouse is still
+// unresolved, and `run(self)` takes no config path to resolve a
+// different one.
+//
+// It is also NOT "no second read of the filesystem in between", which
+// this comment also claimed — flatly contradicting `LoadedCheckSet`'s
+// own type doc one crate over, which disowns that exact sentence by
+// name. `resolve_warehouse_adapter` reads `rocky.toml` AFTER the digest
+// is computed, and the bound adapter keeps reading files while it runs
+// (Snowflake key-pair auth re-reads its PEM inside per-request
+// `get_token`). The guarantee is caller substitution, not filesystem
+// quiescence.
+//
+// `BindFailure` keeps a config problem from being reported as a custody
+// divergence, whose remedy would not fix it.
+#[cfg(feature = "duckdb")]
+pub use crate::commands::test::{BindFailure, LoadedCheckSet};
 // The loop's stop report (registered in export-schemas as `fulfill`),
 // and the one JSON printer, so the loop's whole rocky-cli surface stays
 // this module.
@@ -774,6 +820,131 @@ pub async fn observe_max_time_column(
     })
 }
 
+/// One declared check that did not pass, as the loop may quote it.
+///
+/// Deliberately NARROWER than the CLI's `DeclarativeTestResult`: it drops
+/// the generated `sql`. That SQL is built from sidecar `[[tests]]`, which
+/// a worker holding a file writer can still append — `draft_check` left
+/// the worker MCP profile, but nothing confines the worker's filesystem
+/// (#1491) — and the loop's next move on a red observation is to hand
+/// this evidence to a worker as a task brief.
+/// Brief validation runs on the TEMPLATE, before substitution, so
+/// anything interpolated is unvalidated text — keeping worker-authored
+/// SQL out of the type means it cannot reach a brief by accident. The
+/// `detail` strings the runner produces are counts and bounds
+/// (`"3 NULL row(s) found"`, `"row count 0 outside range [1, +inf)"`),
+/// never warehouse cell values, so the evidence stays useful without
+/// carrying data.
+#[cfg(feature = "duckdb")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedCheck {
+    /// The model the check belongs to.
+    pub model: String,
+    /// The column under test, when the check names one.
+    pub column: Option<String>,
+    /// The check type (`not_null`, `unique`, `row_count_range`, ...).
+    pub test_type: String,
+    /// `"fail"` or `"error"` (passes are not carried).
+    pub status: String,
+    /// The declared severity, `"error"` or `"warning"`.
+    pub severity: String,
+    /// What the check actually measured.
+    pub detail: Option<String>,
+}
+
+/// The post-apply reading of a product's declared data checks.
+#[cfg(feature = "duckdb")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedChecks {
+    /// Checks the model loader expanded for this model.
+    pub declared: usize,
+    /// Checks that actually executed.
+    pub executed: usize,
+    /// Checks that passed.
+    pub passed: usize,
+    /// Checks that failed at `severity = "error"`.
+    pub failed: usize,
+    /// Checks that failed at `severity = "warning"`.
+    pub warned: usize,
+    /// Checks whose execution errored — no verdict on the data.
+    pub errored: usize,
+    /// Declared checks that produced no result at all.
+    pub unevaluated: usize,
+    /// The non-passing checks, for the human and the repair brief.
+    pub findings: Vec<ObservedCheck>,
+}
+
+/// Run the product's declared data checks against the MATERIALISED
+/// output, after apply.
+///
+/// Invariant guarded: this is the same execution path `rocky test
+/// --declarative` takes — one shared typed core
+/// ([`crate::commands::test::execute_declarative`], which
+/// `declarative_run` also calls), not a second check engine. The set
+/// executed is the set the model loader expands, which is the set
+/// [`declarative_test_count`] reports as deferred at verify: both go
+/// through the runner's OWN loader, so "N deferred" at verify and "N
+/// evaluated" at observation are the same predicate rather than two
+/// re-derivations that have to be kept in step by hand.
+///
+/// Be exact about how far that goes. It is one LOADER, not one read.
+/// The verify-time count, the verify-time digest, and this execution
+/// are three separate reads at three separate times, and files can
+/// change between them. What ties the set that RUNS to the set that
+/// was APPROVED is the digest comparison the caller makes against this
+/// handle — not the shared loader. The shared loader only guarantees
+/// the two numbers mean the same thing about an unchanged directory.
+///
+/// Invariant guarded, second: what runs is the snapshot the caller
+/// already digested, against the warehouse that snapshot was bound to.
+/// `checks` is the ONLY parameter, and it is an OWNED
+/// [`LoadedCheckSet`] consumed here. There is no path, so there is no
+/// file to read: the models, the target, and the adapter were all fixed
+/// before `digest()` could be called, and a rewrite of any of them
+/// after the comparison has no window. This function cannot be pointed
+/// at a different model, a different table, or a different warehouse
+/// than the ones whose digest was compared.
+///
+/// Scoped to one model — the product's output model. A product is
+/// answerable for what it declared about its own output, not for the rest
+/// of the project.
+#[cfg(feature = "duckdb")]
+pub async fn observe_declarative_checks(checks: LoadedCheckSet) -> Result<ObservedChecks> {
+    let run = checks.run().await?;
+    let (declared, passed, failed, warned, errored, unevaluated) = (
+        run.declared,
+        run.passed(),
+        run.failed(),
+        run.warned(),
+        run.errored(),
+        run.unevaluated(),
+    );
+    let executed = run.results.len();
+    let findings = run
+        .results
+        .into_iter()
+        .filter(|r| r.status != "pass")
+        .map(|r| ObservedCheck {
+            model: r.model,
+            column: r.column,
+            test_type: r.test_type,
+            status: r.status,
+            severity: r.severity,
+            detail: r.detail,
+        })
+        .collect();
+    Ok(ObservedChecks {
+        declared,
+        executed,
+        passed,
+        failed,
+        warned,
+        errored,
+        unevaluated,
+        findings,
+    })
+}
+
 /// The adapter a pipeline's target names.
 fn pipeline_target_adapter(pipeline: &rocky_core::config::PipelineConfig) -> String {
     use rocky_core::config::PipelineConfig;
@@ -867,6 +1038,68 @@ pub fn product_approve(
 
 /// Re-exported so the loop's capability classification and gate share
 /// the exact types the plan store persists.
+/// What a plan says about the warehouse it was authorised to write.
+///
+/// Four outcomes, because collapsing them to `Option<String>` makes two
+/// different facts look identical and prints a remedy that cannot work
+/// for one of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanRouting {
+    /// The plan authorised this routing identity.
+    Identity(String),
+    /// A genuinely-legacy plan: `fingerprint_version == 0`, written
+    /// before routing identities existed.
+    ///
+    /// APPLY EXEMPTS THESE — `verify_routing_identity`'s `None =>
+    /// Ok(())` arm, reached when `require_fingerprint` is false. So
+    /// observation exempts them too. Holding here would strand a
+    /// product behind a gate the apply it is observing did not apply,
+    /// with a remedy (restore the routing) that cannot create evidence
+    /// the plan never carried.
+    LegacyExempt,
+    /// The plan requires an identity and carries none. Apply refuses
+    /// this; so does observation.
+    MissingButRequired,
+    /// The plan could not be read at all. Distinct from "carries no
+    /// identity", because the remedy is different and the message must
+    /// not claim to know what the plan recorded.
+    Unreadable(String),
+}
+
+/// Read what plan `plan_id` authorised.
+///
+/// Mirrors apply's own rule rather than inventing a second one: the
+/// legacy exemption here is the same `fingerprint_version >= 1` test
+/// apply uses to decide whether a missing identity is tolerable.
+pub fn plan_routing(root: &std::path::Path, plan_id: &str) -> PlanRouting {
+    let plan = match crate::plan_store::read_plan(root, plan_id) {
+        Ok(plan) => plan,
+        Err(err) => return PlanRouting::Unreadable(format!("{err:#}")),
+    };
+    let embedded = plan.embedded_capabilities();
+    match embedded.config_identity {
+        Some(identity) => PlanRouting::Identity(identity),
+        // The SAME threshold apply uses (`require_fingerprint =
+        // fingerprint_version >= 1`). Deliberately `>= 1`, not
+        // `>= CURRENT`: gating on CURRENT would silently re-exempt v1
+        // plans as the version advances.
+        None if embedded.fingerprint_version >= 1 => PlanRouting::MissingButRequired,
+        None => PlanRouting::LegacyExempt,
+    }
+}
+
+/// The routing identity of the config at `config_path`, right now.
+///
+/// For the EARLY refusal only — the one that keeps a wrong-warehouse
+/// query from happening. The authoritative comparison is against
+/// `LoadedCheckSet::routing_identity()`, which comes from the same load
+/// that produced the adapter that will execute.
+pub fn current_routing_identity(config_path: &std::path::Path) -> anyhow::Result<String> {
+    let cfg = rocky_core::config::load_rocky_config(config_path)
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    Ok(super::apply::config_policy_identity(&cfg))
+}
+
 pub use crate::plan_store::EmbeddedCapabilities as ProposeCapabilities;
 
 #[cfg(test)]
@@ -1117,5 +1350,345 @@ mod tests {
                 "{err:#}"
             );
         });
+    }
+
+    /// THE TOCTOU PIN: the checks that RUN are the checks that were
+    /// DIGESTED, even when the files change in between.
+    ///
+    /// The custody gate reads a digest, compares it with the value this
+    /// generation pinned at verify, and only then executes. If the
+    /// digest came from one read of the models directory and the
+    /// execution from a second, the comparison says nothing about what
+    /// ran: a rewrite landing between them passes the gate and the loop
+    /// executes SQL nobody approved. That shape reaches none of the
+    /// gate's refusal arms — they all fire on a digest that MISMATCHES,
+    /// and this one matches.
+    ///
+    /// So the fixture rewrites the sidecar after the load, and the
+    /// rewrite is built to flip the VERDICT, not just a count: the
+    /// digested set holds one check that passes, and the set on disk
+    /// holds two more that fail. A second read would report failures.
+    /// The owned snapshot reports the pass it was digested with.
+    #[test]
+    fn the_checks_that_run_are_the_snapshot_that_was_digested() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let config = config_with_state(root, "");
+        let models = root.join("models");
+        write_file(
+            &models.join("orders.sql"),
+            b"SELECT 1 AS id, NULL AS status\n",
+        );
+        // The APPROVED set: one check, and it passes against the seeded
+        // table below.
+        let approved = b"name = \"orders\"\n\n\
+             [target]\ncatalog = \"wh\"\nschema = \"out\"\ntable = \"orders\"\n\n\
+             [[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n";
+        write_file(&models.join("orders.toml"), approved);
+
+        let cfg = rocky_core::config::load_rocky_config(&config).expect("config");
+        let registry = crate::registry::AdapterRegistry::from_config(&cfg).expect("registry");
+        let warehouse = registry.warehouse_adapter("default").expect("adapter");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            for statement in [
+                "CREATE SCHEMA IF NOT EXISTS out",
+                "CREATE TABLE out.orders (id BIGINT, status VARCHAR)",
+                "INSERT INTO out.orders VALUES (1, NULL), (2, NULL)",
+            ] {
+                warehouse.execute_query(statement).await.expect(statement);
+            }
+
+            // 1. Load and digest — the custody comparison's input.
+            let loaded = LoadedCheckSet::bind(&models, "orders", &config, None).expect("binds");
+            let digested = loaded.digest().to_string();
+
+            // 2. The rewrite the gate must not be fooled by. `status` is
+            //    NULL in every row and the table holds 2 rows, so both
+            //    added checks FAIL.
+            write_file(
+                &models.join("orders.toml"),
+                b"name = \"orders\"\n\n\
+                  [target]\ncatalog = \"wh\"\nschema = \"out\"\ntable = \"orders\"\n\n\
+                  [[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n\n\
+                  [[tests]]\ntype = \"not_null\"\ncolumn = \"status\"\n\n\
+                  [[tests]]\ntype = \"row_count_range\"\nmin = 99\n",
+            );
+            // The fixture must actually exhibit the condition: a FRESH
+            // load now digests differently, so a second read really
+            // would run a different set.
+            let after = LoadedCheckSet::bind(&models, "orders", &config, None).expect("binds");
+            assert_ne!(
+                digested,
+                after.digest(),
+                "the rewrite must change what a re-load would execute, or this proves nothing"
+            );
+            drop(after);
+
+            // 3. Execute the handle from step 1.
+            let observed = observe_declarative_checks(loaded).await.expect("observes");
+            assert_eq!(
+                observed.declared, 1,
+                "the declared count is the digested snapshot's, not the file's: {observed:?}"
+            );
+            assert_eq!(
+                observed.executed, 1,
+                "exactly the digested check ran: {observed:?}"
+            );
+            assert_eq!(
+                observed.passed, 1,
+                "and it is the passing one: {observed:?}"
+            );
+            assert_eq!(
+                observed.failed, 0,
+                "a re-read would have run the two failing checks written after the digest: \
+                 {observed:?}"
+            );
+            assert!(
+                observed.findings.is_empty(),
+                "no finding can come from a check the digest never covered: {observed:?}"
+            );
+        });
+    }
+
+    /// THE TARGET PIN: the digest covers WHERE the checks run, not just
+    /// WHAT runs.
+    ///
+    /// The sidecar's bytes are verified against the committed lowering
+    /// manifest at `product_status`, which happens BEFORE the check set
+    /// is loaded. A rewrite that lands in that window and touches only
+    /// `[target]` used to be invisible: the digest hashed
+    /// `ModelConfig.tests` alone, so it matched, the custody gate went
+    /// green, and the approved query ran against a different table.
+    ///
+    /// The fixture proves both halves. The digests must DIFFER, so the
+    /// gate refuses — and the two tables must give DIFFERENT verdicts,
+    /// so that refusal is load-bearing rather than pedantry.
+    #[test]
+    fn a_target_only_rewrite_moves_the_check_digest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let config = config_with_state(root, "");
+        let models = root.join("models");
+        write_file(&models.join("orders.sql"), b"SELECT 1 AS id\n");
+        let sidecar = |table: &str| {
+            format!(
+                "name = \"orders\"\n\n\
+                 [target]\ncatalog = \"wh\"\nschema = \"out\"\ntable = \"{table}\"\n\n\
+                 [[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n"
+            )
+        };
+        write_file(&models.join("orders.toml"), sidecar("orders").as_bytes());
+
+        let cfg = rocky_core::config::load_rocky_config(&config).expect("config");
+        let registry = crate::registry::AdapterRegistry::from_config(&cfg).expect("registry");
+        let warehouse = registry.warehouse_adapter("default").expect("adapter");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            for statement in [
+                "CREATE SCHEMA IF NOT EXISTS out",
+                // The APPROVED table: the check passes here.
+                "CREATE TABLE out.orders (id BIGINT)",
+                "INSERT INTO out.orders VALUES (1), (2)",
+                // The SWAPPED table: the same check fails here.
+                "CREATE TABLE out.orders_elsewhere (id BIGINT)",
+                "INSERT INTO out.orders_elsewhere VALUES (NULL), (2)",
+            ] {
+                warehouse.execute_query(statement).await.expect(statement);
+            }
+            drop(warehouse);
+
+            // The verify-time pin, taken against the approved target.
+            let verified = declarative_check_digest(&models, "orders").expect("digest");
+
+            // The rewrite: `[[tests]]` byte-identical, `[target]` moved.
+            write_file(
+                &models.join("orders.toml"),
+                sidecar("orders_elsewhere").as_bytes(),
+            );
+
+            // Half one — the gate can SEE it.
+            let moved = LoadedCheckSet::bind(&models, "orders", &config, None).expect("binds");
+            assert_ne!(
+                verified,
+                moved.digest(),
+                "a target-only rewrite must move the digest, or the custody gate cannot see it"
+            );
+
+            // Half two — seeing it MATTERS. The same declared check
+            // gives the opposite verdict against the swapped table, so a
+            // digest that still matched would have blessed an answer
+            // about the wrong data.
+            let observed = observe_declarative_checks(moved).await.expect("observes");
+            assert_eq!(
+                observed.failed, 1,
+                "the swapped target must flip the verdict, or the digest change proves \
+                 nothing: {observed:?}"
+            );
+        });
+    }
+
+    /// THE WAREHOUSE PIN: the adapter is resolved BEFORE the digest is
+    /// exposed, so a `rocky.toml` rewrite after the custody comparison
+    /// cannot reroute the approved query.
+    ///
+    /// `rocky.toml` is deliberately NOT in the digest — it is
+    /// operator-owned infrastructure, and hashing it raw would turn
+    /// every credential rotation into a custody hold whose printed
+    /// remedy (a restore) is not what the operator wants. Binding is
+    /// the answer instead: `LoadedCheckSet::bind` resolves the adapter,
+    /// and `run(self)` takes no config path and consumes the handle, so
+    /// no caller can hand it a warehouse resolved from a different
+    /// config.
+    ///
+    /// Precisely that, and no more. It is not a claim that nothing
+    /// reads a file after the bind — the bound adapter reads its own
+    /// (Snowflake key-pair auth reads its PEM inside per-request
+    /// `get_token`). What is closed is CALLER SUBSTITUTION of the
+    /// warehouse, which is what this test drives.
+    ///
+    /// The fixture exhibits the condition it claims: after the rewrite,
+    /// a FRESH bind against the same config really does reach a
+    /// different warehouse and really does reach the opposite verdict.
+    #[test]
+    fn the_warehouse_is_bound_before_the_digest_is_exposed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let models = root.join("models");
+        write_file(&models.join("orders.sql"), b"SELECT 1 AS id\n");
+        write_file(
+            &models.join("orders.toml"),
+            b"name = \"orders\"\n\n\
+              [target]\ncatalog = \"wh\"\nschema = \"out\"\ntable = \"orders\"\n\n\
+              [[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n",
+        );
+
+        // Two warehouses, one config file. The approved one holds data
+        // the check passes on; the other holds data it fails on.
+        let config = root.join("rocky.toml");
+        let write_config = |db: &std::path::Path| {
+            write_file(
+                &config,
+                format!(
+                    "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n[pipeline.p]\n\
+                     type = \"transformation\"\nmodels = \"models/**\"\n\n\
+                     [pipeline.p.target.governance]\nauto_create_schemas = true\n",
+                    db.display()
+                )
+                .as_bytes(),
+            );
+        };
+        // Same file STEM in two directories: DuckDB names the catalog
+        // after the stem, and the sidecar's target says `wh`.
+        let approved_db = root.join("approved").join("wh.duckdb");
+        let other_db = root.join("other").join("wh.duckdb");
+        for db in [&approved_db, &other_db] {
+            std::fs::create_dir_all(db.parent().expect("has a parent")).expect("create db dir");
+        }
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            for (db, rows) in [(&approved_db, "(1), (2)"), (&other_db, "(NULL), (2)")] {
+                write_config(db);
+                let cfg = rocky_core::config::load_rocky_config(&config).expect("config");
+                let registry =
+                    crate::registry::AdapterRegistry::from_config(&cfg).expect("registry");
+                let warehouse = registry.warehouse_adapter("default").expect("adapter");
+                for statement in [
+                    "CREATE SCHEMA IF NOT EXISTS out".to_string(),
+                    "CREATE TABLE out.orders (id BIGINT)".to_string(),
+                    format!("INSERT INTO out.orders VALUES {rows}"),
+                ] {
+                    warehouse.execute_query(&statement).await.expect("seeds");
+                }
+                drop(warehouse);
+            }
+
+            // 1. Bind against the APPROVED warehouse.
+            write_config(&approved_db);
+            let bound = LoadedCheckSet::bind(&models, "orders", &config, None).expect("binds");
+            let digested = bound.digest().to_string();
+
+            // 2. Reroute the config. Not one byte under `models/`
+            //    changed, so the digest is untouched — this is exactly
+            //    the rewrite a digest comparison cannot see.
+            write_config(&other_db);
+            let rerouted = LoadedCheckSet::bind(&models, "orders", &config, None).expect("binds");
+            assert_eq!(
+                digested,
+                rerouted.digest(),
+                "the config is not part of the digest, so this rewrite must NOT move it — \
+                 hashing rocky.toml would make a credential rotation a custody hold"
+            );
+
+            // 3. And the reroute really would flip the verdict: a fresh
+            //    bind reaches the other warehouse and fails.
+            let elsewhere = observe_declarative_checks(rerouted)
+                .await
+                .expect("observes");
+            assert_eq!(
+                elsewhere.failed, 1,
+                "the fixture must exhibit the condition — the rewritten config has to reach \
+                 a warehouse that answers differently: {elsewhere:?}"
+            );
+
+            // 4. The handle from step 1 still runs where it was bound.
+            let observed = observe_declarative_checks(bound).await.expect("observes");
+            assert_eq!(
+                observed.passed, 1,
+                "the bound warehouse is the approved one: {observed:?}"
+            );
+            assert_eq!(
+                observed.failed, 0,
+                "re-resolving the adapter at run time would have run the approved query \
+                 against the rerouted warehouse: {observed:?}"
+            );
+        });
+    }
+
+    /// A config problem is NOT a custody divergence. `bind` says which
+    /// of the two failed, because the two have different remedies and
+    /// `step.rs` prints them differently — the custody remedy tells an
+    /// operator to restore a file and then edit the product spec, which
+    /// fixes nothing about an unloadable `rocky.toml`.
+    #[test]
+    fn bind_separates_a_bad_check_set_from_a_bad_warehouse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let config = config_with_state(root, "");
+        let models = root.join("models");
+        write_file(&models.join("orders.sql"), b"SELECT 1 AS id\n");
+        write_file(
+            &models.join("orders.toml"),
+            b"name = \"orders\"\n\n\
+              [target]\ncatalog = \"wh\"\nschema = \"out\"\ntable = \"orders\"\n\n\
+              [[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n",
+        );
+
+        // `LoadedCheckSet` holds a live adapter and is not `Debug`, so
+        // the classifier reports the arm rather than the handle.
+        let classify = |outcome: std::result::Result<LoadedCheckSet, BindFailure>| match outcome {
+            Ok(_) => "bound".to_string(),
+            Err(BindFailure::CheckSet(why)) => format!("check-set: {why:#}"),
+            Err(BindFailure::Warehouse(why)) => format!("warehouse: {why:#}"),
+        };
+
+        // A model the project does not hold: the CHECK SET is the
+        // problem, and the config is fine.
+        let unknown = classify(LoadedCheckSet::bind(&models, "not_a_model", &config, None));
+        assert!(
+            unknown.starts_with("check-set:"),
+            "an unknown model is a check-set failure, not a warehouse one: {unknown}"
+        );
+
+        // A config that does not parse: the WAREHOUSE is the problem,
+        // and the check set is fine.
+        write_file(&config, b"this is not toml\n");
+        let broken = classify(LoadedCheckSet::bind(&models, "orders", &config, None));
+        assert!(
+            broken.starts_with("warehouse:"),
+            "an unloadable config is a warehouse failure — reporting it as custody would \
+             print a remedy that cannot fix it: {broken}"
+        );
     }
 }

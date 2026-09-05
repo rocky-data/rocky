@@ -264,7 +264,11 @@ You write one spec file. `products/<name>.toml` states what the product must be:
 
 `rocky fulfill` runs the drafting agent through the driver you set in `[fulfill.driver]`. There are two. The subprocess driver runs a command you choose: the worker sees only the environment variables you allowlist, and the whole task runs in one process group the loop kills when the task ends. The replay driver runs a recorded session against the worker-profile MCP server instead, which is what CI uses.
 
-Rocky ships a narrowed MCP surface for that worker. `rocky mcp --profile worker` serves the read and inspect tools, the compile and test loop, and two draft tools. It serves no other tools, and a tool added later stays out until someone adds it deliberately. The MCP prompts stay available in every profile. Point your driver command at it. The engine does not force the command you configure to use it.
+Rocky ships a narrowed MCP surface for that worker. `rocky mcp --profile worker` serves the read and inspect tools, the compile and test loop, and one draft tool: `draft_model`. It serves no other tools, and a tool added later stays out until someone adds it deliberately. The MCP prompts stay available in every profile. Point your driver command at it. The engine does not force the command you configure to use it.
+
+The worker cannot write a data check through that server. Be exact about what that buys you: it closes the tool route, and nothing more. The worker runs as a normal process in your project directory, so a worker that can write files can still write a check into a sidecar.
+
+The loop does compare the checks it is about to run with the set the plan was verified against, and refuses to run a set that does not match. That catches a change made after verification. It does not catch a check that was already there when the plan was verified — that one is inside the verified set and runs like any other. Verified is not approved: the loop pins that set itself, and nothing shows it to you or asks you to sign it off. Read the model's sidecar if you want to know what will run.
 
 The runner then re-reads what the agent wrote from disk, re-verifies it, and hands it to the same governed `propose` as any other agent change.
 

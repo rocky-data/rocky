@@ -392,10 +392,123 @@ JROWS=$(jq -r '.journal_rows' expected/10_status.json)
 [ "${JROWS:-0}" -ge 10 ] || fail "10 (journal has only $JROWS rows; the loop did not record its history)"
 echo "    OK  fresh lag ${FRESH_LAG}s < ${FRESH_BUD}s; stale lag ${STALE_LAG}s > ${STALE_BUD}s; journal=$JROWS rows"
 
+# ------------------------------------------------------------------ Assert 11
+# DATA-RED (F3). The checks a product declares about its OUTPUT cannot run at
+# verify — the table does not exist yet — so they are reported deferred there
+# and first evaluated after apply. A violated one is the failure class a data
+# product exists to prevent: it compiles, it applies, and the number is wrong.
+#
+# Injecting a duplicate (client_id, day) into the MATERIALISED output is the
+# same violation mutation 9 uses, so the check is known to be real and known to
+# be severity=error. What assert 11 adds is where it ROUTES: the loop must
+# record it in a state that is not a healthy `observing`, confirm it on a fresh
+# reading, spend one repair round, and come back through a NEW human review —
+# never re-applying on the strength of the approval the failing plan already had.
+echo; echo "[11] data-red: a violated declared check routes into a repair round behind a NEW human gate"
+# MUTATION 11: skip the injection -> every declared check passes, the loop stays
+# `observing`, and the whole data-red branch never runs.
+mut 11 || duckdb wh.duckdb "INSERT INTO out.${PRODUCT} SELECT * FROM out.${PRODUCT} ORDER BY client_id, day LIMIT 1" >/dev/null 2>&1 || fail "11 (could not inject the duplicate row)"
+
+# (a) The FIRST reading records the red in a visibly distinct state, names what
+# the check measured, and stops. Exit 4 is its own code: a caller scripting the
+# loop must not read "the live output is wrong" as a clean stop.
+code=$(rj expected/11_red.json fulfill "$PRODUCT")
+[ "$code" = "4" ] || fail "11 (a data-red must exit 4, got $code; $(cat expected/11_red.err))"
+STATE11="$(jq -r .state expected/11_red.json)"
+[ "$STATE11" = "observed_failing" ] || fail "11 (state $STATE11 after a violated declared check, want observed_failing)"
+[ "$STATE11" != "observing" ] || fail "11 (a failing output must never be recorded as a healthy one)"
+jq -e '.message | test("failing its own declared data checks")' expected/11_red.json >/dev/null \
+  || fail "11 (the stop does not say the applied output is failing its own checks)"
+jq -e '.message | test("duplicate")' expected/11_red.json >/dev/null \
+  || fail "11 (the stop does not report what the check actually measured)"
+
+# (b) A SECOND, independent reading confirms it and spends ONE repair round,
+# which converges and lands a NEW proposal parked at the human gate.
+code=$(rj expected/11_repair.json fulfill "$PRODUCT")
+[ "$code" = "0" ] || fail "11 (the data-repair round exit $code; $(cat expected/11_repair.err))"
+STATE11B="$(jq -r .state expected/11_repair.json)"
+[ "$STATE11B" = "needs_input" ] || fail "11 (state $STATE11B after the repair round, want needs_input(plan_approval))"
+PLAN3="$(jq -r '.plan_id // empty' expected/11_repair.json)"
+[ -n "$PLAN3" ] || fail "11 (the repair round produced no new plan)"
+# THE condition the forward-only posture rests on: a repair must not be able to
+# recompute the id of a plan a human already approved, or the stale sign-off
+# marker would wave the re-apply through with no fresh review.
+[ "$PLAN3" != "$PLAN2" ] || fail "11 (the repair reused the applied plan id — it would inherit that plan's approval marker)"
+
+# (c) The earlier approval buys the repaired plan nothing: a bare apply refuses.
+( rocky apply "$PLAN3" >expected/11_bare.out 2>expected/11_bare.err ); bare3=$?
+[ "$bare3" != "0" ] || fail "11 (bare apply of the repaired plan must refuse — a data-red grants the loop no authority it lacked)"
+
+# (d) A FRESH human approval lets it apply. The rebuild drops the injected row,
+# so the next reading is clean and the loop returns to `observing`.
+# MUTATION 11h: skip the fresh review -> no sign-off marker for the NEW plan, so
+# the loop cannot leave needs_input(plan_approval) and never returns to observing.
+if mut 11h; then
+  echo "    (mutation 11h: skipping the fresh rocky review --approve)"
+else
+  code=$(rj expected/11_review.json review "$PLAN3" --approve)
+  [ "$code" = "0" ] || fail "11 (review --approve of the repaired plan exit $code; $(cat expected/11_review.err))"
+fi
+code=$(rj expected/11_clean.json fulfill "$PRODUCT")
+[ "$code" = "0" ] || fail "11 (the repaired apply exit $code; $(cat expected/11_clean.err))"
+STATE11C="$(jq -r .state expected/11_clean.json)"
+[ "$STATE11C" = "observing" ] || fail "11 (state $STATE11C after the repaired apply, want observing)"
+DUPES="$(duckdb -csv -noheader wh.duckdb "SELECT COUNT(*) FROM (SELECT client_id, day FROM out.${PRODUCT} GROUP BY client_id, day HAVING COUNT(*) > 1)" 2>/dev/null)"
+[ "${DUPES:-1}" = "0" ] || fail "11 (the repaired apply left ${DUPES} duplicate grain key(s) — the loop reported observing over data that still violates the check)"
+echo "    OK  red -> observed_failing (exit 4) -> repair round -> NEW plan $PLAN3 (!= $PLAN2), bare apply refused, fresh review -> observing"
+
+
+# ----------------------------------------------------------------- Assert 12
+# ROUTING CUSTODY. The product is applied and healthy. Re-point `rocky.toml`
+# at a DIFFERENT warehouse and the declared checks must NOT run.
+#
+# The warehouse we re-point to is a COPY of the real one, so every declared
+# check would PASS there. That is the whole point: without the gate the loop
+# reports health, and the health is about a table this generation never wrote.
+# A green reading is the failure mode, not a red one.
+echo; echo "[12] routing custody: a post-apply re-route holds instead of certifying another warehouse"
+cp wh.duckdb wh_elsewhere.duckdb || fail "12 (could not copy the warehouse)"
+cp rocky.toml rocky.toml.orig || fail "12 (could not save the config)"
+# MUTATION 12: skip the re-route -> the config still names the applied
+# warehouse, the gate has nothing to catch, and the loop reads clean.
+mut 12 || sed -i.bak 's|^path = "wh.duckdb"$|path = "wh_elsewhere.duckdb"|' rocky.toml \
+  || fail "12 (could not re-route the config)"
+
+code=$(rj expected/12_routing.json fulfill "$PRODUCT")
+STATE12="$(jq -r .state expected/12_routing.json)"
+[ "$STATE12" != "observing" ] \
+  || fail "12 (the loop reported observing after a re-route — it certified a warehouse this generation never wrote to)"
+jq -e '.message | test("is not the (configuration|one this generation applied under)")' expected/12_routing.json >/dev/null \
+  || fail "12 (the stop does not name the routing divergence; got: $(jq -r .message expected/12_routing.json | head -c 200))"
+# BOTH causes, because the compared value is env-resolved and the two are
+# indistinguishable in it. Naming only the edit strands an operator who
+# changed no file.
+jq -e '.message | test("the config was edited")' expected/12_routing.json >/dev/null \
+  || fail "12 (the remedy does not name an edit as a cause)"
+jq -e '.message | test("resolved to a different value")' expected/12_routing.json >/dev/null \
+  || fail "12 (the remedy does not name an environment-resolved field as the other cause)"
+# And it must NOT borrow the custody wording — no sidecar changed here.
+jq -e '.message | contains("restore the file you changed") | not' expected/12_routing.json >/dev/null \
+  || fail "12 (the routing hold borrowed the check-set custody remedy — it would send the operator after a sidecar nobody touched)"
+
+# The hold CLEARS by restoring the routing. A gate whose remedy does not work
+# is a product stranded by its own guard.
+mv rocky.toml.orig rocky.toml || fail "12 (could not restore the config)"
+rm -f rocky.toml.bak wh_elsewhere.duckdb
+code=$(rj expected/12_cleared.json fulfill "$PRODUCT")
+STATE12B="$(jq -r .state expected/12_cleared.json)"
+[ "$STATE12B" = "observing" ] \
+  || fail "12 (restoring the routing did not clear the hold — state $STATE12B, want observing)"
+echo "    OK  re-route -> hold (state $STATE12, both causes named) -> restore -> observing"
+
+
+
 echo
 echo "=================================================================="
 echo "POC complete: spec -> lowering -> red draft -> REPAIR -> propose -> human"
-echo "gate -> digest-gated apply, with 6 refusal paths exercised (negatives,"
-echo "policy, supersession, backstop, staleness)."
+echo "gate -> digest-gated apply -> observation, including a post-apply DATA-RED"
+echo "routed back through repair and a SECOND human review, with 7 refusal paths"
+echo "exercised (negatives, policy, supersession, backstop, staleness, bare apply"
+echo "of the repaired plan)."
 echo "This is the MACHINERY proof (replay driver). run-live.sh is the capability proof."
 echo "=================================================================="

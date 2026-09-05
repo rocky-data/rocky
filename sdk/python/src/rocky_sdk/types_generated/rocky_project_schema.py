@@ -2190,7 +2190,7 @@ class FulfillConfig(BaseModel):
     )
     briefs_dir: str | None = None
     """
-    Directory of brief overrides (`elicitation.md`, `drafting.md`, `repair.md`). A file present there replaces the compiled default of the same name; absent files fall back. Must be a plain RELATIVE path inside the project — the loop resolves it through the staged commit's containment primitive, so an absolute path, a `..` traversal, or a symlinked-ancestor escape is refused, and every loaded brief is validated before any dispatch: an override may not name ANY tool outside the worker profile (nor the word `apply`), with no quoting exception — the compiled defaults carry the sanctioned prohibition wording.
+    Directory of brief overrides (`elicitation.md`, `drafting.md`, `repair.md`, `data-repair.md`). A file present there replaces the compiled default of the same name; absent files fall back. Must be a plain RELATIVE path inside the project — the loop resolves it through the staged commit's containment primitive, so an absolute path, a `..` traversal, or a symlinked-ancestor escape is refused, and every loaded brief is validated before any dispatch: an override may not name ANY tool outside the worker profile (nor the word `apply`), with no quoting exception — the compiled defaults carry the sanctioned prohibition wording.
     """
     driver: FulfillDriverConfig1 | FulfillDriverConfig2 | None = None
     """

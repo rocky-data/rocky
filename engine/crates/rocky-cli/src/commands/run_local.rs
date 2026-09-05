@@ -1020,22 +1020,11 @@ async fn count_rows(
 }
 
 /// Count failed checks bucketed by severity across every table result.
+///
+/// One implementation, shared with the replication check gate (#1598), so the
+/// two runners can never disagree about which failures are error-severity.
 fn count_failures_by_severity(output: &RunOutput) -> (usize, usize) {
-    use rocky_core::tests::TestSeverity;
-    let mut error = 0usize;
-    let mut warning = 0usize;
-    for t in &output.check_results {
-        for c in &t.checks {
-            if c.passed {
-                continue;
-            }
-            match c.severity {
-                TestSeverity::Error => error += 1,
-                TestSeverity::Warning => warning += 1,
-            }
-        }
-    }
-    (error, warning)
+    output.check_failures_by_severity()
 }
 
 /// Execute `rocky run` for a snapshot (SCD Type 2) pipeline.
