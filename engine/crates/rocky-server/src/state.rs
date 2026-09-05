@@ -69,6 +69,9 @@ pub struct ServerState {
     /// answers `404` — a webhook can only be consumed by a resident reconciler,
     /// so ingress without one is disabled.
     pub webhook: Option<crate::webhook_ingress::WebhookIngress>,
+    /// The browser UI (`rocky serve --ui`): its files, the `Host` values it
+    /// accepts. `None` means no UI routes and no host guard.
+    pub ui: Option<crate::ui::UiConfig>,
     /// Per-session throttle for the "N sources hit" info log so it
     /// emits once per server start, not once per recompile. Keyed on
     /// `models_dir`, which stays constant.
@@ -120,6 +123,7 @@ impl ServerState {
             allowed_origins,
             state_path,
             None,
+            None,
         )
     }
 
@@ -138,6 +142,7 @@ impl ServerState {
         allowed_origins: Vec<String>,
         state_path: Option<PathBuf>,
         webhook: Option<crate::webhook_ingress::WebhookIngress>,
+        ui: Option<crate::ui::UiConfig>,
     ) -> Arc<Self> {
         let state = Arc::new(Self {
             models_dir,
@@ -146,6 +151,7 @@ impl ServerState {
             config_path,
             state_path,
             webhook,
+            ui,
             compile_result: RwLock::new(None),
             dag_status: DagStatusStore::new(),
             mutation_permit: crate::jobs::MutationPermit::new(),

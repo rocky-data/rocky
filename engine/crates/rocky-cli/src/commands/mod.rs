@@ -3,7 +3,7 @@ mod ai;
 mod ai_contract;
 pub mod apply;
 mod archive;
-mod audit;
+pub(crate) mod audit;
 mod backfill;
 #[cfg(feature = "duckdb")]
 pub mod bench;
@@ -63,7 +63,7 @@ mod resilience;
 mod restore;
 mod retention_status;
 mod reuse_decision;
-mod review;
+pub(crate) mod review;
 mod run;
 mod run_audit;
 mod run_content_addressed;
@@ -101,7 +101,8 @@ pub use apply::{
 };
 pub use archive::{run_archive, run_archive_apply, run_archive_catalog};
 pub use audit::{
-    compute_audit_for, compute_audit_scorecard, run_audit, run_audit_for, run_audit_scorecard,
+    compute_audit, compute_audit_for, compute_audit_scorecard, resolve_product_scope, run_audit,
+    run_audit_for, run_audit_scorecard,
 };
 pub use backfill::run_backfill;
 #[cfg(feature = "duckdb")]
@@ -164,7 +165,8 @@ pub use preview::{
 };
 pub use preview_rows::run_preview_rows;
 pub use product::{
-    run_product_approve, run_product_compile, run_product_status, run_product_verify,
+    run_product_approve, run_product_compile, run_product_journal, run_product_list,
+    run_product_status, run_product_verify,
 };
 pub use profile::run_profile;
 pub use profile_storage::run_profile_storage;

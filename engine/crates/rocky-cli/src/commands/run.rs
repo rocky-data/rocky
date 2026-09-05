@@ -21,8 +21,8 @@ use rocky_core::hooks::{HookContext, HookRegistry};
 use rocky_core::sql_gen;
 use rocky_core::state::{ResumeScope, RunProgress, StateError, StateStore};
 use rocky_core::traits::{
-    BatchCheckAdapter, FreshnessResult as BatchFreshnessResult, GovernanceAdapter, MaskingPolicy,
-    RowCountResult as BatchRowCountResult, TagTarget, WarehouseAdapter,
+    AdapterResult, BatchCheckAdapter, FreshnessResult as BatchFreshnessResult, GovernanceAdapter,
+    MaskingPolicy, RowCountResult as BatchRowCountResult, TagTarget, WarehouseAdapter,
 };
 use rocky_ir::*;
 
@@ -77,6 +77,11 @@ struct TableResult {
     drift_checked: bool,
     drift_detected: Option<DriftActionOutput>,
     column_match_check: Option<rocky_core::checks::CheckResult>,
+    /// A post-copy `column_match` probe failed and the failure looked like a
+    /// warehouse rate limit. The copy itself succeeded, so the table is still
+    /// a success — but the collector must tell the adaptive throttle to back
+    /// off instead of reading the whole task as "the warehouse is happy".
+    probe_rate_limited: bool,
     source_batch_ref: Option<TableRef>,
     target_batch_ref: Option<TableRef>,
     freshness_batch_ref: Option<TableRef>,
@@ -2097,6 +2102,7 @@ pub async fn run(
             } else {
                 rocky_core::state_sync::FinalizeDurability::ConfigDefault
             },
+            loaded.config.cache.schemas.replicate,
         );
         if let Err(e) = model_session.acquire().await {
             // Unreachable on a fresh session (`Err` = double-acquire misuse);
@@ -2503,6 +2509,7 @@ pub async fn run(
                     } else {
                         rocky_core::state_sync::FinalizeDurability::ConfigDefault
                     },
+                    loaded.config.cache.schemas.replicate,
                 );
                 if let Err(e) = session.acquire().await {
                     // Unreachable on a fresh session (`Err` = double-acquire
@@ -2649,6 +2656,7 @@ pub async fn run(
                 } else {
                     rocky_core::state_sync::FinalizeDurability::ConfigDefault
                 },
+                loaded.config.cache.schemas.replicate,
             );
             if let Err(e) = session.acquire().await {
                 session.abandon("quality acquire misuse").await;
@@ -2727,6 +2735,7 @@ pub async fn run(
                 } else {
                     rocky_core::state_sync::FinalizeDurability::ConfigDefault
                 },
+                loaded.config.cache.schemas.replicate,
             );
             if let Err(e) = session.acquire().await {
                 session.abandon("snapshot acquire misuse").await;
@@ -2903,6 +2912,7 @@ pub async fn run(
         } else {
             rocky_core::state_sync::FinalizeDurability::ConfigDefault
         },
+        loaded.config.cache.schemas.replicate,
     ));
     let authority = session.acquire().await?;
     let authority = if authority.is_usable() {
@@ -4407,9 +4417,17 @@ pub async fn run(
             }
             Ok((_, Ok(TableOutcome::Materialized(tr)))) => {
                 let tr = *tr;
-                // Signal success to the adaptive throttle
+                // Signal the adaptive throttle. The copy succeeded, but a
+                // post-copy `column_match` probe that came back rate-limited is
+                // still the warehouse asking us to slow down (#1666) — reading
+                // the whole task as a success there would widen the semaphore
+                // while it throttles.
                 if let Some(t) = &throttle {
-                    t.on_success();
+                    if tr.probe_rate_limited {
+                        t.on_rate_limit();
+                    } else {
+                        t.on_success();
+                    }
                     adjust_semaphore(t, &semaphore, &mut semaphore_capacity);
                 }
                 // §P2.6 per-table emit: after_materialize on success.
@@ -12531,12 +12549,38 @@ async fn process_table(
 
     let table_duration = table_start.elapsed().as_millis() as u64;
 
+    // #1666: compare the two column sets AS THEY ARE AFTER THE COPY, and read
+    // both of them here so the pair is coherent.
+    //
+    // `target_cols` above is the pre-copy probe — the same read that decides
+    // `target_exists` — so on a first run it is empty and every source column
+    // reads as "missing" even though the copy just built that target from the
+    // source. `source_cols` has the mirror problem: under the batch pre-fetch
+    // it is a snapshot taken before this task was even scheduled, so a source
+    // DDL landing in that window makes the copy's own output read as `extra`.
+    // Reading both sides here narrows that window to the gap between these two
+    // concurrent probes, and picks up whatever schema evolution this run
+    // applied (ADD COLUMN, a widening ALTER, a drop-and-recreate).
+    //
+    // Two extra DESCRIBEs per table, and only when the check is on. Neither
+    // `source_cols` nor `target_cols` is touched: `target_exists`, drift
+    // detection, the pre-drop decision and merge-column resolution all have to
+    // keep reading the pre-copy state.
+    let mut probe_rate_limited = false;
     let column_match_check = if task.check_column_match {
-        Some(checks::check_column_match(
-            &source_cols,
-            &target_cols,
+        let (source_probe, target_probe) = tokio::join!(
+            warehouse.describe_table(&source_table),
+            warehouse.describe_table(&target_table),
+        );
+        let (check, rate_limited) = post_copy_column_match(
+            &source_table,
+            &target_table,
+            source_probe,
+            target_probe,
             &task.column_match_exclude,
-        ))
+        );
+        probe_rate_limited = rate_limited;
+        Some(check)
     } else {
         None
     };
@@ -12603,6 +12647,7 @@ async fn process_table(
     }
 
     Ok(TableOutcome::Materialized(Box::new(TableResult {
+        probe_rate_limited,
         materialization: MaterializationOutput {
             asset_key: asset_key.clone(),
             attempts: Vec::new(),
@@ -12755,8 +12800,15 @@ async fn process_completed_result(
         }
         Ok((_, Ok(TableOutcome::Materialized(tr)))) => {
             let tr = *tr;
+            // Same rule as the inline collector in `run()`: the copy succeeded,
+            // but a post-copy `column_match` probe that came back rate-limited
+            // is still the warehouse asking us to slow down (#1666).
             if let Some(t) = &throttle {
-                t.on_success();
+                if tr.probe_rate_limited {
+                    t.on_rate_limit();
+                } else {
+                    t.on_success();
+                }
                 adjust_semaphore(t, semaphore, semaphore_capacity);
             }
             output.tables_copied += 1;
@@ -12929,6 +12981,78 @@ fn is_rate_limit_error(error_msg: &str) -> bool {
         || upper.contains("UC_REQUEST_LIMIT_EXCEEDED")
         || upper.contains("RATE LIMIT")
         || upper.contains("TOO MANY REQUESTS")
+}
+
+/// Build the `column_match` result from the post-copy probes of both sides.
+///
+/// Returns the check plus whether a probe failure looked like a warehouse rate
+/// limit, so a swallowed `429` still reaches the adaptive throttle instead of
+/// reading as "the warehouse is happy".
+///
+/// A probe that will not answer records `not_evaluated` rather than a
+/// comparison against a list that was never read — and never fails the table.
+/// The copy has already succeeded by the time this runs, so propagating would
+/// move a copied table into `tables_failed` over a metadata read, and on
+/// `incremental` the retry would insert the same rows twice. `not_evaluated`
+/// forces `passed = false`, so the check itself is still fail-closed (#1602).
+///
+/// An `Ok` with no columns counts as unread: after a successful copy a target
+/// with zero columns is not a real SQL state, and neither is such a source.
+/// When both sides are unread the source's reason is the one reported.
+fn post_copy_column_match(
+    source_table: &TableRef,
+    target_table: &TableRef,
+    source_probe: AdapterResult<Vec<ColumnInfo>>,
+    target_probe: AdapterResult<Vec<ColumnInfo>>,
+    exclude: &[String],
+) -> (rocky_core::checks::CheckResult, bool) {
+    /// `Ok(columns)`, or the reason it was unread plus whether that reason
+    /// looked like a rate limit.
+    fn read(
+        table: &TableRef,
+        probe: AdapterResult<Vec<ColumnInfo>>,
+    ) -> Result<Vec<ColumnInfo>, (String, bool)> {
+        match probe {
+            Ok(columns) if !columns.is_empty() => Ok(columns),
+            Ok(_) => Err((
+                format!(
+                    "post-copy column probe for '{}' returned no columns",
+                    table.full_name()
+                ),
+                false,
+            )),
+            Err(e) => {
+                let raw = e.to_string();
+                // Reuse the collector's own rate-limit predicate rather than a
+                // second, differently-worded rule.
+                let rate_limited = is_rate_limit_error(&raw);
+                Err((
+                    format!(
+                        "post-copy column probe for '{}' failed: {raw}",
+                        table.full_name()
+                    ),
+                    rate_limited,
+                ))
+            }
+        }
+    }
+
+    match (
+        read(source_table, source_probe),
+        read(target_table, target_probe),
+    ) {
+        (Ok(source_columns), Ok(target_columns)) => (
+            checks::check_column_match(&source_columns, &target_columns, exclude),
+            false,
+        ),
+        (Err((reason, rate_limited)), Ok(_)) | (Ok(_), Err((reason, rate_limited))) => {
+            (checks::column_match_not_evaluated(reason), rate_limited)
+        }
+        (Err((reason, source_rate_limited)), Err((_, target_rate_limited))) => (
+            checks::column_match_not_evaluated(reason),
+            source_rate_limited || target_rate_limited,
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -19060,6 +19184,736 @@ timestamp_column = "ts"
             .await
             .unwrap();
         assert_eq!(count.rows[0][0], "3");
+    }
+
+    /// A `src.events` → `tgt.events` task with `column_match` switched on.
+    #[cfg(feature = "duckdb")]
+    fn column_match_task(
+        metadata_columns: Vec<MetadataColumn>,
+        column_match_exclude: Vec<String>,
+    ) -> TableTask {
+        TableTask {
+            source_catalog: String::new(),
+            source_schema: "src".into(),
+            target_catalog: String::new(),
+            target_schema: "tgt".into(),
+            source_table_name: "events".into(),
+            target_table_name: "events".into(),
+            asset_key_prefix: vec!["test".into()],
+            tenant: None,
+            check_column_match: true,
+            check_row_count: false,
+            check_freshness: false,
+            column_match_exclude,
+            metadata_columns,
+            governance_tags: BTreeMap::new(),
+            prefetched_source_cols: None,
+            prefetched_target_cols: None,
+            effective_override: ResolvedTableOverride::default(),
+            auto_apply_gate: None,
+        }
+    }
+
+    /// The `(missing, extra)` a `column_match` result reports, sorted so the
+    /// assertion does not depend on set iteration order.
+    #[cfg(feature = "duckdb")]
+    fn column_match_sets(check: &checks::CheckResult) -> (Vec<String>, Vec<String>) {
+        match &check.details {
+            checks::CheckDetails::ColumnMatch { missing, extra } => {
+                let mut missing = missing.clone();
+                let mut extra = extra.clone();
+                missing.sort();
+                extra.sort();
+                (missing, extra)
+            }
+            other => panic!("column_match must carry ColumnMatch details, got {other:?}"),
+        }
+    }
+
+    /// Regression (#1666): `column_match` reads the target as it stands AFTER
+    /// the copy.
+    ///
+    /// Treatment — a first run, target absent. The pre-copy probe is the same
+    /// read that decides `target_exists`, so it is empty here; comparing
+    /// against it reported every source column as missing on the first run of
+    /// every table, right after Rocky itself built that target from the
+    /// source. Fails before the fix with `missing = [event_id, event_type,
+    /// user_id]`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn column_match_passes_on_the_first_run_that_creates_the_target() {
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (event_id INTEGER, user_id INTEGER, event_type VARCHAR)",
+            "INSERT INTO src.events VALUES (1, 7, 'click'), (2, 8, 'view')",
+            // tgt.events is deliberately absent: this is the first run.
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let pipeline = parse_pipeline(r#"strategy = "full_refresh""#);
+        let task = column_match_task(vec![], vec![]);
+
+        let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+            .await
+            .expect("the first run must copy the table");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+        let check = result
+            .column_match_check
+            .expect("the task enables column_match");
+        assert_eq!(
+            check.not_evaluated, None,
+            "the post-copy probe answered, so the check must be a measurement"
+        );
+        let (missing, extra) = column_match_sets(&check);
+        assert!(
+            check.passed && missing.is_empty() && extra.is_empty(),
+            "the copy created the target from the source, so the column sets \
+             match by construction; got missing={missing:?} extra={extra:?}"
+        );
+    }
+
+    /// #1666, the metadata-column half. The target the copy creates carries
+    /// Rocky's own metadata columns, which the source does not have. The
+    /// pre-copy read never saw them on a first run; the post-copy read does,
+    /// so `column_match_exclude` — built from `metadata_columns` — has to take
+    /// them back out. Without that, reading the post-copy target would trade
+    /// "missing everything" for "extra: _rocky_loaded_at".
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn column_match_excludes_rocky_metadata_columns_on_a_first_run() {
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (event_id INTEGER, user_id INTEGER)",
+            "INSERT INTO src.events VALUES (1, 7), (2, 8)",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let pipeline = parse_pipeline(r#"strategy = "full_refresh""#);
+        let task = column_match_task(
+            vec![
+                MetadataColumn::new("_rocky_loaded_at", "TIMESTAMP", "CURRENT_TIMESTAMP")
+                    .expect("valid metadata column"),
+            ],
+            vec!["_rocky_loaded_at".to_string()],
+        );
+
+        let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+            .await
+            .expect("the first run must copy the table");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+        let target_cols = adapter
+            .describe_table(&TableRef {
+                catalog: String::new(),
+                schema: "tgt".into(),
+                table: "events".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            target_cols.iter().any(|c| c.name == "_rocky_loaded_at"),
+            "the copy must actually have written the metadata column, or this \
+             test proves nothing: {target_cols:?}"
+        );
+        let check = result
+            .column_match_check
+            .expect("the task enables column_match");
+        let (missing, extra) = column_match_sets(&check);
+        assert!(
+            check.passed && missing.is_empty() && extra.is_empty(),
+            "an excluded metadata column must not read as `extra`; got \
+             missing={missing:?} extra={extra:?}"
+        );
+    }
+
+    /// #1666, the existing-target half. A column added to the source since the
+    /// last run is ALTERed into the target by drift repair, and the copy then
+    /// fills it — so after the copy the sets match. The pre-copy read is from
+    /// before that ALTER, so the check reported the new column as missing.
+    /// Fails before the fix with `missing = [region]`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn column_match_sees_the_column_drift_repair_added_this_run() {
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (event_id INTEGER, user_id INTEGER)",
+            "INSERT INTO src.events VALUES (1, 7), (2, 8)",
+            // The target as the previous run left it, then a source change.
+            "CREATE TABLE tgt.events AS SELECT * FROM src.events",
+            "ALTER TABLE src.events ADD COLUMN region VARCHAR",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let pipeline = parse_pipeline(r#"strategy = "full_refresh""#);
+        let task = column_match_task(vec![], vec![]);
+
+        let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+            .await
+            .expect("the second run must copy the table");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+        let check = result
+            .column_match_check
+            .expect("the task enables column_match");
+        let (missing, extra) = column_match_sets(&check);
+        assert!(
+            check.passed && missing.is_empty() && extra.is_empty(),
+            "the run itself added `region` to the target, so nothing is \
+             missing after the copy; got missing={missing:?} extra={extra:?}"
+        );
+    }
+
+    /// The control for #1666: reading the post-copy target must not turn the
+    /// check into a rubber stamp. Here the target genuinely ends the run one
+    /// source column short — the copy is followed by a `DROP COLUMN` the
+    /// runner did not ask for — and the check still fails, naming that column.
+    ///
+    /// The target exists before the run, so the pre-copy read holds the full
+    /// column set: before the fix this reported `passed = true` on a target
+    /// that is really missing a column.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn column_match_still_fails_when_the_post_copy_target_differs() {
+        use async_trait::async_trait;
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::{
+            AdapterResult, ExecutionStats, QueryResult, SqlDialect, WarehouseAdapter,
+        };
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        /// Runs the copy, then drops a column from the target behind the
+        /// runner's back, so the post-copy target really does differ.
+        struct DropColumnAfterCopy<'a> {
+            inner: &'a DuckDbWarehouseAdapter,
+        }
+
+        #[async_trait]
+        impl WarehouseAdapter for DropColumnAfterCopy<'_> {
+            fn dialect(&self) -> &dyn SqlDialect {
+                self.inner.dialect()
+            }
+
+            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+                self.inner.execute_statement(sql).await
+            }
+
+            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+                self.inner.execute_query(sql).await
+            }
+
+            async fn describe_table(
+                &self,
+                table: &rocky_ir::TableRef,
+            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+                self.inner.describe_table(table).await
+            }
+
+            async fn execute_statement_with_stats(
+                &self,
+                sql: &str,
+            ) -> AdapterResult<ExecutionStats> {
+                let stats = self.inner.execute_statement_with_stats(sql).await?;
+                self.inner
+                    .execute_statement("ALTER TABLE tgt.events DROP COLUMN region")
+                    .await?;
+                Ok(stats)
+            }
+        }
+
+        let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (event_id INTEGER, user_id INTEGER, region VARCHAR)",
+            "INSERT INTO src.events VALUES (1, 7, 'eu'), (2, 8, 'us')",
+            "CREATE TABLE tgt.events AS SELECT * FROM src.events",
+        ] {
+            inner.execute_statement(sql).await.unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let pipeline = parse_pipeline(r#"strategy = "full_refresh""#);
+        let task = column_match_task(vec![], vec![]);
+
+        let adapter = DropColumnAfterCopy { inner: &inner };
+        let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+            .await
+            .expect("the copy itself succeeded");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+        let check = result
+            .column_match_check
+            .expect("the task enables column_match");
+        assert_eq!(
+            check.not_evaluated, None,
+            "the probe answered; this is a measured mismatch, not an unread one"
+        );
+        let (missing, extra) = column_match_sets(&check);
+        assert!(
+            !check.passed,
+            "a target that really is a column short must fail the check"
+        );
+        assert_eq!(missing, vec!["region".to_string()]);
+        assert!(extra.is_empty(), "unexpected extra columns: {extra:?}");
+    }
+
+    /// A post-copy probe that will not answer must not fail the table: the
+    /// copy already succeeded, and a metadata read cannot be allowed to move a
+    /// copied table into `tables_failed`. It records the reason and fails the
+    /// check instead — `not_evaluated` set, `passed = false` (#1602).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn column_match_records_a_reason_when_the_post_copy_probe_fails() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use async_trait::async_trait;
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::{
+            AdapterError, AdapterResult, ExecutionStats, QueryResult, SqlDialect, WarehouseAdapter,
+        };
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        struct FailPostCopyDescribe<'a> {
+            inner: &'a DuckDbWarehouseAdapter,
+            copied: AtomicBool,
+        }
+
+        #[async_trait]
+        impl WarehouseAdapter for FailPostCopyDescribe<'_> {
+            fn dialect(&self) -> &dyn SqlDialect {
+                self.inner.dialect()
+            }
+
+            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+                self.inner.execute_statement(sql).await
+            }
+
+            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+                self.inner.execute_query(sql).await
+            }
+
+            async fn describe_table(
+                &self,
+                table: &rocky_ir::TableRef,
+            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+                if table.schema == "tgt" && self.copied.load(Ordering::SeqCst) {
+                    return Err(AdapterError::msg("injected post-copy probe failure"));
+                }
+                self.inner.describe_table(table).await
+            }
+
+            async fn execute_statement_with_stats(
+                &self,
+                sql: &str,
+            ) -> AdapterResult<ExecutionStats> {
+                let stats = self.inner.execute_statement_with_stats(sql).await?;
+                self.copied.store(true, Ordering::SeqCst);
+                Ok(stats)
+            }
+        }
+
+        let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (event_id INTEGER, user_id INTEGER)",
+            "INSERT INTO src.events VALUES (1, 7), (2, 8)",
+        ] {
+            inner.execute_statement(sql).await.unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let pipeline = parse_pipeline(r#"strategy = "full_refresh""#);
+        let task = column_match_task(vec![], vec![]);
+
+        let adapter = FailPostCopyDescribe {
+            inner: &inner,
+            copied: AtomicBool::new(false),
+        };
+        let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+            .await
+            .expect("a failed metadata read must not fail a table that copied");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+        assert!(
+            !result.probe_rate_limited,
+            "an ordinary probe failure is not a rate limit and must not \
+             throttle the run down"
+        );
+        let check = result
+            .column_match_check
+            .expect("the task enables column_match");
+        let reason = check
+            .not_evaluated
+            .as_deref()
+            .expect("an unreadable probe must record a reason");
+        assert!(
+            reason.contains("post-copy column probe")
+                && reason.contains("injected post-copy probe failure"),
+            "unexpected reason: {reason}"
+        );
+        assert!(!check.passed, "an unevaluated check never passes");
+    }
+
+    /// The other side of the same read. The source is probed after the copy
+    /// too, so a source that will not answer is "not read", never "no
+    /// columns" — comparing an empty source against the target the copy just
+    /// wrote would report every column as `extra`, which is the #1666 false
+    /// failure again wearing the opposite sign. The check records the reason
+    /// and fails, and the table still succeeds.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn column_match_records_a_reason_when_the_source_probe_returns_nothing() {
+        use async_trait::async_trait;
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::{
+            AdapterError, AdapterResult, QueryResult, SqlDialect, WarehouseAdapter,
+        };
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        struct FailSourceDescribe<'a> {
+            inner: &'a DuckDbWarehouseAdapter,
+        }
+
+        #[async_trait]
+        impl WarehouseAdapter for FailSourceDescribe<'_> {
+            fn dialect(&self) -> &dyn SqlDialect {
+                self.inner.dialect()
+            }
+
+            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+                self.inner.execute_statement(sql).await
+            }
+
+            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+                self.inner.execute_query(sql).await
+            }
+
+            async fn describe_table(
+                &self,
+                table: &rocky_ir::TableRef,
+            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+                if table.schema == "src" {
+                    return Err(AdapterError::msg("injected source probe failure"));
+                }
+                self.inner.describe_table(table).await
+            }
+        }
+
+        let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (event_id INTEGER, user_id INTEGER)",
+            "INSERT INTO src.events VALUES (1, 7), (2, 8)",
+        ] {
+            inner.execute_statement(sql).await.unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let pipeline = parse_pipeline(r#"strategy = "full_refresh""#);
+        let task = column_match_task(vec![], vec![]);
+
+        let adapter = FailSourceDescribe { inner: &inner };
+        let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+            .await
+            .expect("a failed source probe is tolerated by the copy path");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+        let check = result
+            .column_match_check
+            .expect("the task enables column_match");
+        let reason = check
+            .not_evaluated
+            .as_deref()
+            .expect("an unread source must record a reason");
+        assert!(
+            reason.contains("post-copy column probe") && reason.contains("src.events"),
+            "the reason must name the side that would not answer: {reason}"
+        );
+        assert!(!check.passed, "an unevaluated check never passes");
+        let (missing, extra) = column_match_sets(&check);
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "nothing was compared, so neither list is a reading: \
+             missing={missing:?} extra={extra:?}"
+        );
+    }
+
+    /// Red-team finding (Codex, round 1): the two column sets must come from
+    /// the same moment. Under the batch pre-fetch, `source_cols` is a snapshot
+    /// taken before this task was ever scheduled. A source DDL landing between
+    /// that snapshot and the copy makes `SELECT *` write a column the snapshot
+    /// never saw, so comparing the snapshot against the post-copy target
+    /// reported it as `extra` — the same false failure #1666 is about, with
+    /// the sign flipped.
+    ///
+    /// Here the pre-fetch says `{event_id, user_id}` while the live source
+    /// already carries `region`. Both sides are re-read after the copy, so the
+    /// check passes.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn column_match_survives_a_source_ddl_after_the_prefetch_snapshot() {
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (event_id INTEGER, user_id INTEGER)",
+            "INSERT INTO src.events VALUES (1, 7), (2, 8)",
+            // The target as the previous run left it.
+            "CREATE TABLE tgt.events AS SELECT * FROM src.events",
+            // The source DDL that lands after the pre-fetch snapshot below.
+            "ALTER TABLE src.events ADD COLUMN region VARCHAR",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+
+        let stale = |name: &str| ColumnInfo {
+            name: name.to_string(),
+            data_type: "INTEGER".to_string(),
+            nullable: true,
+        };
+        let mut task = column_match_task(vec![], vec![]);
+        // Both pre-fetches present, so `process_table` uses them instead of
+        // probing — exactly the batch path the finding is about.
+        task.prefetched_source_cols = Some(vec![stale("event_id"), stale("user_id")]);
+        task.prefetched_target_cols = Some(vec![stale("event_id"), stale("user_id")]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let pipeline = parse_pipeline(r#"strategy = "full_refresh""#);
+
+        let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+            .await
+            .expect("the copy must succeed");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+        let target_cols = adapter
+            .describe_table(&TableRef {
+                catalog: String::new(),
+                schema: "tgt".into(),
+                table: "events".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            target_cols.iter().any(|c| c.name == "region"),
+            "the copy must have written the new source column, or this test \
+             proves nothing: {target_cols:?}"
+        );
+        let check = result
+            .column_match_check
+            .expect("the task enables column_match");
+        let (missing, extra) = column_match_sets(&check);
+        assert!(
+            check.passed && missing.is_empty() && extra.is_empty(),
+            "a column the copy itself wrote must not read as `extra` against a \
+             stale snapshot; got missing={missing:?} extra={extra:?}"
+        );
+    }
+
+    /// Red-team finding (Codex, round 1): the post-copy probe is an extra
+    /// warehouse call, so it can be rate-limited. Swallowing that error to keep
+    /// the copied table a success must not also tell the adaptive throttle the
+    /// warehouse is happy — that widens the semaphore while it is throttling.
+    /// The table still succeeds; the rate-limit signal rides out separately.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_rate_limited_post_copy_probe_still_reaches_the_throttle() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use async_trait::async_trait;
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::{
+            AdapterError, AdapterResult, ExecutionStats, QueryResult, SqlDialect, WarehouseAdapter,
+        };
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        struct RateLimitPostCopyDescribe<'a> {
+            inner: &'a DuckDbWarehouseAdapter,
+            copied: AtomicBool,
+        }
+
+        #[async_trait]
+        impl WarehouseAdapter for RateLimitPostCopyDescribe<'_> {
+            fn dialect(&self) -> &dyn SqlDialect {
+                self.inner.dialect()
+            }
+
+            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+                self.inner.execute_statement(sql).await
+            }
+
+            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+                self.inner.execute_query(sql).await
+            }
+
+            async fn describe_table(
+                &self,
+                table: &rocky_ir::TableRef,
+            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+                if table.schema == "tgt" && self.copied.load(Ordering::SeqCst) {
+                    return Err(AdapterError::msg(
+                        "429 Too Many Requests: UC_REQUEST_LIMIT_EXCEEDED",
+                    ));
+                }
+                self.inner.describe_table(table).await
+            }
+
+            async fn execute_statement_with_stats(
+                &self,
+                sql: &str,
+            ) -> AdapterResult<ExecutionStats> {
+                let stats = self.inner.execute_statement_with_stats(sql).await?;
+                self.copied.store(true, Ordering::SeqCst);
+                Ok(stats)
+            }
+        }
+
+        let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (event_id INTEGER, user_id INTEGER)",
+            "INSERT INTO src.events VALUES (1, 7), (2, 8)",
+        ] {
+            inner.execute_statement(sql).await.unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let pipeline = parse_pipeline(r#"strategy = "full_refresh""#);
+        let task = column_match_task(vec![], vec![]);
+
+        let adapter = RateLimitPostCopyDescribe {
+            inner: &inner,
+            copied: AtomicBool::new(false),
+        };
+        let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+            .await
+            .expect("a throttled metadata read must not fail a table that copied");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+        assert!(
+            result.probe_rate_limited,
+            "a 429 on the post-copy probe must be carried out to the throttle"
+        );
+        let check = result
+            .column_match_check
+            .as_ref()
+            .expect("the task enables column_match");
+        assert!(!check.passed, "an unevaluated check never passes");
+        assert!(
+            check
+                .not_evaluated
+                .as_deref()
+                .is_some_and(|r| r.contains("429")),
+            "the reason must carry the warehouse's own error: {:?}",
+            check.not_evaluated
+        );
+
+        // The flag has to reach the throttle, not just ride on the result.
+        // `process_completed_result` is the collector `run()` drains through
+        // while adaptive concurrency is on; it must slow down, and it must
+        // still count the table as copied.
+        let throttle = Some(AdaptiveThrottle::new(8, 1, 1));
+        let semaphore = Semaphore::new(8);
+        let mut semaphore_capacity = 8;
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        let mut pending_checks = HashMap::new();
+        let (mut source_refs, mut target_refs, mut freshness_refs) =
+            (Vec::new(), Vec::new(), Vec::new());
+        let mut batch_asset_keys = Vec::new();
+        let mut table_errors = Vec::new();
+        let (mut deferred_tags, mut deferred_watermarks) = (Vec::new(), Vec::new());
+        let mut total_completed = 0;
+        let tasks = vec![task.clone()];
+        state
+            .init_run_progress("run-1", tasks.len(), Some(&test_resume_scope("p1")))
+            .unwrap();
+        process_completed_result(
+            Ok((0, Ok(TableOutcome::Materialized(result)))),
+            &tasks,
+            &throttle,
+            &semaphore,
+            &mut semaphore_capacity,
+            &mut output,
+            &mut pending_checks,
+            &mut source_refs,
+            &mut target_refs,
+            &mut freshness_refs,
+            &mut batch_asset_keys,
+            &mut table_errors,
+            &mut deferred_tags,
+            &mut deferred_watermarks,
+            &state,
+            "run-1",
+            &mut total_completed,
+        )
+        .await;
+
+        assert_eq!(
+            throttle.as_ref().map(AdaptiveThrottle::rate_limits_total),
+            Some(1),
+            "the collector must report the throttled probe as a rate limit"
+        );
+        let current = throttle.as_ref().map(AdaptiveThrottle::current);
+        assert!(
+            current.is_some_and(|c| c < 8),
+            "the throttle must back off, not widen: {current:?}"
+        );
+        assert_eq!(
+            output.tables_copied, 1,
+            "the copy still succeeded — backing off must not un-count the table"
+        );
+        assert_eq!(
+            table_errors.len(),
+            0,
+            "a throttled metadata read is not a table failure"
+        );
     }
 
     /// Regression: if the target-MAX query fails after a missing-watermark
@@ -29216,6 +30070,215 @@ table = "fct_events"
                 .as_deref()
                 .is_some_and(|r| r.starts_with("could not address the table: ")),
             "{custom:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // #1609: what a config refusal promises, stated as a warehouse CALL LOG
+    // rather than as one schema lookup.
+    // ---------------------------------------------------------------------
+
+    /// A refused `metadata_columns[].value` (#1594) issues **zero** warehouse
+    /// statements.
+    ///
+    /// ```text
+    ///   no metadata column   ──► preflight passes ──► CREATE CATALOG, CREATE SCHEMA, …
+    ///   with metadata column ──► preflight REFUSES ──► (no statement at all)
+    /// ```
+    ///
+    /// `rocky/tests/metadata_column_refusal.rs` already pins this against a
+    /// real DuckDB fixture, but all it can observe is *the target schema does
+    /// not exist*. DuckDB's `create_catalog_sql` returns `None`, so on that
+    /// adapter a guard sitting BETWEEN catalog creation and schema creation
+    /// would pass the same assertion. The recording adapter's dialect does
+    /// answer `create_catalog_sql`, and the control below asserts the catalog
+    /// statement is the FIRST one the run issues — so an empty treatment log
+    /// rules that placement out as well.
+    ///
+    /// Scope, stated plainly: this counts SQL the run hands to
+    /// `WarehouseAdapter::execute_statement`, which is every catalog, schema,
+    /// pre-drop, CTAS, INSERT and MERGE. Tag / workspace-binding / grant
+    /// emission on a real warehouse also lands there, but the recording
+    /// adapter resolves to the no-op governance adapter (as DuckDB does), so
+    /// those three are absent from the control log rather than proven-absent
+    /// from the treatment log.
+    ///
+    /// The control run is load-bearing twice: it shows this fixture reaches
+    /// the setup loop at all, and it names the statement the treatment must
+    /// not have issued. The `ListTables` assertion is the third guard — it
+    /// proves the recording adapter was actually wired in, so an empty
+    /// statement log cannot pass by the adapter never having been reached.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_refused_metadata_value_issues_no_warehouse_statement() {
+        use crate::testing::{AdapterCall, recorder};
+
+        /// Source schema `raw__ship-it` parses fine — `SchemaPattern::parse`
+        /// splits on the separator and checks nothing — so `{source}`
+        /// resolves to `ship-it`, which is not a plain SQL identifier. The
+        /// TARGET templates deliberately do not use `{source}`, so the
+        /// metadata column is the only thing that differs between the two
+        /// runs.
+        const SOURCE_SCHEMA: &str = "raw__ship-it";
+
+        const CONFIG: &str = r#"
+[adapter.default]
+type = "duckdb"
+path = "__FIXTURE__"
+
+[adapter.rec]
+type = "recording"
+path = "__KEY__"
+
+[pipeline.ingest]
+strategy = "full_refresh"
+__METADATA__
+[pipeline.ingest.source.discovery]
+adapter = "default"
+
+[pipeline.ingest.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.ingest.target]
+adapter = "rec"
+catalog_template = "fixture"
+schema_template = "staging"
+
+[pipeline.ingest.target.governance]
+auto_create_catalogs = true
+auto_create_schemas = true
+"#;
+
+        const HOSTILE_METADATA: &str = r#"
+[[pipeline.ingest.metadata_columns]]
+name = "_src"
+type = "VARCHAR"
+value = "'{source}'"
+"#;
+
+        async fn drive(dir: &std::path::Path, metadata: &str, key: &str) -> Result<RunTermination> {
+            let fixture = dir.join("fixture.duckdb");
+            // Seed the SOURCE through a real DuckDB handle, then drop it:
+            // DuckDB allows a single writer per file, and `run()` opens the
+            // same path through the registry.
+            {
+                let seed = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&fixture)
+                    .expect("open the duckdb fixture");
+                for sql in [
+                    format!("CREATE SCHEMA \"{SOURCE_SCHEMA}\""),
+                    format!("CREATE TABLE \"{SOURCE_SCHEMA}\".orders AS SELECT 1 AS id"),
+                ] {
+                    seed.execute_statement(&sql).await.expect("seed the source");
+                }
+            }
+
+            let config_path = dir.join("rocky.toml");
+            std::fs::write(
+                &config_path,
+                CONFIG
+                    .replace("__FIXTURE__", &fixture.display().to_string())
+                    .replace("__KEY__", key)
+                    .replace("__METADATA__", metadata),
+            )
+            .expect("write rocky.toml");
+
+            let state_path = dir.join("state.redb");
+            let opts = PartitionRunOptions::default();
+            super::run(
+                &config_path,
+                std::sync::Arc::new(
+                    rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+                ),
+                None,
+                None,
+                &state_path,
+                None,
+                false,
+                None,
+                false,
+                None,
+                false,
+                None,
+                &opts,
+                None,
+                None,
+                None,
+                None,
+                &DeferOptions::default(),
+                &SkipRunOptions::default(),
+                &rocky_core::run_vars::RunVars::new(),
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+        }
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+
+        // --- Control: no metadata column. The preflight passes and the setup
+        // loop issues its statements.
+        let control_dir = tmp.path().join("control");
+        std::fs::create_dir_all(&control_dir).unwrap();
+        let control_key = control_dir.join("calls").display().to_string();
+        let control_log = recorder(&control_key);
+        let control = drive(&control_dir, "", &control_key).await;
+
+        let control_stmts = control_log.statements();
+        assert!(
+            !control_stmts.is_empty(),
+            "control: the run must reach the setup loop, otherwise the \
+             treatment's empty log proves nothing. run result: {control:?}, \
+             calls: {:?}",
+            control_log.calls()
+        );
+        assert!(
+            control_stmts[0].contains("CREATE CATALOG"),
+            "control: the catalog statement must be the FIRST statement — \
+             that ordering is what makes an empty treatment log rule out a \
+             guard placed after catalog creation. statements: {control_stmts:?}"
+        );
+        assert!(
+            control_stmts.iter().any(|s| s.contains("CREATE SCHEMA")),
+            "control: the setup loop must also create the target schema; \
+             statements: {control_stmts:?}"
+        );
+
+        // --- Treatment: the same fixture plus a metadata column whose value
+        // resolves to a non-identifier component.
+        let treat_dir = tmp.path().join("treatment");
+        std::fs::create_dir_all(&treat_dir).unwrap();
+        let treat_key = treat_dir.join("calls").display().to_string();
+        let treat_log = recorder(&treat_key);
+        let refused = drive(&treat_dir, HOSTILE_METADATA, &treat_key)
+            .await
+            .expect_err("a non-identifier schema component in a metadata value must be refused");
+
+        // The refusal must be THE metadata-columns refusal. Without this the
+        // empty log below would also pass on an unrelated earlier bail.
+        let msg = format!("{refused:#}");
+        assert!(
+            msg.contains("metadata_columns") && msg.contains("ship-it"),
+            "the refusal must name the field and the offending component; got: {msg}"
+        );
+
+        assert!(
+            treat_log
+                .calls()
+                .iter()
+                .any(|c| matches!(c, AdapterCall::ListTables { .. })),
+            "the recording adapter was never reached — an empty statement log \
+             would then prove nothing. calls: {:?}",
+            treat_log.calls()
+        );
+        assert!(
+            treat_log.statements().is_empty(),
+            "the refusal issued warehouse statements; the guard is no longer \
+             ahead of the setup loop. calls: {:?}",
+            treat_log.calls()
         );
     }
 }

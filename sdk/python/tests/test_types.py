@@ -350,3 +350,119 @@ def test_parse_rocky_output_routes_product_commands():
     )
     assert isinstance(status, ProductStatusOutput)
     assert status.spec_present is False
+
+
+def test_model_detail_typed_columns_round_trip_by_alias():
+    """The structured ``data_type`` on model detail is an externally tagged enum.
+
+    The generator renders a payload-carrying variant as a model whose field is
+    the tag under an alias (``Decimal_1`` aliased to ``"Decimal"``), so the
+    wire form only survives a dump with ``by_alias=True``. This pins that the
+    Decimal and nested-Struct shapes validate from the wire and dump back to
+    exactly the same bytes, nullability of the struct field included.
+    """
+    from rocky_sdk.types_generated import ModelDetailOutput
+
+    payload = {
+        "name": "orders",
+        "sql": "SELECT 1",
+        "sql_truncated": False,
+        "sql_bytes": 8,
+        "file_path": "models/orders.sql",
+        "columns": [{"name": "amount"}, {"name": "address"}, {"name": "id"}],
+        "typed_columns": [
+            {
+                "name": "amount",
+                "data_type": {"Decimal": {"precision": 10, "scale": 2}},
+                "data_type_display": "DECIMAL(10,2)",
+                "nullable": True,
+            },
+            {
+                "name": "address",
+                "data_type": {
+                    "Struct": [
+                        {"name": "street", "data_type": "String", "nullable": True},
+                        {"name": "zip", "data_type": "Int32", "nullable": False},
+                    ]
+                },
+                "data_type_display": "STRUCT<street:STRING,zip:INT32>",
+                "nullable": False,
+            },
+            {
+                "name": "id",
+                "data_type": "Int64",
+                "data_type_display": "INT64",
+                "nullable": False,
+            },
+        ],
+        "has_star": False,
+        "upstream": [],
+        "downstream": ["revenue"],
+    }
+
+    parsed = ModelDetailOutput.model_validate(payload)
+    assert parsed.model_dump(mode="json", by_alias=True) == payload
+
+
+def test_parse_rocky_output_dispatches_product_list():
+    from rocky_sdk.types import ProductListOutput
+
+    payload = {
+        "version": "1.74.0",
+        "command": "product_list",
+        "products": [
+            {
+                "name": "revenue_daily",
+                "spec_present": True,
+                "product_id": "product:revenue_daily",
+                "artifact_problems": 0,
+                "staging_journal_present": False,
+                "journal_rows": 0,
+            }
+        ],
+        "count": 1,
+    }
+    result = parse_rocky_output(json.dumps(payload))
+    assert isinstance(result, ProductListOutput)
+    assert result.count == 1
+    assert result.products[0].approval is None
+
+    empty = parse_rocky_output(
+        json.dumps({"version": "1.74.0", "command": "product_list", "products": [], "count": 0})
+    )
+    assert isinstance(empty, ProductListOutput)
+    assert empty.products == []
+
+
+def test_parse_rocky_output_dispatches_product_journal():
+    from rocky_sdk.types import ProductJournalOutput
+
+    payload = {
+        "version": "1.74.0",
+        "command": "product_journal",
+        "product": "revenue_daily",
+        "product_id": "product:revenue_daily",
+        "rows": [
+            {
+                "seq": 1,
+                "at": "2026-08-19T00:00:00Z",
+                "event": "spec approved",
+                "to_state": "spec_approved",
+                "spec_digest": "sha256:" + "a" * 64,
+            },
+            {
+                "seq": 2,
+                "event": "plan proposed",
+                "from_state": "spec_approved",
+                "to_state": "proposed",
+                "plan_id": "b" * 64,
+            },
+        ],
+        "count": 2,
+    }
+    result = parse_rocky_output(json.dumps(payload))
+    assert isinstance(result, ProductJournalOutput)
+    assert result.count == 2
+    assert [row.seq for row in result.rows] == [1, 2]
+    assert result.rows[1].from_state == "spec_approved"
+    assert result.rows[1].plan_id == "b" * 64

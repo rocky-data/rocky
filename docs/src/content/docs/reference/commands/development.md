@@ -251,10 +251,32 @@ CORS is empty-by-default. Browser apps must declare every allowed origin via `--
 | `--token <SECRET>` | `String` | | Bearer token required by every API request except `/api/v1/health`. Falls back to `ROCKY_SERVE_TOKEN` env var when omitted. **Required when `--host` is non-loopback.** |
 | `--token-scope <SCOPE>` | `full` \| `read-only` | `full` | What `--token` may do. `read-only` allows `GET`, `HEAD`, and `OPTIONS` only; anything else gets `403 forbidden_read_only_token`. Falls back to `ROCKY_SERVE_TOKEN_SCOPE`. Setting a scope without a token is an error. |
 | `--allowed-origin <ORIGIN>` | `String` (repeatable) | `[]` | Add an origin to the CORS allowlist. Repeat for multiple origins (e.g. `--allowed-origin http://localhost:5173 --allowed-origin https://dashboard.example.com`). |
+| `--ui` | `bool` | `false` | Serve the browser UI at `/ui/`. Release binaries carry it; from source, build with `--features ui`. Requires `--token` with `--token-scope read-only`, and `ROCKY_WEBHOOK_SECRET` with `--scheduler`. Prints the address to open, token included. |
+| `--allowed-host <HOST>` | `String` (repeatable) | `[]` | With `--ui`: an extra `Host` header value to accept, for a reverse proxy in front of the UI. Loopback names and the bind host are always accepted; any other `Host` is refused `421`. |
 | `--watch` | `bool` | `false` | Watch for file changes and auto-recompile. |
 | `--scheduler` | `bool` | `false` | Also run the resident scheduler: a timer loop that evaluates every pipeline's `[schedule]` and runs what is due, in-process. On SIGTERM or Ctrl-C the server drains a running scheduled child before it exits. Run one instance per project directory. Experimental. |
 | `--poll-interval-seconds <SECONDS>` | `u64` | `15` | Seconds between scheduler ticks. Must be at least 1. Only meaningful with `--scheduler`. |
 | `--drain-timeout-seconds <SECONDS>` | `u64` | `60` | Seconds a running scheduled child may keep going after a shutdown signal before Rocky terminates it. Only meaningful with `--scheduler`. |
+
+### The browser UI
+
+`rocky serve --ui` serves a browser UI at `/ui/`, from files built into the release binaries (cargo feature `ui`; a plain `cargo build` has no UI and refuses the flag with the build command to run).
+
+```bash
+rocky serve --ui --token s3cret --token-scope read-only
+# Rocky UI: http://127.0.0.1:8080/ui/#token=s3cret
+```
+
+The rules, each refused at start with its fix:
+
+- `--ui` needs a token, and the token must be read-only. The page holds it, and a page must never reach a mutating route. One server has one token, so for job submissions run a second sidecar without `--ui`, or use the CLI.
+- The printed address carries the token in the fragment. Browsers never send a fragment, so the secret is in no access log; the page reads it once, keeps it for the tab, and clears the address.
+- The page and its files are public: they carry no data. Every API call the page makes carries the token.
+- With `--ui`, a request whose `Host` is not a loopback name, the bind host, or an `--allowed-host` entry is refused `421 host_not_allowed` before routing. A present `Origin` that is neither this server's own nor an `--allowed-origin` entry is refused `403 origin_not_allowed`. Both refusals carry the error envelope. Without `--ui` neither check runs.
+- Every UI response carries a Content Security Policy that allows scripts, styles, images, fonts and connections from this server only and forbids framing. The page loads nothing from any other host.
+- `--ui --scheduler` refuses to start without `ROCKY_WEBHOOK_SECRET`: a browser can reach the webhook route.
+
+A reverse proxy in front of the UI names itself with `--allowed-host proxy.internal`; a page served from another origin lists it with `--allowed-origin https://app.example`.
 
 ### Examples
 

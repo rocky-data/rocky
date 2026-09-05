@@ -468,8 +468,14 @@ pub fn run_policy_freeze(
     // pick the Local backend, record the freeze LOCAL-only, exit 0 with no upload,
     // and let a later remote download overwrite it. Mirrors the `[gc]
     // physical_delete` fail-loud pattern.
+    // `[cache.schemas] replicate` rides alongside the `[state]` backend so the
+    // freeze seam replicates exactly the table set every other leg does (#1620).
+    let mut replicate_schema_cache = false;
     let state_cfg = match rocky_core::config::load_rocky_config(config_path) {
-        Ok(cfg) => cfg.state,
+        Ok(cfg) => {
+            replicate_schema_cache = cfg.cache.schemas.replicate;
+            cfg.state
+        }
         Err(ConfigError::FileNotFound { .. }) => StateConfig::default(),
         Err(e) => {
             return Err(anyhow::Error::new(e).context(format!(
@@ -519,13 +525,16 @@ pub fn run_policy_freeze(
         // successful download of either usable variant means the local ledger
         // now mirrors remote truth; failure still `?`-bails fail-closed
         // (unchanged).
-        let _authority = block_on_state_sync(
-            rocky_core::state_sync::RemoteStateSession::download_only(&state_cfg, state_path),
-        )
-        .with_context(|| {
-            "failed to download remote state before recording the policy freeze; \
+        let _authority =
+            block_on_state_sync(rocky_core::state_sync::RemoteStateSession::download_only(
+                &state_cfg,
+                state_path,
+                replicate_schema_cache,
+            ))
+            .with_context(|| {
+                "failed to download remote state before recording the policy freeze; \
                  a remote-backend freeze requires the state backend to be reachable"
-        })?;
+            })?;
     }
 
     // Preserve the legacy open-before-timestamp ordering when CAS is inert.
@@ -652,7 +661,11 @@ pub fn run_policy_freeze(
         // exact set of pre-constructed ledger records above. The marker is
         // deliberately outside this closure because its create-once UUID
         // cannot be replayed.
-        let session = rocky_core::state_sync::LedgerSeamSession::new(&state_cfg, state_path);
+        let session = rocky_core::state_sync::LedgerSeamSession::new(
+            &state_cfg,
+            state_path,
+            replicate_schema_cache,
+        );
         let expected_record_count = records.len();
         let committed_record_count =
             block_on_state_sync(session.execute(move |fresh_store, _fresh_base| {
@@ -676,6 +689,7 @@ pub fn run_policy_freeze(
                 &state_cfg,
                 state_path,
                 "policy freeze",
+                replicate_schema_cache,
             ),
         )
         .with_context(|| "failed to upload remote state after recording the policy freeze")?;
@@ -1500,6 +1514,7 @@ max_retries = 0
         let _authority = block_on_state_sync(rocky_core::state_sync::download_state(
             &harness.pod_b.cfg,
             &verify_path,
+            false,
         ))
         .unwrap();
         let rows = StateStore::open(&verify_path)

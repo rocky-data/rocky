@@ -12,10 +12,14 @@
 //! GET  /api/v1/models/:name/history             → per-model run history
 //! GET  /api/v1/models/:name/metrics             → per-model quality snapshots
 //! GET  /api/v1/runs                             → project run history
+//! GET  /api/v1/products                         → every product (= rocky product list)
+//! GET  /api/v1/products/:name                   → one product (= rocky product status)
+//! GET  /api/v1/review/queue                     → pending escalations (= rocky review --queue)
+//! GET  /api/v1/review/:plan_id/status           → one plan's sign-off (= rocky review --status)
 //! GET  /api/v1/compile                          → full compile result
 //! GET  /api/v1/dag                              → full unified DAG
-//! GET  /api/v1/dag/layers                       → execution layers (dashboard-only)
-//! GET  /api/v1/dag/status                       → latest DAG run status (server-only)
+//! GET  /api/v1/dag/layers                       → execution layers (typed, no CLI twin)
+//! GET  /api/v1/dag/status                       → latest DAG run status (typed, no CLI twin)
 //! POST /api/v1/compile                          → trigger recompilation
 //! POST /api/v1/jobs/run                         → submit a run job    → 202 {job_id}
 //! POST /api/v1/jobs/plan                        → submit a plan job   → 202 {job_id}
@@ -34,11 +38,15 @@
 //! (`compile`'s wall-clock `compile_timings` are the one non-deterministic
 //! field; everything else is deterministic given the same project + state.)
 //!
-//! `models`, `models/:name`, and `dag/layers` render the dashboard's
-//! ad-hoc shapes and are **explicitly out of the `/api/v1` value contract**
-//! for now — they have no canonical CLI counterpart (promoting them is
-//! net-new construction, deferred). `health`, `POST /compile`, and
-//! `dag/status` are server-lifecycle, also out of contract.
+//! `health`, `models`, `models/:name`, `dag/layers` and `dag/status` have
+//! **no CLI counterpart** — no verb lists compiled models with their graph
+//! edges, and the DAG status is populated by the in-process executor only.
+//! They still serve typed payloads (`HealthOutput`, `ModelListOutput`,
+//! `ModelDetailOutput`, `DagLayersOutput`, `DagStatusOutput`) exported
+//! through the same schema registry as every CLI output, so the OpenAPI
+//! document and the generated bindings describe them; `/meta` advertises
+//! the `estate` capability for them. Only `POST /compile` is still an
+//! ad-hoc server-lifecycle body.
 //!
 //! All routes except `/api/v1/health` require a Bearer token when one is
 //! configured on [`ServerState`]; see [`rocky_server::auth`]. A token
@@ -74,13 +82,32 @@ use rocky_server::auth::{build_cors_layer, require_bearer_token};
 use rocky_server::dashboard;
 use rocky_server::state::ServerState;
 
+use crate::commands::audit::{
+    compute_audit, compute_audit_for, compute_audit_scorecard, parse_window, plan_file_path,
+    resolve_product_scope,
+};
+use crate::commands::product::{
+    ProductJournalOutput, ProductListOutput, ProductStatusOutput, product_journal_in,
+    product_list_in, product_names_in, product_status_in,
+};
+use crate::commands::review::{
+    ReviewMarkerState, compute_review_queue, compute_review_status, review_marker_state,
+};
+use crate::commands::{BriefSince, compute_brief};
 use crate::commands::{
     ScheduleStatusError, column_lineage_output, compile_output, dag_output, history_runs_output,
     lineage_output, metrics_output, model_history_output, schedule_status_output, schemas_hash,
 };
 use crate::output::{
-    ColumnLineageOutput, CompileOutput, DagOutput, ErrorEnvelope, HistoryOutput, JobKind, JobState,
-    JobStatus, LineageOutput, MetaOutput, MetricsOutput, ModelHistoryOutput, ScheduleStatusOutput,
+    AuditForOutput, AuditOutput, AuditScorecardOutput, BriefOutput, ReviewQueueOutput,
+    ReviewStatusOutput, ScorecardDimension,
+};
+use crate::output::{
+    ColumnLineageOutput, CompileOutput, DagExecutionOutput, DagLayersOutput, DagNodeResultOutput,
+    DagNodeStatusOutput, DagOutput, DagStatusOutput, ErrorEnvelope, HealthOutput, HistoryOutput,
+    JobKind, JobState, JobStatus, LineageOutput, MetaOutput, MetricsOutput, ModelColumnOutput,
+    ModelDetailOutput, ModelHistoryOutput, ModelListEntry, ModelListOutput, ScheduleStatusOutput,
+    TypedColumnOutput, cap_model_sql,
 };
 
 /// Bind config for [`serve`].
@@ -132,7 +159,7 @@ impl Default for ServeConfig {
 pub fn router(state: Arc<ServerState>) -> Router {
     let cors = build_cors_layer(&state.allowed_origins);
 
-    Router::new()
+    let api = Router::new()
         .route("/", get(dashboard::dashboard))
         .route("/dashboard", get(dashboard::dashboard))
         .route("/api/v1/health", get(health))
@@ -154,6 +181,15 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/jobs/apply", post(submit_apply))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/schedule", get(schedule_status))
+        .route("/api/v1/products", get(list_products))
+        .route("/api/v1/products/{name}", get(get_product))
+        .route("/api/v1/products/{name}/journal", get(product_journal))
+        .route("/api/v1/review/queue", get(review_queue))
+        .route("/api/v1/review/{plan_id}/status", get(review_status))
+        .route("/api/v1/brief", get(governor_brief))
+        .route("/api/v1/audit", get(audit_ledger))
+        .route("/api/v1/audit/scorecard", get(audit_scorecard))
+        .route("/api/v1/custody/{subject}", get(custody_chain))
         // Webhook ingress. Registered BEFORE the auth layer like every route, but
         // the middleware PREFIX-exempts `/api/v1/hooks/trigger/{pipeline}` from
         // the Bearer token (see `rocky_server::auth`): the handler authenticates
@@ -172,7 +208,33 @@ pub fn router(state: Arc<ServerState>) -> Router {
             require_bearer_token,
         ))
         .layer(cors)
-        .with_state(state)
+        .with_state(state.clone());
+
+    // The browser UI's files are public (they carry no data, and the page
+    // must load before it has a token to send), so they sit OUTSIDE the
+    // bearer layer above. They exist only with `--ui`; without it there is
+    // no `/ui` path, and the API fallback answers as before.
+    let app = if state.ui.is_some() {
+        api.merge(crate::ui::ui_router(state.clone()))
+    } else {
+        api
+    };
+
+    app
+        // The `Host`/`Origin` guard is outermost so it precedes routing for
+        // every request, UI files included. It is a no-op without `--ui`.
+        .layer(middleware::from_fn_with_state(
+            state,
+            rocky_server::auth::require_known_host,
+        ))
+        // A body over the limit is refused by the extractors with a bare
+        // `413`; this rewrites it into the envelope. Every mode, every route.
+        .layer(middleware::map_response(
+            crate::ui::envelope_payload_too_large,
+        ))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            crate::ui::MAX_REQUEST_BODY_BYTES,
+        ))
 }
 
 /// Start the HTTP server.
@@ -354,6 +416,38 @@ impl ApiError {
         )
     }
 
+    /// `404` — no spec file and no state record under this product name.
+    fn product_not_found(name: &str) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "product_not_found",
+            format!("product '{name}' not found"),
+            Some("list the products this project knows at GET /api/v1/products"),
+        )
+    }
+
+    /// `404` — no persisted plan file under this id.
+    fn plan_not_found(plan_id: &str) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "plan_not_found",
+            format!("plan '{plan_id}' not found"),
+            Some("list the pending plans at GET /api/v1/review/queue"),
+        )
+    }
+
+    /// `409` — a review marker exists for the plan but is malformed, or
+    /// names another plan. An integrity fault of custody files, not a server
+    /// fault; the CLI refuses the same way.
+    fn review_marker_malformed(plan_id: &str, reason: &str) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "review_marker_malformed",
+            format!("review marker for plan '{plan_id}' is invalid: {reason}"),
+            Some("re-approve with `rocky review <plan-id> --approve` to rewrite it atomically"),
+        )
+    }
+
     /// `404` — no job with this id (neither in-memory nor persisted).
     fn job_not_found(id: &str) -> Self {
         Self::new(
@@ -395,6 +489,18 @@ impl ApiError {
     /// `400` — the request body could not be parsed.
     fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "bad_request", message, None)
+    }
+
+    /// `409` — `products/<name>.toml` exists but the spec loader rejects it,
+    /// so the product's output model cannot be resolved. An integrity fault of
+    /// a custody file, like a malformed review marker, not a server fault.
+    fn product_spec_invalid(name: &str, code: &str, reason: &str) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "product_spec_invalid",
+            format!("product '{name}' has a spec the loader rejects ({code}): {reason}"),
+            Some("fix products/<name>.toml until `rocky product verify <name>` accepts it"),
+        )
     }
 
     /// `404` — no route matches the request path. Deliberately distinct from
@@ -574,6 +680,31 @@ where
     }
 }
 
+/// Query-string extractor whose rejection is the error envelope (`400
+/// bad_request`) rather than axum's plain-text body, so a malformed query
+/// string fails the same way a malformed path parameter does.
+struct ApiQuery<T>(T);
+
+impl<S, T> FromRequestParts<S> for ApiQuery<T>
+where
+    T: serde::de::DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::extract::Query::<T>::from_request_parts(parts, state).await {
+            Ok(axum::extract::Query(value)) => Ok(Self(value)),
+            Err(rejection) => Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                rejection.body_text(),
+                None,
+            )),
+        }
+    }
+}
+
 /// Map a blocking-task join failure (panic / cancel) onto a `500`.
 fn map_join_err(err: &tokio::task::JoinError) -> ApiError {
     ApiError::internal(format!("blocking task failed: {err}"))
@@ -619,6 +750,15 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "POST /api/v1/jobs/apply",
         "GET /api/v1/jobs/{id}",
         "GET /api/v1/schedule",
+        "GET /api/v1/products",
+        "GET /api/v1/products/{name}",
+        "GET /api/v1/products/{name}/journal",
+        "GET /api/v1/review/queue",
+        "GET /api/v1/review/{plan_id}/status",
+        "GET /api/v1/brief",
+        "GET /api/v1/audit",
+        "GET /api/v1/audit/scorecard",
+        "GET /api/v1/custody/{subject}",
         "POST /api/v1/hooks/trigger/{pipeline}",
     ]
     .into_iter()
@@ -628,7 +768,9 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
 
 /// Coarse capability tokens so embedders feature-detect a build's surface
 /// without version-sniffing. The canonical read routes carry the same
-/// `*Output` shapes the CLI `--output json` emits.
+/// `*Output` shapes the CLI `--output json` emits. `estate` says the five
+/// server-only routes (`/health`, `/models`, `/models/{name}`, `/dag/layers`,
+/// `/dag/status`) answer with their typed, schema-exported payloads.
 fn capabilities() -> Vec<String> {
     [
         "compile",
@@ -642,6 +784,12 @@ fn capabilities() -> Vec<String> {
         "jobs",
         "schedule",
         "webhooks",
+        "estate",
+        "products",
+        "review",
+        "governor",
+        "audit",
+        "journal",
     ]
     .into_iter()
     .map(String::from)
@@ -650,8 +798,12 @@ fn capabilities() -> Vec<String> {
 
 // --- Route handlers ---
 
-async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
+/// `GET /api/v1/health` — auth-exempt liveness probe, typed [`HealthOutput`].
+async fn health() -> PrettyJson<HealthOutput> {
+    PrettyJson(HealthOutput {
+        status: "ok".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    })
 }
 
 /// `GET /api/v1/meta` — engine + config fingerprint for feature detection.
@@ -683,39 +835,44 @@ async fn meta(State(state): State<Arc<ServerState>>) -> PrettyJson<MetaOutput> {
     })
 }
 
-/// `GET /api/v1/models` — dashboard-only model list (out of `/api/v1` contract).
+/// `GET /api/v1/models` — the compiled model list, typed [`ModelListOutput`].
+///
+/// No CLI counterpart: no verb lists compiled models with their graph edges.
+/// Sorted by model name; bounded by the project's model count.
 async fn list_models(
     State(state): State<Arc<ServerState>>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<PrettyJson<ModelListOutput>, ApiError> {
     let lock = state.compile_result.read().await;
     let result = lock.as_ref().ok_or_else(ApiError::engine_not_ready)?;
 
-    let models: Vec<serde_json::Value> = result
+    let mut models: Vec<ModelListEntry> = result
         .semantic_graph
         .models
         .iter()
-        .map(|(name, schema)| {
-            serde_json::json!({
-                "name": name,
-                "columns": schema.columns.len(),
-                "has_star": schema.has_star,
-                "upstream": schema.upstream,
-                "downstream": schema.downstream,
-            })
+        .map(|(name, schema)| ModelListEntry {
+            name: name.clone(),
+            columns: schema.columns.len(),
+            has_star: schema.has_star,
+            upstream: schema.upstream.clone(),
+            downstream: schema.downstream.clone(),
         })
         .collect();
+    // The graph iterates in topological order; the list contract is by name.
+    models.sort_by(|a, b| a.name.cmp(&b.name));
 
-    Ok(Json(serde_json::json!({
-        "models": models,
-        "count": models.len(),
-    })))
+    let count = models.len();
+    Ok(PrettyJson(ModelListOutput { models, count }))
 }
 
-/// `GET /api/v1/models/:name` — dashboard-only model detail (out of contract).
+/// `GET /api/v1/models/:name` — one model's detail, typed [`ModelDetailOutput`].
+///
+/// No CLI counterpart. The SQL text is capped at
+/// [`crate::output::MODEL_DETAIL_SQL_CAP_BYTES`]; a cut is reported, never
+/// silent.
 async fn get_model(
     State(state): State<Arc<ServerState>>,
     ApiPath(name): ApiPath<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<PrettyJson<ModelDetailOutput>, ApiError> {
     let lock = state.compile_result.read().await;
     let result = lock.as_ref().ok_or_else(ApiError::engine_not_ready)?;
 
@@ -724,23 +881,37 @@ async fn get_model(
         .model_schema(&name)
         .ok_or_else(|| ApiError::model_not_found(&name))?;
 
-    let typed_cols = result.type_check.typed_models.get(&name);
+    let typed_columns = result.type_check.typed_models.get(&name).map(|cols| {
+        cols.iter()
+            .map(TypedColumnOutput::from_typed_column)
+            .collect()
+    });
 
     let model = result
         .project
         .model(&name)
         .ok_or_else(|| ApiError::model_not_found(&name))?;
 
-    Ok(Json(serde_json::json!({
-        "name": name,
-        "sql": model.sql,
-        "file_path": model.file_path,
-        "columns": schema.columns,
-        "typed_columns": typed_cols,
-        "has_star": schema.has_star,
-        "upstream": schema.upstream,
-        "downstream": schema.downstream,
-    })))
+    let (sql, sql_truncated) = cap_model_sql(&model.sql);
+
+    Ok(PrettyJson(ModelDetailOutput {
+        name,
+        sql,
+        sql_truncated,
+        sql_bytes: model.sql.len(),
+        file_path: model.file_path.clone(),
+        columns: schema
+            .columns
+            .iter()
+            .map(|c| ModelColumnOutput {
+                name: c.name.clone(),
+            })
+            .collect(),
+        typed_columns,
+        has_star: schema.has_star,
+        upstream: schema.upstream.clone(),
+        downstream: schema.downstream.clone(),
+    }))
 }
 
 /// `GET /api/v1/models/:name/lineage` — canonical [`LineageOutput`].
@@ -909,32 +1080,494 @@ async fn model_metrics(
     Ok(PrettyJson(output))
 }
 
-/// `GET /api/v1/dag/layers` — dashboard-only execution layers (out of contract).
+/// `GET /api/v1/dag/layers` — the execution layers, typed [`DagLayersOutput`].
+///
+/// No CLI counterpart. Bounded by the project's model count.
 async fn dag_layers(
     State(state): State<Arc<ServerState>>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<PrettyJson<DagLayersOutput>, ApiError> {
     let lock = state.compile_result.read().await;
     let result = lock.as_ref().ok_or_else(ApiError::engine_not_ready)?;
 
-    Ok(Json(serde_json::json!({
-        "layers": result.project.layers,
-        "total_models": result.project.model_count(),
-    })))
+    Ok(PrettyJson(DagLayersOutput {
+        layers: result.project.layers.clone(),
+        total_models: result.project.model_count(),
+    }))
 }
 
-/// `GET /api/v1/dag/status` — latest DAG execution status (server-only).
+/// `GET /api/v1/dag/status` — latest DAG execution status, typed
+/// [`DagStatusOutput`].
 ///
 /// Returns `503 engine_not_ready` when no DAG run has been recorded yet.
-/// Serializes the [`DagStatus`][rocky_core::dag_status::DagStatus] struct;
-/// pinned out of the `/api/v1` value contract (no CLI counterpart, and the
-/// in-process executor that populates it is future work).
+/// Projects the [`DagStatus`][rocky_core::dag_status::DagStatus] the
+/// in-process executor records; there is no CLI counterpart.
 async fn dag_status(
     State(state): State<Arc<ServerState>>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<PrettyJson<DagStatusOutput>, ApiError> {
     match state.dag_status.get().await {
-        Some(status) => Ok(Json(serde_json::json!(status))),
+        Some(status) => Ok(PrettyJson(dag_status_output(&status))),
         None => Err(ApiError::engine_not_ready()),
     }
+}
+
+/// Project the executor's [`DagStatus`][rocky_core::dag_status::DagStatus]
+/// onto the served [`DagStatusOutput`], field for field.
+fn dag_status_output(status: &rocky_core::dag_status::DagStatus) -> DagStatusOutput {
+    use rocky_core::dag_executor::NodeStatus;
+
+    let result = &status.result;
+    DagStatusOutput {
+        completed_at: status.completed_at,
+        result: DagExecutionOutput {
+            nodes: result
+                .nodes
+                .iter()
+                .map(|n| DagNodeResultOutput {
+                    id: n.id.clone(),
+                    kind: n.kind.clone(),
+                    label: n.label.clone(),
+                    // Exhaustive on purpose: a new executor status must be
+                    // given a served rendering here, not fall through.
+                    status: match n.status {
+                        NodeStatus::Pending => DagNodeStatusOutput::Pending,
+                        NodeStatus::Running => DagNodeStatusOutput::Running,
+                        NodeStatus::Completed => DagNodeStatusOutput::Completed,
+                        NodeStatus::Failed => DagNodeStatusOutput::Failed,
+                        NodeStatus::Skipped => DagNodeStatusOutput::Skipped,
+                    },
+                    layer: n.layer,
+                    duration_ms: n.duration_ms,
+                    error: n.error.clone(),
+                })
+                .collect(),
+            total_layers: result.total_layers,
+            total_nodes: result.total_nodes,
+            completed: result.completed,
+            failed: result.failed,
+            skipped: result.skipped,
+            duration_ms: result.duration_ms,
+        },
+    }
+}
+
+/// The project root the product routes read `products/` under: the directory
+/// of the bound `rocky.toml`. `503 engine_not_ready` when no config is bound —
+/// a models-only sidecar has no product surface.
+fn project_root_for(state: &ServerState) -> Result<std::path::PathBuf, ApiError> {
+    let config = state
+        .config_path
+        .as_deref()
+        .ok_or_else(ApiError::engine_not_ready)?;
+    Ok(match config.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    })
+}
+
+/// `GET /api/v1/products` — canonical [`ProductListOutput`].
+///
+/// The same bytes as `rocky product list --output json` for the project the
+/// bound config names. Reads `products/` and the state store; never writes.
+async fn list_products(
+    State(state): State<Arc<ServerState>>,
+) -> Result<PrettyJson<ProductListOutput>, ApiError> {
+    let root = project_root_for(&state)?;
+    let state_path = state_path_for(&state);
+    let output = tokio::task::spawn_blocking(move || product_list_in(&root, Some(&state_path)))
+        .await
+        .map_err(|e| map_join_err(&e))?
+        .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    Ok(PrettyJson(output))
+}
+
+/// `GET /api/v1/products/:name` — canonical [`ProductStatusOutput`].
+///
+/// The same bytes as `rocky product status <name> --output json`. A name
+/// with neither a spec file nor a state record is `404 product_not_found`;
+/// a spec that exists but does not parse is `200` with `spec_error` set,
+/// exactly as the CLI reports it.
+async fn get_product(
+    State(state): State<Arc<ServerState>>,
+    ApiPath(name): ApiPath<String>,
+) -> Result<PrettyJson<ProductStatusOutput>, ApiError> {
+    // A name is only ever looked up in the computed product set before any
+    // path is built from it, so a traversal cannot reach the filesystem.
+    // This guard refuses anything that is not a bare identifier before
+    // opening anything: a spec's own `product.name` must be one to exist.
+    if !is_bare_product_name(&name) {
+        return Err(ApiError::product_not_found(&name));
+    }
+    let root = project_root_for(&state)?;
+    let state_path = state_path_for(&state);
+    let lookup = name.clone();
+    let output = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<_>> {
+        let known = product_names_in(&root, Some(&state_path))?;
+        if !known.iter().any(|known| known == &lookup) {
+            return Ok(None);
+        }
+        product_status_in(&root, Some(&state_path), &lookup).map(Some)
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    match output {
+        Some(status) => Ok(PrettyJson(status)),
+        None => Err(ApiError::product_not_found(&name)),
+    }
+}
+
+/// `GET /api/v1/products/{name}/journal` — canonical [`ProductJournalOutput`].
+///
+/// The same bytes as `rocky product journal <name> --output json`: the
+/// product's fulfillment journal rows in append order, read through the
+/// store function the loop reads through. A name that is not a bare
+/// identifier, or that neither a spec file nor a store record knows, is
+/// `404 product_not_found`. A known product with no rows is an empty
+/// journal, not a refusal.
+async fn product_journal(
+    State(state): State<Arc<ServerState>>,
+    ApiPath(name): ApiPath<String>,
+) -> Result<PrettyJson<ProductJournalOutput>, ApiError> {
+    if !is_bare_product_name(&name) {
+        return Err(ApiError::product_not_found(&name));
+    }
+    let root = project_root_for(&state)?;
+    let state_path = state_path_for(&state);
+    let lookup = name.clone();
+    let output =
+        tokio::task::spawn_blocking(move || product_journal_in(&root, Some(&state_path), &lookup))
+            .await
+            .map_err(|e| map_join_err(&e))?
+            .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    match output {
+        Some(journal) => Ok(PrettyJson(journal)),
+        None => Err(ApiError::product_not_found(&name)),
+    }
+}
+
+/// `GET /api/v1/review/queue` — canonical [`ReviewQueueOutput`].
+///
+/// The same bytes as `rocky review --queue --output json` for the project the
+/// bound config names, modulo the clock: `staleness_seconds` and the `score`
+/// it feeds derive from the request instant. Compiles the project once per
+/// call to rank by blast radius, exactly as the CLI does. Reads only.
+async fn review_queue(
+    State(state): State<Arc<ServerState>>,
+) -> Result<PrettyJson<ReviewQueueOutput>, ApiError> {
+    let root = project_root_for(&state)?;
+    let config = state
+        .config_path
+        .clone()
+        .ok_or_else(ApiError::engine_not_ready)?;
+    let state_path = state_path_for(&state);
+    let models_dir = state.models_dir.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        compute_review_queue(&root, &config, &state_path, &models_dir)
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    Ok(PrettyJson(output))
+}
+
+/// `GET /api/v1/review/:plan_id/status` — canonical [`ReviewStatusOutput`].
+///
+/// The same bytes as `rocky review <plan-id> --status --output json`. A plan
+/// id that is not 64 lower-case hex characters, or has no plan file, is
+/// `404 plan_not_found`. A marker that exists but is malformed or names
+/// another plan is `409 review_marker_malformed`, with the CLI's own reason.
+async fn review_status(
+    State(state): State<Arc<ServerState>>,
+    ApiPath(plan_id): ApiPath<String>,
+) -> Result<PrettyJson<ReviewStatusOutput>, ApiError> {
+    if !is_plan_id(&plan_id) {
+        return Err(ApiError::plan_not_found(&plan_id));
+    }
+    let root = project_root_for(&state)?;
+    let lookup = plan_id.clone();
+    let output = tokio::task::spawn_blocking(move || -> anyhow::Result<ReviewStatusLookup> {
+        if !plan_file_path(&root, &lookup).is_file() {
+            return Ok(ReviewStatusLookup::NoPlan);
+        }
+        if let ReviewMarkerState::Invalid { reason } = review_marker_state(&root, &lookup) {
+            return Ok(ReviewStatusLookup::MalformedMarker { reason });
+        }
+        compute_review_status(&root, &lookup)
+            .map(|status| ReviewStatusLookup::Found(Box::new(status)))
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    match output {
+        ReviewStatusLookup::Found(status) => Ok(PrettyJson(*status)),
+        ReviewStatusLookup::NoPlan => Err(ApiError::plan_not_found(&plan_id)),
+        ReviewStatusLookup::MalformedMarker { reason } => {
+            Err(ApiError::review_marker_malformed(&plan_id, &reason))
+        }
+    }
+}
+
+/// The three ways a status lookup can end, decided on the blocking side so
+/// the handler maps each to its documented status code.
+enum ReviewStatusLookup {
+    /// Boxed: the payload dwarfs the two refusal arms.
+    Found(Box<ReviewStatusOutput>),
+    NoPlan,
+    MalformedMarker {
+        reason: String,
+    },
+}
+
+/// A plan id is the 64 lower-case hex characters of a blake3 digest. Anything
+/// else names no plan file, so the route answers 404 without touching disk.
+fn is_plan_id(candidate: &str) -> bool {
+    candidate.len() == 64
+        && candidate
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+// --- The governor routes: brief, scorecard, custody ---
+
+/// Query string of `GET /api/v1/brief`.
+#[derive(Debug, Deserialize)]
+struct BriefQuery {
+    /// `last` | `24h` | `7d`. Defaults to `7d`.
+    since: Option<String>,
+}
+
+/// Query string of `GET /api/v1/audit/scorecard`.
+#[derive(Debug, Deserialize)]
+struct ScorecardQuery {
+    /// `principal` | `rule` | `scope`. Defaults to `principal`.
+    by: Option<String>,
+    /// `all`, or a `<N>d` / `<N>h` duration. Defaults to `all`.
+    window: Option<String>,
+}
+
+/// Longest custody subject the route reads. Model names are short
+/// identifiers, run ids and plan ids are fixed-width, and a decision-only
+/// custody id (`freeze:…`, `draft:…`, `autoapply:…`) is one of those with a
+/// prefix; anything longer is not a subject the ledger can hold.
+const MAX_CUSTODY_SUBJECT_BYTES: usize = 512;
+
+/// `GET /api/v1/brief` — canonical [`BriefOutput`].
+///
+/// The same bytes as `rocky brief --since <since> --output json`, except
+/// `generated_at` and, for the relative windows, `since_timestamp`, which
+/// derive from the request instant. The route never advances the digest
+/// cursor: `since=last` reads the cursor as it stands, so a screen that
+/// refreshes does not consume a Slack hook's `--since last` window. The
+/// default is `7d`, the MCP tool's default rather than the CLI's `last`,
+/// because a route that cannot advance the cursor has no window of its own
+/// under `last`, and a first-ever `last` spans all of recorded history.
+async fn governor_brief(
+    State(state): State<Arc<ServerState>>,
+    ApiQuery(query): ApiQuery<BriefQuery>,
+) -> Result<PrettyJson<BriefOutput>, ApiError> {
+    let since = match query.since.as_deref().unwrap_or("7d") {
+        "last" => BriefSince::Last,
+        "24h" => BriefSince::Hours24,
+        "7d" => BriefSince::Days7,
+        other => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                format!("unknown since window '{other}'"),
+                Some("pass since=last, since=24h or since=7d"),
+            ));
+        }
+    };
+    let root = project_root_for(&state)?;
+    let config = state
+        .config_path
+        .clone()
+        .ok_or_else(ApiError::engine_not_ready)?;
+    let state_path = state_path_for(&state);
+    let output = tokio::task::spawn_blocking(move || {
+        compute_brief(&root, &state_path, &config, since, chrono::Utc::now())
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    Ok(PrettyJson(output))
+}
+
+/// `GET /api/v1/audit/scorecard` — canonical [`AuditScorecardOutput`].
+///
+/// The same bytes as `rocky audit --scorecard --by <by> --window <window>
+/// --output json`, except `window_start` for a duration window, which derives
+/// from the request instant. Reads the state store only, so it needs no bound
+/// config. A malformed `window` is `400` with the CLI's own message; a ledger
+/// that cannot be read is `200` with `availability: unavailable`, because the
+/// core fails closed inside the payload and the CLI prints exactly that.
+async fn audit_scorecard(
+    State(state): State<Arc<ServerState>>,
+    ApiQuery(query): ApiQuery<ScorecardQuery>,
+) -> Result<PrettyJson<AuditScorecardOutput>, ApiError> {
+    let by = match query.by.as_deref().unwrap_or("principal") {
+        "principal" => ScorecardDimension::Principal,
+        "rule" => ScorecardDimension::Rule,
+        "scope" => ScorecardDimension::Scope,
+        other => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                format!("unknown scorecard dimension '{other}'"),
+                Some("pass by=principal, by=rule or by=scope"),
+            ));
+        }
+    };
+    // Validated here so a usage error is a 400; the only other failure the
+    // core can return is then a read failure, which stays a 500.
+    parse_window(query.window.as_deref(), chrono::Utc::now()).map_err(|e| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            format!("{e:#}"),
+            Some("pass window=all or a <N>d / <N>h duration such as window=30d"),
+        )
+    })?;
+    let state_path = state_path_for(&state);
+    let window = query.window;
+    let output = tokio::task::spawn_blocking(move || {
+        compute_audit_scorecard(&state_path, by, window.as_deref())
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    Ok(PrettyJson(output))
+}
+
+/// `GET /api/v1/custody/{subject}` — canonical [`AuditForOutput`].
+///
+/// The same bytes as `rocky audit --for <subject> --output json`: the custody
+/// chain for a model name, a run id, a plan id, or a decision-only custody id
+/// such as `freeze:global`. A subject nothing references is `200` with
+/// `resolved: false`, as the CLI. Compiles the project once per request for
+/// the blast radius, as the CLI does. The subject touches disk only when it is
+/// 64 hex characters, through the non-creating plan-path probe.
+async fn custody_chain(
+    State(state): State<Arc<ServerState>>,
+    ApiPath(subject): ApiPath<String>,
+) -> Result<PrettyJson<AuditForOutput>, ApiError> {
+    if subject.len() > MAX_CUSTODY_SUBJECT_BYTES {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            format!(
+                "subject is {} bytes; the limit is {MAX_CUSTODY_SUBJECT_BYTES}",
+                subject.len()
+            ),
+            Some("pass a model name, a run id, a plan id or a custody id"),
+        ));
+    }
+    let root = project_root_for(&state)?;
+    let config = state
+        .config_path
+        .clone()
+        .ok_or_else(ApiError::engine_not_ready)?;
+    let state_path = state_path_for(&state);
+    let models_dir = state.models_dir.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        compute_audit_for(&root, &config, &state_path, &models_dir, &subject)
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    Ok(PrettyJson(output))
+}
+
+/// Query string of `GET /api/v1/audit`.
+#[derive(Debug, Deserialize)]
+struct AuditQuery {
+    /// A product name: list only the rows about its output model.
+    product: Option<String>,
+}
+
+/// The three ways a ledger lookup can end, decided on the blocking side so
+/// the handler maps each to its documented status code.
+enum AuditLookup {
+    /// Boxed: the payload dwarfs the two refusal arms.
+    Found(Box<AuditOutput>),
+    NoProduct,
+    SpecInvalid {
+        code: String,
+        reason: String,
+    },
+}
+
+/// `GET /api/v1/audit` — canonical [`AuditOutput`].
+///
+/// The same bytes as `rocky audit --output json`: every recorded policy
+/// decision, oldest first. With `?product=<name>`, the same bytes as
+/// `rocky audit --product <name> --output json`: only the rows about that
+/// product's output model, resolved from `products/<name>.toml` through the
+/// loader `rocky product status` uses. Unfiltered, it reads the state store
+/// only and needs no bound config. A name that is not a bare identifier, or
+/// has no spec file, is `404 product_not_found`; a spec the loader rejects is
+/// `409 product_spec_invalid` with the loader's code and reason.
+async fn audit_ledger(
+    State(state): State<Arc<ServerState>>,
+    ApiQuery(query): ApiQuery<AuditQuery>,
+) -> Result<PrettyJson<AuditOutput>, ApiError> {
+    let product_name = query.product.clone().unwrap_or_default();
+    let scope = match query.product {
+        None => None,
+        Some(name) => {
+            // The spec path is built only from a bare identifier, the same
+            // guard the product routes apply before opening anything.
+            if !is_bare_product_name(&name) {
+                return Err(ApiError::product_not_found(&name));
+            }
+            Some((project_root_for(&state)?, name))
+        }
+    };
+    let state_path = state_path_for(&state);
+    let output = tokio::task::spawn_blocking(move || -> anyhow::Result<AuditLookup> {
+        let product = match scope {
+            None => None,
+            Some((root, name)) => match resolve_product_scope(&root, &name) {
+                Ok(scope) => Some(scope),
+                Err(reject) if reject.code == "spec-file-missing" => {
+                    return Ok(AuditLookup::NoProduct);
+                }
+                Err(reject) => {
+                    return Ok(AuditLookup::SpecInvalid {
+                        code: reject.code.to_string(),
+                        reason: reject.message,
+                    });
+                }
+            },
+        };
+        compute_audit(&state_path, product).map(|output| AuditLookup::Found(Box::new(output)))
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    match output {
+        AuditLookup::Found(output) => Ok(PrettyJson(*output)),
+        AuditLookup::NoProduct => Err(ApiError::product_not_found(&product_name)),
+        AuditLookup::SpecInvalid { code, reason } => Err(ApiError::product_spec_invalid(
+            &product_name,
+            &code,
+            &reason,
+        )),
+    }
+}
+
+/// The rule a product name must satisfy to exist at all: a bare identifier,
+/// ASCII letter or `_` first, then ASCII letters, digits or `_`. It is the
+/// spec parser's `product-name-invalid` rule, so a name that fails it can
+/// name no spec file and no state record, and the route can answer 404
+/// without touching the filesystem or the store.
+fn is_bare_product_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    match bytes.next() {
+        Some(b) if b.is_ascii_alphabetic() || b == b'_' => {}
+        _ => return false,
+    }
+    bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// `GET /api/v1/schedule` — a read-only scheduler snapshot.
@@ -1642,8 +2275,9 @@ mod tests {
         let base = spawn_router(test_state()).await;
         let resp = reqwest::get(format!("{base}/api/v1/health")).await.unwrap();
         assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["status"], "ok");
+        let body: HealthOutput = resp.json().await.unwrap();
+        assert_eq!(body.status, "ok");
+        assert_eq!(body.version, env!("CARGO_PKG_VERSION"));
     }
 
     #[tokio::test]
@@ -1654,13 +2288,99 @@ mod tests {
 
         let resp = reqwest::get(format!("{base}/api/v1/models")).await.unwrap();
         assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["count"], 3);
+        let text = resp.text().await.unwrap();
+        let body: ModelListOutput = serde_json::from_str(&text).unwrap();
+        assert_eq!(body.count, 3);
+        assert_eq!(
+            body.models.len(),
+            body.count,
+            "count must equal the list length"
+        );
+        // Pretty-printed like every canonical route.
+        assert_eq!(text, reference_bytes(&body));
+        let customer_orders = body
+            .models
+            .iter()
+            .find(|m| m.name == "customer_orders")
+            .expect("the fixture's customer_orders model is listed");
+        assert!(customer_orders.upstream.contains(&"raw_orders".to_string()));
+        assert!(!customer_orders.has_star);
     }
 
     #[tokio::test]
     async fn test_get_model_detail() {
         let state = test_state();
+        state.recompile().await;
+        let state_for_detail = state.clone();
+        let base = spawn_router(state).await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/models/raw_orders"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let body: ModelDetailOutput = serde_json::from_str(&text).unwrap();
+        assert_eq!(body.name, "raw_orders");
+        assert!(body.sql.contains("SELECT"));
+        assert!(!body.sql_truncated, "a fixture-sized model is never cut");
+        assert_eq!(body.sql_bytes, body.sql.len());
+        assert!(body.file_path.ends_with("raw_orders.sql"));
+        assert!(
+            body.columns.iter().any(|c| c.name == "order_id"),
+            "inferred columns carry the projection: {:?}",
+            body.columns
+        );
+        // Pretty-printed like every canonical route.
+        assert_eq!(text, reference_bytes(&body));
+        // The typed columns carry the structured type and its label together,
+        // and the label is exactly the type's own rendering.
+        let typed = body
+            .typed_columns
+            .as_ref()
+            .expect("the type checker produces columns for a fixture model");
+        assert!(!typed.is_empty());
+        for column in typed {
+            assert_eq!(column.data_type_display, column.data_type.to_string());
+        }
+        // The served type is the checker's own, field for field.
+        let state_cols: Vec<TypedColumnOutput> = {
+            let lock = state_for_detail.compile_result.read().await;
+            lock.as_ref().unwrap().type_check.typed_models["raw_orders"]
+                .iter()
+                .map(TypedColumnOutput::from_typed_column)
+                .collect()
+        };
+        assert_eq!(
+            serde_json::to_value(typed).unwrap(),
+            serde_json::to_value(&state_cols).unwrap()
+        );
+    }
+
+    /// The one estate route whose size is not bounded by the model count
+    /// carries an explicit cap, and a cut is reported, never silent.
+    #[tokio::test]
+    async fn model_detail_caps_long_sql_and_says_so() {
+        use crate::output::MODEL_DETAIL_SQL_CAP_BYTES;
+
+        // A copy of the fixture project with one model padded past the cap.
+        // The padding is a SQL comment that ends on a multi-byte character,
+        // so the cut also has to land on a char boundary.
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        for entry in std::fs::read_dir(simple_project_models()).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), models.join(entry.file_name())).unwrap();
+        }
+        let padded = models.join("raw_orders.sql");
+        let mut sql = std::fs::read_to_string(&padded).unwrap();
+        let line = "-- ééééééééééééééééééééééééééééééééééééééééééééé\n";
+        while sql.len() <= MODEL_DETAIL_SQL_CAP_BYTES + 4096 {
+            sql.push_str(line);
+        }
+        std::fs::write(&padded, &sql).unwrap();
+
+        let state = ServerState::new(models, None, None);
         state.recompile().await;
         let base = spawn_router(state).await;
 
@@ -1668,9 +2388,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["name"], "raw_orders");
-        assert!(body["sql"].as_str().unwrap().contains("SELECT"));
+        let body: ModelDetailOutput = resp.json().await.unwrap();
+        assert!(
+            body.sql_truncated,
+            "a model past the cap must say it was cut"
+        );
+        // The loader trims the file's surrounding whitespace before it stores
+        // the SQL, so the reported length is the trimmed source's.
+        let stored = sql.trim();
+        assert_eq!(body.sql_bytes, stored.len(), "the full length is reported");
+        assert!(body.sql_bytes > MODEL_DETAIL_SQL_CAP_BYTES);
+        assert!(body.sql.len() <= MODEL_DETAIL_SQL_CAP_BYTES);
+        assert!(
+            stored.starts_with(&body.sql),
+            "the served text is a prefix of the source"
+        );
     }
 
     #[tokio::test]
@@ -1698,9 +2430,1001 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["total_models"], 3);
-        assert_eq!(body["layers"].as_array().unwrap().len(), 3);
+        let body: DagLayersOutput = resp.json().await.unwrap();
+        assert_eq!(body.total_models, 3);
+        assert_eq!(body.layers.len(), 3);
+        let listed: usize = body.layers.iter().map(Vec::len).sum();
+        assert_eq!(
+            listed, body.total_models,
+            "every model sits in exactly one layer"
+        );
+    }
+
+    /// The model list is sorted by name, whatever order the graph iterates in.
+    #[tokio::test]
+    async fn model_list_is_sorted_by_name() {
+        let state = test_state();
+        state.recompile().await;
+        let base = spawn_router(state).await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/models")).await.unwrap();
+        let body: ModelListOutput = resp.json().await.unwrap();
+        let names: Vec<&str> = body.models.iter().map(|m| m.name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "{names:?}");
+    }
+
+    /// `/dag/status` projects the executor's record field for field: the
+    /// served JSON equals the executor's own serialization of the same
+    /// record, across every node status.
+    #[test]
+    fn dag_status_projection_equals_the_executor_serialization() {
+        use rocky_core::dag_executor::{DagExecutionResult, NodeResult, NodeStatus};
+        use rocky_core::dag_status::DagStatus;
+
+        let statuses = [
+            NodeStatus::Pending,
+            NodeStatus::Running,
+            NodeStatus::Completed,
+            NodeStatus::Failed,
+            NodeStatus::Skipped,
+        ];
+        let nodes = statuses
+            .iter()
+            .enumerate()
+            .map(|(i, status)| NodeResult {
+                id: format!("n{i}"),
+                kind: "model".into(),
+                label: format!("node {i}"),
+                status: status.clone(),
+                layer: i,
+                duration_ms: i as u64 * 7,
+                error: matches!(status, NodeStatus::Failed).then(|| "boom".to_string()),
+            })
+            .collect();
+        let status = DagStatus {
+            completed_at: chrono::Utc::now(),
+            result: DagExecutionResult {
+                nodes,
+                total_layers: 5,
+                total_nodes: 5,
+                completed: 1,
+                failed: 1,
+                skipped: 1,
+                duration_ms: 70,
+            },
+        };
+
+        assert_eq!(
+            serde_json::to_value(dag_status_output(&status)).unwrap(),
+            serde_json::to_value(&status).unwrap()
+        );
+    }
+
+    // --- /products ---
+
+    /// Both product routes answer with the CLI's bytes for the same project:
+    /// `rocky product list --output json` and `rocky product status <name>
+    /// --output json`, pretty-printed. An unknown name is the documented 404.
+    #[tokio::test]
+    async fn product_routes_match_the_cli_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) =
+            crate::commands::product::tests::api_fixture_project(dir.path());
+        // Approve once so the store holds records beside the spec file.
+        crate::commands::product::product_approve_in(&root, &state_path, "revenue_daily")
+            .expect("approves");
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config),
+            &state_path,
+        ))
+        .await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/products"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let expected = product_list_in(&root, Some(&state_path)).unwrap();
+        assert_eq!(text, reference_bytes(&expected));
+        let list: ProductListOutput = serde_json::from_str(&text).unwrap();
+        assert_eq!(list.count, 1);
+        assert_eq!(list.products[0].name, "revenue_daily");
+        assert_eq!(
+            list.products[0].fulfill_state.as_deref(),
+            Some("spec_approved")
+        );
+
+        let resp = reqwest::get(format!("{base}/api/v1/products/revenue_daily"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let expected = product_status_in(&root, Some(&state_path), "revenue_daily").unwrap();
+        assert_eq!(text, reference_bytes(&expected));
+
+        let resp = reqwest::get(format!("{base}/api/v1/products/nope"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "product_not_found");
+        assert!(err.remediation_hint.is_some());
+
+        // A traversal-shaped or non-identifier name is a 404 before any path
+        // is built from it: the router refuses shapes that do not match one
+        // segment (`route_not_found`), and the handler's identifier guard
+        // refuses the rest (`product_not_found`). Either way nothing on
+        // disk is touched.
+        for shape in [
+            "..",
+            "..%2F..%2Fetc%2Fpasswd",
+            "a%5Cb",
+            "a.b",
+            "-x",
+            "a%23b",
+        ] {
+            let resp = reqwest::get(format!("{base}/api/v1/products/{shape}"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 404, "{shape}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert!(
+                err.code == "product_not_found" || err.code == "route_not_found",
+                "{shape}: {}",
+                err.code
+            );
+        }
+    }
+
+    /// A product the store knows but whose spec file is gone is still a
+    /// product: listed, and served, with `spec_present = false`.
+    #[tokio::test]
+    async fn product_routes_serve_a_product_only_the_store_knows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) =
+            crate::commands::product::tests::api_fixture_project(dir.path());
+        crate::commands::product::product_approve_in(&root, &state_path, "revenue_daily")
+            .expect("approves");
+        std::fs::remove_file(root.join("products/revenue_daily.toml")).unwrap();
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config),
+            &state_path,
+        ))
+        .await;
+
+        let list: ProductListOutput = reqwest::get(format!("{base}/api/v1/products"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(list.count, 1);
+        assert!(!list.products[0].spec_present);
+
+        let resp = reqwest::get(format!("{base}/api/v1/products/revenue_daily"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let status: ProductStatusOutput = resp.json().await.unwrap();
+        assert!(!status.spec_present);
+        assert!(status.approval.is_some());
+    }
+
+    /// A store that cannot be opened for reading — here, a file that is not
+    /// a redb database at all — is the documented 500, with the envelope, on
+    /// both routes. Nothing is repaired or rewritten on the way.
+    #[tokio::test]
+    async fn product_routes_report_an_unreadable_store_as_500() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) =
+            crate::commands::product::tests::api_fixture_project(dir.path());
+        std::fs::write(&state_path, b"this is not a redb database").unwrap();
+        let before = std::fs::read(&state_path).unwrap();
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config),
+            &state_path,
+        ))
+        .await;
+
+        for path in ["/api/v1/products", "/api/v1/products/revenue_daily"] {
+            let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+            assert_eq!(resp.status(), 500, "{path}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "internal_error", "{path}");
+        }
+        assert_eq!(
+            std::fs::read(&state_path).unwrap(),
+            before,
+            "the file is left alone"
+        );
+    }
+
+    /// A models-only sidecar has no bound config, so it has no product
+    /// surface: the documented 503, with the envelope.
+    #[tokio::test]
+    async fn product_routes_need_a_bound_config() {
+        let base = spawn_router(test_state()).await;
+        for path in ["/api/v1/products", "/api/v1/products/anything"] {
+            let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+            assert_eq!(resp.status(), 503, "{path}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "engine_not_ready", "{path}");
+        }
+    }
+
+    // --- /review ---
+
+    /// A project with two pending escalations, one reviewed plan, and one
+    /// decision-only ledger row (a plan id with no plan file). Returns the
+    /// root, config, state path, and the three plan ids in that order:
+    /// pending A, pending B, reviewed C.
+    fn review_fixture(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf, [String; 3]) {
+        use crate::commands::review::{record_plan_review_escalation, write_test_review_marker};
+        use crate::plan_store::{PlanKind, write_plan};
+        use rocky_core::config::{PolicyCapability, PolicyPrincipal};
+
+        let (root, config, state_path) = crate::commands::product::tests::api_fixture_project(dir);
+        let plan = |tag: &str| {
+            write_plan(
+                &root,
+                PlanKind::Run,
+                &serde_json::json!({ "models": [tag] }),
+            )
+            .expect("plan written")
+        };
+        let a = plan("orders");
+        let b = plan("customers");
+        let c = plan("revenue");
+        for (plan_id, model, capability) in [
+            (&a, "orders", PolicyCapability::SchemaChangeAdditive),
+            (&b, "customers", PolicyCapability::SchemaChangeBreaking),
+            (&c, "revenue", PolicyCapability::SchemaChangeAdditive),
+        ] {
+            record_plan_review_escalation(
+                &state_path,
+                plan_id,
+                PolicyPrincipal::Agent,
+                capability,
+                model,
+                "test escalation",
+            );
+        }
+        // C is signed off, so it leaves the queue but keeps a status.
+        write_test_review_marker(&root, &c);
+        // A decision-only row: a plan id no file backs, counted, not listed.
+        record_plan_review_escalation(
+            &state_path,
+            &"0".repeat(64),
+            PolicyPrincipal::Agent,
+            PolicyCapability::Apply,
+            "ghost",
+            "decision-only custody row",
+        );
+        (root, config, state_path, [a, b, c])
+    }
+
+    /// Strip the two clock-derived fields from every pending entry and return
+    /// their `staleness_seconds` values, so two payloads taken a moment apart
+    /// can be compared exactly on everything else.
+    fn without_clock(mut queue: serde_json::Value) -> (serde_json::Value, Vec<i64>) {
+        let mut staleness = Vec::new();
+        if let Some(pending) = queue["pending"].as_array_mut() {
+            for entry in pending {
+                let obj = entry.as_object_mut().expect("entry object");
+                staleness.push(
+                    obj.remove("staleness_seconds")
+                        .and_then(|v| v.as_i64())
+                        .expect("staleness_seconds"),
+                );
+                obj.remove("score").expect("score");
+            }
+        }
+        (queue, staleness)
+    }
+
+    /// `/review/queue` answers with the CLI's bytes for the same project,
+    /// modulo the clock: every field equal except `staleness_seconds` and
+    /// `score`, and the staleness values within five seconds.
+    #[tokio::test]
+    async fn review_queue_matches_the_cli_modulo_the_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path, [a, b, c]) = review_fixture(dir.path());
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config.clone()),
+            &state_path,
+        ))
+        .await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/review/queue"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let served: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(served["total"], 2, "{text}");
+        assert_eq!(served["excluded_non_plan_rows"], 1);
+        let listed: Vec<&str> = served["pending"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["plan_id"].as_str().unwrap())
+            .collect();
+        assert!(listed.contains(&a.as_str()) && listed.contains(&b.as_str()));
+        assert!(
+            !listed.contains(&c.as_str()),
+            "a reviewed plan leaves the queue"
+        );
+        // Pretty-printed with a trailing newline, like every canonical route.
+        assert!(text.ends_with("}\n"), "{text}");
+
+        let expected =
+            compute_review_queue(&root, &config, &state_path, &root.join("models")).unwrap();
+        let (served_json, served_stale) = without_clock(served);
+        let (expected_json, expected_stale) =
+            without_clock(serde_json::to_value(&expected).unwrap());
+        assert_eq!(served_json, expected_json);
+        for (s, e) in served_stale.iter().zip(&expected_stale) {
+            assert!((s - e).abs() <= 5, "staleness drifted: {s} vs {e}");
+        }
+    }
+
+    /// `/review/{plan_id}/status` answers with the CLI's bytes for a pending
+    /// and a reviewed plan, and the three refusals carry their codes.
+    #[tokio::test]
+    async fn review_status_matches_the_cli_and_refuses_with_its_codes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path, [a, _b, c]) = review_fixture(dir.path());
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config),
+            &state_path,
+        ))
+        .await;
+
+        for (plan_id, reviewed) in [(&a, false), (&c, true)] {
+            let resp = reqwest::get(format!("{base}/api/v1/review/{plan_id}/status"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{plan_id}");
+            let text = resp.text().await.unwrap();
+            let expected = compute_review_status(&root, plan_id).unwrap();
+            assert_eq!(text, reference_bytes(&expected));
+            let status: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(status["reviewed"], reviewed, "{plan_id}");
+        }
+
+        // Not a plan id at all, and a well-formed id with no plan file.
+        for shape in ["not-hex", "..%2F..", &"f".repeat(64)] {
+            let resp = reqwest::get(format!("{base}/api/v1/review/{shape}/status"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 404, "{shape}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert!(
+                err.code == "plan_not_found" || err.code == "route_not_found",
+                "{shape}: {}",
+                err.code
+            );
+        }
+
+        // A marker that is not a review marker: the documented 409, with the
+        // CLI's own reason in the message.
+        let marker = crate::commands::apply::review_marker_path(&root, &a);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"not json").unwrap();
+        let resp = reqwest::get(format!("{base}/api/v1/review/{a}/status"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "review_marker_malformed");
+        assert!(err.message.contains("does not parse"), "{}", err.message);
+    }
+
+    /// Without a bound config there is no project root: the documented 503
+    /// on both review routes.
+    #[tokio::test]
+    async fn review_routes_need_a_bound_config() {
+        let base = spawn_router(test_state()).await;
+        let id = "a".repeat(64);
+        for path in [
+            "/api/v1/review/queue".to_string(),
+            format!("/api/v1/review/{id}/status"),
+        ] {
+            let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+            assert_eq!(resp.status(), 503, "{path}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "engine_not_ready", "{path}");
+        }
+    }
+
+    // --- The governor routes: brief, scorecard, custody ---
+
+    /// The review fixture plus what the governor projections need: one run
+    /// an hour ago that executed `orders`, and a decision-only `freeze:global`
+    /// row half an hour ago. Both sit well inside every relative window.
+    fn governor_fixture(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf, [String; 3]) {
+        use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+        use rocky_core::state::{
+            ModelExecution, PolicyDecisionRecord, RunRecord, RunStatus, RunTrigger, SessionSource,
+            StateStore,
+        };
+
+        let (root, config, state_path, plans) = review_fixture(dir);
+        let now = chrono::Utc::now();
+        let started = now - chrono::Duration::hours(1);
+        let store = StateStore::open(&state_path).expect("store");
+        store
+            .record_run(&RunRecord {
+                run_id: "run-orders-1".to_string(),
+                started_at: started,
+                finished_at: started + chrono::Duration::minutes(1),
+                status: RunStatus::Success,
+                models_executed: vec![ModelExecution {
+                    model_name: "orders".to_string(),
+                    started_at: started,
+                    finished_at: started + chrono::Duration::seconds(10),
+                    duration_ms: 10_000,
+                    rows_affected: Some(10),
+                    status: "success".to_string(),
+                    sql_hash: "h".to_string(),
+                    skip_hash: None,
+                    upstream_freshness: None,
+                    bytes_scanned: None,
+                    bytes_written: None,
+                    tenant: None,
+                    recipe_hash: None,
+                    input_hash: None,
+                    input_proof_class: None,
+                    env_hash: None,
+                    hash_scheme: None,
+                    output_column_hashes: None,
+                    attempts: Vec::new(),
+                }],
+                trigger: RunTrigger::Manual,
+                config_hash: "c".to_string(),
+                triggering_identity: None,
+                session_source: SessionSource::Cli,
+                git_commit: None,
+                git_branch: None,
+                idempotency_key: None,
+                target_catalog: None,
+                hostname: "host".to_string(),
+                rocky_version: "0.0.0-test".to_string(),
+                check_outcomes: Vec::new(),
+                pipeline: None,
+                submission_id: None,
+            })
+            .expect("run recorded");
+        store
+            .record_policy_decision(&PolicyDecisionRecord {
+                timestamp: now - chrono::Duration::minutes(30),
+                plan_id: "freeze:global".to_string(),
+                principal: PolicyPrincipal::Human,
+                capability: PolicyCapability::Apply,
+                model: "*".to_string(),
+                effect: PolicyEffect::Deny,
+                rule_id: Some(0),
+                reason: "test freeze".to_string(),
+                verify_after: Vec::new(),
+                auto_apply: None,
+            })
+            .expect("decision recorded");
+        drop(store);
+        (root, config, state_path, plans)
+    }
+
+    /// Strip the clock-derived fields of a digest and return its
+    /// `generated_at` instant, so two digests a moment apart compare exactly
+    /// on everything else.
+    fn brief_without_clock(
+        mut brief: serde_json::Value,
+    ) -> (serde_json::Value, chrono::DateTime<chrono::Utc>) {
+        let obj = brief.as_object_mut().expect("brief object");
+        let generated_at = obj
+            .remove("generated_at")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .expect("generated_at");
+        obj.remove("since_timestamp");
+        let at = chrono::DateTime::parse_from_rfc3339(&generated_at)
+            .expect("rfc3339")
+            .with_timezone(&chrono::Utc);
+        (brief, at)
+    }
+
+    fn rfc3339(value: &serde_json::Value) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(value.as_str().expect("timestamp string"))
+            .expect("rfc3339")
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// `/brief` answers with the CLI's bytes for each window, modulo the two
+    /// clock fields, defaults to `7d`, never advances the cursor, and refuses
+    /// an unknown window with the envelope.
+    #[tokio::test]
+    async fn brief_matches_the_cli_modulo_the_clock_and_never_moves_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path, _) = governor_fixture(dir.path());
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config.clone()),
+            &state_path,
+        ))
+        .await;
+
+        for (since, mode) in [
+            ("last", BriefSince::Last),
+            ("24h", BriefSince::Hours24),
+            ("7d", BriefSince::Days7),
+        ] {
+            let resp = reqwest::get(format!("{base}/api/v1/brief?since={since}"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{since}");
+            let text = resp.text().await.unwrap();
+            assert!(text.ends_with("}\n"), "{text}");
+            let served: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(served["since_mode"], since);
+            assert_eq!(served["runs"]["availability"], "available", "{since}");
+            assert_eq!(
+                served["escalations"]["availability"], "available",
+                "{since}"
+            );
+            let expected =
+                compute_brief(&root, &state_path, &config, mode, chrono::Utc::now()).unwrap();
+            let (served_json, served_at) = brief_without_clock(served);
+            let (expected_json, expected_at) =
+                brief_without_clock(serde_json::to_value(&expected).unwrap());
+            assert_eq!(served_json, expected_json, "{since}");
+            assert!(
+                (expected_at - served_at).num_seconds().abs() <= 5,
+                "{since}: generated_at drifted"
+            );
+        }
+
+        // No query at all is the MCP tool's `7d`, not the CLI's `last`.
+        let served: serde_json::Value = reqwest::get(format!("{base}/api/v1/brief"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(served["since_mode"], "7d");
+
+        // Three reads, one of them `last`: the cursor is still unset.
+        let cursor = rocky_core::state::StateStore::open_read_only(&state_path)
+            .unwrap()
+            .get_last_brief_at()
+            .unwrap();
+        assert!(
+            cursor.is_none(),
+            "a read must never advance the brief cursor: {cursor:?}"
+        );
+
+        let resp = reqwest::get(format!("{base}/api/v1/brief?since=yesterday"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "bad_request");
+        assert!(err.message.contains("yesterday"), "{}", err.message);
+        assert!(err.remediation_hint.is_some());
+    }
+
+    /// `/audit/scorecard` answers with the CLI's bytes for every grouping,
+    /// defaults to `principal` over `all`, differs only in `window_start` for
+    /// a duration window, and refuses the two usage errors with the envelope.
+    #[tokio::test]
+    async fn scorecard_matches_the_cli_bytes_and_refuses_bad_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path, _) = governor_fixture(dir.path());
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config),
+            &state_path,
+        ))
+        .await;
+
+        for (by, dimension) in [
+            ("principal", ScorecardDimension::Principal),
+            ("rule", ScorecardDimension::Rule),
+            ("scope", ScorecardDimension::Scope),
+        ] {
+            let resp = reqwest::get(format!("{base}/api/v1/audit/scorecard?by={by}&window=all"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{by}");
+            let text = resp.text().await.unwrap();
+            let expected = compute_audit_scorecard(&state_path, dimension, Some("all")).unwrap();
+            assert_eq!(text, reference_bytes(&expected), "{by}");
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(json["by"], by);
+            assert_eq!(json["availability"], "available", "{by}");
+        }
+
+        let text = reqwest::get(format!("{base}/api/v1/audit/scorecard"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let expected =
+            compute_audit_scorecard(&state_path, ScorecardDimension::Principal, None).unwrap();
+        assert_eq!(text, reference_bytes(&expected));
+
+        let resp = reqwest::get(format!("{base}/api/v1/audit/scorecard?window=30d"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let mut served: serde_json::Value = resp.json().await.unwrap();
+        let mut expected = serde_json::to_value(
+            compute_audit_scorecard(&state_path, ScorecardDimension::Principal, Some("30d"))
+                .unwrap(),
+        )
+        .unwrap();
+        let served_start = served
+            .as_object_mut()
+            .unwrap()
+            .remove("window_start")
+            .expect("window_start");
+        let expected_start = expected
+            .as_object_mut()
+            .unwrap()
+            .remove("window_start")
+            .expect("window_start");
+        assert_eq!(served, expected);
+        assert!(
+            (rfc3339(&expected_start) - rfc3339(&served_start))
+                .num_seconds()
+                .abs()
+                <= 5
+        );
+
+        for query in ["by=team", "window=fortnight"] {
+            let resp = reqwest::get(format!("{base}/api/v1/audit/scorecard?{query}"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{query}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "bad_request", "{query}");
+            assert!(err.remediation_hint.is_some(), "{query}");
+        }
+        // The window refusal carries the CLI's own message.
+        let err: ErrorEnvelope =
+            reqwest::get(format!("{base}/api/v1/audit/scorecard?window=fortnight"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert!(err.message.contains("fortnight"), "{}", err.message);
+    }
+
+    /// `/custody/{subject}` answers with the CLI's bytes for a model, a run,
+    /// a plan on disk, a decision-only custody id and a subject nothing
+    /// references; an over-long subject is refused before anything is read.
+    #[tokio::test]
+    async fn custody_matches_the_cli_bytes_for_every_subject_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path, [a, _b, _c]) = governor_fixture(dir.path());
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config.clone()),
+            &state_path,
+        ))
+        .await;
+        let models = root.join("models");
+
+        for (subject, kind, resolved) in [
+            ("orders", "model", true),
+            ("run-orders-1", "run", true),
+            (a.as_str(), "plan", true),
+            ("freeze:global", "plan", true),
+            ("nothing_here", "model", false),
+        ] {
+            let resp = reqwest::get(format!("{base}/api/v1/custody/{subject}"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{subject}");
+            let text = resp.text().await.unwrap();
+            let expected =
+                compute_audit_for(&root, &config, &state_path, &models, subject).unwrap();
+            assert_eq!(text, reference_bytes(&expected), "{subject}");
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(json["subject_kind"], kind, "{subject}");
+            assert_eq!(json["resolved"], resolved, "{subject}");
+        }
+
+        let long = "m".repeat(MAX_CUSTODY_SUBJECT_BYTES + 1);
+        let resp = reqwest::get(format!("{base}/api/v1/custody/{long}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "bad_request");
+
+        // No subject at all is no route.
+        let resp = reqwest::get(format!("{base}/api/v1/custody/"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    /// `/audit` answers with the CLI's bytes, whole and scoped to a product,
+    /// and the product refusals carry their codes.
+    #[tokio::test]
+    async fn audit_ledger_matches_the_cli_bytes_whole_and_scoped() {
+        use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+        use rocky_core::state::{PolicyDecisionRecord, StateStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path, _) = governor_fixture(dir.path());
+        // One row about the fixture product's output model, `revenue_daily`.
+        StateStore::open(&state_path)
+            .unwrap()
+            .record_policy_decision(&PolicyDecisionRecord {
+                timestamp: chrono::Utc::now() - chrono::Duration::minutes(5),
+                plan_id: "plan-revenue-daily".to_string(),
+                principal: PolicyPrincipal::Agent,
+                capability: PolicyCapability::Apply,
+                model: "revenue_daily".to_string(),
+                effect: PolicyEffect::Allow,
+                rule_id: None,
+                reason: "test".to_string(),
+                verify_after: Vec::new(),
+                auto_apply: None,
+            })
+            .unwrap();
+        // A spec the loader rejects, beside the fixture's valid one.
+        std::fs::write(root.join("products/broken.toml"), b"not = [toml").unwrap();
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config),
+            &state_path,
+        ))
+        .await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/audit")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        assert_eq!(
+            text,
+            reference_bytes(&compute_audit(&state_path, None).unwrap())
+        );
+        let whole: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(whole.get("product").is_none(), "{text}");
+        assert!(whole["decisions"].as_array().unwrap().len() >= 6, "{text}");
+
+        let resp = reqwest::get(format!("{base}/api/v1/audit?product=revenue_daily"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let scope = resolve_product_scope(&root, "revenue_daily").unwrap();
+        assert_eq!(
+            text,
+            reference_bytes(&compute_audit(&state_path, Some(scope)).unwrap())
+        );
+        let scoped: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(scoped["product"]["output_model"], "revenue_daily");
+        assert_eq!(scoped["decisions"].as_array().unwrap().len(), 1, "{text}");
+        assert_eq!(scoped["decisions"][0]["plan_id"], "plan-revenue-daily");
+
+        // No spec, a traversal shape, and a name with a space: 404 each,
+        // the last two before any path is built.
+        for name in ["nope", "..%2Fx", "not%20a%20name"] {
+            let resp = reqwest::get(format!("{base}/api/v1/audit?product={name}"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 404, "{name}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "product_not_found", "{name}");
+        }
+        let resp = reqwest::get(format!("{base}/api/v1/audit?product=broken"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "product_spec_invalid");
+        assert!(err.message.contains("broken"), "{}", err.message);
+    }
+
+    /// `/products/{name}/journal` answers with the CLI's bytes: empty for a
+    /// product known by its spec alone, one row after an approval; an
+    /// unknown or traversal-shaped name is 404.
+    #[tokio::test]
+    async fn product_journal_matches_the_cli_bytes_and_refuses_unknown_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) =
+            crate::commands::product::tests::api_fixture_project(dir.path());
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config),
+            &state_path,
+        ))
+        .await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/products/revenue_daily/journal"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let expected = product_journal_in(&root, Some(&state_path), "revenue_daily")
+            .unwrap()
+            .expect("known by its spec");
+        assert_eq!(text, reference_bytes(&expected));
+        let empty: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(empty["count"], 0, "{text}");
+        assert_eq!(empty["product_id"], "product:revenue_daily");
+
+        // One approval appends one row, which the route shows byte for byte.
+        crate::commands::product::product_approve_in(&root, &state_path, "revenue_daily")
+            .expect("approved");
+        let resp = reqwest::get(format!("{base}/api/v1/products/revenue_daily/journal"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let expected = product_journal_in(&root, Some(&state_path), "revenue_daily")
+            .unwrap()
+            .expect("known");
+        assert_eq!(text, reference_bytes(&expected));
+        let one: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(one["count"], 1, "{text}");
+        assert_eq!(one["rows"][0]["seq"], 1);
+        assert_eq!(one["rows"][0]["to_state"], "spec_approved");
+        assert!(
+            one["rows"][0]["spec_digest"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:"),
+            "{text}"
+        );
+
+        for name in ["nope", "..%2F..", "not%20a%20name"] {
+            let resp = reqwest::get(format!("{base}/api/v1/products/{name}/journal"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 404, "{name}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert!(
+                err.code == "product_not_found" || err.code == "route_not_found",
+                "{name}: {}",
+                err.code
+            );
+        }
+    }
+
+    /// Without a bound config there is no `products/` to know a name by.
+    #[tokio::test]
+    async fn product_journal_needs_a_bound_config() {
+        let base = spawn_router(test_state()).await;
+        let resp = reqwest::get(format!("{base}/api/v1/products/revenue_daily/journal"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "engine_not_ready");
+    }
+
+    /// Unfiltered, the ledger needs no config; a product filter needs the
+    /// project root the config names.
+    #[tokio::test]
+    async fn audit_ledger_needs_a_bound_config_only_for_a_product() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, _config, state_path, _) = governor_fixture(dir.path());
+        let base = spawn_router(pinned_server(root.join("models"), None, &state_path)).await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/audit")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.text().await.unwrap(),
+            reference_bytes(&compute_audit(&state_path, None).unwrap())
+        );
+
+        let resp = reqwest::get(format!("{base}/api/v1/audit?product=revenue_daily"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "engine_not_ready");
+    }
+
+    /// The brief and the custody chain need a project root; the scorecard
+    /// reads the state store only and answers without a config.
+    #[tokio::test]
+    async fn governor_routes_need_a_bound_config_except_the_scorecard() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, _config, state_path, _) = governor_fixture(dir.path());
+        let base = spawn_router(pinned_server(root.join("models"), None, &state_path)).await;
+
+        for path in ["/api/v1/brief", "/api/v1/custody/orders"] {
+            let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+            assert_eq!(resp.status(), 503, "{path}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "engine_not_ready", "{path}");
+        }
+
+        let resp = reqwest::get(format!("{base}/api/v1/audit/scorecard"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let expected =
+            compute_audit_scorecard(&state_path, ScorecardDimension::Principal, None).unwrap();
+        assert_eq!(text, reference_bytes(&expected));
+    }
+
+    /// `/dag/status` projects the executor's record field for field, with
+    /// the node status rendered in `snake_case` as the executor serializes it.
+    #[tokio::test]
+    async fn dag_status_is_typed_and_snake_case() {
+        use rocky_core::dag_executor::{DagExecutionResult, NodeResult, NodeStatus};
+
+        let state = test_state();
+        let base = spawn_router(state.clone()).await;
+
+        // Nothing recorded yet: the documented 503, with the envelope.
+        let resp = reqwest::get(format!("{base}/api/v1/dag/status"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "engine_not_ready");
+
+        state
+            .dag_status
+            .set(DagExecutionResult {
+                nodes: vec![
+                    NodeResult {
+                        id: "raw_orders".into(),
+                        kind: "model".into(),
+                        label: "raw_orders".into(),
+                        status: NodeStatus::Completed,
+                        layer: 0,
+                        duration_ms: 12,
+                        error: None,
+                    },
+                    NodeResult {
+                        id: "customer_orders".into(),
+                        kind: "model".into(),
+                        label: "customer_orders".into(),
+                        status: NodeStatus::Failed,
+                        layer: 1,
+                        duration_ms: 3,
+                        error: Some("boom".into()),
+                    },
+                ],
+                total_layers: 2,
+                total_nodes: 2,
+                completed: 1,
+                failed: 1,
+                skipped: 0,
+                duration_ms: 15,
+            })
+            .await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/dag/status"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let body: DagStatusOutput = serde_json::from_str(&text).unwrap();
+        assert_eq!(body.result.total_nodes, 2);
+        assert_eq!(body.result.failed, 1);
+        assert_eq!(body.result.nodes[0].status, DagNodeStatusOutput::Completed);
+        assert_eq!(body.result.nodes[1].status, DagNodeStatusOutput::Failed);
+        assert_eq!(body.result.nodes[1].error.as_deref(), Some("boom"));
+        assert!(body.result.nodes[0].error.is_none());
+        // The wire rendering is the executor's `snake_case`, not the variant name.
+        assert!(text.contains("\"status\": \"completed\""), "{text}");
+        assert!(!text.contains("Completed"), "{text}");
     }
 
     // --- /meta ---
@@ -1721,8 +3445,271 @@ mod tests {
         assert_eq!(body.schemas_hash, schemas_hash());
         assert!(!body.schemas_hash.is_empty());
         assert!(body.routes.iter().any(|r| r == "GET /api/v1/meta"));
+        // The five typed estate routes are advertised as one capability.
+        assert!(
+            body.capabilities.iter().any(|c| c == "estate"),
+            "{:?}",
+            body.capabilities
+        );
+        // So are the product, review and governor routes, and all seven are
+        // registered.
+        for capability in ["products", "review", "governor", "audit", "journal"] {
+            assert!(
+                body.capabilities.iter().any(|c| c == capability),
+                "{capability}: {:?}",
+                body.capabilities
+            );
+        }
+        for route in [
+            "GET /api/v1/products",
+            "GET /api/v1/products/{name}",
+            "GET /api/v1/products/{name}/journal",
+            "GET /api/v1/review/queue",
+            "GET /api/v1/review/{plan_id}/status",
+            "GET /api/v1/brief",
+            "GET /api/v1/audit/scorecard",
+            "GET /api/v1/custody/{subject}",
+            "GET /api/v1/audit",
+        ] {
+            assert!(body.routes.iter().any(|r| r == route), "{route} missing");
+        }
         // No config bound in this fixture (models-only ServerState).
         assert!(body.config_hash.is_none());
+    }
+
+    // --- The browser UI: `rocky serve --ui` ---
+
+    /// A `--ui` server: a read-only token, an in-memory file set standing in
+    /// for the embedded one, and the given allowed hosts and origins.
+    fn ui_state(allowed_hosts: &[&str], allowed_origins: &[&str]) -> Arc<ServerState> {
+        use rocky_server::auth::{ServeToken, TokenScope};
+        use rocky_server::ui::{InMemoryAssets, UiConfig};
+
+        let mut files = std::collections::BTreeMap::new();
+        files.insert(
+            "index.html".to_string(),
+            b"<!doctype html><div id=root></div>".to_vec(),
+        );
+        files.insert(
+            "assets/index-abc123.js".to_string(),
+            b"console.log('rocky')".to_vec(),
+        );
+        ServerState::with_auth_and_webhook(
+            simple_project_models(),
+            false,
+            None,
+            None,
+            Some(ServeToken {
+                secret: "s3cret".to_string(),
+                scope: TokenScope::ReadOnly,
+            }),
+            allowed_origins.iter().map(ToString::to_string).collect(),
+            None,
+            None,
+            Some(UiConfig {
+                bind_host: "127.0.0.1".to_string(),
+                allowed_hosts: allowed_hosts.iter().map(ToString::to_string).collect(),
+                assets: Arc::new(InMemoryAssets(files)),
+            }),
+        )
+    }
+
+    /// The UI files are public and carry every security header; a client
+    /// route deep-links to the shell; the API behind them still needs the
+    /// token, and the read-only token still cannot mutate.
+    #[tokio::test]
+    async fn ui_files_are_public_carry_the_headers_and_the_api_stays_behind_the_token() {
+        let base = spawn_router(ui_state(&[], &[])).await;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        let resp = client.get(format!("{base}/ui/")).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers()["content-type"], "text/html; charset=utf-8");
+        assert_eq!(resp.headers()["cache-control"], "no-cache");
+        for (name, value) in rocky_server::ui::UI_SECURITY_HEADERS {
+            assert_eq!(
+                resp.headers().get(*name).and_then(|v| v.to_str().ok()),
+                Some(*value),
+                "{name}"
+            );
+        }
+        assert!(resp.text().await.unwrap().contains("id=root"));
+
+        let resp = client
+            .get(format!("{base}/ui/assets/index-abc123.js"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()["content-type"],
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            resp.headers()["cache-control"],
+            "public, max-age=31536000, immutable"
+        );
+        assert!(resp.headers().contains_key("content-security-policy"));
+
+        let resp = client
+            .get(format!("{base}/ui/estate"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "a client route gets the shell");
+        assert_eq!(resp.headers()["content-type"], "text/html; charset=utf-8");
+
+        let resp = client
+            .get(format!("{base}/ui/assets/missing.js"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "asset_not_found");
+
+        let resp = client.get(format!("{base}/ui")).send().await.unwrap();
+        assert_eq!(resp.status(), 308);
+        assert_eq!(resp.headers()["location"], "/ui/");
+
+        let resp = client
+            .get(format!("{base}/api/v1/meta"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "the API stays behind the token");
+        let resp = client
+            .get(format!("{base}/api/v1/meta"))
+            .bearer_auth("s3cret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let resp = client
+            .post(format!("{base}/api/v1/jobs/run"))
+            .bearer_auth("s3cret")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "the UI token never reaches a mutation");
+    }
+
+    /// Without `--ui` there is no `/ui` path at all.
+    #[tokio::test]
+    async fn without_ui_there_is_no_ui_route() {
+        let base = spawn_router(test_state()).await;
+        let resp = reqwest::get(format!("{base}/ui/")).await.unwrap();
+        assert_eq!(resp.status(), 404);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "route_not_found");
+    }
+
+    /// The host guard: a foreign `Host` is 421 and a foreign or opaque
+    /// `Origin` is 403, on UI files and API alike, before routing; the
+    /// server's own names, an allowed host and an allowed origin pass; a
+    /// request with no `Origin` passes; without `--ui` the guard is off.
+    #[tokio::test]
+    async fn ui_mode_refuses_foreign_hosts_and_origins_before_routing() {
+        let base = spawn_router(ui_state(&["ui.internal"], &["https://app.example"])).await;
+        let client = reqwest::Client::new();
+        for path in ["/ui/", "/api/v1/health"] {
+            let resp = client
+                .get(format!("{base}{path}"))
+                .header("host", "evil.example")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 421, "{path}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "host_not_allowed", "{path}");
+
+            let resp = client
+                .get(format!("{base}{path}"))
+                .header("origin", "http://evil.example")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 403, "{path}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "origin_not_allowed", "{path}");
+
+            let resp = client
+                .get(format!("{base}{path}"))
+                .header("origin", "null")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 403, "{path}: the opaque origin never passes");
+        }
+        for (name, value) in [
+            ("host", "localhost:9"),
+            ("host", "127.0.0.1:9"),
+            ("host", "ui.internal"),
+            ("origin", "https://app.example"),
+            ("origin", "http://127.0.0.1:9"),
+            ("origin", "http://localhost:5173"),
+        ] {
+            let resp = client
+                .get(format!("{base}/api/v1/health"))
+                .header(name, value)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{name}: {value}");
+        }
+        let resp = client
+            .get(format!("{base}/api/v1/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "no Origin is an ordinary request");
+
+        let base = spawn_router(test_state()).await;
+        let resp = client
+            .get(format!("{base}/api/v1/health"))
+            .header("host", "evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "without --ui the guard is off");
+    }
+
+    /// A body over the limit is refused with the envelope before any
+    /// handler; a body under it reaches the handler. Every mode.
+    #[tokio::test]
+    async fn oversized_bodies_are_413_with_the_envelope() {
+        let base = spawn_router(test_state_with_token("s3cret")).await;
+        let client = reqwest::Client::new();
+        let big = vec![b'x'; crate::ui::MAX_REQUEST_BODY_BYTES + 1];
+        let resp = client
+            .post(format!("{base}/api/v1/jobs/run"))
+            .bearer_auth("s3cret")
+            .body(big)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 413);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "payload_too_large");
+        assert!(err.remediation_hint.is_some());
+
+        let small = vec![b'x'; 100 * 1024];
+        let resp = client
+            .post(format!("{base}/api/v1/jobs/run"))
+            .bearer_auth("s3cret")
+            .body(small)
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            413,
+            "a body under the limit reaches the handler"
+        );
     }
 
     // --- Golden API-vs-CLI parity (the load-bearing contract tests) ---
@@ -3709,7 +5696,7 @@ mod tests {
         // Forms this counter cannot classify. Each could mount a mutating
         // method invisibly, so their presence fails the test rather than
         // silently weakening it — someone must come here and decide.
-        for form in [
+        let unclassifiable = [
             ".nest(",
             ".nest_service(",
             ".merge(",
@@ -3718,7 +5705,21 @@ mod tests {
             ".any(",
             ".on(",
             "MethodFilter",
-        ] {
+        ];
+
+        // The one merge this guard understands: the browser UI's router,
+        // merged AFTER the bearer layer because its files are public. It is
+        // counted below by the same rules, and its bar is stricter — zero
+        // mutating registrations, because a `post(` there would be an
+        // unauthenticated mutation, not merely an undeclared one.
+        let ui_merge = ".merge(crate::ui::ui_router(state.clone()))";
+        assert!(
+            body.contains(ui_merge),
+            "router() must merge the UI router by exactly `{ui_merge}` so this \
+             guard can find and check it"
+        );
+        let body = body.replace(ui_merge, "");
+        for form in unclassifiable {
             assert!(
                 !body.contains(form),
                 "router() uses `{form}`, which this guard cannot classify. \
@@ -3726,6 +5727,35 @@ mod tests {
                  teach this test (and re-check the read-scope enumeration)."
             );
         }
+
+        let ui_source = include_str!("ui.rs");
+        let ui_start = ui_source
+            .find("pub(crate) fn ui_router(state: Arc<ServerState>) -> Router {")
+            .expect("ui_router() must be findable by its exact signature");
+        let ui_body = &ui_source[ui_start..];
+        let ui_end = ui_body
+            .find("\n}\n")
+            .expect("ui_router() must end at column 0");
+        let ui_body: String = ui_body[..ui_end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for form in unclassifiable {
+            assert!(
+                !ui_body.contains(form),
+                "ui_router() uses `{form}`, which this guard cannot classify"
+            );
+        }
+        let ui_mutating: usize = ["post(", "put(", "patch(", "delete("]
+            .iter()
+            .map(|verb| ui_body.matches(verb).count())
+            .sum();
+        assert_eq!(
+            ui_mutating, 0,
+            "ui_router() is merged outside the bearer layer, so it may register \
+             safe methods only"
+        );
 
         let registered: usize = ["post(", "put(", "patch(", "delete("]
             .iter()
@@ -4099,6 +6129,7 @@ adapter = "db"
             Vec::new(),
             None,
             Some(ingress),
+            None,
         );
         (state, dir)
     }

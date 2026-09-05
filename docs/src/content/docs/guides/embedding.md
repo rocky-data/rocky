@@ -73,7 +73,9 @@ See [authoring with MCP](/concepts/mcp-authoring/) for the tool surface, and [op
 rocky --config rocky.toml serve --port 8080
 ```
 
-The read routes return the same payloads as the matching CLI command, byte for byte. `GET /api/v1/models/{name}/lineage` returns exactly what `rocky lineage <name> --output json` prints. `GET /api/v1/compile` matches `rocky compile --output json`. A caller on the HTTP API and a caller on the SDK see identical data.
+The read routes return the same payloads as the matching CLI command, byte for byte. `GET /api/v1/models/{name}/lineage` returns exactly what `rocky lineage <name> --output json` prints. `GET /api/v1/compile` matches `rocky compile --output json`. `GET /api/v1/products` matches `rocky product list --output json`, and `GET /api/v1/products/{name}` matches `rocky product status <name> --output json`, and `GET /api/v1/products/{name}/journal` matches `rocky product journal <name> --output json`. `GET /api/v1/review/queue` matches `rocky review --queue --output json`, except the two fields that derive from the request instant (`staleness_seconds` and `score`), and `GET /api/v1/review/{plan_id}/status` matches `rocky review <plan-id> --status --output json`. There is no approve route: approving happens in the terminal. The governor's three reads match too: `GET /api/v1/brief` matches `rocky brief --output json` except `generated_at` and `since_timestamp`, and never advances the digest cursor, so its `since` defaults to `7d` rather than the CLI's `last`; `GET /api/v1/audit/scorecard` matches `rocky audit --scorecard --output json` except `window_start`; `GET /api/v1/custody/{subject}` matches `rocky audit --for <subject> --output json`; `GET /api/v1/audit` matches `rocky audit --output json`, and with `?product=<name>` matches `rocky audit --product <name> --output json`. The window, grouping and product are query parameters, and the OpenAPI document lists their accepted values. A caller on the HTTP API and a caller on the SDK see identical data.
+
+Five routes have no CLI command to match: `GET /api/v1/health`, `/models`, `/models/{name}`, `/dag/layers` and `/dag/status`. They still return typed payloads with published schemas, and `GET /api/v1/meta` lists the `estate` capability when a build serves them that way. Model detail caps the SQL text at 256 KiB. A cut is reported in the body through `sql_truncated` and `sql_bytes`, so a reader never mistakes a cut text for the whole. Each type-checked column carries its structured `data_type`, which keeps a struct field's own nullability, and a `data_type_display` label such as `DECIMAL(10,2)` for showing to a person.
 
 ### Mutations are jobs you poll
 
@@ -104,6 +106,10 @@ Every route except `GET /api/v1/health` returns a structured error body on failu
 Router-level failures use the same envelope. An unknown path answers `404` with `code: "route_not_found"`. A known path called with the wrong method answers `405` with `code: "method_not_allowed"`. One case has no envelope: a request the HTTP stack rejects before it reaches the router, such as malformed HTTP framing or a connection dropped mid-body.
 
 The full route reference, request and response schemas, and status codes are published as a generated OpenAPI 3.1 document: **[openapi.json](/openapi.json)**. It is generated from the same typed schemas that back the CLI, so it cannot drift from what the server returns. Load it into any OpenAPI tool to explore the surface or generate a client.
+
+### The browser UI
+
+`rocky serve --ui` serves a browser UI at `/ui/`, from files built into the release binaries. It needs a read-only token: `rocky serve --ui --token <secret> --token-scope read-only`. The server prints one address, `http://127.0.0.1:8080/ui/#token=<secret>`; the page reads the token from the fragment once, clears it, and sends it on every API call. The page itself is public. With `--ui` the server refuses a foreign `Host` (`421`) and a foreign `Origin` (`403`) before routing; a reverse proxy names itself with `--allowed-host`, and a page on another origin with `--allowed-origin`. The UI token cannot start a run: run a second sidecar without `--ui` for job submissions.
 
 For the command flags, see [`rocky serve`](/reference/commands/development/). For where the server sits in the engine, see the [architecture overview](/concepts/architecture/).
 
