@@ -67,8 +67,14 @@ describe("App", () => {
 
   it("switches lanes on a nav click without a reload, and deep-links by path", async () => {
     window.history.pushState(null, "", "/ui/governor");
-    render(<App engine={<span>engine slot</span>} estate={<span>estate slot</span>} />);
-    expect(screen.getByText("The governor screen is not built yet")).toBeInTheDocument();
+    render(
+      <App
+        engine={<span>engine slot</span>}
+        estate={<span>estate slot</span>}
+        governor={<span>governor slot</span>}
+      />,
+    );
+    expect(screen.getByText("governor slot")).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Governor" })).toHaveAttribute("aria-current", "page");
 
     screen.getByRole("link", { name: "Estate" }).click();

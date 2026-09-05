@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { laneFromPath, navigate, pathForLane } from "./router";
+import { laneFromPath, navigate, pathForLane, subpathFromPath } from "./router";
+
+describe("subpathFromPath", () => {
+  it("reads the segment after the lane, or null", () => {
+    expect(subpathFromPath("/ui/governor/scorecard")).toBe("scorecard");
+    expect(subpathFromPath("/ui/governor")).toBeNull();
+    expect(subpathFromPath("/ui/")).toBeNull();
+    expect(pathForLane("governor", "brief")).toBe("/ui/governor/brief");
+  });
+});
 
 describe("laneFromPath", () => {
   it("selects the estate for the shell's root and for anything unknown", () => {
