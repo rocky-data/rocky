@@ -83,7 +83,8 @@ use rocky_server::dashboard;
 use rocky_server::state::ServerState;
 
 use crate::commands::audit::{
-    compute_audit_for, compute_audit_scorecard, parse_window, plan_file_path,
+    compute_audit, compute_audit_for, compute_audit_scorecard, parse_window, plan_file_path,
+    resolve_product_scope,
 };
 use crate::commands::product::{
     ProductListOutput, ProductStatusOutput, product_list_in, product_names_in, product_status_in,
@@ -97,8 +98,8 @@ use crate::commands::{
     lineage_output, metrics_output, model_history_output, schedule_status_output, schemas_hash,
 };
 use crate::output::{
-    AuditForOutput, AuditScorecardOutput, BriefOutput, ReviewQueueOutput, ReviewStatusOutput,
-    ScorecardDimension,
+    AuditForOutput, AuditOutput, AuditScorecardOutput, BriefOutput, ReviewQueueOutput,
+    ReviewStatusOutput, ScorecardDimension,
 };
 use crate::output::{
     ColumnLineageOutput, CompileOutput, DagExecutionOutput, DagLayersOutput, DagNodeResultOutput,
@@ -184,6 +185,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/review/queue", get(review_queue))
         .route("/api/v1/review/{plan_id}/status", get(review_status))
         .route("/api/v1/brief", get(governor_brief))
+        .route("/api/v1/audit", get(audit_ledger))
         .route("/api/v1/audit/scorecard", get(audit_scorecard))
         .route("/api/v1/custody/{subject}", get(custody_chain))
         // Webhook ingress. Registered BEFORE the auth layer like every route, but
@@ -461,6 +463,18 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, "bad_request", message, None)
     }
 
+    /// `409` — `products/<name>.toml` exists but the spec loader rejects it,
+    /// so the product's output model cannot be resolved. An integrity fault of
+    /// a custody file, like a malformed review marker, not a server fault.
+    fn product_spec_invalid(name: &str, code: &str, reason: &str) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "product_spec_invalid",
+            format!("product '{name}' has a spec the loader rejects ({code}): {reason}"),
+            Some("fix products/<name>.toml until `rocky product verify <name>` accepts it"),
+        )
+    }
+
     /// `404` — no route matches the request path. Deliberately distinct from
     /// the resource-level 404s (`model_not_found`, `job_not_found`) so a
     /// client — and the route-registration probe test — can tell "no such
@@ -713,6 +727,7 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "GET /api/v1/review/queue",
         "GET /api/v1/review/{plan_id}/status",
         "GET /api/v1/brief",
+        "GET /api/v1/audit",
         "GET /api/v1/audit/scorecard",
         "GET /api/v1/custody/{subject}",
         "POST /api/v1/hooks/trigger/{pipeline}",
@@ -744,6 +759,7 @@ fn capabilities() -> Vec<String> {
         "products",
         "review",
         "governor",
+        "audit",
     ]
     .into_iter()
     .map(String::from)
@@ -1401,6 +1417,84 @@ async fn custody_chain(
     .map_err(|e| map_join_err(&e))?
     .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
     Ok(PrettyJson(output))
+}
+
+/// Query string of `GET /api/v1/audit`.
+#[derive(Debug, Deserialize)]
+struct AuditQuery {
+    /// A product name: list only the rows about its output model.
+    product: Option<String>,
+}
+
+/// The three ways a ledger lookup can end, decided on the blocking side so
+/// the handler maps each to its documented status code.
+enum AuditLookup {
+    /// Boxed: the payload dwarfs the two refusal arms.
+    Found(Box<AuditOutput>),
+    NoProduct,
+    SpecInvalid {
+        code: String,
+        reason: String,
+    },
+}
+
+/// `GET /api/v1/audit` — canonical [`AuditOutput`].
+///
+/// The same bytes as `rocky audit --output json`: every recorded policy
+/// decision, oldest first. With `?product=<name>`, the same bytes as
+/// `rocky audit --product <name> --output json`: only the rows about that
+/// product's output model, resolved from `products/<name>.toml` through the
+/// loader `rocky product status` uses. Unfiltered, it reads the state store
+/// only and needs no bound config. A name that is not a bare identifier, or
+/// has no spec file, is `404 product_not_found`; a spec the loader rejects is
+/// `409 product_spec_invalid` with the loader's code and reason.
+async fn audit_ledger(
+    State(state): State<Arc<ServerState>>,
+    ApiQuery(query): ApiQuery<AuditQuery>,
+) -> Result<PrettyJson<AuditOutput>, ApiError> {
+    let product_name = query.product.clone().unwrap_or_default();
+    let scope = match query.product {
+        None => None,
+        Some(name) => {
+            // The spec path is built only from a bare identifier, the same
+            // guard the product routes apply before opening anything.
+            if !is_bare_product_name(&name) {
+                return Err(ApiError::product_not_found(&name));
+            }
+            Some((project_root_for(&state)?, name))
+        }
+    };
+    let state_path = state_path_for(&state);
+    let output = tokio::task::spawn_blocking(move || -> anyhow::Result<AuditLookup> {
+        let product = match scope {
+            None => None,
+            Some((root, name)) => match resolve_product_scope(&root, &name) {
+                Ok(scope) => Some(scope),
+                Err(reject) if reject.code == "spec-file-missing" => {
+                    return Ok(AuditLookup::NoProduct);
+                }
+                Err(reject) => {
+                    return Ok(AuditLookup::SpecInvalid {
+                        code: reject.code.to_string(),
+                        reason: reject.message,
+                    });
+                }
+            },
+        };
+        compute_audit(&state_path, product).map(|output| AuditLookup::Found(Box::new(output)))
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    match output {
+        AuditLookup::Found(output) => Ok(PrettyJson(*output)),
+        AuditLookup::NoProduct => Err(ApiError::product_not_found(&product_name)),
+        AuditLookup::SpecInvalid { code, reason } => Err(ApiError::product_spec_invalid(
+            &product_name,
+            &code,
+            &reason,
+        )),
+    }
 }
 
 /// The rule a product name must satisfy to exist at all: a bare identifier,
@@ -3003,6 +3097,108 @@ mod tests {
         assert_eq!(resp.status(), 404);
     }
 
+    /// `/audit` answers with the CLI's bytes, whole and scoped to a product,
+    /// and the product refusals carry their codes.
+    #[tokio::test]
+    async fn audit_ledger_matches_the_cli_bytes_whole_and_scoped() {
+        use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+        use rocky_core::state::{PolicyDecisionRecord, StateStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path, _) = governor_fixture(dir.path());
+        // One row about the fixture product's output model, `revenue_daily`.
+        StateStore::open(&state_path)
+            .unwrap()
+            .record_policy_decision(&PolicyDecisionRecord {
+                timestamp: chrono::Utc::now() - chrono::Duration::minutes(5),
+                plan_id: "plan-revenue-daily".to_string(),
+                principal: PolicyPrincipal::Agent,
+                capability: PolicyCapability::Apply,
+                model: "revenue_daily".to_string(),
+                effect: PolicyEffect::Allow,
+                rule_id: None,
+                reason: "test".to_string(),
+                verify_after: Vec::new(),
+                auto_apply: None,
+            })
+            .unwrap();
+        // A spec the loader rejects, beside the fixture's valid one.
+        std::fs::write(root.join("products/broken.toml"), b"not = [toml").unwrap();
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config),
+            &state_path,
+        ))
+        .await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/audit")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        assert_eq!(
+            text,
+            reference_bytes(&compute_audit(&state_path, None).unwrap())
+        );
+        let whole: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(whole.get("product").is_none(), "{text}");
+        assert!(whole["decisions"].as_array().unwrap().len() >= 6, "{text}");
+
+        let resp = reqwest::get(format!("{base}/api/v1/audit?product=revenue_daily"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let scope = resolve_product_scope(&root, "revenue_daily").unwrap();
+        assert_eq!(
+            text,
+            reference_bytes(&compute_audit(&state_path, Some(scope)).unwrap())
+        );
+        let scoped: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(scoped["product"]["output_model"], "revenue_daily");
+        assert_eq!(scoped["decisions"].as_array().unwrap().len(), 1, "{text}");
+        assert_eq!(scoped["decisions"][0]["plan_id"], "plan-revenue-daily");
+
+        // No spec, a traversal shape, and a name with a space: 404 each,
+        // the last two before any path is built.
+        for name in ["nope", "..%2Fx", "not%20a%20name"] {
+            let resp = reqwest::get(format!("{base}/api/v1/audit?product={name}"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 404, "{name}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "product_not_found", "{name}");
+        }
+        let resp = reqwest::get(format!("{base}/api/v1/audit?product=broken"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "product_spec_invalid");
+        assert!(err.message.contains("broken"), "{}", err.message);
+    }
+
+    /// Unfiltered, the ledger needs no config; a product filter needs the
+    /// project root the config names.
+    #[tokio::test]
+    async fn audit_ledger_needs_a_bound_config_only_for_a_product() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, _config, state_path, _) = governor_fixture(dir.path());
+        let base = spawn_router(pinned_server(root.join("models"), None, &state_path)).await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/audit")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.text().await.unwrap(),
+            reference_bytes(&compute_audit(&state_path, None).unwrap())
+        );
+
+        let resp = reqwest::get(format!("{base}/api/v1/audit?product=revenue_daily"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "engine_not_ready");
+    }
+
     /// The brief and the custody chain need a project root; the scorecard
     /// reads the state store only and answers without a config.
     #[tokio::test]
@@ -3120,7 +3316,7 @@ mod tests {
         );
         // So are the product, review and governor routes, and all seven are
         // registered.
-        for capability in ["products", "review", "governor"] {
+        for capability in ["products", "review", "governor", "audit"] {
             assert!(
                 body.capabilities.iter().any(|c| c == capability),
                 "{capability}: {:?}",
@@ -3135,6 +3331,7 @@ mod tests {
             "GET /api/v1/brief",
             "GET /api/v1/audit/scorecard",
             "GET /api/v1/custody/{subject}",
+            "GET /api/v1/audit",
         ] {
             assert!(body.routes.iter().any(|r| r == route), "{route} missing");
         }

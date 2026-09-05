@@ -166,10 +166,11 @@ rocky audit --scorecard --by principal --window 30d
 | `--scorecard` | `bool` | `false` | Aggregate the ledger into acceptance / denial / escalation rates instead of listing decisions. |
 | `--by <DIM>` | `principal` \| `rule` \| `scope` | `principal` | Scorecard grouping dimension. |
 | `--window <W>` | `string` | `all` | Scorecard window, e.g. `30d` or `12h`. |
+| `--product <NAME>` | `string` | | List only the decisions about one product: the rows whose model is the product's output model (`product.output.model`, default the product name), read from `products/<NAME>.toml`. Conflicts with `--for` and `--scorecard`. |
 
 Read-only. Only mutating enforcement seams record decisions — reads are never logged — so the ledger is the audit trail of governed mutations. A signal the ledger does not persist is reported as *not recorded* rather than inferred, and the scorecard is wired to no automatic policy change.
 
-`rocky serve` answers the scorecard at `GET /api/v1/audit/scorecard?by=<dim>&window=<w>`, except `window_start` for a duration window, and the custody chain at `GET /api/v1/custody/{subject}`, byte for byte.
+`rocky serve` answers the ledger at `GET /api/v1/audit`, or one product's rows at `GET /api/v1/audit?product=<name>`, byte for byte; the scorecard at `GET /api/v1/audit/scorecard?by=<dim>&window=<w>`, except `window_start` for a duration window; and the custody chain at `GET /api/v1/custody/{subject}`, byte for byte.
 
 ---
 

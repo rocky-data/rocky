@@ -612,6 +612,11 @@ enum Command {
         /// like `30d`. Only meaningful with `--scorecard`.
         #[arg(long, requires = "scorecard")]
         window: Option<String>,
+        /// List only the decisions about one product: the rows whose model
+        /// is the product's output model (`product.output.model`, default
+        /// the product name), read from `products/<NAME>.toml`.
+        #[arg(long, conflicts_with_all = ["for_subject", "scorecard"])]
+        product: Option<String>,
         /// Models directory used to compute the downstream blast radius.
         #[arg(long, default_value = "models")]
         models: PathBuf,
@@ -3456,6 +3461,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             scorecard,
             by,
             window,
+            product,
             models,
         } => {
             if scorecard {
@@ -3474,7 +3480,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         &selector,
                         json,
                     ),
-                    None => rocky_cli::commands::run_audit(&state_path, json),
+                    None => rocky_cli::commands::run_audit(&state_path, product.as_deref(), json),
                 }
             }
         }
