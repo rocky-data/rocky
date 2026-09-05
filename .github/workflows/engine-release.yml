@@ -240,10 +240,127 @@ jobs:
             --repo "${GITHUB_REPOSITORY}" \
             --clobber
 
+  # Publish one container image per release to GHCR, from the two Linux
+  # archives the matrix attached. Nothing is compiled here, so the image is the
+  # release, bit for bit (engine/Dockerfile). Ordered after `build` and before
+  # `publish`, so a release never goes live without its image — the same
+  # fail-closed rule as `checksums`: an image failure leaves the draft
+  # unpublished, and a re-run of this job publishes it.
+  #
+  # Tags: `<version>` from the `engine-v<version>` tag, `<major>.<minor>`, and
+  # `latest`. A pre-release version (anything with a `-`, such as
+  # `1.74.0-rc.1`) gets only its own tag and never moves `latest` or
+  # `<major>.<minor>`. A tag is never rebuilt in place: a base-image bump ships
+  # as a new patch release.
+  #
+  # `permissions` here replaces the workflow-level block for this job:
+  # `contents: write` is what every job in this file uses to read the draft's
+  # assets, `packages: write` is the push. No other job can reach GHCR.
+  image:
+    name: Publish container image
+    needs: [ensure-release, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    # Override the workflow-level `working-directory: engine` — this job
+    # operates at the repo root and needs no Cargo workspace.
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/rocky
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the Linux release archives
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "rocky-x86_64-unknown-linux-gnu.tar.gz" \
+            --pattern "rocky-aarch64-unknown-linux-gnu.tar.gz" \
+            --dir release-archives
+
+      # The build context is only the two binaries, laid out the way
+      # engine/Dockerfile expects (`<context>/<TARGETARCH>/rocky`), so the
+      # image build sees nothing else in the checkout.
+      - name: Lay out the build context
+        run: |
+          mkdir -p image-context/amd64 image-context/arm64
+          tar xzf release-archives/rocky-x86_64-unknown-linux-gnu.tar.gz -C image-context/amd64
+          tar xzf release-archives/rocky-aarch64-unknown-linux-gnu.tar.gz -C image-context/arm64
+          test -x image-context/amd64/rocky
+          test -x image-context/arm64/rocky
+
+      # The version and the tag list derive from the git tag here, so the
+      # image needs no third-party tag-parsing action.
+      - name: Derive the image tags
+        id: tags
+        run: |
+          VERSION="${GITHUB_REF_NAME#engine-v}"
+          if [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not start with engine-v"
+            exit 1
+          fi
+          TAGS="${IMAGE}:${VERSION}"
+          case "$VERSION" in
+            *-*)
+              echo "Pre-release ${VERSION}: its own tag only"
+              ;;
+            *)
+              MAJOR_MINOR="${VERSION%.*}"
+              TAGS="${TAGS},${IMAGE}:${MAJOR_MINOR},${IMAGE}:latest"
+              ;;
+          esac
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "Publishing ${TAGS}"
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Both platforms from one build: the Dockerfile has no RUN step, so the
+      # foreign-architecture layer needs no emulation. BuildKit attaches an
+      # SBOM and max-detail provenance to the pushed index.
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: image-context
+          file: engine/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=rocky
+            org.opencontainers.image.description=The Rocky engine: the rocky CLI, rocky serve and the browser UI
+            org.opencontainers.image.version=${{ steps.tags.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=Apache-2.0
+          provenance: mode=max
+          sbom: true
+
+      # Pull what was pushed and run it once: the version it prints must be
+      # the release's. A wrong binary in an archive, or a wrong tag, fails here
+      # and keeps the release a draft.
+      - name: Smoke the pushed image
+        run: |
+          docker run --rm "${IMAGE}:${{ steps.tags.outputs.version }}" --version | tee version.txt
+          grep -Fx "rocky ${{ steps.tags.outputs.version }}" version.txt
+
   # Publish the draft, making the version resolvable by engine/install.sh.
   # Depends on `checksums` as well as `build` so checksums.txt is in place
   # before anyone can resolve the release — install.sh fetches it to verify
-  # the download.
+  # the download. Depends on `image` so the image exists before the version
+  # is resolvable at all.
   #
   # `--latest` here rather than at creation: the engine binary owns the repo's
   # "Latest" badge, and asserting it at publish time also settles the ordering
@@ -255,7 +372,7 @@ jobs:
   # a bug — re-run the failed jobs and this publishes it.
   publish:
     name: Publish release
-    needs: [ensure-release, build, checksums]
+    needs: [ensure-release, build, checksums, image]
     runs-on: ubuntu-24.04
     # Override the workflow-level `working-directory: engine` — this job needs
     # no checkout, so that directory does not exist here.
