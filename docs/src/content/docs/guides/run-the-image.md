@@ -137,6 +137,10 @@ Pull the next version tag and restart the container on the same mount. On the fi
 
 Rolling back is running the previous tag. When the upgrade crossed a state-schema change, the older engine finds a store written by a newer one. `rocky serve` and every inspection command refuse it. `rocky run` follows `[state] on_schema_mismatch`: the default, `recreate`, starts from a fresh local state and does one full-refresh run; `fail` refuses like the rest. To roll back with the history intact, restore the store from a copy taken before the upgrade. Copy `models/.rocky-state.redb` (or the `models/.rocky-state/` directory) before every upgrade; it is one file per store.
 
+## A Compose example
+
+The repository ships [`deploy/rocky/`](https://github.com/rocky-data/rocky/tree/main/deploy/rocky): one `compose.yaml` that runs the image as a long-lived process with the UI and the scheduler, an `.env.example` for the two secrets, and a README that walks the three steps to start it. It encodes the rules on this page, one line each: the pinned tag, the loopback port, the volume, the drain grace, one replica. It is community-supported: an example to start from, not a supported deployment.
+
 ## A minikube example
 
 This is an example, not a supported deployment. It follows the rules above: one replica, replaced in place, on a persistent volume, with the health probe from the kubelet and a drain grace above the server's own.
