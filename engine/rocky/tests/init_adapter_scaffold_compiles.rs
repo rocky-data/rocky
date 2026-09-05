@@ -42,6 +42,18 @@
 //! Both halves ASSERT rather than skip when the environment is not there. A
 //! skip that silently always skips is the vacuous pass this test exists to
 //! replace.
+//!
+//! # What this does NOT cover
+//!
+//! - The emitted `Cargo.toml`. Driving `rustc` skips dependency resolution, so
+//!   a dependency the template declares wrongly — or fails to declare — is not
+//!   caught here. The three render tests in `commands/init_adapter.rs` and a
+//!   human running `rocky init-adapter` still own that half.
+//! - Provenance of the rlibs. The externs are picked newest-by-mtime out of the
+//!   shared `deps/` directory, which is a heuristic, not a proof that they came
+//!   from this build. The compile below is deliberately written so the only
+//!   thing that heuristic can cause is a false FAILURE — see the comment at the
+//!   positive half.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -129,36 +141,35 @@ fn the_scaffold_refuses_to_compile_until_literal_escape_is_chosen_and_compiles_a
     )
     .expect("write the substituted dialect.rs");
 
-    // Try the newest rlib for each crate first; fall back through the other
-    // candidates only when the failure is rustc refusing to LOAD a crate. A
-    // local `target/` can hold rlibs from several feature sets, and mixing two
-    // sets is an environment fault that must not read as a broken scaffold.
-    let mut attempts: Vec<(Vec<PathBuf>, String)> = Vec::new();
-    for externs in extern_candidate_sets(&deps) {
-        let compiled = compile(&lib_rs, &deps, &externs, edition, &scratch);
-        if compiled.status.success() {
-            return;
-        }
-        let stderr = String::from_utf8_lossy(&compiled.stderr).into_owned();
-        if !is_crate_loading_failure(&stderr) {
-            panic!(
-                "the scaffolded crate does not compile once `literal_escape` is \
-                 chosen — `rocky init-adapter` emits a crate that cannot build. \
-                 The usual cause is a required `SqlDialect` method added without \
-                 updating the template in `commands/init_adapter.rs`.\n\
-                 --- rustc stderr ---\n{stderr}"
-            );
-        }
-        attempts.push((externs, stderr));
+    // ONE compile, against the newest rlib for each crate. There is
+    // deliberately no fallback to other candidates: "try combinations until one
+    // compiles" would accept a STALE but self-consistent set, so a scaffold
+    // that is broken against today's `SqlDialect` could still compile against
+    // yesterday's and the test would go green on the exact drift it exists to
+    // catch.
+    //
+    // The residual risk is therefore a false FAILURE on a `target/` holding
+    // several builds, never a false PASS. That is the safe direction, and the
+    // message below says how to clear it.
+    let compiled = compile(&lib_rs, &deps, &externs, edition, &scratch);
+    if compiled.status.success() {
+        return;
     }
-
-    panic!(
-        "every rlib combination in {} failed to LOAD ({} tried). That is an \
-         environment problem — inconsistent or missing rlibs — not a scaffold \
-         problem. Last stderr:\n{}",
+    let stderr = String::from_utf8_lossy(&compiled.stderr);
+    assert!(
+        !is_crate_loading_failure(&stderr),
+        "rustc could not LOAD a dependency from {}. That is an environment \
+         problem, not a scaffold problem: the directory holds rlibs from more \
+         than one build and the newest-by-mtime pick is not self-consistent. \
+         Re-run after a full `cargo build --tests`, or clear the stale \
+         artifacts.\n--- rustc stderr ---\n{stderr}",
         deps.display(),
-        attempts.len(),
-        attempts.last().map(|(_, e)| e.as_str()).unwrap_or("<none>"),
+    );
+    panic!(
+        "the scaffolded crate does not compile once `literal_escape` is chosen \
+         — `rocky init-adapter` emits a crate that cannot build. The usual \
+         cause is a required `SqlDialect` method added without updating the \
+         template in `commands/init_adapter.rs`.\n--- rustc stderr ---\n{stderr}"
     );
 }
 
@@ -255,36 +266,6 @@ fn newest_externs(deps: &Path) -> Vec<PathBuf> {
         .iter()
         .map(|name| rlib_candidates(deps, name)[0].clone())
         .collect()
-}
-
-/// Every combination of candidate rlibs, newest-first, capped so a pathological
-/// `target/` cannot turn this into a long loop.
-fn extern_candidate_sets(deps: &Path) -> Vec<Vec<PathBuf>> {
-    const MAX_SETS: usize = 32;
-    let per_crate: Vec<Vec<PathBuf>> = SCAFFOLD_EXTERNS
-        .iter()
-        .map(|name| rlib_candidates(deps, name))
-        .collect();
-
-    let mut sets: Vec<Vec<PathBuf>> = vec![Vec::new()];
-    for candidates in &per_crate {
-        let mut next = Vec::new();
-        for set in &sets {
-            for candidate in candidates {
-                let mut extended = set.clone();
-                extended.push(candidate.clone());
-                next.push(extended);
-                if next.len() >= MAX_SETS {
-                    break;
-                }
-            }
-            if next.len() >= MAX_SETS {
-                break;
-            }
-        }
-        sets = next;
-    }
-    sets
 }
 
 /// The workspace's Rust edition, read from `engine/Cargo.toml`.
