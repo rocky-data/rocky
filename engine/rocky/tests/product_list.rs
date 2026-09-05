@@ -348,3 +348,141 @@ fn serve_reads_the_namespaced_store_the_cli_uses() {
         "the server read the namespaced store, not the default: {body}"
     );
 }
+
+/// `rocky product journal <name>` prints the persisted transitions in append
+/// order, the real server answers the same bytes, and an unknown product is a
+/// refusal on both: exit 1 on the CLI, 404 over HTTP.
+#[test]
+fn journal_follows_an_approval_and_refuses_unknown_names() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("project");
+    let out = rocky()
+        .args(["playground", root.to_str().unwrap()])
+        .output()
+        .expect("spawn rocky playground");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::create_dir_all(root.join("products")).expect("mkdir");
+    std::fs::write(root.join("products/revenue_daily.toml"), SPEC_FIXTURE).expect("write spec");
+    let state = dir.path().join("state.redb");
+    let config = root.join("rocky.toml");
+
+    // Known by its spec alone: an empty journal, exit 0.
+    let (code, empty) = run_json(&root, &state, &["product", "journal", "revenue_daily"]);
+    assert_eq!(code, 0, "{empty}");
+    assert_eq!(empty["command"], "product_journal");
+    assert_eq!(empty["product_id"], "product:revenue_daily");
+    assert_eq!(empty["count"], 0);
+    assert_eq!(empty["rows"], serde_json::json!([]));
+
+    // One approval appends one row.
+    let approve = rocky()
+        .current_dir(&root)
+        .args([
+            "-o",
+            "json",
+            "--state-path",
+            state.to_str().unwrap(),
+            "product",
+            "approve",
+            "revenue_daily",
+        ])
+        .output()
+        .expect("spawn rocky product approve");
+    assert!(
+        approve.status.success(),
+        "{}",
+        String::from_utf8_lossy(&approve.stderr)
+    );
+    let (code, journal) = run_json(&root, &state, &["product", "journal", "revenue_daily"]);
+    assert_eq!(code, 0, "{journal}");
+    assert_eq!(journal["count"], 1, "{journal}");
+    assert_eq!(journal["rows"][0]["seq"], 1);
+    assert_eq!(journal["rows"][0]["to_state"], "spec_approved");
+    assert_eq!(journal["rows"][0]["event"], "spec approved");
+
+    // A product nobody knows is a refusal, not an empty journal.
+    let unknown = rocky()
+        .current_dir(&root)
+        .args([
+            "-o",
+            "json",
+            "--state-path",
+            state.to_str().unwrap(),
+            "product",
+            "journal",
+            "nope",
+        ])
+        .output()
+        .expect("spawn rocky product journal");
+    assert_eq!(unknown.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("not known"),
+        "{}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+
+    // The real server: the same bytes, and the same refusal as a 404.
+    let port = TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port();
+    let server = Server(
+        rocky()
+            .current_dir(&root)
+            .args([
+                "--config",
+                config.to_str().unwrap(),
+                "--state-path",
+                state.to_str().unwrap(),
+                "serve",
+                "--models",
+                root.join("models").to_str().unwrap(),
+                "--port",
+                &port.to_string(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn rocky serve"),
+    );
+    let _keep_alive = &server;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            let (status, _) = http_get(port, "/api/v1/health");
+            if status.contains("200") {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rocky serve did not come up on {port}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let cli = rocky()
+        .current_dir(&root)
+        .args([
+            "-o",
+            "json",
+            "--state-path",
+            state.to_str().unwrap(),
+            "product",
+            "journal",
+            "revenue_daily",
+        ])
+        .output()
+        .expect("spawn rocky product journal");
+    assert!(cli.status.success());
+    let (status, body) = http_get(port, "/api/v1/products/revenue_daily/journal");
+    assert!(status.contains("200"), "{status}");
+    assert_eq!(body, String::from_utf8_lossy(&cli.stdout));
+    let (status, body) = http_get(port, "/api/v1/products/nope/journal");
+    assert!(status.contains("404"), "{status}: {body}");
+    assert!(body.contains("product_not_found"), "{body}");
+}

@@ -158,6 +158,11 @@ def product_list_json() -> str:
 
 
 @pytest.fixture
+def product_journal_json() -> str:
+    return json.dumps(scenarios.PRODUCT_JOURNAL)
+
+
+@pytest.fixture
 def plan_with_run_spine_json() -> str:
     """PlanResult with Phase 2 plan_id / models / execution_layers fields."""
     return json.dumps(scenarios.PLAN_WITH_RUN_SPINE)
