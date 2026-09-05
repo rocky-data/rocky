@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.40.0] — 2026-09-03
+
+Pairs with engine 1.73.0.
+
+### Changed
+
+- Regenerated TypeScript bindings for engine 1.73.0: `SchemaEvolutionConfig` and `RockyProject.schema_evolution` are gone (the engine's config loader refuses the block; the LSP itself still falls back to defaults on that error, #1625), the `[freshness]` doc comments describe whole-block inheritance, and the cross-source overlap check result carries `not_evaluated`.
+- Dev dependencies: `json-schema-to-typescript` 15 → 16, `eslint` 10.9, `vitest` 4.1.11, `@xyflow/react` 12.11.5, `typescript-eslint` 8.68, `@testing-library/react` 16.3.3, `@types/node` 26.4, `@types/react-dom` 19.2.5, `fast-uri` 3.1.7.
+
 ## [1.39.0] — 2026-08-26
 
 ### Added

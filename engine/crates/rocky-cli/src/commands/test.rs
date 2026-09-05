@@ -94,8 +94,9 @@ pub fn test_output(
         })
         .collect();
     let model_results = to_output_results(&result.model_results);
-    let mut output =
-        TestOutput::new(result.total, result.passed, failures).with_model_results(model_results);
+    let mut output = TestOutput::new(result.total, result.passed, failures)
+        .with_model_results(model_results)
+        .with_diagnostics(result.diagnostics.clone());
     let unit_run = rocky_engine::test_runner::run_unit_tests(models_dir, model_filter)?;
     if let Some(summary) = unit_summary(&unit_run) {
         output = output.with_unit_tests(summary);
@@ -131,7 +132,8 @@ pub fn run_test(
             .collect();
         let model_results = to_output_results(&result.model_results);
         let mut output = TestOutput::new(result.total, result.passed, failures)
-            .with_model_results(model_results);
+            .with_model_results(model_results)
+            .with_diagnostics(result.diagnostics.clone());
         if let Some(summary) = unit_summary(&unit_run) {
             output = output.with_unit_tests(summary);
         }
@@ -201,8 +203,11 @@ pub fn run_test(
 // ---------------------------------------------------------------------------
 
 /// Load every `.sql` and `.rocky` model beneath the models directory.
-fn load_all_models(models_dir: &Path) -> Result<Vec<rocky_core::models::Model>> {
-    let mut all = crate::models_loader::load_project_models(models_dir)?;
+fn load_all_models(
+    models_dir: &Path,
+    project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
+) -> Result<Vec<rocky_core::models::Model>> {
+    let mut all = crate::models_loader::load_project_models(models_dir, project_freshness)?;
     all.sort_unstable_by(|a, b| a.config.name.cmp(&b.config.name));
     Ok(all)
 }
@@ -227,7 +232,9 @@ fn load_all_models(models_dir: &Path) -> Result<Vec<rocky_core::models::Model>> 
 /// An unknown model is an error, never a zero: a caller must be able to
 /// tell "no checks" from "no answer".
 pub fn declarative_test_count(models_dir: &Path, model: &str) -> Result<usize> {
-    let all_models = load_all_models(models_dir)?;
+    // No project `[freshness]`: this entry point takes a models directory and
+    // loads no `RockyConfig`, and the count reads only `tests`.
+    let all_models = load_all_models(models_dir, None)?;
     let found = all_models
         .iter()
         .find(|loaded| loaded.config.name == model)
@@ -648,7 +655,7 @@ pub(crate) async fn declarative_run(
         resolve_warehouse_adapter(config_path, pipeline_name)?;
 
     // 2. Load all models.
-    let all_models = load_all_models(models_dir)?;
+    let all_models = load_all_models(models_dir, Some(&rocky_cfg.freshness))?;
 
     execute_declarative(&all_models, models_dir, &warehouse_adapter, model_filter).await
 }
@@ -1314,7 +1321,7 @@ mod tests {
             "the expanded [[use_test]] reference must be counted alongside the inline test"
         );
         // The loader agrees with the counter, by construction.
-        let loaded = load_all_models(&models).expect("load models");
+        let loaded = load_all_models(&models, None).expect("load models");
         assert_eq!(loaded[0].config.tests.len(), 2);
     }
 
@@ -1346,7 +1353,7 @@ mod tests {
         )
         .expect("write model sidecar");
 
-        let loaded = load_all_models(&models).expect("load models");
+        let loaded = load_all_models(&models, None).expect("load models");
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].config.name, "orders");

@@ -34,6 +34,15 @@ pub enum ValidationError {
     )]
     InvalidGcpProjectId { value: String },
 
+    #[error("SQL type cannot be empty")]
+    EmptySqlType,
+
+    #[error(
+        "invalid SQL type '{value}': must contain only letters, digits, underscores, \
+         spaces, parentheses and commas"
+    )]
+    InvalidSqlType { value: String },
+
     #[error("SQL identifier cannot be empty")]
     EmptyIdentifier,
 
@@ -100,6 +109,44 @@ pub fn validate_gcp_project_id(value: &str) -> Result<&str, ValidationError> {
         });
     }
     Ok(value)
+}
+
+/// Validates a SQL type string for safe interpolation into generated SQL.
+///
+/// A type name is spliced raw into `CAST(<value> AS <type>)` and
+/// `ALTER … TYPE <type>`, so it must not be able to close the cast and add
+/// SQL of its own. The rule is a pure character allowlist: ASCII letters,
+/// digits, `_`, space, `(`, `)` and `,` — enough for `STRING`, `INT`,
+/// `DECIMAL(10,2)` and `DOUBLE PRECISION`, and nothing else.
+///
+/// It is an allowlist, **not** a type grammar. `NOT A TYPE (1,2)` passes:
+/// the warehouse rejects it as a syntax error. What the allowlist buys is
+/// that nothing accepted can carry a quote, a `;`, a comment or an operator
+/// out of the cast.
+///
+/// This is the single owner of the rule. `rocky_core::sql_gen::validate_sql_type`
+/// delegates here and only re-wraps the error, so the check cannot drift
+/// between the two crates. (`rocky-databricks`'s loader keeps a separate,
+/// deliberately looser allowlist that also accepts `<`/`>` for `array<int>`;
+/// that one is not this rule and is out of scope here.)
+///
+/// # Errors
+///
+/// [`ValidationError::EmptySqlType`] for an empty string and
+/// [`ValidationError::InvalidSqlType`] for any character outside the allowlist.
+pub fn validate_sql_type(data_type: &str) -> Result<(), ValidationError> {
+    if data_type.is_empty() {
+        return Err(ValidationError::EmptySqlType);
+    }
+    let valid = data_type
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ' ' | '(' | ')' | ','));
+    if !valid {
+        return Err(ValidationError::InvalidSqlType {
+            value: data_type.to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Validates a principal name for use in GRANT/REVOKE statements.
@@ -331,21 +378,20 @@ pub fn reject_statement_terminator(context: &str, sql: &str) -> Result<(), Valid
 
 /// Refuses a value Rocky cannot safely wrap in a `'…'` SQL literal.
 ///
-/// Rocky encodes a config-supplied string constant — a declarative check's
-/// `accepted_values`, for instance — by doubling single quotes. That is enough
-/// only where `''` is the *only* escape. Snowflake, DuckDB and BigQuery also
-/// honour a backslash escape, so a value ending in `\` escapes the first quote
-/// of the `''` pair Rocky emits and the second quote closes the literal — the
-/// bypass `rocky-snowflake/src/governance.rs` documents for tag values.
+/// Doubling single quotes encodes a string constant correctly only where `''`
+/// is the *only* escape. Snowflake, Databricks and BigQuery also read a
+/// backslash escape, so a value ending in `\` escapes the first quote of the
+/// `''` pair and the second quote closes the literal.
 ///
-/// Escaping backslashes as well closes the bypass on those three but changes the
-/// *value* on Trino and standard-SQL DuckDB, where a doubled backslash is two
-/// literal backslashes. No single encoding is correct everywhere, and these call
-/// sites have no dialect to ask. So a backslash is refused and the author is
-/// told which value to change.
+/// Escaping backslashes as well would change the *value* on Trino and DuckDB,
+/// where a backslash stands for itself. No single encoding is correct without
+/// knowing the dialect, so a caller that has none refuses a backslash and
+/// tells the author which value to change.
 ///
-/// The proper fix is dialect-owned literal encoding or parameter binding at
-/// these call sites; this is the cheap, sound guard until that lands.
+/// Every sink with a dialect in hand encodes through
+/// [`crate::literal::encode_string_literal`] instead and needs no guard. The
+/// one remaining caller is the dialect-less `generate_test_sql` in
+/// `rocky-core`, kept for callers that cannot name a dialect.
 ///
 /// # Errors
 ///
@@ -463,6 +509,44 @@ mod tests {
         // Injection attempts.
         assert!(validate_gcp_project_id("'; DROP TABLE users; --").is_err());
         assert!(validate_gcp_project_id("project`backtick").is_err());
+    }
+
+    // ----- validate_sql_type -----
+
+    #[test]
+    fn sql_type_accepts_the_shapes_the_engine_emits() {
+        for ty in [
+            "STRING",
+            "INT",
+            "DECIMAL(10,2)",
+            "DOUBLE PRECISION",
+            "varchar",
+            "TIMESTAMP_NTZ",
+        ] {
+            assert!(validate_sql_type(ty).is_ok(), "should accept: {ty}");
+        }
+    }
+
+    #[test]
+    fn sql_type_refuses_empty_and_anything_that_can_close_the_cast() {
+        assert!(matches!(
+            validate_sql_type(""),
+            Err(ValidationError::EmptySqlType)
+        ));
+        for ty in [
+            "VARCHAR) AS x, (SELECT secret FROM creds) AS leak --",
+            "STRING;--",
+            "STRING'",
+            "array<int>",
+        ] {
+            assert!(
+                matches!(
+                    validate_sql_type(ty),
+                    Err(ValidationError::InvalidSqlType { .. })
+                ),
+                "should refuse: {ty}"
+            );
+        }
     }
 
     // ----- reject_statement_terminator -----

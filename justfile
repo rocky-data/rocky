@@ -71,16 +71,6 @@ lint-dagster:
 lint-vscode:
     cd editors/vscode && npm run lint
 
-# --- Vendoring (used by Dockerfile builds + dagster integration tests) ---
-
-# Build the rocky binary locally and copy into vendor/
-vendor-rocky:
-    ./scripts/vendor_rocky.sh
-
-# Build the dagster_rocky wheel and copy into vendor/
-vendor-dagster:
-    ./scripts/vendor_dagster_rocky.sh
-
 # --- Phase 2 schema codegen ---
 
 # Run the full codegen pipeline: rust → JSON schemas → Pydantic + TypeScript + VS Code project schema

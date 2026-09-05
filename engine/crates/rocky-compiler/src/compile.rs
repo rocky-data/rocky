@@ -109,13 +109,19 @@ pub struct CompilerConfig {
     /// matching `[mask]` strategy — the escape hatch documented on
     /// `[classifications.allow_unmasked]`. Suppresses W004 for listed tags.
     pub allow_unmasked: Vec<String>,
-    /// Whether `rocky.toml`'s top-level `[freshness]` block declares a
-    /// project-wide `expected_lag_seconds`. When `true`, the W005
-    /// freshness-coverage check skips every model — they all inherit
-    /// the project default. Callers that don't load a `RockyConfig`
-    /// keep the default (`false`) and continue to see W005 per
+    /// `rocky.toml`'s top-level `[freshness]` block.
+    ///
+    /// Two jobs. It is the last rung of each model's freshness
+    /// precedence chain (sidecar > `_defaults.toml` > project), so a model
+    /// that declares no block of its own inherits this one (#1435). And
+    /// when it carries an `expected_lag_seconds`, the W005
+    /// freshness-coverage check skips every model, because they are all
+    /// covered.
+    ///
+    /// Callers that don't load a `RockyConfig` keep the default (every
+    /// field `None`): nothing is inherited and W005 still fires per
     /// uncovered model.
-    pub project_freshness_default: bool,
+    pub project_freshness: rocky_core::config::ProjectFreshnessConfig,
     /// Per-run variables (`rocky run --var name=value`) substituted into each
     /// model's SQL **before** the semantic graph and typecheck run, so the
     /// resolved SQL flows uniformly into `rocky run`, `rocky compile`, and
@@ -253,10 +259,15 @@ fn compile_with_db_inner(
     //    error before `compile_project` can substitute.
     let load_start = Instant::now();
     let models = match models_glob {
-        Some(models_glob) => {
-            Project::load_models_matching_with_db(&config.models_dir, models_glob, db)?
+        Some(models_glob) => Project::load_models_matching_with_db(
+            &config.models_dir,
+            models_glob,
+            db,
+            Some(&config.project_freshness),
+        )?,
+        None => {
+            Project::load_models_with_db(&config.models_dir, db, Some(&config.project_freshness))?
         }
-        None => Project::load_models_with_db(&config.models_dir, db)?,
     };
     compile_preloaded_models_inner(models, config, total_start, load_start)
 }
@@ -427,7 +438,7 @@ pub fn compile_project(
     let freshness_diagnostics = typecheck::check_freshness_coverage(
         &project.models,
         &type_check.typed_models,
-        config.project_freshness_default,
+        config.project_freshness.has_default(),
     );
 
     // 9. Managed-Iceberg format_options (E035). Reject `format_options` the
@@ -446,6 +457,12 @@ pub fn compile_project(
     diagnostics.extend(lakehouse_diagnostics);
     diagnostics.extend(run_var_diagnostics);
     diagnostics.extend(target_collision_diagnostics(&project));
+    // Dependency-resolution warnings (D011 depends_on mismatch, D012 an edge
+    // derived from a name match a warehouse run does not honour). Produced by
+    // `resolve::resolve_dependencies` and parked on the project until now;
+    // without this merge they were written and never read, so the one place
+    // that knows an edge is questionable said nothing.
+    diagnostics.extend(project.resolve_diagnostics.iter().cloned());
 
     let has_errors = diagnostics
         .iter()
@@ -505,7 +522,7 @@ pub fn compile_incremental(
     //    as the full-compile path: a bare `@var(...)` must never reach the
     //    SQL parser during lineage extraction (see `compile_with_db`).
     let load_start = Instant::now();
-    let mut models = Project::load_models(&config.models_dir)?;
+    let mut models = Project::load_models(&config.models_dir, Some(&config.project_freshness))?;
     let run_var_diagnostics = substitute_run_vars_into_models(&mut models, &config.run_vars);
     let project = Project::from_models(models)?;
     let project_load_ms = load_start.elapsed().as_millis() as u64;
@@ -639,7 +656,7 @@ pub fn compile_incremental(
     let freshness_diagnostics = typecheck::check_freshness_coverage(
         &project.models,
         &type_check.typed_models,
-        config.project_freshness_default,
+        config.project_freshness.has_default(),
     );
 
     // E035: managed-Iceberg format_options, mirroring the full-compile path so
@@ -654,6 +671,12 @@ pub fn compile_incremental(
     diagnostics.extend(lakehouse_diagnostics);
     diagnostics.extend(run_var_diagnostics);
     diagnostics.extend(target_collision_diagnostics(&project));
+    // Dependency-resolution warnings (D011 depends_on mismatch, D012 an edge
+    // derived from a name match a warehouse run does not honour). Produced by
+    // `resolve::resolve_dependencies` and parked on the project until now;
+    // without this merge they were written and never read, so the one place
+    // that knows an edge is questionable said nothing.
+    diagnostics.extend(project.resolve_diagnostics.iter().cloned());
 
     let has_errors = diagnostics
         .iter()
@@ -729,7 +752,16 @@ fn validate_all_contracts(
 ) -> Vec<Diagnostic> {
     let mut all_diags = Vec::new();
 
-    for (model_name, contract) in contract_map {
+    // Sorted, not `HashMap` iteration order. Contract diagnostics are
+    // serialized into `rocky compile --output json`, and the dagster fixture
+    // corpus is byte-diffed in CI — so two runs of the same project must
+    // produce the same order. One contracted model hid this; a project with
+    // two or more does not.
+    let mut model_names: Vec<&String> = contract_map.keys().collect();
+    model_names.sort();
+
+    for model_name in model_names {
+        let contract = &contract_map[model_name];
         if let Some(schema) = typed_models.get(model_name) {
             let diags = contracts::validate_contract(model_name, schema, contract);
             all_diags.extend(diags);
@@ -789,6 +821,135 @@ pub fn default_type_mapper(warehouse_type: &str) -> RockyType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Contract diagnostics are serialized into `rocky compile --output json`
+    /// and the dagster fixture corpus is byte-diffed in CI, so two runs of the
+    /// same project must order them the same way. `HashMap` iteration does not
+    /// promise that; the model names are sorted for exactly this reason.
+    #[test]
+    fn contract_diagnostics_are_ordered_by_model_name() {
+        let contract = |type_name: &str| CompilerContract {
+            columns: vec![crate::contracts::ContractColumn {
+                name: "id".to_string(),
+                type_name: Some(type_name.to_string()),
+                nullable: None,
+                description: None,
+            }],
+            rules: crate::contracts::ContractRules::default(),
+        };
+        let unknown_id = vec![TypedColumn {
+            name: "id".to_string(),
+            data_type: RockyType::Unknown,
+            nullable: true,
+        }];
+
+        // Sixteen models, inserted in reverse name order. `HashMap` iteration
+        // is randomized per process, so a single pair could come out sorted by
+        // luck — with sixteen keys the chance that dropping the sort still
+        // yields this exact order is 1 in 16!, about 1 in 2e13.
+        let names: Vec<String> = (0..16).map(|i| format!("m{:02}", 15 - i)).collect();
+        let mut typed_models: IndexMap<String, Vec<TypedColumn>> = IndexMap::new();
+        let mut contract_map: HashMap<String, CompilerContract> = HashMap::new();
+        for name in &names {
+            typed_models.insert(name.clone(), unknown_id.clone());
+            contract_map.insert(name.clone(), contract("Int64"));
+        }
+
+        let mut expected = names.clone();
+        expected.sort();
+        let models: Vec<String> = validate_all_contracts(&contract_map, &typed_models)
+            .iter()
+            .map(|d| d.model.clone())
+            .collect();
+        assert_eq!(models, expected, "{models:?}");
+    }
+
+    /// The wire, not the writer: `resolve::resolve_dependencies` produced
+    /// D011/D012 warnings that were parked on `Project::resolve_diagnostics`
+    /// and never read by anything. A warning nobody merges is a warning nobody
+    /// sees, so #1354's "this edge rests on a name match the warehouse does
+    /// not honour" would have been silent. This test fails if the merge is
+    /// removed.
+    #[test]
+    fn dependency_resolution_warnings_reach_the_diagnostic_set() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("customers.toml"),
+            "name = \"customers\"\n[target]\ncatalog = \"warehouse\"\nschema = \"prod\"\ntable = \"customers_v2\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("customers.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            dir.path().join("rollup.toml"),
+            "name = \"rollup\"\n[target]\ncatalog = \"warehouse\"\nschema = \"silver\"\ntable = \"rollup\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("rollup.sql"), "SELECT id FROM customers").unwrap();
+
+        let config = CompilerConfig {
+            models_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let result = compile(&config).unwrap();
+
+        let d012: Vec<&Diagnostic> = result
+            .diagnostics
+            .iter()
+            .filter(|d| &*d.code == "D012")
+            .collect();
+        assert_eq!(d012.len(), 1, "{:?}", result.diagnostics);
+        assert_eq!(d012[0].model, "rollup");
+        assert!(!result.has_errors, "D012 is a warning, not an error");
+
+        // The edge is reported, not removed — see the module docs in
+        // `resolve.rs` for why removing it is not this layer's call.
+        let rollup = result
+            .project
+            .dag_nodes
+            .iter()
+            .find(|n| n.name == "rollup")
+            .unwrap();
+        assert_eq!(rollup.depends_on, vec!["customers"]);
+
+        // The INCREMENTAL path merges diagnostics at its own site. The LSP
+        // recompiles through it on every debounced file change, so a wire test
+        // that only drives `compile()` leaves that merge unproven — and D012
+        // would vanish from the editor while `rocky compile` still showed it.
+        //
+        // The eight filler models are load-bearing: `compile_incremental`
+        // returns `compile(config)` outright when the project has fewer than
+        // ten models, or when the affected set exceeds half of them (the
+        // guardrail above `typecheck_project_incremental`). With two models
+        // this assertion silently re-ran the FULL path and proved nothing
+        // about the second merge site.
+        for i in 0..8 {
+            std::fs::write(
+                dir.path().join(format!("filler{i}.toml")),
+                format!(
+                    "name = \"filler{i}\"\n[target]\ncatalog = \"warehouse\"\n\
+                     schema = \"silver\"\ntable = \"filler{i}\"\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(dir.path().join(format!("filler{i}.sql")), "SELECT 1 AS id").unwrap();
+        }
+        let result = compile(&config).unwrap();
+        // Edit the file the incremental call is told changed, so the fixture
+        // is the shape the LSP actually hands it.
+        std::fs::write(dir.path().join("filler0.sql"), "SELECT 2 AS id").unwrap();
+        let incremental =
+            compile_incremental(&config, &[dir.path().join("filler0.sql")], &result).unwrap();
+        assert_eq!(
+            incremental
+                .diagnostics
+                .iter()
+                .filter(|d| &*d.code == "D012")
+                .count(),
+            1,
+            "{:?}",
+            incremental.diagnostics
+        );
+    }
 
     #[test]
     fn outer_join_rejects_non_null_contract() {

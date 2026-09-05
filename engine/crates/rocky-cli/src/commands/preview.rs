@@ -585,7 +585,7 @@ async fn apply_bisection_to_models(
     };
     let adapter = registry.warehouse_adapter(&adapter_name)?;
 
-    let models = crate::models_loader::load_project_models(models_dir)?;
+    let models = crate::models_loader::load_project_models(models_dir, Some(&cfg.freshness))?;
     let model_by_name: BTreeMap<String, &rocky_core::models::Model> =
         models.iter().map(|m| (m.config.name.clone(), m)).collect();
     let mut model_out_idx: HashMap<String, usize> = HashMap::new();
@@ -1187,15 +1187,20 @@ pub async fn run_preview_cost(
     // Best-effort sidecar load: a missing or malformed model directory
     // silently degrades to an empty per-model budget map. Project-level
     // budget projection still runs.
-    let model_budgets: BTreeMap<String, rocky_core::config::ModelBudgetConfig> =
-        Some(crate::models_loader::load_project_models_partial(models_dir).0)
-            .map(|models| {
-                models
-                    .into_iter()
-                    .filter_map(|m| m.config.budget.map(|b| (m.config.name.clone(), b)))
-                    .collect()
-            })
-            .unwrap_or_default();
+    let model_budgets: BTreeMap<String, rocky_core::config::ModelBudgetConfig> = Some(
+        crate::models_loader::load_project_models_partial(
+            models_dir,
+            loaded_config.as_ref().map(|c| &c.freshness),
+        )
+        .0,
+    )
+    .map(|models| {
+        models
+            .into_iter()
+            .filter_map(|m| m.config.budget.map(|b| (m.config.name.clone(), b)))
+            .collect()
+    })
+    .unwrap_or_default();
 
     let (summary, per_model) = match (branch_run.as_ref(), base_run.as_ref()) {
         (Some(b), Some(p)) => build_preview_cost_delta(b, p, cost_params.as_ref()),
@@ -2046,7 +2051,7 @@ async fn execute_copy_from_base(
         .unwrap_or_else(|| "unknown".to_string());
 
     // Load the model sidecars to resolve each model's source schema.
-    let models = crate::models_loader::load_project_models(models_dir)?;
+    let models = crate::models_loader::load_project_models(models_dir, Some(&cfg.freshness))?;
     let model_by_name: BTreeMap<String, &rocky_core::models::Model> =
         models.iter().map(|m| (m.config.name.clone(), m)).collect();
 
@@ -3750,7 +3755,7 @@ on_breach = "warn"
         )
         .unwrap();
 
-        let models = load_models_from_dir(dir.path()).unwrap();
+        let models = load_models_from_dir(dir.path(), None).unwrap();
         assert_eq!(models.len(), 1);
         let budget = models[0]
             .config
@@ -3776,7 +3781,7 @@ table = "plain"
 "#,
         )
         .unwrap();
-        let models = load_models_from_dir(dir.path()).unwrap();
+        let models = load_models_from_dir(dir.path(), None).unwrap();
         let plain = models.iter().find(|m| m.config.name == "plain").unwrap();
         assert!(plain.config.budget.is_none());
     }

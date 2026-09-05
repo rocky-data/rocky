@@ -175,7 +175,9 @@ fn load_dag_from_models(models_dir: Option<&Path>) -> Vec<DagNode> {
     // Top-level + immediate subdirectories, including `.rocky` DSL files.
     // Partial: this drives advisory downstream-reference counts, so one broken
     // draft model must not silently collapse every healthy count to zero.
-    let (all_models, load_errors) = crate::models_loader::load_project_models_partial(dir);
+    // No project `[freshness]`: this path loads no `RockyConfig`, and the
+    // models are used only to count downstream references.
+    let (all_models, load_errors) = crate::models_loader::load_project_models_partial(dir, None);
     // Tolerant on purpose — recommendations over the models that DID load are
     // still useful — but never silent: a model missing from this set gets no
     // recommendation at all, and that absence must be visible (#1262).

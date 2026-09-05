@@ -1,6 +1,6 @@
 //! BigQuery SQL dialect implementation.
 
-use rocky_core::traits::{AdapterError, AdapterResult, SqlDialect};
+use rocky_core::traits::{AdapterError, AdapterResult, LiteralEscape, SqlDialect};
 use rocky_ir::{ColumnSelection, MetadataColumn};
 use rocky_sql::validation;
 
@@ -11,6 +11,28 @@ pub struct BigQueryDialect;
 impl SqlDialect for BigQueryDialect {
     fn name(&self) -> &'static str {
         "bigquery"
+    }
+
+    /// GoogleSQL's `'…'` literal processes backslash escapes; a quote is
+    /// `\'` and a backslash is `\\`.
+    ///
+    /// **Doc-derived, not executed** — the BigQuery sandbox is expired. Both
+    /// halves come from the GoogleSQL/ZetaSQL lexical spec, which lists the
+    /// supported escapes — the C-style set plus the three quote characters
+    /// and the octal/hex/unicode forms — and then says "Any sequence not in
+    /// this table produces an error":
+    ///   - `\'` **is** supported, so this rule is valid;
+    ///   - `''` is **not** an escape, so the `Standard` rule would be a
+    ///     syntax error here, not a wrong value. BigQuery is the reason
+    ///     `LiteralEscape` exists rather than one hand-written encoder.
+    ///
+    /// The same spec says "Quoted strings can't contain newlines, even when
+    /// preceded by a backslash". That is why `Backslash` encodes a line break
+    /// as `\n` / `\r` rather than passing it through: a raw one would be a
+    /// BigQuery parse error, and the escaped form is documented here and on
+    /// both of the other `Backslash` dialects.
+    fn literal_escape(&self) -> LiteralEscape {
+        LiteralEscape::Backslash
     }
 
     fn format_table_ref(&self, catalog: &str, schema: &str, table: &str) -> AdapterResult<String> {
@@ -103,16 +125,24 @@ impl SqlDialect for BigQueryDialect {
             return Ok(base);
         }
 
-        // `name` and `data_type` are interpolated raw into the CAST — validate
-        // both (same guards used elsewhere) so a metadata block from a hostile
-        // config can't inject; the trusted `value` expression is left as-is.
+        // All three fields are interpolated raw into the CAST, so all three are
+        // validated. `value` is an SQL expression, not an identifier, and it is
+        // NOT trusted: `rocky-cli` substitutes `{placeholder}`s in it from source
+        // schema names read back from the warehouse. `rocky_ir::MetadataColumn::new`
+        // is the boundary that guards it; this repeats the scan because
+        // `new_unchecked` and any future construction path must not reach a raw
+        // splice.
         let mut meta_cols: Vec<String> = Vec::with_capacity(metadata.len());
         for m in metadata {
-            validation::validate_identifier(&m.name).map_err(AdapterError::new)?;
-            rocky_core::sql_gen::validate_sql_type(&m.data_type).map_err(AdapterError::new)?;
+            validation::validate_identifier(m.name()).map_err(AdapterError::new)?;
+            rocky_core::sql_gen::validate_sql_type(m.data_type()).map_err(AdapterError::new)?;
+            validation::reject_statement_terminator("metadata_columns[].value", m.value())
+                .map_err(AdapterError::new)?;
             meta_cols.push(format!(
                 "CAST({} AS {}) AS {}",
-                m.value, m.data_type, m.name
+                m.value(),
+                m.data_type(),
+                m.name()
             ));
         }
 
@@ -530,14 +560,40 @@ mod tests {
         assert_eq!(sql, "SELECT *");
     }
 
+    /// #1594: `value` is spliced raw into the CAST alongside `name` and
+    /// `data_type`. The IR boundary (`rocky_ir::MetadataColumn::new`) refuses
+    /// this input, so `new_unchecked` is the only way to build it — which is
+    /// exactly what makes this a test of THIS dialect's own scan rather than
+    /// of the constructor. Both the serde path and any future construction
+    /// site land here.
+    #[test]
+    fn select_clause_rejects_a_hostile_metadata_value() {
+        let d = BigQueryDialect;
+        // Ends Rocky's statement and starts another.
+        let terminator = vec![MetadataColumn::new_unchecked(
+            "_loaded_by",
+            "STRING",
+            "NULL) AS x; SELECT 1 --",
+        )];
+        assert!(d.select_clause(&ColumnSelection::All, &terminator).is_err());
+
+        // Unbalanced quote: pairs its quotes across the rest of the SELECT.
+        let unbalanced = vec![MetadataColumn::new_unchecked(
+            "_loaded_by",
+            "STRING",
+            "'o'brien'",
+        )];
+        assert!(d.select_clause(&ColumnSelection::All, &unbalanced).is_err());
+
+        // The benign expression still renders.
+        let ok = vec![MetadataColumn::new("_loaded_by", "STRING", "NULL").unwrap()];
+        assert!(d.select_clause(&ColumnSelection::All, &ok).is_ok());
+    }
+
     #[test]
     fn test_select_clause_with_metadata() {
         let d = BigQueryDialect;
-        let meta = vec![MetadataColumn {
-            name: "_loaded_by".to_string(),
-            data_type: "STRING".to_string(),
-            value: "NULL".to_string(),
-        }];
+        let meta = vec![MetadataColumn::new("_loaded_by", "STRING", "NULL").unwrap()];
         let sql = d.select_clause(&ColumnSelection::All, &meta).unwrap();
         assert!(sql.contains("CAST(NULL AS STRING) AS _loaded_by"));
     }

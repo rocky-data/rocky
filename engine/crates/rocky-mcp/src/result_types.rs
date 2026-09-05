@@ -743,6 +743,24 @@ pub struct AiContractResult {
     /// `contract_toml` is `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Declared column types the compiler could NOT check, one message each.
+    ///
+    /// The compile-verify loop only fails on error-severity diagnostics. A
+    /// column whose type Rocky could not infer reports `I003` instead, and
+    /// the declared type is accepted without being compared to anything.
+    /// With a cold schema cache that is every leaf column, so a returned
+    /// contract with no errors is not evidence its types are right (#1618).
+    /// Empty when every declared type was actually checked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unverified_types: Vec<String>,
+    /// Optional columns the draft declares that the model does not produce.
+    ///
+    /// `W010`, dropped by the same error-only filter as `unverified_types`.
+    /// A missing REQUIRED column fails the draft (`E010`); an optional one
+    /// only warns, so a drafted column the model never emits went
+    /// unreported. Empty when every declared column exists.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmatched_columns: Vec<String>,
 }
 
 /// One generated test assertion in an `ai_test` result.

@@ -21,6 +21,10 @@ use tempfile::TempDir;
 struct TestDialect;
 
 impl SqlDialect for TestDialect {
+    fn literal_escape(&self) -> rocky_core::traits::LiteralEscape {
+        rocky_core::traits::LiteralEscape::Standard
+    }
+
     fn format_table_ref(&self, catalog: &str, schema: &str, table: &str) -> AdapterResult<String> {
         rocky_sql::validation::format_table_ref(catalog, schema, table).map_err(AdapterError::new)
     }
@@ -94,12 +98,14 @@ impl SqlDialect for TestDialect {
             }
         }
         for mc in metadata {
-            rocky_sql::validation::validate_identifier(&mc.name).map_err(AdapterError::new)?;
+            rocky_sql::validation::validate_identifier(mc.name()).map_err(AdapterError::new)?;
             use std::fmt::Write;
             write!(
                 sql,
                 ", CAST({} AS {}) AS {}",
-                mc.value, mc.data_type, mc.name
+                mc.value(),
+                mc.data_type(),
+                mc.name()
             )
             .unwrap();
         }
@@ -186,11 +192,7 @@ fn sample_replication_ir(strategy: MaterializationStrategy) -> ModelIr {
             table: "orders".into(),
         },
         ColumnSelection::All,
-        vec![MetadataColumn {
-            name: "_loaded_by".into(),
-            data_type: "STRING".into(),
-            value: "NULL".into(),
-        }],
+        vec![MetadataColumn::new("_loaded_by", "STRING", "NULL").unwrap()],
         GovernanceConfig {
             permissions_file: None,
             auto_create_catalogs: false,
@@ -885,11 +887,11 @@ fn test_sql_injection_prevention() {
 
     // Unsafe metadata column name
     let mut bad_plan = sample_replication_ir(MaterializationStrategy::FullRefresh);
-    bad_plan.metadata_columns = vec![MetadataColumn {
-        name: "col; DROP TABLE".into(),
-        data_type: "STRING".into(),
-        value: "NULL".into(),
-    }];
+    bad_plan.metadata_columns = vec![MetadataColumn::new_unchecked(
+        "col; DROP TABLE",
+        "STRING",
+        "NULL",
+    )];
     assert!(
         sql_gen::generate_select_sql(&bad_plan, &dialect, None).is_err(),
         "should reject SQL injection in metadata column name"

@@ -384,3 +384,56 @@ async fn drift_widening_alters_iceberg_in_place() {
 
     println!("VERDICT: Iceberg SET DATA TYPE widening accepted; rows preserved.");
 }
+
+/// Executed proof that `TrinoDialect::literal_escape` states the truth.
+///
+/// Trino's `'…'` has no backslash escape, so the `Standard` rule must
+/// round-trip a quote, a backslash and the `\'` pair byte-identical. Runs
+/// `SELECT <literal>` per value against the live coordinator — no catalog
+/// needed.
+#[tokio::test]
+#[ignore = "requires a live Trino coordinator at TRINO_HOST:TRINO_PORT (default localhost:8080); run with `--ignored`"]
+async fn literal_escape_round_trips_live() {
+    use rocky_core::sql_gen::string_literal;
+    use rocky_core::traits::LiteralEscape;
+
+    let adapter = build_adapter();
+    let dialect = adapter.dialect();
+    assert_eq!(
+        dialect.literal_escape(),
+        LiteralEscape::Standard,
+        "this probe pins the Standard rule; update it deliberately"
+    );
+
+    for value in [
+        "it's",
+        r"C:\tmp",
+        r"a\'b",
+        r"trailing\",
+        "",
+        "line1\nline2",
+        "crlf\r\nvalue",
+        r"'; DROP TABLE t; --",
+        r"\'; DROP TABLE t; --",
+        "plain",
+    ] {
+        let literal = string_literal(dialect, value);
+        let sql = format!("SELECT {literal} AS v");
+        let result = adapter
+            .execute_query(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("Trino rejected `{sql}`: {e}"));
+        assert_eq!(result.rows.len(), 1, "expected one row from `{sql}`");
+        let read_back = result.rows[0]
+            .first()
+            .expect("row has one column")
+            .as_str()
+            .expect("column is a string");
+        assert_eq!(
+            read_back, value,
+            "value {value:?} did not survive Trino as {literal}"
+        );
+    }
+
+    println!("VERDICT: Trino LiteralEscape::Standard round-trips byte-identical.");
+}

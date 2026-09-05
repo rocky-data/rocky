@@ -99,6 +99,6 @@ Results travel back up the same chain. The CLI prints typed JSON on stdout. `Roc
 - `rocky-sdk >= 0.6.0`
 - `pydantic >= 2.0`
 - `pygments >= 2.20.0`
-- The `rocky` binary must be available on `PATH` (or configured via `binary_path`). For deployment, you can vendor the binary under a `vendor/` directory and point `binary_path` to it.
+- The `rocky` binary must be available on `PATH` (or configured via `binary_path`). To pin one Rocky version in a container or cloud deployment, ship the binary next to your Dagster code and point `binary_path` at it — see [Installation](/dagster/installation/#vendor-binary-for-deployment).
 
 `RockyResource` exposes one Python method per Rocky CLI command. See the [RockyResource](/dagster/resource/) page for the full method list and signatures.

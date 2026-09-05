@@ -884,26 +884,45 @@ pub fn archive_from_ir(
     Ok(statements)
 }
 
+/// Encodes `value` as a complete single-quoted string literal for `dialect`.
+///
+/// A convenience over [`rocky_sql::literal::encode_string_literal`] that asks
+/// the dialect for its own lexer rule, so a caller that already holds a
+/// `&dyn SqlDialect` never picks a rule by hand. The return value includes
+/// the surrounding quotes.
+///
+/// This is a free function on purpose: a provided trait method could be
+/// overridden into a third encoding, which is the failure this lane removes.
+///
+/// # Examples
+///
+/// ```
+/// use rocky_core::sql_gen::string_literal;
+/// use rocky_duckdb::dialect::DuckDbSqlDialect;
+///
+/// // DuckDB's lexer reads no backslash escapes, so a quote is doubled and a
+/// // backslash stands for itself.
+/// assert_eq!(string_literal(&DuckDbSqlDialect, "it's"), "'it''s'");
+/// assert_eq!(string_literal(&DuckDbSqlDialect, r"C:\tmp"), r"'C:\tmp'");
+/// ```
+#[must_use]
+pub fn string_literal(dialect: &dyn SqlDialect, value: &str) -> String {
+    rocky_sql::literal::encode_string_literal(dialect.literal_escape(), value)
+}
+
 /// Validates a SQL type string for safety (no injection).
+///
+/// The rule itself lives in [`rocky_sql::validation::validate_sql_type`] so
+/// that `rocky-ir`, which cannot depend on `rocky-core`, runs exactly the same
+/// allowlist at the [`rocky_ir::MetadataColumn`] boundary. This wrapper only
+/// re-wraps the error as a [`SqlGenError`] for the callers that already
+/// propagate one; keep the body a single delegation so the two crates cannot
+/// drift apart.
 pub fn validate_sql_type(data_type: &str) -> Result<(), SqlGenError> {
-    if data_type.is_empty() {
-        return Err(SqlGenError::UnsafeFragment {
-            value: data_type.to_string(),
-            reason: "data type cannot be empty".to_string(),
-        });
-    }
-    // SQL types: alphanumeric, underscores, spaces, parens, commas
-    // e.g., STRING, INT, DECIMAL(10,2), DOUBLE PRECISION
-    let valid = data_type
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ' ' | '(' | ')' | ','));
-    if !valid {
-        return Err(SqlGenError::UnsafeFragment {
-            value: data_type.to_string(),
-            reason: "data type contains invalid characters".to_string(),
-        });
-    }
-    Ok(())
+    rocky_sql::validation::validate_sql_type(data_type).map_err(|e| SqlGenError::UnsafeFragment {
+        value: data_type.to_string(),
+        reason: e.to_string(),
+    })
 }
 
 /// Validates a SQL literal value for safety (no injection).
@@ -1092,6 +1111,10 @@ mod tests {
     struct TestDialect;
 
     impl SqlDialect for TestDialect {
+        fn literal_escape(&self) -> crate::traits::LiteralEscape {
+            crate::traits::LiteralEscape::Standard
+        }
+
         fn name(&self) -> &'static str {
             "test"
         }
@@ -1184,11 +1207,13 @@ mod tests {
                 }
             }
             for mc in metadata {
-                rocky_sql::validation::validate_identifier(&mc.name).map_err(AdapterError::new)?;
+                rocky_sql::validation::validate_identifier(mc.name()).map_err(AdapterError::new)?;
                 write!(
                     sql,
                     ", CAST({} AS {}) AS {}",
-                    mc.value, mc.data_type, mc.name
+                    mc.value(),
+                    mc.data_type(),
+                    mc.name()
                 )
                 .unwrap();
             }
@@ -1307,11 +1332,7 @@ mod tests {
                 table: "orders".into(),
             },
             ColumnSelection::All,
-            vec![MetadataColumn {
-                name: "_loaded_by".into(),
-                data_type: "STRING".into(),
-                value: "NULL".into(),
-            }],
+            vec![MetadataColumn::new("_loaded_by", "STRING", "NULL").unwrap()],
             GovernanceConfig {
                 permissions_file: None,
                 auto_create_catalogs: true,
@@ -1435,16 +1456,8 @@ mod tests {
     fn test_multiple_metadata_columns() {
         let mut ir = sample_full_refresh_ir();
         ir.metadata_columns = vec![
-            MetadataColumn {
-                name: "_loaded_by".into(),
-                data_type: "STRING".into(),
-                value: "NULL".into(),
-            },
-            MetadataColumn {
-                name: "load_id".into(),
-                data_type: "INT".into(),
-                value: "42".into(),
-            },
+            MetadataColumn::new("_loaded_by", "STRING", "NULL").unwrap(),
+            MetadataColumn::new("load_id", "INT", "42").unwrap(),
         ];
         let sql = generate_select_sql(&ir, &dialect(), None).unwrap();
 
@@ -1466,39 +1479,39 @@ mod tests {
     #[test]
     fn test_rejects_unsafe_metadata_name() {
         let mut ir = sample_full_refresh_ir();
-        ir.metadata_columns = vec![MetadataColumn {
-            name: "col; DROP TABLE".into(),
-            data_type: "STRING".into(),
-            value: "NULL".into(),
-        }];
+        ir.metadata_columns = vec![MetadataColumn::new_unchecked(
+            "col; DROP TABLE",
+            "STRING",
+            "NULL",
+        )];
         assert!(generate_select_sql(&ir, &dialect(), None).is_err());
     }
 
     #[test]
     fn test_rejects_unsafe_metadata_value() {
         let mut ir = sample_full_refresh_ir();
-        ir.metadata_columns = vec![MetadataColumn {
-            name: "col".into(),
-            data_type: "STRING".into(),
-            value: "1; DROP TABLE users".into(),
-        }];
-        // Note: metadata value validation is delegated to the dialect's select_clause.
-        // The test dialect writes the value verbatim. The SQL gen layer itself does not
-        // validate literal values anymore (that was in the removed non-dialect code).
-        // This test now checks that the dialect produces output (it does, since TestDialect
-        // doesn't validate literal values). In production, the DatabricksSqlDialect should
-        // validate literal values.
+        ir.metadata_columns = vec![MetadataColumn::new_unchecked(
+            "col",
+            "STRING",
+            "1; DROP TABLE users",
+        )];
+        // Metadata-value validation is NOT sql_gen's job. It happens at the
+        // boundary (`rocky_ir::MetadataColumn::new`, which `new_unchecked`
+        // deliberately bypasses here) and again in every shipping dialect's
+        // `select_clause`. The stub dialect below validates nothing, so this
+        // only pins that sql_gen itself stays a pass-through — the refusal
+        // tests live in `rocky-ir` and in each adapter crate.
         let _ = generate_select_sql(&ir, &dialect(), None);
     }
 
     #[test]
     fn test_rejects_unsafe_data_type() {
         let mut ir = sample_full_refresh_ir();
-        ir.metadata_columns = vec![MetadataColumn {
-            name: "col".into(),
-            data_type: "STRING); DROP TABLE users--".into(),
-            value: "NULL".into(),
-        }];
+        ir.metadata_columns = vec![MetadataColumn::new_unchecked(
+            "col",
+            "STRING); DROP TABLE users--",
+            "NULL",
+        )];
         // Same as above: data type validation is delegated to the dialect.
         let _ = generate_select_sql(&ir, &dialect(), None);
     }
@@ -2633,6 +2646,10 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     struct MaintenanceDialect(TestDialect);
 
     impl SqlDialect for MaintenanceDialect {
+        fn literal_escape(&self) -> crate::traits::LiteralEscape {
+            crate::traits::LiteralEscape::Standard
+        }
+
         fn name(&self) -> &'static str {
             "maintenance"
         }
@@ -2753,6 +2770,10 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     struct PredropDialect(TestDialect);
 
     impl SqlDialect for PredropDialect {
+        fn literal_escape(&self) -> crate::traits::LiteralEscape {
+            crate::traits::LiteralEscape::Standard
+        }
+
         fn name(&self) -> &'static str {
             "predrop"
         }

@@ -1,6 +1,6 @@
 [package]
 name = "rocky-trino"
-version = "1.72.0"
+version = "1.73.0"
 description = "Trino warehouse adapter for Rocky"
 edition.workspace = true
 license.workspace = true
@@ -25,6 +25,10 @@ base64 = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+# `test-support` exposes `MetadataColumn::new_unchecked`, which this crate's
+# tests use to build the hostile metadata columns `select_clause` must refuse.
+# Dev-only: resolver v2 keeps the feature out of normal builds.
+rocky-ir = { path = "../rocky-ir", features = ["test-support"] }
 tokio = { workspace = true }
 wiremock = { workspace = true }
 

@@ -83,7 +83,7 @@ pub fn run_publish_ir(
         source_schemas,
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: Vec::new(),
-        project_freshness_default: false,
+        project_freshness: Default::default(),
         run_vars: rocky_core::run_vars::RunVars::new(),
     };
 
@@ -92,6 +92,19 @@ pub fn run_publish_ir(
         anyhow::bail!(
             "cannot publish IR: producer project failed to compile ({} diagnostic(s))",
             result.diagnostics.len()
+        );
+    }
+
+    // Errors bail above, so anything left is a warning, a lint or an info
+    // code. `rocky compile` renders these; this command used to drop them
+    // and print only its success line, so a project could publish a snapshot
+    // with three `I003` reports and be told nothing (#1617). stderr, so the
+    // command's own output stays parseable.
+    if !result.diagnostics.is_empty() {
+        let source_map = std::collections::HashMap::new();
+        eprint!(
+            "{}",
+            rocky_compiler::diagnostic::render_diagnostics(&result.diagnostics, &source_map)
         );
     }
 

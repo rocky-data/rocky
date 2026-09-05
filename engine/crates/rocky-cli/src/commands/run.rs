@@ -1432,6 +1432,16 @@ fn require_resume_progress(
 /// touch the catalog. Classifying a bypassed template recorded a fact that
 /// did not hold and refused a resume over an edit that moved nothing.
 ///
+/// The same predicate decides whether `schema_template` itself is recorded
+/// (#1592). A template the resolver never reads is not part of this run's
+/// routing, and editing it between two `--branch branch__feature` runs
+/// refused the later resume for a difference that changed nothing. Eliding
+/// it is not fail-open, because [`ResumeShadow::Schema`] above already
+/// records the override — the physical schema every table task is keyed by
+/// (`table_key` is `{target_catalog}.{target_schema}.{target_table_name}`,
+/// and `target_schema` is the override verbatim). `catalog_template` stays
+/// recorded on every path: the override does not replace it.
+///
 /// **The separator must be target-only.** `[target] separator` is: it
 /// moves rendered target names and nothing else. The source pattern's is
 /// not, and `separator` falls back to it when the target pins none.
@@ -1448,6 +1458,7 @@ fn require_resume_progress(
 /// [`SchemaPattern::separator_joins_a_placeholder`]: rocky_core::schema::SchemaPattern::separator_joins_a_placeholder
 /// [`SchemaPattern::parse`]: rocky_core::schema::SchemaPattern::parse
 /// [`ResumeSeparator::Unused`]: rocky_core::state::ResumeSeparator::Unused
+/// [`ResumeShadow::Schema`]: rocky_core::state::ResumeShadow::Schema
 fn replication_resume_scope(
     pipeline_name: &str,
     target: &rocky_core::config::PipelineTargetConfig,
@@ -1494,7 +1505,16 @@ fn replication_resume_scope(
         target: Some(ResumeTarget {
             adapter: target.adapter.clone(),
             catalog_template: target.catalog_template.clone(),
-            schema_template: target.schema_template.clone(),
+            // Recorded only when this run renders it — the same predicate,
+            // and the same reading of it, that decided the separator above
+            // (#1592). Under a schema override the resolver takes the
+            // override string and never reads the template, so a difference
+            // here moves no name. `ResumeShadow::Schema` above carries the
+            // override, which is what keeps the elision from being
+            // fail-open: it pins the physical schema every table is keyed
+            // by. `catalog_template` is NOT elided — the override does not
+            // replace it.
+            schema_template: renders_schema_template.then(|| target.schema_template.clone()),
             separator_role: Some(separator_role),
             endpoint: target_adapter.endpoint_identity(),
             shadow,
@@ -1524,8 +1544,11 @@ fn ensure_resume_scope(progress: &RunProgress, current: &ResumeScope) -> Result<
     Ok(())
 }
 
-/// Refuse `--resume-latest` when the selected run's own [`RunRecord`] says it
-/// left no work to recover (#1548). The failure statuses stay resumable.
+/// Refuse a resume when the selected run's own [`RunRecord`] says it left no
+/// work to recover (#1548). Applies to both `--resume-latest` and an explicit
+/// `--resume <run-id>` (#1635): a run id names the same checkpoint either
+/// way, and a succeeded one has nothing to recover however it was chosen.
+/// The failure statuses stay resumable.
 /// No record at all is the crash case — the run never reached a terminal
 /// status — and stays resumable whatever the checkpoint shows: a run killed
 /// after its last table copy still has post-copy work (checks, hooks, the
@@ -1536,7 +1559,7 @@ fn ensure_resume_scope(progress: &RunProgress, current: &ResumeScope) -> Result<
 /// refused run.
 ///
 /// [`RunRecord`]: rocky_core::state::RunRecord
-fn ensure_latest_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> Result<()> {
+fn ensure_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> Result<()> {
     let record = state_store
         .get_run(&progress.run_id)
         .with_context(|| format!("failed to load the run record for '{}'", progress.run_id))?;
@@ -1571,7 +1594,7 @@ fn resolve_resume_progress(
             &format!("the latest run for {scope}"),
         )?;
         ensure_resume_scope(&progress, scope)?;
-        ensure_latest_run_is_resumable(state_store, &progress)?;
+        ensure_run_is_resumable(state_store, &progress)?;
         return Ok(Some(progress));
     }
     if let Some(run_id) = resume_run_id {
@@ -1580,6 +1603,7 @@ fn resolve_resume_progress(
             &format!("run '{run_id}'"),
         )?;
         ensure_resume_scope(&progress, scope)?;
+        ensure_run_is_resumable(state_store, &progress)?;
         return Ok(Some(progress));
     }
     Ok(None)
@@ -3114,6 +3138,15 @@ pub async fn run(
             }
             let empty = std::collections::HashSet::new();
             let source_tables = source_tables_by_schema.get(&conn.schema).unwrap_or(&empty);
+            // Refusing a `metadata_columns` value must land here, not at
+            // collection: the setup loop below creates catalogs and schemas,
+            // sets tags, binds workspaces and applies grants, so a refusal
+            // during collection would abort only after changing access
+            // control. Resolved once per connector, lazily — the first table
+            // that survives the SAME skip conditions the collection loop uses,
+            // so a connector whose tables are all filtered, missing or
+            // disabled is not refused for a value `run` never renders.
+            let mut metadata_preflighted = false;
             let target_catalog = parsed.resolve_template(target_catalog_template, target_sep);
             let target_schema = if let Some(cfg) = shadow_config {
                 cfg.schema_override
@@ -3140,6 +3173,15 @@ pub async fn run(
                     == Some(false)
                 {
                     continue;
+                }
+                if !metadata_preflighted {
+                    rocky_core::schema::resolve_metadata_columns(
+                        &parsed,
+                        &pipeline.metadata_columns,
+                        &pattern.separator,
+                    )
+                    .with_context(|| format!("source schema '{}'", conn.schema))?;
+                    metadata_preflighted = true;
                 }
                 let target_table_name = if let Some(cfg) = shadow_config {
                     if cfg.schema_override.is_none() {
@@ -3656,6 +3698,18 @@ pub async fn run(
                 }
                 claimed_targets.insert(target_identity, this_source);
 
+                // The single producer `rocky plan` also uses, so the preview
+                // and the run cannot disagree. It substitutes the
+                // warehouse-derived schema components, checks each one is a
+                // plain identifier, and validates the resolved triple.
+                let metadata_columns: Vec<MetadataColumn> =
+                    rocky_core::schema::resolve_metadata_columns(
+                        &parsed,
+                        &pipeline.metadata_columns,
+                        &pattern.separator,
+                    )
+                    .with_context(|| format!("source schema '{}'", conn.schema))?;
+
                 tables_to_process.push(TableTask {
                     source_catalog: source_catalog.clone(),
                     source_schema: conn.schema.clone(),
@@ -3697,15 +3751,7 @@ pub async fn run(
                         .iter()
                         .map(|mc| mc.name.clone())
                         .collect(),
-                    metadata_columns: pipeline
-                        .metadata_columns
-                        .iter()
-                        .map(|mc| MetadataColumn {
-                            name: mc.name.clone(),
-                            data_type: mc.data_type.clone(),
-                            value: parsed.resolve_template(&mc.value, &pattern.separator),
-                        })
-                        .collect(),
+                    metadata_columns,
                     governance_tags: governance.build_tags(&components),
                     // Populated later by batch pre-fetch phase
                     prefetched_source_cols: None,
@@ -4802,589 +4848,23 @@ pub async fn run(
     let _checks_span = info_span!("batched_checks");
     let checks_start = Instant::now();
 
-    let row_count_enabled = pipeline.checks.row_count.enabled() && !source_batch_refs.is_empty();
-    let freshness_enabled = pipeline.checks.freshness.is_some() && !freshness_batch_refs.is_empty();
-
-    // §P2.6 emit: before_checks. Table count is the number of tables
-    // participating in row-count / freshness batched checks (distinct
-    // from the per-table count from materialization — a table might
-    // skip one or both check types).
-    let _ = hook_registry
-        .fire(&HookContext::before_checks(
-            &run_id,
-            pipeline_name,
-            source_batch_refs.len().max(freshness_batch_refs.len()),
-        ))
-        .await;
-
-    if row_count_enabled || freshness_enabled {
-        info!(
-            row_count_tables = source_batch_refs.len(),
-            freshness_tables = freshness_batch_refs.len(),
-            "running batched checks concurrently"
-        );
-    }
-
-    // Batch checks dispatch through the BatchCheckAdapter trait when the
-    // warehouse provides one (UNION ALL batching). Otherwise, fall back to
-    // per-table queries via the generic WarehouseAdapter — same observable
-    // check results, just more round-trips.
-    let (source_counts, target_counts, freshness_results): (
-        Vec<BatchRowCountResult>,
-        Vec<BatchRowCountResult>,
-        Vec<BatchFreshnessResult>,
-    ) = if let Some(ref bc) = shared_batch_check {
-        let (src, tgt, fresh) = tokio::try_join!(
-            async {
-                if row_count_enabled {
-                    bc.batch_row_counts(&source_batch_refs).await
-                } else {
-                    Ok(vec![])
-                }
-            },
-            async {
-                if row_count_enabled {
-                    bc.batch_row_counts(&target_batch_refs).await
-                } else {
-                    Ok(vec![])
-                }
-            },
-            async {
-                if freshness_enabled {
-                    bc.batch_freshness(&freshness_batch_refs, &pipeline.timestamp_column)
-                        .await
-                } else {
-                    Ok(vec![])
-                }
-            },
-        )
-        .map_err(anyhow::Error::from)?;
-        (src, tgt, fresh)
-    } else {
-        // Per-table fallback via WarehouseAdapter for adapters with no
-        // BatchCheckAdapter implementation.
-        let dialect = shared_warehouse.dialect();
-        let mut src_counts = Vec::new();
-        let mut tgt_counts = Vec::new();
-        let mut fresh_results: Vec<BatchFreshnessResult> = Vec::new();
-
-        if row_count_enabled {
-            for br in &source_batch_refs {
-                let table_ref = dialect
-                    .format_table_ref(&br.catalog, &br.schema, &br.table)
-                    .map_err(anyhow::Error::from)?;
-                let sql = format!("SELECT COUNT(*) FROM {table_ref}");
-                match shared_warehouse.execute_query(&sql).await {
-                    Ok(result) => {
-                        let count = result
-                            .rows
-                            .first()
-                            .and_then(|r| r.first())
-                            .and_then(|v| {
-                                v.as_u64()
-                                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                            })
-                            .unwrap_or(0);
-                        src_counts.push(BatchRowCountResult {
-                            table: br.clone(),
-                            count,
-                        });
-                    }
-                    Err(e) => {
-                        warn!(table = br.table.as_str(), error = %e, "per-table row count failed");
-                    }
-                }
-            }
-            for br in &target_batch_refs {
-                let table_ref = dialect
-                    .format_table_ref(&br.catalog, &br.schema, &br.table)
-                    .map_err(anyhow::Error::from)?;
-                let sql = format!("SELECT COUNT(*) FROM {table_ref}");
-                match shared_warehouse.execute_query(&sql).await {
-                    Ok(result) => {
-                        let count = result
-                            .rows
-                            .first()
-                            .and_then(|r| r.first())
-                            .and_then(|v| {
-                                v.as_u64()
-                                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                            })
-                            .unwrap_or(0);
-                        tgt_counts.push(BatchRowCountResult {
-                            table: br.clone(),
-                            count,
-                        });
-                    }
-                    Err(e) => {
-                        warn!(table = br.table.as_str(), error = %e, "per-table row count failed");
-                    }
-                }
-            }
-        }
-
-        if freshness_enabled {
-            for br in &freshness_batch_refs {
-                let table_ref = dialect
-                    .format_table_ref(&br.catalog, &br.schema, &br.table)
-                    .map_err(anyhow::Error::from)?;
-                let sql = format!("SELECT MAX({}) FROM {table_ref}", pipeline.timestamp_column);
-                match shared_warehouse.execute_query(&sql).await {
-                    Ok(result) => {
-                        let max_ts = result
-                            .rows
-                            .first()
-                            .and_then(|r| r.first())
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| {
-                                s.parse::<chrono::DateTime<Utc>>().ok().or_else(|| {
-                                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
-                                        .or_else(|_| {
-                                            chrono::NaiveDateTime::parse_from_str(
-                                                s,
-                                                "%Y-%m-%d %H:%M:%S",
-                                            )
-                                        })
-                                        .ok()
-                                        .map(|naive| naive.and_utc())
-                                })
-                            });
-                        fresh_results.push(BatchFreshnessResult {
-                            table: br.clone(),
-                            max_timestamp: max_ts,
-                        });
-                    }
-                    Err(e) => {
-                        warn!(table = br.table.as_str(), error = %e, "per-table freshness check failed");
-                    }
-                }
-            }
-        }
-
-        (src_counts, tgt_counts, fresh_results)
-    };
-
-    // Process row count results
-    if row_count_enabled {
-        let source_map: HashMap<String, u64> = source_counts
-            .iter()
-            .map(|r| (r.table.full_name(), r.count))
-            .collect();
-        let target_map: HashMap<String, u64> = target_counts
-            .iter()
-            .map(|r| (r.table.full_name(), r.count))
-            .collect();
-
-        for (target_key, asset_key) in &batch_asset_keys {
-            let src_ref = &source_batch_refs
-                .iter()
-                .zip(target_batch_refs.iter())
-                .find(|(_, t)| t.full_name() == *target_key)
-                .map(|(s, _)| s.full_name());
-
-            if let Some(src_key) = src_ref {
-                let src_count = source_map.get(src_key).copied().unwrap_or(0);
-                let tgt_count = target_map.get(target_key).copied().unwrap_or(0);
-                let check = checks::check_row_count(src_count, tgt_count);
-                let entry =
-                    pending_checks
-                        .entry(target_key.clone())
-                        .or_insert_with(|| PendingCheck {
-                            asset_key: asset_key.clone(),
-                            checks: Vec::new(),
-                        });
-                entry.checks.push(check);
-            }
-        }
-    }
-
-    // Anomaly detection
-    if row_count_enabled
-        && let Some(ref store) = state_store {
-            for (target_key, _) in &batch_asset_keys {
-                let tgt_count = target_counts
-                    .iter()
-                    .find(|r| r.table.full_name() == *target_key)
-                    .map(|r| r.count)
-                    .unwrap_or(0);
-
-                let _ = store.record_row_count(target_key, tgt_count, 10);
-
-                if let Ok(history) = store.get_check_history(target_key) {
-                    let anomaly = rocky_core::state::detect_anomaly(
-                        target_key,
-                        tgt_count,
-                        &history,
-                        pipeline.checks.anomaly_threshold_pct,
-                    );
-                    if anomaly.is_anomaly {
-                        warn!(
-                            table = target_key.as_str(),
-                            reason = anomaly.reason.as_str(),
-                            "row count anomaly detected"
-                        );
-                        rocky_observe::metrics::METRICS.inc_anomalies_detected();
-                        // §P2.6 emit: anomaly_detected. Fires before
-                        // pushing to output.anomalies so we can pass
-                        // references without cloning.
-                        let _ = hook_registry
-                            .fire(&HookContext::anomaly_detected(
-                                &run_id,
-                                pipeline_name,
-                                &anomaly.table,
-                                &anomaly.reason,
-                            ))
-                            .await;
-                        output.anomalies.push(AnomalyOutput {
-                            table: anomaly.table,
-                            current_count: anomaly.current_count,
-                            baseline_avg: anomaly.baseline_avg,
-                            deviation_pct: anomaly.deviation_pct,
-                            reason: anomaly.reason,
-                        });
-                    }
-                }
-            }
-        }
-
-    // Process freshness results
-    if let Some(ref freshness_cfg) = pipeline.checks.freshness {
-        let now = Utc::now();
-        for fr in &freshness_results {
-            let key = fr.table.full_name();
-            if let Some(ts) = fr.max_timestamp {
-                let lag = (now - ts).num_seconds().unsigned_abs();
-                let mut check = checks::check_freshness(lag, freshness_cfg.threshold_seconds);
-                check.severity = freshness_cfg.severity;
-
-                if let Some((_, asset_key)) = batch_asset_keys.iter().find(|(k, _)| *k == key) {
-                    let entry = pending_checks.entry(key).or_insert_with(|| PendingCheck {
-                        asset_key: asset_key.clone(),
-                        checks: Vec::new(),
-                    });
-                    entry.checks.push(check);
-                }
-            }
-        }
-    }
-
-    // Row-level assertions (uniqueness, etc.) on each replication target.
-    // The replication runner runs the SAME `[checks].assertions` the quality
-    // runner does, so uniqueness fires at replication time. Driven by
-    // `assertion_targets` (populated per materialized table, independent of
-    // row_count/freshness) so it runs even when those checks are disabled.
-    // Results are surfaced advisorily — like every other check in this runner,
-    // the run does not bail; the orchestrator decides from the JSON
-    // CheckResult + severity. (The data has already landed by check time, so
-    // bailing would only change the exit code, not prevent the write.)
-    if !pipeline.checks.assertions.is_empty() {
-        let dialect = shared_warehouse.dialect();
-        for (tref, asset_key) in &assertion_targets {
-            let full = match dialect.format_table_ref(&tref.catalog, &tref.schema, &tref.table) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        table = %tref.full_name(),
-                        error = %e,
-                        "assertion table ref formatting failed — skipping"
-                    );
-                    continue;
-                }
-            };
-            let results = super::run_local::run_table_assertions(
-                shared_warehouse.as_ref(),
-                dialect,
-                &full,
-                &tref.table,
-                &pipeline.checks.assertions,
-            )
-            .await;
-            if !results.is_empty() {
-                let entry =
-                    pending_checks
-                        .entry(tref.full_name())
-                        .or_insert_with(|| PendingCheck {
-                            asset_key: asset_key.clone(),
-                            checks: Vec::new(),
-                        });
-                entry.checks.extend(results);
-            }
-        }
-    }
-
-    // Custom SQL checks on each replication target. Ported from the quality
-    // runner so `[[checks.custom]]` fires at replication time too. Driven by
-    // `assertion_targets` (every materialized table); surfaced advisorily like
-    // the other replication checks — the run reports pass/fail in the JSON
-    // CheckResult + severity rather than bailing (the data has already landed).
-    if !pipeline.checks.custom.is_empty() {
-        let dialect = shared_warehouse.dialect();
-        for (tref, asset_key) in &assertion_targets {
-            let full = match dialect.format_table_ref(&tref.catalog, &tref.schema, &tref.table) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        table = %tref.full_name(),
-                        error = %e,
-                        "custom check table ref formatting failed — skipping"
-                    );
-                    continue;
-                }
-            };
-            let results = super::run_local::run_custom_checks(
-                shared_warehouse.as_ref(),
-                &full,
-                &pipeline.checks.custom,
-            )
-            .await;
-            if !results.is_empty() {
-                pending_checks
-                    .entry(tref.full_name())
-                    .or_insert_with(|| PendingCheck {
-                        asset_key: asset_key.clone(),
-                        checks: Vec::new(),
-                    })
-                    .checks
-                    .extend(results);
-            }
-        }
-    }
-
-    // Null-rate checks: sample each configured column and flag when the null
-    // fraction exceeds the threshold. `generate_null_rate_sql` returns one row
-    // per column `(col, nulls, sampled)`; the rate is computed per row. Like the
-    // other replication checks this is advisory — the configured severity rides
-    // into the JSON CheckResult and the orchestrator decides.
-    if let Some(ref null_rate_cfg) = pipeline.checks.null_rate {
-        let dialect = shared_warehouse.dialect();
-        for (tref, asset_key) in &assertion_targets {
-            let sql = match checks::generate_null_rate_sql(
-                tref,
-                &null_rate_cfg.columns,
-                null_rate_cfg.sample_percent,
-                dialect,
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        table = %tref.full_name(),
-                        error = %e,
-                        "null_rate SQL generation failed — skipping"
-                    );
-                    continue;
-                }
-            };
-            match shared_warehouse.execute_query(&sql).await {
-                Ok(result) => {
-                    for row in &result.rows {
-                        let col = row.first().and_then(|v| v.as_str()).unwrap_or_default();
-                        // A parse failure on the counts is a malformed result,
-                        // not a real zero — skip the column rather than emit a
-                        // false PASS (rate 0.0). An empty (0-row) sample still
-                        // parses to a real 0 and correctly passes below.
-                        let (Some(nulls), Some(sampled)) =
-                            (checks::cell_as_u64(row.get(1)), checks::cell_as_u64(row.get(2)))
-                        else {
-                            warn!(table = %tref.full_name(), column = col, "null_rate counts unparseable — skipping column");
-                            continue;
-                        };
-                        if col.is_empty() {
-                            warn!(table = %tref.full_name(), "null_rate result missing column name — skipping");
-                            continue;
-                        }
-                        let rate = if sampled == 0 {
-                            0.0
-                        } else {
-                            nulls as f64 / sampled as f64
-                        };
-                        // `check_null_rate` names the result `null_rate:{col}`,
-                        // byte-matching discover's projection.
-                        let mut check = checks::check_null_rate(col, rate, null_rate_cfg.threshold);
-                        check.severity = null_rate_cfg.severity;
-                        pending_checks
-                            .entry(tref.full_name())
-                            .or_insert_with(|| PendingCheck {
-                                asset_key: asset_key.clone(),
-                                checks: Vec::new(),
-                            })
-                            .checks
-                            .push(check);
-                    }
-                }
-                Err(e) => {
-                    warn!(table = %tref.full_name(), error = %e, "null_rate query failed — skipping");
-                }
-            }
-        }
-    }
-
-    // Cross-source overlap — flag a business key shared across SIBLING targets:
-    // tables with the same source type + table name that landed in more than
-    // one target schema (the hierarchy/tenant fan-out that gets unioned
-    // downstream, doubling rows). Generic — groups by the discovered source
-    // type (asset_key[0]) + table name, with no schema-pattern-component
-    // assumptions. Self-limiting: only groups of ≥2 siblings are checked, so a
-    // single-target pipeline runs nothing. Surfaced advisorily like the other
-    // replication checks; a missing-key/keyless table is skipped with a logged
-    // reason rather than failing.
-    if let Some(ref overlap_cfg) = pipeline.checks.cross_source_overlap {
-        // Resolved once, but NOT unwrapped here: a `keys`/`key_expr`
-        // misconfiguration used to be logged and skipped, which left the run
-        // green with no record that the check existed. The groups are walked
-        // either way so a refusal is reported per group, like any other
-        // check that cannot run.
-        let key_exprs_result = overlap_cfg.resolved_key_exprs();
-        {
-            {
-                // (source_type, table) -> sibling members (target ref, asset key).
-                // The ≥2 grouping and the result name come from shared helpers
-                // in rocky-core so `rocky discover` can declare the exact same
-                // overlap names this runner emits (byte-match guarantee).
-                type SiblingGroups = HashMap<(String, String), Vec<(TableRef, Vec<String>)>>;
-                let mut groups: SiblingGroups = HashMap::new();
-                let mut pairs: Vec<(String, String)> = Vec::new();
-                for (tref, asset_key) in &assertion_targets {
-                    let source_type = asset_key.first().cloned().unwrap_or_default();
-                    let key = (source_type, tref.table.clone());
-                    pairs.push(key.clone());
-                    groups
-                        .entry(key)
-                        .or_default()
-                        .push((tref.clone(), asset_key.clone()));
-                }
-                // Qualifying (source_type, table) keys (≥2 siblings), sorted.
-                let qualifying = checks::cross_source_overlap_groups(pairs);
-
-                let dialect = shared_warehouse.dialect();
-                for gk in &qualifying {
-                    let members = &groups[gk];
-                    let (source_type, table) = gk;
-                    let siblings: Vec<TableRef> =
-                        members.iter().map(|(t, _)| t.clone()).collect();
-                    let name = checks::cross_source_overlap_name(source_type, table);
-                    let contributing: Vec<String> =
-                        siblings.iter().map(TableRef::full_name).collect();
-                    let key_exprs = match &key_exprs_result {
-                        Ok(k) => k,
-                        Err(e) => {
-                            warn!(source_type, table, error = %e, "cross_source_overlap key is misconfigured — reporting the check as not evaluated");
-                            let entry = pending_checks
-                                .entry(siblings[0].full_name())
-                                .or_insert_with(|| PendingCheck {
-                                    asset_key: members[0].1.clone(),
-                                    checks: Vec::new(),
-                                });
-                            entry.checks.push(
-                                rocky_core::checks::cross_source_overlap_not_evaluated(
-                                    name,
-                                    contributing,
-                                    e.clone(),
-                                    overlap_cfg.severity,
-                                ),
-                            );
-                            continue;
-                        }
-                    };
-                    let sql = match rocky_core::checks::generate_cross_source_overlap_sql(
-                        &siblings, key_exprs, dialect,
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            // A check that will not run must stay in the tally.
-                            // Skipping silently let `after_checks` and the JSON
-                            // `check_results` claim a clean group that was never
-                            // evaluated. (The QUERY-error arm below still skips
-                            // by design — that is the keyless-table case.)
-                            warn!(source_type, table, error = %e, "cross_source_overlap SQL generation failed — reporting the check as not evaluated");
-                            let entry = pending_checks
-                                .entry(siblings[0].full_name())
-                                .or_insert_with(|| PendingCheck {
-                                    asset_key: members[0].1.clone(),
-                                    checks: Vec::new(),
-                                });
-                            entry.checks.push(
-                                rocky_core::checks::cross_source_overlap_not_evaluated(
-                                    name,
-                                    contributing,
-                                    e.to_string(),
-                                    overlap_cfg.severity,
-                                ),
-                            );
-                            continue;
-                        }
-                    };
-                    match shared_warehouse.execute_query(&sql).await {
-                        Ok(result) => {
-                            let overlap_count = result.rows.len() as u64;
-                            let sample: Vec<String> = result
-                                .rows
-                                .iter()
-                                .take(overlap_cfg.sample)
-                                .map(|row| {
-                                    row.iter()
-                                        .take(key_exprs.len())
-                                        .map(|v| {
-                                            v.as_str()
-                                                .map(str::to_string)
-                                                .unwrap_or_else(|| v.to_string())
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join(" | ")
-                                })
-                                .collect();
-                            let contributing: Vec<String> =
-                                siblings.iter().map(TableRef::full_name).collect();
-                            let check = rocky_core::checks::check_cross_source_overlap(
-                                name,
-                                overlap_count,
-                                overlap_cfg.max_overlap_rows,
-                                contributing,
-                                sample,
-                                overlap_cfg.severity,
-                            );
-                            // Attach to the first sibling's asset (the result's
-                            // contributing_tables lists the whole group).
-                            let entry = pending_checks
-                                .entry(siblings[0].full_name())
-                                .or_insert_with(|| PendingCheck {
-                                    asset_key: members[0].1.clone(),
-                                    checks: Vec::new(),
-                                });
-                            entry.checks.push(check);
-                        }
-                        Err(e) => {
-                            // A missing key column / keyless table surfaces as a
-                            // query error, and that case is tolerated by design
-                            // (FR acceptance criterion) — but the ERROR TYPE does
-                            // not say which case this is. Syntax, permission and
-                            // transport failures arrive here too, and skipping
-                            // silently dropped the check from `check_results`,
-                            // the `after_checks` tally and the JSON entirely, so
-                            // a group that was never evaluated read as a group
-                            // with nothing to report. Record the same explicit
-                            // not-evaluated state the generation arm above uses:
-                            // still not a hard failure, but never invisible.
-                            warn!(source_type, table, error = %e, "cross_source_overlap query failed (missing key column / keyless table?) — reporting the check as not evaluated");
-                            let entry = pending_checks
-                                .entry(siblings[0].full_name())
-                                .or_insert_with(|| PendingCheck {
-                                    asset_key: members[0].1.clone(),
-                                    checks: Vec::new(),
-                                });
-                            entry.checks.push(
-                                rocky_core::checks::cross_source_overlap_not_evaluated(
-                                    name,
-                                    contributing,
-                                    e.to_string(),
-                                    overlap_cfg.severity,
-                                ),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
+    run_batched_checks(
+        shared_warehouse.as_ref(),
+        shared_batch_check.as_deref(),
+        state_store.as_ref(),
+        &hook_registry,
+        &run_id,
+        pipeline_name,
+        pipeline,
+        &source_batch_refs,
+        &target_batch_refs,
+        &freshness_batch_refs,
+        &batch_asset_keys,
+        &assertion_targets,
+        &mut pending_checks,
+        &mut output.anomalies,
+    )
+    .await?;
 
     // Assemble check results
     for (_table_key, pending) in pending_checks {
@@ -6084,6 +5564,784 @@ pub async fn run(
     run_result.map(|()| RunTermination::Completed)
 }
 
+/// Runs the batched replication checks against the tables copied this run
+/// and appends the results to `pending_checks`.
+///
+/// Row count and freshness go through the warehouse's `BatchCheckAdapter`
+/// when it has one (one UNION ALL query) and fall back to one query per
+/// table otherwise. Assertions, custom checks, null-rate checks and the
+/// cross-source overlap check run per table through the plain
+/// `WarehouseAdapter`. Row-count anomalies detected on the way are pushed to
+/// `anomalies`.
+///
+/// Lifted out of `run()` so a test can drive it with a warehouse that fails
+/// a specific query; `run()` itself builds its adapters from the config and
+/// offers no seam for that.
+#[allow(clippy::too_many_arguments)]
+async fn run_batched_checks(
+    warehouse: &dyn WarehouseAdapter,
+    batch_check: Option<&dyn BatchCheckAdapter>,
+    state_store: Option<&StateStore>,
+    hook_registry: &HookRegistry,
+    run_id: &str,
+    pipeline_name: &str,
+    pipeline: &ReplicationPipelineConfig,
+    source_batch_refs: &[TableRef],
+    target_batch_refs: &[TableRef],
+    freshness_batch_refs: &[TableRef],
+    batch_asset_keys: &[(String, Vec<String>)],
+    assertion_targets: &[(TableRef, Vec<String>)],
+    pending_checks: &mut HashMap<String, PendingCheck>,
+    anomalies: &mut Vec<AnomalyOutput>,
+) -> Result<()> {
+    let row_count_enabled = pipeline.checks.row_count.enabled() && !source_batch_refs.is_empty();
+    let freshness_enabled = pipeline.checks.freshness.is_some() && !freshness_batch_refs.is_empty();
+
+    // §P2.6 emit: before_checks. Table count is the number of tables
+    // participating in row-count / freshness batched checks (distinct
+    // from the per-table count from materialization — a table might
+    // skip one or both check types).
+    let _ = hook_registry
+        .fire(&HookContext::before_checks(
+            run_id,
+            pipeline_name,
+            source_batch_refs.len().max(freshness_batch_refs.len()),
+        ))
+        .await;
+
+    if row_count_enabled || freshness_enabled {
+        info!(
+            row_count_tables = source_batch_refs.len(),
+            freshness_tables = freshness_batch_refs.len(),
+            "running batched checks concurrently"
+        );
+    }
+
+    // Why a table has no measurement, keyed by its full name. Consulted only
+    // for a table that is missing from the measured results, so a measured
+    // table never reads a stale reason. The batch path records nothing here:
+    // a batch query that fails ends the run below, and a table it silently
+    // left out is reported without a reason.
+    let mut source_count_failures: HashMap<String, String> = HashMap::new();
+    let mut target_count_failures: HashMap<String, String> = HashMap::new();
+    // In table order, so the emitted results are deterministic.
+    let mut freshness_failures: Vec<(String, String)> = Vec::new();
+
+    // Batch checks dispatch through the BatchCheckAdapter trait when the
+    // warehouse provides one (UNION ALL batching). Otherwise, fall back to
+    // per-table queries via the generic WarehouseAdapter — same observable
+    // check results, just more round-trips.
+    let (source_counts, target_counts, freshness_results): (
+        Vec<BatchRowCountResult>,
+        Vec<BatchRowCountResult>,
+        Vec<BatchFreshnessResult>,
+    ) = if let Some(bc) = batch_check {
+        let (src, tgt, fresh) = tokio::try_join!(
+            async {
+                if row_count_enabled {
+                    bc.batch_row_counts(source_batch_refs).await
+                } else {
+                    Ok(vec![])
+                }
+            },
+            async {
+                if row_count_enabled {
+                    bc.batch_row_counts(target_batch_refs).await
+                } else {
+                    Ok(vec![])
+                }
+            },
+            async {
+                if freshness_enabled {
+                    bc.batch_freshness(freshness_batch_refs, &pipeline.timestamp_column)
+                        .await
+                } else {
+                    Ok(vec![])
+                }
+            },
+        )
+        .map_err(anyhow::Error::from)?;
+        (src, tgt, fresh)
+    } else {
+        // Per-table fallback via WarehouseAdapter for adapters with no
+        // BatchCheckAdapter implementation.
+        let dialect = warehouse.dialect();
+        let mut src_counts = Vec::new();
+        let mut tgt_counts = Vec::new();
+        let mut fresh_results: Vec<BatchFreshnessResult> = Vec::new();
+
+        if row_count_enabled {
+            // A side that fails is recorded as missing, with the reason. It
+            // used to default to 0, and 0 matched an empty or equally
+            // unreadable other side (#1602).
+            for (refs, counts, failures) in [
+                (
+                    source_batch_refs,
+                    &mut src_counts,
+                    &mut source_count_failures,
+                ),
+                (
+                    target_batch_refs,
+                    &mut tgt_counts,
+                    &mut target_count_failures,
+                ),
+            ] {
+                for br in refs {
+                    let table_ref = dialect
+                        .format_table_ref(&br.catalog, &br.schema, &br.table)
+                        .map_err(anyhow::Error::from)?;
+                    let sql = format!("SELECT COUNT(*) FROM {table_ref}");
+                    match warehouse.execute_query(&sql).await {
+                        Ok(result) => {
+                            match checks::cell_as_u64(result.rows.first().and_then(|r| r.first())) {
+                                Some(count) => counts.push(BatchRowCountResult {
+                                    table: br.clone(),
+                                    count,
+                                }),
+                                None => {
+                                    warn!(
+                                        table = br.table.as_str(),
+                                        "per-table row count returned no readable count"
+                                    );
+                                    failures.insert(
+                                        br.full_name(),
+                                        "the row count query returned no readable count"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(table = br.table.as_str(), error = %e, "per-table row count failed");
+                            failures
+                                .insert(br.full_name(), format!("the row count query failed: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+
+        if freshness_enabled {
+            for br in freshness_batch_refs {
+                let table_ref = dialect
+                    .format_table_ref(&br.catalog, &br.schema, &br.table)
+                    .map_err(anyhow::Error::from)?;
+                let sql = format!("SELECT MAX({}) FROM {table_ref}", pipeline.timestamp_column);
+                match warehouse.execute_query(&sql).await {
+                    Ok(result) => {
+                        // `MAX()` over an empty table is NULL: there is no row
+                        // to be fresh, and no check is emitted (unchanged). A
+                        // non-NULL cell that does not read as a timestamp — a
+                        // DATE or numeric `timestamp_column`, say — is a check
+                        // the engine could not evaluate, and used to be
+                        // dropped without a trace.
+                        match result.rows.first().and_then(|r| r.first()) {
+                            Some(cell) if cell.is_null() => {
+                                fresh_results.push(BatchFreshnessResult {
+                                    table: br.clone(),
+                                    max_timestamp: None,
+                                });
+                            }
+                            Some(cell) => match cell.as_str().and_then(parse_freshness_timestamp) {
+                                Some(ts) => fresh_results.push(BatchFreshnessResult {
+                                    table: br.clone(),
+                                    max_timestamp: Some(ts),
+                                }),
+                                None => {
+                                    warn!(table = br.table.as_str(), cell = %cell, "per-table freshness check returned an unreadable timestamp");
+                                    freshness_failures.push((
+                                        br.full_name(),
+                                        format!("could not read {cell} as a timestamp"),
+                                    ));
+                                }
+                            },
+                            None => {
+                                warn!(
+                                    table = br.table.as_str(),
+                                    "per-table freshness check returned no rows"
+                                );
+                                freshness_failures.push((
+                                    br.full_name(),
+                                    "the freshness query returned no rows".to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(table = br.table.as_str(), error = %e, "per-table freshness check failed");
+                        freshness_failures
+                            .push((br.full_name(), format!("the freshness query failed: {e}")));
+                    }
+                }
+            }
+        }
+
+        (src_counts, tgt_counts, fresh_results)
+    };
+
+    // Measured counts by full table name. A table absent from a map has no
+    // measurement: its query failed, returned no readable count, or the batch
+    // query left it out.
+    let source_map: HashMap<String, u64> = source_counts
+        .iter()
+        .map(|r| (r.table.full_name(), r.count))
+        .collect();
+    let target_map: HashMap<String, u64> = target_counts
+        .iter()
+        .map(|r| (r.table.full_name(), r.count))
+        .collect();
+
+    // Process row count results
+    if row_count_enabled {
+        for (target_key, asset_key) in batch_asset_keys {
+            let src_ref = &source_batch_refs
+                .iter()
+                .zip(target_batch_refs.iter())
+                .find(|(_, t)| t.full_name() == *target_key)
+                .map(|(s, _)| s.full_name());
+
+            if let Some(src_key) = src_ref {
+                let check = match (source_map.get(src_key), target_map.get(target_key)) {
+                    (Some(&src_count), Some(&tgt_count)) => {
+                        checks::check_row_count(src_count, tgt_count)
+                    }
+                    (source, target) => {
+                        // A side with no measurement used to default to 0, and
+                        // `0 == 0` reported a check that never ran as a pass
+                        // (#1602). Report it as not evaluated, naming each
+                        // side that is missing and why.
+                        let missing_side = |label: &str, reason: Option<&String>| match reason {
+                            Some(reason) => format!("{label}: {reason}"),
+                            None => format!(
+                                "{label}: the batch row count query returned no result for this table"
+                            ),
+                        };
+                        let mut parts = Vec::new();
+                        if source.is_none() {
+                            parts.push(missing_side("source", source_count_failures.get(src_key)));
+                        }
+                        if target.is_none() {
+                            parts.push(missing_side(
+                                "target",
+                                target_count_failures.get(target_key),
+                            ));
+                        }
+                        let reason = parts.join("; ");
+                        warn!(
+                            table = target_key.as_str(),
+                            reason = reason.as_str(),
+                            "row count check could not be evaluated"
+                        );
+                        checks::row_count_not_evaluated(reason)
+                    }
+                };
+                let entry =
+                    pending_checks
+                        .entry(target_key.clone())
+                        .or_insert_with(|| PendingCheck {
+                            asset_key: asset_key.clone(),
+                            checks: Vec::new(),
+                        });
+                entry.checks.push(check);
+            }
+        }
+    }
+
+    // Anomaly detection
+    if row_count_enabled && let Some(store) = state_store {
+        for (target_key, _) in batch_asset_keys {
+            // Only a measured count enters the anomaly history. The 0 a
+            // failed query used to record read as "the table emptied" and
+            // skewed every later baseline.
+            let Some(&tgt_count) = target_map.get(target_key) else {
+                continue;
+            };
+
+            let _ = store.record_row_count(target_key, tgt_count, 10);
+
+            if let Ok(history) = store.get_check_history(target_key) {
+                let anomaly = rocky_core::state::detect_anomaly(
+                    target_key,
+                    tgt_count,
+                    &history,
+                    pipeline.checks.anomaly_threshold_pct,
+                );
+                if anomaly.is_anomaly {
+                    warn!(
+                        table = target_key.as_str(),
+                        reason = anomaly.reason.as_str(),
+                        "row count anomaly detected"
+                    );
+                    rocky_observe::metrics::METRICS.inc_anomalies_detected();
+                    // §P2.6 emit: anomaly_detected. Fires before
+                    // pushing to `anomalies` so we can pass
+                    // references without cloning.
+                    let _ = hook_registry
+                        .fire(&HookContext::anomaly_detected(
+                            run_id,
+                            pipeline_name,
+                            &anomaly.table,
+                            &anomaly.reason,
+                        ))
+                        .await;
+                    anomalies.push(AnomalyOutput {
+                        table: anomaly.table,
+                        current_count: anomaly.current_count,
+                        baseline_avg: anomaly.baseline_avg,
+                        deviation_pct: anomaly.deviation_pct,
+                        reason: anomaly.reason,
+                    });
+                }
+            }
+        }
+    }
+
+    // Process freshness results
+    if let Some(ref freshness_cfg) = pipeline.checks.freshness {
+        let now = Utc::now();
+        // Driven by the REQUESTED tables, not the returned ones. Iterating
+        // the results would drop a table the batch query left out, which is
+        // exactly the silent gap this change closes for row counts; the
+        // batch path never populates `freshness_failures`, so there would be
+        // nothing else to notice the omission. A returned `None` is an empty
+        // table and still emits no check: `MAX(ts)` over no rows is NULL
+        // because there is no row to be fresh, which is not the same as a
+        // query that could not answer.
+        let measured = freshness_batch_refs.iter().filter_map(|tref| {
+            let key = tref.full_name();
+            match freshness_results.iter().find(|fr| fr.table == *tref) {
+                Some(fr) => {
+                    let ts = fr.max_timestamp?;
+                    let lag = (now - ts).num_seconds().unsigned_abs();
+                    Some((key, checks::check_freshness(lag, freshness_cfg.threshold_seconds)))
+                }
+                // Absent from the results and with no recorded reason: the
+                // batch query left this table out.
+                None if !freshness_failures.iter().any(|(k, _)| *k == key) => {
+                    warn!(
+                        table = key.as_str(),
+                        "the batch freshness query returned no result for this table — reporting it as not evaluated"
+                    );
+                    Some((
+                        key,
+                        checks::freshness_not_evaluated(
+                            freshness_cfg.threshold_seconds,
+                            "the batch freshness query returned no result for this table",
+                        ),
+                    ))
+                }
+                // Absent, but the per-table path already recorded why.
+                None => None,
+            }
+        });
+        // A freshness query that failed, or returned a cell that is not a
+        // timestamp, used to be logged and dropped: no result, no trace in
+        // the tally. It is reported as not evaluated instead.
+        let unevaluated = freshness_failures.iter().map(|(key, reason)| {
+            (
+                key.clone(),
+                checks::freshness_not_evaluated(freshness_cfg.threshold_seconds, reason.clone()),
+            )
+        });
+        for (key, mut check) in measured.chain(unevaluated) {
+            check.severity = freshness_cfg.severity;
+            if let Some((_, asset_key)) = batch_asset_keys.iter().find(|(k, _)| *k == key) {
+                let entry = pending_checks.entry(key).or_insert_with(|| PendingCheck {
+                    asset_key: asset_key.clone(),
+                    checks: Vec::new(),
+                });
+                entry.checks.push(check);
+            }
+        }
+    }
+
+    // Row-level assertions (uniqueness, etc.) on each replication target.
+    // The replication runner runs the SAME `[checks].assertions` the quality
+    // runner does, so uniqueness fires at replication time. Driven by
+    // `assertion_targets` (populated per materialized table, independent of
+    // row_count/freshness) so it runs even when those checks are disabled.
+    // Results are surfaced advisorily — like every other check in this runner,
+    // the run does not bail; the orchestrator decides from the JSON
+    // CheckResult + severity. (The data has already landed by check time, so
+    // bailing would only change the exit code, not prevent the write.)
+    if !pipeline.checks.assertions.is_empty() {
+        let dialect = warehouse.dialect();
+        for (tref, asset_key) in assertion_targets {
+            let results = match dialect.format_table_ref(&tref.catalog, &tref.schema, &tref.table) {
+                Ok(full) => {
+                    super::run_local::run_table_assertions(
+                        warehouse,
+                        dialect,
+                        &full,
+                        &tref.table,
+                        &pipeline.checks.assertions,
+                    )
+                    .await
+                }
+                Err(e) => {
+                    // The table's assertions cannot run, and used to be
+                    // skipped without a trace. Every one of them is reported
+                    // as not evaluated instead.
+                    warn!(
+                        table = %tref.full_name(),
+                        error = %e,
+                        "assertion table ref formatting failed — reporting the table's assertions as not evaluated"
+                    );
+                    super::run_local::table_assertions_not_evaluated(
+                        &tref.table,
+                        &pipeline.checks.assertions,
+                        &format!("could not address the table: {e}"),
+                    )
+                }
+            };
+            if !results.is_empty() {
+                let entry =
+                    pending_checks
+                        .entry(tref.full_name())
+                        .or_insert_with(|| PendingCheck {
+                            asset_key: asset_key.clone(),
+                            checks: Vec::new(),
+                        });
+                entry.checks.extend(results);
+            }
+        }
+    }
+
+    // Custom SQL checks on each replication target. Ported from the quality
+    // runner so `[[checks.custom]]` fires at replication time too. Driven by
+    // `assertion_targets` (every materialized table); surfaced advisorily like
+    // the other replication checks — the run reports pass/fail in the JSON
+    // CheckResult + severity rather than bailing (the data has already landed).
+    if !pipeline.checks.custom.is_empty() {
+        let dialect = warehouse.dialect();
+        for (tref, asset_key) in assertion_targets {
+            let results = match dialect.format_table_ref(&tref.catalog, &tref.schema, &tref.table) {
+                Ok(full) => {
+                    super::run_local::run_custom_checks(warehouse, &full, &pipeline.checks.custom)
+                        .await
+                }
+                Err(e) => {
+                    warn!(
+                        table = %tref.full_name(),
+                        error = %e,
+                        "custom check table ref formatting failed — reporting the custom checks as not evaluated"
+                    );
+                    super::run_local::custom_checks_not_evaluated(
+                        &pipeline.checks.custom,
+                        &format!("could not address the table: {e}"),
+                    )
+                }
+            };
+            if !results.is_empty() {
+                pending_checks
+                    .entry(tref.full_name())
+                    .or_insert_with(|| PendingCheck {
+                        asset_key: asset_key.clone(),
+                        checks: Vec::new(),
+                    })
+                    .checks
+                    .extend(results);
+            }
+        }
+    }
+
+    // Null-rate checks: sample each configured column and flag when the null
+    // fraction exceeds the threshold. Like the other replication checks this
+    // is advisory — the configured severity rides into the JSON CheckResult
+    // and the orchestrator decides.
+    if let Some(ref null_rate_cfg) = pipeline.checks.null_rate {
+        let dialect = warehouse.dialect();
+        for (tref, asset_key) in assertion_targets {
+            let results = run_null_rate_checks(warehouse, dialect, tref, null_rate_cfg).await;
+            if !results.is_empty() {
+                pending_checks
+                    .entry(tref.full_name())
+                    .or_insert_with(|| PendingCheck {
+                        asset_key: asset_key.clone(),
+                        checks: Vec::new(),
+                    })
+                    .checks
+                    .extend(results);
+            }
+        }
+    }
+
+    // Cross-source overlap — flag a business key shared across SIBLING targets:
+    // tables with the same source type + table name that landed in more than
+    // one target schema (the hierarchy/tenant fan-out that gets unioned
+    // downstream, doubling rows). Generic — groups by the discovered source
+    // type (asset_key[0]) + table name, with no schema-pattern-component
+    // assumptions. Self-limiting: only groups of ≥2 siblings are checked, so a
+    // single-target pipeline runs nothing. Surfaced advisorily like the other
+    // replication checks; a missing-key/keyless table is skipped with a logged
+    // reason rather than failing.
+    if let Some(ref overlap_cfg) = pipeline.checks.cross_source_overlap {
+        // Resolved once, but NOT unwrapped here: a `keys`/`key_expr`
+        // misconfiguration used to be logged and skipped, which left the run
+        // green with no record that the check existed. The groups are walked
+        // either way so a refusal is reported per group, like any other
+        // check that cannot run.
+        let key_exprs_result = overlap_cfg.resolved_key_exprs();
+        {
+            {
+                // (source_type, table) -> sibling members (target ref, asset key).
+                // The ≥2 grouping and the result name come from shared helpers
+                // in rocky-core so `rocky discover` can declare the exact same
+                // overlap names this runner emits (byte-match guarantee).
+                type SiblingGroups = HashMap<(String, String), Vec<(TableRef, Vec<String>)>>;
+                let mut groups: SiblingGroups = HashMap::new();
+                let mut pairs: Vec<(String, String)> = Vec::new();
+                for (tref, asset_key) in assertion_targets {
+                    let source_type = asset_key.first().cloned().unwrap_or_default();
+                    let key = (source_type, tref.table.clone());
+                    pairs.push(key.clone());
+                    groups
+                        .entry(key)
+                        .or_default()
+                        .push((tref.clone(), asset_key.clone()));
+                }
+                // Qualifying (source_type, table) keys (≥2 siblings), sorted.
+                let qualifying = checks::cross_source_overlap_groups(pairs);
+
+                let dialect = warehouse.dialect();
+                for gk in &qualifying {
+                    let members = &groups[gk];
+                    let (source_type, table) = gk;
+                    let siblings: Vec<TableRef> = members.iter().map(|(t, _)| t.clone()).collect();
+                    let name = checks::cross_source_overlap_name(source_type, table);
+                    let contributing: Vec<String> =
+                        siblings.iter().map(TableRef::full_name).collect();
+                    let key_exprs = match &key_exprs_result {
+                        Ok(k) => k,
+                        Err(e) => {
+                            warn!(source_type, table, error = %e, "cross_source_overlap key is misconfigured — reporting the check as not evaluated");
+                            let entry = pending_checks
+                                .entry(siblings[0].full_name())
+                                .or_insert_with(|| PendingCheck {
+                                    asset_key: members[0].1.clone(),
+                                    checks: Vec::new(),
+                                });
+                            entry.checks.push(
+                                rocky_core::checks::cross_source_overlap_not_evaluated(
+                                    name,
+                                    contributing,
+                                    e.clone(),
+                                    overlap_cfg.severity,
+                                ),
+                            );
+                            continue;
+                        }
+                    };
+                    let sql = match rocky_core::checks::generate_cross_source_overlap_sql(
+                        &siblings, key_exprs, dialect,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            // A check that will not run must stay in the tally.
+                            // Skipping silently let `after_checks` and the JSON
+                            // `check_results` claim a clean group that was never
+                            // evaluated. (The QUERY-error arm below still skips
+                            // by design — that is the keyless-table case.)
+                            warn!(source_type, table, error = %e, "cross_source_overlap SQL generation failed — reporting the check as not evaluated");
+                            let entry = pending_checks
+                                .entry(siblings[0].full_name())
+                                .or_insert_with(|| PendingCheck {
+                                    asset_key: members[0].1.clone(),
+                                    checks: Vec::new(),
+                                });
+                            entry.checks.push(
+                                rocky_core::checks::cross_source_overlap_not_evaluated(
+                                    name,
+                                    contributing,
+                                    e.to_string(),
+                                    overlap_cfg.severity,
+                                ),
+                            );
+                            continue;
+                        }
+                    };
+                    match warehouse.execute_query(&sql).await {
+                        Ok(result) => {
+                            let overlap_count = result.rows.len() as u64;
+                            let sample: Vec<String> = result
+                                .rows
+                                .iter()
+                                .take(overlap_cfg.sample)
+                                .map(|row| {
+                                    row.iter()
+                                        .take(key_exprs.len())
+                                        .map(|v| {
+                                            v.as_str()
+                                                .map(str::to_string)
+                                                .unwrap_or_else(|| v.to_string())
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(" | ")
+                                })
+                                .collect();
+                            let contributing: Vec<String> =
+                                siblings.iter().map(TableRef::full_name).collect();
+                            let check = rocky_core::checks::check_cross_source_overlap(
+                                name,
+                                overlap_count,
+                                overlap_cfg.max_overlap_rows,
+                                contributing,
+                                sample,
+                                overlap_cfg.severity,
+                            );
+                            // Attach to the first sibling's asset (the result's
+                            // contributing_tables lists the whole group).
+                            let entry = pending_checks
+                                .entry(siblings[0].full_name())
+                                .or_insert_with(|| PendingCheck {
+                                    asset_key: members[0].1.clone(),
+                                    checks: Vec::new(),
+                                });
+                            entry.checks.push(check);
+                        }
+                        Err(e) => {
+                            // A missing key column / keyless table surfaces as a
+                            // query error, and that case is tolerated by design
+                            // (FR acceptance criterion) — but the ERROR TYPE does
+                            // not say which case this is. Syntax, permission and
+                            // transport failures arrive here too, and skipping
+                            // silently dropped the check from `check_results`,
+                            // the `after_checks` tally and the JSON entirely, so
+                            // a group that was never evaluated read as a group
+                            // with nothing to report. Record the same explicit
+                            // not-evaluated state the generation arm above uses:
+                            // still not a hard failure, but never invisible.
+                            warn!(source_type, table, error = %e, "cross_source_overlap query failed (missing key column / keyless table?) — reporting the check as not evaluated");
+                            let entry = pending_checks
+                                .entry(siblings[0].full_name())
+                                .or_insert_with(|| PendingCheck {
+                                    asset_key: members[0].1.clone(),
+                                    checks: Vec::new(),
+                                });
+                            entry.checks.push(
+                                rocky_core::checks::cross_source_overlap_not_evaluated(
+                                    name,
+                                    contributing,
+                                    e.to_string(),
+                                    overlap_cfg.severity,
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Reads a `MAX(timestamp_column)` cell the way the per-table freshness
+/// fallback always has: RFC 3339 first, then the `YYYY-MM-DD HH:MM:SS[.fff]`
+/// shape most warehouses render a timestamp in.
+fn parse_freshness_timestamp(s: &str) -> Option<DateTime<Utc>> {
+    s.parse::<DateTime<Utc>>().ok().or_else(|| {
+        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+            .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
+            .ok()
+            .map(|naive| naive.and_utc())
+    })
+}
+
+/// Runs the null-rate check for every configured column of one table.
+///
+/// `generate_null_rate_sql` returns one row per column, `(col, nulls,
+/// sampled)`, and the rate is computed per row. Every configured column gets
+/// exactly one result: a measurement, or a not-evaluated failure saying why
+/// (the SQL could not be generated, the query failed, or it returned no
+/// readable row for that column). Each of those used to be logged and
+/// skipped, so a column the engine never measured was absent from the tally.
+async fn run_null_rate_checks(
+    warehouse: &dyn WarehouseAdapter,
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    tref: &TableRef,
+    cfg: &rocky_core::config::NullRateConfig,
+) -> Vec<checks::CheckResult> {
+    let every_column_not_evaluated = |reason: String| -> Vec<checks::CheckResult> {
+        cfg.columns
+            .iter()
+            .map(|col| {
+                let mut check = checks::null_rate_not_evaluated(col, cfg.threshold, reason.clone());
+                check.severity = cfg.severity;
+                check
+            })
+            .collect()
+    };
+
+    let sql = match checks::generate_null_rate_sql(tref, &cfg.columns, cfg.sample_percent, dialect)
+    {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(table = %tref.full_name(), error = %e, "null_rate SQL generation failed — reporting every column as not evaluated");
+            return every_column_not_evaluated(format!(
+                "could not generate the null-rate SQL: {e}"
+            ));
+        }
+    };
+    let result = match warehouse.execute_query(&sql).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(table = %tref.full_name(), error = %e, "null_rate query failed — reporting every column as not evaluated");
+            return every_column_not_evaluated(format!("the null-rate query failed: {e}"));
+        }
+    };
+
+    cfg.columns
+        .iter()
+        .map(|col| {
+            // The query labels each row with the configured column name.
+            let row = result
+                .rows
+                .iter()
+                .find(|row| row.first().and_then(|v| v.as_str()) == Some(col.as_str()));
+            // `sampled` decides whether there was anything to measure, so it
+            // is read first. `SUM(...)` over an empty sample is NULL, not 0,
+            // and the default `sample_percent` is 10, so a small table
+            // sampled at 10% lands here routinely. That is an empty sample,
+            // not a check the engine failed to run, and it must not be
+            // reported as one.
+            let counts = row.and_then(|row| {
+                let sampled = checks::cell_as_u64(row.get(2))?;
+                if sampled == 0 {
+                    return Some((0, 0));
+                }
+                Some((checks::cell_as_u64(row.get(1))?, sampled))
+            });
+            let mut check = match counts {
+                // An empty (0-row) sample is a real 0 and passes.
+                Some((nulls, sampled)) => {
+                    let rate = if sampled == 0 {
+                        0.0
+                    } else {
+                        nulls as f64 / sampled as f64
+                    };
+                    // `check_null_rate` names the result `null_rate:{col}`,
+                    // byte-matching discover's projection.
+                    checks::check_null_rate(col, rate, cfg.threshold)
+                }
+                // A count that does not parse is a malformed result, not a
+                // real zero; a missing row is a column the query never
+                // reported on.
+                None => {
+                    warn!(table = %tref.full_name(), column = col.as_str(), "null_rate result has no readable row for the column — reporting it as not evaluated");
+                    checks::null_rate_not_evaluated(
+                        col,
+                        cfg.threshold,
+                        "the null-rate query returned no readable row for this column",
+                    )
+                }
+            };
+            check.severity = cfg.severity;
+            check
+        })
+        .collect()
+}
+
 /// End-of-run retention sweep, gated by `last_retention_sweep_at`.
 ///
 /// Reads the configured `[state.retention]` policy and the timestamp of
@@ -6466,6 +6724,20 @@ fn apply_defer_rewrite(
     // Governs CTE-alias comparison inside the rewrite, not the `deferred`
     // lookup (which is by exact model name). Same dialect table the shadow path
     // uses, deliberately shared rather than copied.
+    //
+    // ‼️ #1282 makes one thing reachable here that was latent before. These rules
+    // reach `qualify_deferred_refs` ONLY as the CTE-shadowing question, and on
+    // Snowflake that question now gets the answer the warehouse gives UNDER ITS
+    // DEFAULT `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE`: a quoted lowercase alias
+    // does not hide an unquoted reference, because Snowflake does not bind those
+    // either. The reference is then a table reference, and `--defer` qualifies it
+    // to the deferred model's target — a bare name matching a model name IS that
+    // model (`resolve::classify_table_ref`).
+    //
+    // Read that scope narrowly: there is no near-miss to report on this path and
+    // therefore no refusal, so the answer is acted on rather than checked. The
+    // note on `qualify_deferred_refs` says what is still assumed and what it
+    // costs.
     let case_rules = dialect_case_rules(dialect)?;
     let recursive_visibility = dialect_recursive_cte_visibility(dialect);
 
@@ -6519,7 +6791,11 @@ fn apply_defer_rewrite(
 /// ‼️ Keep this function's dialect arms in step with [`dialect_case_rules`].
 /// Both are called on the `--defer` and shadow paths, so a dialect added to one
 /// and not the other turns a supported warehouse into a hard refusal on a path
-/// nobody was thinking about.
+/// nobody was thinking about. "In step" means the same SET of dialect names, not
+/// the same grouping: `dialect_case_rules` splits `snowflake` out from
+/// `bigquery` because Snowflake also folds UNQUOTED identifiers, while this
+/// function groups `snowflake` with `trino` because both render double quotes.
+/// Those two groupings answer different questions and are meant to disagree.
 fn rewrite_quote_style(dialect: &dyn rocky_core::traits::SqlDialect) -> Result<Option<char>> {
     match dialect.name() {
         // `format_table_ref` renders bare identifiers.
@@ -6663,31 +6939,46 @@ pub(crate) fn dialect_case_rules(
         // therefore do not collide. That question is deliberately NOT asked here:
         // `apply_shadow_rewrite` answers it with its own always-folding
         // `collision_identity`. Do not reuse this function for it.
-        // ‼️ Snowflake has a SECOND identity axis this deliberately does not
-        // model yet: it resolves an UNQUOTED identifier by upper-casing it,
-        // while Rocky renders its targets QUOTED. So a configured target
-        // `orders` is the object `orders`, which an unquoted `FROM orders` does
-        // NOT name — it names `ORDERS`. Matching on spelled text therefore
-        // rewrites a read of one object to the replacement for another.
+        "bigquery" => Ok(uniform(true)),
+        // Snowflake carries a SECOND identity axis on top of case: it resolves
+        // an UNQUOTED identifier by upper-casing it, while
+        // `SnowflakeSqlDialect::format_table_ref` renders every component of a
+        // target QUOTED. So a configured target `orders` is the object
+        // `orders`, which an unquoted `FROM orders` does NOT name — that names
+        // `ORDERS`. Matching on spelled text alone therefore rewrote a read of
+        // one object to the replacement registered for another (#1282).
         //
-        // `IdentifierCaseRules::uniform_uppercasing` implements and tests that
-        // resolution (see `defer.rs`'s
-        // `snowflake_resolves_unquoted_identifiers_before_matching`), and
-        // enabling it here is a one-line change. It is NOT enabled because doing
-        // so refuses any lowercase-configured Snowflake project, and while the
-        // reasoning says such a project could not read its upstream in
-        // production either, that conclusion has not been verified against a
-        // live Snowflake account.
+        // `uniform_uppercasing` resolves the reference the way Snowflake
+        // resolves it before matching, so such a read becomes a reported
+        // near-miss and the caller refuses. The idiomatic uppercase-target
+        // project is unaffected: an unquoted reference resolves onto an
+        // uppercase target and routes exactly as before. See `defer.rs`'s
+        // `snowflake_resolves_unquoted_identifiers_before_matching` for the
+        // full matrix.
         //
-        // The in-repo blast radius is one test fixture, not the examples: the
-        // only Snowflake POC (`05-orchestration/08-circuit-breaker`) is
-        // uppercase throughout (`catalog = "ANALYTICS"`), so it is unaffected.
-        // Do not read this deferral as "it would break our own examples". Shipping it
-        // untested would trade a known, pre-existing and unchanged hazard for an
-        // unmeasured break. Tracked as #1282; #1281 would settle it exactly.
+        // What this refuses that it did not refuse before: a lowercase or
+        // mixed-case configured target read through an UNQUOTED reference. On
+        // an account with the default `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE`
+        // that project cannot read its upstream on a plain run either — Rocky
+        // created `"main"."orders"` and the model asks for `MAIN.ORDERS` — so
+        // the refusal replaces a silent wrong read on a shape that is already
+        // broken. On an account that sets that parameter to TRUE the read does
+        // resolve today and is now refused; that parameter is connection state
+        // Rocky cannot observe (#1281 tracks reading it), and the refusal names
+        // both remedies. The remedy is trivial either way: quote the reference
+        // so it spells the target exactly, or spell the target in upper case.
         //
-        // Unchanged from the behaviour on `main`, which also matched on text.
-        "bigquery" | "snowflake" => Ok(uniform(true)),
+        // The only in-repo Snowflake project
+        // (`examples/playground/pocs/07-adapters/01-snowflake-dynamic-table`)
+        // is uppercase throughout — `catalog = "ANALYTICS"`, `schema = "MARTS"`
+        // and `FROM RAW__ORDERS.ORDERS` — so it is unaffected.
+        //
+        // ‼️ This arm differs in SHAPE from the `bigquery` one above on purpose:
+        // BigQuery is case-sensitive but does not fold unquoted identifiers, so
+        // it takes `uniform`. Do not "tidy" the two back into one arm.
+        "snowflake" => Ok(rocky_sql::defer::IdentifierCaseRules::uniform_uppercasing(
+            true,
+        )),
         other => anyhow::bail!(
             "shadow/branch execution does not know whether '{other}' treats identifier case as \
              part of object identity, so it cannot tell whether two targets differing only by \
@@ -6695,6 +6986,42 @@ pub(crate) fn dialect_case_rules(
              `dialect_case_rules` after checking how it folds identifiers"
         ),
     }
+}
+
+/// What to tell an operator whose reference matched a routed upstream only when
+/// identifier case was ignored.
+///
+/// Shared by the shadow and the replay refusal so the two cannot drift, and
+/// keyed on the dialect's own rules because the right advice differs.
+///
+/// On a dialect that folds UNQUOTED identifiers the generic "spell the reference
+/// exactly as the configured target" line is not merely incomplete, it is wrong:
+/// the reference in such a near-miss is normally spelled EXACTLY like the target
+/// and still names a different object, because `format_table_ref` created the
+/// target quoted while the model wrote the reference bare. An operator following
+/// the generic advice would compare two identical strings and conclude Rocky was
+/// broken (#1282).
+pub(crate) fn case_near_miss_remedy(rules: rocky_sql::defer::IdentifierCaseRules) -> &'static str {
+    if rules.unquoted_uppercases {
+        return "On this warehouse an UNQUOTED identifier resolves UPPER-CASED, so \
+                `main.orders` names `MAIN.ORDERS` while Rocky creates a configured target \
+                `main.orders` quoted, as `\"main\".\"orders\"` — two different objects with \
+                identical text. Make the reference name the object the target is, per component: \
+                either quote EVERY component of the reference so it spells the target exactly \
+                (`\"main\".\"orders\"`), or leave every component unquoted AND spell the \
+                configured target in upper case (`MAIN.ORDERS`), so the reference resolves onto \
+                it. A half-quoted reference such as `\"main\".orders` needs both — its quoted \
+                part must match the target's spelling and its unquoted part must be upper case in \
+                the target. Where a component is a reserved word (`ORDER`, `SELECT`, …) only the \
+                quoting remedy is available: such a name cannot be read unquoted at all. An \
+                account that sets QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE, or a \
+                catalog-linked database with CATALOG_CASE_SENSITIVITY = CASE_INSENSITIVE, can \
+                make the two one object. Rocky can observe the first on a connection (#1281), but \
+                that answer describes one request and does not govern this one, so it cannot \
+                decide this — spell the reference unambiguously instead";
+    }
+    "Spell the reference exactly as the upstream's configured target, or rename one so they \
+     differ by more than case (#1281 tracks reading the live setting instead of assuming it)"
 }
 
 /// Route the models built by this invocation and their in-run dependency reads
@@ -7087,6 +7414,15 @@ fn apply_shadow_rewrite(
             // reads a table the model never named, while leaving it reads
             // PRODUCTION while this model writes its shadow — an isolation break
             // that exits 0 and then shows up as a clean `rocky compare`. Refuse.
+            //
+            // On a dialect that folds UNQUOTED identifiers the near-miss is
+            // usually not a spelling difference at all: the reference is spelled
+            // exactly like the configured target and STILL names a different
+            // object, because Rocky created the target quoted and the model
+            // wrote the reference bare. "Spell it the same" is useless advice
+            // there, so the message names quoting explicitly and gives both
+            // remedies — an operator must not have to read this file to learn
+            // what to change (#1282).
             anyhow::ensure!(
                 outcome.case_fold_only_refs.is_empty(),
                 "shadow mode cannot tell whether upstream reference(s) {:?} in model '{}' name a \
@@ -7094,11 +7430,10 @@ fn apply_shadow_rewrite(
                  whether case separates two objects depends on connection state Rocky cannot \
                  observe (a Snowflake account may set QUOTED_IDENTIFIERS_IGNORE_CASE, a BigQuery \
                  dataset may be is_case_insensitive). Redirecting could read the wrong table and \
-                 not redirecting would read production, so neither is safe. Spell the reference \
-                 exactly as the upstream's configured target, or rename one so they differ by \
-                 more than case (#1281 tracks reading the live setting instead of assuming it)",
+                 not redirecting would read production, so neither is safe. {}",
                 outcome.case_fold_only_refs,
-                model.config.name
+                model.config.name,
+                case_near_miss_remedy(case_rules)
             );
             // Every reference actually redirected is now a read of a table
             // THIS run produces, so it is a real dependency regardless of what
@@ -8663,7 +8998,7 @@ pub(crate) async fn execute_models(
                     exec_ctx.typed_models,
                     exec_ctx.surrogate_keys,
                     dialect,
-                );
+                )?;
                 match gate
                     .evaluate(model, &typed_ir, warehouse, state_store)
                     .await
@@ -8944,7 +9279,7 @@ pub(crate) async fn execute_models(
                     exec_ctx.typed_models,
                     exec_ctx.surrogate_keys,
                     dialect,
-                );
+                )?;
                 if let ColumnSkipOutcome::Skip {
                     prior_output_column_hashes,
                     prior_blake3,
@@ -9041,7 +9376,7 @@ pub(crate) async fn execute_models(
                     exec_ctx.typed_models,
                     exec_ctx.surrogate_keys,
                     dialect,
-                );
+                )?;
                 let model_started_at = Utc::now();
                 let target_table_full_name = format!(
                     "{}.{}.{}",
@@ -9552,9 +9887,10 @@ fn build_reuse_target_by_model<'a, I>(models: I) -> std::collections::HashMap<St
 where
     I: IntoIterator<Item = (&'a str, &'a rocky_core::models::TargetConfig)>,
 {
-    // Each model contributes two lookup keys — its lowercased bare name and its
-    // lowercased 3-part `catalog.schema.table` — both resolving to the model's
-    // target full name. When two *different* models would claim the same key
+    // Each model contributes its lowercased 3-part `catalog.schema.table` key,
+    // plus its lowercased bare name when that name is what it writes (#1354),
+    // both resolving to the model's target full name.
+    // When two *different* models would claim the same key
     // with two *different* targets (case-colliding names, or a name that folds
     // onto another model's target), the key is **poisoned** (removed) rather
     // than resolved last-writer-wins: a consumer reading through an ambiguous
@@ -9567,7 +9903,40 @@ where
     let mut poisoned: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (name, t) in models {
         let target_full = format!("{}.{}.{}", t.catalog, t.schema, t.table);
-        for key in [target_full.to_lowercase(), name.to_lowercase()] {
+        // The bare-NAME key RESOLVES only when the model's configured target
+        // table is spelled like its name (#1354). A bare `FROM x` carries no
+        // schema, so the warehouse resolves it through the search path to a
+        // physical `x`; for a model named `x` whose target is `y`, binding
+        // that read to this model's column hashes compares the wrong producer
+        // and can SKIP a consumer whose real input moved (silent staleness).
+        //
+        // A model that does not qualify POISONS the key rather than merely
+        // skipping it. Model names collide case-insensitively (`Orders` and
+        // `orders` are both legal — only exact duplicates are rejected), and a
+        // silent skip would leave the *other* claimant resolving a key that is
+        // ambiguous today, turning a fail-closed BUILD into a possible skip.
+        // Poisoned or absent, the read resolves to `None`, no baseline is
+        // recorded, and the gate builds.
+        //
+        // `bare_name_binds` is the same question the compiler asks before
+        // raising D012 on the matching DAG edge — one spelling, two consumers,
+        // each taking the direction that costs work rather than correctness
+        // (the compiler keeps the edge and reports it, this drops the key).
+        let mut keys: Vec<String> = vec![target_full.to_lowercase()];
+        if rocky_core::physical_edges::bare_name_binds(name, &t.table) {
+            keys.push(name.to_lowercase());
+        } else if !name.contains('.') {
+            // Model names are not identifier-validated at load
+            // (`models.rs::parse_model_config`), so a model can be NAMED
+            // `cat.sch.orders`. Its folded name key would then be its own
+            // legitimate 3-part target key, and poisoning it would refuse a
+            // read that resolves correctly today. The bare-name namespace is
+            // the dot-free one; leave the qualified namespace alone.
+            let name_key = name.to_lowercase();
+            map.remove(&name_key);
+            poisoned.insert(name_key);
+        }
+        for key in keys {
             if poisoned.contains(&key) {
                 continue;
             }
@@ -9979,8 +10348,10 @@ fn propagate_skip_outputs(
 /// un-enumerable read can never be mistaken for "no raw-source reads". This is
 /// the same completeness fail-safe `skip_gate` uses.
 ///
-/// Only an UNAMBIGUOUS read resolves: a 1-part bare name (unique per project)
-/// or a 3-part `catalog.schema.table` (names a single catalog). A 2-part
+/// Only an UNAMBIGUOUS read resolves: a 1-part bare name (unique per project,
+/// and only for a model whose configured target table is spelled the same —
+/// #1354) or a 3-part
+/// `catalog.schema.table` (names a single catalog). A 2-part
 /// `schema.table` read is **catalog-ambiguous** — it binds to the session
 /// default catalog at runtime and `classify_table_ref` already treats it as an
 /// external source with no DAG edge — so it is refused here (returns `None` for
@@ -10284,7 +10655,7 @@ fn typed_model_ir(
     typed_models: &indexmap::IndexMap<String, Vec<rocky_compiler::types::TypedColumn>>,
     surrogate_keys: &HashMap<String, Vec<rocky_core::models::SurrogateKeySpec>>,
     dialect: &dyn rocky_core::traits::SqlDialect,
-) -> rocky_ir::ModelIr {
+) -> Result<rocky_ir::ModelIr> {
     let mut ir = model.to_model_ir();
     if let Some(cols) = typed_models.get(&model.config.name) {
         ir.typed_columns = cols.clone();
@@ -10293,9 +10664,9 @@ fn typed_model_ir(
     // declared surrogate key: a model that *gains* a key changes its IR and
     // re-materializes instead of being skipped as unchanged.
     if let Some(specs) = surrogate_keys.get(&model.config.name) {
-        rocky_core::models::apply_surrogate_keys(&mut ir, specs, dialect);
+        rocky_core::models::apply_surrogate_keys(&mut ir, specs, dialect)?;
     }
-    ir
+    Ok(ir)
 }
 
 /// Execute exactly one "plain" single-statement transformation model:
@@ -10338,7 +10709,7 @@ async fn execute_one_plain_model(
     // replication-only metadata-column path), so the wrap is what surfaces the
     // computed column into the CTAS / merge-source schema.
     if let Some(specs) = exec_ctx.surrogate_keys.get(model_name) {
-        rocky_core::models::apply_surrogate_keys(&mut model_ir, specs, dialect);
+        rocky_core::models::apply_surrogate_keys(&mut model_ir, specs, dialect)?;
     }
     let target_ref = dialect
         .format_table_ref(
@@ -11192,7 +11563,7 @@ fn resolve_merge_update_columns(
         .map(|c| Arc::from(c.name.as_str()))
         .collect();
     for m in metadata_columns {
-        cols.push(Arc::from(m.name.as_str()));
+        cols.push(Arc::from(m.name()));
     }
     MaterializationStrategy::Merge {
         unique_key: unique_key.clone(),
@@ -12463,7 +12834,8 @@ mod tests {
             target: Some(ResumeTarget {
                 adapter: "default".to_string(),
                 catalog_template: "wh".to_string(),
-                schema_template: format!("staging_{pipeline}__{{source}}"),
+                // `shadow: None`, so the run renders the template (#1592).
+                schema_template: Some(format!("staging_{pipeline}__{{source}}")),
                 // `{source}` is single-valued, so no separator joins it.
                 separator_role: Some(rocky_core::state::ResumeSeparator::Unused),
                 endpoint: rocky_core::config::EndpointIdentity {
@@ -12650,7 +13022,10 @@ token = "dapi-SECRET"
                 "target": {
                     "adapter": "default",
                     "catalog_template": "wh",
-                    "schema_template": "staging__{regions}",
+                    // The branch override supplies the schema, so the
+                    // template this run never renders is not recorded
+                    // (#1592). The catalog template is, on every path.
+                    "schema_template": null,
                     "separator_role": { "joins": "__" },
                     "endpoint": {
                         "adapter_type": "databricks",
@@ -12668,7 +13043,7 @@ token = "dapi-SECRET"
         assert_eq!(
             scope.to_string(),
             format!(
-                "pipeline 'p1', filter 'client=acme', target default:wh.staging__{{regions}} \
+                "pipeline 'p1', filter 'client=acme', target default:wh.<overridden> \
                  separator(__) endpoint(databricks host=https://adb-1.azuredatabricks.net \
                  host_route_digest={DATABRICKS_ROUTE_DIGEST} \
                  http_path=/sql/1.0/warehouses/abc) shadow(schema=branch__feature)"
@@ -12748,6 +13123,26 @@ token = "dapi-SECRET"
             serde_json::Value::Null
         );
         assert_ne!(plain, shadowed);
+        // The recorded half of #1592, pinned on the same `[target]` block
+        // the override elided it from: with no override the run renders the
+        // template, so its exact text rides in the blob. A `--shadow`
+        // suffix does not replace the schema either, so it records it too.
+        for (label, scope) in [("no override", &plain), ("suffix shadow", &shadowed)] {
+            assert_eq!(
+                serde_json::to_value(scope).unwrap()["target"]["schema_template"],
+                serde_json::json!("staging__{regions}"),
+                "{label} renders the schema template"
+            );
+            assert!(
+                scope.to_string().contains("wh.staging__{regions} "),
+                "{label} must name the template it renders: {scope}"
+            );
+        }
+        assert_ne!(
+            plain.target.as_ref().unwrap().schema_template,
+            scope.target.as_ref().unwrap().schema_template,
+            "the override case records no template at all"
+        );
 
         // The delimiter-injection pair: an `http_path` spelled to close the
         // old `endpoint(...)` text and open a `shadow(schema=x)` of its own
@@ -12759,11 +13154,17 @@ token = "dapi-SECRET"
         // instead and the collision would not be exercised. The variadic
         // placeholder therefore sits in the CATALOG template, which an
         // override does not replace: both sides classify as `joins` (#1586).
+        //
+        // The schema template is spelled `<overridden>` for the same
+        // reason: that is what the message shows for the elided template
+        // (#1592), and nothing stops a config from spelling it literally.
+        // The sentinel is forgeable exactly like the delimiters — which is
+        // the point. Only the structured comparison tells the two apart.
         let injection_target: PipelineTargetConfig = toml::from_str(
             r#"
 adapter = "default"
 catalog_template = "wh__{regions}"
-schema_template = "staging__{regions}"
+schema_template = "<overridden>"
 "#,
         )
         .unwrap();
@@ -12808,7 +13209,18 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         );
         assert_ne!(
             forged, genuine,
-            "the structured scopes must not: shadow and endpoint are separate fields"
+            "the structured scopes must not: shadow, endpoint and the \
+             schema template are separate fields"
+        );
+        assert_eq!(
+            genuine.target.as_ref().unwrap().schema_template,
+            None,
+            "the override elides the template it bypasses"
+        );
+        assert_eq!(
+            forged.target.as_ref().unwrap().schema_template,
+            Some("<overridden>".to_string()),
+            "the forged side records the template it really renders"
         );
 
         // The endpoint is the data location, not the alias: the same
@@ -12956,30 +13368,39 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
     /// record says the run succeeded or was a no-work skip; it stays
     /// resumable on failure statuses and on the crash case (no record).
     #[test]
-    fn resume_latest_refuses_runs_with_nothing_to_recover() {
+    fn resume_refuses_runs_with_nothing_to_recover() {
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
         store.init_run_progress("run-1", 1, Some(&scope)).unwrap();
 
+        // Both entry points, because a run id names the same checkpoint
+        // either way. `--resume <id>` skipped this gate entirely until
+        // #1635, so a pinned stale id exited 0 having copied nothing.
+        let entry_points = [(None, true), (Some("run-1"), false)];
+
         seed_run_record(&store, "run-1", "Success");
-        let err = resolve_resume_progress(&store, None, true, &scope)
-            .expect_err("a succeeded run must not resume");
-        assert!(
-            err.to_string()
-                .contains("nothing to resume: run run-1 already succeeded"),
-            "unexpected error: {err:#}"
-        );
+        for (resume_run_id, resume_latest) in entry_points {
+            let err = resolve_resume_progress(&store, resume_run_id, resume_latest, &scope)
+                .expect_err("a succeeded run must not resume");
+            assert!(
+                err.to_string()
+                    .contains("nothing to resume: run run-1 already succeeded"),
+                "unexpected error for {resume_run_id:?}/{resume_latest}: {err:#}"
+            );
+        }
 
         for status in ["SkippedIdempotent", "SkippedInFlight"] {
             seed_run_record(&store, "run-1", status);
-            let err = resolve_resume_progress(&store, None, true, &scope)
-                .expect_err("a no-work skip left no partial state to recover");
-            let message = err.to_string();
-            assert!(
-                message.contains("nothing to resume") && message.contains(status),
-                "unexpected error: {message}"
-            );
+            for (resume_run_id, resume_latest) in entry_points {
+                let err = resolve_resume_progress(&store, resume_run_id, resume_latest, &scope)
+                    .expect_err("a no-work skip left no partial state to recover");
+                let message = err.to_string();
+                assert!(
+                    message.contains("nothing to resume") && message.contains(status),
+                    "unexpected error for {resume_run_id:?}/{resume_latest}: {message}"
+                );
+            }
         }
     }
 
@@ -12987,24 +13408,32 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
     /// checkpoint with no run record at all (the crash case — the run never
     /// reached a terminal status).
     #[test]
-    fn resume_latest_allows_failed_and_crashed_runs() {
+    fn resume_allows_failed_and_crashed_runs() {
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
         store.init_run_progress("run-1", 1, Some(&scope)).unwrap();
 
-        // Crash case: no RunRecord exists.
-        let progress = resolve_resume_progress(&store, None, true, &scope)
-            .unwrap()
-            .unwrap();
-        assert_eq!(progress.run_id, "run-1");
+        let entry_points = [(None, true), (Some("run-1"), false)];
 
-        for status in ["Failure", "PartialFailure"] {
-            seed_run_record(&store, "run-1", status);
-            let progress = resolve_resume_progress(&store, None, true, &scope)
+        // Crash case: no RunRecord exists. Resumable on both entry points —
+        // widening the gate must not close the case it was written to keep.
+        for (resume_run_id, resume_latest) in entry_points {
+            let progress = resolve_resume_progress(&store, resume_run_id, resume_latest, &scope)
                 .unwrap()
                 .unwrap();
             assert_eq!(progress.run_id, "run-1");
+        }
+
+        for status in ["Failure", "PartialFailure"] {
+            seed_run_record(&store, "run-1", status);
+            for (resume_run_id, resume_latest) in entry_points {
+                let progress =
+                    resolve_resume_progress(&store, resume_run_id, resume_latest, &scope)
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(progress.run_id, "run-1");
+            }
         }
     }
 
@@ -13057,13 +13486,18 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
     /// exactly like this invocation's but differs field-wise is another
     /// scope. `--resume <id>` refuses it and `--resume-latest` never
     /// selects it — the comparison is structural at both seams.
+    ///
+    /// The template is spelled `<overridden>` because that is what the
+    /// message shows where an override elided one (#1592), and a config can
+    /// spell it literally. Forging it is exactly as easy as forging the
+    /// `endpoint(...)` delimiters, and just as ineffective.
     #[test]
     fn resume_refuses_a_checkpoint_whose_scope_only_renders_the_same() {
         use rocky_core::config::{AdapterConfig, PipelineTargetConfig};
         use rocky_core::shadow::ShadowConfig;
 
         let target: PipelineTargetConfig = toml::from_str(
-            "adapter = \"default\"\ncatalog_template = \"wh\"\nschema_template = \"staging\"\n",
+            "adapter = \"default\"\ncatalog_template = \"wh\"\nschema_template = \"<overridden>\"\n",
         )
         .unwrap();
         let injected: AdapterConfig = toml::from_str(
@@ -13547,6 +13981,138 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         );
     }
 
+    /// The template itself, not just the separator that joins it (#1592).
+    ///
+    /// A `--shadow --shadow-schema` or `--branch` override supplies the
+    /// target schema name outright, so the resolver never reads
+    /// `schema_template` — the two `schema_override.clone().unwrap_or_else(..)`
+    /// sites in this file take the override and never call the closure.
+    /// Editing the template between two `--branch branch__feature` runs
+    /// therefore refused the later resume over a difference that moved
+    /// nothing.
+    ///
+    /// Why eliding it is not fail-open, which is the question that matters:
+    /// a resume skips a table by its `table_key`
+    /// (`{target_catalog}.{target_schema}.{target_table_name}`), and under
+    /// an override `target_schema` is the override string verbatim.
+    /// [`ResumeShadow::Schema`] records that string, so the physical schema
+    /// is pinned whatever the template says. Two scopes that differ only in
+    /// `schema_template` really do write the same objects. With no
+    /// override the template IS the schema, and a change to it still
+    /// refuses — the second half of this test.
+    ///
+    /// [`ResumeShadow::Schema`]: rocky_core::state::ResumeShadow::Schema
+    #[test]
+    fn resume_survives_a_schema_template_change_an_override_bypasses() {
+        use rocky_core::config::PipelineTargetConfig;
+        use rocky_core::shadow::ShadowConfig;
+
+        let branch = ShadowConfig {
+            suffix: "_rocky_shadow".to_string(),
+            schema_override: Some("branch__feature".to_string()),
+            cleanup_after: false,
+        };
+        let adapter = test_duckdb_adapter(None);
+        let pattern = test_schema_pattern();
+        // Both fixtures pin the SAME `[target] separator` and a catalog
+        // template with no placeholder, so `separator_role` classifies as
+        // `Unused` on both sides. `schema_template` is then the only field
+        // that moves — otherwise the case would pass for the wrong reason.
+        let target = |schema_template: &str| -> PipelineTargetConfig {
+            toml::from_str(&format!(
+                "adapter = \"default\"\ncatalog_template = \"wh\"\nschema_template = \"{schema_template}\"\nseparator = \"--\"\n"
+            ))
+            .unwrap()
+        };
+        let scope = |target: &PipelineTargetConfig, shadow: Option<&ShadowConfig>| -> ResumeScope {
+            replication_resume_scope(
+                "p1",
+                target,
+                &adapter,
+                None,
+                shadow,
+                target.separator.as_deref().unwrap_or(&pattern.separator),
+                &pattern,
+            )
+        };
+        // A source schema whose `regions` binds TWO values, so a template
+        // edit that could move a name would show.
+        let parsed = pattern
+            .parse("src__acme__us_west__us_central__shopify")
+            .unwrap();
+        assert_ne!(
+            parsed.resolve_template("raw__{regions}", "--"),
+            parsed.resolve_template("staging__{regions}", "--"),
+            "the two templates really would resolve different schemas"
+        );
+
+        let written = scope(&target("raw__{regions}"), Some(&branch));
+        let edited = scope(&target("staging__{regions}"), Some(&branch));
+        assert_eq!(
+            serde_json::to_value(&written).unwrap()["target"]["schema_template"],
+            serde_json::Value::Null,
+            "a bypassed template is not recorded"
+        );
+        assert_eq!(
+            written, edited,
+            "an edit the override bypasses moves no name"
+        );
+        // Why skipping stays correct: every table this run checkpoints is
+        // keyed `wh.branch__feature.<table>` under either template, and
+        // `shadow(schema=branch__feature)` is what the scope compares.
+        assert_eq!(
+            written.target.as_ref().unwrap().shadow,
+            Some(rocky_core::state::ResumeShadow::Schema(
+                "branch__feature".to_string()
+            )),
+            "the physical schema is pinned by the shadow, not by the template"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        store
+            .init_run_progress("run-written", 1, Some(&written))
+            .unwrap();
+        resolve_resume_progress(&store, Some("run-written"), false, &edited)
+            .expect("a bypassed template edit must still resume")
+            .expect("the checkpoint is found");
+        resolve_resume_progress(&store, None, true, &edited)
+            .expect("a bypassed template edit must still resume")
+            .expect("--resume-latest selects it");
+
+        // The carve-out, and the reason this is not fail-open: with no
+        // override the resolver renders the template, so the same edit
+        // moves every target schema and the resume refuses.
+        let plain_written = scope(&target("raw__{regions}"), None);
+        let plain_edited = scope(&target("staging__{regions}"), None);
+        assert_eq!(
+            serde_json::to_value(&plain_written).unwrap()["target"]["schema_template"],
+            serde_json::json!("raw__{regions}"),
+            "a rendered template is recorded verbatim"
+        );
+        assert_ne!(
+            plain_written, plain_edited,
+            "a rendered template edit resolves other names"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        store
+            .init_run_progress("run-plain", 1, Some(&plain_written))
+            .unwrap();
+        let err = resolve_resume_progress(&store, Some("run-plain"), false, &plain_edited)
+            .expect_err("another schema template's checkpoint must not resume");
+        assert!(
+            err.to_string().contains("different pipeline scope"),
+            "unexpected error: {err:#}"
+        );
+        let err = resolve_resume_progress(&store, None, true, &plain_edited)
+            .expect_err("--resume-latest must not select it");
+        assert!(
+            err.to_string().contains("no progress found"),
+            "unexpected error: {err:#}"
+        );
+    }
+
     /// The other half of #1586, and the dangerous one. Eliding a separator
     /// is only sound when the value is **target-only**. With no `[target]
     /// separator` the run inherits the source pattern's, and
@@ -13858,6 +14424,28 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         resume_run_id: Option<&str>,
         resume_latest: bool,
     ) -> anyhow::Result<()> {
+        drive_shadowed_resume_test_run(
+            config_path,
+            state_path,
+            pipeline,
+            resume_run_id,
+            resume_latest,
+            None,
+        )
+        .await
+    }
+
+    /// The same driver with a `--shadow` / `--shadow-schema` / `--branch`
+    /// override, for the cases that need the run to route somewhere other
+    /// than its rendered `schema_template` (#1592).
+    async fn drive_shadowed_resume_test_run(
+        config_path: &std::path::Path,
+        state_path: &std::path::Path,
+        pipeline: &str,
+        resume_run_id: Option<&str>,
+        resume_latest: bool,
+        shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
+    ) -> anyhow::Result<()> {
         super::run(
             config_path,
             std::sync::Arc::new(
@@ -13872,7 +14460,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             false,
             resume_run_id,
             resume_latest,
-            None,
+            shadow_config,
             &PartitionRunOptions::default(),
             None,
             None,
@@ -14308,6 +14896,109 @@ auto_create_schemas = true
                 !target_table_exists(&db_path, "staging_p2__acme", "orders").await,
                 "the resumed run must skip the table the checkpoint completed \
                  (seeded record: {run_record_status:?})"
+            );
+        }
+    }
+
+    /// #1592 acceptance, end to end: the checkpoint key really is
+    /// `catalog.<override>.table`, so eliding the bypassed template is not
+    /// fail-open.
+    ///
+    /// A `--branch branch__feature` run writes into `branch__feature`
+    /// whatever `schema_template` says. This test seeds that run's
+    /// checkpoint, edits the template, then resumes under the same branch.
+    /// Two things must hold, and the second is the direction-of-harm proof:
+    ///
+    /// ```text
+    ///   run 1  --branch branch__feature   template staging_p1__{source}
+    ///          checkpoint: warehouse.branch__feature.orders = Success
+    ///   edit   template -> edited_p1__{source}
+    ///   run 2  --branch branch__feature   --resume-latest
+    ///          scope matches  ->  orders SKIPPED  ->  table never created
+    /// ```
+    ///
+    /// The resume is accepted (it refused before this fix), and the only
+    /// source table stays uncopied — which it can only do if the seeded key
+    /// equals the key run 2 would have written. Neither template names a
+    /// schema the run touches.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn resume_under_a_branch_skips_the_recorded_table_after_a_template_edit() {
+        use rocky_core::shadow::ShadowConfig;
+
+        let branch = ShadowConfig {
+            suffix: "_rocky_shadow".to_string(),
+            schema_override: Some("branch__feature".to_string()),
+            cleanup_after: false,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, state_path, db_path) =
+            write_two_pipeline_project(dir.path(), "staging_p1__{source}", "staging_p2__{source}")
+                .await;
+
+        // The checkpoint a `--branch branch__feature` run leaves: the scope
+        // built by the run path's own helper, and the one source table
+        // recorded under the key that run writes. No run record — the crash
+        // shape, which stays resumable.
+        {
+            let loaded = rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap();
+            let (name, pipeline_config) =
+                registry::resolve_pipeline(&loaded.config, Some("p1")).unwrap();
+            let replication = pipeline_config.as_replication().unwrap();
+            let target = &replication.target;
+            let pattern = replication.schema_pattern().unwrap();
+            let scope = replication_resume_scope(
+                name,
+                target,
+                &loaded.config.adapters[&target.adapter],
+                None,
+                Some(&branch),
+                target.separator.as_deref().unwrap_or(&pattern.separator),
+                &pattern,
+            );
+            assert_eq!(
+                scope.target.as_ref().unwrap().schema_template,
+                None,
+                "the branch override bypasses the template, so it is not recorded"
+            );
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .init_run_progress("run-branch", 1, Some(&scope))
+                .unwrap();
+            store
+                .record_table_progress(
+                    "run-branch",
+                    &table_entry(
+                        0,
+                        "warehouse.branch__feature.orders",
+                        rocky_core::state::TableStatus::Success,
+                    ),
+                )
+                .unwrap();
+        }
+
+        // Edit the one field this change is about. Nothing else moves.
+        write_two_pipeline_config(
+            dir.path(),
+            &db_path,
+            "edited_p1__{source}",
+            "staging_p2__{source}",
+        );
+
+        drive_shadowed_resume_test_run(&config_path, &state_path, "p1", None, true, Some(&branch))
+            .await
+            .expect("a template edit the branch bypasses must not refuse the resume");
+
+        assert!(
+            !target_table_exists(&db_path, "branch__feature", "orders").await,
+            "the resumed run must skip the table the checkpoint completed — \
+             the seeded key is the key this run would write"
+        );
+        for schema in ["staging_p1__acme", "edited_p1__acme"] {
+            assert!(
+                !target_table_exists(&db_path, schema, "orders").await,
+                "'{schema}' comes from a template the override replaces; \
+                 no run may write there"
             );
         }
     }
@@ -16415,11 +17106,8 @@ merge_keys_fallback = ["fallback_only"]
                 nullable: true,
             },
         ];
-        let metadata = vec![MetadataColumn {
-            name: "_loaded_at".to_string(),
-            data_type: "TIMESTAMP".to_string(),
-            value: "CURRENT_TIMESTAMP()".to_string(),
-        }];
+        let metadata =
+            vec![MetadataColumn::new("_loaded_at", "TIMESTAMP", "CURRENT_TIMESTAMP()").unwrap()];
 
         let resolved = resolve_merge_update_columns(&strategy, &source_cols, &metadata);
 
@@ -20762,7 +21450,7 @@ backend = "local"
         let surrogate_keys = std::collections::HashMap::new();
         let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
 
-        let ir = super::typed_model_ir(&model, &typed_models, &surrogate_keys, &dialect);
+        let ir = super::typed_model_ir(&model, &typed_models, &surrogate_keys, &dialect).unwrap();
         assert_eq!(
             ir.typed_columns.len(),
             2,
@@ -21353,19 +22041,32 @@ auto_create_schemas = true
     /// quoted too; DuckDB renders bare. Nothing else in the suite exercises
     /// these dialects, so this asserts the serialized SQL directly rather than
     /// reasoning about how each warehouse resolves it.
+    ///
+    /// The identifier case is a parameter because Snowflake resolves an
+    /// UNQUOTED reference upper-cased (#1282): the lowercase `main.orders` this
+    /// fixture used to write for every dialect is a shape Snowflake now refuses,
+    /// since the producer creates `"main"."orders"` and the consumer's bare
+    /// `FROM main.orders` names `MAIN.ORDERS`. The uppercase spelling is the
+    /// Snowflake-idiomatic one and keeps this test about QUOTING, which is what
+    /// it exists to pin. DuckDB keeps the lowercase spelling so the bare-render
+    /// assertion still means something.
     #[cfg(feature = "duckdb")]
     #[test]
     fn shadow_rewritten_reads_match_the_producer_quoting_per_dialect() {
-        fn rewritten_sql(dialect: &dyn rocky_core::traits::SqlDialect) -> String {
+        fn rewritten_sql(
+            dialect: &dyn rocky_core::traits::SqlDialect,
+            schema: &str,
+            table: &str,
+        ) -> String {
             let tmp = tempfile::TempDir::new().expect("temp dir");
             let models_dir = tmp.path().join("models");
             std::fs::create_dir(&models_dir).expect("mkdir models");
-            write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+            write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", schema, table);
             write_model_with_target(
                 &models_dir,
                 "mart",
-                "SELECT id FROM main.orders",
-                "main",
+                &format!("SELECT id FROM {schema}.{table}"),
+                schema,
                 "mart",
             );
             let mut compiled =
@@ -21393,7 +22094,7 @@ auto_create_schemas = true
                 .clone()
         }
 
-        let duck = rewritten_sql(&rocky_duckdb::dialect::DuckDbSqlDialect);
+        let duck = rewritten_sql(&rocky_duckdb::dialect::DuckDbSqlDialect, "main", "orders");
         assert!(
             duck.contains("orders_rocky_shadow") && !duck.contains('"'),
             "DuckDB renders bare identifiers: {duck}"
@@ -21402,16 +22103,234 @@ auto_create_schemas = true
         for (name, sql) in [
             (
                 "snowflake",
-                rewritten_sql(&rocky_snowflake::dialect::SnowflakeSqlDialect),
+                rewritten_sql(
+                    &rocky_snowflake::dialect::SnowflakeSqlDialect,
+                    "MAIN",
+                    "ORDERS",
+                ),
             ),
-            ("trino", rewritten_sql(&rocky_trino::dialect::TrinoDialect)),
+            (
+                "trino",
+                rewritten_sql(&rocky_trino::dialect::TrinoDialect, "MAIN", "ORDERS"),
+            ),
         ] {
             assert!(
-                sql.contains("\"orders_rocky_shadow\""),
+                sql.contains("\"ORDERS_rocky_shadow\""),
                 "{name} quotes its targets, so the rewritten read must be quoted too or it \
                  folds case and names a different object: {sql}"
             );
         }
+    }
+
+    /// #1282: on Snowflake a lowercase configured target read through an
+    /// UNQUOTED reference must be REFUSED, not silently rewritten.
+    ///
+    /// `SnowflakeSqlDialect::format_table_ref` creates the target as
+    /// `"main"."orders"`. Snowflake resolves the consumer's bare
+    /// `FROM main.orders` to `MAIN.ORDERS`. Those are two different objects with
+    /// identical text, so the text match this fixture used to satisfy redirected
+    /// a read of one object to the other's shadow replacement.
+    ///
+    /// This goes through `apply_shadow_rewrite` on purpose. Constructing
+    /// `IdentifierCaseRules::uniform_uppercasing(true)` by hand passes with the
+    /// dialect table unchanged and proves only that the rules type works; the
+    /// thing under test is that `dialect_case_rules` hands Snowflake those
+    /// rules.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_refuses_a_snowflake_read_that_folds_to_a_different_object() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+        write_model_with_target(
+            &models_dir,
+            "mart",
+            "SELECT id FROM main.orders",
+            "main",
+            "mart",
+        );
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+
+        let err = super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            None,
+            &rocky_core::shadow::ShadowConfig::default(),
+            &rocky_snowflake::dialect::SnowflakeSqlDialect,
+            false,
+        )
+        .expect_err("an unquoted read of a quoted lowercase target must be refused");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("[\"main.orders\"]"),
+            "the refusal must name the reference it could not decide: {message}"
+        );
+        // The remedy has to be in the message. An operator hitting this sees a
+        // reference spelled exactly like the target, so "spell it the same" on
+        // its own would send them hunting a difference that is not there.
+        assert!(
+            message.contains("quote EVERY component of the reference so it spells the target"),
+            "the refusal must name the quoting remedy: {message}"
+        );
+        assert!(
+            message.contains("spell the configured target in upper case"),
+            "the refusal must name the upper-case remedy: {message}"
+        );
+        assert!(
+            message.contains("QUOTED_IDENTIFIERS_IGNORE_CASE"),
+            "the refusal must name the account setting that makes this ambiguous: {message}"
+        );
+    }
+
+    /// #1282's other half: the shapes that must keep working.
+    ///
+    /// An uppercase configured target — the Snowflake-idiomatic spelling — is
+    /// what an unquoted reference resolves onto, so it routes exactly as before.
+    /// And the remedy the refusal message prints has to actually work: a
+    /// lowercase target read through a QUOTED reference names the object Rocky
+    /// created, so it routes too. Without this second half the change could have
+    /// been "refuse everything on Snowflake" and still looked correct.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_routes_snowflake_reads_that_name_the_object_rocky_created() {
+        fn routed_sql(schema: &str, table: &str, reference: &str) -> String {
+            let tmp = tempfile::TempDir::new().expect("temp dir");
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).expect("mkdir models");
+            write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", schema, table);
+            write_model_with_target(
+                &models_dir,
+                "mart",
+                &format!("SELECT id FROM {reference}"),
+                schema,
+                "mart",
+            );
+            let mut compiled =
+                rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                    models_dir,
+                    ..Default::default()
+                })
+                .expect("compile models");
+            super::apply_shadow_rewrite(
+                &mut compiled,
+                None,
+                None,
+                &rocky_core::shadow::ShadowConfig::default(),
+                &rocky_snowflake::dialect::SnowflakeSqlDialect,
+                false,
+            )
+            .expect("a reference that names the created object must route");
+            compiled
+                .project
+                .models
+                .iter()
+                .find(|m| m.config.name == "mart")
+                .expect("mart missing")
+                .sql
+                .clone()
+        }
+
+        let idiomatic = routed_sql("MAIN", "ORDERS", "MAIN.ORDERS");
+        assert!(
+            idiomatic.contains("\"ORDERS_rocky_shadow\""),
+            "an uppercase target read unquoted must still route: {idiomatic}"
+        );
+
+        let quoted_remedy = routed_sql("main", "orders", "\"main\".\"orders\"");
+        assert!(
+            quoted_remedy.contains("\"orders_rocky_shadow\""),
+            "quoting the reference is the remedy the refusal prints, so it must route: \
+             {quoted_remedy}"
+        );
+
+        // This one is a LOOSENING, not a break. Before #1282 the matcher
+        // compared spelled text, so a lowercase unquoted reference to an
+        // uppercase target failed the exact comparison, matched only when case
+        // was ignored, and the run was REFUSED. Snowflake resolves that
+        // reference to `MAIN.ORDERS`, which is exactly the target, so it now
+        // routes. Reverting the arm makes this assertion fail, which is what
+        // makes "it used to be refused" evidence rather than a claim.
+        let case_insensitive_unquoted = routed_sql("MAIN", "ORDERS", "main.orders");
+        assert!(
+            case_insensitive_unquoted.contains("\"ORDERS_rocky_shadow\""),
+            "an unquoted reference in any case resolves onto an uppercase target: \
+             {case_insensitive_unquoted}"
+        );
+    }
+
+    /// `--defer` is the third path these rules reach, and this proves the
+    /// wiring rather than the rule: it runs `apply_defer_rewrite` with the real
+    /// Snowflake dialect.
+    ///
+    /// The behaviour is a change and is disclosed as one. A quoted lowercase CTE
+    /// alias no longer hides an unquoted reference, because Snowflake does not
+    /// bind those two names. The reference is then a table reference, and a bare
+    /// name matching a model name is that model, so `--defer` qualifies it to
+    /// the deferred model's target. There is no refusal on this path — the
+    /// qualifier substitutes on an exact model-name match and reports no
+    /// near-miss — so the scope answer has to be the warehouse's own.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn defer_on_snowflake_qualifies_a_reference_a_quoted_cte_does_not_bind() {
+        fn deferred_sql(mart_sql: &str) -> String {
+            let tmp = tempfile::TempDir::new().expect("temp dir");
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).expect("mkdir models");
+            write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+            write_model_with_target(&models_dir, "mart", mart_sql, "main", "mart");
+            let mut compiled =
+                rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                    models_dir,
+                    ..Default::default()
+                })
+                .expect("compile models");
+            super::apply_defer_rewrite(
+                &mut compiled,
+                Some("mart"),
+                &super::DeferOptions {
+                    enabled: true,
+                    defer_to: None,
+                },
+                &rocky_snowflake::dialect::SnowflakeSqlDialect,
+            )
+            .expect("defer rewrite must succeed");
+            compiled
+                .project
+                .models
+                .iter()
+                .find(|m| m.config.name == "mart")
+                .expect("mart missing")
+                .sql
+                .clone()
+        }
+
+        // Quoted alias, unquoted reference: Snowflake does not bind them, so the
+        // reference is the deferred model and is qualified to its target.
+        let freed = deferred_sql("WITH \"orders\" AS (SELECT 1 AS id) SELECT * FROM orders");
+        assert!(
+            freed.contains("\"main\".\"orders\""),
+            "a quoted alias does not bind an unquoted reference: {freed}"
+        );
+
+        // The other direction, and the one the disclosure has to cover too. The
+        // reference must still spell the model name exactly, because the
+        // deferred lookup is by model name and stays exact — only the ALIAS
+        // differs by case here. Two unquoted spellings are ONE name on
+        // Snowflake, so the CTE hides the reference and nothing is qualified.
+        // Under the previous exact alias comparison they were two names, the
+        // reference was not hidden, and it WAS qualified.
+        let hidden = deferred_sql("WITH Orders AS (SELECT 1 AS id) SELECT * FROM orders");
+        assert!(
+            !hidden.contains("\"main\".\"orders\""),
+            "an unquoted alias differing only by case is the same name, so it hides the \
+             reference: {hidden}"
+        );
     }
 
     /// A run that routes a single model rewrites nothing — a model's own
@@ -24613,8 +25532,11 @@ auto_create_schemas = true
             !map.contains_key("marts.orders"),
             "a catalog-less schema.table key would let a 2-part read false-strong"
         );
-        assert_eq!(map.get("orders_a"), Some(&"cat1.marts.orders".to_string()));
-        assert_eq!(map.get("orders_b"), Some(&"cat2.marts.orders".to_string()));
+        // Neither model writes a table called by its own name, so neither
+        // contributes a bare-name key (#1354): `FROM orders_a` reads a physical
+        // `orders_a`, not `cat1.marts.orders`.
+        assert!(!map.contains_key("orders_a"), "{map:?}");
+        assert!(!map.contains_key("orders_b"), "{map:?}");
         assert_eq!(
             map.get("cat1.marts.orders"),
             Some(&"cat1.marts.orders".to_string())
@@ -24688,20 +25610,21 @@ auto_create_schemas = true
 
     #[test]
     fn reuse_one_part_bare_name_read_still_resolves() {
-        // (c) A 1-part bare model-name read still resolves (names are unique
-        // per project, so there is no ambiguity to refuse).
+        // (c) A 1-part bare model-name read still resolves when the model
+        // writes a table of that name (names are unique per project, so there
+        // is no ambiguity to refuse). The fixture used to be a model named
+        // `orders_a` writing `marts.orders`; that read resolves to a physical
+        // `orders_a`, not to this model, so it no longer binds (#1354) — see
+        // `reuse_bare_read_of_a_renamed_target_model_stays_unresolved`.
         let t1 = target_cfg("cat1", "marts", "orders");
-        let target_by_model = build_reuse_target_by_model([("orders_a", &t1)]);
+        let target_by_model = build_reuse_target_by_model([("orders", &t1)]);
 
         let mut outputs = std::collections::HashMap::new();
         outputs.insert("cat1.marts.orders".to_string(), "hash-cat1".to_string());
 
-        let resolved = resolve_read_set_content_upstreams(
-            "SELECT id FROM orders_a",
-            &target_by_model,
-            &outputs,
-        )
-        .expect("a 1-part bare-name read resolves");
+        let resolved =
+            resolve_read_set_content_upstreams("SELECT id FROM orders", &target_by_model, &outputs)
+                .expect("a 1-part bare-name read resolves");
         assert_eq!(resolved.len(), 1);
         match &resolved[0] {
             rocky_core::reuse::UpstreamIdentity::Content {
@@ -24827,6 +25750,114 @@ auto_create_schemas = true
         );
     }
 
+    /// #1354 in the content-reuse path: a bare read that merely matches a
+    /// model's NAME must not inherit that model's column hashes.
+    ///
+    /// Model `orders_a` writes `cat1.marts.orders`; `FROM orders_a` resolves
+    /// through the warehouse search path to a physical `orders_a`, which is a
+    /// different object. Binding it would compare the wrong producer and could
+    /// SKIP a consumer whose real input moved — silent staleness. Unresolved
+    /// fails closed: no baseline, the gate builds.
+    #[test]
+    fn reuse_bare_read_of_a_renamed_target_model_stays_unresolved() {
+        let t1 = target_cfg("cat1", "marts", "orders");
+        let target_by_model = build_reuse_target_by_model([("orders_a", &t1)]);
+
+        let mut outputs = std::collections::HashMap::new();
+        outputs.insert("cat1.marts.orders".to_string(), "hash-cat1".to_string());
+
+        assert!(
+            resolve_read_set_content_upstreams(
+                "SELECT id FROM orders_a",
+                &target_by_model,
+                &outputs,
+            )
+            .is_none(),
+            "a bare read matching only a model NAME must leave the consumer unindexed"
+        );
+        // The model's own physical name still resolves — nothing legitimate lost.
+        assert!(
+            resolve_read_set_content_upstreams(
+                "SELECT id FROM cat1.marts.orders",
+                &target_by_model,
+                &outputs,
+            )
+            .is_some(),
+            "the 3-part read of the real target must still resolve"
+        );
+    }
+
+    /// A model NAME may contain dots — nothing identifier-validates it at load
+    /// — and then its folded name key IS a legitimate 3-part target key.
+    /// Poisoning the bare-name namespace must not reach into the qualified
+    /// one, or a read that resolves correctly today would build forever.
+    #[test]
+    fn a_dotted_model_name_does_not_poison_its_own_three_part_key() {
+        let t = target_cfg("cat", "sch", "orders");
+        let map = build_reuse_target_by_model([("cat.sch.orders", &t)]);
+
+        assert_eq!(
+            map.get("cat.sch.orders"),
+            Some(&"cat.sch.orders".to_string()),
+            "the model's own 3-part target key must survive: {map:?}"
+        );
+    }
+
+    /// The mixed collision: two models whose names fold together, where only
+    /// ONE writes a table of that name.
+    ///
+    /// Before #1354's key filter, both claimed the folded key `orders` with
+    /// different targets, so it was poisoned and the consumer built. If the
+    /// renamed one merely stopped contributing, the surviving claimant would
+    /// resolve a key that is still ambiguous — turning a fail-closed BUILD
+    /// into a possible SKIP against the wrong producer's hashes. The renamed
+    /// model therefore POISONS the key instead of skipping it, and this test
+    /// drives the real consumer-baseline decision to prove it.
+    #[test]
+    fn consumer_baseline_fails_closed_when_only_one_case_colliding_model_writes_the_name() {
+        let t_a = target_cfg("cat", "sch_a", "a");
+        let t_b = target_cfg("cat", "sch_b", "orders");
+
+        // BOTH input orders. With the renamed model first, `poisoned.insert`
+        // does the work; with it second, `map.remove` does — a test that fixes
+        // the order proves only one of the two lines.
+        for (label, map) in [
+            (
+                "renamed first",
+                build_reuse_target_by_model([("Orders", &t_a), ("orders", &t_b)]),
+            ),
+            (
+                "renamed second",
+                build_reuse_target_by_model([("orders", &t_b), ("Orders", &t_a)]),
+            ),
+        ] {
+            assert!(
+                !map.contains_key("orders"),
+                "{label}: a folded name claimed by a model that does not write it must be \
+                 poisoned, not left to the other claimant: {map:?}"
+            );
+        }
+
+        let target_by_model = build_reuse_target_by_model([("Orders", &t_a), ("orders", &t_b)]);
+        assert_eq!(
+            target_by_model.get("cat.sch_b.orders"),
+            Some(&"cat.sch_b.orders".to_string()),
+            "the unambiguous 3-part key still resolves"
+        );
+
+        let mut built = std::collections::HashMap::new();
+        built.insert("cat.sch_a.a".to_string(), vec![ch("id", "h_id")]);
+        built.insert("cat.sch_b.orders".to_string(), vec![ch("id", "h_id")]);
+
+        let sigs = compute_consumer_baseline("SELECT id FROM orders", &target_by_model, &built)
+            .expect("consumed set is complete");
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(
+            sigs[0].consumed_column_hashes, None,
+            "no column baseline ⇒ the later gate builds (fail closed)"
+        );
+    }
+
     #[test]
     fn consumer_baseline_fails_closed_on_ambiguous_case_colliding_model_key() {
         // Two distinct models whose bare names collide case-insensitively
@@ -24836,8 +25867,12 @@ auto_create_schemas = true
         // `orders` would otherwise compare the wrong sibling's producer hashes
         // and could skip on a real content change (silent staleness). The read
         // yields no column baseline ⇒ the later gate builds (fail closed).
-        let t_a = target_cfg("cat", "sch", "a");
-        let t_b = target_cfg("cat", "sch", "b");
+        // Both models write a table spelled like their own name, so both
+        // contribute a bare-name key (#1354) — which is what makes the
+        // collision reachable at all. Distinct schemas keep their 3-part keys
+        // unambiguous.
+        let t_a = target_cfg("cat", "sch_a", "Orders");
+        let t_b = target_cfg("cat", "sch_b", "orders");
         let target_by_model = build_reuse_target_by_model([("Orders", &t_a), ("orders", &t_b)]);
 
         // The ambiguous bare-name key is dropped; the unambiguous full-target
@@ -24847,19 +25882,19 @@ auto_create_schemas = true
             "an ambiguous case-colliding model key must be poisoned, not resolved"
         );
         assert_eq!(
-            target_by_model.get("cat.sch.a"),
-            Some(&"cat.sch.a".to_string())
+            target_by_model.get("cat.sch_a.orders"),
+            Some(&"cat.sch_a.Orders".to_string())
         );
         assert_eq!(
-            target_by_model.get("cat.sch.b"),
-            Some(&"cat.sch.b".to_string())
+            target_by_model.get("cat.sch_b.orders"),
+            Some(&"cat.sch_b.orders".to_string())
         );
 
         // Even though the wrong sibling recorded matching hashes, the consumed
         // read via the poisoned key resolves to no baseline.
         let mut built = std::collections::HashMap::new();
-        built.insert("cat.sch.a".to_string(), vec![ch("id", "h_id")]);
-        built.insert("cat.sch.b".to_string(), vec![ch("id", "h_id")]);
+        built.insert("cat.sch_a.Orders".to_string(), vec![ch("id", "h_id")]);
+        built.insert("cat.sch_b.orders".to_string(), vec![ch("id", "h_id")]);
 
         let sigs = compute_consumer_baseline("SELECT id FROM orders", &target_by_model, &built)
             .expect("consumed set is complete");
@@ -27017,6 +28052,623 @@ table = "fct_events"
         assert_eq!(
             clean_rows, flaky_rows,
             "the retried-then-succeeded build materializes byte-identical data"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Batched replication checks (#1602): a check the engine could not run
+    // must not read as a pass, and must not vanish from the tally.
+    // ---------------------------------------------------------------------
+
+    /// What an intercepted query answers with.
+    #[cfg(feature = "duckdb")]
+    enum Intercept {
+        /// The query fails with this message.
+        Fail(&'static str),
+        /// The query succeeds with exactly these rows.
+        Rows(Vec<Vec<serde_json::Value>>),
+    }
+
+    /// A DuckDB adapter that intercepts every query starting with `prefix`
+    /// and runs everything else for real.
+    #[cfg(feature = "duckdb")]
+    struct InterceptingDuckDb<'a> {
+        inner: &'a rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+        prefix: &'static str,
+        reply: Intercept,
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[async_trait::async_trait]
+    impl WarehouseAdapter for InterceptingDuckDb<'_> {
+        fn dialect(&self) -> &dyn rocky_core::traits::SqlDialect {
+            self.inner.dialect()
+        }
+
+        async fn execute_statement(&self, sql: &str) -> rocky_core::traits::AdapterResult<()> {
+            self.inner.execute_statement(sql).await
+        }
+
+        async fn execute_query(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::QueryResult> {
+            if sql.trim_start().starts_with(self.prefix) {
+                return match &self.reply {
+                    Intercept::Fail(msg) => Err(rocky_core::traits::AdapterError::msg(*msg)),
+                    Intercept::Rows(rows) => Ok(rocky_core::traits::QueryResult {
+                        columns: Vec::new(),
+                        rows: rows.clone(),
+                    }),
+                };
+            }
+            self.inner.execute_query(sql).await
+        }
+
+        async fn describe_table(
+            &self,
+            table: &TableRef,
+        ) -> rocky_core::traits::AdapterResult<Vec<ColumnInfo>> {
+            self.inner.describe_table(table).await
+        }
+    }
+
+    /// One copied table, `src.orders` -> `tgt.orders`, one row each.
+    #[cfg(feature = "duckdb")]
+    async fn seeded_duckdb() -> rocky_duckdb::adapter::DuckDbWarehouseAdapter {
+        let inner = rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.orders AS SELECT 1 AS id, TIMESTAMP '2026-01-01 00:00:00' AS ts",
+            "CREATE TABLE tgt.orders AS SELECT * FROM src.orders",
+        ] {
+            inner.execute_statement(sql).await.unwrap();
+        }
+        inner
+    }
+
+    /// The inputs `run()` hands to `run_batched_checks` for that one table.
+    #[cfg(feature = "duckdb")]
+    struct BatchedCheckFixture {
+        pipeline: ReplicationPipelineConfig,
+        source_refs: Vec<TableRef>,
+        target_refs: Vec<TableRef>,
+        freshness_refs: Vec<TableRef>,
+        asset_keys: Vec<(String, Vec<String>)>,
+        assertion_targets: Vec<(TableRef, Vec<String>)>,
+    }
+
+    #[cfg(feature = "duckdb")]
+    impl BatchedCheckFixture {
+        /// `checks_toml` is the body of `[pipeline.bronze.checks]`.
+        fn new(checks_toml: &str) -> Self {
+            let pipeline = parse_pipeline(&format!(
+                "strategy = \"full_refresh\"\ntimestamp_column = \"ts\"\n\n[pipeline.bronze.checks]\n{checks_toml}\n"
+            ));
+            let source = TableRef {
+                catalog: String::new(),
+                schema: "src".into(),
+                table: "orders".into(),
+            };
+            let target = TableRef {
+                catalog: String::new(),
+                schema: "tgt".into(),
+                table: "orders".into(),
+            };
+            let asset_key = vec!["test".to_string(), "orders".to_string()];
+            Self {
+                pipeline,
+                source_refs: vec![source],
+                target_refs: vec![target.clone()],
+                freshness_refs: vec![target.clone()],
+                asset_keys: vec![(target.full_name(), asset_key.clone())],
+                assertion_targets: vec![(target, asset_key)],
+            }
+        }
+
+        fn target_key(&self) -> String {
+            self.target_refs[0].full_name()
+        }
+
+        async fn run(
+            &self,
+            warehouse: &dyn WarehouseAdapter,
+            batch_check: Option<&dyn BatchCheckAdapter>,
+            state_store: Option<&StateStore>,
+        ) -> (HashMap<String, PendingCheck>, Vec<AnomalyOutput>) {
+            let mut pending = HashMap::new();
+            let mut anomalies = Vec::new();
+            run_batched_checks(
+                warehouse,
+                batch_check,
+                state_store,
+                &HookRegistry::empty(),
+                "run-1",
+                "bronze",
+                &self.pipeline,
+                &self.source_refs,
+                &self.target_refs,
+                &self.freshness_refs,
+                &self.asset_keys,
+                &self.assertion_targets,
+                &mut pending,
+                &mut anomalies,
+            )
+            .await
+            .expect("the batched checks run");
+            (pending, anomalies)
+        }
+    }
+
+    /// The results recorded for the fixture's one target, by check name.
+    #[cfg(feature = "duckdb")]
+    fn results_named<'a>(
+        pending: &'a HashMap<String, PendingCheck>,
+        target_key: &str,
+        name: &str,
+    ) -> Vec<&'a rocky_core::checks::CheckResult> {
+        pending
+            .get(target_key)
+            .map(|p| p.checks.iter().filter(|c| c.name == name).collect())
+            .unwrap_or_default()
+    }
+
+    #[cfg(feature = "duckdb")]
+    fn the_result<'a>(
+        pending: &'a HashMap<String, PendingCheck>,
+        target_key: &str,
+        name: &str,
+    ) -> &'a rocky_core::checks::CheckResult {
+        let found = results_named(pending, target_key, name);
+        assert_eq!(
+            found.len(),
+            1,
+            "expected exactly one `{name}` result for {target_key}, got {found:?}"
+        );
+        found[0]
+    }
+
+    /// #1602: a side whose query failed defaulted to zero. When both sides
+    /// fail, `0 == 0` reported a PASS for a check that never ran.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_row_count_check_whose_queries_both_fail_does_not_pass() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new("row_count = true");
+
+        // Control: with a working warehouse the check is a real measurement.
+        let (pending, _) = fx.run(&inner, None, None).await;
+        let measured = the_result(&pending, &fx.target_key(), "row_count");
+        assert!(measured.passed, "one row on each side passes: {measured:?}");
+        assert!(measured.not_evaluated.is_none());
+
+        // Every COUNT(*) fails: the warehouse is unreachable at check time.
+        let failing = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT COUNT(*)",
+            reply: Intercept::Fail("injected COUNT failure"),
+        };
+        let (pending, _) = fx.run(&failing, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), "row_count");
+        assert!(
+            !result.passed,
+            "a row-count check whose queries failed must not pass: {result:?}"
+        );
+        assert_eq!(
+            result.not_evaluated.as_deref(),
+            Some(
+                "source: the row count query failed: injected COUNT failure; \
+                 target: the row count query failed: injected COUNT failure"
+            ),
+            "{result:?}"
+        );
+        assert!(
+            matches!(
+                result.details,
+                rocky_core::checks::CheckDetails::RowCount {
+                    source_count: 0,
+                    target_count: 0
+                }
+            ),
+            "the counts are placeholders, not measurements: {result:?}"
+        );
+    }
+
+    /// #1602, the shape the issue warns about: the copy moved nothing, and
+    /// the source that would have shown it cannot be read. A defaulted zero
+    /// matched the empty target and the check passed.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_row_count_check_with_an_unreadable_source_and_an_empty_target_does_not_pass() {
+        let inner = seeded_duckdb().await;
+        inner
+            .execute_statement("DELETE FROM tgt.orders")
+            .await
+            .unwrap();
+        let fx = BatchedCheckFixture::new("row_count = true");
+
+        let failing = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT COUNT(*) FROM src.orders",
+            reply: Intercept::Fail("injected source COUNT failure"),
+        };
+        let (pending, _) = fx.run(&failing, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), "row_count");
+        assert!(
+            !result.passed,
+            "an unreadable source must not match an empty target: {result:?}"
+        );
+        // Only the side that failed is named; the target was measured.
+        assert_eq!(
+            result.not_evaluated.as_deref(),
+            Some("source: the row count query failed: injected source COUNT failure"),
+            "{result:?}"
+        );
+    }
+
+    /// A COUNT(*) that returns a cell the parser cannot read is not a zero.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_row_count_cell_that_does_not_parse_is_not_evaluated() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new("row_count = true");
+
+        let unreadable = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT COUNT(*) FROM tgt.orders",
+            reply: Intercept::Rows(vec![vec![serde_json::json!("not-a-number")]]),
+        };
+        let (pending, _) = fx.run(&unreadable, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), "row_count");
+        assert!(!result.passed, "{result:?}");
+        assert_eq!(
+            result.not_evaluated.as_deref(),
+            Some("target: the row count query returned no readable count"),
+            "{result:?}"
+        );
+    }
+
+    /// A `BatchCheckAdapter` that answers without a row for the table.
+    #[cfg(feature = "duckdb")]
+    struct EmptyBatchCheck;
+
+    #[cfg(feature = "duckdb")]
+    #[async_trait::async_trait]
+    impl BatchCheckAdapter for EmptyBatchCheck {
+        async fn batch_row_counts(
+            &self,
+            _tables: &[TableRef],
+        ) -> rocky_core::traits::AdapterResult<Vec<BatchRowCountResult>> {
+            Ok(Vec::new())
+        }
+
+        async fn batch_freshness(
+            &self,
+            _tables: &[TableRef],
+            _timestamp_col: &str,
+        ) -> rocky_core::traits::AdapterResult<Vec<BatchFreshnessResult>> {
+            Ok(Vec::new())
+        }
+
+        async fn batch_describe_schema(
+            &self,
+            _catalog: &str,
+            _schema: &str,
+        ) -> rocky_core::traits::AdapterResult<HashMap<String, Vec<ColumnInfo>>> {
+            Ok(HashMap::new())
+        }
+    }
+
+    /// The batch path has no per-table error: a table the UNION ALL query
+    /// left out is simply absent, and used to default to zero on both sides.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_table_the_batch_row_count_left_out_is_not_evaluated() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new("row_count = true");
+
+        let (pending, _) = fx.run(&inner, Some(&EmptyBatchCheck), None).await;
+        let result = the_result(&pending, &fx.target_key(), "row_count");
+        assert!(!result.passed, "{result:?}");
+        assert_eq!(
+            result.not_evaluated.as_deref(),
+            Some(
+                "source: the batch row count query returned no result for this table; \
+                 target: the batch row count query returned no result for this table"
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// The anomaly baseline is built from the target counts. A failed target
+    /// query used to record a 0 there, which read as "the table emptied" on
+    /// every later run.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_failed_target_count_records_no_anomaly_history() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new("row_count = true");
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+
+        // Control: a measured count is recorded.
+        fx.run(&inner, None, Some(&store)).await;
+        let history = store.get_check_history(&fx.target_key()).unwrap();
+        assert_eq!(history.len(), 1, "a measurement enters the history");
+        assert_eq!(history[0].row_count, 1);
+
+        let failing = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT COUNT(*) FROM tgt.orders",
+            reply: Intercept::Fail("injected target COUNT failure"),
+        };
+        fx.run(&failing, None, Some(&store)).await;
+        let history = store.get_check_history(&fx.target_key()).unwrap();
+        assert_eq!(
+            history.len(),
+            1,
+            "a failed count must not enter the history as a 0: {history:?}"
+        );
+    }
+
+    /// A freshness query that fails used to be logged and dropped. It is
+    /// reported as not evaluated, at the configured severity.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_freshness_check_whose_query_fails_is_not_evaluated() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.freshness]\nthreshold_seconds = 3600\nseverity = \"warning\"",
+        );
+
+        let failing = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT MAX(",
+            reply: Intercept::Fail("injected MAX failure"),
+        };
+        let (pending, _) = fx.run(&failing, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), "freshness");
+        assert!(!result.passed, "{result:?}");
+        assert_eq!(
+            result.not_evaluated.as_deref(),
+            Some("the freshness query failed: injected MAX failure"),
+            "{result:?}"
+        );
+        assert_eq!(result.severity, rocky_core::tests::TestSeverity::Warning);
+        assert!(
+            matches!(
+                result.details,
+                rocky_core::checks::CheckDetails::Freshness {
+                    lag_seconds: 0,
+                    threshold_seconds: 3600
+                }
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// A `MAX(timestamp_column)` cell that is not a timestamp — a DATE or a
+    /// numeric column, say — used to emit no check at all.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_freshness_cell_that_is_not_a_timestamp_is_not_evaluated() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.freshness]\nthreshold_seconds = 3600",
+        );
+
+        let unreadable = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT MAX(",
+            reply: Intercept::Rows(vec![vec![serde_json::json!("yesterday")]]),
+        };
+        let (pending, _) = fx.run(&unreadable, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), "freshness");
+        assert!(!result.passed, "{result:?}");
+        assert_eq!(
+            result.not_evaluated.as_deref(),
+            Some("could not read \"yesterday\" as a timestamp"),
+            "{result:?}"
+        );
+    }
+
+    /// Pinned, not changed: `MAX()` over an empty table is NULL, there is no
+    /// row to be fresh, and no freshness check is emitted. A measured table
+    /// still gets its measurement.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn an_empty_table_still_emits_no_freshness_check() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.freshness]\nthreshold_seconds = 3600",
+        );
+
+        let (pending, _) = fx.run(&inner, None, None).await;
+        let measured = the_result(&pending, &fx.target_key(), "freshness");
+        assert!(measured.not_evaluated.is_none(), "{measured:?}");
+
+        inner
+            .execute_statement("DELETE FROM tgt.orders")
+            .await
+            .unwrap();
+        let (pending, _) = fx.run(&inner, None, None).await;
+        assert!(
+            results_named(&pending, &fx.target_key(), "freshness").is_empty(),
+            "an empty table has no freshness to measure: {pending:?}",
+            pending = pending.get(&fx.target_key()).map(|p| &p.checks)
+        );
+    }
+
+    /// A null-rate query that fails used to skip the table. Every configured
+    /// column is reported as not evaluated instead, at the configured
+    /// severity.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_null_rate_query_that_fails_reports_every_column_not_evaluated() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.null_rate]\ncolumns = [\"id\", \"ts\"]\nthreshold = 0.5\nseverity = \"warning\"",
+        );
+
+        // Control: both columns are measured.
+        let (pending, _) = fx.run(&inner, None, None).await;
+        for name in ["null_rate:id", "null_rate:ts"] {
+            let measured = the_result(&pending, &fx.target_key(), name);
+            assert!(
+                measured.passed && measured.not_evaluated.is_none(),
+                "{measured:?}"
+            );
+        }
+
+        let failing = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT 'id' AS col",
+            reply: Intercept::Fail("injected null-rate failure"),
+        };
+        let (pending, _) = fx.run(&failing, None, None).await;
+        for name in ["null_rate:id", "null_rate:ts"] {
+            let result = the_result(&pending, &fx.target_key(), name);
+            assert!(!result.passed, "{result:?}");
+            assert_eq!(
+                result.not_evaluated.as_deref(),
+                Some("the null-rate query failed: injected null-rate failure"),
+                "{result:?}"
+            );
+            assert_eq!(result.severity, rocky_core::tests::TestSeverity::Warning);
+        }
+    }
+
+    /// The batch path reports an omitted freshness result too. Reading only
+    /// the returned entries would drop the table silently, and the batch path
+    /// records no per-table reason to notice it by.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_table_the_batch_freshness_left_out_is_not_evaluated() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.freshness]\nthreshold_seconds = 3600",
+        );
+
+        let (pending, _) = fx.run(&inner, Some(&EmptyBatchCheck), None).await;
+        let result = the_result(&pending, &fx.target_key(), "freshness");
+        assert!(!result.passed, "{result:?}");
+        assert_eq!(
+            result.not_evaluated.as_deref(),
+            Some("the batch freshness query returned no result for this table"),
+            "{result:?}"
+        );
+    }
+
+    /// A row whose counts do not parse used to be skipped, leaving that column
+    /// out of the tally. The other columns keep their measurements.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_null_rate_row_that_does_not_parse_is_not_evaluated_for_that_column_only() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.null_rate]\ncolumns = [\"id\", \"ts\"]\nthreshold = 0.5",
+        );
+
+        let partial = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT 'id' AS col",
+            reply: Intercept::Rows(vec![
+                vec![
+                    serde_json::json!("id"),
+                    serde_json::json!("0"),
+                    serde_json::json!("1"),
+                ],
+                vec![
+                    serde_json::json!("ts"),
+                    serde_json::json!("many"),
+                    serde_json::json!("1"),
+                ],
+            ]),
+        };
+        let (pending, _) = fx.run(&partial, None, None).await;
+        let id = the_result(&pending, &fx.target_key(), "null_rate:id");
+        assert!(id.passed && id.not_evaluated.is_none(), "{id:?}");
+        let ts = the_result(&pending, &fx.target_key(), "null_rate:ts");
+        assert!(!ts.passed, "{ts:?}");
+        assert_eq!(
+            ts.not_evaluated.as_deref(),
+            Some("the null-rate query returned no readable row for this column"),
+            "{ts:?}"
+        );
+    }
+
+    /// An empty sample is not an unevaluatable check. `SUM(...)` over zero
+    /// sampled rows is NULL, and the default `sample_percent` is 10, so a
+    /// small table hits this on an ordinary run. It must stay a measured
+    /// zero, or #1602's honesty fix would report a failing check for every
+    /// small table.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn an_empty_null_rate_sample_is_measured_not_reported() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.null_rate]\ncolumns = [\"id\"]\nthreshold = 0.5",
+        );
+
+        let empty_sample = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT 'id' AS col",
+            reply: Intercept::Rows(vec![vec![
+                serde_json::json!("id"),
+                // What the warehouse really returns for SUM() over no rows.
+                serde_json::json!(null),
+                serde_json::json!("0"),
+            ]]),
+        };
+        let (pending, _) = fx.run(&empty_sample, None, None).await;
+        let id = the_result(&pending, &fx.target_key(), "null_rate:id");
+        assert!(
+            id.passed && id.not_evaluated.is_none(),
+            "an empty sample is a measured zero: {id:?}"
+        );
+    }
+
+    /// A target whose reference cannot be formatted used to have its
+    /// assertions and custom checks skipped without a trace. Each is reported
+    /// as not evaluated instead.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn assertions_and_custom_checks_on_an_unaddressable_table_are_not_evaluated() {
+        let inner = seeded_duckdb().await;
+        let mut fx = BatchedCheckFixture::new(
+            "[[pipeline.bronze.checks.assertions]]\ntable = \"bad-name\"\ntype = \"not_null\"\ncolumn = \"id\"\nseverity = \"warning\"\n\n\
+             [[pipeline.bronze.checks.custom]]\nname = \"no_dupes\"\nsql = \"SELECT 0 FROM {table}\"\nthreshold = 0",
+        );
+        // A hyphen fails identifier validation, so the dialect cannot address
+        // the table at all.
+        let bad = TableRef {
+            catalog: String::new(),
+            schema: "tgt".into(),
+            table: "bad-name".into(),
+        };
+        let key = bad.full_name();
+        fx.assertion_targets = vec![(bad, vec!["test".into(), "bad-name".into()])];
+
+        let (pending, _) = fx.run(&inner, None, None).await;
+        let assertion = the_result(&pending, &key, "not_null:id");
+        assert!(!assertion.passed, "{assertion:?}");
+        assert!(
+            assertion
+                .not_evaluated
+                .as_deref()
+                .is_some_and(|r| r.starts_with("could not address the table: ")),
+            "{assertion:?}"
+        );
+        assert_eq!(assertion.severity, rocky_core::tests::TestSeverity::Warning);
+        let custom = the_result(&pending, &key, "no_dupes");
+        assert!(!custom.passed, "{custom:?}");
+        assert!(
+            custom
+                .not_evaluated
+                .as_deref()
+                .is_some_and(|r| r.starts_with("could not address the table: ")),
+            "{custom:?}"
         );
     }
 }

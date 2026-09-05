@@ -180,19 +180,19 @@ impl ServerState {
         // CLI compile path. Without a config_path (or on a parse error) both
         // come through empty and the checks stay silent — matching standalone
         // `rocky compile --models models/`.
-        let (mask, allow_unmasked, project_freshness_default) = match &self.config_path {
+        let (mask, allow_unmasked, project_freshness) = match &self.config_path {
             Some(path) => match rocky_core::config::load_rocky_config(path) {
                 Ok(cfg) => (
                     cfg.mask.clone(),
                     cfg.classifications.allow_unmasked.clone(),
-                    cfg.freshness.has_default(),
+                    cfg.freshness.clone(),
                 ),
                 Err(e) => {
                     debug!(error = %e, "rocky.toml load failed; W004/W005 will be silent");
-                    (Default::default(), Vec::new(), false)
+                    (Default::default(), Vec::new(), Default::default())
                 }
             },
-            None => (Default::default(), Vec::new(), false),
+            None => (Default::default(), Vec::new(), Default::default()),
         };
 
         let config = CompilerConfig {
@@ -201,7 +201,7 @@ impl ServerState {
             source_schemas,
             mask,
             allow_unmasked,
-            project_freshness_default,
+            project_freshness,
             run_vars: rocky_core::run_vars::RunVars::new(),
         };
 

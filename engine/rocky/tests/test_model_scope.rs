@@ -222,6 +222,70 @@ fn a_known_model_is_not_refused() {
 // `rocky estimate` / `rocky retention-status` — same selector contract
 // ---------------------------------------------------------------------------
 
+/// #1617: `rocky test --output json` carries the compile's non-error
+/// diagnostics.
+///
+/// Errors already fail the command, so what this proves is that everything
+/// which does NOT fail still reaches the caller. `rocky test` compiles with
+/// empty source schemas, so a contract whose column type cannot be resolved
+/// reports `I003` — the declared type was accepted without being compared —
+/// and that used to be dropped on the floor. It is the command most likely
+/// to run in CI, which is where a silent "unchecked" reads as "clean".
+#[test]
+fn test_json_carries_the_compiles_non_error_diagnostics() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let models = scaffold(root);
+    // Reads a source the compile cannot resolve, so `id`'s type is Unknown.
+    fs::write(models.join("m.sql"), "SELECT id FROM raw.orders\n").expect("write model sql");
+    fs::write(
+        models.join("m.toml"),
+        "name = \"m\"\ndepends_on = []\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+         [target]\ncatalog = \"test\"\nschema = \"main\"\ntable = \"m\"\n",
+    )
+    .expect("write model sidecar");
+    // The contract declares a type for that column, which is what makes the
+    // compiler report that it could not check it.
+    fs::write(
+        models.join("m.contract.toml"),
+        "[[columns]]\nname = \"id\"\ntype = \"Int64\"\n",
+    )
+    .expect("write contract");
+
+    let output = test_cmd(root, &models, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout is not JSON ({e}):\n{stdout}"));
+
+    let diagnostics = parsed
+        .get("diagnostics")
+        .and_then(|d| d.as_array())
+        .unwrap_or_else(|| panic!("no `diagnostics` array in the output:\n{stdout}"));
+    let codes: Vec<&str> = diagnostics
+        .iter()
+        .filter_map(|d| d.get("code").and_then(|c| c.as_str()))
+        .collect();
+    assert!(
+        codes.contains(&"I003"),
+        "the unchecked-contract report must reach the caller; got {codes:?} in:\n{stdout}"
+    );
+    // And it is carried as the non-error it is. Severity is the point: an
+    // error would already have failed the command, so what this proves is
+    // that the codes which do NOT fail still reach the caller. (The command
+    // itself does fail here, on the model execution — `raw.orders` does not
+    // exist — which is unrelated to the diagnostic and not what is asserted.)
+    let severities: Vec<&str> = diagnostics
+        .iter()
+        .filter(|d| d.get("code").and_then(|c| c.as_str()) == Some("I003"))
+        .filter_map(|d| d.get("severity").and_then(|s| s.as_str()))
+        .collect();
+    assert_eq!(
+        severities,
+        vec!["Info"],
+        "the report must arrive as a non-error:\n{stdout}"
+    );
+}
+
 fn cmd(root: &std::path::Path, models: &std::path::Path, verb: &str, args: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_rocky"));
     command

@@ -519,7 +519,7 @@ pub fn generate_insert_sql(
                     .get(i)
                     .map(|c| c.data_type.as_str())
                     .unwrap_or("STRING");
-                format_value(trimmed, col_type)
+                format_value(trimmed, col_type, dialect)
             })
             .collect();
 
@@ -553,9 +553,9 @@ pub fn generate_insert_sql(
 
 /// Format a cell value for a SQL VALUES clause.
 ///
-/// Numeric and boolean types are emitted bare; everything else is
-/// single-quoted with internal quotes escaped.
-fn format_value(value: &str, col_type: &str) -> String {
+/// Numeric and boolean types are emitted bare; everything else is a
+/// single-quoted string literal encoded by `dialect`'s own lexer rule.
+fn format_value(value: &str, col_type: &str, dialect: &dyn SqlDialect) -> String {
     let upper = col_type.to_uppercase();
     if upper == "BIGINT"
         || upper == "INTEGER"
@@ -575,8 +575,8 @@ fn format_value(value: &str, col_type: &str) -> String {
             return lower;
         }
     }
-    // Default: single-quoted string with escaped quotes.
-    format!("'{}'", value.replace('\'', "''"))
+    // Default: a string literal encoded by the dialect's own lexer rule.
+    crate::sql_gen::string_literal(dialect, value)
 }
 
 // ---------------------------------------------------------------------------
@@ -869,6 +869,10 @@ post_hook = ["ANALYZE main.seeds.dim_date"]
     struct TestDialect;
 
     impl SqlDialect for TestDialect {
+        fn literal_escape(&self) -> crate::traits::LiteralEscape {
+            crate::traits::LiteralEscape::Standard
+        }
+
         fn format_table_ref(
             &self,
             catalog: &str,
@@ -1053,26 +1057,53 @@ post_hook = ["ANALYZE main.seeds.dim_date"]
 
     #[test]
     fn format_value_numerics_bare() {
-        assert_eq!(format_value("42", "BIGINT"), "42");
-        assert_eq!(format_value("3.14", "DOUBLE"), "3.14");
-        assert_eq!(format_value("-1", "INTEGER"), "-1");
+        assert_eq!(format_value("42", "BIGINT", &TestDialect), "42");
+        assert_eq!(format_value("3.14", "DOUBLE", &TestDialect), "3.14");
+        assert_eq!(format_value("-1", "INTEGER", &TestDialect), "-1");
     }
 
     #[test]
     fn format_value_boolean() {
-        assert_eq!(format_value("true", "BOOLEAN"), "true");
-        assert_eq!(format_value("False", "BOOLEAN"), "false");
+        assert_eq!(format_value("true", "BOOLEAN", &TestDialect), "true");
+        assert_eq!(format_value("False", "BOOLEAN", &TestDialect), "false");
     }
 
     #[test]
     fn format_value_string_escaping() {
-        assert_eq!(format_value("hello", "STRING"), "'hello'");
-        assert_eq!(format_value("it's", "STRING"), "'it''s'");
+        assert_eq!(format_value("hello", "STRING", &TestDialect), "'hello'");
+        assert_eq!(format_value("it's", "STRING", &TestDialect), "'it''s'");
+    }
+
+    /// A seed cell holding a backslash or a quote is encoded by the
+    /// dialect's own lexer rule (issue #1596): verbatim backslash and doubled
+    /// quote under `Standard` (DuckDB, Trino); doubled backslash
+    /// and `\'` under `Backslash`.
+    #[test]
+    fn format_value_encodes_a_backslash_and_a_quote_per_dialect() {
+        use crate::traits::LiteralEscape;
+        use crate::traits::test_dialects::StubDialect;
+
+        assert_eq!(
+            format_value(r"C:\tmp\", "STRING", &StubDialect(LiteralEscape::Standard)),
+            r"'C:\tmp\'"
+        );
+        assert_eq!(
+            format_value("it's", "STRING", &StubDialect(LiteralEscape::Standard)),
+            "'it''s'"
+        );
+        assert_eq!(
+            format_value(r"C:\tmp\", "STRING", &StubDialect(LiteralEscape::Backslash)),
+            r"'C:\\tmp\\'"
+        );
+        assert_eq!(
+            format_value("it's", "STRING", &StubDialect(LiteralEscape::Backslash)),
+            r"'it\'s'"
+        );
     }
 
     #[test]
     fn format_value_non_numeric_in_numeric_col_is_quoted() {
         // If a "numeric" column has a non-parseable value, quote it safely.
-        assert_eq!(format_value("abc", "BIGINT"), "'abc'");
+        assert_eq!(format_value("abc", "BIGINT", &TestDialect), "'abc'");
     }
 }

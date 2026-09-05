@@ -556,63 +556,34 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   every one of them refuses as a scope mismatch rather than resuming:
 ///
 ///   ```text
-///     build                       forward-deserializes as   verdict
-///     flat `target_routing`       target: None              refuse
-///     structured, raw separator   separator_role: None      refuse
-///     structured, no separator    separator_role: None      refuse
-///     this build                  separator_role: Some(..)  compare
+///     build                       forward-deserializes as     verdict
+///     flat `target_routing`       target: None                refuse
+///     structured, raw separator   separator_role: None        refuse
+///     structured, no separator    separator_role: None        refuse
+///     verbatim schema_template    schema_template: Some(..)   compare
+///     this build                  separator_role: Some(..)    compare
 ///   ```
 ///
 ///   The raw-separator build wrote a bare string under the `separator` key;
 ///   this build neither reads nor writes that key, and serde ignores it, so
 ///   an old blob still deserializes (a hard parse error there would break
 ///   `--resume-latest` for every scope, since one scan reads every header).
-///   Guarded by `test_pre_release_v23_scope_forward_deserializes_target_none`
-///   and `test_pre_release_v23_unclassified_separators_never_match`. No
-///   released build wrote any of them, so the version stays at 23.
 ///
-///   **Fulfillment observation.** Adds the fulfillment loop's post-apply
-///   data-check surface: the
-///   [`crate::fulfill::FulfillState::ObservedFailing`] state, the
-///   [`crate::fulfill::DraftingRound::DataRepair`] round, and two
-///   serde-additive [`crate::fulfill::FulfillStateRecord`] fields
-///   (`data_repair_rounds`, `observation_detail`). A v22 blob (which lacks
-///   the fields) forward-deserializes with the counter 0 and the detail
-///   `None`, guarded by
-///   `fulfill::tests::the_f3_observation_fields_read_across_the_version_that_added_them`.
-///
-///   **Why this half of the bump is load-bearing rather than bookkeeping:**
-///   the two fields are additive, but `observed_failing` is a NEW VARIANT of
-///   a `#[serde(tag = "state")]` enum. An added field forward-defaults; an
-///   unknown variant is a hard read failure. So unlike the resume-scope
-///   half, a v23 `fulfill_state` blob does NOT back-read on a v22 binary. A
-///   v22 binary opening a v23 store must therefore never reach that blob —
-///   and it does not, because the version check runs at OPEN and `[state]
-///   on_schema_mismatch` engages there ([`SchemaMismatchPolicy::Fail`]
-///   refuses with the version pair; [`SchemaMismatchPolicy::Recreate`]
-///   bootstraps a fresh store).
-///
-///   **What losing the record does and does not cost — stated carefully,
-///   because an earlier version of this note overclaimed.** `fulfill_state`
-///   is in [`LOCAL_ONLY_TABLE_NAMES`], so the record is per-machine loop
-///   state rather than shared history, and a re-run rebuilds the LOOP's
-///   position. It does not follow that the loss is free. The loop derives
-///   its proposal nonce from `journal_seq`, and a plan id is a hash of the
-///   plan payload, so a recreated state that reaches the same journal
-///   position can mint the same plan id — while `.rocky/plans/<id>.reviewed.json`
-///   sits outside this store and survives. A surviving marker would then
-///   approve a freshly-minted proposal. That is a pre-existing custody
-///   property, not something this bump introduces, but the bump is where
-///   the "losing it is fine" claim is written down, so it is corrected
-///   here rather than repeated. Tracked as
-///   [#1525](https://github.com/rocky-data/rocky/issues/1525); do not
-///   rely on state loss being harmless.
-///
-///   The variant's read behaviour under an
-///   older vocabulary is pinned by
-///   `fulfill::tests::the_data_red_state_round_trips_and_is_a_hard_error_on_an_older_reader`,
-///   so "the version gate is what protects the downgrade" stays true by
-///   test rather than by comment.
+///   The fourth row is #1592: earlier builds recorded `schema_template` as a
+///   bare string on every path, including under a schema override that
+///   bypasses it. `Option<String>` still reads that string as `Some(..)`, so
+///   the header deserializes and the scan keeps working. It then compares:
+///   equal for a run with no override (the shape is unchanged there), and a
+///   scope mismatch for one with an override, which this build records as
+///   `None` — a loud refusal, never a resume of routing it cannot check.
+///   Guarded by `test_pre_release_v23_scope_forward_deserializes_target_none`,
+///   `test_pre_release_v23_unclassified_separators_never_match` and
+///   `test_pre_release_v23_verbatim_schema_template_deserializes`. No
+///   release wrote any of those incompatible pre-release shapes, so the
+///   version stays at 23; engine 1.73.0 is the first release to write this
+///   shape. The reverse direction — an older *unreleased* binary reading a
+///   `null` `schema_template` — fails to parse, and that is acceptable only
+///   because no release before 1.73.0 had this field at all.
 const CURRENT_SCHEMA_VERSION: u32 = 23;
 
 /// Errors from the embedded redb state store.
@@ -915,9 +886,9 @@ impl StateStore {
     /// flag so the caller can suppress writing the downgraded state back to a
     /// shared tier.
     ///
-    /// Only the `rocky run` path threads a non-default policy here (from
-    /// `[state] on_schema_mismatch`); every other caller uses the hard-fail
-    /// default via [`open`][Self::open].
+    /// Only the `rocky run` and `rocky load` paths thread a non-default policy
+    /// here (from `[state] on_schema_mismatch`); every other caller uses the
+    /// hard-fail default via [`open`][Self::open].
     pub fn open_with_policy(path: &Path, policy: SchemaMismatchPolicy) -> Result<Self, StateError> {
         Self::open_inner(path, OpenMode::ReadWrite, policy, None)
     }
@@ -2423,10 +2394,27 @@ pub struct ResumeScope {
 pub struct ResumeTarget {
     /// The target adapter name (a config alias).
     pub adapter: String,
-    /// The target catalog template, verbatim.
+    /// The target catalog template, verbatim. Always recorded: a
+    /// `--shadow-schema` / `--branch` override does not replace it, so the
+    /// resolver renders it on every path.
     pub catalog_template: String,
-    /// The target schema template, verbatim.
-    pub schema_template: String,
+    /// The target schema template, verbatim — recorded only when this run
+    /// renders it (#1592).
+    ///
+    /// `None` under a `--shadow --shadow-schema` or `--branch` override:
+    /// the override supplies the schema name outright, the resolver never
+    /// reads the template, and no character of it reaches a physical name.
+    /// Recording it then refused a resume over an edit that moved nothing —
+    /// the same argument #1586 applied to the separator.
+    ///
+    /// Eliding a field from a scope is fail-open unless the physical value
+    /// it would have produced is pinned elsewhere. Here it is: `None`
+    /// occurs only alongside [`ResumeShadow::Schema`], which records the
+    /// override string itself, and every table this run checkpoints is keyed
+    /// `catalog.<that schema>.table`. So two scopes that differ only here
+    /// really do write the same objects.
+    #[serde(default)]
+    pub schema_template: Option<String>,
     /// What the separator did to the templates above — see
     /// [`ResumeSeparator`]. `[target] separator` when set, else the source
     /// pattern's.
@@ -2513,11 +2501,12 @@ impl std::fmt::Display for ResumeScope {
 
 impl std::fmt::Display for ResumeTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}:{}.{} ",
-            self.adapter, self.catalog_template, self.schema_template
-        )?;
+        write!(f, "{}:{}.", self.adapter, self.catalog_template)?;
+        match &self.schema_template {
+            Some(template) => write!(f, "{template} ")?,
+            // The `shadow(schema=…)` clause below names what replaced it.
+            None => write!(f, "<overridden> ")?,
+        }
         match &self.separator_role {
             Some(ResumeSeparator::Joins(separator)) => write!(f, "separator({separator}) ")?,
             Some(ResumeSeparator::Unused) => write!(f, "separator unused ")?,
@@ -8454,7 +8443,8 @@ mod tests {
             target: Some(ResumeTarget {
                 adapter: "default".to_string(),
                 catalog_template: "wh".to_string(),
-                schema_template: format!("staging_{pipeline}__{{source}}"),
+                // `shadow: None`, so the run renders the template (#1592).
+                schema_template: Some(format!("staging_{pipeline}__{{source}}")),
                 separator_role: Some(ResumeSeparator::Joins("__".to_string())),
                 endpoint: crate::config::EndpointIdentity {
                     adapter_type: "duckdb".to_string(),
@@ -8684,6 +8674,91 @@ mod tests {
                 "{run_id} is never a --resume-latest candidate"
             );
         }
+    }
+
+    /// Earlier unreleased builds recorded `schema_template` as a bare
+    /// string on every path, including under a schema override that never
+    /// renders it (#1592). Such a header must still deserialize: one scan
+    /// reads every header in the store, so a hard parse error here would
+    /// break `--resume-latest` for every scope, not just this one.
+    ///
+    /// It then compares. A run with no override records the same string,
+    /// so its checkpoint still resumes. A run with an override records
+    /// `None` now, so the old header is a scope mismatch — a loud refusal,
+    /// which is the safe verdict for routing this build cannot check.
+    #[test]
+    fn test_pre_release_v23_verbatim_schema_template_deserializes() {
+        let (store, _dir) = temp_store();
+        let live = progress_scope("p1");
+        let verbatim = live
+            .target
+            .as_ref()
+            .unwrap()
+            .schema_template
+            .clone()
+            .expect("the live scope records a rendered template");
+
+        let mut blob = serde_json::to_value(&live).unwrap();
+        blob["target"]["schema_template"] = serde_json::json!(verbatim);
+        assert!(
+            blob["target"]["schema_template"].is_string(),
+            "the old spelling is a bare string, not null"
+        );
+        let header = serde_json::json!({
+            "run_id": "run-verbatim",
+            "started_at": "2026-08-30T00:00:00Z",
+            "total_tables": 1,
+            "tables": [],
+            "scope": blob,
+        });
+        let bytes = serde_json::to_vec(&header).unwrap();
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(RUN_PROGRESS).unwrap();
+                table.insert("run-verbatim", bytes.as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let progress = store.get_run_progress("run-verbatim").unwrap().unwrap();
+        let recorded = progress.scope.expect("the older target still deserializes");
+        assert_eq!(
+            recorded.target.as_ref().unwrap().schema_template,
+            Some(verbatim),
+            "a bare string reads back as Some(..)"
+        );
+        assert_eq!(recorded, live, "a run with no override still matches");
+        assert_eq!(
+            store
+                .get_latest_run_progress_for_scope(&live)
+                .unwrap()
+                .expect("the header is a candidate")
+                .run_id,
+            "run-verbatim"
+        );
+
+        // The same header against a run that DOES override the schema: this
+        // build records no template there, so the shapes differ and the
+        // resume refuses instead of trusting it.
+        let mut overridden = live.clone();
+        {
+            let target = overridden.target.as_mut().unwrap();
+            target.schema_template = None;
+            target.shadow = Some(ResumeShadow::Schema("branch__feature".to_string()));
+        }
+        assert_ne!(recorded, overridden);
+        assert!(
+            store
+                .get_latest_run_progress_for_scope(&overridden)
+                .unwrap()
+                .is_none(),
+            "a verbatim-template header is never selected for an overriding run"
+        );
+        assert!(
+            overridden.to_string().contains("wh.<overridden>"),
+            "the message must say the template was replaced: {overridden}"
+        );
     }
 
     /// The classified separator is the compared value, and `Unused` is a

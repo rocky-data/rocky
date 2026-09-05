@@ -3213,11 +3213,95 @@ mod tests {
                     && diagnostic.message.contains("avg_quantity")),
             "known Float64 AVG should reject a Decimal contract: {diagnostics:?}"
         );
+        // This assertion used to be "no diagnostic mentions avg_amount at
+        // all", which was satisfied by the #1240 fail-open: the column was not
+        // checked and nobody was told. The claim being protected is narrower —
+        // no *false mismatch* — so it is now scoped to E011, and paired with a
+        // positive check that the withheld type is reported at info severity.
         assert!(
             diagnostics
                 .iter()
-                .all(|diagnostic| !diagnostic.message.contains("avg_amount")),
+                .all(|diagnostic| &*diagnostic.code != "E011"
+                    || !diagnostic.message.contains("avg_amount")),
             "dialect-dependent Decimal AVG should not produce a false mismatch: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| &*diagnostic.code == "I003"
+                    && diagnostic.message.contains("avg_amount")),
+            "the unchecked Decimal AVG contract type must be reported: {diagnostics:?}"
+        );
+    }
+
+    /// The #1240 case end to end: `AVG` over a `DECIMAL` input infers
+    /// `Unknown`, so a contract that declares `Boolean` for it cannot be
+    /// checked. That must not fail the build — and must not be silent either.
+    #[test]
+    fn test_avg_over_decimal_reports_an_unchecked_contract_type() {
+        let models = vec![make_model(
+            "averages",
+            "SELECT AVG(amount) AS avg_amount FROM source.raw.orders",
+        )];
+        let project = Project::from_models(models).unwrap();
+
+        let mut external = HashMap::new();
+        external.insert(
+            "source.raw.orders".to_string(),
+            vec![rocky_ir::ColumnInfo {
+                name: "amount".to_string(),
+                data_type: "DECIMAL(10,2)".to_string(),
+                nullable: false,
+            }],
+        );
+        let graph = build_semantic_graph(&project, &external).unwrap();
+
+        let mut sources = HashMap::new();
+        sources.insert(
+            "source.raw.orders".to_string(),
+            source_schema(&[(
+                "amount",
+                RockyType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+                false,
+            )]),
+        );
+
+        let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        let columns = &result.typed_models["averages"];
+        let avg_amount = columns.iter().find(|col| col.name == "avg_amount").unwrap();
+        assert_eq!(
+            avg_amount.data_type,
+            RockyType::Unknown,
+            "the Decimal AVG carve-out must still withhold a type"
+        );
+
+        let contract = CompilerContract {
+            columns: vec![ContractColumn {
+                name: "avg_amount".to_string(),
+                type_name: Some("Boolean".to_string()),
+                nullable: Some(true),
+                description: None,
+            }],
+            rules: ContractRules::default(),
+        };
+        let diagnostics = validate_contract("averages", columns, &contract);
+
+        let i003 = diagnostics
+            .iter()
+            .find(|diagnostic| &*diagnostic.code == "I003")
+            .unwrap_or_else(|| panic!("expected I003, got {diagnostics:?}"));
+        assert!(
+            i003.message.contains("avg_amount") && i003.message.contains("Boolean"),
+            "I003 must name the column and the declared type: {i003:?}"
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(crate::diagnostic::Diagnostic::is_error),
+            "an unresolved type must not fail the build: {diagnostics:?}"
         );
     }
 

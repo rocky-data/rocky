@@ -9,6 +9,8 @@ import pytest
 
 from dagster_rocky.contracts import (
     CONTRACT_COLUMN_CONSTRAINTS_CHECK,
+    CONTRACT_COMPILE_MISSING_METADATA_KEY,
+    CONTRACT_MODEL_NOT_FOUND_METADATA_KEY,
     CONTRACT_PROTECTED_COLUMNS_CHECK,
     CONTRACT_REQUIRED_COLUMNS_CHECK,
     ContractParseError,
@@ -276,6 +278,83 @@ def test_results_e014_maps_to_column_constraints():
     assert r.passed is False, "an E014 violation must fail the check, not pass silently"
 
 
+def test_results_i003_passes_but_is_listed_as_unverified():
+    """I003 is not a violation, so the check passes — but it must not be hidden.
+
+    The column-constraints check would otherwise claim a declared type was
+    satisfied when Rocky never compared it against anything.
+    """
+    asset_key = dg.AssetKey(["orders"])
+    rules = ContractRules(has_required=False, has_protected=False, has_column_constraints=True)
+
+    results = list(
+        contract_check_results_from_diagnostics(
+            diagnostics=[
+                _diag(
+                    "I003",
+                    "orders",
+                    "column 'id' declares type Int64 in the contract, but Rocky could not "
+                    "work out the column's type, so it did not check the declared type",
+                    severity=Severity.info,
+                ),
+            ],
+            asset_key=asset_key,
+            model_name="orders",
+            rules=rules,
+        )
+    )
+
+    assert len(results) == 1
+    r = results[0]
+    assert r.check_name == CONTRACT_COLUMN_CONSTRAINTS_CHECK
+    assert r.passed is True, "an unchecked type is not a violation"
+    assert r.metadata["rocky/unverified_count"].value == 1
+    assert "I003" in r.metadata["rocky/unverified_0"].value
+    assert "rocky/violation_count" not in r.metadata
+
+
+def test_results_i003_rides_along_with_a_real_violation():
+    """A failing check keeps its violations and still lists the unchecked ones."""
+    asset_key = dg.AssetKey(["orders"])
+    rules = ContractRules(has_required=False, has_protected=False, has_column_constraints=True)
+
+    results = list(
+        contract_check_results_from_diagnostics(
+            diagnostics=[
+                _diag("E011", "orders", "column 'amount' type mismatch"),
+                _diag("I003", "orders", "column 'id' ...", severity=Severity.info),
+            ],
+            asset_key=asset_key,
+            model_name="orders",
+            rules=rules,
+        )
+    )
+
+    r = results[0]
+    assert r.passed is False
+    assert r.metadata["rocky/violation_count"].value == 1
+    assert r.metadata["rocky/unverified_count"].value == 1
+
+
+def test_results_pass_with_no_unverified_metadata_when_nothing_is_unchecked():
+    """A clean check carries no `rocky/unverified_*` keys at all."""
+    asset_key = dg.AssetKey(["orders"])
+    rules = ContractRules(has_required=False, has_protected=False, has_column_constraints=True)
+
+    results = list(
+        contract_check_results_from_diagnostics(
+            diagnostics=[],
+            asset_key=asset_key,
+            model_name="orders",
+            rules=rules,
+        )
+    )
+
+    r = results[0]
+    assert r.passed is True
+    assert not any(k.startswith("rocky/unverified") for k in r.metadata)
+
+
 def test_results_e011_e012_map_to_column_constraints():
     """E011 (type mismatch) and E012 (nullability) → contract_column_constraints fails."""
     asset_key = dg.AssetKey(["orders"])
@@ -474,3 +553,146 @@ def test_results_only_yield_for_declared_rules():
     assert len(results) == 1
     assert results[0].check_name == CONTRACT_REQUIRED_COLUMNS_CHECK
     assert results[0].passed is True
+
+
+# ---------------------------------------------------------------------------
+# No compile output at all (#1619)
+# ---------------------------------------------------------------------------
+
+
+def test_results_not_verified_when_there_is_no_compile_output():
+    """``diagnostics=None`` means ``rocky compile`` produced no output.
+
+    That is not the same as an empty diagnostics list: nothing was checked,
+    so every declared check must report a not-verified failure instead of
+    the green it reported before (#1619).
+    """
+    asset_key = dg.AssetKey(["orders"])
+    rules = ContractRules(has_required=True, has_protected=True, has_column_constraints=True)
+
+    results = list(
+        contract_check_results_from_diagnostics(
+            diagnostics=None,
+            asset_key=asset_key,
+            model_name="orders",
+            rules=rules,
+        )
+    )
+
+    assert [r.check_name for r in results] == [
+        CONTRACT_REQUIRED_COLUMNS_CHECK,
+        CONTRACT_PROTECTED_COLUMNS_CHECK,
+        CONTRACT_COLUMN_CONSTRAINTS_CHECK,
+    ]
+    for r in results:
+        assert r.passed is False, r.check_name
+        assert r.severity == dg.AssetCheckSeverity.WARN
+        assert r.asset_key == asset_key
+        assert r.metadata[CONTRACT_COMPILE_MISSING_METADATA_KEY].value is True
+        assert "not verified" in (r.description or "")
+        assert "not verified" in r.metadata["status"].value
+
+
+def test_results_not_verified_when_the_model_was_not_found():
+    """``W011`` means the compiler never found the model the contract names.
+
+    ``validate_contract`` is not called at all in that branch, so no
+    ``E010``-``E014`` can follow and an unmapped ``W011`` used to be dropped,
+    leaving every declared check green (#1644).
+    """
+    asset_key = dg.AssetKey(["orders"])
+    rules = ContractRules(has_required=True, has_protected=True, has_column_constraints=True)
+    diagnostics = [
+        _diag(
+            "W011",
+            "orders",
+            "contract exists for 'orders' but model was not found in project",
+            severity=Severity.warning,
+        )
+    ]
+
+    results = list(
+        contract_check_results_from_diagnostics(
+            diagnostics=diagnostics,
+            asset_key=asset_key,
+            model_name="orders",
+            rules=rules,
+        )
+    )
+
+    assert [r.check_name for r in results] == [
+        CONTRACT_REQUIRED_COLUMNS_CHECK,
+        CONTRACT_PROTECTED_COLUMNS_CHECK,
+        CONTRACT_COLUMN_CONSTRAINTS_CHECK,
+    ]
+    for r in results:
+        assert r.passed is False, r.check_name
+        assert r.severity == dg.AssetCheckSeverity.WARN
+        assert r.metadata[CONTRACT_MODEL_NOT_FOUND_METADATA_KEY].value is True
+        assert "not verified" in (r.description or "")
+        assert "did not find a model named 'orders'" in r.metadata["status"].value
+
+
+def test_a_model_not_found_warning_for_another_model_does_not_leak():
+    """``W011`` names its own model; another model's must not blank this one."""
+    asset_key = dg.AssetKey(["orders"])
+    rules = ContractRules(has_required=True, has_protected=False, has_column_constraints=False)
+    diagnostics = [
+        _diag(
+            "W011",
+            "customers",
+            "contract exists for 'customers' but model was not found in project",
+            severity=Severity.warning,
+        )
+    ]
+
+    results = list(
+        contract_check_results_from_diagnostics(
+            diagnostics=diagnostics,
+            asset_key=asset_key,
+            model_name="orders",
+            rules=rules,
+        )
+    )
+
+    assert len(results) == 1
+    assert results[0].passed is True
+    assert CONTRACT_MODEL_NOT_FOUND_METADATA_KEY not in results[0].metadata
+
+
+def test_results_not_verified_only_for_declared_rules():
+    """The not-verified result is still gated on the declared rule kinds."""
+    asset_key = dg.AssetKey(["orders"])
+    rules = ContractRules(has_required=True, has_protected=False, has_column_constraints=False)
+
+    results = list(
+        contract_check_results_from_diagnostics(
+            diagnostics=None,
+            asset_key=asset_key,
+            model_name="orders",
+            rules=rules,
+        )
+    )
+
+    assert len(results) == 1
+    assert results[0].check_name == CONTRACT_REQUIRED_COLUMNS_CHECK
+    assert results[0].passed is False
+
+
+def test_results_empty_diagnostics_still_pass_without_compile_missing_marker():
+    """An empty list is "compiled, nothing to report": green, and not marked."""
+    asset_key = dg.AssetKey(["orders"])
+    rules = ContractRules(has_required=True, has_protected=False, has_column_constraints=False)
+
+    results = list(
+        contract_check_results_from_diagnostics(
+            diagnostics=[],
+            asset_key=asset_key,
+            model_name="orders",
+            rules=rules,
+        )
+    )
+
+    assert len(results) == 1
+    assert results[0].passed is True
+    assert CONTRACT_COMPILE_MISSING_METADATA_KEY not in results[0].metadata

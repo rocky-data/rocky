@@ -1,6 +1,6 @@
 [package]
 name = "rocky-ir"
-version = "1.72.0"
+version = "1.73.0"
 description = "Typed intermediate representation (IR) for Rocky transformation pipelines"
 edition.workspace = true
 license.workspace = true
@@ -14,6 +14,12 @@ schemars = { workspace = true }
 chrono = { workspace = true }
 blake3 = { workspace = true }
 thiserror = { workspace = true }
+
+[features]
+# Exposes `MetadataColumn::new_unchecked` so other crates' tests can build the
+# hostile inputs their dialects must refuse. Never enable it in a normal
+# dependency — only in `[dev-dependencies]`.
+test-support = []
 
 [lints]
 workspace = true

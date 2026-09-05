@@ -113,6 +113,28 @@ class RowMismatch(BaseModel):
     row_index: conint(ge=0)
 
 
+class Severity(StrEnum):
+    """
+    Severity level of a diagnostic.
+
+    Serialized in PascalCase (`"Error"`, `"Warning"`, `"Info"`) to stay compatible with existing dagster fixtures and the hand-written `Severity` StrEnum in `integrations/dagster/src/dagster_rocky/types.py`.
+    """
+
+    Error = "Error"
+    Warning = "Warning"
+    Info = "Info"
+
+
+class SourceSpan(BaseModel):
+    """
+    Location in a source file.
+    """
+
+    col: conint(ge=0)
+    file: str
+    line: conint(ge=0)
+
+
 class TestFailure(BaseModel):
     """
     One failed test, mirroring the (name, error) tuple in `rocky_engine::test_runner::TestResult::failures` but with named fields because schemars/JSON Schema can't represent positional tuples cleanly.
@@ -160,6 +182,39 @@ class UnitTestSummary(BaseModel):
     total: conint(ge=0)
 
 
+class Diagnostic(BaseModel):
+    """
+    A compiler diagnostic (error, warning, or informational message).
+
+    `code` and `message` use `Arc<str>` (§P3.5) — cloning a `Diagnostic` in the LSP publish loop becomes a refcount bump. Construction still accepts any `Into<String>` / `&str` via the helper constructors below; the arc wrap happens once at construction time.
+    """
+
+    code: str
+    """
+    Diagnostic code (e.g., "E001", "W001").
+    """
+    message: str
+    """
+    Human-readable message.
+    """
+    model: str
+    """
+    Which model this diagnostic relates to.
+    """
+    severity: Severity
+    """
+    Severity level.
+    """
+    span: SourceSpan | None = None
+    """
+    Source location (if available).
+    """
+    suggestion: str | None = None
+    """
+    Suggested fix (if any).
+    """
+
+
 class TestOutput(BaseModel):
     """
     JSON output for `rocky test`.
@@ -169,6 +224,12 @@ class TestOutput(BaseModel):
     declarative: DeclarativeTestSummary | None = None
     """
     Results from declarative `[[tests]]` in model sidecars. Present only when `--declarative` is used.
+    """
+    diagnostics: list[Diagnostic] | None = None
+    """
+    Compiler diagnostics from the compile `rocky test` ran.
+
+    Errors already fail the command, so what shows up here is everything that does not: `W001`, `W004`, `W005`, `P002`, `I001`, `I002`, `I003`. The runner has always carried them and the output dropped them (#1617). `rocky test` is the command most likely to run in CI, and it compiles with empty source schemas, so it is where an unchecked-contract report is most likely to exist. Empty when the compile reported nothing.
     """
     failed: conint(ge=0)
     failures: list[TestFailure]

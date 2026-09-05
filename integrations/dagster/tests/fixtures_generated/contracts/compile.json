@@ -13,6 +13,14 @@
       "suggestion": "add `customer_id` to the SELECT, or remove it from `[rules] required`"
     },
     {
+      "severity": "Info",
+      "code": "I003",
+      "message": "column 'order_id' declares type Int64 in the contract, but Rocky could not work out the column's type, so it did not check the declared type",
+      "span": null,
+      "model": "broken_metrics",
+      "suggestion": "give `rocky compile` source schemas so `order_id`'s type resolves \u2014 `rocky discover --with-schemas` fills the cache, or use `rocky compile --with-seed`; `rocky test` and `rocky ci` always compile without them. A CAST to Int64 only helps when the value it casts already has a known type"
+    },
+    {
       "severity": "Error",
       "code": "E012",
       "message": "column 'order_id' must be non-nullable per contract, but is nullable",
@@ -21,12 +29,44 @@
       "suggestion": "filter out NULLs (e.g. `WHERE order_id IS NOT NULL`) or COALESCE `order_id` to a default, or relax `nullable = true` in the contract"
     },
     {
+      "severity": "Info",
+      "code": "I003",
+      "message": "column 'amount' declares type Decimal in the contract, but Rocky could not work out the column's type, so it did not check the declared type",
+      "span": null,
+      "model": "broken_metrics",
+      "suggestion": "give `rocky compile` source schemas so `amount`'s type resolves \u2014 `rocky discover --with-schemas` fills the cache, or use `rocky compile --with-seed`; `rocky test` and `rocky ci` always compile without them. A CAST to Decimal only helps when the value it casts already has a known type"
+    },
+    {
       "severity": "Error",
       "code": "E013",
       "message": "protected column 'customer_id' has been removed",
       "span": null,
       "model": "broken_metrics",
       "suggestion": "restore `customer_id` in the SELECT, or remove it from `[rules] protected`"
+    },
+    {
+      "severity": "Info",
+      "code": "I003",
+      "message": "column 'order_id' declares type Int64 in the contract, but Rocky could not work out the column's type, so it did not check the declared type",
+      "span": null,
+      "model": "good_metrics",
+      "suggestion": "give `rocky compile` source schemas so `order_id`'s type resolves \u2014 `rocky discover --with-schemas` fills the cache, or use `rocky compile --with-seed`; `rocky test` and `rocky ci` always compile without them. A CAST to Int64 only helps when the value it casts already has a known type"
+    },
+    {
+      "severity": "Info",
+      "code": "I003",
+      "message": "column 'customer_id' declares type Int64 in the contract, but Rocky could not work out the column's type, so it did not check the declared type",
+      "span": null,
+      "model": "good_metrics",
+      "suggestion": "give `rocky compile` source schemas so `customer_id`'s type resolves \u2014 `rocky discover --with-schemas` fills the cache, or use `rocky compile --with-seed`; `rocky test` and `rocky ci` always compile without them. A CAST to Int64 only helps when the value it casts already has a known type"
+    },
+    {
+      "severity": "Info",
+      "code": "I003",
+      "message": "column 'amount' declares type Decimal in the contract, but Rocky could not work out the column's type, so it did not check the declared type",
+      "span": null,
+      "model": "good_metrics",
+      "suggestion": "give `rocky compile` source schemas so `amount`'s type resolves \u2014 `rocky discover --with-schemas` fills the cache, or use `rocky compile --with-seed`; `rocky test` and `rocky ci` always compile without them. A CAST to Decimal only helps when the value it casts already has a known type"
     }
   ],
   "has_errors": true,

@@ -27,6 +27,7 @@ struct ProjectInfo {
     models: Option<ModelsInfo>,
     last_run: Option<RunInfo>,
     diagnostics_count: usize,
+    warning_count: usize,
     has_errors: bool,
 }
 
@@ -95,19 +96,25 @@ async fn gather_project_info(state: &ServerState) -> ProjectInfo {
         };
 
     // Read compilation status.
-    let (models, diagnostics_count, has_errors) = {
+    let (models, diagnostics_count, warning_count, has_errors) = {
         let lock = state.compile_result.read().await;
         match lock.as_ref() {
             Some(result) => {
                 let names: Vec<String> = result.semantic_graph.models.keys().cloned().collect();
                 let count = names.len();
+                let warnings = result
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.severity == rocky_compiler::diagnostic::Severity::Warning)
+                    .count();
                 (
                     Some(ModelsInfo { count, names }),
                     result.diagnostics.len(),
+                    warnings,
                     result.has_errors,
                 )
             }
-            None => (None, 0, false),
+            None => (None, 0, 0, false),
         }
     };
 
@@ -140,6 +147,7 @@ async fn gather_project_info(state: &ServerState) -> ProjectInfo {
         models,
         last_run,
         diagnostics_count,
+        warning_count,
         has_errors,
     }
 }
@@ -324,13 +332,7 @@ fn render_html(info: &ProjectInfo) -> String {
     // --- Compilation status ---
     html.push_str(r#"<h2>Compilation</h2><div class="card">"#);
     if let Some(ref models) = info.models {
-        let status_badge = if info.has_errors {
-            r#"<span class="badge badge-red">errors</span>"#
-        } else if info.diagnostics_count > 0 {
-            r#"<span class="badge badge-orange">warnings</span>"#
-        } else {
-            r#"<span class="badge badge-green">ok</span>"#
-        };
+        let status_badge = compilation_badge(info.has_errors, info.warning_count);
         html.push_str(&format!(
             r#"<div class="stat"><span class="stat-label">Status</span><span class="stat-value">{status_badge}</span></div>"#
         ));
@@ -468,4 +470,73 @@ fn render_html(info: &ProjectInfo) -> String {
     );
 
     html
+}
+
+/// The compilation status badge.
+///
+/// Keyed on severity, not on "any diagnostic at all". `I001` (dependency
+/// inferred from SQL), `I002` and `I003` are informational and say nothing is
+/// wrong, so a compile that emits only those is `ok`, not `warnings`. The
+/// separate `Diagnostics` stat still shows the total count.
+fn compilation_badge(has_errors: bool, warning_count: usize) -> &'static str {
+    if has_errors {
+        r#"<span class="badge badge-red">errors</span>"#
+    } else if warning_count > 0 {
+        r#"<span class="badge badge-orange">warnings</span>"#
+    } else {
+        r#"<span class="badge badge-green">ok</span>"#
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ModelsInfo, ProjectInfo, compilation_badge, render_html};
+
+    #[test]
+    fn badge_reads_severity_not_diagnostic_count() {
+        assert!(compilation_badge(true, 0).contains("errors"));
+        assert!(compilation_badge(true, 3).contains("errors"));
+        assert!(compilation_badge(false, 1).contains("warnings"));
+        // An info-only compile — I001/I002/I003 — is green.
+        assert!(compilation_badge(false, 0).contains("ok"));
+    }
+
+    fn project_info(diagnostics_count: usize, warning_count: usize) -> ProjectInfo {
+        ProjectInfo {
+            project_name: "demo".to_string(),
+            config_path: "rocky.toml".to_string(),
+            pipelines: Vec::new(),
+            adapters: Vec::new(),
+            models: Some(ModelsInfo {
+                count: 1,
+                names: vec!["orders".to_string()],
+            }),
+            last_run: None,
+            diagnostics_count,
+            warning_count,
+            has_errors: false,
+        }
+    }
+
+    /// Through the real renderer, not just the helper: this fails if the call
+    /// site is wired back to `diagnostics_count`.
+    #[test]
+    fn rendered_page_is_ok_for_an_info_only_compile() {
+        let html = render_html(&project_info(3, 0));
+        assert!(
+            html.contains(r#"<span class="badge badge-green">ok</span>"#),
+            "three info diagnostics and no warning must render ok"
+        );
+        assert!(!html.contains(r#"<span class="badge badge-orange">warnings</span>"#));
+        // The total is still shown, so the infos are not hidden.
+        assert!(html.contains(
+            r#"<span class="stat-label">Diagnostics</span><span class="stat-value">3</span>"#
+        ));
+    }
+
+    #[test]
+    fn rendered_page_is_orange_when_a_warning_is_present() {
+        let html = render_html(&project_info(3, 1));
+        assert!(html.contains(r#"<span class="badge badge-orange">warnings</span>"#));
+    }
 }

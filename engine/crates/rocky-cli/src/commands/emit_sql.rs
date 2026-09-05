@@ -40,7 +40,53 @@ use rocky_core::models::SurrogateKeySpec;
 use rocky_core::sql_gen;
 use tracing::{debug, info};
 
-use super::plan::preview_dialect;
+use super::plan::dialect_for_adapter_type;
+use crate::registry;
+
+/// Load the project config, or `None` when there is no `rocky.toml` to load.
+///
+/// The same derivation `rocky compile` uses (`commands::compile`): the
+/// credential-tolerant loader, so an unset `${VAR}` in an adapter's
+/// connection fields does not stop a command that needs no credentials;
+/// a missing file is `None`; **every other failure refuses**.
+///
+/// The refusal matters. The previous form swallowed every config error with
+/// `.ok()` and fell back to the DuckDB dialect, so a project whose config
+/// did not load got another warehouse's SQL and no word about it. It also
+/// meant a config that every other command rejects — one still declaring the
+/// removed `[schema_evolution]` section (#1435) — emitted SQL here as if
+/// nothing were wrong.
+fn load_project_config(
+    config_path: Option<&Path>,
+) -> Result<Option<rocky_core::config::RockyConfig>> {
+    let Some(path) = config_path else {
+        return Ok(None);
+    };
+    match rocky_core::config::load_rocky_config_credential_tolerant(path) {
+        Ok(config) => Ok(Some(config)),
+        Err(rocky_core::config::ConfigError::FileNotFound { .. }) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Resolve the project's target dialect from the loaded config, falling back
+/// to DuckDB when there is none. Mirrors the resolution in
+/// [`super::plan::plan_preview_output`] so emitted SQL matches the plan preview.
+fn resolve_dialect(
+    config: Option<&rocky_core::config::RockyConfig>,
+) -> Box<dyn rocky_core::traits::SqlDialect> {
+    let adapter_type = config
+        .and_then(|cfg| {
+            let target_adapter_name = registry::resolve_replication_pipeline(cfg, None)
+                .ok()
+                .map(|(_, pipeline)| pipeline.target.adapter.clone());
+            target_adapter_name
+                .and_then(|name| cfg.adapters.get(&name).map(|a| a.adapter_type.clone()))
+                .or_else(|| cfg.adapters.values().next().map(|a| a.adapter_type.clone()))
+        })
+        .unwrap_or_else(|| "duckdb".to_string());
+    dialect_for_adapter_type(&adapter_type)
+}
 
 /// One model's emitted SQL: its name and the joined runnable statement(s).
 struct EmittedModel {
@@ -84,14 +130,8 @@ fn emit_models(
 ) -> Result<EmitResult> {
     use rocky_compiler::compile::{self, CompilerConfig};
 
-    // The SAME resolution `plan_preview_output` uses — literally the same
-    // function, so "emitted SQL matches the plan preview" is true by
-    // construction. A `rocky.toml` that exists but does not load refuses here
-    // too, rather than emitting DuckDB SQL for a broken Snowflake project. An
-    // unset `${CREDENTIAL}` is not that case: this command connects to
-    // nothing and is documented as needing none, so the placeholder is
-    // tolerated (`preview_dialect`).
-    let dialect = preview_dialect(config_path)?;
+    let project_config = load_project_config(config_path)?;
+    let dialect = resolve_dialect(project_config.as_ref());
 
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
@@ -99,7 +139,10 @@ fn emit_models(
         source_schemas: std::collections::HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
-        project_freshness_default: false,
+        project_freshness: project_config
+            .as_ref()
+            .map(|c| c.freshness.clone())
+            .unwrap_or_default(),
         run_vars: run_vars.clone(),
     };
     let result = match compile::compile(&config) {
@@ -210,7 +253,7 @@ fn emit_models(
 
         let mut model_ir = model_ir.clone();
         if let Some(specs) = surrogate_keys.get(model_name) {
-            rocky_core::models::apply_surrogate_keys(&mut model_ir, specs, dialect.as_ref());
+            rocky_core::models::apply_surrogate_keys(&mut model_ir, specs, dialect.as_ref())?;
         }
 
         match sql_gen::generate_transformation_sql_with_warehouse(&model_ir, dialect.as_ref(), None)
@@ -369,6 +412,62 @@ fn report_skipped(skipped: &[String]) {
 #[cfg(all(test, feature = "duckdb"))]
 mod tests {
     use super::*;
+
+    /// `emit-sql` refuses a config it cannot load instead of falling back
+    /// to the DuckDB dialect and emitting SQL anyway.
+    ///
+    /// The bypass this closes: `[schema_evolution]` is removed and every
+    /// other command refuses it (#1435), but `emit-sql` swallowed every
+    /// config error with `.ok()` and emitted SQL as if the config were
+    /// fine — the same silent acceptance the removal exists to end.
+    #[test]
+    fn a_config_that_does_not_load_is_refused_not_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let config_path = root.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter.wh]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n\n[schema_evolution]\ngrace_period_days = 30\n",
+        )
+        .unwrap();
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        write_model(&models, "m", "SELECT 1 AS id", "");
+
+        let err = emit_models(
+            Some(&config_path),
+            &models,
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .err()
+        .expect("a config declaring the removed section must be refused");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("`[schema_evolution]` section was removed"),
+            "the refusal must reach the user, got: {rendered}"
+        );
+    }
+
+    /// No `rocky.toml` at all is still fine: `emit-sql` is usable against a
+    /// bare models directory and falls back to the DuckDB dialect.
+    #[test]
+    fn a_missing_config_still_emits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        write_model(&models, "m", "SELECT 1 AS id", "");
+
+        let result = emit_models(
+            Some(&root.join("rocky.toml")),
+            &models,
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap_or_else(|e| panic!("a missing rocky.toml must not stop emit-sql: {e:#}"));
+        assert_eq!(result.models.len(), 1);
+    }
 
     /// Write a minimal full-refresh model + sidecar to `dir`.
     fn write_model(dir: &Path, name: &str, sql: &str, extra_toml: &str) {

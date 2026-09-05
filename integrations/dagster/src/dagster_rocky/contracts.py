@@ -17,7 +17,10 @@ This module provides:
 
 * :func:`contract_check_results_from_diagnostics` — yields one
   :class:`AssetCheckResult` per check spec, mapping compiler diagnostics with
-  contract-related codes (E010-E013, W010) to pass/fail status.
+  contract-related codes (E010-E013, W010) to pass/fail status. Pass
+  ``diagnostics=None`` when there is no ``rocky compile`` output at all:
+  every declared check then fails as "not verified" instead of passing on
+  an empty list (#1619).
 
 Mapping from compiler diagnostic codes to dagster check names:
 
@@ -46,7 +49,7 @@ import dagster as dg
 _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     from .types import Diagnostic
 
@@ -72,6 +75,38 @@ _CONTRACT_CODE_TO_CHECK: dict[str, str] = {
     "E014": CONTRACT_COLUMN_CONSTRAINTS_CHECK,
     "W010": CONTRACT_COLUMN_CONSTRAINTS_CHECK,
 }
+
+#: Compiler diagnostic codes that report a contract rule Rocky could *not*
+#: check. These are not violations, so they must never fail a check — but the
+#: check would otherwise claim a constraint was satisfied when it was never
+#: tested. They are attached to the check as metadata instead, and the result
+#: still passes. Keep them out of ``_CONTRACT_CODE_TO_CHECK``: anything mapped
+#: there fails the check, and only ``W010`` downgrades to WARN.
+#:
+#: ``I003``: the column's inferred type is ``Unknown``, so the contract's
+#: declared type was not compared against anything.
+_CONTRACT_UNVERIFIED_CODE_TO_CHECK: dict[str, str] = {
+    "I003": CONTRACT_COLUMN_CONSTRAINTS_CHECK,
+}
+
+#: Metadata key stamped (``True``) on a contract check result that was not
+#: evaluated because there was no ``rocky compile`` output to read. The
+#: result also fails, so this key only tells a "not verified" failure apart
+#: from a real violation; it is never present on a passing result.
+CONTRACT_COMPILE_MISSING_METADATA_KEY: str = "rocky/compile_missing"
+
+#: Metadata key stamped (``True``) on a contract check result that was not
+#: evaluated because the compiler never found the model the contract names
+#: (``W011``). As with the compile-missing key above, the result also fails,
+#: so this key only tells a "not verified" failure apart from a real
+#: violation; it is never present on a passing result.
+CONTRACT_MODEL_NOT_FOUND_METADATA_KEY: str = "rocky/contract_model_not_found"
+
+#: The compiler diagnostic that says a contract names a model the project does
+#: not contain. ``validate_all_contracts`` emits this *instead of* calling
+#: ``validate_contract``, so no ``E010``-``E014`` can follow it and an absence
+#: of violations proves nothing.
+_CONTRACT_MODEL_NOT_FOUND_CODE: str = "W011"
 
 
 @dataclass(frozen=True)
@@ -224,9 +259,7 @@ def contract_check_specs_for_model(
         yield dg.AssetCheckSpec(
             name=CONTRACT_COLUMN_CONSTRAINTS_CHECK,
             asset=asset_key,
-            description=(
-                "Column types and nullability constraints from .contract.toml are satisfied"
-            ),
+            description="Column type and nullability constraints from .contract.toml",
             partitions_def=partitions_def,
         )
 
@@ -301,7 +334,7 @@ def configured_check_specs_for_model(
 
 
 def contract_check_results_from_diagnostics(
-    diagnostics: list[Diagnostic],
+    diagnostics: list[Diagnostic] | None,
     *,
     asset_key: dg.AssetKey,
     model_name: str,
@@ -322,10 +355,18 @@ def contract_check_results_from_diagnostics(
     * E010-E013 → ``AssetCheckSeverity.ERROR``
     * W010      → ``AssetCheckSeverity.WARN``
 
+    An empty list and ``None`` are different inputs. An empty list means the
+    compile ran and reported nothing for this model, so the checks pass.
+    ``None`` means there is no compile output at all (``rocky compile``
+    failed, or never ran), so nothing was checked: every declared check then
+    fails with ``AssetCheckSeverity.WARN`` and
+    :data:`CONTRACT_COMPILE_MISSING_METADATA_KEY` set, instead of passing
+    on the empty list (#1619).
+
     Args:
-        diagnostics: Compile-time diagnostics from :class:`CompileResult`.
-            Both contract codes and other codes are tolerated; non-contract
-            codes are ignored.
+        diagnostics: Compile-time diagnostics from :class:`CompileResult`,
+            or ``None`` when there is no compile result. Both contract codes
+            and other codes are tolerated; non-contract codes are ignored.
         asset_key: The Dagster asset key the checks belong to.
         model_name: The compiled model name to filter diagnostics by.
         rules: ContractRules — only check kinds with declared rules
@@ -335,8 +376,23 @@ def contract_check_results_from_diagnostics(
         ``dg.AssetCheckResult`` events. The number of yields equals the
         number of declared rule kinds in ``rules``.
     """
+    if diagnostics is None:
+        yield from _not_verified_results_for_rules(
+            rules=rules,
+            asset_key=asset_key,
+            build=lambda check_name: _not_verified_result(
+                check_name=check_name, asset_key=asset_key
+            ),
+        )
+        return
+
     # Group diagnostics by which check they belong to
     by_check: dict[str, list[Diagnostic]] = {
+        CONTRACT_REQUIRED_COLUMNS_CHECK: [],
+        CONTRACT_PROTECTED_COLUMNS_CHECK: [],
+        CONTRACT_COLUMN_CONSTRAINTS_CHECK: [],
+    }
+    unverified_by_check: dict[str, list[Diagnostic]] = {
         CONTRACT_REQUIRED_COLUMNS_CHECK: [],
         CONTRACT_PROTECTED_COLUMNS_CHECK: [],
         CONTRACT_COLUMN_CONSTRAINTS_CHECK: [],
@@ -344,29 +400,120 @@ def contract_check_results_from_diagnostics(
     for diag in diagnostics:
         if diag.model != model_name:
             continue
+        # Nothing was validated for this model, so the absence of violations
+        # below would be evidence of nothing. Report every declared check as
+        # not verified, the same way a missing compile does (#1644).
+        if diag.code == _CONTRACT_MODEL_NOT_FOUND_CODE:
+            yield from _not_verified_results_for_rules(
+                rules=rules,
+                asset_key=asset_key,
+                build=lambda check_name: _model_not_found_result(
+                    check_name=check_name, asset_key=asset_key, model_name=model_name
+                ),
+            )
+            return
         check_name = _CONTRACT_CODE_TO_CHECK.get(diag.code)
-        if check_name is None:
+        if check_name is not None:
+            by_check[check_name].append(diag)
             continue
-        by_check[check_name].append(diag)
+        unverified_name = _CONTRACT_UNVERIFIED_CODE_TO_CHECK.get(diag.code)
+        if unverified_name is not None:
+            unverified_by_check[unverified_name].append(diag)
 
     if rules.has_required:
         yield _result_for_check(
             check_name=CONTRACT_REQUIRED_COLUMNS_CHECK,
             asset_key=asset_key,
             diagnostics=by_check[CONTRACT_REQUIRED_COLUMNS_CHECK],
+            unverified=unverified_by_check[CONTRACT_REQUIRED_COLUMNS_CHECK],
         )
     if rules.has_protected:
         yield _result_for_check(
             check_name=CONTRACT_PROTECTED_COLUMNS_CHECK,
             asset_key=asset_key,
             diagnostics=by_check[CONTRACT_PROTECTED_COLUMNS_CHECK],
+            unverified=unverified_by_check[CONTRACT_PROTECTED_COLUMNS_CHECK],
         )
     if rules.has_column_constraints:
         yield _result_for_check(
             check_name=CONTRACT_COLUMN_CONSTRAINTS_CHECK,
             asset_key=asset_key,
             diagnostics=by_check[CONTRACT_COLUMN_CONSTRAINTS_CHECK],
+            unverified=unverified_by_check[CONTRACT_COLUMN_CONSTRAINTS_CHECK],
         )
+
+
+def _not_verified_results_for_rules(
+    *,
+    rules: ContractRules,
+    asset_key: dg.AssetKey,
+    build: Callable[[str], dg.AssetCheckResult],
+) -> Iterator[dg.AssetCheckResult]:
+    """Yield one ``build(check_name)`` result per rule kind the contract declares.
+
+    Shared by every "nothing was checked" path so they all report exactly the
+    checks that were declared, in the same order as the evaluated path.
+    """
+    if rules.has_required:
+        yield build(CONTRACT_REQUIRED_COLUMNS_CHECK)
+    if rules.has_protected:
+        yield build(CONTRACT_PROTECTED_COLUMNS_CHECK)
+    if rules.has_column_constraints:
+        yield build(CONTRACT_COLUMN_CONSTRAINTS_CHECK)
+
+
+def _model_not_found_result(
+    *, check_name: str, asset_key: dg.AssetKey, model_name: str
+) -> dg.AssetCheckResult:
+    """Build the failing result for a contract whose model the compiler did not find.
+
+    ``validate_all_contracts`` emits ``W011`` *instead of* validating, so the
+    contract may be violated and nothing looked. Fails at ``WARN`` like the
+    integration's other "not checked" placeholders.
+    """
+    status = (
+        f"not verified: the compiler did not find a model named '{model_name}', so its "
+        "contract was never checked — the contract file may name a model that was "
+        "renamed or removed, or the model may be missing from the compiled project"
+    )
+    return dg.AssetCheckResult(
+        asset_key=asset_key,
+        check_name=check_name,
+        passed=False,
+        severity=dg.AssetCheckSeverity.WARN,
+        description="contract not verified: model not found in project",
+        metadata={
+            "status": dg.MetadataValue.text(status),
+            CONTRACT_MODEL_NOT_FOUND_METADATA_KEY: dg.MetadataValue.bool(True),
+        },
+    )
+
+
+def _not_verified_result(*, check_name: str, asset_key: dg.AssetKey) -> dg.AssetCheckResult:
+    """Build the failing result for a contract check that could not be evaluated.
+
+    Used when there is no ``rocky compile`` output to read. The check fails
+    (the contract may be violated and nothing looked), at ``WARN`` severity
+    like the integration's other "not checked" placeholders, and carries
+    :data:`CONTRACT_COMPILE_MISSING_METADATA_KEY` so it can be told apart
+    from a real violation.
+    """
+    status = (
+        "not verified: no rocky compile output in the cached state (rocky compile "
+        "failed, or did not run, when the state was written), so this contract "
+        "was not checked — refresh the state after rocky compile succeeds"
+    )
+    return dg.AssetCheckResult(
+        asset_key=asset_key,
+        check_name=check_name,
+        passed=False,
+        severity=dg.AssetCheckSeverity.WARN,
+        description="contract not verified: no rocky compile output",
+        metadata={
+            "status": dg.MetadataValue.text(status),
+            CONTRACT_COMPILE_MISSING_METADATA_KEY: dg.MetadataValue.bool(True),
+        },
+    )
 
 
 def _result_for_check(
@@ -374,18 +521,33 @@ def _result_for_check(
     check_name: str,
     asset_key: dg.AssetKey,
     diagnostics: list[Diagnostic],
+    unverified: list[Diagnostic] | None = None,
 ) -> dg.AssetCheckResult:
     """Build one AssetCheckResult from a filtered diagnostics list.
 
-    ``passed=True`` when the list is empty. When non-empty, the result
+    ``passed=True`` when ``diagnostics`` is empty. When non-empty, the result
     fails with severity matching the worst diagnostic (W010 → WARN, all
     others → ERROR) and metadata listing each diagnostic message.
+
+    ``unverified`` holds diagnostics that report a rule Rocky could not check
+    (``I003``). They never fail the check, but they are listed in metadata as
+    ``rocky/unverified_*`` so a passing check does not silently claim a
+    constraint was tested when it was not.
     """
+    unverified = unverified or []
+    unverified_metadata: dict[str, dg.MetadataValue] = {
+        f"rocky/unverified_{i}": dg.MetadataValue.text(f"[{d.code}] {d.message}")
+        for i, d in enumerate(unverified)
+    }
+    if unverified:
+        unverified_metadata["rocky/unverified_count"] = dg.MetadataValue.int(len(unverified))
+
     if not diagnostics:
         return dg.AssetCheckResult(
             asset_key=asset_key,
             check_name=check_name,
             passed=True,
+            metadata=unverified_metadata,
         )
 
     # WARN if every failing diagnostic is W010, ERROR otherwise
@@ -397,6 +559,7 @@ def _result_for_check(
         for i, d in enumerate(diagnostics)
     }
     metadata["rocky/violation_count"] = dg.MetadataValue.int(len(diagnostics))
+    metadata.update(unverified_metadata)
 
     return dg.AssetCheckResult(
         asset_key=asset_key,

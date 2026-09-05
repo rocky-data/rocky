@@ -235,8 +235,11 @@ pub fn resolve_models_dir(models_glob: &str, config_path: &Path) -> Result<Optio
 /// (#1262). Propagating subdirectory errors does not close that hole, and a
 /// project nesting models deeper than one level still silently builds nothing
 /// for the deeper subtree.
-pub fn load_project_models(models_dir: &Path) -> Result<Vec<Model>> {
-    let (models, mut errors) = load_project_models_partial(models_dir);
+pub fn load_project_models(
+    models_dir: &Path,
+    project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
+) -> Result<Vec<Model>> {
+    let (models, mut errors) = load_project_models_partial(models_dir, project_freshness);
     if errors.is_empty() {
         Ok(models)
     } else {
@@ -245,9 +248,18 @@ pub fn load_project_models(models_dir: &Path) -> Result<Vec<Model>> {
 }
 
 /// Load only project models whose primary source path matches `models_glob`.
-pub fn load_project_models_matching(models_dir: &Path, models_glob: &str) -> Result<Vec<Model>> {
+///
+/// `project_freshness` is the project's `[freshness]` block, threaded down
+/// so a model that declares none of its own inherits it (#1435). Pass
+/// `None` only when the caller wants declared-only freshness — see
+/// `member_max_lags` in `commands::tick`.
+pub fn load_project_models_matching(
+    models_dir: &Path,
+    models_glob: &str,
+    project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
+) -> Result<Vec<Model>> {
     let load = |dir: &Path| {
-        rocky_compiler::project::load_dir_models_matching(dir, models_glob)
+        rocky_compiler::project::load_dir_models_matching(dir, models_glob, project_freshness)
             .map_err(|e| anyhow::anyhow!("{e}"))
             .with_context(|| format!("failed to load models from {}", dir.display()))
     };
@@ -264,9 +276,10 @@ pub fn load_project_models_matching(models_dir: &Path, models_glob: &str) -> Res
 pub fn load_project_models_matching_partial(
     models_dir: &Path,
     models_glob: &str,
+    project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
 ) -> (Vec<Model>, Vec<anyhow::Error>) {
     let load = |dir: &Path| {
-        rocky_compiler::project::load_dir_models_matching(dir, models_glob)
+        rocky_compiler::project::load_dir_models_matching(dir, models_glob, project_freshness)
             .map_err(|e| anyhow::anyhow!("{e}"))
             .with_context(|| format!("failed to load models from {}", dir.display()))
     };
@@ -291,8 +304,11 @@ pub fn load_project_models_matching_partial(
 ///
 /// Strict callers should use [`load_project_models`], which surfaces the first
 /// error instead.
-pub fn load_project_models_partial(models_dir: &Path) -> (Vec<Model>, Vec<anyhow::Error>) {
-    load_project_models_partial_with(models_dir, &load_one_dir)
+pub fn load_project_models_partial(
+    models_dir: &Path,
+    project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
+) -> (Vec<Model>, Vec<anyhow::Error>) {
+    load_project_models_partial_with(models_dir, &|dir| load_one_dir(dir, project_freshness))
 }
 
 fn load_project_models_partial_with(
@@ -320,8 +336,11 @@ fn load_project_models_partial_with(
 }
 
 /// Load one directory's models, naming that directory in the error.
-fn load_one_dir(dir: &Path) -> Result<Vec<Model>> {
-    rocky_compiler::project::load_dir_models(dir)
+fn load_one_dir(
+    dir: &Path,
+    project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
+) -> Result<Vec<Model>> {
+    rocky_compiler::project::load_dir_models(dir, project_freshness)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .with_context(|| format!("failed to load models from {}", dir.display()))
 }
@@ -357,7 +376,7 @@ mod tests {
         write_model(&models.join("staging").join("deep"), "lvl2");
         write_model(&models.join("staging").join("deep").join("deeper"), "lvl3");
 
-        let loaded = load_project_models(&models).expect("load");
+        let loaded = load_project_models(&models, None).expect("load");
         let mut names: Vec<&str> = loaded.iter().map(|m| m.config.name.as_str()).collect();
         names.sort_unstable();
         assert_eq!(names, ["lvl2", "lvl3", "stg", "top"]);
@@ -377,7 +396,7 @@ mod tests {
             "name = [\n",
         );
 
-        let err = load_project_models(&models).expect_err("a deep failure must propagate");
+        let err = load_project_models(&models, None).expect_err("a deep failure must propagate");
         let rendered = format!("{err:#}");
         assert!(
             rendered.contains("failed to load models from"),
@@ -400,7 +419,8 @@ mod tests {
         write(&models.join("staging").join("broken.sql"), "SELECT 1\n");
         write(&models.join("staging").join("broken.toml"), "name = [\n");
 
-        let err = load_project_models(&models).expect_err("subdirectory failure must propagate");
+        let err =
+            load_project_models(&models, None).expect_err("subdirectory failure must propagate");
         let rendered = format!("{err:#}");
         assert!(
             rendered.contains("failed to load models from"),
@@ -416,7 +436,7 @@ mod tests {
     #[test]
     fn a_missing_directory_yields_no_models() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let loaded = load_project_models(&tmp.path().join("does-not-exist")).expect("load");
+        let loaded = load_project_models(&tmp.path().join("does-not-exist"), None).expect("load");
         assert!(loaded.is_empty());
     }
 
@@ -430,7 +450,7 @@ mod tests {
         write(&models.join("README.md"), "# notes\n");
         write(&models.join("docs").join("notes.md"), "# more notes\n");
 
-        let loaded = load_project_models(&models).expect("load");
+        let loaded = load_project_models(&models, None).expect("load");
         let names: Vec<&str> = loaded.iter().map(|m| m.config.name.as_str()).collect();
         assert_eq!(names, ["top"]);
     }
@@ -444,7 +464,7 @@ mod tests {
         write(&models.join("excluded/_defaults.toml"), "target = [\n");
         let glob = models.join("orders*.sql").to_string_lossy().into_owned();
 
-        let loaded = load_project_models_matching(&models, &glob)
+        let loaded = load_project_models_matching(&models, &glob, None)
             .expect("metadata belonging only to excluded models must not be parsed");
 
         let names: Vec<&str> = loaded.iter().map(|m| m.config.name.as_str()).collect();

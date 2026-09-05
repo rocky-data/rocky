@@ -185,7 +185,7 @@ A table that keeps a row's history instead of overwriting it. A `snapshot` pipel
 
 ### Schema evolution
 
-Changing a table's columns over time without breaking the models that read it. When a source column disappears, Rocky can keep it in the target for a grace period and fill it with `NULL`, so consumers have time to adapt. See [`[schema_evolution]`](/reference/configuration/#schema_evolution).
+Changing a table's columns over time without breaking the models that read it. Rocky adds a column the source gained and widens a column whose type grew. It does not drop a column the source lost. The `[schema_evolution]` block that used to configure a grace period for such a drop is [removed](/reference/configuration/#schema_evolution-removed). See [Schema drift](/concepts/schema-drift/).
 
 ### Seam
 

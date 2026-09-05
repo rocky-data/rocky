@@ -22,6 +22,12 @@ use rocky_ir::{
     ColumnInfo, ColumnSelection, Grant, GrantTarget, MaskStrategy, MetadataColumn, TableRef,
 };
 
+/// Re-exported so a `SqlDialect` impl needs one import, not two.
+///
+/// The encoding itself lives in [`rocky_sql::literal::encode_string_literal`];
+/// a dialect only states which rule its lexer follows.
+pub use rocky_sql::literal::LiteralEscape;
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -1229,6 +1235,27 @@ pub trait SqlDialect: Send + Sync {
         format!("\"{name}\"")
     }
 
+    /// How this warehouse's lexer reads a single-quoted string literal.
+    ///
+    /// The literal twin of [`SqlDialect::quote_identifier`]. Feed the answer
+    /// to [`rocky_sql::literal::encode_string_literal`] — or call
+    /// [`crate::sql_gen::string_literal`], which does it for you — instead of
+    /// splicing a value into `'…'` by hand.
+    ///
+    /// **There is deliberately no default.** A default would let a new
+    /// adapter inherit one dialect's lexer rule silently, and a silently
+    /// wrong lexer rule is exactly the defect this method exists to remove:
+    /// it corrupts values on some dialects and lets a quote close the literal
+    /// on others. An implementor states a one-word fact about its own lexer.
+    ///
+    /// That is a claim about the trait, so it is guarded like one. Every
+    /// implementation in the tree supplies the method, so *adding* a default
+    /// would leave the whole suite green. The guard is a `trybuild` case:
+    /// `rocky-core-compiletest/tests/compile_fail/missing_literal_escape.rs`
+    /// implements every other required method and omits this one, and is
+    /// pinned to fail with `E0046`.
+    fn literal_escape(&self) -> LiteralEscape;
+
     /// SQL expression that computes a single-row hash over `columns`,
     /// returning an integer wide enough to feed `BIT_XOR(...)` for
     /// chunk-checksum aggregation in
@@ -2117,6 +2144,104 @@ mod tests {
             assert_eq!(s, wire);
             let parsed: MaskStrategy = serde_json::from_str(wire).unwrap();
             assert_eq!(parsed, strat);
+        }
+    }
+}
+
+/// A stub dialect for this crate's own literal-encoding tests.
+///
+/// A real adapter dialect cannot stand in here: a dev-dependency on an
+/// adapter crate links a second instance of `rocky-core`, so its dialect
+/// implements that instance's `SqlDialect`, not this one's. The stub answers
+/// the lexer fact it is built with and the handful of methods a SQL
+/// generator calls; the real dialects are exercised in the adapter crates.
+#[cfg(test)]
+pub(crate) mod test_dialects {
+    use super::{AdapterError, AdapterResult, LiteralEscape, SqlDialect};
+
+    /// A dialect that answers exactly the lexer rule it carries.
+    pub(crate) struct StubDialect(pub(crate) LiteralEscape);
+
+    impl SqlDialect for StubDialect {
+        fn literal_escape(&self) -> LiteralEscape {
+            self.0
+        }
+
+        fn format_table_ref(
+            &self,
+            catalog: &str,
+            schema: &str,
+            table: &str,
+        ) -> AdapterResult<String> {
+            rocky_sql::validation::format_table_ref(catalog, schema, table)
+                .map_err(AdapterError::new)
+        }
+
+        fn create_table_as(&self, target: &str, select_sql: &str) -> String {
+            format!("CREATE OR REPLACE TABLE {target} AS\n{select_sql}")
+        }
+
+        fn insert_into(&self, target: &str, select_sql: &str) -> String {
+            format!("INSERT INTO {target}\n{select_sql}")
+        }
+
+        fn merge_into(
+            &self,
+            _target: &str,
+            _source_sql: &str,
+            _keys: &[std::sync::Arc<str>],
+            _update_cols: &rocky_ir::ColumnSelection,
+        ) -> AdapterResult<String> {
+            unimplemented!("not reached by literal-encoding tests")
+        }
+
+        fn select_clause(
+            &self,
+            _columns: &rocky_ir::ColumnSelection,
+            _metadata: &[rocky_ir::MetadataColumn],
+        ) -> AdapterResult<String> {
+            unimplemented!("not reached by literal-encoding tests")
+        }
+
+        fn watermark_where(
+            &self,
+            _timestamp_col: &str,
+            _last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
+        ) -> AdapterResult<String> {
+            unimplemented!("not reached by literal-encoding tests")
+        }
+
+        fn describe_table_sql(&self, table_ref: &str) -> String {
+            format!("DESCRIBE TABLE {table_ref}")
+        }
+
+        fn drop_table_sql(&self, table_ref: &str) -> String {
+            format!("DROP TABLE IF EXISTS {table_ref}")
+        }
+
+        fn create_catalog_sql(&self, _name: &str) -> Option<AdapterResult<String>> {
+            None
+        }
+
+        fn create_schema_sql(
+            &self,
+            _catalog: &str,
+            _schema: &str,
+        ) -> Option<AdapterResult<String>> {
+            None
+        }
+
+        fn tablesample_clause(&self, _percent: u32) -> Option<String> {
+            None
+        }
+
+        fn insert_overwrite_partition(
+            &self,
+            _target: &str,
+            _partition_filter: &str,
+            _select_sql: &str,
+        ) -> AdapterResult<Vec<String>> {
+            unimplemented!("not reached by literal-encoding tests")
         }
     }
 }

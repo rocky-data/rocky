@@ -28,7 +28,7 @@ Thumbs.db
 # Resident-scheduler runtime dir: tick lock, heartbeat, and the webhook demand spool.
 .rocky/
 
-# --- Vendored binaries (downloaded by scripts/vendor_*.sh) ---
+# --- Local release-build output (scripts/build_rocky_linux.sh) ---
 vendor/
 
 # --- Per-user Claude state (skills + shared settings.json are committed) ---

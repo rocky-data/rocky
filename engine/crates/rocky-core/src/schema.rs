@@ -142,6 +142,22 @@ pub enum SchemaError {
 
     #[error("invalid component spec '{spec}': cannot determine component type")]
     InvalidComponentSpec { spec: String },
+
+    #[error(
+        "metadata_columns value '{template}' substitutes source-schema component '{component}' \
+         whose value '{value}' is not a plain SQL identifier ([A-Za-z0-9_]+). That text comes \
+         from a schema name read back from the warehouse and is spliced into the replication \
+         SELECT, so Rocky refuses it. Rename the source schema, or drop the placeholder from \
+         this value."
+    )]
+    NonIdentifierComponent {
+        template: String,
+        component: String,
+        value: String,
+    },
+
+    #[error("metadata_columns entry '{name}' is not usable in the replication SELECT: {reason}")]
+    InvalidMetadataColumn { name: String, reason: String },
 }
 
 impl SchemaPattern {
@@ -493,6 +509,138 @@ impl ParsedSchema {
             true
         })
     }
+
+    /// Like [`Self::resolve_template`], but refuses to substitute a component
+    /// whose value is not a plain SQL identifier.
+    ///
+    /// Deliberately **not** a general-purpose method: the only caller is
+    /// [`resolve_metadata_columns`], because that is the only place a
+    /// component value is spliced into an SQL *expression* rather than into
+    /// an identifier position that `format_table_ref` validates later. Adding
+    /// a second caller means thinking about whether the strict rule is right
+    /// there too.
+    ///
+    /// # Errors
+    ///
+    /// [`SchemaError::NonIdentifierComponent`] naming the first offending
+    /// component. The rendered string is discarded on error, never returned.
+    fn resolve_template_from_identifiers(
+        &self,
+        template: &str,
+        default_sep: &str,
+    ) -> Result<String, SchemaError> {
+        let mut rejected: Option<(String, String)> = None;
+        let rendered = render_placeholders(template, |name, sep, out| {
+            let Some(value) = self.values.get(name) else {
+                return false;
+            };
+            // Check every part BEFORE any of it is appended, so a rejected
+            // component never contributes text to `out`.
+            let parts: &[String] = match value {
+                SchemaValue::Single(s) => std::slice::from_ref(s),
+                SchemaValue::Multiple(v) => v.as_slice(),
+            };
+            for part in parts {
+                if rocky_sql::validation::validate_identifier(part).is_err() {
+                    if rejected.is_none() {
+                        rejected = Some((name.to_string(), part.clone()));
+                    }
+                    return false;
+                }
+            }
+            match value {
+                SchemaValue::Single(s) => out.push_str(s),
+                SchemaValue::Multiple(v) => {
+                    let sep = sep.unwrap_or(default_sep);
+                    let mut iter = v.iter();
+                    if let Some(first) = iter.next() {
+                        out.push_str(first);
+                        for part in iter {
+                            out.push_str(sep);
+                            out.push_str(part);
+                        }
+                    }
+                }
+            }
+            true
+        });
+        if let Some((component, value)) = rejected {
+            return Err(SchemaError::NonIdentifierComponent {
+                template: template.to_string(),
+                component,
+                value,
+            });
+        }
+        Ok(rendered)
+    }
+}
+
+/// Resolves the `[[pipeline.<name>.metadata_columns]]` block for one parsed
+/// source schema into validated [`rocky_ir::MetadataColumn`]s.
+///
+/// This is the **only** production producer of replication metadata columns —
+/// `rocky plan` and `rocky run` both call it, so the preview and the run
+/// cannot disagree, and the two checks below have exactly one home.
+///
+/// # Why two checks and not one
+///
+/// A metadata `value` is an SQL *expression* by design (`NULL`,
+/// `current_timestamp()`, `'{tenant}'`), and it is spliced into
+/// `CAST({value} AS {type}) AS {name}`. Two different kinds of text meet in
+/// that string, and they get different rules:
+///
+/// ```text
+///   rocky.toml            warehouse
+///   value = "'{tenant}'"  schema name "src__acme__shopify"
+///        │                     │
+///        │                     ├─ SchemaPattern::parse  (splits on the separator,
+///        │                     │                         no identifier check)
+///        │                     ▼
+///        │                component value "acme"
+///        │                     │
+///        │                     ├─ validate_identifier   ◄── STRICT: warehouse text
+///        │                     │                             is never an expression
+///        ▼                     ▼
+///   resolved  "'acme'"  ─► MetadataColumn::new
+///                             ├─ validate_identifier(name)
+///                             ├─ validate_sql_type(data_type)
+///                             └─ reject_statement_terminator(value)  ◄── the author's
+///                                                                        own text
+/// ```
+///
+/// The author's own template text keeps the fragment rule Rocky uses
+/// everywhere: one statement, reads unbounded (a subquery is still possible —
+/// that is the documented posture, not a gap specific to this field). The
+/// substituted text is warehouse-controlled, was never an expression, and is
+/// held to a plain identifier. A terminator scan alone would not bound it: a
+/// component such as `a' || (…) || 'b` is semicolon-free and quote-balanced,
+/// and would reshape the expression inside the `CAST`.
+///
+/// Each component value is checked **individually**, before a multi-valued
+/// placeholder joins its parts with the separator.
+///
+/// # Errors
+///
+/// [`SchemaError::NonIdentifierComponent`] when a substituted source-schema
+/// component is not `[A-Za-z0-9_]+`, and
+/// [`SchemaError::InvalidMetadataColumn`] when the resolved triple fails
+/// [`rocky_ir::MetadataColumn::new`].
+pub fn resolve_metadata_columns(
+    parsed: &ParsedSchema,
+    configs: &[crate::config::MetadataColumnConfig],
+    default_sep: &str,
+) -> Result<Vec<rocky_ir::MetadataColumn>, SchemaError> {
+    let mut out = Vec::with_capacity(configs.len());
+    for mc in configs {
+        let resolved = parsed.resolve_template_from_identifiers(&mc.value, default_sep)?;
+        let column = rocky_ir::MetadataColumn::new(mc.name.clone(), mc.data_type.clone(), resolved)
+            .map_err(|e| SchemaError::InvalidMetadataColumn {
+                name: mc.name.clone(),
+                reason: e.to_string(),
+            })?;
+        out.push(column);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -510,6 +658,107 @@ mod tests {
             ])
             .unwrap(),
         }
+    }
+
+    fn metadata_config(
+        name: &str,
+        data_type: &str,
+        value: &str,
+    ) -> crate::config::MetadataColumnConfig {
+        crate::config::MetadataColumnConfig {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    /// The whole point of validating at the boundary rather than at config
+    /// load: `value` carries `{placeholder}`s filled from **source schema
+    /// names read back from the warehouse**, and `SchemaPattern::parse` splits
+    /// those on the separator with no identifier check. The config text is
+    /// accepted; the resolved text is what reaches `select_clause`.
+    ///
+    /// This drives `resolve_metadata_columns` — the same function `rocky plan`
+    /// and `rocky run` call — not a hand-rolled composition.
+    #[test]
+    fn a_hostile_source_schema_segment_is_refused_after_resolution() {
+        let pattern = sample_pattern();
+        let configs = [metadata_config("_tenant", "VARCHAR", "'{tenant}'")];
+
+        // The benign schema resolves and validates.
+        let benign = pattern.parse("src__acme__us_west__shopify").unwrap();
+        let cols = resolve_metadata_columns(&benign, &configs, &pattern.separator).unwrap();
+        assert_eq!(cols[0].value(), "'acme'");
+
+        // A quote in the segment is not an identifier and is refused before
+        // it ever reaches the rendered string.
+        let quoted = pattern.parse("src__o'brien__us_west__shopify").unwrap();
+        assert_eq!(quoted.get("tenant"), Some("o'brien"));
+        let err = resolve_metadata_columns(&quoted, &configs, &pattern.separator)
+            .expect_err("a non-identifier component must be refused");
+        assert!(
+            matches!(err, SchemaError::NonIdentifierComponent { .. }),
+            "expected NonIdentifierComponent, got {err:?}"
+        );
+    }
+
+    /// The statement-terminator scan alone does not bound the substituted
+    /// text: a component can be free of `;` and have balanced quotes and still
+    /// reshape the expression inside the `CAST`. Described in the abstract on
+    /// purpose — this repository is public.
+    ///
+    /// The identifier rule on each substituted component is what closes it.
+    #[test]
+    fn a_semicolon_free_balanced_segment_is_still_refused() {
+        let pattern = sample_pattern();
+        let configs = [metadata_config("_tenant", "VARCHAR", "'{tenant}'")];
+        // Balanced quotes, no terminator: the fragment scan accepts this text.
+        let segment = "a' || 'b";
+        assert!(
+            rocky_sql::validation::reject_statement_terminator("t", &format!("'{segment}'"))
+                .is_ok(),
+            "precondition: the fragment scan alone does NOT refuse this"
+        );
+        let parsed = pattern
+            .parse(&format!("src__{segment}__us_west__shopify"))
+            .unwrap();
+        let err = resolve_metadata_columns(&parsed, &configs, &pattern.separator)
+            .expect_err("a component that is not an identifier must be refused");
+        assert!(matches!(err, SchemaError::NonIdentifierComponent { .. }));
+    }
+
+    /// Each part of a multi-valued placeholder is checked on its own, before
+    /// the separator joins them — a hostile part must not hide behind a benign
+    /// first one.
+    #[test]
+    fn every_part_of_a_multi_valued_component_is_checked() {
+        let pattern = sample_pattern();
+        let configs = [metadata_config("_regions", "VARCHAR", "'{regions}'")];
+        let parsed = pattern
+            .parse("src__acme__us_west__eu(west__shopify")
+            .unwrap();
+        assert_eq!(
+            parsed.get_multiple("regions"),
+            Some(["us_west".to_string(), "eu(west".to_string()].as_slice())
+        );
+        let err = resolve_metadata_columns(&parsed, &configs, &pattern.separator)
+            .expect_err("the second region part is not an identifier");
+        match err {
+            SchemaError::NonIdentifierComponent { value, .. } => assert_eq!(value, "eu(west"),
+            other => panic!("expected NonIdentifierComponent, got {other:?}"),
+        }
+    }
+
+    /// A template whose own text is hostile is refused by the constructor,
+    /// even with no placeholder in it at all.
+    #[test]
+    fn the_authors_own_template_text_still_goes_through_the_constructor() {
+        let pattern = sample_pattern();
+        let parsed = pattern.parse("src__acme__us_west__shopify").unwrap();
+        let configs = [metadata_config("_x", "VARCHAR", "NULL) AS y; SELECT 1 --")];
+        let err = resolve_metadata_columns(&parsed, &configs, &pattern.separator)
+            .expect_err("a statement terminator in the template must be refused");
+        assert!(matches!(err, SchemaError::InvalidMetadataColumn { .. }));
     }
 
     #[test]
