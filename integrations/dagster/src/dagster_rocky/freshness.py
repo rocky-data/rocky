@@ -31,10 +31,26 @@ FRESHNESS_CHECK_NAME: str = "freshness"
 
 
 def freshness_is_configured(checks: ChecksConfig | None) -> bool:
-    """Return ``True`` when the pipeline declares ``[checks.freshness]``.
+    """Return ``True`` when the given ``rocky discover`` projection reports a
+    ``[checks.freshness]`` config.
 
-    This is the single predicate for "the engine will emit a ``freshness``
-    ``CheckResult`` for this pipeline". Two consumers depend on it:
+    This reads a PROJECTION, not the engine. It answers "the discover output in
+    front of me says freshness is configured", which is the best available
+    stand-in for "the engine will emit a ``freshness`` ``CheckResult``" — but it
+    is not the same statement. It is wrong in two known cases, both of which
+    make it say ``False`` while the engine emits a result:
+
+    * **Stale state.** ``RockyComponent`` caches ``rocky discover``. Adding
+      ``[checks.freshness]`` to ``rocky.toml`` without refreshing the state
+      leaves this ``False``.
+    * **An old binary.** A ``rocky`` that predates the ``checks`` projection
+      emits no ``checks`` field at all, which parses as ``None``.
+
+    In both cases the emitted result meets no declared spec: the streaming path
+    drops it (``_emit_results``) and the Pipes path fails the step. Refresh the
+    state after changing ``[checks]``.
+
+    Two consumers depend on it:
 
     * :func:`freshness_policy_from_checks` returns the pipeline-level
       :class:`dagster.FreshnessPolicy` only when it is ``True``;
@@ -52,11 +68,10 @@ def freshness_is_configured(checks: ChecksConfig | None) -> bool:
     by ``rocky tick`` and ``rocky validate``, not by the check runner — so it
     does not change the answer here.
 
-    ``checks`` is ``None`` in two cases, and both mean "no freshness":
-    the pipeline declares no ``[checks]`` block at all (the engine's
-    ``ChecksConfigOutput::from_engine`` returns ``None`` when there is neither a
-    freshness config nor a configured check), or the ``rocky`` binary predates
-    the ``checks`` projection in ``rocky discover``.
+    ``checks`` is ``None`` when the pipeline declares no ``[checks]`` block at
+    all — the engine's ``ChecksConfigOutput::from_engine`` returns ``None`` when
+    there is neither a freshness config nor a configured check — and also in the
+    old-binary case above. The two are indistinguishable here.
     """
     return checks is not None and checks.freshness is not None
 
