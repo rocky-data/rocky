@@ -43,6 +43,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A dangling symlink at the webhook spool now refuses, instead of reading as no pending demand.** The scheduler lists `.rocky/pending-demands` on every tick. A spool that was never created reads as an empty list, which is right: most projects take no webhook demand. That branch was built from `ErrorKind::NotFound`, and a spool symlink whose target is gone fails the read in exactly the same way. The scheduler saw no demand and ticked on. Demands already spooled behind that link were never run, and nothing said so.
+
+  The scan now asks `std::fs::symlink_metadata`, which stats the link instead of following it. Nothing at the path is still an empty list. An entry at the path that the scan could not read is now an error naming the spool path and the symlink target it could not resolve; the reconciler logs it and skips the webhook step for that tick, rather than reporting zero pending demand. A missing `.rocky` directory is still absence. A symlink that resolves still lists as before. This is the #1668 discriminator, now shared by both read sites in one crate-private helper.
+
+  The incidents directory that #1707 also names needed no change: `rocky brief` and the incident sweep have refused any symlinked `.rocky/incidents`, dangling or not, since #1339. A test now pins the dangling half.
+
+  **On upgrade:** a project whose spool path is a broken symlink changes from silently idle to a logged refusal on each tick. Fix or remove the link and the scheduler resumes. Nothing changes for a project with an ordinary spool directory, or with none. (#1707)
+
 - **A `rocky.toml` that is a symlink to a missing file now refuses, instead of reading as no config at all.** `ConfigError::FileNotFound` is the one signal every caller reads as "this project has no `rocky.toml`", and #1667 made it the single discriminator for the offline entry points that share one loader. It was built from `ErrorKind::NotFound`, which does not only mean "nothing is at this path". A `rocky.toml` symlink whose target was deleted fails the read the same way. The project plainly had a config. Every command read that as absent and carried on against defaults — compiling on the DuckDB dialect, and, at the governance gate, finding no `[policy]` block to enforce.
 
   The single read site now asks `std::fs::symlink_metadata`, which stats the link instead of following it. Nothing at the path is still `FileNotFound`. An entry at the path that the read could not open is a new `ConfigError::UnreadableFile`; its message names the config path and the symlink target it could not resolve. A missing parent directory is still absence. A directory sitting where the file should be already refused as a read error, and still does. A symlink that resolves still loads normally.

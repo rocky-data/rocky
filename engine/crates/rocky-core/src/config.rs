@@ -9,6 +9,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::hooks::HooksConfig;
+use crate::path_presence::{PathPresence, classify_not_found};
 use crate::redacted::RedactedString;
 use crate::schema::SchemaPattern;
 
@@ -6251,65 +6252,26 @@ fn read_config_file(path: &Path) -> Result<String, ConfigError> {
 /// Decide what a `NotFound` from reading `path` actually means.
 ///
 /// `std::io::ErrorKind::NotFound` covers two different worlds, and only one of
-/// them is "this project has no config":
+/// them is "this project has no config". [`crate::path_presence`] holds the
+/// discriminator — [`std::fs::symlink_metadata`], which still stats a
+/// `rocky.toml` symlink whose target is missing — and the scheduler spool scan
+/// shares it (#1707). This function only names the two answers in config
+/// terms: an absence every caller reads as "no config", and a refusal.
 ///
-/// ```text
-///   read_to_string(path) -> NotFound
-///            |
-///            +-- symlink_metadata FAILS with NotFound
-///            |        nothing is at this path -> FileNotFound  (absent)
-///            |
-///            +-- symlink_metadata SUCCEEDS
-///                     an entry IS at this path -> UnreadableFile (refuse)
-/// ```
-///
-/// [`std::fs::symlink_metadata`] stats the link itself instead of following
-/// it, so a `rocky.toml` symlink whose target is missing still stats even
-/// though the read failed. That is the discriminator. Without it a project
-/// whose config symlink is broken looks configless and runs on defaults
-/// (#1668).
+/// Without it a project whose config symlink is broken looks configless and
+/// runs on defaults (#1668).
 ///
 /// A directory at the path never reaches here: reading a directory fails with
 /// `IsADirectory` (Windows: `PermissionDenied`), so it was already a
 /// [`ConfigError::ReadFile`] refusal and stays one.
 fn classify_read_not_found(path: &Path) -> ConfigError {
-    match std::fs::symlink_metadata(path) {
-        // Nothing at this path. Genuinely absent — unchanged behaviour, and
-        // the case dozens of callers depend on.
-        Err(stat_error) if stat_error.kind() == std::io::ErrorKind::NotFound => {
-            ConfigError::FileNotFound {
-                path: path.to_path_buf(),
-            }
-        }
-        // The path could not even be stat-ed, so absence is unproven.
-        // Refusing is the fail-closed answer.
-        Err(stat_error) => ConfigError::UnreadableFile {
+    match classify_not_found(path) {
+        PathPresence::Absent => ConfigError::FileNotFound {
             path: path.to_path_buf(),
-            detail: format!("the path could not be inspected: {stat_error}"),
         },
-        // A symlink is here and the read followed it into nothing: dangling.
-        // `read_link` names the immediate hop — the link as written, which is
-        // what the operator has to go fix — so the message says the target
-        // cannot be RESOLVED rather than claiming that one name is missing.
-        Ok(metadata) if metadata.is_symlink() => ConfigError::UnreadableFile {
+        PathPresence::Present { detail } => ConfigError::UnreadableFile {
             path: path.to_path_buf(),
-            detail: match std::fs::read_link(path) {
-                Ok(target) => format!(
-                    "it is a symlink to '{}', which cannot be resolved",
-                    target.display()
-                ),
-                Err(link_error) => {
-                    format!("it is a symlink that cannot be resolved ({link_error})")
-                }
-            },
-        },
-        // An entry that is not a symlink is here, yet the read said the file
-        // was missing — it was replaced under us between the two calls. Not
-        // absence either way.
-        Ok(_) => ConfigError::UnreadableFile {
-            path: path.to_path_buf(),
-            detail: "an entry exists at this path, but reading it reported the file missing"
-                .to_string(),
+            detail,
         },
     }
 }

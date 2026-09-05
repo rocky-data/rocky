@@ -2201,4 +2201,42 @@ mod tests {
         );
         assert_eq!(s.runs_in_window, 1);
     }
+
+    /// The DANGLING half of the same guard, pinned: a `.rocky/incidents`
+    /// symlink whose target is gone must not report zero incidents. The guard
+    /// stats the link rather than following it, so it fires before `read_dir`
+    /// can return the `NotFound` that a never-created directory also returns
+    /// (#1707). Without this the section would under-report to 0 in a brief a
+    /// human reads to decide something.
+    #[cfg(unix)]
+    #[test]
+    fn scheduler_section_refuses_a_dangling_incidents_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = scheduler_project(&tmp);
+        let state_path = tmp.path().join("state.redb");
+        let store = StateStore::open(&state_path).unwrap();
+        let rocky_dir = tmp.path().join(".rocky");
+        std::fs::create_dir_all(&rocky_dir).unwrap();
+        // The target is never created: the link resolves to nothing.
+        std::os::unix::fs::symlink(tmp.path().join("gone"), rocky_dir.join("incidents")).unwrap();
+
+        let mut sched_fail = run("r-sched", RunStatus::Failure, vec![]);
+        sched_fail.trigger = RunTrigger::Schedule;
+        store.record_run(&sched_fail).unwrap();
+
+        let s = build_scheduler(&config, &store, None, &rocky_dir, MAX_HISTORY_SCAN);
+        assert!(
+            matches!(s.availability, SectionAvailability::Unavailable),
+            "a dangling incidents link must fail the section closed, not read as 0"
+        );
+        assert_eq!(
+            s.incident_count, 0,
+            "an unavailable section reports no count at all"
+        );
+        assert!(
+            s.note.as_deref().unwrap().contains("symlink"),
+            "{:?}",
+            s.note
+        );
+    }
 }
