@@ -408,6 +408,24 @@ pub fn check_column_match(
     }
 }
 
+/// A column-match check the engine could not evaluate: a column probe on
+/// either side failed or returned no columns.
+///
+/// Always fails. `missing` and `extra` are empty because nothing was
+/// compared — they are placeholders, never a reading of the two column sets.
+pub fn column_match_not_evaluated(reason: impl Into<String>) -> CheckResult {
+    CheckResult {
+        name: "column_match".to_string(),
+        passed: false,
+        severity: TestSeverity::Error,
+        not_evaluated: Some(reason.into()),
+        details: CheckDetails::ColumnMatch {
+            missing: Vec::new(),
+            extra: Vec::new(),
+        },
+    }
+}
+
 /// Checks null rate for a column.
 pub fn check_null_rate(column: &str, null_rate: f64, threshold: f64) -> CheckResult {
     CheckResult {
