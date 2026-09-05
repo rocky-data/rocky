@@ -65,7 +65,11 @@ fn load_project_config(
     match rocky_core::config::load_rocky_config_credential_tolerant(path) {
         Ok(config) => Ok(Some(config)),
         Err(rocky_core::config::ConfigError::FileNotFound { .. }) => Ok(None),
-        Err(error) => Err(error.into()),
+        // Name the config as the cause, the way `plan` and `test` do, so the
+        // user reads "failed to load config from <path>" before the parse
+        // detail rather than a bare TOML error.
+        Err(error) => Err(anyhow::Error::new(error)
+            .context(format!("failed to load config from {}", path.display()))),
     }
 }
 
