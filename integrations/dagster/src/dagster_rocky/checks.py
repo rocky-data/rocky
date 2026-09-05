@@ -148,6 +148,27 @@ def check_metadata(check: CheckResult) -> dict[str, dg.MetadataValue]:
     if check.result_value is not None:
         metadata["result_value"] = dg.MetadataValue.int(check.result_value)
 
+    # Cross-source overlap. Without these the only failed cross-source-overlap
+    # check an operator can see says nothing about WHAT overlapped: the count,
+    # the sibling tables the check unioned, and the sample keys all live on the
+    # result and were being dropped here (#1669).
+    if check.overlap_count is not None:
+        metadata["overlap_count"] = dg.MetadataValue.int(check.overlap_count)
+    if check.contributing_tables is not None:
+        metadata["contributing_tables"] = dg.MetadataValue.text(
+            ", ".join(check.contributing_tables) if check.contributing_tables else "(none)"
+        )
+    if check.sample:
+        metadata["overlap_sample"] = dg.MetadataValue.text("\n".join(check.sample))
+
+    # Not evaluated — applies to EVERY check kind, not just cross-source
+    # overlap: a refused SQL fragment, a failed query, a keyless table and a
+    # misconfigured key all land here. While it is set the check is reported
+    # as failed and the numeric fields above are placeholders, not readings,
+    # so the reason must be visible next to them.
+    if check.not_evaluated is not None:
+        metadata["not_evaluated"] = dg.MetadataValue.text(check.not_evaluated)
+
     # Severity — surfaced only when advisory (WARN). ``"error"`` is the implicit
     # default, so showing it on every check would clutter the panel. Deriving
     # from :func:`dagster_check_severity` keeps one source of truth for "is this

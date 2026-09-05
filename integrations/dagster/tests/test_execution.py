@@ -460,9 +460,11 @@ def test_configured_checks_predeclared_when_opt_in(discover_json: str, tmp_path:
     # the same sanitizer runs in _emit_results so the run-time result lands.
     orders_specs = _check_specs_for_table(defs, "orders")
     assert {"orders_have_rows", "null_rate_amount"} <= orders_specs
-    # The ``candidate`` cross_source_overlap name is a GROUP check — excluded so
-    # non-emitting siblings don't get a misleading passing placeholder.
-    assert "cross_source_overlap_fivetran_orders" not in orders_specs
+    # The ``candidate`` cross_source_overlap name is a GROUP check. It IS
+    # declared (#1669) — the emit side gives the non-carrier siblings an
+    # explicit "not evaluated on this asset" result rather than the passing
+    # placeholder that made excluding it necessary.
+    assert "cross_source_overlap_fivetran_orders" in orders_specs
     # The names attach to the matching asset only, not to other tables.
     assert "orders_have_rows" not in _check_specs_for_table(defs, "payments")
 
