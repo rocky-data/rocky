@@ -379,6 +379,7 @@ def test_run_filters_pipes_builds_asset_key_fn_from_group_mapping():
             filters=["client=acme"],
             group=group,
             selected_keys=selected,
+            declared_check_pairs=set(),
         )
     )
 
@@ -421,6 +422,7 @@ def test_run_filters_pipes_falls_back_to_last_segment_for_drift_events():
             filters=["client=acme"],
             group=group,
             selected_keys={dagster_key},
+            declared_check_pairs=set(),
         )
     )
 
@@ -462,6 +464,7 @@ def test_run_filters_pipes_last_segment_ambiguous_across_connectors_drops(caplog
             filters=["client=coca_cola"],
             group=group,
             selected_keys={fb, gg},
+            declared_check_pairs=set(),
         )
     )
 
@@ -474,9 +477,9 @@ def test_run_filters_pipes_last_segment_ambiguous_across_connectors_drops(caplog
     assert any("Ambiguous Rocky table identifier" in r.message for r in caplog.records)
 
 
-def test_run_filters_pipes_yields_get_results_unchanged():
-    """The asset body yields whatever `.get_results()` produces — the
-    wrapper is pure plumbing, not a transform."""
+def test_run_filters_pipes_yields_non_check_results_unchanged():
+    """Everything that is not an ``AssetCheckResult`` passes through
+    untouched — only check results are filtered against the declared specs."""
     from dagster_rocky.component import _GroupBuild, _run_filters_pipes
 
     group = _GroupBuild(
@@ -501,6 +504,7 @@ def test_run_filters_pipes_yields_get_results_unchanged():
             filters=["client=g"],
             group=group,
             selected_keys=set(),
+            declared_check_pairs=set(),
         )
     )
     assert out == sentinel_events

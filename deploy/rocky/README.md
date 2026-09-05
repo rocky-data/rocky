@@ -91,5 +91,5 @@ On its first read the new engine migrates the state store forward when the state
 ## What it does not do
 
 - Remote state. `[state] backend = "s3"` and the other sync backends are not configured here; the state store is the file on the volume.
-- More than one replica, a rolling update, or a second machine. One scheduler per project is the rule the engine enforces with a per-volume lock, and this example keeps to it.
+- More than one replica, a rolling update, or a second machine. One scheduler per project is the rule the engine enforces with a per-volume lock, and this example keeps to it. The [deployment contract](https://rocky-data.dev/advanced/deployment-contract/) says what happens when the rule is broken.
 - TLS, users, or a public port. Those belong to the gateway you put in front.
