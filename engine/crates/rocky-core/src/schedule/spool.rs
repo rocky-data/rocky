@@ -385,7 +385,7 @@ pub fn list_pending_files(rocky_dir: &Path) -> io::Result<Vec<PathBuf>> {
         Ok(e) => e,
         // `NotFound` has two meanings here and only one of them is "no demand
         // is pending". Ask the shared discriminator which one this is.
-        Err(e) if e.kind() == io::ErrorKind::NotFound => match classify_not_found(&dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => match classify_not_found(dir.as_path()) {
             PathPresence::Absent => return Ok(out),
             PathPresence::Present { detail } => {
                 return Err(io::Error::other(format!(
