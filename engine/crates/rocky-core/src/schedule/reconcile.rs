@@ -1862,6 +1862,35 @@ cron = "also invalid"
         finished_at: DateTime<Utc>,
     }
 
+    /// A spawner that takes the store gate during the child's window, the way
+    /// the resident server's job-record write does
+    /// (`JobsModelSpawner::record`). It must succeed: the tick releases its
+    /// permit with the store at `PhaseStore::close`, and if a future edit ever
+    /// held the permit across the spawn instead, this waits forever — a hung
+    /// scheduler, not a failed one. The bounded wait turns that into a failure.
+    struct GateProbingSpawner {
+        gate: Arc<Semaphore>,
+        acquired: Mutex<bool>,
+    }
+
+    #[async_trait]
+    impl Spawner for GateProbingSpawner {
+        async fn run(&self, _request: &SpawnRequest) -> RunOutcome {
+            let got = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                Arc::clone(&self.gate).acquire_owned(),
+            )
+            .await
+            .is_ok();
+            *self.acquired.lock().unwrap() = got;
+            RunOutcome {
+                exit_code: 0,
+                pid: Some(4243),
+                drain_interrupted: false,
+            }
+        }
+    }
+
     #[async_trait]
     impl Spawner for OpeningSpawner {
         async fn run(&self, request: &SpawnRequest) -> RunOutcome {
@@ -2914,6 +2943,52 @@ freshness = true
             report.evaluated.len(),
             1,
             "the pipeline was evaluated once the gate opened"
+        );
+        assert_eq!(
+            gate.available_permits(),
+            1,
+            "the tick returned its permit with the store"
+        );
+    }
+
+    #[test]
+    fn the_store_gate_is_free_during_a_child_window() {
+        let (state_path, _dir, mut opts) = temp_env();
+        let config = cfg(CRON_ONLY);
+        let gate = Arc::new(Semaphore::new(1));
+        opts.store_gate = Some(gate.clone());
+
+        // First sight anchors raw's cron and fires nothing.
+        let anchor = CapturingSpawner::new(0);
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            at(2026, 5, 1, 12, 0),
+            &anchor,
+            &opts,
+        ))
+        .unwrap();
+
+        // The occurrence fires. The spawner takes the gate mid-child, exactly as
+        // the server's job-record write does.
+        let spawner = GateProbingSpawner {
+            gate: gate.clone(),
+            acquired: Mutex::new(false),
+        };
+        let report = rt()
+            .block_on(tick_once(
+                &config,
+                &state_path,
+                at(2026, 5, 2, 4, 0),
+                &spawner,
+                &opts,
+            ))
+            .unwrap();
+
+        assert_eq!(report.executed.len(), 1, "the occurrence fired");
+        assert!(
+            *spawner.acquired.lock().unwrap(),
+            "the gate must be free while a child runs, or the scheduler deadlocks"
         );
         assert_eq!(
             gate.available_permits(),
