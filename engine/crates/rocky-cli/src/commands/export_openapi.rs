@@ -330,6 +330,24 @@ fn route_table() -> Vec<Route> {
              by a newer engine), or `products/` could not be read.",
         body: Body::Component("ErrorEnvelope"),
     };
+    const PLAN_NOT_FOUND: Resp = Resp {
+        status: "404",
+        description: "The id is not 64 lower-case hex characters, or no plan file exists \
+             under it.",
+        body: Body::Component("ErrorEnvelope"),
+    };
+    const REVIEW_MARKER_MALFORMED: Resp = Resp {
+        status: "409",
+        description: "A review marker exists for the plan but does not parse, or names \
+             another plan. Re-approve with `rocky review <plan-id> --approve` to rewrite it.",
+        body: Body::Component("ErrorEnvelope"),
+    };
+    const REVIEW_READ_FAILED: Resp = Resp {
+        status: "500",
+        description: "The decision ledger could not be read, or the plan file could not be \
+             parsed.",
+        body: Body::Component("ErrorEnvelope"),
+    };
     const JOB_ACCEPTED: Resp = Resp {
         status: "202",
         description: "Job accepted. Poll `GET /api/v1/jobs/{id}` for status.",
@@ -766,6 +784,57 @@ fn route_table() -> Vec<Route> {
         },
         Route {
             method: "get",
+            path: "/api/v1/review/queue",
+            operation_id: "getReviewQueue",
+            tag: "review",
+            summary: "Pending review queue",
+            description: "Every outstanding `require_review` escalation that a persisted plan \
+                 can clear, ranked by blast radius, change class and staleness. The same \
+                 bytes as `rocky review --queue --output json` for the same project and \
+                 store, except `staleness_seconds` and `score`, which derive from the \
+                 request instant. Compiles the project once per call to rank by blast \
+                 radius, as the CLI does. Reads only.",
+            path_params: &[],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The ranked queue.",
+                    body: Body::Component("ReviewQueueOutput"),
+                },
+                ENGINE_BUSY_OR_NOT_READY,
+                REVIEW_READ_FAILED,
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
+            path: "/api/v1/review/{plan_id}/status",
+            operation_id: "getReviewStatus",
+            tag: "review",
+            summary: "One plan's review state",
+            description: "Whether a well-formed sign-off marker naming the plan exists, who \
+                 approved it and when, and its product binding. The same bytes as \
+                 `rocky review <plan-id> --status --output json`. Reads only.",
+            path_params: &["plan_id"],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The plan's review state.",
+                    body: Body::Component("ReviewStatusOutput"),
+                },
+                PLAN_NOT_FOUND,
+                REVIEW_MARKER_MALFORMED,
+                ENGINE_BUSY_OR_NOT_READY,
+                REVIEW_READ_FAILED,
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
             path: "/api/v1/schedule",
             operation_id: "getScheduleStatus",
             tag: "schedule",
@@ -1083,6 +1152,8 @@ mod tests {
             "DagStatusOutput",
             "ProductListOutput",
             "ProductStatusOutput",
+            "ReviewQueueOutput",
+            "ReviewStatusOutput",
             "ErrorEnvelope",
             "JobRequest",
         ] {
@@ -1144,6 +1215,8 @@ mod tests {
             ("/api/v1/dag/status", "DagStatusOutput"),
             ("/api/v1/products", "ProductListOutput"),
             ("/api/v1/products/{name}", "ProductStatusOutput"),
+            ("/api/v1/review/queue", "ReviewQueueOutput"),
+            ("/api/v1/review/{plan_id}/status", "ReviewStatusOutput"),
         ] {
             let schema = &doc["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]
                 ["schema"];

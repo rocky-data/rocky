@@ -22051,6 +22051,121 @@
         ]
       }
     },
+    "/api/v1/review/queue": {
+      "get": {
+        "description": "Every outstanding `require_review` escalation that a persisted plan can clear, ranked by blast radius, change class and staleness. The same bytes as `rocky review --queue --output json` for the same project and store, except `staleness_seconds` and `score`, which derive from the request instant. Compiles the project once per call to rank by blast radius, as the CLI does. Reads only.",
+        "operationId": "getReviewQueue",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewQueueOutput"
+                }
+              }
+            },
+            "description": "The ranked queue."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The decision ledger could not be read, or the plan file could not be parsed."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "Pending review queue",
+        "tags": [
+          "review"
+        ]
+      }
+    },
+    "/api/v1/review/{plan_id}/status": {
+      "get": {
+        "description": "Whether a well-formed sign-off marker naming the plan exists, who approved it and when, and its product binding. The same bytes as `rocky review <plan-id> --status --output json`. Reads only.",
+        "operationId": "getReviewStatus",
+        "parameters": [
+          {
+            "description": "Path parameter `plan_id`.",
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewStatusOutput"
+                }
+              }
+            },
+            "description": "The plan's review state."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The id is not 64 lower-case hex characters, or no plan file exists under it."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A review marker exists for the plan but does not parse, or names another plan. Re-approve with `rocky review <plan-id> --approve` to rewrite it."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The decision ledger could not be read, or the plan file could not be parsed."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "One plan's review state",
+        "tags": [
+          "review"
+        ]
+      }
+    },
     "/api/v1/runs": {
       "get": {
         "description": "Canonical project run history. Byte-identical to `rocky history --output json`.",

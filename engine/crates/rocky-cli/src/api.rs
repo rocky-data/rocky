@@ -14,6 +14,8 @@
 //! GET  /api/v1/runs                             → project run history
 //! GET  /api/v1/products                         → every product (= rocky product list)
 //! GET  /api/v1/products/:name                   → one product (= rocky product status)
+//! GET  /api/v1/review/queue                     → pending escalations (= rocky review --queue)
+//! GET  /api/v1/review/:plan_id/status           → one plan's sign-off (= rocky review --status)
 //! GET  /api/v1/compile                          → full compile result
 //! GET  /api/v1/dag                              → full unified DAG
 //! GET  /api/v1/dag/layers                       → execution layers (typed, no CLI twin)
@@ -80,8 +82,12 @@ use rocky_server::auth::{build_cors_layer, require_bearer_token};
 use rocky_server::dashboard;
 use rocky_server::state::ServerState;
 
+use crate::commands::audit::plan_file_path;
 use crate::commands::product::{
     ProductListOutput, ProductStatusOutput, product_list_in, product_names_in, product_status_in,
+};
+use crate::commands::review::{
+    ReviewMarkerState, compute_review_queue, compute_review_status, review_marker_state,
 };
 use crate::commands::{
     ScheduleStatusError, column_lineage_output, compile_output, dag_output, history_runs_output,
@@ -94,6 +100,7 @@ use crate::output::{
     ModelDetailOutput, ModelHistoryOutput, ModelListEntry, ModelListOutput, ScheduleStatusOutput,
     TypedColumnOutput, cap_model_sql,
 };
+use crate::output::{ReviewQueueOutput, ReviewStatusOutput};
 
 /// Bind config for [`serve`].
 ///
@@ -168,6 +175,8 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/schedule", get(schedule_status))
         .route("/api/v1/products", get(list_products))
         .route("/api/v1/products/{name}", get(get_product))
+        .route("/api/v1/review/queue", get(review_queue))
+        .route("/api/v1/review/{plan_id}/status", get(review_status))
         // Webhook ingress. Registered BEFORE the auth layer like every route, but
         // the middleware PREFIX-exempts `/api/v1/hooks/trigger/{pipeline}` from
         // the Bearer token (see `rocky_server::auth`): the handler authenticates
@@ -375,6 +384,28 @@ impl ApiError {
             "product_not_found",
             format!("product '{name}' not found"),
             Some("list the products this project knows at GET /api/v1/products"),
+        )
+    }
+
+    /// `404` — no persisted plan file under this id.
+    fn plan_not_found(plan_id: &str) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "plan_not_found",
+            format!("plan '{plan_id}' not found"),
+            Some("list the pending plans at GET /api/v1/review/queue"),
+        )
+    }
+
+    /// `409` — a review marker exists for the plan but is malformed, or
+    /// names another plan. An integrity fault of custody files, not a server
+    /// fault; the CLI refuses the same way.
+    fn review_marker_malformed(plan_id: &str, reason: &str) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "review_marker_malformed",
+            format!("review marker for plan '{plan_id}' is invalid: {reason}"),
+            Some("re-approve with `rocky review <plan-id> --approve` to rewrite it atomically"),
         )
     }
 
@@ -645,6 +676,8 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "GET /api/v1/schedule",
         "GET /api/v1/products",
         "GET /api/v1/products/{name}",
+        "GET /api/v1/review/queue",
+        "GET /api/v1/review/{plan_id}/status",
         "POST /api/v1/hooks/trigger/{pipeline}",
     ]
     .into_iter()
@@ -672,6 +705,7 @@ fn capabilities() -> Vec<String> {
         "webhooks",
         "estate",
         "products",
+        "review",
     ]
     .into_iter()
     .map(String::from)
@@ -1096,6 +1130,88 @@ async fn get_product(
         Some(status) => Ok(PrettyJson(status)),
         None => Err(ApiError::product_not_found(&name)),
     }
+}
+
+/// `GET /api/v1/review/queue` — canonical [`ReviewQueueOutput`].
+///
+/// The same bytes as `rocky review --queue --output json` for the project the
+/// bound config names, modulo the clock: `staleness_seconds` and the `score`
+/// it feeds derive from the request instant. Compiles the project once per
+/// call to rank by blast radius, exactly as the CLI does. Reads only.
+async fn review_queue(
+    State(state): State<Arc<ServerState>>,
+) -> Result<PrettyJson<ReviewQueueOutput>, ApiError> {
+    let root = project_root_for(&state)?;
+    let config = state
+        .config_path
+        .clone()
+        .ok_or_else(ApiError::engine_not_ready)?;
+    let state_path = state_path_for(&state);
+    let models_dir = state.models_dir.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        compute_review_queue(&root, &config, &state_path, &models_dir)
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    Ok(PrettyJson(output))
+}
+
+/// `GET /api/v1/review/:plan_id/status` — canonical [`ReviewStatusOutput`].
+///
+/// The same bytes as `rocky review <plan-id> --status --output json`. A plan
+/// id that is not 64 lower-case hex characters, or has no plan file, is
+/// `404 plan_not_found`. A marker that exists but is malformed or names
+/// another plan is `409 review_marker_malformed`, with the CLI's own reason.
+async fn review_status(
+    State(state): State<Arc<ServerState>>,
+    ApiPath(plan_id): ApiPath<String>,
+) -> Result<PrettyJson<ReviewStatusOutput>, ApiError> {
+    if !is_plan_id(&plan_id) {
+        return Err(ApiError::plan_not_found(&plan_id));
+    }
+    let root = project_root_for(&state)?;
+    let lookup = plan_id.clone();
+    let output = tokio::task::spawn_blocking(move || -> anyhow::Result<ReviewStatusLookup> {
+        if !plan_file_path(&root, &lookup).is_file() {
+            return Ok(ReviewStatusLookup::NoPlan);
+        }
+        if let ReviewMarkerState::Invalid { reason } = review_marker_state(&root, &lookup) {
+            return Ok(ReviewStatusLookup::MalformedMarker { reason });
+        }
+        compute_review_status(&root, &lookup)
+            .map(|status| ReviewStatusLookup::Found(Box::new(status)))
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    match output {
+        ReviewStatusLookup::Found(status) => Ok(PrettyJson(*status)),
+        ReviewStatusLookup::NoPlan => Err(ApiError::plan_not_found(&plan_id)),
+        ReviewStatusLookup::MalformedMarker { reason } => {
+            Err(ApiError::review_marker_malformed(&plan_id, &reason))
+        }
+    }
+}
+
+/// The three ways a status lookup can end, decided on the blocking side so
+/// the handler maps each to its documented status code.
+enum ReviewStatusLookup {
+    /// Boxed: the payload dwarfs the two refusal arms.
+    Found(Box<ReviewStatusOutput>),
+    NoPlan,
+    MalformedMarker {
+        reason: String,
+    },
+}
+
+/// A plan id is the 64 lower-case hex characters of a blake3 digest. Anything
+/// else names no plan file, so the route answers 404 without touching disk.
+fn is_plan_id(candidate: &str) -> bool {
+    candidate.len() == 64
+        && candidate
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// The rule a product name must satisfy to exist at all: a bare identifier,
@@ -2199,6 +2315,193 @@ mod tests {
         }
     }
 
+    // --- /review ---
+
+    /// A project with two pending escalations, one reviewed plan, and one
+    /// decision-only ledger row (a plan id with no plan file). Returns the
+    /// root, config, state path, and the three plan ids in that order:
+    /// pending A, pending B, reviewed C.
+    fn review_fixture(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf, [String; 3]) {
+        use crate::commands::review::{record_plan_review_escalation, write_test_review_marker};
+        use crate::plan_store::{PlanKind, write_plan};
+        use rocky_core::config::{PolicyCapability, PolicyPrincipal};
+
+        let (root, config, state_path) = crate::commands::product::tests::api_fixture_project(dir);
+        let plan = |tag: &str| {
+            write_plan(
+                &root,
+                PlanKind::Run,
+                &serde_json::json!({ "models": [tag] }),
+            )
+            .expect("plan written")
+        };
+        let a = plan("orders");
+        let b = plan("customers");
+        let c = plan("revenue");
+        for (plan_id, model, capability) in [
+            (&a, "orders", PolicyCapability::SchemaChangeAdditive),
+            (&b, "customers", PolicyCapability::SchemaChangeBreaking),
+            (&c, "revenue", PolicyCapability::SchemaChangeAdditive),
+        ] {
+            record_plan_review_escalation(
+                &state_path,
+                plan_id,
+                PolicyPrincipal::Agent,
+                capability,
+                model,
+                "test escalation",
+            );
+        }
+        // C is signed off, so it leaves the queue but keeps a status.
+        write_test_review_marker(&root, &c);
+        // A decision-only row: a plan id no file backs, counted, not listed.
+        record_plan_review_escalation(
+            &state_path,
+            &"0".repeat(64),
+            PolicyPrincipal::Agent,
+            PolicyCapability::Apply,
+            "ghost",
+            "decision-only custody row",
+        );
+        (root, config, state_path, [a, b, c])
+    }
+
+    /// Strip the two clock-derived fields from every pending entry and return
+    /// their `staleness_seconds` values, so two payloads taken a moment apart
+    /// can be compared exactly on everything else.
+    fn without_clock(mut queue: serde_json::Value) -> (serde_json::Value, Vec<i64>) {
+        let mut staleness = Vec::new();
+        if let Some(pending) = queue["pending"].as_array_mut() {
+            for entry in pending {
+                let obj = entry.as_object_mut().expect("entry object");
+                staleness.push(
+                    obj.remove("staleness_seconds")
+                        .and_then(|v| v.as_i64())
+                        .expect("staleness_seconds"),
+                );
+                obj.remove("score").expect("score");
+            }
+        }
+        (queue, staleness)
+    }
+
+    /// `/review/queue` answers with the CLI's bytes for the same project,
+    /// modulo the clock: every field equal except `staleness_seconds` and
+    /// `score`, and the staleness values within five seconds.
+    #[tokio::test]
+    async fn review_queue_matches_the_cli_modulo_the_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path, [a, b, c]) = review_fixture(dir.path());
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config.clone()),
+            &state_path,
+        ))
+        .await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/review/queue"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let served: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(served["total"], 2, "{text}");
+        assert_eq!(served["excluded_non_plan_rows"], 1);
+        let listed: Vec<&str> = served["pending"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["plan_id"].as_str().unwrap())
+            .collect();
+        assert!(listed.contains(&a.as_str()) && listed.contains(&b.as_str()));
+        assert!(
+            !listed.contains(&c.as_str()),
+            "a reviewed plan leaves the queue"
+        );
+        // Pretty-printed with a trailing newline, like every canonical route.
+        assert!(text.ends_with("}\n"), "{text}");
+
+        let expected =
+            compute_review_queue(&root, &config, &state_path, &root.join("models")).unwrap();
+        let (served_json, served_stale) = without_clock(served);
+        let (expected_json, expected_stale) =
+            without_clock(serde_json::to_value(&expected).unwrap());
+        assert_eq!(served_json, expected_json);
+        for (s, e) in served_stale.iter().zip(&expected_stale) {
+            assert!((s - e).abs() <= 5, "staleness drifted: {s} vs {e}");
+        }
+    }
+
+    /// `/review/{plan_id}/status` answers with the CLI's bytes for a pending
+    /// and a reviewed plan, and the three refusals carry their codes.
+    #[tokio::test]
+    async fn review_status_matches_the_cli_and_refuses_with_its_codes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path, [a, _b, c]) = review_fixture(dir.path());
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config),
+            &state_path,
+        ))
+        .await;
+
+        for (plan_id, reviewed) in [(&a, false), (&c, true)] {
+            let resp = reqwest::get(format!("{base}/api/v1/review/{plan_id}/status"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{plan_id}");
+            let text = resp.text().await.unwrap();
+            let expected = compute_review_status(&root, plan_id).unwrap();
+            assert_eq!(text, reference_bytes(&expected));
+            let status: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(status["reviewed"], reviewed, "{plan_id}");
+        }
+
+        // Not a plan id at all, and a well-formed id with no plan file.
+        for shape in ["not-hex", "..%2F..", &"f".repeat(64)] {
+            let resp = reqwest::get(format!("{base}/api/v1/review/{shape}/status"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 404, "{shape}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert!(
+                err.code == "plan_not_found" || err.code == "route_not_found",
+                "{shape}: {}",
+                err.code
+            );
+        }
+
+        // A marker that is not a review marker: the documented 409, with the
+        // CLI's own reason in the message.
+        let marker = crate::commands::apply::review_marker_path(&root, &a);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"not json").unwrap();
+        let resp = reqwest::get(format!("{base}/api/v1/review/{a}/status"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "review_marker_malformed");
+        assert!(err.message.contains("does not parse"), "{}", err.message);
+    }
+
+    /// Without a bound config there is no project root: the documented 503
+    /// on both review routes.
+    #[tokio::test]
+    async fn review_routes_need_a_bound_config() {
+        let base = spawn_router(test_state()).await;
+        let id = "a".repeat(64);
+        for path in [
+            "/api/v1/review/queue".to_string(),
+            format!("/api/v1/review/{id}/status"),
+        ] {
+            let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+            assert_eq!(resp.status(), 503, "{path}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "engine_not_ready", "{path}");
+        }
+    }
+
     /// `/dag/status` projects the executor's record field for field, with
     /// the node status rendered in `snake_case` as the executor serializes it.
     #[tokio::test]
@@ -2289,13 +2592,20 @@ mod tests {
             "{:?}",
             body.capabilities
         );
-        // So are the product routes, and both are registered.
-        assert!(
-            body.capabilities.iter().any(|c| c == "products"),
-            "{:?}",
-            body.capabilities
-        );
-        for route in ["GET /api/v1/products", "GET /api/v1/products/{name}"] {
+        // So are the product and review routes, and all four are registered.
+        for capability in ["products", "review"] {
+            assert!(
+                body.capabilities.iter().any(|c| c == capability),
+                "{capability}: {:?}",
+                body.capabilities
+            );
+        }
+        for route in [
+            "GET /api/v1/products",
+            "GET /api/v1/products/{name}",
+            "GET /api/v1/review/queue",
+            "GET /api/v1/review/{plan_id}/status",
+        ] {
             assert!(body.routes.iter().any(|r| r == route), "{route} missing");
         }
         // No config bound in this fixture (models-only ServerState).

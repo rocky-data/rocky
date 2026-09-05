@@ -3,7 +3,7 @@ mod ai;
 mod ai_contract;
 pub mod apply;
 mod archive;
-mod audit;
+pub(crate) mod audit;
 mod backfill;
 #[cfg(feature = "duckdb")]
 pub mod bench;
@@ -63,7 +63,7 @@ mod resilience;
 mod restore;
 mod retention_status;
 mod reuse_decision;
-mod review;
+pub(crate) mod review;
 mod run;
 mod run_audit;
 mod run_content_addressed;
