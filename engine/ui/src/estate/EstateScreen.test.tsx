@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { DagOutput } from "@rocky-types/dag";
 import type { HistoryOutput } from "@rocky-types/history";
 import type { ModelDetailOutput } from "@rocky-types/model_detail";
+import type { ProjectOutput } from "@rocky-types/project";
 import type { ScheduleStatusOutput } from "@rocky-types/schedule_status";
 import dagFixture from "@rocky-fixtures/dag.json";
 import historyFixture from "@rocky-fixtures/history.json";
@@ -14,6 +15,23 @@ const capturedDag = dagFixture as unknown as DagOutput;
 const capturedHistory = historyFixture as unknown as HistoryOutput;
 
 const NOW = Date.parse("2026-09-05T08:00:00Z");
+
+const project: ProjectOutput = {
+  name: "playground",
+  config_path: "/tmp/playground/rocky.toml",
+  pipelines: [{ name: "playground", pipeline_type: "transformation" }],
+  adapters: [{ name: "default", adapter_type: "duckdb" }],
+  models_compiled: 2,
+  diagnostics: { total: 1, warnings: 1, has_errors: false },
+  last_run: {
+    run_id: "run-SENTINEL",
+    started_at: "2026-09-05T07:59:00Z",
+    finished_at: "2026-09-05T07:59:10Z",
+    status: "Success",
+    models_executed: 2,
+    trigger: "Manual",
+  },
+};
 
 const emptySchedule: ScheduleStatusOutput = {
   counts: { config_errors: 0, enabled: 0, in_flight: 0, overdue: 0, scheduled: 0, throttled: 0 },
@@ -40,6 +58,7 @@ const detail = (name: string): ModelDetailOutput => ({
 
 function loaders(overrides: Partial<EstateLoaders> = {}): EstateLoaders {
   return {
+    project: async () => project,
     dag: async () => capturedDag,
     runs: async () => capturedHistory,
     schedule: async () => emptySchedule,
@@ -171,3 +190,47 @@ import { ModelDetail } from "./ModelDetail";
 function DetailHarness({ name, load }: { name: string; load: EstateLoaders["detail"] }) {
   return <ModelDetail name={name} load={load} onClose={() => {}} />;
 }
+
+describe("ProjectStrip", () => {
+  it("renders the project's config, pipelines, adapters and newest run", async () => {
+    render(<EstateScreen loaders={loaders()} refreshMs={0} now={NOW} />);
+    expect(await screen.findByText("playground (transformation)")).toBeInTheDocument();
+    expect(screen.getByText("default (duckdb)")).toBeInTheDocument();
+    expect(screen.getByText("/tmp/playground/rocky.toml")).toBeInTheDocument();
+    expect(screen.getByText("1 diagnostics, 1 warnings")).toBeInTheDocument();
+    expect(screen.getByText(/Success · Manual · 2 model\(s\)/)).toBeInTheDocument();
+  });
+
+  it("renders a hostile project name as text and a config error in the card", async () => {
+    const hostile = '<b onmouseover="alert(1)">x</b>';
+    const { container } = render(
+      <EstateScreen
+        loaders={loaders({
+          project: async () => ({
+            ...project,
+            name: hostile,
+            config_error: "rocky.toml: expected a table",
+            pipelines: [],
+            adapters: [],
+          }),
+        })}
+        refreshMs={0}
+        now={NOW}
+      />,
+    );
+    expect(await screen.findByText(hostile)).toBeInTheDocument();
+    expect(screen.getByText("rocky.toml: expected a table")).toBeInTheDocument();
+    expect(container.querySelector("b")).toBeNull();
+  });
+
+  it("says when no run was recorded", async () => {
+    render(
+      <EstateScreen
+        loaders={loaders({ project: async () => ({ ...project, last_run: undefined }) })}
+        refreshMs={0}
+        now={NOW}
+      />,
+    );
+    expect(await screen.findByText("the state store holds no run yet")).toBeInTheDocument();
+  });
+});
