@@ -1,0 +1,172 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ProjectAdapterOutput": {
+      "description": "One adapter of the bound config.",
+      "properties": {
+        "adapter_type": {
+          "description": "The adapter's `type` as configured (`duckdb`, `databricks`, …).",
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "adapter_type",
+        "name"
+      ],
+      "type": "object"
+    },
+    "ProjectDiagnosticsOutput": {
+      "description": "The compile's diagnostics, counted. All zero before the first compile.",
+      "properties": {
+        "has_errors": {
+          "type": "boolean"
+        },
+        "total": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "warnings": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "has_errors",
+        "total",
+        "warnings"
+      ],
+      "type": "object"
+    },
+    "ProjectPipelineOutput": {
+      "description": "One pipeline of the bound config.",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "pipeline_type": {
+          "description": "`replication`, `transformation`, `quality`, `snapshot` or `load`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "pipeline_type"
+      ],
+      "type": "object"
+    },
+    "ProjectRunOutput": {
+      "description": "The newest run, as the dashboard summarised it.",
+      "properties": {
+        "finished_at": {
+          "description": "RFC 3339.",
+          "type": "string"
+        },
+        "models_executed": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "started_at": {
+          "description": "RFC 3339.",
+          "type": "string"
+        },
+        "status": {
+          "description": "The run's recorded status (`Success`, `PartialFailure`, `Failure`, …).",
+          "type": "string"
+        },
+        "trigger": {
+          "description": "What started it (`Manual`, `Schedule`, `Webhook`, …).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "finished_at",
+        "models_executed",
+        "run_id",
+        "started_at",
+        "status",
+        "trigger"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "The project a sidecar serves, for `GET /api/v1/project`: what the server-rendered dashboard at `/` used to show, as a typed payload.\n\nServer-only, no CLI twin. Bounded by construction: names of pipelines and adapters (a handful), counts for models and diagnostics, and the one newest run. The model names are on `GET /api/v1/models` and the DAG.",
+  "properties": {
+    "adapters": {
+      "description": "Every `[adapter.<name>]`, in config order.",
+      "items": {
+        "$ref": "#/definitions/ProjectAdapterOutput"
+      },
+      "type": "array"
+    },
+    "config_error": {
+      "description": "Why the config could not be loaded, when it could not. The lists below are then empty.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "config_path": {
+      "description": "The bound config's path; `null` when the sidecar has none.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "diagnostics": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ProjectDiagnosticsOutput"
+        }
+      ],
+      "description": "The compile's diagnostics, counted."
+    },
+    "last_run": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ProjectRunOutput"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The newest run in the state store the server resolved; `null` when none was recorded."
+    },
+    "models_compiled": {
+      "description": "Models in the in-memory compile result; `null` before the first compile finishes.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "name": {
+      "description": "The directory the bound `rocky.toml` lives in, or `rocky` when no config is bound.",
+      "type": "string"
+    },
+    "pipelines": {
+      "description": "Every `[pipeline.<name>]`, in config order.",
+      "items": {
+        "$ref": "#/definitions/ProjectPipelineOutput"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "adapters",
+    "diagnostics",
+    "name",
+    "pipelines"
+  ],
+  "title": "ProjectOutput",
+  "type": "object"
+}

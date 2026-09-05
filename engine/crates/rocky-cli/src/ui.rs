@@ -82,6 +82,8 @@ pub fn embedded_assets() -> Option<Arc<dyn UiAssetSource>> {
 /// server started without `--ui` has no `/ui` path at all.
 pub(crate) fn ui_router(state: Arc<ServerState>) -> Router {
     Router::new()
+        // The retired dashboard's address: with `--ui`, the page is here.
+        .route("/", get(redirect_to_ui))
         .route("/ui", get(redirect_to_ui))
         .route("/ui/", get(serve_index))
         .route("/ui/{*path}", get(serve_asset))
