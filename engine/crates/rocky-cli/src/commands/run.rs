@@ -1663,10 +1663,35 @@ fn ensure_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> 
 /// complete and is refused even though 3 tables would be re-copied. That is
 /// the conservative direction: the refusal is loud and says to re-run, while
 /// admitting it would risk the silent exit-0 this gate exists to stop.
+///
+/// The completeness test deliberately does NOT rest on a count alone. A count
+/// compared against `total_tables` is only sound while every recorded key comes
+/// from the invocation's own plan — true today (both `record_table_progress`
+/// call sites iterate `tables_to_process`, whose length *is* `total_tables`),
+/// but nothing in this function proves it, and a future site that records a
+/// table outside the plan would silently turn this into a refusal. So a
+/// checkpoint entry in ANY non-`Success` state means work remains, whatever the
+/// count says: a `Failed`, `Interrupted` or `Skipped` table is re-attempted by
+/// a resume, because the resume filter admits only `Success` keys.
 fn ensure_the_resume_would_do_work(
     record: &rocky_core::state::RunRecord,
     progress: &RunProgress,
 ) -> Result<()> {
+    // A run that planned nothing — discovery returned no table, or an earlier
+    // resume had already taken them all — left no copy checkpoint to reason
+    // about, and a resume of it re-plans from scratch. It also cannot have
+    // tripped the check gate: a check exists only for a table this invocation
+    // copied. Resumable.
+    if progress.total_tables == 0 {
+        return Ok(());
+    }
+    if progress
+        .tables
+        .iter()
+        .any(|t| t.status != rocky_core::state::TableStatus::Success)
+    {
+        return Ok(());
+    }
     let copied = progress
         .tables
         .iter()
@@ -13729,6 +13754,60 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                 .unwrap();
             assert_eq!(progress.run_id, "run-1", "{label} is not a copied table");
         }
+    }
+
+    /// The adversarial checkpoint shapes an independent review named for this
+    /// gate. Each one must stay RESUMABLE: the refusal is for a checkpoint that
+    /// proves there is nothing left to copy, and none of these do.
+    ///
+    /// The `Success`-entries-exceed-`total_tables` shape cannot arise today —
+    /// both `record_table_progress` call sites iterate `tables_to_process`,
+    /// whose length is `total_tables`, so recorded keys are a subset of the
+    /// plan. It is pinned anyway, because the gate must not depend on an
+    /// invariant it cannot see.
+    #[test]
+    fn adversarial_checkpoints_stay_resumable() {
+        use rocky_core::state::TableStatus;
+
+        // A non-Success entry means work remains, whatever the count says.
+        for trailing in [
+            TableStatus::Interrupted,
+            TableStatus::Skipped,
+            TableStatus::Failed,
+        ] {
+            let label = format!("{trailing:?}");
+            let dir = tempfile::tempdir().unwrap();
+            let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+            let scope = test_resume_scope("p1");
+            // Two copied tables against a post-filter plan of ONE, plus an
+            // unfinished third: a count alone would read this as complete.
+            store.init_run_progress("run-1", 1, Some(&scope)).unwrap();
+            complete_tables(&store, "run-1", 2);
+            store
+                .record_table_progress("run-1", &table_entry(2, "wh.staging_p1__acme.t2", trailing))
+                .unwrap();
+            seed_run_record(&store, "run-1", "PartialFailure");
+
+            let progress = resolve_resume_progress(&store, None, true, &scope)
+                .unwrap()
+                .unwrap_or_else(|| {
+                    panic!("{label}: a checkpoint with unfinished work must resume")
+                });
+            assert_eq!(progress.run_id, "run-1", "{label}");
+        }
+
+        // A run that planned nothing has no copy checkpoint to reason about and
+        // cannot have tripped the check gate — a check exists only for a table
+        // this invocation copied. A resume re-plans from scratch.
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        store.init_run_progress("run-0", 0, Some(&scope)).unwrap();
+        seed_run_record(&store, "run-0", "Failure");
+        let progress = resolve_resume_progress(&store, Some("run-0"), false, &scope)
+            .unwrap()
+            .expect("a zero-table plan must stay resumable");
+        assert_eq!(progress.run_id, "run-0");
     }
 
     /// `total_tables` is what the recorded run planned to copy AFTER its own
