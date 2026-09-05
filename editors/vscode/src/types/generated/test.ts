@@ -6,6 +6,12 @@
  */
 
 /**
+ * Severity level of a diagnostic.
+ *
+ * Serialized in PascalCase (`"Error"`, `"Warning"`, `"Info"`) to stay compatible with existing dagster fixtures and the hand-written `Severity` StrEnum in `integrations/dagster/src/dagster_rocky/types.py`.
+ */
+export type Severity = "Error" | "Warning" | "Info";
+/**
  * Type of row mismatch.
  */
 export type MismatchKind = "missing" | "extra" | "value_diff";
@@ -19,6 +25,12 @@ export interface TestOutput {
    * Results from declarative `[[tests]]` in model sidecars. Present only when `--declarative` is used.
    */
   declarative?: DeclarativeTestSummary | null;
+  /**
+   * Compiler diagnostics from the compile `rocky test` ran.
+   *
+   * Errors already fail the command, so what shows up here is everything that does not: `W001`, `W004`, `W005`, `P002`, `I001`, `I002`, `I003`. The runner has always carried them and the output dropped them (#1617). `rocky test` is the command most likely to run in CI, and it compiles with empty source schemas, so it is where an unchecked-contract report is most likely to exist. Empty when the compile reported nothing.
+   */
+  diagnostics?: Diagnostic[];
   failed: number;
   failures: TestFailure[];
   /**
@@ -82,6 +94,47 @@ export interface DeclarativeTestResult {
    * Test type (e.g., "not_null", "unique", "row_count_range").
    */
   test_type: string;
+  [k: string]: unknown;
+}
+/**
+ * A compiler diagnostic (error, warning, or informational message).
+ *
+ * `code` and `message` use `Arc<str>` (§P3.5) — cloning a `Diagnostic` in the LSP publish loop becomes a refcount bump. Construction still accepts any `Into<String>` / `&str` via the helper constructors below; the arc wrap happens once at construction time.
+ */
+export interface Diagnostic {
+  /**
+   * Diagnostic code (e.g., "E001", "W001").
+   */
+  code: string;
+  /**
+   * Human-readable message.
+   */
+  message: string;
+  /**
+   * Which model this diagnostic relates to.
+   */
+  model: string;
+  /**
+   * Severity level.
+   */
+  severity: Severity;
+  /**
+   * Source location (if available).
+   */
+  span?: SourceSpan | null;
+  /**
+   * Suggested fix (if any).
+   */
+  suggestion?: string | null;
+  [k: string]: unknown;
+}
+/**
+ * Location in a source file.
+ */
+export interface SourceSpan {
+  col: number;
+  file: string;
+  line: number;
   [k: string]: unknown;
 }
 /**

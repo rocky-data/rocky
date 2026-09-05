@@ -743,8 +743,11 @@ def test_pruned_placeholder_carries_prior_failure_end_to_end(tmp_path):
     assert tuesday_checks["row_count"].passed is False
     assert tuesday_checks["row_count"].metadata["rocky/pruned_unchanged"].value is True
     # A sibling check whose Monday verdict passed carries forward green.
-    assert tuesday_checks["freshness"].passed is True
-    assert tuesday_checks["freshness"].metadata["rocky/pruned_unchanged"].value is True
+    # `column_match`, not `freshness`: this discover payload declares no
+    # `[checks.freshness]`, so the `freshness` spec is not declared at all
+    # (#1645). Any other declared default check proves the same carry-forward.
+    assert tuesday_checks["column_match"].passed is True
+    assert tuesday_checks["column_match"].metadata["rocky/pruned_unchanged"].value is True
 
 
 def test_prune_without_satisfy_empty_outputs_warns(caplog):

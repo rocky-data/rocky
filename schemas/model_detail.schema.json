@@ -1,0 +1,254 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ModelColumnOutput": {
+      "description": "One inferred output column of a model.",
+      "properties": {
+        "name": {
+          "description": "Column name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "RockyType": {
+      "description": "Rocky's unified column type.\n\nDerives `JsonSchema` because it is served verbatim on the HTTP model detail route (`TypedColumnOutput::data_type`): the structured form is the only lossless one — the `Display` rendering drops a struct field's nullability.\n\n# Wire contract\n\nThe serde shape — externally tagged, with these exact variant names — is published in `schemas/model_detail.schema.json` and the generated Python and TypeScript bindings. From engine 1.74.0 it is a public contract:\n\n- **Adding** a variant is additive. Consumers must treat an unknown tag as \"a type this build does not know\", never as an error. - **Renaming or removing** a variant, or changing a variant's payload, is a breaking change to the model-detail route and every binding. It needs a `Changed` changelog entry that names the old and new tags, and the codegen cascade in the same PR.\n\nThe `Display` rendering (`data_type_display`) is a label and carries no such promise.",
+      "oneOf": [
+        {
+          "enum": [
+            "Boolean",
+            "Int32",
+            "Int64",
+            "Float32",
+            "Float64",
+            "String",
+            "Date",
+            "Binary",
+            "Variant",
+            "Unknown"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "Decimal": {
+              "properties": {
+                "precision": {
+                  "format": "uint8",
+                  "minimum": 0.0,
+                  "type": "integer"
+                },
+                "scale": {
+                  "format": "uint8",
+                  "minimum": 0.0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "precision",
+                "scale"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "Decimal"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Timestamp with timezone.",
+          "enum": [
+            "Timestamp"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Timestamp without timezone (common in Databricks).",
+          "enum": [
+            "TimestampNtz"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "Array": {
+              "$ref": "#/definitions/RockyType"
+            }
+          },
+          "required": [
+            "Array"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "Map": {
+              "items": [
+                {
+                  "$ref": "#/definitions/RockyType"
+                },
+                {
+                  "$ref": "#/definitions/RockyType"
+                }
+              ],
+              "maxItems": 2,
+              "minItems": 2,
+              "type": "array"
+            }
+          },
+          "required": [
+            "Map"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "Struct": {
+              "items": {
+                "$ref": "#/definitions/StructField"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "Struct"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "StructField": {
+      "description": "A field in a struct type.",
+      "properties": {
+        "data_type": {
+          "$ref": "#/definitions/RockyType"
+        },
+        "name": {
+          "type": "string"
+        },
+        "nullable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "data_type",
+        "name",
+        "nullable"
+      ],
+      "type": "object"
+    },
+    "TypedColumnOutput": {
+      "description": "One type-checked column of a model.",
+      "properties": {
+        "data_type": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RockyType"
+            }
+          ],
+          "description": "The inferred type, structured and lossless — a struct field keeps its own nullability, which the display string drops."
+        },
+        "data_type_display": {
+          "description": "Rocky's human rendering of `data_type`, e.g. `INT64`, `DECIMAL(10,2)` or `STRUCT<a:INT64>`. A label, not a parser input.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Column name.",
+          "type": "string"
+        },
+        "nullable": {
+          "description": "Whether the column may be `NULL`.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "data_type",
+        "data_type_display",
+        "name",
+        "nullable"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "One model's detail for `GET /api/v1/models/{name}`.",
+  "properties": {
+    "columns": {
+      "description": "Inferred output columns.",
+      "items": {
+        "$ref": "#/definitions/ModelColumnOutput"
+      },
+      "type": "array"
+    },
+    "downstream": {
+      "description": "Direct downstream model names.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "file_path": {
+      "description": "Path to the source file, as the compiler recorded it.",
+      "type": "string"
+    },
+    "has_star": {
+      "description": "Whether the model uses `SELECT *`, so its schema depends on upstream.",
+      "type": "boolean"
+    },
+    "name": {
+      "description": "Model name.",
+      "type": "string"
+    },
+    "sql": {
+      "description": "The model's SQL text, capped at [`MODEL_DETAIL_SQL_CAP_BYTES`] bytes. When it was cut, `sql_truncated` is `true` and `sql_bytes` carries the full length, so a consumer never mistakes a cut text for the whole.",
+      "type": "string"
+    },
+    "sql_bytes": {
+      "description": "Length of the full SQL text in bytes, cut or not.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "sql_truncated": {
+      "description": "Whether `sql` was cut at the cap.",
+      "type": "boolean"
+    },
+    "typed_columns": {
+      "description": "Type-checked columns, or `null` when the type checker produced none for this model. Each carries the structured type and its label.",
+      "items": {
+        "$ref": "#/definitions/TypedColumnOutput"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "upstream": {
+      "description": "Direct upstream model names.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "columns",
+    "downstream",
+    "file_path",
+    "has_star",
+    "name",
+    "sql",
+    "sql_bytes",
+    "sql_truncated",
+    "upstream"
+  ],
+  "title": "ModelDetailOutput",
+  "type": "object"
+}
