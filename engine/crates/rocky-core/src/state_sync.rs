@@ -665,6 +665,11 @@ pub struct RemoteStateSession {
     /// tier-less backends, or when the object was absent (bootstrap →
     /// create-if-absent).
     base: Option<Generation>,
+    /// `[cache.schemas] replicate` — whether `schema_cache` travels with the
+    /// replicated state (#1620). Carried explicitly rather than re-derived,
+    /// so the acquire, periodic and finalize legs of one session can never
+    /// disagree about the posture.
+    replicate_schema_cache: bool,
 }
 
 /// Whether Rocky performs compare-and-swap state writes on `backend` at all.
@@ -751,6 +756,10 @@ pub type LedgerSeamAttempt<'a, T> =
 pub struct LedgerSeamSession {
     cfg: StateConfig,
     state_path: PathBuf,
+    /// `[cache.schemas] replicate` — whether `schema_cache` travels with the
+    /// replicated state (#1620). Carried explicitly rather than re-derived,
+    /// so a session cannot disagree with the config it was built from.
+    replicate_schema_cache: bool,
 }
 
 const LEDGER_SEAM_MAX_ATTEMPTS: u32 = 3;
@@ -759,10 +768,11 @@ impl LedgerSeamSession {
     /// Build a session from an owned state-config snapshot and local ledger
     /// path. Performs no I/O until [`execute`][Self::execute].
     #[must_use]
-    pub fn new(cfg: &StateConfig, state_path: &Path) -> Self {
+    pub fn new(cfg: &StateConfig, state_path: &Path, replicate_schema_cache: bool) -> Self {
         Self {
             cfg: cfg.clone(),
             state_path: state_path.to_path_buf(),
+            replicate_schema_cache,
         }
     }
 
@@ -795,7 +805,8 @@ impl LedgerSeamSession {
         }
 
         if !cas_effective(&self.cfg) {
-            let _authority = download_state(&self.cfg, &self.state_path).await?;
+            let _authority =
+                download_state(&self.cfg, &self.state_path, self.replicate_schema_cache).await?;
             let store = StateStore::open(&self.state_path)?;
             let result = attempt(&store, None).await;
             drop(store);
@@ -804,7 +815,7 @@ impl LedgerSeamSession {
                 on_upload_failure: StateUploadFailureMode::Fail,
                 ..self.cfg.clone()
             };
-            upload_state(&upload_cfg, &self.state_path).await?;
+            upload_state(&upload_cfg, &self.state_path, self.replicate_schema_cache).await?;
             return Ok(output);
         }
 
@@ -813,8 +824,12 @@ impl LedgerSeamSession {
             ..self.cfg.clone()
         };
         for attempt_index in 0..LEDGER_SEAM_MAX_ATTEMPTS {
-            let (_authority, base) =
-                download_state_with_generation(&self.cfg, &self.state_path).await?;
+            let (_authority, base) = download_state_with_generation(
+                &self.cfg,
+                &self.state_path,
+                self.replicate_schema_cache,
+            )
+            .await?;
             let store = StateStore::open(&self.state_path)?;
             let result = attempt(&store, base.as_ref()).await;
             drop(store);
@@ -834,7 +849,14 @@ impl LedgerSeamSession {
                 }
             };
 
-            match upload_state_cas(&upload_cfg, &self.state_path, base.as_ref()).await {
+            match upload_state_cas(
+                &upload_cfg,
+                &self.state_path,
+                base.as_ref(),
+                self.replicate_schema_cache,
+            )
+            .await
+            {
                 Ok(()) => return Ok(output),
                 Err(StateSyncError::CasConflict { key })
                     if attempt_index + 1 < LEDGER_SEAM_MAX_ATTEMPTS =>
@@ -902,7 +924,7 @@ impl LedgerSeamSession {
                 false
             }
         };
-        match download_state(&self.cfg, &self.state_path).await {
+        match download_state(&self.cfg, &self.state_path, self.replicate_schema_cache).await {
             Ok(_) => {
                 if quarantined && let Err(remove_error) = std::fs::remove_file(&quarantine) {
                     warn!(
@@ -945,7 +967,12 @@ impl RemoteStateSession {
     /// Build a session over an owned snapshot of `cfg` for the ledger at
     /// `state_path`. Performs no I/O; call [`acquire`][Self::acquire] before
     /// the first state read.
-    pub fn new(cfg: &StateConfig, state_path: &Path, durability: FinalizeDurability) -> Self {
+    pub fn new(
+        cfg: &StateConfig,
+        state_path: &Path,
+        durability: FinalizeDurability,
+        replicate_schema_cache: bool,
+    ) -> Self {
         Self {
             cfg: cfg.clone(),
             state_path: state_path.to_path_buf(),
@@ -958,6 +985,7 @@ impl RemoteStateSession {
             periodic: None,
             periodic_shutdown: None,
             base: None,
+            replicate_schema_cache,
         }
     }
 
@@ -1009,7 +1037,7 @@ impl RemoteStateSession {
         // commit against it. Tier-less backends fall back to the plain download
         // (and warn once if `cas` was configured but unsupported here).
         let result = if self.cas_enabled() {
-            download_state_with_generation(&self.cfg, &self.state_path)
+            download_state_with_generation(&self.cfg, &self.state_path, self.replicate_schema_cache)
                 .await
                 .map(|(authority, base)| {
                     self.base = base;
@@ -1024,7 +1052,7 @@ impl RemoteStateSession {
                      (auto-downgraded to off)"
                 );
             }
-            download_state(&self.cfg, &self.state_path).await
+            download_state(&self.cfg, &self.state_path, self.replicate_schema_cache).await
         };
 
         match result {
@@ -1135,6 +1163,10 @@ impl RemoteStateSession {
         }
         let cfg = self.cfg.clone();
         let path = self.state_path.clone();
+        // Same posture as the terminal upload legs — a mid-run tick must not
+        // strip a table the end-of-run upload keeps, or the remote's schema
+        // cache would flip between ticks (#1620).
+        let local_only = crate::state::local_only_table_names(self.replicate_schema_cache);
         // Derive the remote key ONCE from the REAL state path (namespace-correct)
         // — never from the scratch temp path, which would resolve to the legacy
         // `state.redb` key and clobber namespaced state (mirrors the invariant in
@@ -1175,7 +1207,7 @@ impl RemoteStateSession {
                 let scratch = ScratchGuard::new();
                 let scratch_path = scratch.path().to_path_buf();
                 let snapshot = tokio::task::spawn_blocking(move || {
-                    store.snapshot_to_excluding(&scratch_path, crate::state::LOCAL_ONLY_TABLE_NAMES)
+                    store.snapshot_to_excluding(&scratch_path, local_only)
                 })
                 .await;
 
@@ -1267,7 +1299,13 @@ impl RemoteStateSession {
                 },
                 FinalizeDurability::ConfigDefault => self.cfg.clone(),
             };
-            return upload_state_cas(&cfg, &self.state_path, self.base.as_ref()).await;
+            return upload_state_cas(
+                &cfg,
+                &self.state_path,
+                self.base.as_ref(),
+                self.replicate_schema_cache,
+            )
+            .await;
         }
 
         match self.durability {
@@ -1276,9 +1314,11 @@ impl RemoteStateSession {
                     on_upload_failure: StateUploadFailureMode::Fail,
                     ..self.cfg.clone()
                 };
-                upload_state(&durable_cfg, &self.state_path).await
+                upload_state(&durable_cfg, &self.state_path, self.replicate_schema_cache).await
             }
-            FinalizeDurability::ConfigDefault => upload_state(&self.cfg, &self.state_path).await,
+            FinalizeDurability::ConfigDefault => {
+                upload_state(&self.cfg, &self.state_path, self.replicate_schema_cache).await
+            }
         }
     }
 
@@ -1319,11 +1359,12 @@ impl RemoteStateSession {
     pub async fn download_only(
         cfg: &StateConfig,
         state_path: &Path,
+        replicate_schema_cache: bool,
     ) -> Result<StateAuthority, StateSyncError> {
         if matches!(cfg.backend, StateBackend::Local) {
             return Ok(StateAuthority::Authoritative);
         }
-        download_state(cfg, state_path).await
+        download_state(cfg, state_path, replicate_schema_cache).await
     }
 
     /// Half-seam upload for the single-record ledger seams: push the local
@@ -1349,6 +1390,7 @@ impl RemoteStateSession {
         cfg: &StateConfig,
         state_path: &Path,
         reason: &str,
+        replicate_schema_cache: bool,
     ) -> Result<(), StateSyncError> {
         if matches!(cfg.backend, StateBackend::Local) {
             return Ok(());
@@ -1358,7 +1400,7 @@ impl RemoteStateSession {
             on_upload_failure: StateUploadFailureMode::Fail,
             ..cfg.clone()
         };
-        upload_state(&upload_cfg, state_path).await
+        upload_state(&upload_cfg, state_path, replicate_schema_cache).await
     }
 }
 
@@ -1457,8 +1499,9 @@ impl Drop for RemoteStateSession {
 pub async fn download_state(
     config: &StateConfig,
     local_path: &Path,
+    replicate_schema_cache: bool,
 ) -> Result<StateAuthority, StateSyncError> {
-    download_state_impl(config, local_path, None).await
+    download_state_impl(config, local_path, None, replicate_schema_cache).await
 }
 
 /// Download-before-read that ALSO captures the remote object's [`Generation`]
@@ -1472,9 +1515,16 @@ pub async fn download_state(
 pub async fn download_state_with_generation(
     config: &StateConfig,
     local_path: &Path,
+    replicate_schema_cache: bool,
 ) -> Result<(StateAuthority, Option<Generation>), StateSyncError> {
     let mut generation = None;
-    let authority = download_state_impl(config, local_path, Some(&mut generation)).await?;
+    let authority = download_state_impl(
+        config,
+        local_path,
+        Some(&mut generation),
+        replicate_schema_cache,
+    )
+    .await?;
     Ok((authority, generation))
 }
 
@@ -1482,6 +1532,7 @@ async fn download_state_impl(
     config: &StateConfig,
     local_path: &Path,
     mut gen_sink: Option<&mut Option<Generation>>,
+    replicate_schema_cache: bool,
 ) -> Result<StateAuthority, StateSyncError> {
     let remote_key = remote_state_key(local_path);
 
@@ -1523,7 +1574,7 @@ async fn download_state_impl(
 
     // 3. Under the lock: re-read the CURRENT local-only tables, merge them into
     //    the candidate db, and publish atomically.
-    let result = publish_merged(&staged, local_path, outcome).await;
+    let result = publish_merged(&staged, local_path, outcome, replicate_schema_cache).await;
 
     drop(lock);
     let _ = std::fs::remove_file(&staged);
@@ -1571,9 +1622,14 @@ async fn publish_merged(
     staged: &Path,
     local_path: &Path,
     outcome: DownloadOutcome,
+    replicate_schema_cache: bool,
 ) -> Result<(), StateSyncError> {
     let local_exists = local_path.exists();
-    let tables = crate::state::LOCAL_ONLY_TABLE_NAMES;
+    // The set to take FROM THE LOCAL FILE when a remote copy exists. Under
+    // `[cache.schemas] replicate = true` the schema cache is not in it, so the
+    // remote's cache survives into the published file instead of being
+    // overwritten by this machine's (#1620).
+    let tables = crate::state::local_only_table_names(replicate_schema_cache);
     match outcome {
         DownloadOutcome::Restored => {
             // `staged` holds the remote replicated tables. Overwrite its
@@ -1593,7 +1649,17 @@ async fn publish_merged(
             // db carrying ONLY the current local-only tables (`staged` was not
             // written by an `Absent` download, so `copy_named_tables` creates it
             // with just those tables → replicated tables are empty on next open).
-            redb_op_retry(|| copy_named_tables(local_path, staged, tables)).await?;
+            //
+            // This arm deliberately keeps the FULL local-only set even when
+            // replicating. There is no remote schema cache to inherit here, and
+            // the replicating set would leave `schema_cache` out of the rebuilt
+            // file — so opting into replication would DELETE this machine's warm
+            // cache every time the remote object is missing. Replication is
+            // about sharing the cache, never about discarding it (#1620).
+            redb_op_retry(|| {
+                copy_named_tables(local_path, staged, crate::state::LOCAL_ONLY_TABLE_NAMES)
+            })
+            .await?;
             publish_atomically(staged, local_path)
         }
         DownloadOutcome::Absent => Ok(()),
@@ -2332,14 +2398,25 @@ async fn tiered_cas_download(
 /// errors. Set `on_upload_failure = "fail"` for strict environments that must
 /// treat state durability as a hard requirement.
 ///
-/// Tables listed in [`crate::state::LOCAL_ONLY_TABLE_NAMES`] are filtered
-/// out of the remote copy by default — the schema cache is wired here so
-/// fresh clones don't inherit another machine's stale types. Use
-/// [`upload_state_with_excluded_tables`] to override the default when
-/// `[cache.schemas] replicate = true` is configured.
-pub async fn upload_state(config: &StateConfig, local_path: &Path) -> Result<(), StateSyncError> {
-    upload_state_with_excluded_tables(config, local_path, crate::state::LOCAL_ONLY_TABLE_NAMES)
-        .await
+/// Tables listed in [`crate::state::LOCAL_ONLY_TABLE_NAMES`] are filtered out
+/// of the remote copy — the schema cache is one of them, so fresh clones don't
+/// inherit another machine's stale types.
+///
+/// `replicate_schema_cache` is `[cache.schemas] replicate`. When it is `true`
+/// the schema cache is NOT stripped, so it travels with the rest of the state
+/// (#1620). It defaults to `false`, and at `false` the uploaded bytes are
+/// identical to what this function produced before the setting was wired.
+pub async fn upload_state(
+    config: &StateConfig,
+    local_path: &Path,
+    replicate_schema_cache: bool,
+) -> Result<(), StateSyncError> {
+    upload_state_with_excluded_tables(
+        config,
+        local_path,
+        crate::state::local_only_table_names(replicate_schema_cache),
+    )
+    .await
 }
 
 /// End-of-run state upload, suppressed when the local store was recreated after
@@ -2362,6 +2439,7 @@ pub async fn upload_state_unless_recreated(
     recreated_for_forward_incompat: bool,
     config: &StateConfig,
     local_path: &Path,
+    replicate_schema_cache: bool,
 ) -> Result<(), StateSyncError> {
     if recreated_for_forward_incompat {
         info!(
@@ -2372,7 +2450,7 @@ pub async fn upload_state_unless_recreated(
         );
         return Ok(());
     }
-    upload_state(config, local_path).await
+    upload_state(config, local_path, replicate_schema_cache).await
 }
 
 /// Variant of [`upload_state`] that lets the caller override the list of
@@ -2688,13 +2766,17 @@ async fn upload_state_cas(
     config: &StateConfig,
     local_path: &Path,
     base: Option<&Generation>,
+    replicate_schema_cache: bool,
 ) -> Result<(), StateSyncError> {
     if !local_path.exists() {
         debug!("No local state file to upload");
         return Ok(());
     }
     let remote_key = remote_state_key(local_path);
-    let excluded = crate::state::LOCAL_ONLY_TABLE_NAMES;
+    // Same posture as the non-CAS upload leg. Wiring one and not the other
+    // would make `[cache.schemas] replicate = true` a no-op for every project
+    // on `concurrency_control = "cas"`, silently (#1620).
+    let excluded = crate::state::local_only_table_names(replicate_schema_cache);
 
     // Resolve the file to upload: a stripped copy when there are local-only
     // tables, else the file as-is. Same fail-closed filter contract as
@@ -3654,7 +3736,7 @@ mod tests {
         let config = StateConfig::default();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.redb");
-        assert!(download_state(&config, &path).await.is_ok());
+        assert!(download_state(&config, &path, false).await.is_ok());
     }
 
     #[tokio::test]
@@ -3662,7 +3744,7 @@ mod tests {
         let config = StateConfig::default();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.redb");
-        assert!(upload_state(&config, &path).await.is_ok());
+        assert!(upload_state(&config, &path, false).await.is_ok());
     }
 
     #[tokio::test]
@@ -3673,7 +3755,7 @@ mod tests {
             ..Default::default()
         };
         let dir = TempDir::new().unwrap();
-        let result = download_state(&config, &dir.path().join("state.redb")).await;
+        let result = download_state(&config, &dir.path().join("state.redb"), false).await;
         assert!(matches!(result, Err(StateSyncError::MissingConfig(..))));
     }
 
@@ -3685,7 +3767,7 @@ mod tests {
             ..Default::default()
         };
         let dir = TempDir::new().unwrap();
-        let result = download_state(&config, &dir.path().join("state.redb")).await;
+        let result = download_state(&config, &dir.path().join("state.redb"), false).await;
         assert!(matches!(result, Err(StateSyncError::MissingConfig(..))));
     }
 
@@ -3697,7 +3779,7 @@ mod tests {
             ..Default::default()
         };
         let dir = TempDir::new().unwrap();
-        let result = download_state(&config, &dir.path().join("state.redb")).await;
+        let result = download_state(&config, &dir.path().join("state.redb"), false).await;
         assert!(matches!(result, Err(StateSyncError::MissingConfig(..))));
     }
 
@@ -3912,7 +3994,7 @@ mod tests {
 
         // Default upload path: strips the schema cache into a /tmp scratch,
         // then dispatches. The remote key must still be derived from `local`.
-        upload_state(&config, &local).await.unwrap();
+        upload_state(&config, &local, false).await.unwrap();
 
         test_support::clear();
 
@@ -4230,7 +4312,7 @@ mod tests {
         seed_watermark_and_cache(&src);
 
         let config = StateConfig::default();
-        assert!(upload_state(&config, &src).await.is_ok());
+        assert!(upload_state(&config, &src, false).await.is_ok());
     }
 
     #[tokio::test]
@@ -4269,7 +4351,7 @@ mod tests {
         // Recreated store: the upload is skipped entirely, so the broken
         // backend is never reached.
         assert!(
-            upload_state_unless_recreated(true, &config, &src)
+            upload_state_unless_recreated(true, &config, &src, false)
                 .await
                 .is_ok(),
             "a store recreated for forward-incompat must skip the end-of-run upload"
@@ -4277,7 +4359,7 @@ mod tests {
 
         // Normal store: the upload runs and hits the (deliberately broken) S3
         // dispatch — proving the gate let a real upload attempt through.
-        let err = upload_state_unless_recreated(false, &config, &src)
+        let err = upload_state_unless_recreated(false, &config, &src, false)
             .await
             .expect_err("an un-suppressed upload must actually attempt the backend");
         assert!(
@@ -4312,7 +4394,7 @@ mod tests {
             s3_bucket: Some("bucket".into()),
             ..Default::default()
         };
-        let result = download_state(&config, &local).await;
+        let result = download_state(&config, &local, false).await;
         test_support::clear();
 
         assert!(
@@ -4341,7 +4423,7 @@ mod tests {
             s3_bucket: Some("bucket".into()),
             ..Default::default()
         };
-        let result = download_state(&config, &local).await;
+        let result = download_state(&config, &local, false).await;
         test_support::clear();
 
         assert!(
@@ -4374,7 +4456,7 @@ mod tests {
             s3_bucket: Some("bucket".into()),
             ..Default::default()
         };
-        let result = download_state(&config, &local).await;
+        let result = download_state(&config, &local, false).await;
         test_support::clear();
         assert!(
             matches!(result, Ok(StateAuthority::Authoritative)),
@@ -4395,7 +4477,7 @@ mod tests {
             s3_bucket: Some("bucket".into()),
             ..Default::default()
         };
-        let result = download_state(&config, &local).await;
+        let result = download_state(&config, &local, false).await;
         test_support::clear();
         assert!(
             matches!(result, Ok(StateAuthority::FreshStart)),
@@ -4420,7 +4502,7 @@ mod tests {
             s3_bucket: Some("bucket".into()),
             ..Default::default()
         };
-        let result = download_state(&config, &local).await;
+        let result = download_state(&config, &local, false).await;
         test_support::clear();
         assert!(
             matches!(result, Err(StateSyncError::S3Download(_))),
@@ -4435,7 +4517,7 @@ mod tests {
     async fn local_backend_is_authoritative_not_fresh_start() {
         let config = StateConfig::default();
         let dir = TempDir::new().unwrap();
-        let result = download_state(&config, &dir.path().join("state.redb")).await;
+        let result = download_state(&config, &dir.path().join("state.redb"), false).await;
         assert!(
             matches!(result, Ok(StateAuthority::Authoritative)),
             "the Local backend's on-disk file is the authority; got {result:?}"
@@ -4626,7 +4708,7 @@ mod tests {
             s3_bucket: Some("bucket".into()),
             ..Default::default()
         };
-        let authority = download_state(&config, &local)
+        let authority = download_state(&config, &local, false)
             .await
             .expect("restored download should succeed");
         test_support::clear();
@@ -4677,7 +4759,7 @@ mod tests {
             s3_bucket: Some("bucket".into()),
             ..Default::default()
         };
-        let authority = download_state(&config, &local)
+        let authority = download_state(&config, &local, false)
             .await
             .expect("an absent remote is a fresh start");
         test_support::clear();
@@ -4788,7 +4870,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            upload_state(&skip, &src).await.is_ok(),
+            upload_state(&skip, &src, false).await.is_ok(),
             "the default Skip policy must swallow an upload failure (degraded mode)"
         );
 
@@ -4800,7 +4882,7 @@ mod tests {
         };
         assert!(
             matches!(
-                upload_state(&fail, &src).await,
+                upload_state(&fail, &src, false).await,
                 Err(StateSyncError::MissingConfig(..))
             ),
             "the Fail policy the seams force must propagate the upload failure (abort)"
@@ -4830,7 +4912,7 @@ mod tests {
             s3_bucket: Some("bucket".into()),
             ..Default::default()
         };
-        let result = download_state(&config, &local).await;
+        let result = download_state(&config, &local, false).await;
         test_support::clear();
 
         assert!(
@@ -4871,7 +4953,7 @@ mod tests {
             s3_bucket: Some("bucket".into()),
             ..Default::default()
         };
-        let authority = download_state(&config, &local)
+        let authority = download_state(&config, &local, false)
             .await
             .expect("restored download should succeed");
         test_support::clear();
@@ -4912,7 +4994,7 @@ mod tests {
             on_upload_failure: StateUploadFailureMode::Fail,
             ..Default::default()
         };
-        let result = upload_state(&config, &local).await;
+        let result = upload_state(&config, &local, false).await;
         let key = object_store_state_key(&remote_state_key(&local));
         let uploaded = provider.exists(&key).await.unwrap();
         test_support::clear();
@@ -4953,7 +5035,7 @@ mod tests {
         // Hold the writer lock, as a live `rocky run` would during execution.
         let held = StateStore::open(&local).unwrap();
 
-        let result = download_state(&config, &local).await;
+        let result = download_state(&config, &local, false).await;
         assert!(
             result.is_err(),
             "the publish must fail closed while another writer holds the lock (finding B)"
@@ -4966,7 +5048,7 @@ mod tests {
         // Release the lock; a fresh download now applies the remote + preserves
         // the local-only `jobs`.
         drop(held);
-        let authority = download_state(&config, &local)
+        let authority = download_state(&config, &local, false)
             .await
             .expect("download should succeed once the writer lock is free");
         test_support::clear();
@@ -5025,7 +5107,7 @@ mod tests {
             on_upload_failure: StateUploadFailureMode::Fail,
             ..Default::default()
         };
-        let result = upload_state(&config, &local).await;
+        let result = upload_state(&config, &local, false).await;
         let key = object_store_state_key(&remote_state_key(&local));
         let uploaded = provider.exists(&key).await.unwrap();
         test_support::clear();
@@ -5096,13 +5178,13 @@ mod tests {
             s3_bucket: Some("bucket".into()),
             ..Default::default()
         };
-        upload_state(&config, &pod_a).await.unwrap();
+        upload_state(&config, &pod_a, false).await.unwrap();
 
         // Pod B: a fresh pod downloads the remote state.
         let dir_b = TempDir::new().unwrap();
         let pod_b = dir_b.path().join(".rocky-state.redb");
         assert_eq!(
-            download_state(&config, &pod_b).await.unwrap(),
+            download_state(&config, &pod_b, false).await.unwrap(),
             StateAuthority::Authoritative
         );
         test_support::clear();
@@ -5191,6 +5273,7 @@ mod tests {
             &StateConfig::default(),
             &local,
             FinalizeDurability::ConfigDefault,
+            false,
         );
         let authority = session.acquire().await.expect("Local acquire");
         assert_eq!(authority, StateAuthority::Authoritative);
@@ -5230,6 +5313,7 @@ mod tests {
             &s3_session_config(StateUploadFailureMode::Skip),
             &local,
             FinalizeDurability::ConfigDefault,
+            false,
         );
         let authority = session.acquire().await.expect(
             "a download failure must be recorded as Ok(Indeterminate), never propagated as Err",
@@ -5269,6 +5353,7 @@ mod tests {
             &s3_session_config(StateUploadFailureMode::Skip),
             &local,
             FinalizeDurability::ConfigDefault,
+            false,
         );
         assert_eq!(
             session.acquire().await.unwrap(),
@@ -5293,6 +5378,7 @@ mod tests {
             &StateConfig::default(),
             &local,
             FinalizeDurability::ConfigDefault,
+            false,
         );
         let _ = session.acquire().await.expect("first acquire");
         let err = session
@@ -5313,6 +5399,7 @@ mod tests {
             &StateConfig::default(),
             Path::new("/nonexistent/.rocky-state.redb"),
             FinalizeDurability::ConfigDefault,
+            false,
         );
         drop(session);
     }
@@ -5331,6 +5418,7 @@ mod tests {
             &s3_session_config(StateUploadFailureMode::Fail),
             &local,
             FinalizeDurability::Durable,
+            false,
         );
         let _ = session.acquire().await.unwrap();
         session.abandon("error-path exit (test)").await;
@@ -5357,6 +5445,7 @@ mod tests {
             &s3_session_config(StateUploadFailureMode::Fail),
             &local,
             FinalizeDurability::Durable,
+            false,
         );
         let _ = session.acquire().await.unwrap();
         session.set_suppress_upload("forward-incompat recreate");
@@ -5392,7 +5481,8 @@ mod tests {
         let skip_cfg = s3_session_config(StateUploadFailureMode::Skip);
 
         // Durable + configured skip ⇒ the forced Fail propagates the Put fault.
-        let mut durable = RemoteStateSession::new(&skip_cfg, &local, FinalizeDurability::Durable);
+        let mut durable =
+            RemoteStateSession::new(&skip_cfg, &local, FinalizeDurability::Durable, false);
         let _ = durable.acquire().await.unwrap();
         let err = durable
             .finalize()
@@ -5405,7 +5495,7 @@ mod tests {
 
         // ConfigDefault + configured skip ⇒ the same fault is swallowed (Ok).
         let mut config_default =
-            RemoteStateSession::new(&skip_cfg, &local, FinalizeDurability::ConfigDefault);
+            RemoteStateSession::new(&skip_cfg, &local, FinalizeDurability::ConfigDefault, false);
         let _ = config_default.acquire().await.unwrap();
         config_default
             .finalize()
@@ -5439,7 +5529,8 @@ mod tests {
         };
 
         // Bootstrap: first run creates the remote object (base None → Create).
-        let mut first = RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault);
+        let mut first =
+            RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault, false);
         let _ = first.acquire().await.unwrap();
         first
             .finalize()
@@ -5447,11 +5538,13 @@ mod tests {
             .expect("first CAS finalize creates the object");
 
         // Pod B acquires and captures the current generation as its base.
-        let mut pod_b = RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault);
+        let mut pod_b =
+            RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault, false);
         let _ = pod_b.acquire().await.unwrap();
 
         // A racer commits in between, advancing the remote generation.
-        let mut racer = RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault);
+        let mut racer =
+            RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault, false);
         let _ = racer.acquire().await.unwrap();
         racer
             .finalize()
@@ -5485,7 +5578,8 @@ mod tests {
         let cfg = s3_session_config(StateUploadFailureMode::Fail);
 
         for _ in 0..2 {
-            let mut s = RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault);
+            let mut s =
+                RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault, false);
             let _ = s.acquire().await.unwrap();
             s.finalize()
                 .await
@@ -5532,6 +5626,7 @@ mod tests {
             &harness.pod_a.cfg,
             &harness.pod_a.state_path,
             FinalizeDurability::Durable,
+            false,
         );
         let _authority = bootstrap.acquire().await.unwrap();
         bootstrap.finalize().await.unwrap();
@@ -5542,6 +5637,7 @@ mod tests {
             &harness.pod_a.cfg,
             &harness.pod_a.state_path,
             FinalizeDurability::Durable,
+            false,
         );
         let _authority = run_winner.acquire().await.unwrap();
         let winner_record = seam_policy_record("run-winner");
@@ -5553,7 +5649,7 @@ mod tests {
         let run_winner = Arc::new(tokio::sync::Mutex::new(Some(run_winner)));
         let attempts = Arc::new(AtomicUsize::new(0));
         let freeze_record = seam_policy_record("freeze-record");
-        let session = LedgerSeamSession::new(&harness.pod_b.cfg, &harness.pod_b.state_path);
+        let session = LedgerSeamSession::new(&harness.pod_b.cfg, &harness.pod_b.state_path, false);
         let winning_attempt = session
             .execute({
                 let run_winner = Arc::clone(&run_winner);
@@ -5594,7 +5690,7 @@ mod tests {
 
         let verify_dir = TempDir::new().unwrap();
         let verify_path = verify_dir.path().join(".rocky-state.redb");
-        let _authority = download_state(&harness.pod_a.cfg, &verify_path)
+        let _authority = download_state(&harness.pod_a.cfg, &verify_path, false)
             .await
             .unwrap();
         let decisions = StateStore::open(&verify_path)
@@ -5628,6 +5724,7 @@ mod tests {
             &harness.pod_a.cfg,
             &harness.pod_a.state_path,
             FinalizeDurability::Durable,
+            false,
         );
         let _authority = bootstrap.acquire().await.unwrap();
         {
@@ -5642,7 +5739,7 @@ mod tests {
             .arm_precondition_failures(&object_key, LEDGER_SEAM_MAX_ATTEMPTS);
         let loser_record = seam_policy_record("losing-freeze");
         let attempts = Arc::new(AtomicUsize::new(0));
-        let session = LedgerSeamSession::new(&harness.pod_b.cfg, &harness.pod_b.state_path);
+        let session = LedgerSeamSession::new(&harness.pod_b.cfg, &harness.pod_b.state_path, false);
         let err = session
             .execute({
                 let attempts = Arc::clone(&attempts);
@@ -5688,7 +5785,7 @@ mod tests {
         harness.faults.clear();
         let verify_dir = TempDir::new().unwrap();
         let verify_path = verify_dir.path().join(".rocky-state.redb");
-        let _authority = download_state(&harness.pod_a.cfg, &verify_path)
+        let _authority = download_state(&harness.pod_a.cfg, &verify_path, false)
             .await
             .unwrap();
         let decisions = StateStore::open(&verify_path)
@@ -5723,7 +5820,7 @@ mod tests {
 
         let calls = Arc::new(AtomicUsize::new(0));
         let seam_record = seam_policy_record("off-seam");
-        let session = LedgerSeamSession::new(&harness.pod_b.cfg, &harness.pod_b.state_path);
+        let session = LedgerSeamSession::new(&harness.pod_b.cfg, &harness.pod_b.state_path, false);
         let output = session
             .execute({
                 let calls = Arc::clone(&calls);
@@ -5774,7 +5871,7 @@ mod tests {
         let state_path = dir.path().join(".rocky-state.redb");
         let calls = Arc::new(AtomicUsize::new(0));
         let record = seam_policy_record("local-seam");
-        let session = LedgerSeamSession::new(&StateConfig::default(), &state_path);
+        let session = LedgerSeamSession::new(&StateConfig::default(), &state_path, false);
         let output = session
             .execute({
                 let calls = Arc::clone(&calls);
@@ -6099,7 +6196,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut session = RemoteStateSession::new(&cfg, &local, FinalizeDurability::Durable);
+        let mut session = RemoteStateSession::new(&cfg, &local, FinalizeDurability::Durable, false);
         let _ = session.acquire().await.unwrap();
         test_support::arm_valkey_set_fault();
         session
@@ -6146,7 +6243,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut session = RemoteStateSession::new(&cfg, &local, FinalizeDurability::Durable);
+        let mut session = RemoteStateSession::new(&cfg, &local, FinalizeDurability::Durable, false);
         let _ = session.acquire().await.unwrap();
         test_support::arm_valkey_set_fault();
         test_support::arm_valkey_del_fault();
@@ -6201,13 +6298,16 @@ mod tests {
         let cache_key = valkey_coherent_key(valkey_key_prefix(&cfg), &remote_key);
 
         // Bootstrap so both racers share a non-None base.
-        let mut first = RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault);
+        let mut first =
+            RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault, false);
         let _ = first.acquire().await.unwrap();
         first.finalize().await.expect("bootstrap commit");
 
-        let mut loser = RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault);
+        let mut loser =
+            RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault, false);
         let _ = loser.acquire().await.unwrap();
-        let mut winner = RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault);
+        let mut winner =
+            RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault, false);
         let _ = winner.acquire().await.unwrap();
         winner.finalize().await.expect("the winner commits");
 
@@ -6247,8 +6347,10 @@ mod tests {
         let cfg = tiered_cas_config();
         let object_key = object_store_state_key(&remote_state_key(&local));
 
-        let mut first = RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault);
-        let mut second = RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault);
+        let mut first =
+            RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault, false);
+        let mut second =
+            RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault, false);
         assert_eq!(
             first.acquire().await.unwrap(),
             StateAuthority::FreshStart,
@@ -6294,7 +6396,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut session = RemoteStateSession::new(&cfg, &local, FinalizeDurability::Durable);
+        let mut session = RemoteStateSession::new(&cfg, &local, FinalizeDurability::Durable, false);
         let _ = session.acquire().await.unwrap();
         faults.arm(
             crate::fault_store::FaultOp::Put,
@@ -6336,7 +6438,7 @@ mod tests {
 
         for _ in 0..2 {
             let mut session =
-                RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault);
+                RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault, false);
             let _ = session.acquire().await.unwrap();
             session
                 .finalize()
@@ -6369,6 +6471,7 @@ mod tests {
             &tiered_cas_config(),
             &local,
             FinalizeDurability::ConfigDefault,
+            false,
         );
         let _ = cas.acquire().await.unwrap();
         cas.start_periodic_uploader(Weak::<StateStore>::new(), Duration::from_secs(3600));
@@ -6382,7 +6485,8 @@ mod tests {
             concurrency_control: ConcurrencyControl::Off,
             ..tiered_cas_config()
         };
-        let mut off = RemoteStateSession::new(&off_cfg, &local, FinalizeDurability::ConfigDefault);
+        let mut off =
+            RemoteStateSession::new(&off_cfg, &local, FinalizeDurability::ConfigDefault, false);
         let _ = off.acquire().await.unwrap();
         off.start_periodic_uploader(Weak::<StateStore>::new(), Duration::from_secs(3600));
         assert!(
@@ -6408,6 +6512,7 @@ mod tests {
             &s3_session_config(StateUploadFailureMode::Fail),
             &local,
             FinalizeDurability::ConfigDefault,
+            false,
         );
         let _ = session.acquire().await.unwrap();
         // A cadence far beyond the test's lifetime: the loop must never fire,
@@ -6468,6 +6573,7 @@ mod tests {
             &s3_session_config(StateUploadFailureMode::Fail),
             &local,
             FinalizeDurability::ConfigDefault,
+            false,
         );
         let _ = session.acquire().await.unwrap();
         session.start_periodic_uploader(Arc::downgrade(&store), Duration::from_millis(40));
@@ -6524,6 +6630,7 @@ mod tests {
             &s3_session_config(StateUploadFailureMode::Fail),
             &local,
             FinalizeDurability::ConfigDefault,
+            false,
         );
         let _ = session.acquire().await.unwrap();
         session.start_periodic_uploader(Arc::downgrade(&store), Duration::from_millis(30));
@@ -6591,6 +6698,7 @@ mod tests {
             &s3_session_config(StateUploadFailureMode::Fail),
             &local,
             FinalizeDurability::ConfigDefault,
+            false,
         );
         let _ = session.acquire().await.unwrap();
         session.start_periodic_uploader(Arc::downgrade(&shared_state), Duration::from_millis(20));

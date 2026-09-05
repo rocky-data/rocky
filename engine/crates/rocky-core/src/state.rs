@@ -294,6 +294,56 @@ pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &[
     "product_approvals",
 ];
 
+/// [`LOCAL_ONLY_TABLE_NAMES`] without `schema_cache` — the set used when
+/// `[cache.schemas] replicate = true`.
+///
+/// Kept as its own const rather than built at runtime so both postures are
+/// visible here, next to the table definitions.
+///
+/// Duplicating the list does not by itself prevent the two from drifting — it
+/// permits exactly that. `the_two_local_only_sets_differ_by_exactly_one_table`
+/// is what enforces it: adding a local-only table here and forgetting it there
+/// (or the reverse) fails that test rather than silently replicating a table
+/// that must stay node-local.
+pub const LOCAL_ONLY_TABLE_NAMES_REPLICATING_SCHEMA_CACHE: &[&str] = &[
+    "jobs",
+    "schedule_state",
+    "schedule_claims",
+    "fulfill_state",
+    "product_approvals",
+];
+
+/// The local-only table set for a given `[cache.schemas] replicate` posture.
+///
+/// `replicate_schema_cache = false` (the default, and every project that has
+/// not opted in) returns [`LOCAL_ONLY_TABLE_NAMES`] unchanged, so the byte
+/// content of every sync leg is exactly what it was before this function
+/// existed. `true` drops `schema_cache` from the set, which is what makes the
+/// cache travel: a table is replicated precisely by NOT being local-only.
+///
+/// ```text
+///   replicate = false   ->  schema_cache stripped on upload,
+///                           overwritten from local on download   (default)
+///   replicate = true    ->  schema_cache uploaded and accepted from remote
+/// ```
+///
+/// # This is not the whole answer for the download leg
+///
+/// The download's `Absent` arm — no remote object, but a local store exists —
+/// rebuilds the local file from the local-only set alone. Passing the
+/// replicating set THERE would delete the local schema cache whenever the
+/// remote object is missing, which is not what opting into replication asks
+/// for. That arm deliberately keeps [`LOCAL_ONLY_TABLE_NAMES`]. See
+/// `state_sync::publish_merged`.
+#[must_use]
+pub fn local_only_table_names(replicate_schema_cache: bool) -> &'static [&'static str] {
+    if replicate_schema_cache {
+        LOCAL_ONLY_TABLE_NAMES_REPLICATING_SCHEMA_CACHE
+    } else {
+        LOCAL_ONLY_TABLE_NAMES
+    }
+}
+
 /// The redb key/value shape of a state table, for the logical snapshot export.
 ///
 /// The full table set is a **closed 2-type split**: exactly two tables are
@@ -6409,6 +6459,66 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    // ---- `[cache.schemas] replicate` table sets (#1620) ----
+
+    /// The default posture returns the pre-existing list, IDENTICALLY. This is
+    /// the guard that wiring the setting changed nothing for anyone who did not
+    /// opt in: every sync leg asks this function, so if `false` returns the same
+    /// slice, the uploaded and downloaded table sets are byte-identical.
+    #[test]
+    fn local_only_table_names_default_is_the_unchanged_list() {
+        assert_eq!(
+            local_only_table_names(false),
+            LOCAL_ONLY_TABLE_NAMES,
+            "replicate = false must not move the local-only set"
+        );
+        assert!(
+            local_only_table_names(false).contains(&"schema_cache"),
+            "the schema cache is local-only by default"
+        );
+    }
+
+    /// Opting in drops `schema_cache` and NOTHING else — a table is replicated
+    /// precisely by not being local-only, so this set difference IS the feature.
+    /// A stray removal here would silently start replicating another pod's
+    /// `jobs` rows or scheduler claims.
+    #[test]
+    fn local_only_table_names_replicating_drops_only_the_schema_cache() {
+        let replicating = local_only_table_names(true);
+        assert!(
+            !replicating.contains(&"schema_cache"),
+            "replicate = true must let the schema cache travel"
+        );
+
+        let expected: Vec<&str> = LOCAL_ONLY_TABLE_NAMES
+            .iter()
+            .copied()
+            .filter(|t| *t != "schema_cache")
+            .collect();
+        assert_eq!(
+            replicating.to_vec(),
+            expected,
+            "exactly one table may differ between the two postures"
+        );
+    }
+
+    /// The two consts cannot drift apart: adding a local-only table to one list
+    /// and forgetting the other would silently replicate it.
+    #[test]
+    fn the_two_local_only_sets_differ_by_exactly_one_table() {
+        assert_eq!(
+            LOCAL_ONLY_TABLE_NAMES.len(),
+            LOCAL_ONLY_TABLE_NAMES_REPLICATING_SCHEMA_CACHE.len() + 1,
+            "the replicating set is the default set minus schema_cache"
+        );
+        for table in LOCAL_ONLY_TABLE_NAMES_REPLICATING_SCHEMA_CACHE {
+            assert!(
+                LOCAL_ONLY_TABLE_NAMES.contains(table),
+                "'{table}' is in the replicating set but not the default one"
+            );
+        }
+    }
 
     fn temp_store() -> (StateStore, TempDir) {
         let dir = TempDir::new().unwrap();
