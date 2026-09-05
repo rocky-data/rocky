@@ -38,8 +38,9 @@ def freshness_is_configured(checks: ChecksConfig | None) -> bool:
     front of me says freshness is configured", which is the best available
     stand-in for "the engine will emit a ``freshness`` ``CheckResult``" — but it
     is not the same statement. It is wrong exactly when the projection and the
-    live ``rocky.toml`` disagree ABOUT FRESHNESS. They can differ in other ways
-    — a custom check added or removed — without changing this answer.
+    live ``rocky.toml`` disagree on WHETHER FRESHNESS IS CONFIGURED — the
+    boolean, not the settings. A changed ``threshold_seconds``, or any other
+    ``[checks]`` edit, leaves this answer correct.
 
     ``RockyComponent`` caches ``rocky discover``, and its state key is
     ``RockyComponent[<config_path>]`` — the PATH, not the file's contents — so
