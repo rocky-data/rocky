@@ -135,7 +135,7 @@ The first command prints the index digest and one digest per platform. The image
 
 Pull the next version tag and restart the container on the same mount. On the first read, the engine migrates the state store forward when the state schema changed; the [changelog](https://github.com/rocky-data/rocky/blob/main/engine/CHANGELOG.md) names every such change.
 
-Rolling back is running the previous tag. An older engine refuses a store written by a newer one, so when the upgrade crossed a state-schema change, restore the store from a copy taken before it. Copy `models/.rocky-state.redb` (or the `models/.rocky-state/` directory) before every upgrade; it is one file per store.
+Rolling back is running the previous tag. When the upgrade crossed a state-schema change, the older engine finds a store written by a newer one. `rocky serve` and every inspection command refuse it. `rocky run` follows `[state] on_schema_mismatch`: the default, `recreate`, starts from a fresh local state and does one full-refresh run; `fail` refuses like the rest. To roll back with the history intact, restore the store from a copy taken before the upgrade. Copy `models/.rocky-state.redb` (or the `models/.rocky-state/` directory) before every upgrade; it is one file per store.
 
 ## A minikube example
 
