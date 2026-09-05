@@ -1,26 +1,59 @@
 import type { ReactNode } from "react";
-import { navigateTo, pathForLane, useSubpath } from "../router";
+import { navigateTo, pathForLane, useSegments } from "../router";
+import { AuditScreen } from "./AuditScreen";
 import { BriefScreen } from "./BriefScreen";
+import { CustodyScreen } from "./CustodyScreen";
 import { ScorecardScreen } from "./ScorecardScreen";
 
 const TABS = [
   { id: "brief", label: "Brief", producer: "GET /api/v1/brief" },
   { id: "scorecard", label: "Scorecard", producer: "GET /api/v1/audit/scorecard" },
+  { id: "custody", label: "Custody", producer: "GET /api/v1/custody/{subject}" },
+  { id: "audit", label: "Audit", producer: "GET /api/v1/audit" },
 ] as const;
 
 type Tab = (typeof TABS)[number]["id"];
 
-function tabFromSubpath(subpath: string | null): Tab {
-  return subpath === "scorecard" ? "scorecard" : "brief";
+function tabFromSegment(segment: string | undefined): Tab {
+  return segment === "scorecard" || segment === "custody" || segment === "audit" ? segment : "brief";
 }
 
 /**
- * The governor lane: the brief and the trust scorecard, one tab each,
- * deep-linked at `/ui/governor/brief` and `/ui/governor/scorecard`.
- * The custody drill-down and the audit browse are U4-P2.
+ * The governor lane: the brief, the trust scorecard, the custody
+ * drill-down and the audit browse, one tab each, deep-linked at
+ * `/ui/governor/<screen>` (`/ui/governor/custody/<subject>` for a subject).
  */
-export function GovernorScreen({ brief, scorecard }: { brief?: ReactNode; scorecard?: ReactNode }) {
-  const tab = tabFromSubpath(useSubpath());
+export function GovernorScreen({
+  brief,
+  scorecard,
+  custody,
+  audit,
+}: {
+  brief?: ReactNode;
+  scorecard?: ReactNode;
+  custody?: (subject: string | null) => ReactNode;
+  audit?: ReactNode;
+}) {
+  const segments = useSegments();
+  const tab = tabFromSegment(segments[1]);
+  const subject = tab === "custody" && segments[2] ? decodeURIComponent(segments[2]) : null;
+
+  let screen: ReactNode;
+  switch (tab) {
+    case "brief":
+      screen = brief ?? <BriefScreen />;
+      break;
+    case "scorecard":
+      screen = scorecard ?? <ScorecardScreen />;
+      break;
+    case "custody":
+      screen = custody ? custody(subject) : <CustodyScreen subject={subject} />;
+      break;
+    case "audit":
+      screen = audit ?? <AuditScreen />;
+      break;
+  }
+
   return (
     <div className="space-y-4">
       <nav aria-label="Governor screens" className="flex gap-4 border-b border-zinc-200 text-sm dark:border-zinc-800">
@@ -44,7 +77,7 @@ export function GovernorScreen({ brief, scorecard }: { brief?: ReactNode; scorec
           </a>
         ))}
       </nav>
-      {tab === "brief" ? (brief ?? <BriefScreen />) : (scorecard ?? <ScorecardScreen />)}
+      {screen}
     </div>
   );
 }
