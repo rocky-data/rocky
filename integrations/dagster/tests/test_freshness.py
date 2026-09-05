@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from unittest.mock import patch
 
 import dagster as dg
+import pytest
 
 from dagster_rocky import (
     ChecksConfig,
@@ -16,8 +19,10 @@ from dagster_rocky import (
     freshness_policy_from_checks,
     load_rocky_assets,
 )
-from dagster_rocky.component import _build_group_contexts
+from dagster_rocky.component import RockyComponent, _build_group_contexts
+from dagster_rocky.freshness import freshness_is_configured
 from dagster_rocky.translator import RockyDagsterTranslator
+from dagster_rocky.types import RunResult
 
 
 def _discover_with_freshness(threshold_seconds: int) -> DiscoverResult:
@@ -233,3 +238,179 @@ def test_per_model_freshness_overrides_pipeline_default():
     assert by_name["payments"].freshness_policy.fail_window.to_timedelta().total_seconds() == 86400
     # Silence unused-import warning so the helper is exercised
     _ = ModelFreshnessConfig
+
+
+# ---------------------------------------------------------------------------
+# freshness_is_configured — the one predicate behind BOTH the FreshnessPolicy
+# and the pre-declared `freshness` AssetCheckSpec (#1645)
+# ---------------------------------------------------------------------------
+
+#: (id, checks projection, freshness is configured?)
+_FRESHNESS_CASES = [
+    ("no_checks_projection", None, False),
+    ("checks_without_freshness", ChecksConfig(freshness=None), False),
+    (
+        "checks_with_freshness",
+        ChecksConfig(freshness=FreshnessConfig(threshold_seconds=3600)),
+        True,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("checks", "expected"),
+    [(c, e) for _, c, e in _FRESHNESS_CASES],
+    ids=[i for i, _, _ in _FRESHNESS_CASES],
+)
+def test_freshness_is_configured(checks: ChecksConfig | None, expected: bool):
+    """``checks=None`` means no ``[checks]`` block at all (or a binary that
+    predates the projection). Both read as "no freshness"."""
+    assert freshness_is_configured(checks) is expected
+
+
+@pytest.mark.parametrize(
+    "checks",
+    [c for _, c, _ in _FRESHNESS_CASES],
+    ids=[i for i, _, _ in _FRESHNESS_CASES],
+)
+def test_freshness_is_configured_agrees_with_the_policy(checks: ChecksConfig | None):
+    """The check-spec gate and the FreshnessPolicy gate must never disagree.
+
+    The component declares the ``freshness`` :class:`dg.AssetCheckSpec` when
+    :func:`freshness_is_configured` is ``True`` and attaches a
+    :class:`dg.FreshnessPolicy` when :func:`freshness_policy_from_checks`
+    returns one. If those two ever diverge, an asset gets a stale-data badge
+    with no check behind it, or the reverse. This pins the equivalence.
+    """
+    assert freshness_is_configured(checks) is (freshness_policy_from_checks(checks) is not None)
+
+
+# ---------------------------------------------------------------------------
+# The `freshness` AssetCheckSpec is declared only when the pipeline configures
+# freshness (#1645). The engine gates its `freshness` CheckResult on
+# `[checks.freshness]` (rocky-cli `commands/run.rs`), so an unconditional spec
+# left `_emit_placeholder_checks` reporting `passed=True` for a check that
+# never ran, on every materialized table.
+# ---------------------------------------------------------------------------
+
+_ORDERS_KEY = dg.AssetKey(["fivetran", "acme", "shopify", "orders"])
+_OTHER_DEFAULT_CHECKS = {"row_count", "column_match", "row_count_anomaly"}
+
+
+def _state_file(tmp_path: Path, checks: dict | None) -> Path:
+    """Write a component state file for one source with one table."""
+    discover: dict = {
+        "version": "0.3.0",
+        "command": "discover",
+        "sources": [
+            {
+                "id": "src_001",
+                "components": {"tenant": "acme", "source": "shopify"},
+                "source_type": "fivetran",
+                "tables": [{"name": "orders"}],
+            }
+        ],
+    }
+    if checks is not None:
+        discover["checks"] = checks
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"discover": discover}))
+    return state_file
+
+
+def _declared_check_names(tmp_path: Path, checks: dict | None) -> set[str]:
+    component = RockyComponent(config_path="rocky.toml")
+    defs = component.build_defs_from_state(context=None, state_path=_state_file(tmp_path, checks))
+    return {
+        cs.name
+        for a in (defs.assets or [])
+        if isinstance(a, dg.AssetsDefinition)
+        for cs in a.check_specs
+    }
+
+
+def test_freshness_check_spec_declared_when_pipeline_configures_freshness(tmp_path: Path):
+    names = _declared_check_names(tmp_path, {"freshness": {"threshold_seconds": 86400}})
+    assert names == _OTHER_DEFAULT_CHECKS | {"freshness"}
+
+
+def test_freshness_check_spec_absent_when_there_is_no_checks_block(tmp_path: Path):
+    """`rocky discover` omits `checks` entirely when the pipeline declares
+    neither freshness nor any non-default check."""
+    names = _declared_check_names(tmp_path, None)
+    assert names == _OTHER_DEFAULT_CHECKS
+
+
+def test_freshness_check_spec_absent_when_checks_block_has_no_freshness(tmp_path: Path):
+    """`[checks]` exists (a non-default check is configured) but there is no
+    `[checks.freshness]`, so `discover.checks.freshness` is null."""
+    names = _declared_check_names(tmp_path, {"freshness": None, "configured_checks": {}})
+    assert names == _OTHER_DEFAULT_CHECKS
+
+
+def test_materialized_table_reports_no_freshness_verdict_without_a_freshness_config(
+    tmp_path: Path,
+):
+    """The bug, end to end: rocky copies the table and emits no `freshness`
+    result, because the pipeline declares no `[checks.freshness]`.
+
+    Before the fix the placeholder pass reported `freshness` as
+    `passed=True` ("not produced by rocky") — a green badge for a check that
+    never ran. Now no `freshness` evaluation is recorded at all, while the
+    other declared defaults still are.
+    """
+    component = RockyComponent(config_path="rocky.toml")
+    defs = component.build_defs_from_state(context=None, state_path=_state_file(tmp_path, None))
+    asset_defs = [a for a in (defs.assets or []) if isinstance(a, dg.AssetsDefinition)]
+
+    run_result = RunResult.model_validate(
+        {
+            "version": "0.3.0",
+            "command": "run",
+            "filter": "tenant=acme",
+            "duration_ms": 10,
+            "tables_copied": 1,
+            "tables_failed": 0,
+            "materializations": [
+                {
+                    "asset_key": ["fivetran", "acme", "shopify", "orders"],
+                    "rows_copied": 100,
+                    "duration_ms": 5,
+                    "metadata": {"strategy": "full_refresh"},
+                }
+            ],
+            # The engine emits NO freshness result: `[checks.freshness]` is absent.
+            "check_results": [],
+            "errors": [],
+            "excluded_tables": [],
+            "contained": [],
+            "permissions": {
+                "grants_added": 0,
+                "grants_revoked": 0,
+                "catalogs_created": 0,
+                "schemas_created": 0,
+            },
+            "drift": {"tables_checked": 0, "tables_drifted": 0, "actions_taken": []},
+        }
+    )
+
+    with (
+        patch.object(RockyResource, "run", return_value=run_result),
+        patch.object(RockyResource, "run_streaming", return_value=run_result),
+    ):
+        result = dg.materialize(
+            asset_defs,
+            resources={"rocky": RockyResource(config_path="rocky.toml")},
+            selection=[_ORDERS_KEY],
+            raise_on_error=False,
+        )
+
+    assert result.success
+    evaluated = {
+        e.event_specific_data.check_name
+        for e in result.all_events
+        if e.event_type_value == "ASSET_CHECK_EVALUATION"
+    }
+    assert "freshness" not in evaluated
+    # The op really ran and the other declared defaults still get a verdict.
+    assert evaluated == _OTHER_DEFAULT_CHECKS

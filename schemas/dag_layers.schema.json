@@ -1,0 +1,28 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "The execution layers for `GET /api/v1/dag/layers`.\n\nBounded by the project's model count: every model appears in exactly one layer.",
+  "properties": {
+    "layers": {
+      "description": "Topologically sorted layers. Models in one layer have no mutual dependencies and can run in parallel.",
+      "items": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "type": "array"
+    },
+    "total_models": {
+      "description": "Number of models across all layers.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "layers",
+    "total_models"
+  ],
+  "title": "DagLayersOutput",
+  "type": "object"
+}

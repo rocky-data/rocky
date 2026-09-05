@@ -1,0 +1,178 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "DagExecutionOutput": {
+      "description": "Aggregate result of one DAG execution.",
+      "properties": {
+        "completed": {
+          "description": "Nodes that completed.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "duration_ms": {
+          "description": "Wall-clock duration of the whole execution, in milliseconds.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "failed": {
+          "description": "Nodes that failed.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "nodes": {
+          "description": "One record per node the executor visited.",
+          "items": {
+            "$ref": "#/definitions/DagNodeResultOutput"
+          },
+          "type": "array"
+        },
+        "skipped": {
+          "description": "Nodes skipped because an ancestor failed.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "total_layers": {
+          "description": "Number of execution layers.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "total_nodes": {
+          "description": "Number of nodes in the DAG.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "completed",
+        "duration_ms",
+        "failed",
+        "nodes",
+        "skipped",
+        "total_layers",
+        "total_nodes"
+      ],
+      "type": "object"
+    },
+    "DagNodeResultOutput": {
+      "description": "One node's record inside [`DagExecutionOutput`].",
+      "properties": {
+        "duration_ms": {
+          "description": "Node duration, in milliseconds.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "error": {
+          "description": "Error message when the node failed; omitted otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Node id.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "Node kind, e.g. `model` or `test`.",
+          "type": "string"
+        },
+        "label": {
+          "description": "Human label.",
+          "type": "string"
+        },
+        "layer": {
+          "description": "The execution layer the node ran in.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "status": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/DagNodeStatusOutput"
+            }
+          ],
+          "description": "Final status of the node."
+        }
+      },
+      "required": [
+        "duration_ms",
+        "id",
+        "kind",
+        "label",
+        "layer",
+        "status"
+      ],
+      "type": "object"
+    },
+    "DagNodeStatusOutput": {
+      "description": "Status of one node in a recorded DAG execution.",
+      "oneOf": [
+        {
+          "description": "Node has not started yet.",
+          "enum": [
+            "pending"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Node is currently executing.",
+          "enum": [
+            "running"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Node completed successfully.",
+          "enum": [
+            "completed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Node failed; `error` is attached.",
+          "enum": [
+            "failed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Node was skipped because an ancestor failed.",
+          "enum": [
+            "skipped"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "description": "The latest recorded DAG execution for `GET /api/v1/dag/status`.\n\nPopulated by the in-process executor only; there is no CLI counterpart. The route answers `503 engine_not_ready` until one execution has been recorded. Bounded by the node count of that execution.",
+  "properties": {
+    "completed_at": {
+      "description": "When the execution finished (UTC).",
+      "format": "date-time",
+      "type": "string"
+    },
+    "result": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/DagExecutionOutput"
+        }
+      ],
+      "description": "The aggregate execution result."
+    }
+  },
+  "required": [
+    "completed_at",
+    "result"
+  ],
+  "title": "DagStatusOutput",
+  "type": "object"
+}

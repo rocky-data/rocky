@@ -1151,6 +1151,77 @@ required_columns = [
         );
     }
 
+    /// A column that lands with a type outside Rocky's type map (DuckDB sniffs
+    /// `12:34:56` as `TIME`, which `warehouse_type_to_rocky` does not know)
+    /// still promotes, and the gate result says the declared type was not
+    /// checked, naming the column and both types (#1614). Exercises the whole
+    /// path: COPY into staging, live `DESCRIBE`, `validate_contract_typed`,
+    /// promote.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn test_contract_gate_reports_a_landed_type_it_cannot_compare() {
+        use rocky_core::contracts::ContractConfig;
+        use rocky_duckdb::DuckDbConnector;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::loader::DuckDbLoaderAdapter;
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("events.csv");
+        std::fs::write(&csv_path, "id,at\n1,12:34:56\n").unwrap();
+
+        let shared = Arc::new(Mutex::new(DuckDbConnector::in_memory().unwrap()));
+        let loader = DuckDbLoaderAdapter::new(Arc::clone(&shared));
+        let wh = DuckDbWarehouseAdapter::from_shared(Arc::clone(&shared));
+
+        let contract = ContractConfig {
+            required_columns: vec![
+                rocky_core::contracts::RequiredColumn {
+                    name: "id".into(),
+                    data_type: "BIGINT".into(),
+                    nullable: true,
+                },
+                rocky_core::contracts::RequiredColumn {
+                    name: "at".into(),
+                    data_type: "TIMESTAMP".into(),
+                    nullable: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let target = TableRef {
+            catalog: String::new(),
+            schema: "main".into(),
+            table: "events".into(),
+        };
+        let source = LoadSource::LocalFile(csv_path);
+        let options = LoadOptions {
+            format: Some(FileFormat::Csv),
+            create_table: true,
+            ..LoadOptions::default()
+        };
+
+        let (rows, _bytes, result) =
+            load_with_contract_gate(&loader, &wh, &source, &target, &options, &contract)
+                .await
+                .expect("an uncomparable type is reported, not refused");
+        assert_eq!(rows, 1);
+        let result = result.expect("gate result should be present");
+        assert!(result.passed, "violations: {:?}", result.violations);
+        assert_eq!(
+            result.warnings.len(),
+            1,
+            "one warning for the one unchecked column: {:?}",
+            result.warnings
+        );
+        let w = &result.warnings[0];
+        assert!(
+            w.contains("'at'") && w.contains("'TIME'") && w.contains("'TIMESTAMP'"),
+            "the warning must name the column, the landed type and the declared type: {w}"
+        );
+    }
+
     /// Regression: a transient target `DESCRIBE` failure during contract-gated
     /// promotion must not turn an append load into a destructive replace. The
     /// probe collapses to `target_exists = false`, so the promote must use a
