@@ -38,7 +38,7 @@ use rocky_core::state::{PolicyDecisionRecord, StateStore};
 use serde::{Deserialize, Serialize};
 
 use crate::commands::apply::{ai_plan_is_reviewed, review_marker_path};
-use crate::commands::audit::{blast_radius_of, compile_project, plan_file_path};
+use crate::commands::audit::{blast_radius_of, compile_project_with_schemas, plan_file_path};
 use crate::output::{
     ApproverIdentity, ReviewOutput, ReviewQueueEntry, ReviewQueueOutput, RunPlan, print_json,
 };
@@ -733,7 +733,7 @@ pub fn compute_review_queue(
         &decisions,
         Utc::now(),
         MAX_HISTORY_SCAN,
-    );
+    )?;
 
     Ok(ReviewQueueOutput {
         version: VERSION.to_string(),
@@ -750,6 +750,10 @@ pub fn compute_review_queue(
 /// count of outstanding escalations excluded because no plan file backs them.
 /// Factored out (with an injectable scan cap) so the ranking and the cap
 /// semantics are unit-testable without a state store.
+///
+/// Refuses when `rocky.toml` is present and does not load (#1702). An absent
+/// `rocky.toml` is still fine — it ranks against a cold schema cache, as it
+/// always did.
 #[allow(clippy::too_many_arguments)]
 fn build_queue(
     root: &Path,
@@ -759,7 +763,20 @@ fn build_queue(
     decisions: &[PolicyDecisionRecord],
     now: DateTime<Utc>,
     max_scan: usize,
-) -> (Vec<ReviewQueueEntry>, u64) {
+) -> Result<(Vec<ReviewQueueEntry>, u64)> {
+    // Read the config FIRST — before the outstanding-selection short-circuit
+    // below, and before the compile. `rocky review --queue` refuses a
+    // present-but-unloadable `rocky.toml`, full stop; the refusal must not
+    // depend on whether the ledger happens to hold a pending row today. The
+    // cost is one read-only schema-cache scan on an otherwise-empty queue,
+    // which is the price of a rule with no exceptions.
+    //
+    // The loader is the credential-tolerant one (`load_optional_project_config`
+    // under `load_project_source_schemas`): `rocky review --queue` reads the
+    // state store and compiles offline, and opens no warehouse connection.
+    let source_schemas =
+        crate::source_schemas::load_project_source_schemas(config_path, state_path, None)?;
+
     // `list_policy_decisions` yields oldest-first; scan the NEWEST `max_scan`
     // rows (matching `list_runs`' newest-first convention) so a long-lived
     // ledger never ages genuinely-pending escalations out of the queue.
@@ -769,13 +786,14 @@ fn build_queue(
         |plan_id| plan_file_path(root, plan_id).exists(),
     );
     if outstanding.is_empty() {
-        return (Vec::new(), excluded_non_plan);
+        return Ok((Vec::new(), excluded_non_plan));
     }
 
-    // One compile serves every model's blast radius. A compile failure leaves
-    // every blast radius unknown (weight-and-staleness-only ranking) rather
-    // than failing the whole queue.
-    let compiled = compile_project(config_path, state_path, models_dir).ok();
+    // One compile serves every model's blast radius. A COMPILE failure still
+    // leaves every blast radius unknown (weight-and-staleness-only ranking)
+    // rather than failing the whole queue — that degrade is deliberate and
+    // unchanged. Only the config leg above refuses, and it already ran.
+    let compiled = compile_project_with_schemas(source_schemas, models_dir).ok();
 
     let mut entries: Vec<ReviewQueueEntry> = outstanding
         .into_iter()
@@ -812,7 +830,7 @@ fn build_queue(
             .then_with(|| a.plan_id.cmp(&b.plan_id))
             .then_with(|| a.model.cmp(&b.model))
     });
-    (entries, excluded_non_plan)
+    Ok((entries, excluded_non_plan))
 }
 
 /// The pending escalations to surface: the latest `require_review` decision
@@ -1405,7 +1423,8 @@ mod tests {
             &decisions,
             now,
             2, // injected cap — production passes MAX_HISTORY_SCAN
-        );
+        )
+        .expect("no rocky.toml is written here, so the config leg must not refuse");
 
         assert_eq!(excluded, 0);
         assert_eq!(entries.len(), 2, "only the capped scan window surfaces");
@@ -1488,5 +1507,150 @@ mod tests {
         let (out, excluded) = select_outstanding(&decisions, |pid| pid == "planB", |_| true);
         assert!(out.is_empty(), "a reviewed plan never re-lists: {out:?}");
         assert_eq!(excluded, 0);
+    }
+    // ------------------------------------------------------------------
+    // `rocky review --queue` — the config leg (#1702)
+    //
+    // `build_queue` called `compile_project(..).ok()`, which re-swallowed the
+    // refusal #1667 added inside `audit::compile_project`. A broken
+    // `rocky.toml` therefore ranked EVERY escalation with "blast radius
+    // unknown" — the same ranking a healthy project with no downstream models
+    // produces. These tests drive `compute_review_queue`, the caller shared by
+    // the CLI, `GET /api/v1/review/queue` and the governor's `review_queue`
+    // MCP tool, so a `.ok()` put back at the call site fails them.
+    // ------------------------------------------------------------------
+
+    /// Parses as TOML, fails a validator: `fivetran` is discovery-only and
+    /// needs `kind = "discovery"`. Present-and-broken, never absent.
+    const BROKEN_CONFIG_1702: &str =
+        "[adapter.ft]\ntype = \"fivetran\"\napi_key = \"k\"\napi_secret = \"s\"\n";
+
+    /// Loads under the credential-TOLERANT loader (#1536), refuses under the
+    /// strict one: `${...}` is unset and sits in an adapter connection field.
+    const UNSET_CREDENTIAL_CONFIG_1702: &str = "[adapters.wh]\ntype = \"databricks\"\n\
+         host = \"${ROCKY_T_1702_UNSET}\"\n";
+
+    /// One outstanding `require_review` escalation, backed by a plan file so
+    /// `select_outstanding` keeps it. Returns the state-store path.
+    fn seed_pending_escalation(root: &Path) -> std::path::PathBuf {
+        let plans = root.join(".rocky").join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        std::fs::write(plans.join("planQ.json"), "{}").unwrap();
+
+        let state_path = root.join("state.redb");
+        let store = StateStore::open(&state_path).unwrap();
+        store
+            .record_policy_decision(&qd(
+                1,
+                "planQ",
+                "fct_orders",
+                PolicyEffect::RequireReview,
+                PolicyCapability::SchemaChangeBreaking,
+            ))
+            .unwrap();
+        state_path
+    }
+
+    /// A present-but-unloadable `rocky.toml` refuses the queue, and the error
+    /// NAMES the file. Restoring `compile_project(..).ok()` makes this fail:
+    /// the queue returns `Ok` with one entry whose `blast_radius` is `None`.
+    #[test]
+    fn review_queue_refuses_a_present_but_unloadable_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let state_path = seed_pending_escalation(root);
+        let cfg = root.join("rocky.toml");
+        std::fs::write(&cfg, BROKEN_CONFIG_1702).unwrap();
+
+        let err = compute_review_queue(root, &cfg, &state_path, &root.join("models"))
+            .expect_err("a present but unloadable rocky.toml must refuse `rocky review --queue`");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(&cfg.display().to_string()),
+            "the refusal must name the config file: {rendered}"
+        );
+        assert!(
+            rendered.contains("discovery-only") || rendered.contains("kind = \"discovery\""),
+            "the loader's own error must survive: {rendered}"
+        );
+    }
+
+    /// The refusal does not depend on the ledger holding a pending row today.
+    /// The config is read BEFORE the outstanding-selection short-circuit, so
+    /// `rocky review --queue` on a broken config refuses whether or not there
+    /// is anything to rank. Moving the read below that short-circuit makes
+    /// this fail while the test above still passes.
+    #[test]
+    fn review_queue_refuses_an_unloadable_config_with_an_empty_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let cfg = root.join("rocky.toml");
+        std::fs::write(&cfg, BROKEN_CONFIG_1702).unwrap();
+
+        let err = compute_review_queue(root, &cfg, &root.join("state.redb"), &root.join("models"))
+            .expect_err("an empty queue must not excuse an unloadable config");
+        assert!(
+            format!("{err:#}").contains(&cfg.display().to_string()),
+            "{err:#}"
+        );
+    }
+
+    /// Honest failure (a): absent is not invalid. With NO `rocky.toml` the
+    /// queue ranks exactly as it always did — a cold schema cache, so the
+    /// blast radius is unknown and the entry still lists.
+    ///
+    /// The second half is the discriminator: it pins that a present-but-broken
+    /// config in the SAME shape does refuse, so this guard cannot pass just
+    /// because the config leg was removed altogether.
+    #[test]
+    fn review_queue_still_ranks_without_any_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let state_path = seed_pending_escalation(root);
+        let cfg = root.join("rocky.toml");
+        assert!(!cfg.exists());
+
+        let out = compute_review_queue(root, &cfg, &state_path, &root.join("models"))
+            .expect("a missing rocky.toml must not refuse the queue");
+        assert_eq!(out.total, 1);
+        assert_eq!(out.pending[0].model, "fct_orders");
+        assert_eq!(
+            out.pending[0].blast_radius, None,
+            "no models dir and a cold cache — the blast radius is unknown, as before"
+        );
+
+        std::fs::write(&cfg, BROKEN_CONFIG_1702).unwrap();
+        assert!(
+            compute_review_queue(root, &cfg, &state_path, &root.join("models")).is_err(),
+            "a present-but-broken config in the same project must refuse"
+        );
+    }
+
+    /// Honest failure (b): a config that LOADS but holds an unset `${VAR}` in
+    /// an adapter connection field must not refuse. `rocky review --queue`
+    /// opens no warehouse connection, so it uses the credential-tolerant
+    /// loader and reads the schema cache the strict loader would have skipped.
+    #[test]
+    fn review_queue_tolerates_an_unset_credential_var() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let state_path = seed_pending_escalation(root);
+        let cfg = root.join("rocky.toml");
+        std::fs::write(&cfg, UNSET_CREDENTIAL_CONFIG_1702).unwrap();
+
+        // The loader choice is what makes the difference — pin both directions.
+        assert!(
+            rocky_core::config::load_rocky_config(&cfg).is_err(),
+            "fixture must fail the STRICT loader, or this proves nothing"
+        );
+        assert!(
+            rocky_core::config::load_optional_project_config(Some(&cfg))
+                .expect("the tolerant loader must accept an unset adapter credential")
+                .is_some()
+        );
+
+        let out = compute_review_queue(root, &cfg, &state_path, &root.join("models"))
+            .expect("an unset ${VAR} in adapter credentials must not refuse the queue");
+        assert_eq!(out.total, 1);
     }
 }

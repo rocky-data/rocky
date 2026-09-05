@@ -32,9 +32,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use tracing::warn;
-
-use rocky_core::config::load_rocky_config;
+use rocky_core::config::load_optional_project_config;
 use rocky_core::cost::{WarehouseType, compute_observed_cost_usd, warehouse_size_to_dbu_per_hour};
 use rocky_core::state::{ModelExecution, RunRecord, RunStatus, RunTrigger, StateStore};
 
@@ -406,11 +404,51 @@ fn print_table(output: &CostOutput) {
     }
 }
 
+/// The billed-warehouse pricing parameters from `rocky.toml`:
+/// `(adapter name, warehouse type, DBU/hour, $/DBU)`.
+///
+/// ```text
+///   no rocky.toml            -> Ok(None)   durations and bytes only
+///   rocky.toml does not load -> Err        naming the file (#1702)
+///   loads, non-billed source -> Ok(None)   Fivetran / Airbyte, unchanged
+/// ```
+///
+/// This used to be a `match` that logged a warning and returned `None` on ANY
+/// load error, so a broken config produced the same rollup as a config-less
+/// project and as a genuinely non-billed one. Three different situations, one
+/// indistinguishable answer.
+///
+/// The loader is the credential-tolerant one: `rocky cost` reads the state
+/// store and prices from the run record, and opens no warehouse connection.
+/// Adapters are read for their `type` only.
+fn adapter_pricing(config_path: &Path) -> Result<Option<(String, WarehouseType, f64, f64)>> {
+    let Some(cfg) = load_optional_project_config(Some(config_path))
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?
+    else {
+        return Ok(None);
+    };
+    let dbu_per_hour = warehouse_size_to_dbu_per_hour(&cfg.cost.warehouse_size);
+    let cost_per_dbu = cfg.cost.compute_cost_per_dbu;
+    Ok(resolve_warehouse_type(&cfg.adapters)
+        .map(|(name, wh)| (name, wh, dbu_per_hour, cost_per_dbu)))
+}
+
 /// Execute `rocky cost <run_id|latest>`.
 ///
 /// Loads the run from the state store, loads `rocky.toml` to resolve the
-/// billed-warehouse type (degrading gracefully when the config can't be
-/// read), and emits the rollup as JSON or a human table.
+/// billed-warehouse type, and emits the rollup as JSON or a human table.
+///
+/// ```text
+///   no rocky.toml            -> durations and bytes only, no dollar figures
+///   rocky.toml does not load -> Err, naming the file (#1702)
+///   unset ${VAR} in adapter
+///     connection fields      -> loads; the cost figures render (#1536)
+/// ```
+///
+/// It used to swallow every load error into "no dollar figures", so a broken
+/// config and a config-less project produced the same rollup. `rocky cost`
+/// reads the state store and prices from the run record — it opens no
+/// warehouse connection — so the loader is the credential-tolerant one.
 pub fn run_cost(
     state_path: &Path,
     config_path: &Path,
@@ -425,25 +463,7 @@ pub fn run_cost(
 
     let record = resolve(&store, target)?;
 
-    // Load config best-effort: the record itself is enough to emit
-    // durations/bytes; the only thing we lose without a config is the
-    // cost formula's parameters.
-    let adapter_info: Option<(String, WarehouseType, f64, f64)> =
-        match load_rocky_config(config_path) {
-            Ok(cfg) => {
-                let dbu_per_hour = warehouse_size_to_dbu_per_hour(&cfg.cost.warehouse_size);
-                let cost_per_dbu = cfg.cost.compute_cost_per_dbu;
-                resolve_warehouse_type(&cfg.adapters)
-                    .map(|(name, wh)| (name, wh, dbu_per_hour, cost_per_dbu))
-            }
-            Err(err) => {
-                warn!(
-                    "failed to load config at {} — cost figures will be omitted: {err}",
-                    config_path.display()
-                );
-                None
-            }
-        };
+    let adapter_info = adapter_pricing(config_path)?;
 
     let output = build_output(&record, adapter_info.as_ref(), model_filter, group_by);
 
@@ -837,5 +857,104 @@ mod tests {
     fn resolve_warehouse_type_none_for_empty_adapters() {
         let pairs: Vec<(String, String)> = Vec::new();
         assert!(resolve_warehouse_type_from_types(&pairs).is_none());
+    }
+    // ------------------------------------------------------------------
+    // The config leg (#1702). `rocky cost` used to swallow every load error
+    // into "no dollar figures", which is also what a config-less project and
+    // a non-billed source show.
+    // ------------------------------------------------------------------
+
+    /// Parses as TOML, fails a validator: `fivetran` is discovery-only and
+    /// needs `kind = "discovery"`. Present-and-broken, never absent.
+    const BROKEN_CONFIG_1702: &str =
+        "[adapter.ft]\ntype = \"fivetran\"\napi_key = \"k\"\napi_secret = \"s\"\n";
+
+    /// Loads under the credential-TOLERANT loader (#1536), refuses under the
+    /// strict one: `${...}` is unset and sits in an adapter connection field.
+    const UNSET_CREDENTIAL_CONFIG_1702: &str = "[adapters.wh]\ntype = \"databricks\"\n\
+         host = \"${ROCKY_T_1702_UNSET}\"\n";
+
+    /// A state store holding one run, so `run_cost` reaches the config leg.
+    fn seed_one_run(dir: &TempDir) -> std::path::PathBuf {
+        let path = dir.path().join("state.redb");
+        let store = StateStore::open(&path).unwrap();
+        store
+            .record_run(&sample_run(
+                "run-1",
+                vec![sample_exec("m", "success", 1000, Some(10), None)],
+            ))
+            .unwrap();
+        path
+    }
+
+    /// The CALLER refuses: `rocky cost latest` on a present-but-unloadable
+    /// `rocky.toml` errors, naming the file. Restoring the swallow makes this
+    /// fail — it returns `Ok` and prints a rollup with no dollar figures.
+    #[test]
+    fn cost_refuses_a_present_but_unloadable_config() {
+        let dir = TempDir::new().unwrap();
+        let state_path = seed_one_run(&dir);
+        let cfg = dir.path().join("rocky.toml");
+        std::fs::write(&cfg, BROKEN_CONFIG_1702).unwrap();
+
+        let err = run_cost(&state_path, &cfg, "latest", None, None, true)
+            .expect_err("a present but unloadable rocky.toml must refuse `rocky cost`");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(&cfg.display().to_string()),
+            "the refusal must name the config file: {rendered}"
+        );
+        assert!(
+            rendered.contains("discovery-only") || rendered.contains("kind = \"discovery\""),
+            "the loader's own error must survive: {rendered}"
+        );
+    }
+
+    /// Honest failure (a): with NO `rocky.toml` the rollup still renders —
+    /// durations and bytes come from the run record. The second half is the
+    /// discriminator, so this cannot pass by the config leg being dropped.
+    #[test]
+    fn cost_still_reports_without_any_config() {
+        let dir = TempDir::new().unwrap();
+        let state_path = seed_one_run(&dir);
+        let cfg = dir.path().join("rocky.toml");
+        assert!(!cfg.exists());
+
+        assert!(
+            adapter_pricing(&cfg)
+                .expect("absent is not invalid")
+                .is_none(),
+            "no config → no pricing parameters, as before"
+        );
+        run_cost(&state_path, &cfg, "latest", None, None, true)
+            .expect("a missing rocky.toml must not refuse `rocky cost`");
+
+        std::fs::write(&cfg, BROKEN_CONFIG_1702).unwrap();
+        assert!(
+            adapter_pricing(&cfg).is_err(),
+            "a present-but-broken config in the same project must refuse"
+        );
+    }
+
+    /// Honest failure (b): a config holding an unset `${VAR}` in an adapter
+    /// connection field now PRICES the run. Under the strict loader it fell
+    /// into the same "no dollar figures" hole as a broken config.
+    #[test]
+    fn cost_prices_a_run_with_an_unset_credential_var() {
+        let dir = TempDir::new().unwrap();
+        let cfg = dir.path().join("rocky.toml");
+        std::fs::write(&cfg, UNSET_CREDENTIAL_CONFIG_1702).unwrap();
+
+        assert!(
+            rocky_core::config::load_rocky_config(&cfg).is_err(),
+            "fixture must fail the STRICT loader, or this proves nothing"
+        );
+
+        let (name, wh, dbu_per_hour, cost_per_dbu) = adapter_pricing(&cfg)
+            .expect("an unset ${VAR} in adapter credentials must not refuse")
+            .expect("the billed warehouse must resolve");
+        assert_eq!(name, "databricks");
+        assert_eq!(wh, WarehouseType::Databricks);
+        assert!(dbu_per_hour > 0.0 && cost_per_dbu > 0.0);
     }
 }

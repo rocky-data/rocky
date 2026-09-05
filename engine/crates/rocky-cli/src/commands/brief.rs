@@ -26,7 +26,9 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 
-use rocky_core::config::{PolicyEffect, PolicyPrincipal, load_rocky_config, parse_window_duration};
+use rocky_core::config::{
+    PolicyEffect, PolicyPrincipal, RockyConfig, load_optional_project_config, parse_window_duration,
+};
 use rocky_core::cost::{WarehouseType, compute_observed_cost_usd, warehouse_size_to_dbu_per_hour};
 use rocky_core::policy;
 use rocky_core::state::{
@@ -140,6 +142,20 @@ pub fn run_brief(
 ///
 /// Fails closed: an absent state store yields a fully `unavailable` digest
 /// rather than an error.
+///
+/// `rocky.toml` is read ONCE here and passed to the three sections that need
+/// it (cost, autonomy, scheduler). Each used to load the file for itself and
+/// swallow the error, so a broken config produced a digest with no dollar
+/// figures, no budget degradations and an unavailable scheduler — the same
+/// digest a healthy config-less project produces (#1702). It now refuses,
+/// naming the file. An absent `rocky.toml` is still `None` and every section
+/// renders exactly as before.
+///
+/// The loader is the credential-tolerant one: the brief reads the state store,
+/// the `[state]` durable tier and the incident directory. Tolerance is scoped
+/// to adapter CONNECTION fields, so an unresolved `${VAR}` under `[state]` is
+/// still refused and no literal placeholder can reach the object-store
+/// provider. Adapters are read for their `type` only, to price runs.
 pub fn compute_brief(
     root: &Path,
     state_path: &Path,
@@ -147,6 +163,11 @@ pub fn compute_brief(
     since: BriefSince,
     now: DateTime<Utc>,
 ) -> Result<BriefOutput> {
+    // Read the config BEFORE the absent-state-store short-circuit: a broken
+    // `rocky.toml` refuses whatever else is or is not on disk.
+    let cfg: Option<RockyConfig> = load_optional_project_config(Some(config_path))
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+
     // Fail closed on an absent state store: there is no history to project.
     if !state_path.exists() {
         return Ok(empty_brief(
@@ -201,13 +222,13 @@ pub fn compute_brief(
     let runs_section = build_runs(&windowed_runs);
     let drift = build_drift(&store, since_ts);
     let (freshness, quality) = build_freshness_and_quality(&store, &windowed_runs, since_ts);
-    let cost = build_cost(config_path, &windowed_runs);
+    let cost = build_cost(cfg.as_ref(), &windowed_runs);
     // Autonomy state is a *current-state* projection: each budget uses its own
     // window and freezes are current, so it reads the full ledger, not the
     // `--since` slice.
-    let autonomy = build_autonomy(config_path, &decisions, now);
+    let autonomy = build_autonomy(cfg.as_ref(), &decisions, now);
     let scheduler = build_scheduler(
-        config_path,
+        cfg.as_ref(),
         &store,
         since_ts,
         &crate::commands::scheduler::rocky_dir_for_config(config_path),
@@ -579,7 +600,7 @@ fn build_freshness_and_quality(
     (freshness_section, quality_section)
 }
 
-fn build_cost(config_path: &Path, runs: &[&RunRecord]) -> BriefCostSection {
+fn build_cost(cfg: Option<&RockyConfig>, runs: &[&RunRecord]) -> BriefCostSection {
     if runs.is_empty() {
         return BriefCostSection {
             availability: SectionAvailability::NoData,
@@ -594,10 +615,10 @@ fn build_cost(config_path: &Path, runs: &[&RunRecord]) -> BriefCostSection {
         };
     }
 
-    // Load config best-effort — a missing config only costs the dollar
-    // figures; durations and bytes stand on their own.
-    let cfg = load_rocky_config(config_path).ok();
-    let adapter_info: Option<(String, WarehouseType, f64, f64)> = cfg.as_ref().and_then(|c| {
+    // A missing config only costs the dollar figures; durations and bytes
+    // stand on their own. A config that is present and does not load never
+    // reaches here — `compute_brief` already refused.
+    let adapter_info: Option<(String, WarehouseType, f64, f64)> = cfg.and_then(|c| {
         let dbu_per_hour = warehouse_size_to_dbu_per_hour(&c.cost.warehouse_size);
         let cost_per_dbu = c.cost.compute_cost_per_dbu;
         resolve_warehouse_type(c).map(|(name, wh)| (name, wh, dbu_per_hour, cost_per_dbu))
@@ -717,7 +738,7 @@ fn build_budget(ceiling: f64, per_run: &[BriefRunCost]) -> BriefBudgetStatus {
 /// budgets are unavailable, and an unreachable marker tier sets the section
 /// note rather than silently rendering ledger-only.
 fn build_autonomy(
-    config_path: &Path,
+    cfg: Option<&RockyConfig>,
     decisions: &[PolicyDecisionRecord],
     now: DateTime<Utc>,
 ) -> BriefAutonomySection {
@@ -731,7 +752,6 @@ fn build_autonomy(
         })
         .collect();
 
-    let cfg = load_rocky_config(config_path).ok();
     let mut degraded_rules: Vec<BriefDegradedRule> = Vec::new();
     let mut note: Option<String> = None;
 
@@ -740,8 +760,8 @@ fn build_autonomy(
     // block. Skipped when there is no durable object tier (Local /
     // Valkey-only). Driven on the dedicated state-sync runtime so this is
     // safe from both the sync CLI arm and the async MCP `estate_brief` tool.
-    let marker_note: Option<String> = match cfg.as_ref() {
-        None => None, // config note below already covers the unloadable case
+    let marker_note: Option<String> = match cfg {
+        None => None, // the config note below already covers the absent case
         Some(cfg) => match rocky_core::state_sync::durable_tier_provider(&cfg.state) {
             Ok(None) => None,
             Ok(Some(provider)) => {
@@ -770,7 +790,7 @@ fn build_autonomy(
         },
     };
 
-    match cfg.as_ref() {
+    match cfg {
         Some(cfg) => match &cfg.policy {
             Some(pol) => {
                 for (idx, rule) in pol.rules.iter().enumerate() {
@@ -795,8 +815,7 @@ fn build_autonomy(
         },
         None => {
             note = Some(
-                "rocky.toml not loaded — budget degradations unavailable; freezes shown from the \
-                 ledger"
+                "no rocky.toml — budget degradations unavailable; freezes shown from the ledger"
                     .to_string(),
             );
         }
@@ -1060,18 +1079,22 @@ fn empty_brief(
 /// closed per the template rule — `unavailable` with a note when a source
 /// cannot be read, never a smoothed narrative.
 fn build_scheduler(
-    config_path: &Path,
+    cfg: Option<&RockyConfig>,
     store: &StateStore,
     since_ts: Option<DateTime<Utc>>,
     rocky_dir: &Path,
     scan_cap: usize,
 ) -> BriefSchedulerSection {
-    let config = match rocky_core::config::load_rocky_config(config_path) {
-        Ok(c) => c,
-        Err(e) => {
+    let config = match cfg {
+        Some(c) => c,
+        // The only way to get here is an ABSENT `rocky.toml` — `compute_brief`
+        // refuses a present one that does not load. Schedules live in the
+        // config, so with no config there is nothing to project and the
+        // section stays `unavailable` rather than reporting a fabricated zero.
+        None => {
             return BriefSchedulerSection {
                 availability: SectionAvailability::Unavailable,
-                note: Some(format!("config unreadable: {e}")),
+                note: Some("no rocky.toml — scheduled pipelines unknown".to_string()),
                 scheduled_pipelines: 0,
                 paused: Vec::new(),
                 consecutive_failures: Vec::new(),
@@ -1973,6 +1996,15 @@ mod tests {
         );
     }
 
+    /// Load a fixture `rocky.toml` the way `compute_brief` does, so the
+    /// section tests drive the builders with the same `Option<&RockyConfig>`
+    /// the production caller passes.
+    fn loaded(config: &Path) -> RockyConfig {
+        load_optional_project_config(Some(config))
+            .expect("the fixture config must load")
+            .expect("the fixture config must exist")
+    }
+
     /// Scheduler-section fixture: a config with two scheduled pipelines and
     /// one unscheduled, returning the config path.
     fn scheduler_project(tmp: &tempfile::TempDir) -> std::path::PathBuf {
@@ -2033,7 +2065,13 @@ mod tests {
         std::fs::write(incidents.join("20260102T000000Z-beta-bbbbbbbb.json"), "{}").unwrap();
         std::fs::write(incidents.join("notes.txt"), "ignored").unwrap();
 
-        let s = build_scheduler(&config, &store, Some(ts(1)), &rocky_dir, MAX_HISTORY_SCAN);
+        let s = build_scheduler(
+            Some(&loaded(&config)),
+            &store,
+            Some(ts(1)),
+            &rocky_dir,
+            MAX_HISTORY_SCAN,
+        );
         assert!(matches!(s.availability, SectionAvailability::Available));
         assert_eq!(s.scheduled_pipelines, 2, "gamma has no [schedule]");
         assert_eq!(s.paused, vec!["alpha".to_string()]);
@@ -2077,7 +2115,7 @@ mod tests {
         let state_path = tmp.path().join("state.redb");
         let store = StateStore::open(&state_path).unwrap();
         let s = build_scheduler(
-            &config,
+            Some(&loaded(&config)),
             &store,
             None,
             &tmp.path().join(".rocky"),
@@ -2087,15 +2125,20 @@ mod tests {
         assert_eq!(s.scheduled_pipelines, 0);
     }
 
-    /// An unreadable config fails the section closed with a note — the digest
-    /// must never render "no holds" out of a config it could not read.
+    /// With NO `rocky.toml` the section fails closed with a note — the digest
+    /// must never render "no holds" out of a config it never read.
+    ///
+    /// The note used to say "config unreadable", which was wrong for the case
+    /// it actually described: this test always passed a MISSING file. A config
+    /// that is present and does not load no longer reaches this function at
+    /// all — `compute_brief` refuses it (#1702).
     #[test]
-    fn scheduler_section_fails_closed_on_unreadable_config() {
+    fn scheduler_section_fails_closed_without_a_config() {
         let tmp = tempfile::tempdir().unwrap();
         let state_path = tmp.path().join("state.redb");
         let store = StateStore::open(&state_path).unwrap();
         let s = build_scheduler(
-            &tmp.path().join("missing.toml"),
+            None,
             &store,
             None,
             &tmp.path().join(".rocky"),
@@ -2103,7 +2146,7 @@ mod tests {
         );
         assert!(matches!(s.availability, SectionAvailability::Unavailable));
         assert!(
-            s.note.as_deref().unwrap().contains("config unreadable"),
+            s.note.as_deref().unwrap().contains("no rocky.toml"),
             "{:?}",
             s.note
         );
@@ -2132,7 +2175,13 @@ mod tests {
 
         // Cap smaller than the manual flood: a capped page of the newest 2
         // runs contains only manual successes.
-        let s = build_scheduler(&config, &store, Some(ts(1)), &tmp.path().join(".rocky"), 2);
+        let s = build_scheduler(
+            Some(&loaded(&config)),
+            &store,
+            Some(ts(1)),
+            &tmp.path().join(".rocky"),
+            2,
+        );
         assert_eq!(s.runs_in_window, 1, "the scheduled failure must be found");
         assert_eq!(s.failed_in_window, 1);
     }
@@ -2152,7 +2201,7 @@ mod tests {
         std::fs::create_dir_all(incidents.join("20260103T000000Z-fake-dirbundle.json")).unwrap();
 
         let s = build_scheduler(
-            &config,
+            Some(&loaded(&config)),
             &store,
             None,
             &tmp.path().join(".rocky"),
@@ -2188,7 +2237,13 @@ mod tests {
         sched_fail.trigger = RunTrigger::Schedule;
         store.record_run(&sched_fail).unwrap();
 
-        let s = build_scheduler(&config, &store, None, &rocky_dir, MAX_HISTORY_SCAN);
+        let s = build_scheduler(
+            Some(&loaded(&config)),
+            &store,
+            None,
+            &rocky_dir,
+            MAX_HISTORY_SCAN,
+        );
         assert!(matches!(s.availability, SectionAvailability::Unavailable));
         assert!(
             s.note.as_deref().unwrap().contains("symlink"),
@@ -2200,5 +2255,150 @@ mod tests {
             "an inventory failure must not zero the run counts already computed"
         );
         assert_eq!(s.runs_in_window, 1);
+    }
+    // ------------------------------------------------------------------
+    // The config leg (#1702). Three sections read `rocky.toml` and each
+    // swallowed the load error for itself: cost silently dropped the dollar
+    // figures, autonomy noted "not loaded", scheduler said "unreadable". The
+    // digest that came out of a broken config was the digest a healthy
+    // config-less project produces. `compute_brief` now reads the file ONCE
+    // and refuses when it is present and does not load.
+    // ------------------------------------------------------------------
+
+    /// Parses as TOML, fails a validator: `fivetran` is discovery-only and
+    /// needs `kind = "discovery"`. Present-and-broken, never absent.
+    const BROKEN_CONFIG_1702: &str =
+        "[adapter.ft]\ntype = \"fivetran\"\napi_key = \"k\"\napi_secret = \"s\"\n";
+
+    /// Loads under the credential-TOLERANT loader (#1536), refuses under the
+    /// strict one: `${...}` is unset and sits in an adapter connection field.
+    const UNSET_CREDENTIAL_CONFIG_1702: &str = "[adapters.wh]\ntype = \"databricks\"\n\
+         host = \"${ROCKY_T_1702_UNSET}\"\n";
+
+    /// A state store with one recorded run, so the digest has history.
+    fn brief_state(root: &Path) -> std::path::PathBuf {
+        let state_path = root.join("state.redb");
+        let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+        store
+            .record_run(&run("r1", RunStatus::Success, vec![]))
+            .unwrap();
+        state_path
+    }
+
+    /// A present-but-unloadable `rocky.toml` refuses the whole digest, naming
+    /// the file. Restoring the three `.ok()` / degrading loads makes this fail
+    /// — `compute_brief` returns `Ok` with a cost section that shows no dollar
+    /// figures, exactly like a healthy project that never configured `[cost]`.
+    #[test]
+    fn brief_refuses_a_present_but_unloadable_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let state_path = brief_state(root);
+        let cfg = root.join("rocky.toml");
+        std::fs::write(&cfg, BROKEN_CONFIG_1702).unwrap();
+
+        let err = compute_brief(root, &state_path, &cfg, BriefSince::Days7, ts(10))
+            .expect_err("a present but unloadable rocky.toml must refuse `rocky brief`");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(&cfg.display().to_string()),
+            "the refusal must name the config file: {rendered}"
+        );
+        assert!(
+            rendered.contains("discovery-only") || rendered.contains("kind = \"discovery\""),
+            "the loader's own error must survive: {rendered}"
+        );
+    }
+
+    /// The refusal does not depend on there being a state store to project
+    /// from. The config is read BEFORE the absent-state-store short-circuit,
+    /// so a broken `rocky.toml` refuses on a fresh project too. Moving the
+    /// read below that short-circuit makes this fail while the test above
+    /// still passes.
+    #[test]
+    fn brief_refuses_an_unloadable_config_without_a_state_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let cfg = root.join("rocky.toml");
+        std::fs::write(&cfg, BROKEN_CONFIG_1702).unwrap();
+
+        let err = compute_brief(
+            root,
+            &root.join("state.redb"),
+            &cfg,
+            BriefSince::Days7,
+            ts(10),
+        )
+        .expect_err("an absent state store must not excuse an unloadable config");
+        assert!(
+            format!("{err:#}").contains(&cfg.display().to_string()),
+            "{err:#}"
+        );
+    }
+
+    /// Honest failure (a): absent is not invalid. With NO `rocky.toml` the
+    /// digest renders exactly as before — no dollar figures, the autonomy note
+    /// about missing budgets, and an unavailable scheduler section.
+    ///
+    /// The second half is the discriminator, so this guard cannot pass just
+    /// because the config leg was dropped altogether.
+    #[test]
+    fn brief_still_renders_without_any_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let state_path = brief_state(root);
+        let cfg = root.join("rocky.toml");
+        assert!(!cfg.exists());
+
+        let out = compute_brief(root, &state_path, &cfg, BriefSince::Days7, ts(10))
+            .expect("a missing rocky.toml must not refuse `rocky brief`");
+        assert!(out.cost.total_cost_usd.is_none(), "no config → no pricing");
+        assert!(matches!(
+            out.scheduler.availability,
+            SectionAvailability::Unavailable
+        ));
+        assert!(
+            out.scheduler
+                .note
+                .as_deref()
+                .unwrap()
+                .contains("no rocky.toml"),
+            "{:?}",
+            out.scheduler.note
+        );
+
+        std::fs::write(&cfg, BROKEN_CONFIG_1702).unwrap();
+        assert!(
+            compute_brief(root, &state_path, &cfg, BriefSince::Days7, ts(10)).is_err(),
+            "a present-but-broken config in the same project must refuse"
+        );
+    }
+
+    /// Honest failure (b): a config holding an unset `${VAR}` in an adapter
+    /// connection field now LOADS. The scheduler section reaches its real
+    /// answer (`no_data` — the config declares no `[schedule]`) instead of the
+    /// `unavailable` the strict loader forced. The brief opens no warehouse
+    /// connection, and tolerance is scoped to adapter connection fields, so no
+    /// literal placeholder can reach the `[state]` durable-tier provider.
+    #[test]
+    fn brief_tolerates_an_unset_credential_var() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let state_path = brief_state(root);
+        let cfg = root.join("rocky.toml");
+        std::fs::write(&cfg, UNSET_CREDENTIAL_CONFIG_1702).unwrap();
+
+        assert!(
+            rocky_core::config::load_rocky_config(&cfg).is_err(),
+            "fixture must fail the STRICT loader, or this proves nothing"
+        );
+
+        let out = compute_brief(root, &state_path, &cfg, BriefSince::Days7, ts(10))
+            .expect("an unset ${VAR} in adapter credentials must not refuse `rocky brief`");
+        assert!(
+            matches!(out.scheduler.availability, SectionAvailability::NoData),
+            "the config loaded, so the scheduler section reports its real answer: {:?}",
+            out.scheduler
+        );
     }
 }

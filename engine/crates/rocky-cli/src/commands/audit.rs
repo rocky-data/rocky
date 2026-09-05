@@ -15,7 +15,7 @@
 //!   closed: a link whose signal is genuinely not recorded renders
 //!   `unavailable` with a note rather than a fabricated value.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -682,8 +682,9 @@ fn run_status_str(status: rocky_core::state::RunStatus) -> &'static str {
 }
 
 /// Compile the project so downstream lineage carries real types. Seeds the
-/// compile with cached source schemas like `rocky lineage` does; degrades to an
-/// empty map on config / cache failure.
+/// compile with cached source schemas like `rocky lineage` does; a cold or
+/// unreadable cache degrades to an empty map, a present-but-unloadable
+/// `rocky.toml` refuses.
 pub(crate) fn compile_project(
     config_path: &Path,
     state_path: &Path,
@@ -693,6 +694,21 @@ pub(crate) fn compile_project(
     // a cold map.
     let source_schemas =
         crate::source_schemas::load_project_source_schemas(config_path, state_path, None)?;
+    compile_project_with_schemas(source_schemas, models_dir)
+}
+
+/// The compile half of [`compile_project`], with the source-schema seed already
+/// resolved by the caller.
+///
+/// Split out for the one caller that must treat the two failures differently:
+/// `rocky review --queue` degrades on a **compile** failure (it ranks with
+/// "blast radius unknown" rather than failing the whole queue) but must still
+/// refuse a present-but-unloadable `rocky.toml` (#1702). Calling
+/// `compile_project(..).ok()` collapsed both into the degrade.
+pub(crate) fn compile_project_with_schemas(
+    source_schemas: HashMap<String, Vec<rocky_compiler::types::TypedColumn>>,
+    models_dir: &Path,
+) -> Result<compile::CompileResult> {
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
