@@ -23,12 +23,20 @@ pub struct CheckResult {
     /// Set when the engine could not run the check, carrying the reason.
     ///
     /// A check that never ran must not read as a measurement. Whenever this
-    /// is set, `passed` is `false` and the numeric fields of the flattened
-    /// details (`source_count`, `target_count`, `lag_seconds`, `null_rate`,
-    /// `failing_rows`, `result_value`, `overlap_count`) are placeholders,
-    /// not readings. A query error, an unreadable result cell, a refused
-    /// SQL fragment and a misconfigured key all land here, so the check
-    /// stays in the tally instead of vanishing or passing on a default.
+    /// is set, the numeric fields of the flattened details (`source_count`,
+    /// `target_count`, `lag_seconds`, `null_rate`, `failing_rows`,
+    /// `result_value`, `overlap_count`) are placeholders, not readings. A
+    /// query error, an unreadable result cell, a refused SQL fragment and a
+    /// misconfigured key all land here, so the check stays in the tally
+    /// instead of vanishing or passing on a default.
+    ///
+    /// `passed` is `false` for all of those — a check Rocky tried and could
+    /// not complete is a failure. The single exception is a check the
+    /// configuration does not apply to, which passes: a cross-source overlap
+    /// group holding a sibling with no key column, a shape the FR accepts
+    /// (#1654). Read `passed` to decide whether a check failed; it is what
+    /// the run gate reads. Read this field to learn whether the numbers next
+    /// to it were measured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_evaluated: Option<String>,
     #[serde(flatten)]
@@ -336,6 +344,35 @@ pub fn cross_source_overlap_not_evaluated(
     CheckResult {
         name: name.into(),
         passed: false,
+        severity,
+        not_evaluated: Some(reason.into()),
+        details: CheckDetails::CrossSourceOverlap {
+            overlap_count: 0,
+            contributing_tables,
+            sample: Vec::new(),
+        },
+    }
+}
+
+/// Builds a `CheckResult` for a cross-source overlap group the configured key
+/// does not apply to: a sibling in the group carries no such column, so there
+/// is no key to share and nothing to measure.
+///
+/// **Passes**, and is the one `CheckResult` that sets `not_evaluated` while
+/// `passed` is `true`. The FR accepts a keyless sibling, so this is not a
+/// failure and must not gate the run — but the group was still never
+/// measured, so `overlap_count` stays a placeholder and the reason is
+/// carried rather than dropped. A group whose query *failed* is a different
+/// thing and keeps [`cross_source_overlap_not_evaluated`] (#1654).
+pub fn cross_source_overlap_not_applicable(
+    name: impl Into<String>,
+    contributing_tables: Vec<String>,
+    reason: impl Into<String>,
+    severity: TestSeverity,
+) -> CheckResult {
+    CheckResult {
+        name: name.into(),
+        passed: true,
         severity,
         not_evaluated: Some(reason.into()),
         details: CheckDetails::CrossSourceOverlap {

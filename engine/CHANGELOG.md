@@ -37,6 +37,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A cross-source overlap check no longer fails a run because one sibling has no key column.** The overlap check groups sibling tables — same source type, same table name, different target schemas — and flags a business key that appears in more than one. A sibling that simply has no such column is a shape the design accepts. It was still reported as a failed check, because the engine only found out when the query failed, and a query error cannot say whether the cause was a missing column, a syntax error or a denied permission.
+
+  The engine now settles that before running the query. When the key is configured as `keys` (a column tuple), it reads each sibling's columns and compares them case-insensitively, the same way `column_match` does, so `CUSTOMER_ID` still matches a configured `customer_id`. A sibling with no such column makes the group **pass**, with `not_evaluated` carrying the reason and naming the sibling. `overlap_count` stays `0` and is still a placeholder, not a measurement.
+
+  Three things deliberately do not change. A real query failure — syntax, permission, transport — still fails with `not_evaluated`, and still gates the run. A `key_expr` is free-text SQL, so a column list cannot say whether it applies; a `key_expr` group is never classified this way and keeps the failing `not_evaluated` it has today. And a `DESCRIBE` that will not answer classifies nothing: an error or an empty column list leaves the group alone to run its query, because "Rocky could not read the schema" must never become "the key is tolerated".
+
+  A key column that is present but entirely NULL is not this case. The column exists, the query runs, and no shared key found is a real passing measurement.
+
+  This is the first `CheckResult` that sets `not_evaluated` while `passed` is `true`. Read `passed` to decide whether a check failed — it is what the run gate reads. Read `not_evaluated` to learn whether the numbers beside it were measured. The JSON schema and the SDK models carry the widened wording.
+
+  **On upgrade: the exit code for this shape changes.** A run whose only failing check was a keyless overlap sibling exited `2` with `status: "PartialFailure"` and `check_gate_failed: true`, because since #1671 an error-severity check failure fails the run. It now exits **0** and records `status: "Success"`, with the passing overlap check and its reason in `check_results`. Nothing else changes: a real overlap, a failed overlap query and every other check gate exactly as they did. (#1654)
+
+
 - **A failed batched check query is reported as a check instead of ending the run.** Replication row-count and freshness checks run one of two ways. A warehouse with a `BatchCheckAdapter` runs three batched queries — source row counts, target row counts, freshness. A warehouse without one runs a query per table. The per-table path already caught a failing query, recorded the reason, and carried on. The batched path returned the error and ended the run. Every adapter Rocky ships that batches took that path, so this was the common case, not the fallback. One unreadable table stopped a run that had already written its data, and no other table's checks reported at all.
 
   All three batched queries now run to completion. A query that fails is folded into the same failure map the per-table path fills, so every table that query covered reports its check as `not_evaluated` with the reason, and the other two queries and their tables still report. The two paths now differ only in blast radius: one batched query covers every table it was handed, so its failure names them all, while a per-table query names only its own table.
