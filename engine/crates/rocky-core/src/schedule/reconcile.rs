@@ -219,6 +219,13 @@ impl PhaseStore {
     /// contention. A genuine fault propagates as [`TickError::State`]; exhausted
     /// contention is [`StoreReopen::Busy`], never an error.
     async fn reopen(&mut self) -> Result<StoreReopen, TickError> {
+        // Drop any permit still held BEFORE waiting for one. `close` already
+        // clears it on every real path, but `self.permit = acquire(..).await`
+        // evaluates its right-hand side first: called while a permit is held,
+        // that waits for a permit only its own holder can release — a silent
+        // hang rather than a failure. Clearing first makes the method safe
+        // whatever the caller did.
+        self.permit = None;
         self.permit = acquire_gate(self.gate.as_ref()).await;
         for attempt in 1..=REOPEN_RETRY_ATTEMPTS {
             match StateStore::open(&self.path) {
