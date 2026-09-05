@@ -5827,9 +5827,11 @@ async fn run_batched_checks(
 
     // Why a table has no measurement, keyed by its full name. Consulted only
     // for a table that is missing from the measured results, so a measured
-    // table never reads a stale reason. The batch path records nothing here:
-    // a batch query that fails ends the run below, and a table it silently
-    // left out is reported without a reason.
+    // table never reads a stale reason. BOTH paths record here: the per-table
+    // path names the one table whose own query failed, the batch path names
+    // every table the failed leg was handed (#1655). A table that a leg
+    // answered WITHOUT leaving a row for is not recorded — there is no reason
+    // to give, and it is reported as "returned no result for this table".
     let mut source_count_failures: HashMap<String, String> = HashMap::new();
     let mut target_count_failures: HashMap<String, String> = HashMap::new();
     // In table order, so the emitted results are deterministic.
@@ -5837,14 +5839,25 @@ async fn run_batched_checks(
 
     // Batch checks dispatch through the BatchCheckAdapter trait when the
     // warehouse provides one (UNION ALL batching). Otherwise, fall back to
-    // per-table queries via the generic WarehouseAdapter — same observable
-    // check results, just more round-trips.
+    // per-table queries via the generic WarehouseAdapter.
+    //
+    // Both paths report the same way: a query that could not answer for a
+    // table reports that table's check as `not_evaluated` with the reason,
+    // and the remaining queries and tables still run. They differ in
+    // round-trips and in blast radius — one batched leg is a single query for
+    // every table it was handed, so its failure names them all, while the
+    // per-table path names only the table whose own query failed.
     let (source_counts, target_counts, freshness_results): (
         Vec<BatchRowCountResult>,
         Vec<BatchRowCountResult>,
         Vec<BatchFreshnessResult>,
     ) = if let Some(bc) = batch_check {
-        let (src, tgt, fresh) = tokio::try_join!(
+        // `join!`, not `try_join!`. `try_join!` returned the first leg's
+        // error, cancelled the other two, and `?` ended the run — after the
+        // data had already been written and before any table's checks were
+        // reported (#1655). Every leg now runs to completion and a failed one
+        // is folded into the failure maps above.
+        let (src, tgt, fresh) = tokio::join!(
             async {
                 if row_count_enabled {
                     bc.batch_row_counts(source_batch_refs).await
@@ -5867,8 +5880,52 @@ async fn run_batched_checks(
                     Ok(vec![])
                 }
             },
-        )
-        .map_err(anyhow::Error::from)?;
+        );
+
+        // A failed row-count leg contributes no measurements, and every table
+        // it covered gets the reason. Reported by the same code that reports
+        // a per-table failure, so the two paths emit the same check shape.
+        fn fold_row_count_leg(
+            leg: AdapterResult<Vec<BatchRowCountResult>>,
+            refs: &[TableRef],
+            side: &str,
+            failures: &mut HashMap<String, String>,
+        ) -> Vec<BatchRowCountResult> {
+            match leg {
+                Ok(rows) => rows,
+                Err(e) => {
+                    warn!(
+                        side,
+                        tables = refs.len(),
+                        error = %e,
+                        "the batch row count query failed — reporting its tables as not evaluated"
+                    );
+                    let reason = format!("the batch row count query failed: {e}");
+                    for br in refs {
+                        failures.insert(br.full_name(), reason.clone());
+                    }
+                    Vec::new()
+                }
+            }
+        }
+
+        let src = fold_row_count_leg(src, source_batch_refs, "source", &mut source_count_failures);
+        let tgt = fold_row_count_leg(tgt, target_batch_refs, "target", &mut target_count_failures);
+        let fresh = match fresh {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(
+                    tables = freshness_batch_refs.len(),
+                    error = %e,
+                    "the batch freshness query failed — reporting its tables as not evaluated"
+                );
+                let reason = format!("the batch freshness query failed: {e}");
+                for br in freshness_batch_refs {
+                    freshness_failures.push((br.full_name(), reason.clone()));
+                }
+                Vec::new()
+            }
+        };
         (src, tgt, fresh)
     } else {
         // Per-table fallback via WarehouseAdapter for adapters with no
@@ -6109,9 +6166,10 @@ async fn run_batched_checks(
         let now = Utc::now();
         // Driven by the REQUESTED tables, not the returned ones. Iterating
         // the results would drop a table the batch query left out, which is
-        // exactly the silent gap this change closes for row counts; the
-        // batch path never populates `freshness_failures`, so there would be
-        // nothing else to notice the omission. A returned `None` is an empty
+        // exactly the silent gap this change closes for row counts. A batch
+        // leg that FAILS does record a reason per table (#1655); a leg that
+        // answered and left a table out records none, so iterating the
+        // results is the only way to notice that one. A returned `None` is an empty
         // table and still emits no check: `MAX(ts)` over no rows is NULL
         // because there is no row to be fresh, which is not the same as a
         // query that could not answer.
@@ -29572,12 +29630,49 @@ table = "fct_events"
             self.target_refs[0].full_name()
         }
 
-        async fn run(
+        /// Adds a second copied table, `src.<name>` -> `tgt.<name>`.
+        ///
+        /// A batched leg is ONE query over every table it is handed, so what
+        /// a failed leg does to the tables it did not single out is only
+        /// observable with more than one table in the leg (#1655).
+        fn plus_table(mut self, name: &str) -> Self {
+            let source = TableRef {
+                catalog: String::new(),
+                schema: "src".into(),
+                table: name.into(),
+            };
+            let target = TableRef {
+                catalog: String::new(),
+                schema: "tgt".into(),
+                table: name.into(),
+            };
+            let asset_key = vec!["test".to_string(), name.to_string()];
+            self.source_refs.push(source);
+            self.target_refs.push(target.clone());
+            self.freshness_refs.push(target.clone());
+            self.asset_keys
+                .push((target.full_name(), asset_key.clone()));
+            self.assertion_targets.push((target, asset_key));
+            self
+        }
+
+        /// The `pending_checks` key for the target table named `name`.
+        fn key_of(&self, name: &str) -> String {
+            self.target_refs
+                .iter()
+                .find(|t| t.table == name)
+                .expect("the fixture carries that table")
+                .full_name()
+        }
+
+        /// The raw outcome, so a test can assert that the checks ran at all.
+        /// `run_batched_checks` returning `Err` is the #1655 abort.
+        async fn try_run(
             &self,
             warehouse: &dyn WarehouseAdapter,
             batch_check: Option<&dyn BatchCheckAdapter>,
             state_store: Option<&StateStore>,
-        ) -> (HashMap<String, PendingCheck>, Vec<AnomalyOutput>) {
+        ) -> Result<(HashMap<String, PendingCheck>, Vec<AnomalyOutput>)> {
             let mut pending = HashMap::new();
             let mut anomalies = Vec::new();
             run_batched_checks(
@@ -29596,9 +29691,19 @@ table = "fct_events"
                 &mut pending,
                 &mut anomalies,
             )
-            .await
-            .expect("the batched checks run");
-            (pending, anomalies)
+            .await?;
+            Ok((pending, anomalies))
+        }
+
+        async fn run(
+            &self,
+            warehouse: &dyn WarehouseAdapter,
+            batch_check: Option<&dyn BatchCheckAdapter>,
+            state_store: Option<&StateStore>,
+        ) -> (HashMap<String, PendingCheck>, Vec<AnomalyOutput>) {
+            self.try_run(warehouse, batch_check, state_store)
+                .await
+                .expect("the batched checks run")
         }
     }
 
@@ -29750,6 +29855,114 @@ table = "fct_events"
             _timestamp_col: &str,
         ) -> rocky_core::traits::AdapterResult<Vec<BatchFreshnessResult>> {
             Ok(Vec::new())
+        }
+
+        async fn batch_describe_schema(
+            &self,
+            _catalog: &str,
+            _schema: &str,
+        ) -> rocky_core::traits::AdapterResult<HashMap<String, Vec<ColumnInfo>>> {
+            Ok(HashMap::new())
+        }
+    }
+
+    /// Which batched leg fails.
+    ///
+    /// `batch_row_counts` is called twice per run — once with the source
+    /// refs, once with the target refs. The double tells the two apart by the
+    /// SCHEMA of the tables it was handed, never by arrival order, so it does
+    /// not depend on how `join!` polls its branches.
+    #[cfg(feature = "duckdb")]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FailingLeg {
+        /// Nothing fails — the control.
+        Nothing,
+        /// The `batch_row_counts` call carrying tables in this schema fails.
+        RowCountsIn(&'static str),
+        /// Both `batch_row_counts` calls fail.
+        BothRowCounts,
+        /// The `batch_freshness` call fails.
+        Freshness,
+    }
+
+    /// A `BatchCheckAdapter` that answers for every table it is handed,
+    /// except on the one leg configured to fail (#1655).
+    #[cfg(feature = "duckdb")]
+    struct LegFailingBatchCheck {
+        fail: FailingLeg,
+        /// The count every answered table reports, on both sides.
+        count: u64,
+        /// What every answered freshness row carries. `None` is what
+        /// `MAX(ts)` over an empty table returns — an answer, not a failure.
+        max_timestamp: Option<DateTime<Utc>>,
+    }
+
+    #[cfg(feature = "duckdb")]
+    impl LegFailingBatchCheck {
+        /// Every leg answers: one row per table, fresh as of now.
+        fn healthy() -> Self {
+            Self {
+                fail: FailingLeg::Nothing,
+                count: 1,
+                max_timestamp: Some(Utc::now()),
+            }
+        }
+
+        fn failing(fail: FailingLeg) -> Self {
+            Self {
+                fail,
+                ..Self::healthy()
+            }
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[async_trait::async_trait]
+    impl BatchCheckAdapter for LegFailingBatchCheck {
+        async fn batch_row_counts(
+            &self,
+            tables: &[TableRef],
+        ) -> rocky_core::traits::AdapterResult<Vec<BatchRowCountResult>> {
+            let schema = tables
+                .first()
+                .map(|t| t.schema.as_str())
+                .unwrap_or_default();
+            let fails = match self.fail {
+                FailingLeg::RowCountsIn(s) => s == schema,
+                FailingLeg::BothRowCounts => true,
+                FailingLeg::Nothing | FailingLeg::Freshness => false,
+            };
+            if fails {
+                return Err(rocky_core::traits::AdapterError::msg(format!(
+                    "injected {schema} batch COUNT failure"
+                )));
+            }
+            Ok(tables
+                .iter()
+                .map(|t| BatchRowCountResult {
+                    table: t.clone(),
+                    count: self.count,
+                })
+                .collect())
+        }
+
+        async fn batch_freshness(
+            &self,
+            tables: &[TableRef],
+            _timestamp_col: &str,
+        ) -> rocky_core::traits::AdapterResult<Vec<BatchFreshnessResult>> {
+            if self.fail == FailingLeg::Freshness {
+                return Err(rocky_core::traits::AdapterError::msg(
+                    "injected batch MAX failure",
+                ));
+            }
+            Ok(tables
+                .iter()
+                .map(|t| BatchFreshnessResult {
+                    table: t.clone(),
+                    max_timestamp: self.max_timestamp,
+                })
+                .collect())
         }
 
         async fn batch_describe_schema(
@@ -29958,6 +30171,176 @@ table = "fct_events"
             result.not_evaluated.as_deref(),
             Some("the batch freshness query returned no result for this table"),
             "{result:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // #1655: a batched leg that FAILS. The per-table path already records a
+    // reason and carries on; the batched path returned the error and ended
+    // the run, after the data had already landed.
+    //
+    //   before: target COUNT leg fails ─► try_join! ─► `?` ─► run ends,
+    //                                     no table's checks reported at all
+    //   after:  target COUNT leg fails ─► every table the leg covered:
+    //                                     row_count not_evaluated + reason
+    //                                     freshness leg still measures both
+    // ---------------------------------------------------------------------
+
+    /// A failed row-count leg reports its tables and lets the other legs run.
+    ///
+    /// Two tables, because a batched leg is ONE query for every table it is
+    /// handed: with a single table there is nothing to show still reporting.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_failed_batched_row_count_leg_is_not_evaluated_and_the_other_legs_still_report() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "row_count = true\n\n[pipeline.bronze.checks.freshness]\nthreshold_seconds = 3600",
+        )
+        .plus_table("customers");
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+
+        // Control: every leg answers, both tables are measured on both kinds.
+        let healthy = LegFailingBatchCheck::healthy();
+        let (pending, anomalies) = fx.run(&inner, Some(&healthy), Some(&store)).await;
+        for table in ["orders", "customers"] {
+            let key = fx.key_of(table);
+            let rc = the_result(&pending, &key, "row_count");
+            assert!(rc.passed && rc.not_evaluated.is_none(), "{rc:?}");
+            let fresh = the_result(&pending, &key, "freshness");
+            assert!(fresh.passed && fresh.not_evaluated.is_none(), "{fresh:?}");
+        }
+        assert!(anomalies.is_empty(), "{anomalies:?}");
+
+        // Treatment: the TARGET row-count leg fails. The source leg and the
+        // freshness leg are healthy.
+        let failing = LegFailingBatchCheck::failing(FailingLeg::RowCountsIn("tgt"));
+        let outcome = fx.try_run(&inner, Some(&failing), Some(&store)).await;
+        // ⚠ THE assertion that fails on `main`: `try_join!` returned the leg's
+        // error and `?` ended the run before one check was reported.
+        let (pending, anomalies) = outcome.expect(
+            "a failed batched leg must not abort the run — the data has already landed (#1655)",
+        );
+
+        for table in ["orders", "customers"] {
+            let key = fx.key_of(table);
+            let rc = the_result(&pending, &key, "row_count");
+            assert!(!rc.passed, "{rc:?}");
+            assert_eq!(
+                rc.not_evaluated.as_deref(),
+                Some("target: the batch row count query failed: injected tgt batch COUNT failure"),
+                "every table the failed leg covered names the reason: {rc:?}"
+            );
+            let fresh = the_result(&pending, &key, "freshness");
+            assert!(
+                fresh.passed && fresh.not_evaluated.is_none(),
+                "the freshness leg still measured {table}: {fresh:?}"
+            );
+        }
+        assert!(anomalies.is_empty(), "{anomalies:?}");
+
+        // #1602 stays closed: an unmeasured target must not enter the anomaly
+        // baseline as a 0. Only the control's measurement is recorded.
+        for table in ["orders", "customers"] {
+            let history = store.get_check_history(&fx.key_of(table)).unwrap();
+            assert_eq!(
+                history.len(),
+                1,
+                "only the control's measurement: {history:?}"
+            );
+            assert_eq!(history[0].row_count, 1);
+        }
+    }
+
+    /// The same fold on the freshness leg: the row-count legs still measure.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_failed_batched_freshness_leg_leaves_the_row_count_legs_reporting() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "row_count = true\n\n[pipeline.bronze.checks.freshness]\nthreshold_seconds = 3600",
+        )
+        .plus_table("customers");
+
+        let failing = LegFailingBatchCheck::failing(FailingLeg::Freshness);
+        let (pending, _) = fx
+            .try_run(&inner, Some(&failing), None)
+            .await
+            .expect("a failed freshness leg must not abort the run (#1655)");
+
+        for table in ["orders", "customers"] {
+            let key = fx.key_of(table);
+            let fresh = the_result(&pending, &key, "freshness");
+            assert!(!fresh.passed, "{fresh:?}");
+            assert_eq!(
+                fresh.not_evaluated.as_deref(),
+                Some("the batch freshness query failed: injected batch MAX failure"),
+                "{fresh:?}"
+            );
+            let rc = the_result(&pending, &key, "row_count");
+            assert!(
+                rc.passed && rc.not_evaluated.is_none(),
+                "the row-count legs still measured {table}: {rc:?}"
+            );
+        }
+    }
+
+    /// Both row-count legs failing names both sides, through the same
+    /// formatter the per-table path uses.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn both_batched_row_count_legs_failing_name_both_sides() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new("row_count = true");
+
+        let failing = LegFailingBatchCheck::failing(FailingLeg::BothRowCounts);
+        let (pending, _) = fx
+            .try_run(&inner, Some(&failing), None)
+            .await
+            .expect("two failed legs must not abort the run (#1655)");
+
+        let rc = the_result(&pending, &fx.target_key(), "row_count");
+        assert!(!rc.passed, "{rc:?}");
+        assert_eq!(
+            rc.not_evaluated.as_deref(),
+            Some(
+                "source: the batch row count query failed: injected src batch COUNT failure; \
+                 target: the batch row count query failed: injected tgt batch COUNT failure"
+            ),
+            "{rc:?}"
+        );
+    }
+
+    /// Honest failure, pinned: an EMPTY answer is not a failed leg.
+    ///
+    /// `MAX(ts)` over an empty table is NULL — the batch adapter answers with
+    /// `max_timestamp: None` — and there is no row to be fresh, so no
+    /// freshness check is emitted. The #1655 fold must not turn that into a
+    /// reported failure. (The row-count analogue — a leg that answers but
+    /// leaves a table out — is pinned by
+    /// `a_table_the_batch_row_count_left_out_is_not_evaluated`, whose reason
+    /// text says "returned no result", never "failed".)
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_batched_freshness_leg_that_answers_null_emits_no_check() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.freshness]\nthreshold_seconds = 3600",
+        );
+
+        let empty = LegFailingBatchCheck {
+            max_timestamp: None,
+            ..LegFailingBatchCheck::healthy()
+        };
+        let (pending, _) = fx
+            .try_run(&inner, Some(&empty), None)
+            .await
+            .expect("an empty answer is not a failure");
+        assert!(
+            results_named(&pending, &fx.target_key(), "freshness").is_empty(),
+            "an empty table has no freshness to measure: {checks:?}",
+            checks = pending.get(&fx.target_key()).map(|p| &p.checks)
         );
     }
 
