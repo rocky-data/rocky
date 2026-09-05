@@ -707,7 +707,7 @@ impl RockyMcpServer {
     /// then falls back to `Unknown` for source-leaf columns — the same
     /// behaviour as `rocky compile` without a warm cache).
     fn compile_full(&self) -> anyhow::Result<CompilerResult> {
-        let source_schemas = self.load_source_schemas();
+        let source_schemas = self.load_source_schemas()?;
         let config = CompilerConfig {
             models_dir: self.models_dir.clone(),
             contracts_dir: None,
@@ -718,25 +718,41 @@ impl RockyMcpServer {
     }
 
     /// Load typed source schemas from the persisted schema cache, honouring
-    /// `[cache.schemas]`. Returns an empty map on a cold cache / missing
-    /// config / disabled cache — the typecheck degrades to `Unknown`.
+    /// `[cache.schemas]`. Returns an empty map on a cold cache, a disabled
+    /// cache, or a project with **no** `rocky.toml` — the typecheck degrades to
+    /// `Unknown`, which is the documented offline behaviour.
+    ///
+    /// A `rocky.toml` that is PRESENT and does not load is refused instead
+    /// (#1625). This is the single config read behind `compile_full` and
+    /// `compute_breaking_change`, so it is the one place the MCP tools —
+    /// `lineage`, `inspect_schema`, `dependents`, `ai_contract`, `ai_test`,
+    /// `explain_model`, `breaking_change` — used to turn a broken config into
+    /// a silently cold typecheck. An agent cannot see that it happened, which
+    /// is what makes the silence worse here than on the CLI.
     fn load_source_schemas(
         &self,
-    ) -> std::collections::HashMap<String, Vec<rocky_compiler::types::TypedColumn>> {
+    ) -> anyhow::Result<std::collections::HashMap<String, Vec<rocky_compiler::types::TypedColumn>>>
+    {
         use rocky_compiler::schema_cache::load_source_schemas_from_cache;
         use rocky_core::state::StateStore;
 
-        let Ok(cfg) = rocky_core::config::load_rocky_config(&self.config_path) else {
-            return std::collections::HashMap::new();
+        let Some(cfg) = rocky_core::config::load_optional_project_config(Some(&self.config_path))
+            .map_err(|e| {
+            anyhow::anyhow!("could not load {}: {e}", self.config_path.display())
+        })?
+        else {
+            return Ok(std::collections::HashMap::new());
         };
         if !cfg.cache.schemas.enabled {
-            return std::collections::HashMap::new();
+            return Ok(std::collections::HashMap::new());
         }
         let Ok(store) = StateStore::open_read_only(&self.state_path()) else {
-            return std::collections::HashMap::new();
+            return Ok(std::collections::HashMap::new());
         };
-        load_source_schemas_from_cache(&store, chrono::Utc::now(), cfg.cache.schemas.ttl())
-            .unwrap_or_default()
+        Ok(
+            load_source_schemas_from_cache(&store, chrono::Utc::now(), cfg.cache.schemas.ttl())
+                .unwrap_or_default(),
+        )
     }
 
     /// Classify the semantic breaking changes between the working tree (HEAD
@@ -749,8 +765,15 @@ impl RockyMcpServer {
     /// compile — typically because the project isn't a git repo), returns a
     /// result with `skipped_reason` set and zeroed counts so the caller can
     /// distinguish "clean diff" from "gate didn't run".
-    fn compute_breaking_change(&self, base_ref: &str) -> BreakingChangeResult {
-        let source_schemas = self.load_source_schemas();
+    ///
+    /// An unloadable `rocky.toml` is an `Err`, NOT a `skipped_reason` (#1625).
+    /// The two are not interchangeable here: a compile failure is already
+    /// visible to the agent in its own diagnostics, whereas a config failure
+    /// silently changes the classifier's inputs. And `skipped_reason` ships
+    /// `has_breaking: false` with zeroed counts, so degrading would read to an
+    /// agent as "no breaking changes" on a gate — fail-open.
+    fn compute_breaking_change(&self, base_ref: &str) -> anyhow::Result<BreakingChangeResult> {
+        let source_schemas = self.load_source_schemas()?;
 
         let config = CompilerConfig {
             models_dir: self.models_dir.clone(),
@@ -761,10 +784,10 @@ impl RockyMcpServer {
         let head_compile = match compile::compile(&config) {
             Ok(r) => r,
             Err(e) => {
-                return BreakingChangeResult {
+                return Ok(BreakingChangeResult {
                     skipped_reason: Some(format!("HEAD compile failed: {e}")),
                     ..Default::default()
-                };
+                });
             }
         };
 
@@ -772,10 +795,10 @@ impl RockyMcpServer {
             match commands::extract_base_compile(base_ref, &self.models_dir, source_schemas) {
                 Ok(r) => r,
                 Err(reason) => {
-                    return BreakingChangeResult {
+                    return Ok(BreakingChangeResult {
                         skipped_reason: Some(format!("base ref '{base_ref}': {reason}")),
                         ..Default::default()
-                    };
+                    });
                 }
             };
 
@@ -785,12 +808,12 @@ impl RockyMcpServer {
 
         let breaking_count = findings.iter().filter(|f| f.is_breaking()).count();
         let lite = findings.iter().map(breaking_finding_lite).collect();
-        BreakingChangeResult {
+        Ok(BreakingChangeResult {
             has_breaking: breaking_count > 0,
             breaking_count,
             findings: lite,
             skipped_reason: None,
-        }
+        })
     }
 
     // -------------------------- MUST tools ---------------------------------
@@ -1131,7 +1154,12 @@ impl RockyMcpServer {
         params: Parameters<BreakingChangeArgs>,
     ) -> ToolResult<BreakingChangeResult> {
         let base = params.0.base;
-        Ok(Json(self.compute_breaking_change(&base)))
+        // A config that does not load refuses; it is not a "gate skipped"
+        // verdict with zeroed counts (#1625).
+        let result = self
+            .compute_breaking_change(&base)
+            .map_err(|e| ToolError::config_invalid(format!("{e:#}")))?;
+        Ok(Json(result))
     }
 
     #[tool(
@@ -5520,6 +5548,135 @@ fn rel_display(root: &Path, path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // An invalid rocky.toml refuses instead of reading as absent (#1625).
+    // ------------------------------------------------------------------
+
+    /// Write a project rooted in a temp dir. `rocky_toml` of `None` writes no
+    /// config file at all — the "absent" case, which must stay tolerated.
+    fn write_mcp_project(rocky_toml: Option<&str>) -> (tempfile::TempDir, RockyMcpServer) {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("rocky.toml");
+        if let Some(body) = rocky_toml {
+            std::fs::write(&cfg_path, body).unwrap();
+        }
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("m.sql"), "-- model: m\nSELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("m.toml"),
+            "name = \"m\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+        let server = RockyMcpServer::new(cfg_path);
+        (tmp, server)
+    }
+
+    /// A config that parses but fails the validator chain (`fivetran` is
+    /// discovery-only and needs `kind = "discovery"`).
+    const INVALID_MCP_TOML: &str = r#"
+[adapter.default]
+type = "duckdb"
+database = ":memory:"
+
+[adapter.ft]
+type = "fivetran"
+api_key = "k"
+api_secret = "s"
+"#;
+
+    const VALID_MCP_TOML: &str = r#"
+[adapter.default]
+type = "duckdb"
+database = ":memory:"
+"#;
+
+    /// The single config read behind every compile-backed MCP tool. A present
+    /// but unloadable `rocky.toml` must refuse; it used to return the same
+    /// empty map a project with no config returns.
+    #[test]
+    fn mcp_source_schemas_refuses_a_present_but_invalid_config() {
+        let (_tmp, server) = write_mcp_project(Some(INVALID_MCP_TOML));
+        let err = server
+            .load_source_schemas()
+            .expect_err("a present but invalid rocky.toml must refuse");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("rocky.toml"),
+            "the refusal must name the file, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("discovery-only") || rendered.contains("kind = \"discovery\""),
+            "the loader's own error must survive, got: {rendered}"
+        );
+    }
+
+    /// Absent is NOT invalid: a project with no `rocky.toml` still gets the
+    /// cold map and the typecheck still degrades to `Unknown`, exactly as
+    /// before.
+    #[test]
+    fn mcp_source_schemas_absent_config_is_still_a_cold_map() {
+        let (_tmp, server) = write_mcp_project(None);
+        let map = server
+            .load_source_schemas()
+            .expect("no rocky.toml is not an error");
+        assert!(map.is_empty(), "absent config → cold map, unchanged");
+    }
+
+    /// A healthy config keeps working: it loads, the cache is cold, and the
+    /// map is empty for the same reason it was before — the cache, not the
+    /// config.
+    #[test]
+    fn mcp_source_schemas_healthy_config_still_loads() {
+        let (_tmp, server) = write_mcp_project(Some(VALID_MCP_TOML));
+        let map = server
+            .load_source_schemas()
+            .expect("a healthy config must not refuse");
+        assert!(map.is_empty(), "cold cache → empty map");
+    }
+
+    /// `compile_full` backs `lineage`, `inspect_schema`, `dependents` and the
+    /// AI helpers. It must carry the refusal rather than compiling against a
+    /// silently cold map.
+    #[test]
+    fn mcp_compile_full_refuses_a_present_but_invalid_config() {
+        let (_tmp, server) = write_mcp_project(Some(INVALID_MCP_TOML));
+        assert!(
+            server.compile_full().is_err(),
+            "compile_full must not compile a project whose config did not load"
+        );
+
+        let (_tmp2, healthy) = write_mcp_project(Some(VALID_MCP_TOML));
+        assert!(
+            healthy.compile_full().is_ok(),
+            "a healthy project must still compile"
+        );
+    }
+
+    /// The breaking-change gate must not report a CLEAN diff when the config
+    /// it typed against never loaded. `skipped_reason` ships
+    /// `has_breaking: false` with zeroed counts, so degrading here would read
+    /// to an agent as "no breaking changes" — fail-open on a gate.
+    #[test]
+    fn mcp_breaking_change_refuses_rather_than_reporting_a_clean_gate() {
+        let (_tmp, server) = write_mcp_project(Some(INVALID_MCP_TOML));
+        match server.compute_breaking_change("HEAD") {
+            Err(e) => {
+                let rendered = format!("{e:#}");
+                assert!(
+                    rendered.contains("rocky.toml"),
+                    "the refusal must name the file, got: {rendered}"
+                );
+            }
+            Ok(result) => panic!(
+                "an unloadable config must refuse, not report has_breaking={} \
+                 with skipped_reason={:?}",
+                result.has_breaking, result.skipped_reason
+            ),
+        }
+    }
 
     #[test]
     fn render_cell_passes_short_strings_through() {

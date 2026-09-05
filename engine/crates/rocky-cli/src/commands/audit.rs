@@ -689,13 +689,10 @@ pub(crate) fn compile_project(
     state_path: &Path,
     models_dir: &Path,
 ) -> Result<compile::CompileResult> {
-    let source_schemas = match rocky_core::config::load_rocky_config(config_path) {
-        Ok(cfg) => {
-            let schema_cfg = cfg.cache.schemas.with_ttl_override(None);
-            crate::source_schemas::load_cached_source_schemas(&schema_cfg, state_path)
-        }
-        Err(_) => std::collections::HashMap::new(),
-    };
+    // Present-but-unloadable `rocky.toml` refuses (#1625); absent still gives
+    // a cold map.
+    let source_schemas =
+        crate::source_schemas::load_project_source_schemas(config_path, state_path, None)?;
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,

@@ -33,6 +33,12 @@ GITHUB_SCRIPT_SOURCE = (
 UPLOAD_ARTIFACT_SOURCE = (
     "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
 )
+# The browser UI is built once per release and handed to every target as an
+# artifact (engine-release.yml `ui` -> `build`), so the release matrix reads
+# one artifact with the same pinned first-party action family that writes it.
+DOWNLOAD_ARTIFACT_SOURCE = (
+    "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+)
 RUST_TOOLCHAIN_SOURCE = (
     "dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8"
 )
@@ -42,6 +48,19 @@ RUST_CACHE_SOURCE = (
 SETUP_UV_SOURCE = "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d"
 SETUP_NODE_SOURCE = (
     "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020"
+)
+# The container image the engine release publishes (engine-release.yml, job
+# `image`): buildx, the GHCR login, and the build-and-push. Pinned like every
+# other release source; the image tags derive from the release tag in a `run`
+# step, so no tag-parsing action is needed here.
+DOCKER_BUILD_PUSH_SOURCE = (
+    "docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a"
+)
+DOCKER_LOGIN_SOURCE = (
+    "docker/login-action@dbcb813823bdd20940b903addbd779551569679f"
+)
+DOCKER_SETUP_BUILDX_SOURCE = (
+    "docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e"
 )
 DEPLOY_PAGES_SOURCE = (
     "actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128"
@@ -73,6 +92,10 @@ RELEASE_ACTION_SOURCES = frozenset(
     {
         CHECKOUT_SOURCE,
         DEPLOY_PAGES_SOURCE,
+        DOCKER_BUILD_PUSH_SOURCE,
+        DOCKER_LOGIN_SOURCE,
+        DOCKER_SETUP_BUILDX_SOURCE,
+        DOWNLOAD_ARTIFACT_SOURCE,
         GH_RELEASE_SOURCE,
         GITHUB_SCRIPT_SOURCE,
         PYPI_PUBLISH_SOURCE,

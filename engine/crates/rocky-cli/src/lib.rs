@@ -11,6 +11,7 @@ pub mod registry;
 pub(crate) mod schema_cache_writer;
 pub(crate) mod scope;
 pub(crate) mod source_schemas;
+pub mod ui;
 
 /// Test-only warehouse doubles. Compiled only under `cfg(test)`, so a released
 /// binary contains none of it — see the module docs and the matching

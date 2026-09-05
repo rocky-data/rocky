@@ -208,6 +208,8 @@ salsa = "0.28"
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.7", features = ["cors"] }
+# Embeds the browser UI (`engine/ui/dist`) into the binary behind the `ui` feature.
+include_dir = "0.7"
 
 # LSP
 tower-lsp = "0.20"

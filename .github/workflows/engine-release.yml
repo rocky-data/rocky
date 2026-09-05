@@ -37,7 +37,7 @@ defaults:
 jobs:
   build:
     name: Build ${{ matrix.target }}
-    needs: ensure-release
+    needs: [ensure-release, ui]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -140,17 +140,25 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
+      # The browser UI, built once by the `ui` job below, embedded into
+      # every target with `--features ui`.
+      - name: Fetch the browser UI build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rocky-ui-dist
+          path: engine/ui/dist
+
       # Linux: build with cargo-zigbuild (portable glibc). Build both
       # binaries in the same invocation so the workspace compile cache
       # is shared and we don't pay rocky-core / rocky-compiler twice.
       - name: Build release binaries (zigbuild)
         if: matrix.zigbuild
-        run: cargo zigbuild --release --bin rocky --bin rocky-lsp --target ${{ matrix.target }}
+        run: cargo zigbuild --release --bin rocky --bin rocky-lsp --features ui --target ${{ matrix.target }}
 
       # macOS / Windows: build with plain cargo
       - name: Build release binaries (cargo)
         if: ${{ !matrix.zigbuild }}
-        run: cargo build --release --bin rocky --bin rocky-lsp --target ${{ matrix.target }}
+        run: cargo build --release --bin rocky --bin rocky-lsp --features ui --target ${{ matrix.target }}
 
       # Unix: package each binary as its own .tar.gz. Split archives so
       # consumers who only need the LSP don't download the full CLI.
@@ -436,3 +444,31 @@ jobs:
               --draft \
               --title "$TAG"
           fi
+
+  # The browser UI `rocky serve --ui` embeds, built once before the matrix.
+  # The first node toolchain in an engine release: every target downloads
+  # this one `dist/` and embeds it with `--features ui`.
+  ui:
+    name: Build the browser UI
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: engine/ui
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: engine/ui/package-lock.json
+      - run: npm ci
+      - run: npm test
+      # `npm run build` also refuses a bundle that loads from another host.
+      - run: npm run build
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rocky-ui-dist
+          path: engine/ui/dist
+          if-no-files-found: error
