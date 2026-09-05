@@ -5772,46 +5772,89 @@ pub async fn run(
     run_result.map(|()| RunTermination::Completed)
 }
 
-/// Names the sibling that makes a configured `keys` tuple inapplicable to a
-/// cross-source overlap group, and why — or `None` when the key applies to
-/// every sibling, or when the question cannot be answered.
+/// A cross-source overlap group split into the siblings that can carry the
+/// configured `keys` and the siblings proven not to.
+struct OverlapKeyPartition {
+    /// The siblings the overlap query may run over, in the group's original
+    /// order. Holds every sibling that carries all the key columns, plus
+    /// every sibling the classifier could not judge (see
+    /// [`partition_overlap_key_carriers`]).
+    carriers: Vec<TableRef>,
+    /// One clause per sibling proven to be missing a key column, e.g.
+    /// `tgt2.orders carries no customer_id column`. Empty when the key
+    /// applies to the whole group.
+    excluded: Vec<String>,
+}
+
+impl OverlapKeyPartition {
+    /// The excluded clauses joined into one reason phrase, or `None` when
+    /// nothing was excluded.
+    fn excluded_reason(&self) -> Option<String> {
+        (!self.excluded.is_empty()).then(|| self.excluded.join("; "))
+    }
+}
+
+/// Splits a cross-source overlap group into the siblings that carry the
+/// configured `keys` and the siblings that provably do not.
 ///
-/// The overlap query selects the key columns from *every* sibling, so one
-/// sibling without them fails the whole query. A keyless sibling is a shape
-/// the FR accepts, but the query error alone cannot say whether the cause was
-/// a missing column, a syntax error or a denied permission, so both came out
-/// as one failed check (#1654). This decides it positively, before the query
-/// runs, instead of inferring a cause from an error string afterwards.
+/// The overlap query selects the key columns from *every* sibling it is
+/// handed, so one sibling without them fails the whole query. A keyless
+/// sibling is a shape the FR accepts, but the query error alone cannot say
+/// whether the cause was a missing column, a syntax error or a denied
+/// permission, so both came out as one failed check (#1654). This decides it
+/// positively, before the query runs, instead of inferring a cause from an
+/// error string afterwards.
 ///
-/// Deliberately bounded — it classifies only what it can prove:
+/// The split is **per sibling**, which is what the published contract says
+/// ("Sibling tables whose key can't be evaluated … are skipped with a logged
+/// reason"). Classifying per group instead stopped comparing the siblings
+/// that *did* carry the key, so a real duplicate shared by two of them went
+/// unreported (#1705).
+///
+/// Deliberately bounded — it classifies only what it can prove, and anything
+/// it cannot prove stays a carrier so the query still runs:
 ///
 /// - **`keys` only.** A `key_expr` is free-text SQL over arbitrary columns
 ///   (`md5(a || b)`, a literal, a subquery), and a column list cannot say
-///   whether it applies. A `key_expr` group is never classified here, so its
-///   query failure keeps the failing `not_evaluated` it has today.
+///   whether it applies. A `key_expr` group is never classified here — every
+///   sibling comes back a carrier — so its query failure keeps the failing
+///   `not_evaluated` it has today.
 /// - **A `describe_table` that will not answer classifies nothing.** An error
-///   (permission denied, transport) or an empty column list leaves the group
-///   alone: it falls through and runs the query exactly as before. "Rocky
+///   (permission denied, transport) or an empty column list leaves that
+///   sibling a carrier: the group runs the query exactly as before. "Rocky
 ///   could not read the schema" must never become "the operator's key is
 ///   tolerated" — that direction fails open on a key that really is there.
 ///
 /// Costs one `DESCRIBE` per sibling of a qualifying (≥2 member) group, and
-/// only when `cross_source_overlap` is configured with `keys`. The schemas the
-/// copy path prefetches live on `TableTask` and are not in scope here.
-async fn overlap_group_missing_key(
+/// only when `cross_source_overlap` is configured with `keys`. Every sibling
+/// is described now, where the group-wide classifier stopped at the first
+/// missing one; that is the same cost a healthy group already paid, and it is
+/// what naming *all* the excluded siblings requires. The schemas the copy path
+/// prefetches live on `TableTask` and are not in scope here.
+async fn partition_overlap_key_carriers(
     warehouse: &dyn WarehouseAdapter,
     siblings: &[TableRef],
     keys: &[String],
-) -> Option<String> {
+) -> OverlapKeyPartition {
+    let mut partition = OverlapKeyPartition {
+        carriers: Vec::with_capacity(siblings.len()),
+        excluded: Vec::new(),
+    };
     if keys.is_empty() {
-        return None;
+        // The `key_expr` path. Not classified at all: every sibling is a
+        // carrier and the query runs over the whole group, byte-identical to
+        // what it ran before.
+        partition.carriers.extend_from_slice(siblings);
+        return partition;
     }
     let no_exclusions = std::collections::HashSet::new();
     for sibling in siblings {
         let Ok(columns) = warehouse.describe_table(sibling).await else {
+            partition.carriers.push(sibling.clone());
             continue;
         };
         if columns.is_empty() {
+            partition.carriers.push(sibling.clone());
             continue;
         }
         // Folded with the same lowercase derivation `column_match` compares
@@ -5824,15 +5867,17 @@ async fn overlap_group_missing_key(
             .filter(|k| !present.contains(&k.to_lowercase()))
             .map(String::as_str)
             .collect();
-        if !missing.is_empty() {
-            return Some(format!(
-                "{} carries no {} column, so the configured cross_source_overlap key does not apply to this group",
+        if missing.is_empty() {
+            partition.carriers.push(sibling.clone());
+        } else {
+            partition.excluded.push(format!(
+                "{} carries no {} column",
                 sibling.full_name(),
                 missing.join(", ")
             ));
         }
     }
-    None
+    partition
 }
 
 /// Runs the batched replication checks against the tables copied this run
@@ -6403,10 +6448,13 @@ async fn run_batched_checks(
     // downstream, doubling rows). Generic — groups by the discovered source
     // type (asset_key[0]) + table name, with no schema-pattern-component
     // assumptions. Self-limiting: only groups of ≥2 siblings are checked, so a
-    // single-target pipeline runs nothing. A group holding a sibling with no
-    // key column is reported as a passing check that says so, and does not
-    // gate the run (#1654); a group whose query fails is reported as a failed
-    // one, and does.
+    // single-target pipeline runs nothing. A sibling with no key column is
+    // dropped from the comparison and named in the log; the siblings that do
+    // carry the key are still measured against each other (#1705). A group
+    // left with one carrier is a passing check that says so and does not gate
+    // the run (#1654); a group left with NONE has a key no sibling carries,
+    // which is a misconfiguration and fails. A group whose query fails is
+    // reported as a failed check, and gates.
     if let Some(ref overlap_cfg) = pipeline.checks.cross_source_overlap {
         // Resolved once, but NOT unwrapped here: a `keys`/`key_expr`
         // misconfiguration used to be logged and skipped, which left the run
@@ -6467,32 +6515,90 @@ async fn run_batched_checks(
                     // Settle the tolerated case BEFORE running a query that
                     // would fail: a sibling with no key column is a shape the
                     // FR accepts, and it must not read as a failed check.
-                    if let Some(reason) =
-                        overlap_group_missing_key(warehouse, &siblings, &overlap_cfg.keys).await
-                    {
-                        info!(
-                            source_type,
-                            table, %reason,
-                            "cross_source_overlap does not apply to this group — reporting it as passed and not measured"
-                        );
-                        let entry = pending_checks
-                            .entry(siblings[0].full_name())
-                            .or_insert_with(|| PendingCheck {
-                                asset_key: members[0].1.clone(),
-                                checks: Vec::new(),
-                            });
-                        entry
-                            .checks
-                            .push(rocky_core::checks::cross_source_overlap_not_applicable(
+                    //
+                    // The split is PER SIBLING. Writing the whole group off on
+                    // the first keyless member also stopped comparing the
+                    // siblings that DO carry the key, so a real duplicate
+                    // shared by two of them was reported as a passing,
+                    // not-applicable check (#1705).
+                    let partition =
+                        partition_overlap_key_carriers(warehouse, &siblings, &overlap_cfg.keys)
+                            .await;
+                    if partition.carriers.len() < 2 {
+                        // Nothing left to compare. Build the reason from the
+                        // excluded siblings plus why what remains cannot be
+                        // measured, so the operator reads both halves.
+                        let mut parts = partition.excluded.clone();
+                        let entry_key = siblings[0].full_name();
+                        let asset_key = members[0].1.clone();
+                        let result = if partition.carriers.is_empty() {
+                            // A key no sibling carries is a MISCONFIGURATION —
+                            // a mistyped column name, say — not a tolerated
+                            // shape. It fails, so the operator sees it on the
+                            // first run instead of reading every group as a
+                            // silent pass.
+                            parts.push(format!(
+                                "no sibling in this group carries the configured cross_source_overlap key ({}), so the key cannot be evaluated",
+                                overlap_cfg.keys.join(", ")
+                            ));
+                            let reason = parts.join("; ");
+                            warn!(
+                                source_type,
+                                table, %reason,
+                                "cross_source_overlap key matches no column on any sibling — reporting the check as not evaluated"
+                            );
+                            rocky_core::checks::cross_source_overlap_not_evaluated(
                                 name,
                                 contributing,
                                 reason,
                                 overlap_cfg.severity,
+                            )
+                        } else {
+                            // Exactly one carrier. A single table cannot
+                            // overlap with itself, so there is genuinely
+                            // nothing to measure — passed, and not gating.
+                            parts.push(format!(
+                                "only 1 of {} siblings carries the configured cross_source_overlap key, so there is nothing to compare",
+                                siblings.len()
                             ));
+                            let reason = parts.join("; ");
+                            info!(
+                                source_type,
+                                table, %reason,
+                                "cross_source_overlap does not apply to this group — reporting it as passed and not measured"
+                            );
+                            rocky_core::checks::cross_source_overlap_not_applicable(
+                                name,
+                                contributing,
+                                reason,
+                                overlap_cfg.severity,
+                            )
+                        };
+                        let entry =
+                            pending_checks
+                                .entry(entry_key)
+                                .or_insert_with(|| PendingCheck {
+                                    asset_key,
+                                    checks: Vec::new(),
+                                });
+                        entry.checks.push(result);
                         continue;
                     }
+                    // Two or more carriers: measure them. The excluded
+                    // siblings are named in the log, and `contributing_tables`
+                    // on the emitted result is the set actually measured.
+                    if let Some(reason) = partition.excluded_reason() {
+                        warn!(
+                            source_type,
+                            table, %reason,
+                            measured = partition.carriers.len(),
+                            of = siblings.len(),
+                            "cross_source_overlap is skipping the siblings that carry no key and measuring the rest"
+                        );
+                    }
+                    let measured = &partition.carriers;
                     let sql = match rocky_core::checks::generate_cross_source_overlap_sql(
-                        &siblings, key_exprs, dialect,
+                        measured, key_exprs, dialect,
                     ) {
                         Ok(s) => s,
                         Err(e) => {
@@ -6537,8 +6643,11 @@ async fn run_batched_checks(
                                         .join(" | ")
                                 })
                                 .collect();
+                            // The measured set, not the whole group: a
+                            // sibling excluded for carrying no key did not
+                            // contribute a row to this measurement (#1705).
                             let contributing: Vec<String> =
-                                siblings.iter().map(TableRef::full_name).collect();
+                                measured.iter().map(TableRef::full_name).collect();
                             let check = rocky_core::checks::check_cross_source_overlap(
                                 name,
                                 overlap_count,
@@ -6547,8 +6656,10 @@ async fn run_batched_checks(
                                 sample,
                                 overlap_cfg.severity,
                             );
-                            // Attach to the first sibling's asset (the result's
-                            // contributing_tables lists the whole group).
+                            // Attach to the first sibling's asset. That is the
+                            // group's stable address, so the result keeps the
+                            // same home whether or not that sibling was one of
+                            // the tables measured.
                             let entry = pending_checks
                                 .entry(siblings[0].full_name())
                                 .or_insert_with(|| PendingCheck {
@@ -6560,11 +6671,13 @@ async fn run_batched_checks(
                         Err(e) => {
                             // A real query failure: syntax, permission,
                             // transport. The tolerated keyless-sibling case no
-                            // longer reaches here — `overlap_group_missing_key`
-                            // settles it above, positively, from the sibling's
-                            // own columns. What is left is a check Rocky tried
-                            // and could not complete, so it fails and carries
-                            // the reason (#1654).
+                            // longer reaches here —
+                            // `partition_overlap_key_carriers` settles it
+                            // above, positively, from each sibling's own
+                            // columns, and only the carriers were queried.
+                            // What is left is a check Rocky tried and could
+                            // not complete, so it fails and carries the reason
+                            // (#1654).
                             //
                             // A `key_expr` group is the exception the
                             // classifier declines to judge: its query failure
@@ -31158,16 +31271,465 @@ value = "'{source}'"
         .plus_overlap_sibling("tgt2", "orders");
 
         let blind = DescribeFailingDuckDb { inner: &inner };
-        let (pending, _) = fx.run(&blind, None, None).await;
+        let recording = QueryRecordingAdapter::new(&blind);
+        let (pending, _) = fx.run(&recording, None, None).await;
         let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
 
         assert!(
             !result.passed,
             "an unreadable schema must not be reported as a tolerated sibling: {result:?}"
         );
+        // The discriminator. `passed = false` plus SOME reason is also what a
+        // group with zero classified carriers would produce, so assert the
+        // shape that only the fall-through produces: the query was ISSUED over
+        // BOTH siblings, and the reason is the warehouse's own error.
+        assert_eq!(
+            recording.overlap_query_count(),
+            1,
+            "an unclassifiable sibling must stay in the comparison — the query              has to run, not be skipped as a misconfigured key"
+        );
+        let issued = recording.the_overlap_query();
         assert!(
-            result.not_evaluated.is_some(),
-            "the group ran the query and it failed, so it carries that reason: {result:?}"
+            issued.contains("tgt.orders") && issued.contains("tgt2.orders"),
+            "both siblings must be in the issued query: {issued}"
+        );
+        let reason = result
+            .not_evaluated
+            .as_deref()
+            .expect("the group ran the query and it failed, so it carries that reason");
+        assert!(
+            reason.contains("customer_id") && !reason.contains("no sibling"),
+            "the reason must be the warehouse's own query failure, not Rocky \
+             declaring the key unusable: {reason}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Cross-source overlap, per-sibling (#1705): a group holding one keyless
+    // sibling must still compare the siblings that DO carry the key.
+    // ---------------------------------------------------------------------
+
+    /// A DuckDB adapter that records every query it is asked to run.
+    ///
+    /// The overlap SQL is the observable this fix must not change for a
+    /// healthy group, so a test needs the exact string the runner issued.
+    #[cfg(feature = "duckdb")]
+    struct QueryRecordingAdapter<'a> {
+        inner: &'a dyn WarehouseAdapter,
+        queries: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[cfg(feature = "duckdb")]
+    impl<'a> QueryRecordingAdapter<'a> {
+        fn new(inner: &'a dyn WarehouseAdapter) -> Self {
+            Self {
+                inner,
+                queries: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// The one recorded query whose text contains `_n_src` — the overlap
+        /// query. Panics unless exactly one was issued, so "no query ran" can
+        /// never read as a pass.
+        fn the_overlap_query(&self) -> String {
+            let found: Vec<String> = self
+                .queries
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|q| q.contains("_n_src"))
+                .cloned()
+                .collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "expected exactly one overlap query, got {found:?}"
+            );
+            found[0].clone()
+        }
+
+        fn overlap_query_count(&self) -> usize {
+            self.queries
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|q| q.contains("_n_src"))
+                .count()
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[async_trait::async_trait]
+    impl WarehouseAdapter for QueryRecordingAdapter<'_> {
+        fn dialect(&self) -> &dyn rocky_core::traits::SqlDialect {
+            self.inner.dialect()
+        }
+
+        async fn execute_statement(&self, sql: &str) -> rocky_core::traits::AdapterResult<()> {
+            self.inner.execute_statement(sql).await
+        }
+
+        async fn execute_query(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::QueryResult> {
+            self.queries.lock().unwrap().push(sql.to_string());
+            self.inner.execute_query(sql).await
+        }
+
+        async fn describe_table(
+            &self,
+            table: &TableRef,
+        ) -> rocky_core::traits::AdapterResult<Vec<ColumnInfo>> {
+            self.inner.describe_table(table).await
+        }
+    }
+
+    /// `<schema>.orders` as `TableRef::full_name` spells it, so an expectation
+    /// is derived from the same formatting the runner used rather than typed
+    /// out by hand (the fixture's refs carry an empty catalog).
+    #[cfg(feature = "duckdb")]
+    fn overlap_sibling_name(schema: &str) -> String {
+        TableRef {
+            catalog: String::new(),
+            schema: schema.into(),
+            table: "orders".into(),
+        }
+        .full_name()
+    }
+
+    /// The `contributing_tables` on an overlap result.
+    #[cfg(feature = "duckdb")]
+    fn contributing_of(result: &rocky_core::checks::CheckResult) -> Vec<String> {
+        match &result.details {
+            rocky_core::checks::CheckDetails::CrossSourceOverlap {
+                contributing_tables,
+                ..
+            } => contributing_tables.clone(),
+            other => panic!("not a cross-source-overlap result: {other:?}"),
+        }
+    }
+
+    /// A three-sibling group: `tgt.orders`, `tgt2.orders`, `tgt3.orders`.
+    /// `tgt.orders` comes from the fixture; the other two are seeded here.
+    #[cfg(feature = "duckdb")]
+    async fn seed_third_overlap_sibling(
+        inner: &rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+        select: &str,
+    ) {
+        inner.execute_statement("CREATE SCHEMA tgt3").await.unwrap();
+        inner
+            .execute_statement(&format!("CREATE TABLE tgt3.orders AS {select}"))
+            .await
+            .unwrap();
+    }
+
+    /// (a) THE REGRESSION. Three siblings; `tgt.orders` and `tgt2.orders`
+    /// share `customer_id = 5`, `tgt3.orders` is keyless. The two carriers
+    /// must still be compared, so the check FAILS and gates the run.
+    ///
+    /// FAILS ON `main`: the group-wide classifier returns on `tgt3.orders`,
+    /// the query never runs, and the result is `passed: true` with
+    /// `overlap_count: 0` — exit 0 on a real duplicate.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_keyless_sibling_does_not_stop_the_carriers_being_compared() {
+        let inner = seeded_duckdb().await;
+        inner
+            .execute_statement("ALTER TABLE tgt.orders ADD COLUMN customer_id INTEGER")
+            .await
+            .unwrap();
+        inner
+            .execute_statement("UPDATE tgt.orders SET customer_id = 5")
+            .await
+            .unwrap();
+        seed_overlap_sibling(&inner, "SELECT 1 AS id, 5 AS customer_id").await;
+        seed_third_overlap_sibling(&inner, "SELECT 1 AS id").await;
+        let fx = BatchedCheckFixture::new(
+            "row_count = false\n\n[pipeline.bronze.checks.cross_source_overlap]\nkeys = [\"customer_id\"]\n",
+        )
+        .plus_overlap_sibling("tgt2", "orders")
+        .plus_overlap_sibling("tgt3", "orders");
+
+        let recorder = QueryRecordingAdapter::new(&inner);
+        let (pending, _) = fx.run(&recorder, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
+
+        assert!(
+            !result.passed,
+            "customer_id 5 is shared by tgt.orders and tgt2.orders; a keyless \
+             THIRD sibling must not turn that into a pass: {result:?}"
+        );
+        assert!(
+            result.not_evaluated.is_none(),
+            "the carriers WERE measured, so this is not a not-evaluated check: {result:?}"
+        );
+        assert_eq!(
+            contributing_of(result),
+            vec![overlap_sibling_name("tgt"), overlap_sibling_name("tgt2")],
+            "contributing_tables is the measured set, and it must NOT list the \
+             excluded keyless sibling: {result:?}"
+        );
+        assert_eq!(
+            recorder.overlap_query_count(),
+            1,
+            "the overlap query must actually have run"
+        );
+        assert!(
+            !recorder.the_overlap_query().contains("tgt3"),
+            "the excluded sibling must not appear in the query: {}",
+            recorder.the_overlap_query()
+        );
+
+        let (gated, status) = run_status_for(&fx, &pending);
+        assert!(gated, "a real overlap between the carriers gates the run");
+        assert!(
+            matches!(status, rocky_core::state::RunStatus::PartialFailure),
+            "{status:?}"
+        );
+    }
+
+    /// (b) Two carriers with NO shared key, plus a keyless third. A measured
+    /// pass whose `contributing_tables` is exactly the two carriers.
+    ///
+    /// FAILS ON `main` at the `not_evaluated` assertion: `main` never measures
+    /// this group, so it carries a reason.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn two_carriers_with_no_overlap_are_a_measured_pass_over_the_carriers() {
+        let inner = seeded_duckdb().await;
+        inner
+            .execute_statement("ALTER TABLE tgt.orders ADD COLUMN customer_id INTEGER")
+            .await
+            .unwrap();
+        inner
+            .execute_statement("UPDATE tgt.orders SET customer_id = 5")
+            .await
+            .unwrap();
+        seed_overlap_sibling(&inner, "SELECT 1 AS id, 99 AS customer_id").await;
+        seed_third_overlap_sibling(&inner, "SELECT 1 AS id").await;
+        let fx = BatchedCheckFixture::new(
+            "row_count = false\n\n[pipeline.bronze.checks.cross_source_overlap]\nkeys = [\"customer_id\"]\n",
+        )
+        .plus_overlap_sibling("tgt2", "orders")
+        .plus_overlap_sibling("tgt3", "orders");
+
+        let (pending, _) = fx.run(&inner, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
+
+        assert!(result.passed, "5 and 99 do not overlap: {result:?}");
+        assert!(
+            result.not_evaluated.is_none(),
+            "the carriers WERE measured: {result:?}"
+        );
+        assert_eq!(
+            contributing_of(result),
+            vec![overlap_sibling_name("tgt"), overlap_sibling_name("tgt2")],
+            "{result:?}"
+        );
+
+        let (gated, _) = run_status_for(&fx, &pending);
+        assert!(!gated, "no overlap between the carriers is a clean run");
+    }
+
+    /// (c) A key NO sibling carries — a mistyped column name. That is a
+    /// misconfiguration, so the check is `not_evaluated` and FAILS. Every
+    /// group silently passing at `info!` level is how a typo went unnoticed.
+    ///
+    /// FAILS ON `main`: `main` reports `passed: true`, exit 0.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_key_no_sibling_carries_is_a_failed_not_evaluated_check() {
+        let inner = seeded_duckdb().await;
+        // Both siblings carry `customer_id`; the CONFIG asks for `custmer_id`.
+        inner
+            .execute_statement("ALTER TABLE tgt.orders ADD COLUMN customer_id INTEGER")
+            .await
+            .unwrap();
+        seed_overlap_sibling(&inner, "SELECT 1 AS id, 5 AS customer_id").await;
+        let fx = BatchedCheckFixture::new(
+            "row_count = false\n\n[pipeline.bronze.checks.cross_source_overlap]\nkeys = [\"custmer_id\"]\n",
+        )
+        .plus_overlap_sibling("tgt2", "orders");
+
+        let recorder = QueryRecordingAdapter::new(&inner);
+        let (pending, _) = fx.run(&recorder, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
+
+        assert!(
+            !result.passed,
+            "a key no sibling carries is a misconfiguration, not a tolerated \
+             shape: {result:?}"
+        );
+        let reason = result
+            .not_evaluated
+            .as_deref()
+            .expect("a not-evaluated check carries its reason");
+        assert!(
+            reason.contains("custmer_id") && reason.contains("no sibling"),
+            "the reason must name the configured key and say no sibling has \
+             it: {reason}"
+        );
+        assert_eq!(
+            recorder.overlap_query_count(),
+            0,
+            "no query can be built from a column nothing has"
+        );
+
+        let (gated, status) = run_status_for(&fx, &pending);
+        assert!(gated, "a misconfigured key gates the run");
+        assert!(
+            matches!(status, rocky_core::state::RunStatus::PartialFailure),
+            "{status:?}"
+        );
+    }
+
+    /// (e) The honest-failure control. Every sibling of a THREE-member group
+    /// carries the key, so nothing is excluded and the SQL must be exactly
+    /// what the whole-group generator produces — byte for byte.
+    ///
+    /// Passes on `main` too. It is the assertion that pins "the healthy shape
+    /// did not change".
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_group_where_every_sibling_carries_the_key_runs_the_same_sql() {
+        let inner = seeded_duckdb().await;
+        inner
+            .execute_statement("ALTER TABLE tgt.orders ADD COLUMN customer_id INTEGER")
+            .await
+            .unwrap();
+        inner
+            .execute_statement("UPDATE tgt.orders SET customer_id = 5")
+            .await
+            .unwrap();
+        seed_overlap_sibling(&inner, "SELECT 1 AS id, 99 AS customer_id").await;
+        seed_third_overlap_sibling(&inner, "SELECT 1 AS id, 7 AS customer_id").await;
+        let fx = BatchedCheckFixture::new(
+            "row_count = false\n\n[pipeline.bronze.checks.cross_source_overlap]\nkeys = [\"customer_id\"]\n",
+        )
+        .plus_overlap_sibling("tgt2", "orders")
+        .plus_overlap_sibling("tgt3", "orders");
+
+        let recorder = QueryRecordingAdapter::new(&inner);
+        let (pending, _) = fx.run(&recorder, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
+
+        assert!(result.passed, "5, 99 and 7 do not overlap: {result:?}");
+        assert!(result.not_evaluated.is_none(), "{result:?}");
+        assert_eq!(
+            contributing_of(result),
+            vec![
+                overlap_sibling_name("tgt"),
+                overlap_sibling_name("tgt2"),
+                overlap_sibling_name("tgt3"),
+            ],
+            "with nothing excluded, contributing_tables is the whole group: {result:?}"
+        );
+
+        // The byte-identity claim: the SQL the runner issued is exactly what
+        // the shared generator produces for the WHOLE group.
+        let all: Vec<TableRef> = ["tgt", "tgt2", "tgt3"]
+            .iter()
+            .map(|s| TableRef {
+                catalog: String::new(),
+                schema: (*s).into(),
+                table: "orders".into(),
+            })
+            .collect();
+        let expected = rocky_core::checks::generate_cross_source_overlap_sql(
+            &all,
+            &["customer_id".to_string()],
+            inner.dialect(),
+        )
+        .expect("the whole-group SQL generates");
+        assert_eq!(
+            recorder.the_overlap_query(),
+            expected,
+            "a group with nothing excluded must issue byte-identical SQL"
+        );
+    }
+
+    /// The excluded sibling is `siblings[0]` — the table the result attaches
+    /// to. The attachment must stay valid: the group's result still lands on
+    /// that asset, and the measured set is the other two.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn the_excluded_sibling_may_be_the_attachment_target() {
+        let inner = seeded_duckdb().await;
+        // `tgt.orders` (siblings[0]) is NOT altered: it has no customer_id.
+        seed_overlap_sibling(&inner, "SELECT 1 AS id, 5 AS customer_id").await;
+        seed_third_overlap_sibling(&inner, "SELECT 1 AS id, 5 AS customer_id").await;
+        let fx = BatchedCheckFixture::new(
+            "row_count = false\n\n[pipeline.bronze.checks.cross_source_overlap]\nkeys = [\"customer_id\"]\n",
+        )
+        .plus_overlap_sibling("tgt2", "orders")
+        .plus_overlap_sibling("tgt3", "orders");
+
+        let (pending, _) = fx.run(&inner, None, None).await;
+        // `fx.target_key()` IS `tgt.orders`, the excluded sibling.
+        let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
+
+        assert!(
+            !result.passed,
+            "tgt2 and tgt3 share customer_id 5: {result:?}"
+        );
+        assert_eq!(
+            contributing_of(result),
+            vec![overlap_sibling_name("tgt2"), overlap_sibling_name("tgt3")],
+            "the excluded sibling is not a contributing table, even though the \
+             result hangs off its asset: {result:?}"
+        );
+        let (gated, _) = run_status_for(&fx, &pending);
+        assert!(gated, "the overlap between the two carriers still gates");
+    }
+
+    /// A composite key where DIFFERENT siblings miss DIFFERENT columns. Only
+    /// the sibling carrying both is a carrier, so one carrier remains and the
+    /// group is not applicable — never a partial-key comparison.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn siblings_missing_different_key_columns_leave_one_carrier() {
+        let inner = seeded_duckdb().await;
+        inner
+            .execute_statement("ALTER TABLE tgt.orders ADD COLUMN customer_id INTEGER")
+            .await
+            .unwrap();
+        inner
+            .execute_statement("ALTER TABLE tgt.orders ADD COLUMN region VARCHAR")
+            .await
+            .unwrap();
+        seed_overlap_sibling(&inner, "SELECT 1 AS id, 5 AS customer_id").await;
+        seed_third_overlap_sibling(&inner, "SELECT 1 AS id, 'eu' AS region").await;
+        let fx = BatchedCheckFixture::new(
+            "row_count = false\n\n[pipeline.bronze.checks.cross_source_overlap]\nkeys = [\"customer_id\", \"region\"]\n",
+        )
+        .plus_overlap_sibling("tgt2", "orders")
+        .plus_overlap_sibling("tgt3", "orders");
+
+        let recorder = QueryRecordingAdapter::new(&inner);
+        let (pending, _) = fx.run(&recorder, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
+
+        assert!(
+            result.passed,
+            "one carrier cannot overlap with itself; that is not a failure: {result:?}"
+        );
+        let reason = result
+            .not_evaluated
+            .as_deref()
+            .expect("the group was never measured, so it must say so");
+        assert!(
+            reason.contains("tgt2.orders") && reason.contains("region"),
+            "the reason must name tgt2.orders and the column IT lacks: {reason}"
+        );
+        assert!(
+            reason.contains("tgt3.orders") && reason.contains("customer_id"),
+            "and tgt3.orders with the column IT lacks: {reason}"
+        );
+        assert_eq!(
+            recorder.overlap_query_count(),
+            0,
+            "a one-carrier group runs no query"
         );
     }
 }
