@@ -5149,8 +5149,8 @@ impl RockyMcpServer {
         .map_err(|e| {
             ToolError::internal(
                 format!("{e:#}"),
-                "Could not read the state store to compose the digest; ensure the project's \
-                 state store is present and readable.",
+                "Could not compose the digest; ensure the project's `rocky.toml` loads and \
+                 its state store is present and readable.",
             )
         })?;
         let value = serde_json::to_value(&output).map_err(|e| {
@@ -5419,8 +5419,8 @@ impl RockyMcpServer {
         .map_err(|e| {
             ToolError::internal(
                 format!("{e:#}"),
-                "Could not build the review queue; ensure the project's state store is present \
-                 and readable.",
+                "Could not build the review queue; ensure the project's `rocky.toml` loads \
+                 and its state store is present and readable.",
             )
         })?;
 
