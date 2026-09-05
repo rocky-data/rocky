@@ -417,7 +417,7 @@ Three rules keep that boundary in place:
 | Tool | What it does |
 |---|---|
 | `compile` | Type-check the project and return diagnostics (errors / warnings). |
-| `plan_preview` | Preview the exact SQL Rocky would execute. Computed offline; no warehouse I/O. |
+| `plan_preview` | Render the SQL Rocky generates, offline, with no warehouse I/O. Not the whole plan: a model it cannot render offline is skipped and is not named in the result. Skipped by construction: Snowflake dynamic tables, time-interval models, and content-addressed models. |
 | `lineage` | Column-level lineage for a model (or a single column). |
 | `test` | Run the project's DuckDB-backed local tests (contracts + assertions). |
 | `list` | List project entities (`models`, `pipelines`, `adapters`, `sources`). |

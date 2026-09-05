@@ -2411,12 +2411,22 @@ fn substitute_env_vars_inner(input: &str) -> EnvExpansion {
     }
 }
 
-/// Formats a list of env-var substitutions into a one-line human-readable
-/// hint appended to post-substitution parse errors. Values are truncated to
-/// avoid dumping secrets / multi-KB strings into a log line; the operator
-/// just needs enough context to find the misbehaving env var.
-fn format_env_var_hint(substitutions: &[EnvVarSubstitution]) -> String {
-    if substitutions.is_empty() {
+/// Formats the env-var context into a one-line human-readable hint appended
+/// to post-substitution parse errors. Values are truncated to avoid dumping
+/// secrets / multi-KB strings into a log line; the operator just needs enough
+/// context to find the misbehaving env var.
+///
+/// `unresolved` matters only under
+/// [`CredentialPolicy::TolerateAdapterCredentials`], and it is the whole
+/// reason that policy does not degrade diagnostics. Under
+/// [`CredentialPolicy::Require`] an unset `${PORT}` is a `MissingEnvVar`
+/// naming `PORT`. Under the tolerant policy the text `${PORT}` survives into
+/// the TOML,
+/// and a BARE `port = ${PORT}` then fails to parse — for a reason the parse
+/// error itself cannot express. Listing the unresolved names here keeps that
+/// error pointing at `PORT` instead of at a stray `$`.
+fn format_env_var_hint(substitutions: &[EnvVarSubstitution], unresolved: &[String]) -> String {
+    if substitutions.is_empty() && unresolved.is_empty() {
         return String::new();
     }
     const MAX_VALUE_LEN: usize = 40;
@@ -2440,10 +2450,27 @@ fn format_env_var_hint(substitutions: &[EnvVarSubstitution]) -> String {
             format!("{}={:?}", sub.name, truncated)
         })
         .collect();
-    format!(
-        "\n  hint: config had these env var substitutions — check one is the culprit: {}",
-        parts.join(", ")
-    )
+    let mut hint = String::new();
+    if !parts.is_empty() {
+        hint.push_str(&format!(
+            "\n  hint: config had these env var substitutions — check one is the culprit: {}",
+            parts.join(", ")
+        ));
+    }
+    if !unresolved.is_empty() {
+        let mut seen_unresolved = std::collections::HashSet::new();
+        let names: Vec<&str> = unresolved
+            .iter()
+            .filter(|name| seen_unresolved.insert(*name))
+            .map(String::as_str)
+            .collect();
+        hint.push_str(&format!(
+            "\n  hint: these env vars are not set, so their ${{...}} placeholders were left \
+             in the config text: {}",
+            names.join(", ")
+        ));
+    }
+    hint
 }
 
 // ===========================================================================
@@ -3201,7 +3228,8 @@ pub struct PolicyTest {
 #[serde(deny_unknown_fields)]
 pub struct FulfillConfig {
     /// Directory of brief overrides (`elicitation.md`, `drafting.md`,
-    /// `repair.md`). A file present there replaces the compiled default
+    /// `repair.md`, `data-repair.md`). A file present there replaces the
+    /// compiled default
     /// of the same name; absent files fall back. Must be a plain
     /// RELATIVE path inside the project — the loop resolves it through
     /// the staged commit's containment primitive, so an absolute path,
@@ -6313,9 +6341,20 @@ fn parse_rocky_config_str_with(
             span: Some(span.clone()),
         });
     }
+    // The names the parse-error hint lists. Under `Require` this is empty —
+    // the first missing variable already returned above — so every executing
+    // path keeps the hint it always had. Under the tolerant policy a surviving
+    // placeholder can still break the PARSE (a bare `port = ${PORT}` was never
+    // valid TOML), and the parse error cannot say why the `$` is there; the
+    // hint names the variable instead.
+    let missing_names: Vec<String> = expanded
+        .missing
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
     let expanded_missing = expanded.missing;
     let (substituted, substitutions) = (expanded.text, expanded.substitutions);
-    let env_var_hint = format_env_var_hint(&substitutions);
+    let env_var_hint = format_env_var_hint(&substitutions, &missing_names);
     let to_parse_err = |source: toml::de::Error| -> ConfigError {
         if env_var_hint.is_empty() {
             ConfigError::ParseToml(source)
@@ -6438,6 +6477,11 @@ pub fn load_rocky_config(path: &Path) -> Result<RockyConfig, ConfigError> {
 /// invalid config is refused exactly as before. `rocky validate` keeps
 /// [`load_rocky_config`] and remains the command that requires every variable
 /// to resolve.
+///
+/// A placeholder written as a BARE value (`port = ${PORT}`) is not tolerated
+/// either, and never could be: it was not valid TOML before substitution, so
+/// it fails as a parse error — one whose hint names `PORT`, so the operator
+/// is not left decoding a stray `$` (see [`format_env_var_hint`]).
 ///
 /// Never use this on a path that connects to anything: a literal
 /// `"${DATABRICKS_HOST}"` reaching an adapter is a confusing failure at best.
@@ -7099,7 +7143,7 @@ mod tests {
             name: "SECRET".to_string(),
             value,
         }];
-        let hint = format_env_var_hint(&subs); // must not panic
+        let hint = format_env_var_hint(&subs, &[]); // must not panic
         assert!(hint.contains("SECRET"));
         assert!(hint.contains('…'));
     }
@@ -7287,6 +7331,133 @@ snapshot = "snap.json"
     fn test_no_env_vars() {
         let result = substitute_env_vars("no variables here").unwrap();
         assert_eq!(result, "no variables here");
+    }
+
+    // -----------------------------------------------------------------
+    // SEVENTEENTH ROUND, finding 1 — the tolerant loader. The branch
+    // shipped it as `load_rocky_config_env_tolerant` (every unset `${VAR}`
+    // tolerated); `main` shipped `load_rocky_config_credential_tolerant`
+    // (#1558, adapter connection fields only). The merge kept main's,
+    // and these fixtures all place the placeholder in a connection field,
+    // so they pin the same behaviour on the surviving API.
+    //
+    // These use a variable that is never set by construction rather than
+    // `set_var`/`remove_var`: the process environment is global, `cargo
+    // test` runs these threads in parallel, and a pin that flakes is worse
+    // than no pin at all.
+    // -----------------------------------------------------------------
+
+    /// An unset credential placeholder loads, and the placeholder survives as
+    /// literal text — so the caller sees exactly what it would have to
+    /// resolve before connecting.
+    #[test]
+    fn credential_tolerant_load_keeps_an_unset_credential_placeholder() {
+        assert!(
+            std::env::var("ROCKY_DEFINITELY_NOT_SET_TOLERANT_HOST").is_err(),
+            "premise: the variable is unset"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &path,
+            r#"
+[adapter.default]
+type = "databricks"
+host = "${ROCKY_DEFINITELY_NOT_SET_TOLERANT_HOST}"
+http_path = "/sql/1.0/warehouses/abc"
+token = "pat"
+"#,
+        )
+        .unwrap();
+
+        // The strict loader refuses — that behaviour is unchanged and is the
+        // baseline this test is a delta against.
+        assert!(matches!(
+            load_rocky_config(&path),
+            Err(ConfigError::MissingEnvVar { .. })
+        ));
+
+        let config = load_rocky_config_credential_tolerant(&path)
+            .expect("an offline reader needs no credential to learn the adapter type");
+        let adapter = config.adapters.get("default").expect("adapter parsed");
+        assert_eq!(adapter.adapter_type, "databricks");
+        assert_eq!(
+            adapter.host.as_deref(),
+            Some("${ROCKY_DEFINITELY_NOT_SET_TOLERANT_HOST}"),
+            "the placeholder must survive verbatim, never silently blank"
+        );
+    }
+
+    /// Tolerating an unset variable must not tolerate a BROKEN file. Both
+    /// halves, because "it loaded" is only good news if the things that
+    /// should still fail still fail.
+    #[test]
+    fn credential_tolerant_load_still_refuses_malformed_and_invalid_configs() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Malformed: unterminated table header.
+        let malformed = tmp.path().join("malformed.toml");
+        std::fs::write(&malformed, "[adapter.default\ntype = \"snowflake\"\n").unwrap();
+        assert!(
+            load_rocky_config_credential_tolerant(&malformed).is_err(),
+            "malformed TOML stays fatal"
+        );
+
+        // Semantically invalid: parses, then fails the validator chain —
+        // snowflake has no discovery role, so `kind = "discovery"` is
+        // rejected by `validate_adapter_kinds`.
+        let invalid = tmp.path().join("invalid.toml");
+        std::fs::write(
+            &invalid,
+            "[adapter.default]\ntype = \"snowflake\"\nkind = \"discovery\"\naccount = \"a\"\n",
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                load_rocky_config_credential_tolerant(&invalid),
+                Err(ConfigError::AdapterKindUnsupported { .. })
+            ),
+            "the whole CONFIG_VALIDATORS chain still runs"
+        );
+    }
+
+    /// The one shape the tolerant policy cannot save, pinned so the
+    /// diagnostic stays useful: a placeholder written as a BARE TOML value
+    /// was never valid TOML, so it fails to parse.
+    ///
+    /// The assertion is on the HINT CLAUSE, not merely on the variable name.
+    /// A first draft asserted the name alone and was not fix-sensitive:
+    /// `toml`'s own error quotes the offending line, which contains the
+    /// `${VAR}` text, so it named the variable with the hint plumbing
+    /// reverted. What this change actually adds is the LABELLED attribution —
+    /// "this variable is not set" rather than a `$` the operator has to
+    /// interpret — and that is what is pinned.
+    #[test]
+    fn credential_tolerant_load_names_an_unresolved_var_in_a_parse_error() {
+        assert!(
+            std::env::var("ROCKY_DEFINITELY_NOT_SET_BARE_PORT").is_err(),
+            "premise: the variable is unset"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &path,
+            "[adapter.default]\ntype = \"duckdb\"\nport = ${ROCKY_DEFINITELY_NOT_SET_BARE_PORT}\n",
+        )
+        .unwrap();
+
+        let err = load_rocky_config_credential_tolerant(&path)
+            .expect_err("a bare ${VAR} is not valid TOML with or without substitution");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("ROCKY_DEFINITELY_NOT_SET_BARE_PORT"),
+            "the parse error must name the unresolved variable, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("env vars are not set"),
+            "the parse error must say WHY the variable appears, not leave the \
+             operator to decode a stray `$`, got: {rendered}"
+        );
     }
 
     #[test]

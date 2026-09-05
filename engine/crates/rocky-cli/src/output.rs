@@ -7354,7 +7354,9 @@ pub struct FulfillOutput {
     /// `product:<name>`.
     pub product_id: String,
     /// The state the record was left in (its wire tag, e.g.
-    /// `"needs_input"`, `"proposed"`, `"observing"`, `"blocked"`).
+    /// `"needs_input"`, `"proposed"`, `"observing"`, `"blocked"`,
+    /// `"observed_failing"` — applied, and the applied output is failing
+    /// a check the product declared about itself).
     pub state: String,
     /// Why the loop stopped, in plain language.
     pub message: String,

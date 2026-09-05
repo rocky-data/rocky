@@ -58,6 +58,11 @@ pub enum TaskBriefKind {
     Drafting,
     /// Repair a red verification.
     Repair,
+    /// Repair an APPLIED output that is failing its own declared data
+    /// checks. Same window and same supervision as [`Self::Repair`]; the
+    /// worker is handed the failing check and what it measured instead
+    /// of a compiler diagnostic.
+    DataRepair,
 }
 
 impl TaskBriefKind {
@@ -67,7 +72,18 @@ impl TaskBriefKind {
             TaskBriefKind::Elicitation => "elicitation",
             TaskBriefKind::Drafting => "drafting",
             TaskBriefKind::Repair => "repair",
+            TaskBriefKind::DataRepair => "data-repair",
         }
+    }
+
+    /// Whether this kind repairs an EXISTING generation, and so needs the
+    /// drafting window reopened before dispatch (#1493).
+    ///
+    /// Both repair kinds do. Asking the kind — rather than testing for
+    /// one variant at each call site — is what stops a third repair kind
+    /// from silently skipping the reopen.
+    pub fn reopens_the_window(self) -> bool {
+        matches!(self, TaskBriefKind::Repair | TaskBriefKind::DataRepair)
     }
 }
 
@@ -455,7 +471,9 @@ fn collect_outcome(
                 transcript_path,
             })
         }
-        TaskBriefKind::Drafting | TaskBriefKind::Repair => {
+        // Every authoring kind produces the same outcome shape: the
+        // worker wrote SQL, and the runner re-verifies it from disk.
+        TaskBriefKind::Drafting | TaskBriefKind::Repair | TaskBriefKind::DataRepair => {
             Ok(DriverOutcome::Drafting { transcript_path })
         }
     }
@@ -867,7 +885,7 @@ impl AgentDriver for ReplayDriver {
                     transcript_path,
                 })
             }
-            TaskBriefKind::Drafting | TaskBriefKind::Repair => {
+            TaskBriefKind::Drafting | TaskBriefKind::Repair | TaskBriefKind::DataRepair => {
                 Ok(DriverOutcome::Drafting { transcript_path })
             }
         }

@@ -566,8 +566,10 @@ enum Command {
     /// every stop prints the state, why it stopped, and the exact next
     /// command. Exit codes: 0 = clean stop (including a `needs_input`
     /// ask and `observing`), 2 = `blocked`, 3 = parked at
-    /// `applying_unknown` for a human (distinct from the generic error
-    /// exit 1, so scripts can tell the two apart).
+    /// `applying_unknown` for a human, 4 = `observed_failing` — the plan
+    /// applied and the applied output is failing a check the product
+    /// declared about itself (each distinct from the generic error exit
+    /// 1, so scripts can tell them apart).
     ///
     /// `rocky fulfill approve-spec <product>` is the same authority
     /// transition as `rocky product approve` — one implementation, two
@@ -2369,8 +2371,8 @@ enum Command {
         /// operator intends to be able to write human sign-off markers;
         /// `worker` is the minimal drafting allowlist for untrusted workers:
         /// the read/inspect grounding tools, compile / test / breaking_change
-        /// / dependents, draft_model + draft_check, and the prompts — no
-        /// contract, metadata, propose, review, or schedule surface.
+        /// / dependents, draft_model, and the prompts — no check, contract,
+        /// metadata, propose, review, or schedule surface.
         #[arg(long, value_enum, default_value_t = McpProfileArg::Default)]
         profile: McpProfileArg,
     },

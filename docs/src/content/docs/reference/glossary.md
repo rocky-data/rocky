@@ -85,7 +85,7 @@ A mismatch between what your code expects and what the warehouse actually has, u
 
 ### Dry run
 
-Doing every step except the write. `rocky plan` is the dry run of `rocky apply`: it produces the exact SQL without executing it. `rocky estimate` is a dry-run cost estimate that asks the warehouse to `EXPLAIN` a query rather than run it.
+Doing every step except the write. `rocky plan` is the dry run of `rocky apply`: it prints SQL without executing it. It needs a replication pipeline, and it reads the live source to discover which tables exist. Both happen before any SQL is printed, and `--model` does not skip either, so a project with no replication pipeline is refused. Bare `rocky plan` prints replication SQL only. `rocky plan --model <name>` prints that one transformation model's SQL in place of it. `rocky emit-sql` prints transformation SQL with no pipeline and no connection. Read it as a preview, not a transcript. The SQL is rendered before anything runs, so parts of it are placeholders. A `MERGE` on any dialect but Databricks shows a canonical shape, not the column list the runner resolves from the live source. An incremental table shows the 1970 sentinel watermark, not the real one. And `rocky apply` recompiles the project rather than replaying stored SQL. `rocky estimate` is a dry-run cost estimate that asks the warehouse to `EXPLAIN` a query rather than run it.
 
 ### Enforced group
 

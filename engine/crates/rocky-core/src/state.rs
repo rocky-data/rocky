@@ -581,20 +581,25 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   record would let another pod observe a valid-looking approval whose
 ///   spec it cannot read or verify. Revisit to replicated only when
 ///   snapshot bytes gain durable replicated storage of their own.
-/// - **v23** — adds the serde-additive [`RunProgress::scope`] field
+/// - **v23** — two serde-additive record-shape additions that landed on
+///   separate branches while the version was unreleased, so they share one
+///   bump (no released build wrote a v23 store, so the version stays at 23
+///   rather than moving to 24). Neither is a table change — the redb table
+///   set is unchanged (`EXPECTED_TABLES` is untouched). The bump tracks the
+///   record-shape additions so `[state] on_schema_mismatch` engages as
+///   usual; no blob walk.
+///
+///   **Resume scope.** Adds the [`RunProgress::scope`] field
 ///   ([`ResumeScope`]): the pipeline name, `--filter`, and target routing a
 ///   checkpoint was written under, so `--resume` / `--resume-latest` can
-///   refuse a checkpoint from a different pipeline scope (#1549). Not a
-///   table change — the redb table set is unchanged (`EXPECTED_TABLES` is
-///   untouched). A v22 blob (which lacks the field) forward-deserializes
-///   with it `None`, guarded by
+///   refuse a checkpoint from a different pipeline scope (#1549). A v22 blob
+///   (which lacks the field) forward-deserializes with it `None`, guarded by
 ///   `test_v22_run_progress_forward_deserializes_scope_none`; the CLI
 ///   refuses to resume such a scopeless checkpoint (fail-closed — start a
 ///   fresh run instead), so old checkpoints degrade to a loud refusal, never
-///   to a cross-pipeline resume. A v23 blob back-reads cleanly on a v22
-///   binary (serde ignores the extra key). The bump tracks the record-shape
-///   addition so `[state] on_schema_mismatch` engages as usual; no blob
-///   walk.
+///   to a cross-pipeline resume. A v23 `RunProgress` blob back-reads cleanly
+///   on a v22 binary (serde ignores the extra key) — but see the fulfillment
+///   half below, which does NOT share that property.
 ///
 ///   The scope's routing half is structured ([`ResumeTarget`], compared
 ///   field-wise). Two earlier unreleased builds wrote other shapes, and
@@ -629,7 +634,51 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   shape. The reverse direction — an older *unreleased* binary reading a
 ///   `null` `schema_template` — fails to parse, and that is acceptable only
 ///   because no release before 1.73.0 had this field at all.
-const CURRENT_SCHEMA_VERSION: u32 = 23;
+///
+/// - **v24** — adds the fulfillment loop's post-apply data-check surface:
+///   the [`crate::fulfill::FulfillState::ObservedFailing`] state, the
+///   [`crate::fulfill::DraftingRound::DataRepair`] round, and two
+///   serde-additive [`crate::fulfill::FulfillStateRecord`] fields
+///   (`data_repair_rounds`, `observation_detail`). Not a table change — the
+///   redb table set is unchanged (`EXPECTED_TABLES` is untouched); no blob
+///   walk. A v23 blob (which lacks the fields) forward-deserializes with the
+///   counter 0 and the detail `None`, guarded by
+///   `fulfill::tests::the_f3_observation_fields_read_across_the_version_that_added_them`.
+///
+///   **Why this is its own bump and not a rider on v23:** engine 1.73.0
+///   released v23, so the "no released build wrote it" argument that let
+///   two additions share one bump no longer applies. And the bump is
+///   load-bearing rather than bookkeeping: the two fields are additive, but
+///   `observed_failing` is a NEW VARIANT of a `#[serde(tag = "state")]`
+///   enum. An added field forward-defaults; an unknown variant is a hard
+///   read failure. So a v24 `fulfill_state` blob does NOT back-read on a
+///   1.73.0 binary. A 1.73.0 binary opening a v24 store must therefore never
+///   reach that blob — and it does not, because the version check runs at
+///   OPEN and `[state] on_schema_mismatch` engages there
+///   ([`SchemaMismatchPolicy::Fail`] refuses with the version pair;
+///   [`SchemaMismatchPolicy::Recreate`] bootstraps a fresh store).
+///
+///   **What losing the record does and does not cost — stated carefully,
+///   because an earlier version of this note overclaimed.** `fulfill_state`
+///   is in [`LOCAL_ONLY_TABLE_NAMES`], so the record is per-machine loop
+///   state rather than shared history, and a re-run rebuilds the LOOP's
+///   position. It does not follow that the loss is free. The loop derives
+///   its proposal nonce from `journal_seq`, and a plan id is a hash of the
+///   plan payload, so a recreated state that reaches the same journal
+///   position can mint the same plan id — while `.rocky/plans/<id>.reviewed.json`
+///   sits outside this store and survives. A surviving marker would then
+///   approve a freshly-minted proposal. That is a pre-existing custody
+///   property, not something this bump introduces, but the bump is where
+///   the "losing it is fine" claim is written down, so it is corrected
+///   here rather than repeated. Tracked as
+///   [#1525](https://github.com/rocky-data/rocky/issues/1525); do not
+///   rely on state loss being harmless.
+///
+///   The variant's read behaviour under an older vocabulary is pinned by
+///   `fulfill::tests::the_data_red_state_round_trips_and_is_a_hard_error_on_an_older_reader`,
+///   so "the version gate is what protects the downgrade" stays true by
+///   test rather than by comment.
+const CURRENT_SCHEMA_VERSION: u32 = 24;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -11841,11 +11890,18 @@ mod tests {
         // guarded by `test_v22_opens_and_creates_fulfill_tables`. Both are
         // local-only (the approval record points at snapshot bytes replication
         // does not transport — see the v22 stanza on CURRENT_SCHEMA_VERSION).
-        // v23 adds `RunProgress::scope` (the pipeline identity a checkpoint
-        // belongs to, #1549), a serde-additive field — the redb table set is
-        // untouched, only the version moves; guarded by
-        // `test_v22_run_progress_forward_deserializes_scope_none`.
-        const EXPECTED_VERSION: u32 = 23;
+        //
+        // v23 (released in 1.73.0) added `RunProgress::scope` (#1549),
+        // guarded by `test_v22_run_progress_forward_deserializes_scope_none`.
+        // v24 adds the F3 data-red vocabulary on `FulfillStateRecord` and
+        // `FulfillState`, whose record-shape and unknown-variant behaviour
+        // are guarded in `fulfill.rs`. NO table change — `EXPECTED_TABLES`
+        // is deliberately unchanged below — so this stanza moves the version
+        // only. What is pinned HERE is that the on-disk version moved with
+        // the new variant, which is the thing the open-time mismatch gate
+        // reads: a 1.73.0 binary must refuse a v24 store at OPEN, before it
+        // can reach a blob it cannot parse.
+        const EXPECTED_VERSION: u32 = 24;
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",

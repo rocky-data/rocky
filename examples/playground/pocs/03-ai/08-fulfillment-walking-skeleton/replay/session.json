@@ -1,5 +1,5 @@
 {
-  "_comment": "Recorded worker session, replayed verbatim against `rocky mcp --profile worker`. Elicitation hands off the candidate spec (digest re-checked by the runner). Drafting first PROVES the privilege boundary (propose/review/etc are tool-not-found on the worker profile), then authors a draft that FORGETS the required revenue_eur column — so the runner's own verify bundle comes back red (E010) and the machine enters a repair round. The recorded repair authors the full model. Repair recovery is exercised on every replay run (it was a known engine gap, #1493: the repair round's sidecar rewrite was mis-classified as tamper; the engine now reopens the drafting window through the staged commit before dispatching repair, so the loop converges — and out-of-band edits between gates are still caught).",
+  "_comment": "Recorded worker session, replayed verbatim against `rocky mcp --profile worker`. Elicitation hands off the candidate spec (digest re-checked by the runner). Drafting first PROVES the privilege boundary (propose/review/etc are tool-not-found on the worker profile), then authors a draft that FORGETS the required revenue_eur column \u2014 so the runner's own verify bundle comes back red (E010) and the machine enters a repair round. The recorded repair authors the full model. Repair recovery is exercised on every replay run (it was a known engine gap, #1493: the repair round's sidecar rewrite was mis-classified as tamper; the engine now reopens the drafting window through the staged commit before dispatching repair, so the loop converges \u2014 and out-of-band edits between gates are still caught). The `data-repair` task is the POST-APPLY round (FF-WP-F3): the checks a product declares about its output cannot run before the table exists, so they are reported deferred at verify and first evaluated at observation. run.sh violates the generated grain check in the MATERIALISED output, and the loop routes that red into this round. The recorded worker re-authors the same correct model, because the defect here is in the data rather than the SQL \u2014 what the lane proves is the ROUTE: a red lands a state that is not a healthy `observing`, and the repaired plan goes back through a NEW human review instead of inheriting the failing plan's approval. The `draft_check` probe is the FF-WP-F3 addition: the tool left the worker allowlist because a check's expression is raw-interpolated into SQL that the loop now executes unattended after every apply. The probe proves the ROUTE is gone at the PROTOCOL level, against the real `rocky mcp --profile worker`, rather than only in a constant. It does not prove a worker cannot author a check: the driver runs an arbitrary command in the project root with no filesystem confinement, and the lowering preserves a worker-written sidecar test. That boundary is #1491 / #1515; what catches a sidecar changed after verify is the observation-time custody digest.",
   "tasks": {
     "elicitation": {
       "calls": [],
@@ -29,6 +29,11 @@
           "expect": "tool_not_found"
         },
         {
+          "tool": "draft_check",
+          "arguments": {},
+          "expect": "tool_not_found"
+        },
+        {
           "tool": "draft_metadata",
           "arguments": {},
           "expect": "tool_not_found"
@@ -50,6 +55,19 @@
       ]
     },
     "repair": {
+      "calls": [
+        {
+          "tool": "draft_model",
+          "arguments": {
+            "name": "revenue_daily",
+            "sql": "SELECT client_id, CAST(charged_at AS DATE) AS day, MAX(charged_at) AS loaded_at, SUM(CASE WHEN is_refund THEN 0 ELSE amount_eur END)::DOUBLE AS revenue_eur FROM wh.raw.stripe_charges GROUP BY client_id, CAST(charged_at AS DATE)",
+            "intent": "Daily gross revenue per client in EUR, refunds excluded"
+          },
+          "expect": "ok"
+        }
+      ]
+    },
+    "data-repair": {
       "calls": [
         {
           "tool": "draft_model",

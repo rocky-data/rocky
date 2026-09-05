@@ -4346,6 +4346,7 @@ dependencies = [
  "anyhow",
  "arrow",
  "async-trait",
+ "blake3",
  "chrono",
  "libc",
  "regex",
