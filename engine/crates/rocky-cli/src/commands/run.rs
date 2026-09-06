@@ -156,14 +156,44 @@ pub struct Interrupted;
 /// distinguish partial success from a total failure (exit 1) or an
 /// interrupt (exit 130). The full JSON `RunOutput` has already been
 /// emitted on stdout by the time this is returned.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "{count} table(s) failed during parallel execution (run_id: {run_id}, use --resume {run_id} to retry)"
-)]
+///
+/// The advice half of the message is conditional on [`Self::check_gate_failed`]
+/// (#1720). `run.rs` returns this sentinel from the failed-copy branch, which
+/// runs BEFORE the check-gate branch and returns, so a run where a copy *and*
+/// a check failed never reaches [`CheckGateFailure`] and used to be told
+/// "use --resume … to retry" with nothing said about the checks. A resume
+/// re-copies the failed table and rebuilds its check inputs only from what it
+/// copies, so it re-runs none of the checks that gated the run.
+#[derive(Debug)]
 pub struct PartialFailure {
     pub count: usize,
     pub run_id: String,
+    /// Whether the same run ALSO failed its check gate. Changes the advice,
+    /// never the exit code — both shapes are exit 2.
+    pub check_gate_failed: bool,
 }
+
+impl std::fmt::Display for PartialFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.check_gate_failed {
+            return write!(
+                f,
+                "{} table(s) failed during parallel execution and this run also failed its \
+                 check gate (run_id: {}); `--resume {}` re-copies only the failed table(s) and \
+                 re-runs none of the checks that gated this run, so a resume cannot clear the \
+                 gate — fix the data and re-run the pipeline",
+                self.count, self.run_id, self.run_id
+            );
+        }
+        write!(
+            f,
+            "{} table(s) failed during parallel execution (run_id: {}, use --resume {} to retry)",
+            self.count, self.run_id, self.run_id
+        )
+    }
+}
+
+impl std::error::Error for PartialFailure {}
 
 /// Sentinel error signalling that `rocky run` completed its terminal state
 /// writes with no successful materialization (`RunStatus::Failure`). The
@@ -193,16 +223,46 @@ pub struct RunFailed {
 /// tables it copies, so a resume of this run would copy nothing and run no
 /// checks. `ensure_run_is_resumable` refuses it for the same reason; this
 /// message must not send the user there.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "{count} error-severity check(s) failed (run_id: {run_id}, see `check_results` in the JSON \
-     output); the data has already landed — fix the source and re-run the pipeline, a resume \
-     would copy nothing"
-)]
+///
+/// [`Self::inherited_from`] names the prior run when this one is a resume that
+/// inherited a still-standing gate (#1720). The count is then this run's OWN
+/// error-severity failures, which is `0` in the common case — the earlier
+/// violation is on a table this resume never re-copied, so it produced no
+/// check result to count. Reporting "0 error-severity check(s) failed" would
+/// be a lie about a run that is deliberately not green, so the message says
+/// which run raised the gate instead.
+#[derive(Debug)]
 pub struct CheckGateFailure {
     pub count: usize,
     pub run_id: String,
+    /// The run whose standing check gate this one inherited, or `None` when
+    /// the gate is this run's own.
+    pub inherited_from: Option<String>,
 }
+
+impl std::fmt::Display for CheckGateFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Some(prior) = &self.inherited_from else {
+            return write!(
+                f,
+                "{} error-severity check(s) failed (run_id: {}, see `check_results` in the \
+                 JSON output); the data has already landed — fix the source and re-run the \
+                 pipeline, a resume would copy nothing",
+                self.count, self.run_id
+            );
+        };
+        write!(
+            f,
+            "the check gate raised by run {prior} still stands (run_id: {}); this resume \
+             re-ran none of those checks — it builds its check inputs only from the tables it \
+             copied — and added {} error-severity failure(s) of its own. Fix the data and \
+             re-run the pipeline; resuming again cannot clear the gate",
+            self.run_id, self.count
+        )
+    }
+}
+
+impl std::error::Error for CheckGateFailure {}
 
 /// Map a finalized [`RunOutput`]'s derived status onto the CLI exit-code
 /// contract for the transformation / model-only execution paths.
@@ -223,6 +283,11 @@ pub(crate) fn run_status_exit_result(output: &RunOutput, run_id: &str) -> Result
         rocky_core::state::RunStatus::PartialFailure => Err(PartialFailure {
             count: output.tables_failed,
             run_id: run_id.to_string(),
+            // The replication path routes its compile-only failure here while
+            // the check gate may already be set, so the advice must reflect it
+            // (#1720). `false` on the transformation / model-only paths, which
+            // never stamp the gate — those messages are unchanged.
+            check_gate_failed: output.check_gate_failed,
         }
         .into()),
         rocky_core::state::RunStatus::Failure => Err(RunFailed {
@@ -310,6 +375,23 @@ fn replication_check_gate_failed(
     checks: &rocky_core::config::ChecksConfig,
 ) -> bool {
     checks.fail_on_error && output.check_failures_by_severity().0 > 0
+}
+
+/// The check-gate verdict this run reports: its own, OR a still-standing one
+/// inherited from the run it resumed (#1720).
+///
+/// [`replication_check_gate_failed`] can only see the checks THIS invocation
+/// ran, and the runner builds check inputs only from the tables this
+/// invocation copied. So a resume that re-copies one failed table evaluates
+/// exactly that table's checks — and reads clean on a violation the earlier
+/// run found on a table it skipped. Without the second term the resumed run
+/// derives `Success`, `StateStore::latest_successful_run` starts matching it,
+/// and every downstream `after` demand fires on data that is still violating.
+///
+/// `inherited_gate` is `None` for every run that is not a resume of a gated
+/// run, so the verdict is unchanged everywhere else.
+fn resolved_check_gate(this_run_gated: bool, inherited_gate: Option<&String>) -> bool {
+    this_run_gated || inherited_gate.is_some()
 }
 
 /// Arm a background watcher that hard-exits with code 130 on a *second*
@@ -1644,23 +1726,38 @@ fn ensure_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> 
 /// check, and exit 0 on data that is still violating. That false recovery is
 /// worse than the exit-0 bug this whole change closes, so it is refused here.
 ///
-/// The discriminator is deliberately neither the status alone nor the recorded
-/// check outcomes:
+/// The discriminator is the recorded gate verdict plus the copy checkpoint:
 ///
 /// ```text
-///   copied < planned            -> resume: real copy work remains
+///   copied < planned                  -> resume: real copy work remains
+///   copied == planned, gate stands    -> refuse: a resume re-runs no check
 ///   copied == planned, a model failed -> resume: the model phase re-runs
-///   copied == planned, no model failed -> refuse: a resume would do nothing
+///   copied == planned, nothing failed -> refuse: a resume would do nothing
 /// ```
 ///
-/// `RunRecord::check_outcomes` is NOT consulted, because it records no
+/// The gate row reads [`RunRecord::check_gate_failed`] (state schema v25,
+/// #1720): the run's own **severity-resolved** answer to "did the checks fail
+/// this run?", written by `to_run_record` from `RunOutput::check_gate_failed`.
+/// It is `false` for a warning-only failure and `false` for every run under
+/// `fail_on_error = false`, so keying on it cannot refuse a resume over a
+/// result the user declared advisory.
+///
+/// `RunRecord::check_outcomes` is still NOT consulted, because it records no
 /// severity: keying on it would refuse a legitimate resume over a
 /// `severity = "warning"` result, or over any result at all under
-/// `fail_on_error = false` — both of which the user declared advisory. The
-/// "did a model fail" question is severity-free: `to_run_record` writes one
-/// `models_executed` entry with `status: "failed"` per `RunOutput::errors`
-/// entry, and on the replication path those are exactly the compile failures
-/// and the failed copies. A check failure adds none.
+/// `fail_on_error = false` — both of which the user declared advisory.
+///
+/// The gate row is checked BEFORE the model row, because the model row admits
+/// exactly the run the gate row must refuse: a failed post-apply
+/// `verify_after` gate pushes a `<verify_after>` entry onto `RunOutput::errors`
+/// with no model involved, and `to_run_record` writes one `models_executed`
+/// entry with `status: "failed"` per errors entry. Ordered the other way, that
+/// entry alone would admit a resume of a fully-copied check-gated run — the
+/// laundering path #1720 reported.
+///
+/// The "did a model fail" question stays severity-free: on the replication path
+/// those failed entries are the compile failures, the failed copies, and the
+/// post-apply custody failures. A check failure adds none.
 ///
 /// `total_tables` is what the recorded run planned to copy *after* its own
 /// resume filtering, not the pipeline's whole table set. So a resume of a
@@ -1699,12 +1796,20 @@ fn ensure_the_resume_would_do_work(
 ) -> Result<()> {
     // A run that planned nothing — discovery returned no table, or an earlier
     // resume had already taken them all — left no copy checkpoint to reason
-    // about, and a resume of it re-plans from scratch. It also cannot have
-    // tripped the check gate: a check exists only for a table this invocation
-    // copied. Resumable.
+    // about, so the resume re-plans every table from scratch and every check
+    // runs again. Resumable whatever the recorded gate says: nothing is
+    // skipped, so nothing goes unchecked. (The older note here claimed such a
+    // run "cannot have tripped the check gate". Persisting the verdict made
+    // that claim checkable, so it is replaced by the one that does not depend
+    // on it.)
     if progress.total_tables == 0 {
         return Ok(());
     }
+    // A table that is not `Success` is re-attempted by the resume, because the
+    // resume filter admits only `Success` keys. Real copy work remains, so this
+    // stays resumable even when the gate stands — what keeps THAT honest is the
+    // carry-forward at the gate stamp, not a refusal here: the resumed run
+    // inherits the standing verdict and cannot record `Success` while it holds.
     if progress
         .tables
         .iter()
@@ -1720,6 +1825,19 @@ fn ensure_the_resume_would_do_work(
     if copied < progress.total_tables {
         return Ok(());
     }
+    // The checks gated this run and no copy work remains (#1720). A resume
+    // rebuilds its check inputs only from the tables it copies, so it would
+    // re-run NONE of the checks that gated the run, and would report clean on
+    // data that is still violating. Refused ahead of the `models_executed`
+    // branch below, which would otherwise admit exactly this run.
+    if record.check_gate_failed {
+        anyhow::bail!(
+            "nothing to resume: run {} was gated by its checks and copied every table it \
+             planned to copy, so a resume would copy nothing and would re-run none of those \
+             checks — fix the data and re-run the pipeline",
+            progress.run_id
+        );
+    }
     if record
         .models_executed
         .iter()
@@ -1732,6 +1850,51 @@ fn ensure_the_resume_would_do_work(
          so a resume would copy nothing and run no checks — re-run the pipeline",
         progress.run_id
     )
+}
+
+/// The prior run whose still-standing check gate an admitted resume inherits.
+///
+/// `Some(run_id)` when the run being resumed recorded
+/// [`rocky_core::state::RunRecord::check_gate_failed`]: an error-severity check
+/// failed (or could not be evaluated) while that pipeline's `fail_on_error`
+/// gate was on.
+///
+/// # Why an admitted resume has to inherit it
+///
+/// [`ensure_the_resume_would_do_work`] refuses a gated run only when no copy
+/// work remains. The commoner shape still resumes: one table failed to copy,
+/// and a *different*, already-copied table failed its check. The resume
+/// legitimately re-copies the failed table — but the runner builds its check
+/// inputs only from the tables the current invocation copies (#1670), so the
+/// standing violation is never re-evaluated. Left alone, that resume derives
+/// `Success`; `StateStore::latest_successful_run` matches on exactly
+/// `RunStatus::Success`, so every downstream `after` demand then fires on data
+/// that is still violating (#1720).
+///
+/// Carrying the verdict forward is the smaller of the two honest fixes. The
+/// larger one — re-evaluating the prior run's checks against the tables it
+/// copied — is a real feature (it can also CLEAR the gate) and is not
+/// attempted here.
+///
+/// # Independent of the resuming run's own `fail_on_error`
+///
+/// A run under `fail_on_error = false` never records a gate, so there is never
+/// anything to inherit from one. And a verdict that was severity-resolved
+/// while the gate was on is not erased by flipping the flag afterwards —
+/// letting it be erased would reopen this bug through the config instead of
+/// through the resume. Re-running the pipeline is what clears it.
+///
+/// `None` when this is not a resume, when the prior record is gone (the crash
+/// case [`ensure_run_is_resumable`] deliberately admits), or when the record
+/// predates state schema v25 — an unrecorded verdict reads `false`, so a
+/// pre-v25 run resumes exactly as it does today.
+fn inherited_check_gate(
+    state_store: &StateStore,
+    progress: Option<&RunProgress>,
+) -> Option<String> {
+    let progress = progress?;
+    let record = state_store.get_run(&progress.run_id).ok().flatten()?;
+    record.check_gate_failed.then(|| progress.run_id.clone())
 }
 
 fn resolve_resume_progress(
@@ -3044,6 +3207,10 @@ pub async fn run(
     );
     let resume_progress =
         resolve_resume_progress(&state_store, resume_run_id, resume_latest, &resume_scope)?;
+    // Read the prior run's persisted check-gate verdict here, while
+    // `resume_progress` is still in scope (it is consumed below). `None` for a
+    // non-resume run, so a plain run is byte-identical to before (#1720).
+    let inherited_gate = inherited_check_gate(&state_store, resume_progress.as_ref());
 
     // Suppress both the periodic and the end-of-run upload when either:
     // - the on-disk state was forward-incompatible (newer schema than this
@@ -3144,6 +3311,19 @@ pub async fn run(
     let concurrency = pipeline.execution.concurrency.max_concurrency();
     let mut output = RunOutput::new(filter.unwrap_or("").to_string(), 0, concurrency);
     output.shadow = shadow_config.is_some();
+    // Stamp an inherited gate HERE, not at the check-gate stamp far below
+    // (#1720). Several exit paths persist a `RunRecord` before that point —
+    // the SIGINT/SIGTERM path is the reachable one — and `derive_run_status`
+    // reads this field. Stamping late would let an interrupted resume of a
+    // gated run record without the standing verdict, and a resume of THAT
+    // interrupted run would then inherit nothing and could go green. The
+    // gate stamp below re-derives the same value from this run's own checks
+    // OR this inheritance, so the two agree by construction.
+    //
+    // The `false` is this run's OWN verdict, which is necessarily false here:
+    // no check has run yet. Written through the same helper as the stamp
+    // below so the two sites cannot drift apart.
+    output.check_gate_failed = resolved_check_gate(false, inherited_gate.as_ref());
     if let Some(ctx) = &idempotency_ctx {
         output.idempotency_key = Some(ctx.key.clone());
     }
@@ -5097,7 +5277,25 @@ pub async fn run(
     // three now read the same gate, so the JSON payload, the persisted
     // `RunRecord`, the idempotency outcome and the exit code give one answer
     // instead of three.
-    output.check_gate_failed = replication_check_gate_failed(&output, &pipeline.checks);
+    let this_run_gated = replication_check_gate_failed(&output, &pipeline.checks);
+    // A resumed run inherits the prior run's standing gate (#1720). The
+    // resume's check inputs cover only the tables IT copied, so a gate the
+    // prior run raised over a table this resume skipped is never re-evaluated.
+    // Without this `||` the resumed run derives `Success`, and
+    // `latest_successful_run` starts matching it — the laundering path. `None`
+    // on every run that is not a resume of a gated run, so nothing else moves.
+    output.check_gate_failed = resolved_check_gate(this_run_gated, inherited_gate.as_ref());
+    if let Some(prior) = &inherited_gate {
+        warn!(
+            resumed_from = prior.as_str(),
+            "resumed run inherits a standing check gate"
+        );
+        crate::status_line!(
+            "Check gate: run {prior} was gated by its checks and this resume re-ran none of \
+             them, so the gate still stands — this run cannot report success. Fix the data and \
+             re-run the pipeline."
+        );
+    }
 
     // Finding #1: whether the compiled-model phase completed cleanly, hoisted so
     // the recipe-manifest write (outside the model block below) can also skip on
@@ -5616,6 +5814,13 @@ pub async fn run(
         // already been written to stdout above; dagster
         // (`allow_partial=True`) reads stdout regardless of exit code
         // for code 2.
+        //
+        // The advice half depends on the check gate too (#1720). This branch
+        // returns before the check-gate branch below, so when a copy AND a
+        // check both failed this is the only message the operator sees — and
+        // "use --resume to retry" alone is wrong there: a resume re-copies the
+        // failed table and re-runs none of the checks that gated the run.
+        let gated = output.check_gate_failed;
         if matches!(
             output.derive_run_status(),
             rocky_core::state::RunStatus::PartialFailure
@@ -5623,8 +5828,16 @@ pub async fn run(
             return Err(PartialFailure {
                 count,
                 run_id: run_id.clone(),
+                check_gate_failed: gated,
             }
             .into());
+        }
+        if gated {
+            anyhow::bail!(
+                "{count} table(s) failed during parallel execution and this run also failed \
+                 its check gate (run_id: {run_id}); a resume re-runs none of the checks that \
+                 gated this run — fix the data and re-run the pipeline"
+            );
         }
         anyhow::bail!(
             "{count} table(s) failed during parallel execution (run_id: {run_id}, use --resume {run_id} to retry)"
@@ -5677,8 +5890,15 @@ pub async fn run(
             return Err(CheckGateFailure {
                 count,
                 run_id: run_id.clone(),
+                inherited_from: inherited_gate.clone(),
             }
             .into());
+        }
+        if let Some(prior) = &inherited_gate {
+            anyhow::bail!(
+                "the check gate raised by run {prior} still stands (run_id: {run_id}); this \
+                 resume re-ran none of those checks — fix the data and re-run the pipeline"
+            );
         }
         anyhow::bail!(
             "{count} error-severity check(s) failed (run_id: {run_id}, see `check_results` in the JSON output)"
@@ -14114,6 +14334,139 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         }
     }
 
+    /// A gated run's record as `to_run_record` writes it: the persisted
+    /// check-gate verdict (state schema v25) plus the `models_executed` entry
+    /// with `status: "failed"` that a `<verify_after>` custody failure leaves
+    /// behind — a failed entry with no model involved.
+    fn seed_gated_run_record(store: &StateStore, run_id: &str, status: &str) {
+        let record: rocky_core::state::RunRecord = serde_json::from_value(serde_json::json!({
+            "run_id": run_id,
+            "started_at": "2026-08-30T00:00:00Z",
+            "finished_at": "2026-08-30T00:01:00Z",
+            "status": status,
+            "models_executed": [{
+                "model_name": "<verify_after>",
+                "started_at": "2026-08-30T00:00:30Z",
+                "finished_at": "2026-08-30T00:00:31Z",
+                "duration_ms": 0,
+                "status": "failed",
+                "sql_hash": "",
+            }],
+            "trigger": "Manual",
+            "config_hash": "test",
+            "check_gate_failed": true,
+        }))
+        .expect("minimal RunRecord deserializes");
+        store.record_run(&record).unwrap();
+    }
+
+    /// #1720. Every table this run planned copied, the checks gated it, AND a
+    /// failed `models_executed` entry is present — the `<verify_after>` shape,
+    /// which needs no `--all` and no model at all.
+    ///
+    /// On `main` the failed-model branch admits this resume. It then skips
+    /// every `Success` key, copies nothing, builds no check input, runs no
+    /// check, derives `Success`, exits 0, and records `Success` — and
+    /// `latest_successful_run` matches on exactly that, so every downstream
+    /// `after` demand fires on data that is still violating. The persisted
+    /// gate is read BEFORE the model branch, so the resume is refused.
+    #[test]
+    fn resume_refuses_a_complete_checkpoint_whose_checks_gated_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        store.init_run_progress("run-1", 2, Some(&scope)).unwrap();
+        complete_tables(&store, "run-1", 2);
+
+        for status in ["PartialFailure", "Failure"] {
+            seed_gated_run_record(&store, "run-1", status);
+            for (resume_run_id, resume_latest) in [(None, true), (Some("run-1"), false)] {
+                let err = resolve_resume_progress(&store, resume_run_id, resume_latest, &scope)
+                    .expect_err("a resume that re-runs none of the gating checks must refuse");
+                let message = format!("{err:#}");
+                assert!(
+                    message.contains("nothing to resume: run run-1")
+                        && message.contains("gated by its checks")
+                        && message.contains("re-run none of those checks"),
+                    "unexpected refusal for {status} {resume_run_id:?}/{resume_latest}: {message}"
+                );
+            }
+        }
+    }
+
+    /// The narrowing conjunct for the refusal above: a gated run with copy
+    /// work left is still admitted, because a resume of it does real work.
+    /// What keeps THAT honest is the carry-forward, not a refusal — see
+    /// `a_resume_of_a_gated_run_cannot_record_success`. Without this the fix
+    /// would refuse every recovery from a run that happened to fail a check.
+    #[test]
+    fn resume_allows_a_gated_run_that_still_has_tables_to_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        store.init_run_progress("run-1", 3, Some(&scope)).unwrap();
+        complete_tables(&store, "run-1", 2);
+        seed_gated_run_record(&store, "run-1", "PartialFailure");
+
+        for (resume_run_id, resume_latest) in [(None, true), (Some("run-1"), false)] {
+            let progress = resolve_resume_progress(&store, resume_run_id, resume_latest, &scope)
+                .expect("a gated run with a table left to copy still resumes")
+                .expect("the checkpoint resolves");
+            assert_eq!(progress.run_id, "run-1");
+            assert_eq!(
+                super::inherited_check_gate(&store, Some(&progress)).as_deref(),
+                Some("run-1"),
+                "the admitted resume must carry the standing gate forward"
+            );
+        }
+    }
+
+    /// Control (#1720): an ungated failed run is untouched. `main`'s
+    /// behaviour for a genuine copy failure — resume admitted, nothing
+    /// inherited — must be exactly preserved, or the fix would refuse the
+    /// recovery path it exists to protect.
+    #[test]
+    fn an_ungated_failed_run_resumes_and_inherits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        store.init_run_progress("run-1", 3, Some(&scope)).unwrap();
+        complete_tables(&store, "run-1", 2);
+        seed_run_record(&store, "run-1", "PartialFailure");
+
+        let progress = resolve_resume_progress(&store, Some("run-1"), false, &scope)
+            .expect("an ungated copy failure resumes")
+            .expect("the checkpoint resolves");
+        assert!(
+            super::inherited_check_gate(&store, Some(&progress)).is_none(),
+            "no gate was recorded, so nothing is inherited"
+        );
+        assert!(
+            super::inherited_check_gate(&store, None).is_none(),
+            "a run that is not a resume inherits nothing"
+        );
+    }
+
+    /// A record that predates state schema v25 has no `check_gate_failed` key
+    /// at all. It must read as "no gate recorded", so every pre-upgrade
+    /// checkpoint resumes exactly as it did before the field existed.
+    #[test]
+    fn a_pre_v25_record_inherits_no_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        store.init_run_progress("run-1", 3, Some(&scope)).unwrap();
+        complete_tables(&store, "run-1", 2);
+        // `seed_run_record` builds the record from a JSON object with no
+        // `check_gate_failed` key — the v24 blob shape.
+        seed_run_record(&store, "run-1", "PartialFailure");
+        let stored = store.get_run("run-1").unwrap().unwrap();
+        assert!(!stored.check_gate_failed);
+
+        let progress = store.get_run_progress("run-1").unwrap().unwrap();
+        assert!(super::inherited_check_gate(&store, Some(&progress)).is_none());
+    }
+
     /// The other narrowing conjunct: an unfinished copy is real work, so it
     /// resumes however the run failed. One of two tables copied.
     #[test]
@@ -20896,6 +21249,315 @@ backend = "local"
         }
     }
 
+    /// #1720, the higher-frequency shape — and the one the tool's own advice
+    /// used to steer an operator into. Three tables; two copy, one fails, and
+    /// one of the COPIED tables fails its row-count check. The run correctly
+    /// exits 2 and now records the gate.
+    ///
+    /// The resume is legitimately admitted (a real copy remains), and it
+    /// re-copies exactly the failed table. Check inputs are built only from
+    /// the tables the current invocation copies (#1670), so the earlier
+    /// violation is never re-evaluated: on `main` the resumed run has no
+    /// failed table and no check result, derives `Success`, exits 0, and
+    /// records `Success` — and `latest_successful_run` matches on exactly
+    /// `Success`, firing every downstream `after` demand on violating data.
+    ///
+    /// Walks the real chain: `replication_check_gate_failed` →
+    /// `to_run_record` → `record_run` → `inherited_check_gate` →
+    /// `resolved_check_gate` → `derive_run_status` → `to_run_record`.
+    #[test]
+    fn a_resume_of_a_gated_run_cannot_record_success() {
+        use rocky_core::state::{RunStatus, StateStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let checks = checks_config("row_count = true");
+        let now = chrono::Utc::now();
+
+        // --- the first run: 2 of 3 tables copied, 1 failed, and a row-count
+        // check failed on a table that DID copy.
+        let mut first = RunOutput::new(String::new(), 0, 3);
+        first.tables_copied = 2;
+        first.tables_failed = 1;
+        first
+            .check_results
+            .push(failing_check_bag(rocky_core::checks::check_row_count(
+                10, 7,
+            )));
+        first.check_gate_failed = super::replication_check_gate_failed(&first, &checks);
+        assert!(first.check_gate_failed, "an error-severity failure gates");
+
+        let first_record = first.to_run_record(
+            "run-1",
+            now,
+            now,
+            "cfg".to_string(),
+            rocky_core::state::RunTrigger::Manual,
+            first.derive_run_status(),
+            crate::output::RunRecordAudit::test_sentinels(),
+        );
+        assert!(
+            first_record.check_gate_failed,
+            "the severity-resolved verdict must reach the record"
+        );
+        store.record_run(&first_record).unwrap();
+        store.init_run_progress("run-1", 3, None).unwrap();
+        let progress = store.get_run_progress("run-1").unwrap().unwrap();
+
+        // --- the resume: it copies the one table that failed, and nothing
+        // else. It runs the checks for that table only, and they pass.
+        let inherited = super::inherited_check_gate(&store, Some(&progress));
+        assert_eq!(inherited.as_deref(), Some("run-1"));
+
+        let mut resumed = RunOutput::new(String::new(), 0, 1);
+        resumed.tables_copied = 1;
+        resumed.resumed_from = Some("run-1".to_string());
+        let own_gate = super::replication_check_gate_failed(&resumed, &checks);
+        assert!(!own_gate, "the resume re-ran none of the gating checks");
+        resumed.check_gate_failed = super::resolved_check_gate(own_gate, inherited.as_ref());
+
+        assert!(
+            !matches!(resumed.derive_run_status(), RunStatus::Success),
+            "a resume that re-ran none of the gating checks must not report Success"
+        );
+        assert!(matches!(
+            resumed.derive_run_status(),
+            RunStatus::PartialFailure
+        ));
+
+        // The resumed run's OWN record carries the gate too, so a resume of
+        // the resume inherits it in turn instead of clearing it by depth.
+        let resumed_record = resumed.to_run_record(
+            "run-2",
+            now,
+            now,
+            "cfg".to_string(),
+            rocky_core::state::RunTrigger::Manual,
+            resumed.derive_run_status(),
+            crate::output::RunRecordAudit::test_sentinels(),
+        );
+        assert!(
+            resumed_record.check_gate_failed,
+            "the standing gate must survive onto the resumed run's own record"
+        );
+        assert!(!matches!(resumed_record.status, RunStatus::Success));
+        store.record_run(&resumed_record).unwrap();
+        store.init_run_progress("run-2", 1, None).unwrap();
+        let progress2 = store.get_run_progress("run-2").unwrap().unwrap();
+        assert_eq!(
+            super::inherited_check_gate(&store, Some(&progress2)).as_deref(),
+            Some("run-2"),
+            "a resume of the resume inherits the same standing gate"
+        );
+    }
+
+    /// #1720. An interrupted resume must still record the standing gate.
+    ///
+    /// The SIGINT path persists its `RunRecord` well before the check-gate
+    /// stamp runs, so the inheritance is stamped onto the output the moment
+    /// it is created instead. Without that, an interrupted resume of a gated
+    /// run would record `check_gate_failed = false`, a resume of THAT run
+    /// would inherit nothing, and the violation would launder through the
+    /// interrupted run in the middle.
+    #[test]
+    fn an_interrupted_resume_still_records_the_standing_gate() {
+        use rocky_core::state::RunStatus;
+
+        let now = chrono::Utc::now();
+        let inherited = Some("run-1".to_string());
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        // Exactly what the runner does at output-creation time.
+        out.check_gate_failed = super::resolved_check_gate(false, inherited.as_ref());
+        out.tables_copied = 1;
+        out.interrupted = true;
+
+        let record = out.to_run_record(
+            "run-2",
+            now,
+            now,
+            "cfg".to_string(),
+            rocky_core::state::RunTrigger::Manual,
+            out.derive_run_status(),
+            crate::output::RunRecordAudit::test_sentinels(),
+        );
+        assert!(
+            record.check_gate_failed,
+            "an interrupt before the check-gate stamp must not drop the standing verdict"
+        );
+        assert!(!matches!(record.status, RunStatus::Success));
+    }
+
+    /// Control (#1720). A resume with nothing inherited is unchanged: the
+    /// verdict is the run's own, so an honest recovery from a copy failure
+    /// still reaches `Success` and still records `check_gate_failed = false`.
+    #[test]
+    fn a_resume_with_no_standing_gate_still_reaches_success() {
+        use rocky_core::state::RunStatus;
+
+        let checks = checks_config("row_count = true");
+        let now = chrono::Utc::now();
+        let mut resumed = RunOutput::new(String::new(), 0, 1);
+        resumed.tables_copied = 1;
+        resumed.resumed_from = Some("run-1".to_string());
+        resumed
+            .check_results
+            .push(failing_check_bag(rocky_core::checks::check_row_count(
+                10, 10,
+            )));
+
+        let own_gate = super::replication_check_gate_failed(&resumed, &checks);
+        resumed.check_gate_failed = super::resolved_check_gate(own_gate, None);
+
+        assert!(!resumed.check_gate_failed);
+        assert!(matches!(resumed.derive_run_status(), RunStatus::Success));
+        let record = resumed.to_run_record(
+            "run-2",
+            now,
+            now,
+            "cfg".to_string(),
+            rocky_core::state::RunTrigger::Manual,
+            resumed.derive_run_status(),
+            crate::output::RunRecordAudit::test_sentinels(),
+        );
+        assert!(!record.check_gate_failed);
+        assert!(matches!(record.status, RunStatus::Success));
+    }
+
+    /// Control (#1720). `fail_on_error = false` declares every check
+    /// advisory, so such a run records NO gate even with an error-severity
+    /// check failing — there is nothing for a later resume to inherit.
+    ///
+    /// This is also why flipping the flag after a gated run cannot erase the
+    /// verdict: a run that declared its checks advisory never wrote one.
+    #[test]
+    fn a_run_with_fail_on_error_off_records_no_gate_to_inherit() {
+        use rocky_core::state::RunStatus;
+
+        let now = chrono::Utc::now();
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.tables_copied = 2;
+        out.check_results
+            .push(failing_check_bag(rocky_core::checks::check_row_count(
+                10, 7,
+            )));
+        out.check_gate_failed =
+            super::replication_check_gate_failed(&out, &checks_config("fail_on_error = false"));
+
+        assert!(!out.check_gate_failed, "an advisory check never gates");
+        assert!(matches!(out.derive_run_status(), RunStatus::Success));
+        let record = out.to_run_record(
+            "run-advisory",
+            now,
+            now,
+            "cfg".to_string(),
+            rocky_core::state::RunTrigger::Manual,
+            out.derive_run_status(),
+            crate::output::RunRecordAudit::test_sentinels(),
+        );
+        assert!(
+            !record.check_gate_failed,
+            "nothing to inherit from a run that declared its checks advisory"
+        );
+    }
+
+    /// A healthy run is untouched (#1720): no check configured, nothing
+    /// copied wrong, `Success` in the payload and `check_gate_failed = false`
+    /// on the record.
+    #[test]
+    fn a_healthy_run_records_no_gate() {
+        use rocky_core::state::RunStatus;
+
+        let now = chrono::Utc::now();
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.tables_copied = 3;
+        out.check_gate_failed =
+            super::replication_check_gate_failed(&out, &checks_config("row_count = true"));
+
+        assert!(!out.check_gate_failed);
+        assert!(matches!(out.derive_run_status(), RunStatus::Success));
+        let record = out.to_run_record(
+            "run-healthy",
+            now,
+            now,
+            "cfg".to_string(),
+            rocky_core::state::RunTrigger::Manual,
+            out.derive_run_status(),
+            crate::output::RunRecordAudit::test_sentinels(),
+        );
+        assert!(!record.check_gate_failed);
+        assert!(matches!(record.status, RunStatus::Success));
+    }
+
+    /// #1720, the misdirected advice. The failed-copy branch returns before
+    /// the check-gate branch, so when a copy AND a check both failed this is
+    /// the only message the operator sees — and "use --resume to retry"
+    /// alone is wrong there. Without the gate the message is byte-identical
+    /// to before, so an honest copy failure reads exactly as it did.
+    #[test]
+    fn the_partial_failure_advice_names_the_check_gate_only_when_one_failed() {
+        let plain = super::PartialFailure {
+            count: 1,
+            run_id: "run-1".to_string(),
+            check_gate_failed: false,
+        }
+        .to_string();
+        assert_eq!(
+            plain,
+            "1 table(s) failed during parallel execution (run_id: run-1, use --resume run-1 to retry)",
+            "an ungated copy failure keeps its exact message"
+        );
+
+        let gated = super::PartialFailure {
+            count: 1,
+            run_id: "run-1".to_string(),
+            check_gate_failed: true,
+        }
+        .to_string();
+        assert!(
+            gated.contains("also failed its check gate")
+                && gated.contains("re-runs none of the checks")
+                && gated.contains("re-run the pipeline"),
+            "a copy + check failure must say the resume cannot clear the gate: {gated}"
+        );
+    }
+
+    /// #1720. A purely inherited gate has a count of `0` — the violation is
+    /// on a table this resume never re-copied, so it produced no check result
+    /// to count. "0 error-severity check(s) failed" would be a lie about a
+    /// run that is deliberately not green, so the message names the run that
+    /// raised the gate instead. The uninherited message is unchanged.
+    #[test]
+    fn the_check_gate_message_names_the_run_that_raised_an_inherited_gate() {
+        let own = super::CheckGateFailure {
+            count: 2,
+            run_id: "run-1".to_string(),
+            inherited_from: None,
+        }
+        .to_string();
+        assert!(
+            own.starts_with("2 error-severity check(s) failed (run_id: run-1")
+                && own.contains("a resume would copy nothing"),
+            "a run's own gate keeps its exact message: {own}"
+        );
+
+        let inherited = super::CheckGateFailure {
+            count: 0,
+            run_id: "run-2".to_string(),
+            inherited_from: Some("run-1".to_string()),
+        }
+        .to_string();
+        assert!(
+            !inherited.starts_with('0'),
+            "an inherited gate must not report a count of zero failures: {inherited}"
+        );
+        assert!(
+            inherited.contains("raised by run run-1")
+                && inherited.contains("re-ran none of those checks")
+                && inherited.contains("resuming again cannot clear the gate"),
+            "an inherited gate must name the run that raised it: {inherited}"
+        );
+    }
+
     /// The stale-JSON-status defect: `merge_replication_compile_and_copy_errors`
     /// stamps `output.status` from the counters, and it used to be the ONLY
     /// thing that decided the payload's status. The gate is set before this
@@ -26339,6 +27001,7 @@ auto_create_schemas = true
             check_outcomes: Vec::new(),
             pipeline: None,
             submission_id: None,
+            check_gate_failed: false,
         };
         state.record_run(&failed).unwrap();
 
@@ -27667,6 +28330,7 @@ auto_create_schemas = true
             check_outcomes: Vec::new(),
             pipeline: None,
             submission_id: None,
+            check_gate_failed: false,
         };
         store.record_run(&run).unwrap();
         // The prior build's LIVE artifact — the ledger row the liveness gate
@@ -27863,6 +28527,7 @@ auto_create_schemas = true
             check_outcomes: Vec::new(),
             pipeline: None,
             submission_id: None,
+            check_gate_failed: false,
         };
         store.record_run(&base_run).unwrap();
         store
@@ -27990,6 +28655,7 @@ auto_create_schemas = true
             check_outcomes: Vec::new(),
             pipeline: None,
             submission_id: None,
+            check_gate_failed: false,
         };
         store.record_run(&run).unwrap();
 
@@ -28974,6 +29640,7 @@ auto_create_schemas = true
                 check_outcomes: Vec::new(),
                 pipeline: None,
                 submission_id: None,
+                check_gate_failed: false,
             };
             store.record_run(&run).unwrap();
             // The prior build's LIVE artifact row — the liveness gate resolves
@@ -29276,6 +29943,7 @@ auto_create_schemas = true
                     check_outcomes: Vec::new(),
                     pipeline: None,
                     submission_id: None,
+                    check_gate_failed: false,
                 })
                 .unwrap();
             // The prior live_d build's LIVE artifact-ledger row — the liveness

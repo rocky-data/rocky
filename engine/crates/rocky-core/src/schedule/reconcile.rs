@@ -1768,6 +1768,7 @@ cron = "also invalid"
             check_outcomes: Vec::new(),
             pipeline: Some(pipeline.to_string()),
             submission_id: submission_id.map(String::from),
+            check_gate_failed: false,
         }
     }
 

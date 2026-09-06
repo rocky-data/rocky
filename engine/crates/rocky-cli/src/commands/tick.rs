@@ -166,6 +166,9 @@ pub async fn run_tick(
         return Err(PartialFailure {
             count: unhealthy,
             run_id,
+            // `rocky tick` reports the reconciler's own tally, not a
+            // replication run's check gate — there is no gate to report here.
+            check_gate_failed: false,
         }
         .into());
     }
