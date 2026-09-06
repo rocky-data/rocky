@@ -48,6 +48,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **On upgrade:** the state store schema moves v23 → v24. No table is added and no blob migration runs; a v23 store upgrades on the next read-write open. The bump is load-bearing: `observed_failing` is a new variant of the `fulfill_state` record's tagged enum, and a 1.73.0 binary cannot read a blob that carries it. **Rolling back is the part to plan for.** Remote state keys are qualified by schema version (`v23/state.redb` on an object store, `…v23:…` on Valkey), so a 1.73.0 binary never reads a v24 remote object. It reads whatever is under its own v23 key, which may be stale, and it cannot see progress recorded under v24. The incompatible-blob hazard is a **local** `state.redb` this version wrote. A 1.73.0 binary opening it either stops with a schema-mismatch error or, on the paths that honour `[state] on_schema_mismatch`, deletes the file and starts fresh under the default `recreate`. Do not point a 1.73.0 binary at a local state file written by this version, and do not share one local file between versions. `rocky doctor --check state_schema` reports the mismatch and exits 3. Which commands honour the key and which refuse is being pinned down in #1679. `fulfill_state` is local-only, so a re-run rebuilds the loop's position; see #1525 before relying on that loss being harmless.
 
 ### Fixed
+- **`severity = "warning"` on `null_rate` or a `[[checks.custom]]` entry silenced a check the engine could not run at all.**
+
+  The configured severity was written over every result of those two kinds, measured or not. `null_rate_not_evaluated` and `custom_not_evaluated` choose `Error` on purpose, so a check Rocky could not evaluate still gates. The clobber undid that choice.
+
+  So a null-rate query that failed produced one `not_evaluated`, `passed: false` result per configured column, all at warning severity. The replication gate counts error-severity failures only, so it stayed clear and the run exited **0** with `status: "Success"`. A `[[checks.custom]]` entry whose query failed behaved the same way.
+
+  ```
+  severity = "warning", the query FAILS
+  before   every column not_evaluated at Warning -> gate clear -> exit 0, Success
+  after    every column not_evaluated at Error   -> gate trips -> exit 2, PartialFailure
+  ```
+
+  The configured severity now applies to a measured result only. It describes a column over the threshold, or a real violation count — not a query Rocky could not run. A measured violation still reports at the configured severity, so `severity = "warning"` keeps meaning "this is advisory" for the case it was written for.
+
+  **This changes an exit code.** A project that set `severity = "warning"` on either check kind, and whose check queries fail, moves from exit 0 to exit 2. That is the same correction #1719 made for `freshness`; these were the two kinds it left. (#1735)
+
 - **`rocky state retention sweep` could delete run history a project's `rocky.toml` said to keep, because a dangling symlink read as "no config at all".**
 
   `Path::exists()` is `std::fs::metadata(..).is_ok()`, and `metadata` **follows** a symlink. A `rocky.toml` that is a symlink to a deleted file therefore answered `false`. Three commands decided whether to load the config with that probe, so #1668's refusal was unreachable at all three: the probe said "no config" and each one carried on.
