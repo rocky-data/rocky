@@ -6820,6 +6820,44 @@
         },
         "type": "object"
       },
+      "DocsOutput": {
+        "description": "Output for `rocky docs --output json`.",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "duration_ms": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "models_count": {
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "output_path": {
+            "type": "string"
+          },
+          "pipelines_count": {
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "duration_ms",
+          "models_count",
+          "output_path",
+          "pipelines_count",
+          "version"
+        ],
+        "type": "object"
+      },
       "DoctorOutput": {
         "description": "Doctor output structure.",
         "properties": {
@@ -19047,6 +19085,63 @@
         ],
         "type": "object"
       },
+      "SnapshotOutput": {
+        "description": "Output for `rocky snapshot --output json`.",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "duration_ms": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "pipeline": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/SnapshotStepOutput"
+            },
+            "type": "array"
+          },
+          "steps_ok": {
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "steps_total": {
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "target": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "dry_run",
+          "duration_ms",
+          "pipeline",
+          "source",
+          "steps",
+          "steps_ok",
+          "steps_total",
+          "target",
+          "version"
+        ],
+        "type": "object"
+      },
       "SnapshotPipelineConfig": {
         "description": "Snapshot pipeline configuration — SCD Type 2 slowly-changing dimension capture.\n\nTracks historical changes to a source table by maintaining `valid_from` / `valid_to` columns in the target history table.\n\n```toml [pipeline.customer_history] type = \"snapshot\" unique_key = [\"customer_id\"] updated_at = \"updated_at\"\n\n[pipeline.customer_history.source] adapter = \"databricks_prod\" catalog = \"raw_catalog\" schema = \"raw__us_west__shopify\" table = \"customers\"\n\n[pipeline.customer_history.target] adapter = \"databricks_prod\" catalog = \"acme_warehouse\" schema = \"silver__scd\" table = \"customers_history\" ```",
         "properties": {
@@ -19167,6 +19262,38 @@
           "catalog",
           "schema",
           "table"
+        ],
+        "type": "object"
+      },
+      "SnapshotStepOutput": {
+        "description": "A single SQL step within a snapshot run.",
+        "properties": {
+          "duration_ms": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sql": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "step": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "duration_ms",
+          "sql",
+          "status",
+          "step"
         ],
         "type": "object"
       },

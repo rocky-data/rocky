@@ -343,3 +343,8 @@ export type {
 export type { ProductStatusOutput } from "./product_status";
 // `rocky product journal <name>`, also served at `GET /api/v1/products/{name}/journal`.
 export type { ProductJournalOutput, ProductJournalEntry } from "./product_journal";
+
+// `rocky snapshot` — SCD2 snapshot execution.
+export type { SnapshotOutput, SnapshotStepOutput } from "./snapshot";
+// `rocky docs` — generated project documentation.
+export type { DocsOutput } from "./docs";
