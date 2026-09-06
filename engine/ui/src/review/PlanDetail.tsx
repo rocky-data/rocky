@@ -267,7 +267,17 @@ export function PlanDetail({
     queue.kind === "ready"
       ? (queue.value.pending.find((row) => row.plan_id === planId) ?? null)
       : null;
-  const model = entry?.model ?? null;
+  // Which model to sample. The queue entry names it, but the queue is not a
+  // durable source: an approval marker resolves the escalation, so the entry
+  // disappears the moment the plan is signed off — and that is exactly when
+  // the table it built starts existing. Reading the queue alone meant the
+  // panel could never show real rows for a product's first plan: before the
+  // approval there is no table, and after it there is no entry.
+  //
+  // The product's own status carries `output_model`, and this screen already
+  // reads it for the spec-drift card, so the fallback costs no request.
+  const model =
+    entry?.model ?? (product.kind === "ready" ? (product.value.output_model ?? null) : null);
 
   return (
     <div className="space-y-4">
@@ -314,7 +324,18 @@ export function PlanDetail({
           </section>
         ))}
 
-      {model !== null && <SamplePanel model={model} />}
+      {model !== null ? (
+        <SamplePanel model={model} />
+      ) : (
+        // Absent is not empty. A missing panel reads as "this plan touches no
+        // data"; say instead that the screen could not work out which model to
+        // sample, which is a different thing and has a different fix.
+        <StatusCard
+          label="sample rows"
+          value="no model to sample"
+          sub="Neither the review queue nor the product names a model for this plan, so there is nothing to read rows from. A plan that is not product-bound and no longer in the queue has no model on this screen."
+        />
+      )}
 
       <HowToApprove status={status.value} entry={entry} />
     </div>
