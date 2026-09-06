@@ -5794,7 +5794,16 @@ pub struct SkippedDemandOutput {
     pub source: Option<String>,
     /// Why it was skipped: `not_due` | `disabled` | `in_flight` |
     /// `tick_in_progress` | `catchup_skipped` | `failure_backoff` |
-    /// `partial_backoff` | `dedup` | `history_unavailable` | `state_busy`.
+    /// `partial_backoff` | `dedup` | `history_unavailable` | `state_busy` |
+    /// `spool_unreadable`.
+    ///
+    /// `spool_unreadable` is pipeline-less and `webhook`-sourced: something is
+    /// at `.rocky/pending-demands` that could not be read (a dangling symlink,
+    /// a permission denial, a file where the directory belongs), so no pending
+    /// webhook demand was consumed this tick. An ABSENT spool directory is the
+    /// ordinary shape for a project that takes no webhooks and never produces
+    /// this — it reads as an empty list, not a fault. The next tick does not
+    /// fix any of the causes that do produce it (#1731).
     pub reason: String,
     /// When the demand becomes eligible again — present for `failure_backoff`
     /// and `partial_backoff`.

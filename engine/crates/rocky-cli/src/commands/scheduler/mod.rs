@@ -233,6 +233,7 @@ pub async fn run_scheduler(
         rocky.scheduler.lock_overridden,
         rocky.scheduler.state_busy,
         rocky.scheduler.drained,
+        rocky.scheduler.spool_unreadable,
     )
 )]
 #[allow(clippy::too_many_arguments)]
@@ -422,6 +423,13 @@ fn record_tick(report: &TickReport, metrics: &SchedulerMetrics) {
     );
     span.record(span_attrs::SCHEDULER_STATE_BUSY, report.state_busy);
     span.record(span_attrs::SCHEDULER_DRAINED, report.drained);
+    // A tick that could not read its spool consumed no webhook demand. Without
+    // this the resident scheduler's trace was identical to a healthy idle tick,
+    // which is what #1710's refusal exists to stop reporting (#1731).
+    span.record(
+        span_attrs::SCHEDULER_SPOOL_UNREADABLE,
+        report.spool_unreadable.is_some(),
+    );
 }
 
 /// Emit a structured summary of a completed tick. (Real OTel instruments are
