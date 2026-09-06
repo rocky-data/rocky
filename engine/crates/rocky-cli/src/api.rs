@@ -1576,6 +1576,24 @@ async fn review_diff(
         return Err(ApiError::plan_not_found(&plan_id));
     }
 
+    // Whether the plan is review-gated at all, asked of the same predicate the
+    // CLI's own guard asks — never read out of its error message, which would
+    // drift the moment the wording changed.
+    let plan = crate::plan_store::read_plan(&root, &plan_id)
+        .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+    if !crate::commands::plan_is_reviewable(&plan) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "plan_not_reviewable",
+            format!(
+                "plan '{plan_id}' is a {} plan; review applies to AI-authored plans, \
+                 agent-authored run plans, backfills, and gc / restore / compact / archive plans",
+                plan.kind
+            ),
+            Some("a human-authored run plan is not review-gated, so there is no sign-off to take"),
+        ));
+    }
+
     // Admission: one diff at a time, with a short wait. A caller that waits out
     // the window is refused with `Retry-After` rather than queueing further.
     let _permit = match tokio::time::timeout(
@@ -1609,21 +1627,9 @@ async fn review_diff(
     // thread, which the permit above bounds to one worker at a time.
     match crate::commands::compute_review(&root, &config, &plan_id, "HEAD", false).await {
         Ok(output) => Ok(PrettyJson(output)),
-        Err(e) => {
-            let message = format!("{e:#}");
-            // The CLI refuses a plan whose kind is never review-gated. That is a
-            // statement about the plan, not a server fault.
-            if message.contains("not reviewable") || message.contains("human-authored") {
-                Err(ApiError::new(
-                    StatusCode::CONFLICT,
-                    "plan_not_reviewable",
-                    message,
-                    Some("only agent-authored and marker-only plan kinds are review-gated"),
-                ))
-            } else {
-                Err(ApiError::internal(message))
-            }
-        }
+        // The reviewability refusal is already handled above, so anything left
+        // here is a genuine failure of this server.
+        Err(e) => Err(ApiError::internal(format!("{e:#}"))),
     }
 }
 
@@ -3338,6 +3344,54 @@ mod tests {
         drop(held);
     }
 
+    /// The diff answers the bytes `compute_review` produces for the same plan,
+    /// and refuses a plan whose kind is never review-gated with the CLI's own
+    /// reason. The fixture is not a git repository, so the base compile finds
+    /// no `HEAD` and the findings come back absent — which both sides report
+    /// identically, and which is the parity under test.
+    #[tokio::test]
+    async fn review_diff_matches_the_core_and_refuses_an_ungated_kind() {
+        use crate::plan_store::{PlanKind, write_plan};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path, [human_authored, ..]) = review_fixture(dir.path());
+        // An AI-authored plan is review-gated by kind; the fixture's own plans
+        // are `Run` with the default human principal, which is not.
+        let gated = write_plan(
+            &root,
+            PlanKind::AiAuthored,
+            &serde_json::json!({ "models": ["orders"] }),
+        )
+        .expect("plan written");
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config.clone()),
+            &state_path,
+        ))
+        .await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/review/{gated}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let expected = crate::commands::compute_review(&root, &config, &gated, "HEAD", false)
+            .await
+            .expect("the core computes the same diff");
+        assert_eq!(text, reference_bytes(&expected));
+        let diff: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(diff["approved"], false, "the route must never approve");
+
+        // A kind the review flow does not gate: the CLI refuses it, so the
+        // route answers 409 rather than pretending there is a diff.
+        let resp = reqwest::get(format!("{base}/api/v1/review/{human_authored}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "plan_not_reviewable");
+    }
+
     /// The review diff refuses the same two shapes the status route does, and
     /// a 404 must not create the plans directory — `read_plan` would.
     #[tokio::test]
@@ -3374,8 +3428,18 @@ mod tests {
     /// with `Retry-After`, never queued indefinitely.
     #[tokio::test]
     async fn a_second_concurrent_review_diff_is_refused_after_its_wait() {
+        use crate::plan_store::{PlanKind, write_plan};
+
         let dir = tempfile::tempdir().unwrap();
-        let (root, config, state_path, [a, ..]) = review_fixture(dir.path());
+        let (root, config, state_path, _) = review_fixture(dir.path());
+        // A plan the route would otherwise answer 200 for, so the 503 below is
+        // the permit refusing and not the reviewability guard.
+        let a = write_plan(
+            &root,
+            PlanKind::AiAuthored,
+            &serde_json::json!({ "models": ["orders"] }),
+        )
+        .expect("plan written");
         let state = pinned_server(root.join("models"), Some(config), &state_path);
         let held = Arc::clone(&state.review_diffs)
             .try_acquire_owned()

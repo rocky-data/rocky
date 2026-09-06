@@ -189,6 +189,31 @@ pub(crate) async fn run_review_in(
 /// sign-off marker at `<root>/.rocky/plans/<plan_id>.reviewed.json` (the same
 /// artifact `rocky apply` checks); the marker records the caller's git identity
 /// and timestamp. Errors (bails) when the plan is not reviewable. No stdout.
+/// Whether `rocky review` — and `GET /api/v1/review/{plan_id}` — has anything
+/// to say about this plan.
+///
+/// Review applies to the kinds an apply gates on `require_review`: AI-authored
+/// plans, agent-authored run plans, backfills, and the marker-only kinds (gc,
+/// restore, compact, archive). A human-authored run plan is never gated, so
+/// reviewing one would write a marker that means nothing.
+///
+/// Public because the HTTP route needs the same answer *before* it calls
+/// [`compute_review`], to refuse with `409` rather than read its own refusal
+/// out of an error message — a rule stated twice drifts, and a rule matched by
+/// text drifts silently.
+pub fn plan_is_reviewable(plan: &crate::plan_store::PersistedPlan) -> bool {
+    matches!(
+        plan.kind,
+        PlanKind::AiAuthored
+            | PlanKind::Backfill
+            | PlanKind::Gc
+            | PlanKind::Restore
+            | PlanKind::Compact
+            | PlanKind::Archive
+    ) || (plan.kind == PlanKind::Run
+        && plan.resolved_principal() == rocky_core::config::PolicyPrincipal::Agent)
+}
+
 pub async fn compute_review(
     root: &Path,
     config_path: &Path,
@@ -207,15 +232,7 @@ pub async fn compute_review(
     // the same way. Human-authored plans are never gated, so reviewing one is a
     // no-op the guard rejects rather than silently writing a marker that means
     // nothing.
-    let reviewable = plan.kind == PlanKind::AiAuthored
-        || plan.kind == PlanKind::Backfill
-        || plan.kind == PlanKind::Gc
-        || plan.kind == PlanKind::Restore
-        || plan.kind == PlanKind::Compact
-        || plan.kind == PlanKind::Archive
-        || (plan.kind == PlanKind::Run
-            && plan.resolved_principal() == rocky_core::config::PolicyPrincipal::Agent);
-    if !reviewable {
+    if !plan_is_reviewable(&plan) {
         bail!(
             "plan '{plan_id}' is a {} plan authored by {}; `rocky review` only applies to \
              AI-authored plans, agent-authored run plans, backfills, gc plans, restore plans, \
