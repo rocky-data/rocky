@@ -40,7 +40,10 @@ use crate::registry::{self, AdapterRegistry};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Execute `rocky preview rows`.
+/// Execute `rocky preview rows`: run [`compute_preview_rows`] and print it.
+///
+/// The printing lives here and nowhere else, so the HTTP route can reuse the
+/// core without a handler ever writing to stdout.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_preview_rows(
     config_path: &Path,
@@ -54,13 +57,60 @@ pub async fn run_preview_rows(
     sql_file: Option<&Path>,
     output_json: bool,
 ) -> Result<()> {
+    match compute_preview_rows(
+        config_path,
+        model,
+        cte,
+        limit,
+        allow_warehouse,
+        pipeline_name,
+        models_dir,
+        sql_file,
+    )
+    .await
+    {
+        Ok(out) => {
+            if output_json {
+                print_json(&out)?;
+            } else {
+                print_table(&out);
+            }
+            Ok(())
+        }
+        Err(failure) => {
+            // Same bytes the printing `err()` helper emitted: the envelope on
+            // stdout in JSON mode (the VS Code extension reads it even on a
+            // non-zero exit), and the human message through the returned error.
+            if output_json {
+                println!("{}", failure.envelope());
+            }
+            Err(anyhow!("{}", failure.message))
+        }
+    }
+}
+
+/// Compute one preview: resolve the model, gate remote execution, mask what
+/// must be masked, and run the query. Prints nothing.
+///
+/// Shared by `rocky preview rows` and `GET /api/v1/models/{name}/rows`, so the
+/// two cannot answer differently: same gate, same masking refusal, same SQL.
+#[allow(clippy::too_many_arguments)]
+pub async fn compute_preview_rows(
+    config_path: &Path,
+    model: &str,
+    cte: Option<&str>,
+    limit: u32,
+    allow_warehouse: bool,
+    pipeline_name: Option<&str>,
+    models_dir: &Path,
+    sql_file: Option<&Path>,
+) -> std::result::Result<PreviewRowsOutput, PreviewFailure> {
     let start = Instant::now();
 
     // `--sql-file` (ad-hoc selection preview) and `--cte` are mutually
     // exclusive: ad-hoc runs the file's SQL, not a model CTE.
     if sql_file.is_some() && cte.is_some() {
-        return Err(err(
-            output_json,
+        return Err(fail(
             "invalid_arguments",
             "--sql-file and --cte cannot be combined",
             None,
@@ -69,27 +119,19 @@ pub async fn run_preview_rows(
 
     // Validate identifiers up-front — never interpolate unvalidated input.
     rocky_sql::validation::validate_identifier(model).map_err(|_| {
-        err(
-            output_json,
+        fail(
             "invalid_model_name",
             &format!("invalid model name '{model}'"),
             None,
         )
     })?;
     if let Some(c) = cte {
-        rocky_sql::validation::validate_identifier(c).map_err(|_| {
-            err(
-                output_json,
-                "invalid_cte_name",
-                &format!("invalid CTE name '{c}'"),
-                None,
-            )
-        })?;
+        rocky_sql::validation::validate_identifier(c)
+            .map_err(|_| fail("invalid_cte_name", &format!("invalid CTE name '{c}'"), None))?;
     }
 
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path).map_err(|e| {
-        err(
-            output_json,
+        fail(
             "config_error",
             &format!("failed to load config from {}: {e}", config_path.display()),
             None,
@@ -97,10 +139,10 @@ pub async fn run_preview_rows(
     })?;
 
     let registry = AdapterRegistry::from_config(&rocky_cfg)
-        .map_err(|e| err(output_json, "config_error", &format!("{e}"), None))?;
+        .map_err(|e| fail("config_error", &format!("{e}"), None))?;
 
     let (_pname, pipeline) = registry::resolve_pipeline(&rocky_cfg, pipeline_name)
-        .map_err(|e| err(output_json, "pipeline_error", &format!("{e}"), None))?;
+        .map_err(|e| fail("pipeline_error", &format!("{e}"), None))?;
 
     let adapter_name = pipeline_target_adapter(pipeline);
     let adapter_type = rocky_cfg
@@ -112,8 +154,7 @@ pub async fn run_preview_rows(
     // Gate (before compile, so it can't fail on missing warehouse creds):
     // remote execution requires an explicit opt-in.
     if !is_local_adapter(&adapter_type) && !allow_warehouse {
-        return Err(err(
-            output_json,
+        return Err(fail(
             "warehouse_gated",
             &format!(
                 "preview would execute against '{adapter_name}' ({adapter_type}); pass --allow-warehouse to run against a remote warehouse"
@@ -131,14 +172,8 @@ pub async fn run_preview_rows(
         project_freshness: rocky_cfg.freshness.clone(),
         run_vars: rocky_core::run_vars::RunVars::new(),
     };
-    let result = compile::compile(&compiler_cfg).map_err(|e| {
-        err(
-            output_json,
-            "compile_error",
-            &format!("compile failed: {e}"),
-            None,
-        )
-    })?;
+    let result = compile::compile(&compiler_cfg)
+        .map_err(|e| fail("compile_error", &format!("compile failed: {e}"), None))?;
 
     let Some(m) = result
         .project
@@ -146,8 +181,7 @@ pub async fn run_preview_rows(
         .iter()
         .find(|m| m.config.name == model)
     else {
-        return Err(err(
-            output_json,
+        return Err(fail(
             "model_not_found",
             &format!("model '{model}' not found in pipeline"),
             None,
@@ -156,8 +190,7 @@ pub async fn run_preview_rows(
 
     // Guards.
     if matches!(m.config.strategy, StrategyConfig::TimeInterval { .. }) {
-        return Err(err(
-            output_json,
+        return Err(fail(
             "unsupported_model_kind",
             &format!(
                 "model '{model}' is a time-interval model; preview rows can't resolve partition placeholders"
@@ -171,8 +204,7 @@ pub async fn run_preview_rows(
             .iter()
             .any(|d| d.model == model && d.severity == Severity::Error);
     if model_has_errors {
-        return Err(err(
-            output_json,
+        return Err(fail(
             "compile_error",
             &format!("model '{model}' has compile errors; fix them before previewing"),
             None,
@@ -182,20 +214,13 @@ pub async fn run_preview_rows(
     // Expand Rocky macros (model.sql may contain unexpanded macro calls).
     let macros_dir = models_dir.join("../macros");
     let macro_defs = if macros_dir.is_dir() {
-        rocky_core::macros::load_macros_from_dir(&macros_dir).map_err(|e| {
-            err(
-                output_json,
-                "compile_error",
-                &format!("macro load failed: {e}"),
-                None,
-            )
-        })?
+        rocky_core::macros::load_macros_from_dir(&macros_dir)
+            .map_err(|e| fail("compile_error", &format!("macro load failed: {e}"), None))?
     } else {
         Vec::new()
     };
     let expanded = rocky_core::macros::expand_macros(&m.sql, &macro_defs).map_err(|e| {
-        err(
-            output_json,
+        fail(
             "compile_error",
             &format!("macro expansion failed: {e}"),
             None,
@@ -203,8 +228,7 @@ pub async fn run_preview_rows(
     })?;
 
     if !rocky_sql::parser::is_single_select(&expanded) {
-        return Err(err(
-            output_json,
+        return Err(fail(
             "unsupported_model_kind",
             &format!("model '{model}' did not compile to a single SELECT statement"),
             None,
@@ -225,8 +249,7 @@ pub async fn run_preview_rows(
     // CTE side-door: a CTE's intermediate columns carry no classification, so
     // previewing one could leak a value the model output would mask. Refuse.
     if cte.is_some() && !masked.is_empty() {
-        return Err(err(
-            output_json,
+        return Err(fail(
             "cte_masking_unverified",
             &format!(
                 "model '{model}' has masked columns; CTE preview is disabled to avoid leaking pre-mask values"
@@ -243,8 +266,7 @@ pub async fn run_preview_rows(
         // fail-safe as CTE preview).
         if !masked.is_empty() {
             let cols: Vec<&String> = masked.keys().collect();
-            return Err(err(
-                output_json,
+            return Err(fail(
                 "adhoc_masking_blocked",
                 &format!(
                     "model '{model}' has masked columns; ad-hoc selection preview is disabled to avoid leaking pre-mask values"
@@ -253,8 +275,7 @@ pub async fn run_preview_rows(
             ));
         }
         let raw = std::fs::read_to_string(path).map_err(|e| {
-            err(
-                output_json,
+            fail(
                 "adhoc_read_error",
                 &format!("failed to read selection from {}: {e}", path.display()),
                 None,
@@ -262,8 +283,7 @@ pub async fn run_preview_rows(
         })?;
         // Expand macros in the selection too (it may reference Rocky macros).
         let ad_expanded = rocky_core::macros::expand_macros(&raw, &macro_defs).map_err(|e| {
-            err(
-                output_json,
+            fail(
                 "compile_error",
                 &format!("macro expansion failed: {e}"),
                 None,
@@ -271,8 +291,7 @@ pub async fn run_preview_rows(
         })?;
         let ad_trimmed = ad_expanded.trim().trim_end_matches(';').trim();
         if !rocky_sql::parser::is_single_select(ad_trimmed) {
-            return Err(err(
-                output_json,
+            return Err(fail(
                 "unsupported_model_kind",
                 "selection is not a single SELECT statement",
                 None,
@@ -281,7 +300,7 @@ pub async fn run_preview_rows(
         wrap_with_limit(ad_trimmed, limit)
     } else if let Some(cte_name) = cte {
         let isolated = rocky_sql::parser::isolate_cte(&expanded, cte_name)
-            .map_err(|e| err(output_json, "cte_error", &format!("{e}"), None))?;
+            .map_err(|e| fail("cte_error", &format!("{e}"), None))?;
         wrap_with_limit(isolated.trim().trim_end_matches(';').trim(), limit)
     } else if masked.is_empty() {
         wrap_with_limit(inner, limit)
@@ -293,8 +312,7 @@ pub async fn run_preview_rows(
             .map(|cols| cols.iter().map(|c| c.name.clone()).collect())
             .unwrap_or_default();
         build_masking_projection(inner, &ordered, &masked, &adapter_type, limit).map_err(|cols| {
-            err(
-                output_json,
+            fail(
                 "unmaskable_column",
                 &format!(
                     "can't safely mask column(s) {cols:?} for adapter '{adapter_type}'; preview refused to avoid leaking unmasked values"
@@ -308,10 +326,9 @@ pub async fn run_preview_rows(
     // credential construction only happens once the run is authorized).
     let adapter = registry
         .warehouse_adapter(&adapter_name)
-        .map_err(|e| err(output_json, "adapter_error", &format!("{e}"), None))?;
+        .map_err(|e| fail("adapter_error", &format!("{e}"), None))?;
     adapter.ping().await.map_err(|e| {
-        err(
-            output_json,
+        fail(
             "connection_error",
             &format!("failed to connect to {adapter_name}: {e}"),
             None,
@@ -329,7 +346,7 @@ pub async fn run_preview_rows(
                 "upstream_not_materialized" => upstream_not_materialized_message(pipeline, &msg),
                 _ => format!("query failed: {msg}"),
             };
-            return Err(err(output_json, kind, &human, None));
+            return Err(fail(kind, &human, None));
         }
     };
 
@@ -349,12 +366,7 @@ pub async fn run_preview_rows(
         duration_ms: start.elapsed().as_millis() as u64,
     };
 
-    if output_json {
-        print_json(&out)?;
-    } else {
-        print_table(&out);
-    }
-    Ok(())
+    Ok(out)
 }
 
 /// DuckDB is the only "local" adapter — it needs no credentials and incurs no
@@ -499,36 +511,55 @@ fn classify_query_error_kind(msg: &str) -> &'static str {
     }
 }
 
-/// Emit a structured error envelope and return a non-zero-exit error.
+/// Why a preview refused, in the shape both callers need.
 ///
-/// In `--output json` mode prints `{"error_kind","message",...extra}` to stdout
-/// (the VS Code extension reads this even on non-zero exit); always returns an
-/// `anyhow::Error` so the process exits non-zero with the human message on
-/// stderr.
-fn err(
-    output_json: bool,
-    kind: &str,
-    message: &str,
-    extra: Option<serde_json::Value>,
-) -> anyhow::Error {
-    if output_json {
+/// The CLI prints it as the `{"error_kind","message",…extra}` envelope the VS
+/// Code extension reads; `GET /api/v1/models/{name}/rows` maps [`Self::kind`]
+/// to a status code. It carries no printing of its own precisely so the two
+/// cannot drift: one construction site, two renderings.
+#[derive(Debug, Clone)]
+pub struct PreviewFailure {
+    /// The stable `error_kind` string. Part of the CLI's output contract —
+    /// renaming one is a breaking change for the extension and for the route's
+    /// status mapping alike.
+    pub kind: String,
+    /// The human message. The CLI puts it on stderr and in the envelope; the
+    /// route puts it in the error envelope's `message`.
+    pub message: String,
+    /// Extra fields merged into the envelope beside `error_kind`/`message`.
+    pub extra: Option<serde_json::Value>,
+}
+
+impl PreviewFailure {
+    /// The envelope the CLI prints in `--output json` mode, byte for byte what
+    /// the printing `err()` helper used to emit.
+    fn envelope(&self) -> serde_json::Value {
         let mut obj = serde_json::Map::new();
         obj.insert(
             "error_kind".to_string(),
-            serde_json::Value::String(kind.to_string()),
+            serde_json::Value::String(self.kind.clone()),
         );
         obj.insert(
             "message".to_string(),
-            serde_json::Value::String(message.to_string()),
+            serde_json::Value::String(self.message.clone()),
         );
-        if let Some(serde_json::Value::Object(extra_map)) = extra {
+        if let Some(serde_json::Value::Object(extra_map)) = self.extra.clone() {
             for (k, v) in extra_map {
                 obj.insert(k, v);
             }
         }
-        println!("{}", serde_json::Value::Object(obj));
+        serde_json::Value::Object(obj)
     }
-    anyhow!("{message}")
+}
+
+/// Build a [`PreviewFailure`]. Prints nothing: the caller decides how to
+/// render it.
+fn fail(kind: &str, message: &str, extra: Option<serde_json::Value>) -> PreviewFailure {
+    PreviewFailure {
+        kind: kind.to_string(),
+        message: message.to_string(),
+        extra,
+    }
 }
 
 /// Minimal column-aligned table for the human (`--output table`) path.
