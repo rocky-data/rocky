@@ -8184,6 +8184,20 @@ pub struct BriefOutput {
     /// recorded history.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since_timestamp: Option<String>,
+    /// The project's `rocky.toml` is present and could not be loaded.
+    ///
+    /// The digest still renders: six of its nine sections take no config at
+    /// all, and one of those — the escalation list — has no other route, since
+    /// `rocky review --queue` refuses on the same error (#1704). Nothing is
+    /// computed from defaults: `cost`, `autonomy` and `scheduler` are
+    /// `unavailable` carrying this same text as their note.
+    ///
+    /// Present here as well as on those notes so a reader does not have to
+    /// sniff note strings to learn the digest is degraded. `rocky brief` exits
+    /// non-zero when it is set. Omitted from the JSON when the config loaded,
+    /// or when the project has none (#1727).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_error: Option<String>,
     /// Agent- and human-authored policy decisions in the window, grouped by
     /// principal and effect.
     pub agent_activity: BriefAgentActivitySection,
