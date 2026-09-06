@@ -13536,9 +13536,16 @@ async fn collect_materialized_table(
 ///
 /// The materialized arm delegates to [`collect_materialized_table`], the one
 /// place a `TableResult` is consumed (#1718). The other three arms — pruned,
-/// failed and panicked — stay here: they are not a `TableResult` and they
-/// differ from the final drain's for reasons of their own (that divergence is
-/// tracked separately).
+/// failed and panicked — stay here: they are not a `TableResult`.
+///
+/// The failed arm now matches the final drain on the two things an operator
+/// sees: the warehouse auth framing on `TableErrorOutput.error`, and the
+/// `materialize_error` hook (#1724). Two differences remain, and they are
+/// structural rather than oversights — an inline drain inside the spawn loop
+/// cannot break that loop, so neither `fail_fast`'s `abort_all` nor the
+/// `error_rate_abort_pct` check can act from here. Closing those means
+/// returning a decision to the caller instead of acting, which is a different
+/// change; it is tracked on #1724.
 #[allow(clippy::too_many_arguments)]
 async fn process_completed_result(
     result: Result<(usize, Result<TableOutcome, anyhow::Error>), tokio::task::JoinError>,
@@ -13592,11 +13599,11 @@ async fn process_completed_result(
             // variant is preserved on `TableError.failure_kind` (plus
             // the optional warehouse-breaker cooldown hint).
             let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(&e);
-            let msg = format!("{e:#}");
-            if msg.contains("TABLE_OR_VIEW_NOT_FOUND") {
+            let raw = format!("{e:#}");
+            if raw.contains("TABLE_OR_VIEW_NOT_FOUND") {
                 warn!(
                     table_index = idx,
-                    error = msg.as_str(),
+                    error = raw.as_str(),
                     "source table not found, skipping"
                 );
                 checkpoint_planned_table(
@@ -13609,28 +13616,59 @@ async fn process_completed_result(
                 return;
             }
 
-            // Signal the adaptive throttle
+            let table_key = tables_to_process
+                .get(idx)
+                .map(|t| {
+                    format!(
+                        "{}.{}.{}",
+                        t.target_catalog, t.target_schema, t.target_table_name
+                    )
+                })
+                .unwrap_or_default();
+
+            // Frame common warehouse auth failures (403/401) into an actionable
+            // message, exactly as the final drain does. Without this, a table
+            // that failed while the spawn loop was still spawning — which under
+            // the default `ConcurrencyMode::Adaptive` is most of them — reported
+            // the raw error chain where the same failure on the other path
+            // reported the framed one (#1724).
+            let msg = crate::output::frame_warehouse_anyhow_error(&e, &table_key)
+                .unwrap_or_else(|| raw.clone());
+
+            // Signal the adaptive throttle. Detected on the RAW chain, not on
+            // `msg`: framing rewrites auth failures, and matching a rate limit
+            // against the rewritten text would silently stop detecting it.
             if let Some(t) = &throttle
-                && is_rate_limit_error(&msg)
+                && is_rate_limit_error(&raw)
             {
                 t.on_rate_limit();
                 adjust_semaphore(t, semaphore, semaphore_capacity);
             }
 
-            warn!(error = msg, "table processing failed");
+            // Raw for debugging, framed for the user — the same pair the final
+            // drain logs.
+            warn!(
+                error = raw.as_str(),
+                framed = msg.as_str(),
+                "table processing failed"
+            );
             rocky_observe::metrics::METRICS.inc_tables_failed();
 
             // Checkpoint: record failed table progress
             {
-                let task = tables_to_process.get(idx);
-                let table_key = task
-                    .map(|t| {
-                        format!(
-                            "{}.{}.{}",
-                            t.target_catalog, t.target_schema, t.target_table_name
-                        )
-                    })
-                    .unwrap_or_default();
+                // §P2.6 per-table emit: materialize_error. The final drain has
+                // always fired this; this path never did, so an alerting
+                // subscriber heard nothing about a table that failed under the
+                // default concurrency mode (#1724).
+                let _ = hooks
+                    .registry
+                    .fire(&HookContext::materialize_error(
+                        hooks.run_id,
+                        hooks.pipeline_name,
+                        &table_key,
+                        &msg,
+                    ))
+                    .await;
                 checkpoint_table_progress(
                     shared_state,
                     shared_run_id,
@@ -33620,6 +33658,124 @@ timestamp_column = "ts"
             v.sort();
             v
         }
+    }
+
+    /// #1724. The inline drain's ERROR arm must match the final drain on the
+    /// two things an operator sees: the warehouse-auth framing, and the
+    /// `materialize_error` hook.
+    ///
+    /// `ConcurrencyMode::Adaptive` is `#[default]`, so this drain handles every
+    /// table that completes while the spawn loop is still spawning — most of
+    /// them once the semaphore saturates. Before this, such a table reported
+    /// the raw error chain where the SAME failure on the final drain reported
+    /// the framed message, and no alerting subscriber heard about it at all.
+    #[tokio::test]
+    async fn the_inline_drain_frames_an_auth_error_and_fires_materialize_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let marker = dir.path().join("materialize_error.fired");
+
+        // A command hook is the only way to OBSERVE a fire from here: it writes
+        // a marker the assertion reads. An empty registry would swallow the
+        // call and prove nothing.
+        let mut hooks_cfg = rocky_core::hooks::HooksConfig::default();
+        hooks_cfg.hooks.insert(
+            "on_materialize_error".to_string(),
+            rocky_core::hooks::HookConfigOrList::Single(rocky_core::hooks::HookConfig {
+                command: format!("touch {}", marker.display()),
+                timeout_ms: 5_000,
+                on_failure: Default::default(),
+                env: Default::default(),
+            }),
+        );
+        let hook_registry = HookRegistry::from_config(&hooks_cfg);
+
+        let task = column_match_task(vec![], vec![]);
+        let tasks = vec![task.clone()];
+        state
+            .init_run_progress("run-1", tasks.len(), Some(&test_resume_scope("p1")))
+            .unwrap();
+
+        let table_key = format!(
+            "{}.{}.{}",
+            task.target_catalog, task.target_schema, task.target_table_name
+        );
+        // The framer keys on a TYPED `ConnectorError::ApiError` in the chain,
+        // not on error text — so build the shape the real run path produces:
+        // the connector error wrapped through the SDK's `AdapterError`.
+        let auth_err = || -> anyhow::Error {
+            rocky_adapter_sdk::AdapterError::new(
+                rocky_databricks::connector::ConnectorError::ApiError {
+                    status: 403,
+                    body: String::new(),
+                },
+            )
+            .into()
+        };
+        let err = auth_err();
+        let raw = format!("{err:#}");
+        let expected_framed = crate::output::frame_warehouse_anyhow_error(&auth_err(), &table_key)
+            .expect("a 403 is a shape the framer recognises");
+
+        let throttle = Some(AdaptiveThrottle::new(8, 1, 1));
+        let semaphore = Semaphore::new(8);
+        let mut semaphore_capacity = 8;
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        let mut pending_checks = HashMap::new();
+        let (mut source_refs, mut target_refs, mut freshness_refs) =
+            (Vec::new(), Vec::new(), Vec::new());
+        let mut batch_asset_keys = Vec::new();
+        let mut assertion_targets = Vec::new();
+        let mut table_errors = Vec::new();
+        let (mut deferred_tags, mut deferred_watermarks) = (Vec::new(), Vec::new());
+        let mut total_completed = 0;
+
+        process_completed_result(
+            Ok((0, Err(err))),
+            &tasks,
+            &throttle,
+            &semaphore,
+            &mut semaphore_capacity,
+            &mut MaterializedSinks {
+                output: &mut output,
+                pending_checks: &mut pending_checks,
+                source_batch_refs: &mut source_refs,
+                target_batch_refs: &mut target_refs,
+                freshness_batch_refs: &mut freshness_refs,
+                batch_asset_keys: &mut batch_asset_keys,
+                assertion_targets: &mut assertion_targets,
+                deferred_tags: &mut deferred_tags,
+                deferred_watermarks: &mut deferred_watermarks,
+            },
+            &TableHookContext {
+                registry: &hook_registry,
+                run_id: "run-1",
+                pipeline_name: "p1",
+            },
+            &mut table_errors,
+            &state,
+            "run-1",
+            &mut total_completed,
+        )
+        .await;
+
+        assert_eq!(table_errors.len(), 1, "the failure is recorded");
+        let reported = &table_errors[0].error;
+        assert_ne!(
+            reported, &raw,
+            "the inline drain must not report the raw chain where the final drain frames it"
+        );
+        assert_eq!(
+            reported, &expected_framed,
+            "and it must be the SAME framing, not a second dialect of it"
+        );
+
+        assert!(
+            marker.exists(),
+            "materialize_error must fire from this drain too — an alerting \
+             subscriber heard nothing about a table that failed under the \
+             default concurrency mode"
+        );
     }
 
     /// #1718, defect 1. `process_completed_result` is the drain the spawn loop
