@@ -1,0 +1,93 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "SnapshotStepOutput": {
+      "description": "A single SQL step within a snapshot run.",
+      "properties": {
+        "duration_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sql": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "step": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "duration_ms",
+        "sql",
+        "status",
+        "step"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "Output for `rocky snapshot --output json`.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "duration_ms": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "pipeline": {
+      "type": "string"
+    },
+    "source": {
+      "type": "string"
+    },
+    "steps": {
+      "items": {
+        "$ref": "#/definitions/SnapshotStepOutput"
+      },
+      "type": "array"
+    },
+    "steps_ok": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "steps_total": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "target": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "dry_run",
+    "duration_ms",
+    "pipeline",
+    "source",
+    "steps",
+    "steps_ok",
+    "steps_total",
+    "target",
+    "version"
+  ],
+  "title": "SnapshotOutput",
+  "type": "object"
+}
