@@ -1850,6 +1850,7 @@ cron = "also invalid"
             pipeline: Some(pipeline.to_string()),
             submission_id: submission_id.map(String::from),
             check_gate_failed: false,
+            verify_after_failed: false,
         }
     }
 

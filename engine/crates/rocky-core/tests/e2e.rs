@@ -516,6 +516,7 @@ fn test_run_history_flow() {
         pipeline: None,
         submission_id: None,
         check_gate_failed: false,
+        verify_after_failed: false,
     };
 
     store.record_run(&run).unwrap();
