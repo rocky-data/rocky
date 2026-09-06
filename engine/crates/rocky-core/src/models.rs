@@ -22,6 +22,16 @@ pub enum ModelError {
     #[error("failed to read model file: {0}")]
     ReadFile(#[from] std::io::Error),
 
+    /// A named read failure. `ReadFile` above carries only the OS error, which
+    /// on a dangling sidecar reads "No such file or directory" — the very
+    /// words the caller used to conclude the file was absent, and wrong: the
+    /// file IS there, its target is not (#1738).
+    #[error("failed to read '{path}': {source}")]
+    ReadPath {
+        path: String,
+        source: std::io::Error,
+    },
+
     #[error("model file '{path}' has no TOML frontmatter (expected ---toml ... --- block)")]
     MissingFrontmatter { path: String },
 
@@ -1398,7 +1408,10 @@ pub fn load_model_pair_with_context(
     ctx: &ModelLoadContext,
 ) -> Result<Model, ModelError> {
     let sql = {
-        let s = std::fs::read_to_string(sql_path)?;
+        let s = std::fs::read_to_string(sql_path).map_err(|source| ModelError::ReadPath {
+            path: sql_path.display().to_string(),
+            source,
+        })?;
         let trimmed = s.trim();
         if trimmed.len() == s.len() {
             s // no trimming needed, reuse allocation
@@ -1406,7 +1419,10 @@ pub fn load_model_pair_with_context(
             trimmed.to_string()
         }
     };
-    let raw_toml = std::fs::read_to_string(toml_path)?;
+    let raw_toml = std::fs::read_to_string(toml_path).map_err(|source| ModelError::ReadPath {
+        path: toml_path.display().to_string(),
+        source,
+    })?;
     let declared = extract_declared_fields(&raw_toml);
     let toml_content =
         substitute_env_vars(&raw_toml).map_err(|source| ModelError::EnvSubstitution {
@@ -1572,7 +1588,7 @@ pub fn load_models_from_dir_filtered(
         .par_iter()
         .map(|path| {
             let toml_path = path.with_extension("toml");
-            if toml_path.exists() {
+            if crate::path_presence::entry_is_present(&toml_path) {
                 load_model_pair_with_context(path, &toml_path, defaults.as_ref(), &ctx)
             } else {
                 let content = std::fs::read_to_string(path)?;
@@ -1627,7 +1643,7 @@ pub fn load_unit_tests_from_dir(
 
         // Sidecar `.toml` is preferred; fall back to inline `---toml` frontmatter.
         let toml_path = path.with_extension("toml");
-        let toml_src = if toml_path.exists() {
+        let toml_src = if crate::path_presence::entry_is_present(&toml_path) {
             std::fs::read_to_string(&toml_path)?
         } else {
             let content = std::fs::read_to_string(&path)?;
@@ -1703,7 +1719,7 @@ pub fn load_column_docs_from_dir(
             .unwrap_or_default();
 
         let toml_path = path.with_extension("toml");
-        let toml_src = if toml_path.exists() {
+        let toml_src = if crate::path_presence::entry_is_present(&toml_path) {
             std::fs::read_to_string(&toml_path)?
         } else if ext == Some("rocky") {
             // DSL files have no `-- name:` frontmatter convention; without a
@@ -1801,7 +1817,7 @@ pub fn load_surrogate_keys_from_dir_filtered(
             .unwrap_or_default();
 
         let toml_path = path.with_extension("toml");
-        let toml_src = if toml_path.exists() {
+        let toml_src = if crate::path_presence::entry_is_present(&toml_path) {
             std::fs::read_to_string(&toml_path)?
         } else {
             let content = std::fs::read_to_string(&path)?;
@@ -1956,6 +1972,56 @@ fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1738. A model sidecar that is a dangling symlink must REFUSE, not
+    /// compile the model against `_defaults.toml`.
+    ///
+    /// `Path::exists()` is `metadata(..).is_ok()` and `metadata` follows a
+    /// symlink, so a `models/orders.toml` pointing at a deleted file answered
+    /// `false` and the loader took its "no sidecar" branch. The sidecar
+    /// carries the target catalog/schema/table, the strategy, `depends_on` and
+    /// the contract wiring — so the model compiled with a different
+    /// materialization strategy, possibly writing to a different table, and
+    /// nothing said so. A bigger blast radius than #1729's `serve` case,
+    /// because it changes what SQL is generated and where it lands.
+    #[test]
+    fn a_dangling_model_sidecar_refuses_instead_of_compiling_against_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("orders.sql"), "SELECT 1 AS id\n").unwrap();
+
+        // The control: with a REAL sidecar the pair loads and the sidecar wins.
+        std::fs::write(
+            models.join("orders.toml"),
+            "name = \"orders\"\ntarget = { catalog = \"c\", schema = \"s\", table = \"declared\" }\n",
+        )
+        .unwrap();
+        let loaded = load_models_from_dir(&models, None).expect("a real sidecar loads");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].config.target.table.as_str(),
+            "declared",
+            "precondition: the sidecar is what carries the target table"
+        );
+
+        // Now break it: same path, nothing behind it.
+        std::fs::remove_file(models.join("orders.toml")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("gone.toml"), models.join("orders.toml"))
+            .unwrap();
+        assert!(
+            !models.join("orders.toml").exists(),
+            "precondition: Path::exists() answers false for a dangling link"
+        );
+
+        let err = load_models_from_dir(&models, None)
+            .expect_err("a sidecar that IS there and cannot be read must refuse");
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("orders"),
+            "the refusal must name the model: {rendered}"
+        );
+    }
 
     #[test]
     fn test_parse_model_full_refresh() {

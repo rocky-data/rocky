@@ -18,7 +18,7 @@ pub fn init(path: &str, template: Option<&str>) -> Result<()> {
     }
 
     let config_path = dir.join("rocky.toml");
-    if config_path.exists() {
+    if rocky_core::path_presence::entry_is_present(&config_path) {
         anyhow::bail!("rocky.toml already exists in {}", dir.display());
     }
 

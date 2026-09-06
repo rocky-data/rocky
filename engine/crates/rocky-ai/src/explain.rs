@@ -90,7 +90,7 @@ pub fn save_intent_to_config(model: &Model, intent: &str) -> Result<(), std::io:
     // Read existing config or start fresh. Refuse to clobber a sidecar
     // that exists but doesn't parse — overwriting it would delete the
     // user's in-flight edits.
-    let mut config: toml::Value = if path.exists() {
+    let mut config: toml::Value = if rocky_core::path_presence::entry_is_present(path) {
         let content = std::fs::read_to_string(path)?;
         match toml::from_str(&content) {
             Ok(value) => value,

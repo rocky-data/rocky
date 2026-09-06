@@ -38,7 +38,7 @@ pub mod object_store;
 pub mod optimize;
 /// Crate-private: the `NotFound` discriminator shared by the config read and
 /// the scheduler spool scan (#1707).
-pub(crate) mod path_presence;
+pub mod path_presence;
 pub mod physical_edges;
 pub mod plan_partition;
 pub mod policy;
