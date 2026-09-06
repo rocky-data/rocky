@@ -22529,6 +22529,155 @@
         ]
       }
     },
+    "/api/v1/models/{name}/rows": {
+      "get": {
+        "description": "Runs the model's compiled SELECT against the pipeline's adapter and returns at most `limit` rows, with classification-tagged columns masked inline. The same bytes as `rocky preview rows <model> --output json`. A remote adapter requires the `X-Rocky-Allow-Warehouse: true` header on every request; a local DuckDB adapter needs none. One sample runs at a time and is bounded by a 30 second timeout. The response carries `Cache-Control: no-store`. Ad-hoc SQL is not exposed.",
+        "operationId": "getModelRows",
+        "parameters": [
+          {
+            "description": "Path parameter `name`.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Rows to return, 1 to 500. Defaults to 20.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sample one named CTE of the model instead of its output. Refused when the model has any masked column.",
+            "in": "query",
+            "name": "cte",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Which pipeline's adapter to run against. Required only when the project declares more than one.",
+            "in": "query",
+            "name": "pipeline",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Advisory principal recorded for audit only. Spoofable under shared-secret auth; never an authorization input.",
+            "in": "header",
+            "name": "X-Rocky-Allow-Warehouse",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreviewRowsOutput"
+                }
+              }
+            },
+            "description": "The sampled rows, masked, with the SQL that ran."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "`limit` is outside 1 to 500, or a name is not a valid identifier."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The adapter is remote and the request carried no `X-Rocky-Allow-Warehouse: true` header."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The named model is not in the compiled graph."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "An upstream is not materialized, or the target catalog does not exist."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The model does not compile to a single SELECT, has compile errors, or has a masked column this adapter cannot express — refused rather than served unmasked."
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The adapter would not connect, or the query failed."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The sample did not finish within 30 seconds. The warehouse may still be running the query."
+          }
+        },
+        "summary": "A bounded, masked sample of a model's rows",
+        "tags": [
+          "estate"
+        ]
+      }
+    },
     "/api/v1/products": {
       "get": {
         "description": "Every product the project knows, sorted by name: the `products/*.toml` specs plus every name the state store holds a fulfillment or approval record for, so a product whose spec file was deleted still lists with `spec_present = false`. The same bytes as `rocky product list --output json` run from the project root against the same state store. Reads `products/` under the directory of the bound `rocky.toml` and the store `--state-path` names (or the default under the models directory). The store is opened read-only: a store at the current schema version is never written, an older one is migrated forward as every read does, a newer one is refused.",
@@ -22776,6 +22925,79 @@
           }
         },
         "summary": "Pending review queue",
+        "tags": [
+          "review"
+        ]
+      }
+    },
+    "/api/v1/review/{plan_id}": {
+      "get": {
+        "description": "The plan's kind and the breaking-change findings against `HEAD`, with `approved` always false — this route never writes the sign-off marker. The same bytes as `rocky review <plan-id> --output json`. The base is `HEAD` and is not a parameter: a ref from a query string would be a subprocess argument. Two compiles per call, one at a time.",
+        "operationId": "getReviewDiff",
+        "parameters": [
+          {
+            "description": "Path parameter `plan_id`.",
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewOutput"
+                }
+              }
+            },
+            "description": "The plan's kind and its breaking-change findings."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The id is not 64 lower-case hex characters, or no plan file exists under it."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The plan's kind is never review-gated, so there is no diff to take."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The decision ledger could not be read, or the plan file could not be parsed."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "One plan's review diff",
         "tags": [
           "review"
         ]
