@@ -8,6 +8,7 @@ function slots() {
     scorecard: <span>scorecard slot</span>,
     custody: (subject: string | null) => <span>custody slot: {subject ?? "none"}</span>,
     audit: <span>audit slot</span>,
+    products: (name: string | null) => <span>products slot: {name ?? "none"}</span>,
   };
 }
 
@@ -27,6 +28,16 @@ describe("GovernorScreen", () => {
 
     screen.getByRole("link", { name: "Custody" }).click();
     await waitFor(() => expect(screen.getByText("custody slot: none")).toBeInTheDocument());
+
+    screen.getByRole("link", { name: "Products" }).click();
+    await waitFor(() => expect(screen.getByText("products slot: none")).toBeInTheDocument());
+    expect(window.location.pathname).toBe("/ui/governor/products");
+  });
+
+  it("deep-links one product's timeline", () => {
+    window.history.pushState(null, "", "/ui/governor/products/revenue%20daily");
+    render(<GovernorScreen {...slots()} />);
+    expect(screen.getByText("products slot: revenue daily")).toBeInTheDocument();
   });
 
   it("deep-links a custody subject, percent-decoded", () => {

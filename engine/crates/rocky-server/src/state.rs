@@ -89,6 +89,24 @@ pub struct ServerState {
     /// turns instead of racing; the busy error is left to mean what it says,
     /// another process holding the store.
     pub store_access: Arc<tokio::sync::Semaphore>,
+    /// Admission for `GET /api/v1/review/{plan_id}`: one review diff at a time.
+    ///
+    /// A diff is two compiles and a git read — local, bounded work, hundreds of
+    /// milliseconds on a large project. A caller that finds it busy waits
+    /// briefly rather than being refused, because a refusal for work that short
+    /// is noise.
+    pub review_diffs: Arc<tokio::sync::Semaphore>,
+    /// Admission for `GET /api/v1/models/{name}/rows`: one warehouse sample at
+    /// a time.
+    ///
+    /// Deliberately **separate** from [`Self::review_diffs`]. A sample is a
+    /// warehouse round trip bounded only by a 30 second timeout; a diff is
+    /// local and ends in milliseconds. Sharing one permit would let the slow
+    /// class block the fast one — the shape that starved the scheduler behind
+    /// the store queue. A caller that finds this one busy is refused at once
+    /// with `Retry-After`, because queueing behind a possible 30 seconds is
+    /// worse for it than a fast refusal.
+    pub warehouse_samples: Arc<tokio::sync::Semaphore>,
 }
 
 impl ServerState {
@@ -173,6 +191,8 @@ impl ServerState {
             allowed_origins,
             schema_cache_throttle: SchemaCacheThrottle::new(),
             store_access: Arc::new(tokio::sync::Semaphore::new(1)),
+            review_diffs: Arc::new(tokio::sync::Semaphore::new(1)),
+            warehouse_samples: Arc::new(tokio::sync::Semaphore::new(1)),
         });
 
         // Initial compile

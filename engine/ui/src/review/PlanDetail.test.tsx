@@ -1,0 +1,240 @@
+import { render, screen, waitFor } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import type { ProductStatusOutput } from "@rocky-types/product_status";
+import type { ReviewOutput } from "@rocky-types/review";
+import type { ReviewQueueOutput } from "@rocky-types/review_queue";
+import type { ReviewStatusOutput } from "@rocky-types/review_status";
+import statusFixture from "@rocky-fixtures/review_status.json";
+import { ApiError } from "../api";
+import { PlanDetail, type PlanLoaders, describeFinding, productNameFromId } from "./PlanDetail";
+
+// The status panel reads a payload captured from the live engine, so a shape
+// change there fails this test rather than passing against a hand-written
+// stand-in. The other three producers have no capture yet — the fixture roster
+// covers `review_status` only — so their payloads are written here, typed.
+const STATUS = statusFixture as ReviewStatusOutput;
+const PLAN = STATUS.plan_id;
+
+const DIFF: ReviewOutput = {
+  version: "1.74.0",
+  command: "review",
+  plan_id: PLAN,
+  base_ref: "HEAD",
+  approved: false,
+  marker_written: false,
+  breaking_changes: [
+    {
+      change: {
+        kind: "column_type_changed",
+        model: "orders",
+        column: "total",
+        old_type: "INT64",
+        new_type: "INT32",
+        narrowing: true,
+      },
+      severity: "breaking",
+    },
+  ],
+};
+
+const QUEUE: ReviewQueueOutput = {
+  version: "1.74.0",
+  command: "review",
+  ranking: "blast_radius × classification × staleness",
+  total: 1,
+  excluded_non_plan_rows: 0,
+  pending: [
+    {
+      plan_id: PLAN,
+      decision_ref: "2026-09-06T09:00:00Z|aaa|orders",
+      timestamp: "2026-09-06T09:00:00Z",
+      principal: "agent",
+      capability: "schema_change.breaking",
+      model: "orders",
+      rule_id: 2,
+      reason: "a breaking schema change needs a human",
+      blast_radius: 7,
+      classification_weight: 3,
+      staleness_seconds: 10_800,
+      score: 42.5,
+      approve_command: `rocky review ${PLAN} --approve`,
+    },
+  ],
+};
+
+const PRODUCT: ProductStatusOutput = {
+  version: "1.74.0",
+  command: "product",
+  name: "revenue_daily",
+  spec_present: true,
+  spec_digest: "sha256:1111",
+} as unknown as ProductStatusOutput;
+
+function loaders(overrides: Partial<PlanLoaders> = {}): PlanLoaders {
+  return {
+    status: vi.fn(async () => STATUS),
+    diff: vi.fn(async () => DIFF),
+    queue: vi.fn(async () => QUEUE),
+    product: vi.fn(async () => PRODUCT),
+    ...overrides,
+  };
+}
+
+describe("PlanDetail", () => {
+  it("shows the plan, its findings, the escalation and the approve command", async () => {
+    render(<PlanDetail planId={PLAN} loaders={loaders()} />);
+
+    await screen.findByText(STATUS.kind);
+    expect(screen.getByText("awaiting a human")).toBeTruthy();
+    await waitFor(() =>
+      expect(screen.getByText(/orders.total changes type, INT64 to INT32/)).toBeTruthy(),
+    );
+    expect(screen.getByText(/\(narrowing\)/)).toBeTruthy();
+    expect(screen.getByText("a breaking schema change needs a human")).toBeTruthy();
+    expect(screen.getByText("#2")).toBeTruthy();
+    // Approving is a command to copy, never a control on the page.
+    expect(screen.getByText(`rocky review ${PLAN} --approve`)).toBeTruthy();
+  });
+
+  it("tells a skipped gate apart from a clean one", async () => {
+    const skipped = render(
+      <PlanDetail
+        planId={PLAN}
+        loaders={loaders({
+          diff: vi.fn(async () => ({
+            ...DIFF,
+            breaking_changes: undefined,
+            message: "the base compile failed",
+          })),
+        })}
+      />,
+    );
+    await screen.findByText("the gate was skipped");
+    expect(screen.getByText("the base compile failed")).toBeTruthy();
+    expect(screen.queryByText("nothing")).toBeNull();
+    skipped.unmount();
+
+    render(
+      <PlanDetail
+        planId={PLAN}
+        loaders={loaders({ diff: vi.fn(async () => ({ ...DIFF, breaking_changes: [] })) })}
+      />,
+    );
+    await screen.findByText("nothing");
+    expect(screen.queryByText("the gate was skipped")).toBeNull();
+  });
+
+  it("says the spec moved when the plan's digest no longer matches the product's", async () => {
+    const moved = render(
+      <PlanDetail
+        planId={PLAN}
+        loaders={loaders({
+          status: vi.fn(async () => ({
+            ...STATUS,
+            product_id: "product:revenue_daily",
+            spec_digest: "sha256:0000",
+          })),
+        })}
+      />,
+    );
+    await screen.findByText("the spec moved");
+    expect(screen.getByText(/Applying this plan would be refused/)).toBeTruthy();
+    moved.unmount();
+
+    render(
+      <PlanDetail
+        planId={PLAN}
+        loaders={loaders({
+          status: vi.fn(async () => ({
+            ...STATUS,
+            product_id: "product:revenue_daily",
+            spec_digest: "sha256:1111",
+          })),
+        })}
+      />,
+    );
+    await screen.findByText("unchanged");
+    expect(screen.queryByText("the spec moved")).toBeNull();
+  });
+
+  it("reads no product at all when the plan is not product-bound", async () => {
+    const product = vi.fn(async () => PRODUCT);
+    render(<PlanDetail planId={PLAN} loaders={loaders({ product })} />);
+    await screen.findByText(STATUS.kind);
+    expect(screen.getByText("not product-bound")).toBeTruthy();
+    expect(product).not.toHaveBeenCalled();
+  });
+
+  it("renders a refused plan read as the engine's own code", async () => {
+    render(
+      <PlanDetail
+        planId={PLAN}
+        loaders={loaders({
+          status: vi.fn(async () => {
+            throw new ApiError(404, {
+              code: "plan_not_found",
+              message: "no plan file",
+              remediation_hint: "check the id",
+            });
+          }),
+        })}
+      />,
+    );
+    await waitFor(() => expect(screen.getByText("plan_not_found")).toBeTruthy());
+    expect(screen.getByText("refused (404)")).toBeTruthy();
+  });
+
+  it("offers no control that could change anything", async () => {
+    const { container } = render(<PlanDetail planId={PLAN} loaders={loaders()} />);
+    await screen.findByText(STATUS.kind);
+    // The sample panel's button is the only one, and it only reads.
+    const buttons = Array.from(container.querySelectorAll("button")).map(
+      (b) => b.textContent ?? "",
+    );
+    expect(buttons).toEqual(["Show 20 rows"]);
+    expect(container.querySelector("form")).toBeNull();
+  });
+
+  it("names a product from its identity, and describes every finding kind", () => {
+    expect(productNameFromId("product:revenue_daily")).toBe("revenue_daily");
+    expect(productNameFromId("revenue_daily")).toBe("revenue_daily");
+    const cases: [Record<string, unknown>, string][] = [
+      [{ kind: "model_removed", model: "orders" }, "orders is removed"],
+      [{ kind: "model_added", model: "orders" }, "orders is added"],
+      [
+        { kind: "column_dropped", model: "orders", column: "total", data_type: "INT64" },
+        "orders.total is dropped (was INT64)",
+      ],
+      [
+        {
+          kind: "column_added",
+          model: "orders",
+          column: "total",
+          data_type: "INT64",
+          nullable: false,
+        },
+        "orders.total is added (INT64, not null)",
+      ],
+      [
+        {
+          kind: "column_nullability_changed",
+          model: "orders",
+          column: "total",
+          old_nullable: false,
+          new_nullable: true,
+        },
+        "orders.total becomes nullable",
+      ],
+    ];
+    for (const [change, expected] of cases) {
+      expect(describeFinding({ change, severity: "breaking" } as never)).toBe(expected);
+    }
+    // A kind this build does not know is still rendered, never dropped.
+    expect(
+      describeFinding({
+        change: { kind: "some_future_kind", model: "orders" },
+        severity: "warning",
+      } as never),
+    ).toBe("orders: some future kind");
+  });
+});
