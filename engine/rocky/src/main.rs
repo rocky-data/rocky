@@ -673,8 +673,9 @@ enum Command {
         #[arg(long)]
         pipeline: Option<String>,
         /// Evaluate demand as of this RFC3339 instant instead of the wall clock.
-        /// Exists for determinism (tests, replay, catch-up previews); the
-        /// reconciler core reads no clock of its own.
+        /// Exists for determinism (tests, replay, catch-up previews). It moves
+        /// scheduling decisions only; it never ages files on disk, so it cannot
+        /// expire the webhook dedup window.
         #[arg(long, hide_short_help = true)]
         now: Option<String>,
     },

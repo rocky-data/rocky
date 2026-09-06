@@ -301,9 +301,13 @@ pub fn accept_journaled(
     let key_path = dir.join(&key_name);
 
     // Best-effort fast-path dedup for a consumed delivery id: the reconciler is
-    // the authority (it also checks the tombstone before running), so a race
-    // here can only cost a redundant durable write that the reconciler then
-    // drops without running — never a second run. No `fsync_dir` is owed here:
+    // the authority (it checks the tombstone before ANY other consume gate,
+    // pause included — see `consume_webhook_demands`), so a race here can only
+    // cost a redundant durable write that the reconciler then drops without
+    // running — never a second run. That claim held only by accident before
+    // #1716: the pause gate ran first, so a duplicate deferred across a pause
+    // longer than `TOMBSTONE_TTL` outlived its own tombstone and ran on resume.
+    // No `fsync_dir` is owed here:
     // this dedups against a tombstone that `dispose` already made durable (its
     // inode `sync_all` + a dir `fsync`), so its existence is not new state we
     // must persist before acking.
@@ -540,9 +544,23 @@ pub fn count_corrupt(rocky_dir: &Path) -> io::Result<usize> {
     Ok(n)
 }
 
+/// What one [`sweep_tombstones`] pass did, so the caller can log it instead of
+/// discarding it (#1716).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TombstoneSweep {
+    /// Tombstones unlinked because their age reached [`TOMBSTONE_TTL`].
+    pub swept: usize,
+    /// Tombstones left in place: still inside the window, their age unreadable,
+    /// or their mtime in the future (see [`sweep_tombstones`]).
+    pub kept: usize,
+    /// Expired tombstones whose `unlink` failed — a racing sweep, a permission
+    /// fault, a read-only mount. Left in place; the next tick retries.
+    pub failed: usize,
+}
+
 /// Sweep `.done` tombstones older than [`TOMBSTONE_TTL`], so the id-dedup window
-/// is bounded and the spool directory does not grow without limit. Returns the
-/// number swept. A tombstone whose age cannot be read is left in place.
+/// is bounded and the spool directory does not grow without limit. Returns what
+/// the pass did, for the caller to log.
 ///
 /// `rocky_dir` is the `.rocky` directory, not the spool directory (see
 /// [`SpoolDir`]) — this function resolves the spool itself. Handing it an
@@ -550,17 +568,32 @@ pub fn count_corrupt(rocky_dir: &Path) -> io::Result<usize> {
 /// exists, which is why no real tick ever removed a tombstone (#1711). The
 /// [`SpoolDir`] type now refuses that at compile time.
 ///
-/// Ages are read from each tombstone's mtime, which [`dispose`] stamps at
-/// consumption. `now` is the caller's instant: a test that ages a tombstone must
-/// age it relative to the `now` it will pass here, not to wall-clock.
-pub fn sweep_tombstones(rocky_dir: &Path, now: DateTime<Utc>) -> io::Result<usize> {
+/// # The clock is the filesystem's, on purpose
+///
+/// Ages are read from each tombstone's mtime, which [`dispose`] stamps from the
+/// host wall clock at consumption. The sweep therefore compares against that
+/// same wall clock and takes **no** `now` argument. It used to take the tick's
+/// injected instant, so `rocky tick --now 2030-01-01T00:00:00Z` unlinked every
+/// tombstone on disk in one pass and erased the whole dedup window (#1716).
+/// Dropping the parameter makes handing it a logical clock a compile error.
+///
+/// A tombstone whose mtime is in the future — a clock that moved backwards, or a
+/// stamp written by another host — has no positive age, so it cannot be expired
+/// and is kept. That is the fail-safe direction: the dedup window stays closed.
+pub fn sweep_tombstones(rocky_dir: &Path) -> io::Result<TombstoneSweep> {
     let dir = spool_dir(rocky_dir);
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(TombstoneSweep::default()),
         Err(e) => return Err(e),
     };
-    let mut swept = 0;
+    // `TOMBSTONE_TTL` is a 24-hour constant, so this conversion cannot fail;
+    // falling back to an empty pass keeps the impossible branch panic-free.
+    let Ok(ttl) = TOMBSTONE_TTL.to_std() else {
+        return Ok(TombstoneSweep::default());
+    };
+    let wall_now = std::time::SystemTime::now();
+    let mut sweep = TombstoneSweep::default();
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name();
@@ -568,17 +601,29 @@ pub fn sweep_tombstones(rocky_dir: &Path, now: DateTime<Utc>) -> io::Result<usiz
             continue;
         }
         let Ok(meta) = entry.metadata() else {
+            sweep.kept += 1;
             continue;
         };
         let Ok(modified) = meta.modified() else {
+            sweep.kept += 1;
             continue;
         };
-        let modified: DateTime<Utc> = modified.into();
-        if now - modified >= TOMBSTONE_TTL && std::fs::remove_file(entry.path()).is_ok() {
-            swept += 1;
+        // `duration_since` is `Err` exactly when the mtime is in the future.
+        // Comparing through `DateTime<Utc>` instead would also risk a panic in
+        // chrono's `From<SystemTime>` on an absurd stamp.
+        let Ok(age) = wall_now.duration_since(modified) else {
+            sweep.kept += 1;
+            continue;
+        };
+        if age < ttl {
+            sweep.kept += 1;
+        } else if std::fs::remove_file(entry.path()).is_ok() {
+            sweep.swept += 1;
+        } else {
+            sweep.failed += 1;
         }
     }
-    Ok(swept)
+    Ok(sweep)
 }
 
 fn remove_ignoring_missing(path: &Path) -> io::Result<()> {
@@ -799,7 +844,14 @@ mod tests {
         let tomb = tombstone_path(&pending[0]);
         dispose(&pending[0], WebhookKind::Id).unwrap();
         // A tombstone freshly created is NOT swept (its mtime is ~now).
-        assert_eq!(sweep_tombstones(dir.path(), Utc::now()).unwrap(), 0);
+        assert_eq!(
+            sweep_tombstones(dir.path()).unwrap(),
+            TombstoneSweep {
+                swept: 0,
+                kept: 1,
+                failed: 0
+            }
+        );
         // Age the tombstone past the TTL, then sweep removes exactly it.
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(25 * 3600);
         std::fs::File::options()
@@ -808,7 +860,42 @@ mod tests {
             .unwrap()
             .set_modified(old)
             .unwrap();
-        assert_eq!(sweep_tombstones(dir.path(), Utc::now()).unwrap(), 1);
+        assert_eq!(
+            sweep_tombstones(dir.path()).unwrap(),
+            TombstoneSweep {
+                swept: 1,
+                kept: 0,
+                failed: 0
+            }
+        );
+    }
+
+    /// A tombstone stamped in the FUTURE — a clock that moved backwards between
+    /// `dispose` and the sweep, or a stamp written by another host — has no
+    /// positive age, so it is kept. Fail-safe: the dedup window stays closed.
+    #[test]
+    fn sweep_keeps_a_tombstone_whose_mtime_is_in_the_future() {
+        let dir = tempfile::tempdir().unwrap();
+        accept(dir.path(), "p", WebhookKind::Id, "evt", "h", Utc::now()).unwrap();
+        let pending = list_pending_files(dir.path()).unwrap();
+        let tomb = tombstone_path(&pending[0]);
+        dispose(&pending[0], WebhookKind::Id).unwrap();
+        let ahead = std::time::SystemTime::now() + std::time::Duration::from_secs(48 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&tomb)
+            .unwrap()
+            .set_modified(ahead)
+            .unwrap();
+        assert_eq!(
+            sweep_tombstones(dir.path()).unwrap(),
+            TombstoneSweep {
+                swept: 0,
+                kept: 1,
+                failed: 0
+            }
+        );
+        assert!(tomb.exists(), "a future-stamped tombstone is never swept");
     }
 
     #[test]
@@ -929,7 +1016,7 @@ mod tests {
         dispose(&pending[0], WebhookKind::Id).unwrap();
         // The tombstone's clock runs from consumption, so a same-instant sweep
         // leaves it — and a redelivery still deduplicates.
-        assert_eq!(sweep_tombstones(dir.path(), Utc::now()).unwrap(), 0);
+        assert_eq!(sweep_tombstones(dir.path()).unwrap().swept, 0);
         assert!(tomb.exists(), "the tombstone survives a same-tick sweep");
         let again = accept(dir.path(), "p", WebhookKind::Id, "evt", "h", Utc::now()).unwrap();
         assert_eq!(again, AcceptOutcome::Duplicate);
