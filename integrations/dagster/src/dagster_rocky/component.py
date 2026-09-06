@@ -3308,6 +3308,17 @@ def _log_run_diagnostics(
     """
     for err in result.errors:
         context.log.error(f"Table failed: {err.error}")
+    # The engine's own verdict on its checks. Nothing in this package read it
+    # before #1728: `RockyClient.run` passes `allow_partial=True`, so a
+    # check-gated exit 2 comes back as a parsed result rather than raising, and
+    # the step finished successful while the engine said it had failed the run.
+    if result.check_gate_failed:
+        context.log.error(
+            "Rocky failed this run on its checks (check_gate_failed): at least one "
+            "error-severity check failed or could not be evaluated while fail_on_error "
+            "was on. A resumed run can also inherit a standing gate from the run it "
+            "resumed, in which case this run's own check_results are clean."
+        )
 
 
 #: Metadata key stamped on the :class:`dg.AssetObservation` that carries a
@@ -3526,9 +3537,32 @@ def _emit_results(
         )
 
     yielded_checks: set[tuple[dg.AssetKey, str]] = set(extra_yielded_checks or ())
+    # Failing checks this step could not report as checks, for the gate
+    # backstop at the end. A cross_source_overlap verdict is a GROUP check the
+    # engine attaches to one sibling in materialization order, so the carrier
+    # is not knowable when specs are built — a partial selection that spans
+    # every source but omits the carrier drops the whole result (#1728).
+    unreported_failures: list[str] = []
+    failing_checks_yielded = False
     for table_check in table_checks:
         asset_key = remap(table_check.asset_key)
         if asset_key not in selected_keys:
+            # Dropped by the selection filter, which runs BEFORE the
+            # declaration filter below — so `_undeclared_check_observation`
+            # never saw it and #1709's fix did not reach this path. An
+            # observation is not available either: Dagster rejects an event on
+            # an asset outside the step. Name it in the log and remember it, so
+            # a gated run cannot finish green on silence (#1728).
+            failing = [c for c in table_check.checks if not c.passed]
+            for check in failing:
+                unreported_failures.append(f"{asset_key.to_user_string()}:{check.name}")
+                (log or _log).warning(
+                    "Rocky reported a FAILED check '%s' on %s, which this step did not "
+                    "select — it cannot be recorded as an asset check here. %s",
+                    check.name,
+                    asset_key.to_user_string(),
+                    check.not_evaluated or "",
+                )
             continue
         for check in table_check.checks:
             # Sanitize the engine name (it may carry ``:`` / ``.`` separators,
@@ -3558,6 +3592,10 @@ def _emit_results(
                 )
                 continue
             yielded_checks.add(spec_key)
+            if not check.passed:
+                # The gate backstop below stays quiet while a failing check is
+                # visible as a check.
+                failing_checks_yielded = True
             yield dg.AssetCheckResult(
                 asset_key=asset_key,
                 check_name=check_name,
@@ -3707,6 +3745,44 @@ def _emit_results(
         instance=instance,
         log=log or _log,
     )
+
+    # THE BACKSTOP (#1728). Raised after every event above is yielded, the same
+    # ordering `_emit_derived_model_results` uses for containment: the step's
+    # real results are recorded first, then it fails.
+    #
+    # The engine failed this run on its checks. `RockyClient.run` passes
+    # `allow_partial=True`, so that exit 2 comes back as a parsed result rather
+    # than raising — and if the failing check could not be reported as an asset
+    # check, the step finished GREEN while the engine said it had failed.
+    #
+    # Deliberately narrow, so it never fires on the ordinary shape: if any
+    # failing AssetCheckResult was yielded, the gate is already visible in the
+    # UI and on the asset's health, and this stays quiet. It fires only when the
+    # gate stands and nothing in this step explains it — a group check whose
+    # carrier sibling is outside the selection, a check whose spec was never
+    # declared, or a resume that inherited a standing gate with clean
+    # check_results of its own (#1720).
+    gated = [r for r in results if r.check_gate_failed]
+    if gated and not failing_checks_yielded:
+        detail = (
+            "\n\nFailing checks this step could not report as asset checks:\n  "
+            + "\n  ".join(unreported_failures)
+            if unreported_failures
+            else (
+                "\n\nNo failing check reached this step at all. Either the failing "
+                "check's asset is outside this step's selection, its spec was never "
+                "declared, or this run inherited a standing gate from the run it "
+                "resumed (its own check_results are clean in that case)."
+            )
+        )
+        raise dg.Failure(
+            description=(
+                "Rocky failed this run on its checks (check_gate_failed), but no failing "
+                "asset check in this step explains it — so the step would otherwise have "
+                "finished successfully. Refusing to report green on a run the engine "
+                "gated." + detail
+            ),
+        )
 
 
 def _empty_output_results(
