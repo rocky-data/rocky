@@ -864,6 +864,7 @@ mod tests {
             pipeline: None,
             submission_id: None,
             check_gate_failed: false,
+            verify_after_failed: false,
         }
     }
 
@@ -891,6 +892,42 @@ mod tests {
         assert_eq!(rows.len(), 1, "one verification outcome row");
         assert_eq!(rows[0].effect, PolicyEffect::Allow);
         assert_eq!(rows[0].verify_after, vec!["row_count".to_string()]);
+    }
+
+    /// #1732, the discriminating case. `verify_after` fails **closed** on a
+    /// required check that is ABSENT from the run record — and absence is not
+    /// a failing check, so the run's own check gate has nothing to gate on and
+    /// stays `false`.
+    ///
+    /// That is why `verify_after_failed` is its own persisted verdict rather
+    /// than a reading of `check_gate_failed`: on this shape, the one the
+    /// resume gate would consult says the run was fine while an auto-applied
+    /// migration stands unconfirmed.
+    #[test]
+    fn an_absent_required_check_fails_verify_after_while_the_check_gate_stays_false() {
+        let (store, _d) = temp_store();
+        let policy = granting_policy(&["row_count"], None);
+        store
+            .record_policy_decision(&applied_decision("run-1", "wh.raw.orders"))
+            .unwrap();
+        // The run recorded NO check outcome at all — `row_count` never ran.
+        let record = run_with_checks("run-1", &[]);
+        assert!(
+            !record.check_gate_failed,
+            "nothing failed, so the check gate has nothing to gate on"
+        );
+        store.record_run(&record).unwrap();
+
+        let err = finalize_drift_verify_after(Some(&store), "run-1", Some(&policy))
+            .expect_err("an absent required check must fail the gate closed");
+        assert!(
+            err.to_string().contains("absent — did not run"),
+            "the refusal names the absence rather than a failure: {err}"
+        );
+
+        let rows = verify_rows(&store, "run-1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].effect, PolicyEffect::Deny);
     }
 
     #[test]
