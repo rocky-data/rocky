@@ -107,6 +107,22 @@ pub fn run_brief(
     let output = compute_brief(&root, state_path, config_path, since, now)?;
     emit(&output, json)?;
 
+    // A present-but-unloadable `rocky.toml` degrades the digest rather than
+    // refusing it (#1727), but it must not exit 0: three sections could not be
+    // computed. Emitted FIRST, so a wrapper parsing stdout still gets the six
+    // sections that did render — including the escalation list, which has no
+    // other route on a broken config since #1704.
+    //
+    // The cursor is deliberately NOT advanced below: a degraded digest must not
+    // consume the `--since last` window, or the sections it could not render
+    // would be silently skipped for the next reader too.
+    if let Some(err) = &output.config_error {
+        anyhow::bail!(
+            "{err}\n\nThe digest above is degraded: cost, autonomy and scheduler could not \
+             be computed. The other six sections are complete."
+        );
+    }
+
     // Advance the digest cursor only after a successful render, and only for
     // the `--since last` mode — the relative windows never touch it. Advancing
     // to the same `now` the digest was composed at keeps the next `--since
@@ -163,19 +179,41 @@ pub fn compute_brief(
     since: BriefSince,
     now: DateTime<Utc>,
 ) -> Result<BriefOutput> {
-    // Read the config BEFORE the absent-state-store short-circuit: a broken
-    // `rocky.toml` refuses whatever else is or is not on disk.
-    let cfg: Option<RockyConfig> = load_optional_project_config(Some(config_path))
-        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    // A `rocky.toml` that is present and does not load no longer refuses the
+    // whole digest (#1727). Six of the nine sections take no config argument
+    // at all, and one of them — the escalation list — has no other route since
+    // #1704 converted `rocky review --queue` to refuse on the same error. An
+    // upgrade that leaves an inert `[schema_evolution]` section behind should
+    // not cost an operator their digest AND their review queue at once.
+    //
+    // Nothing is computed from defaults, which is the rule #1667 set: the
+    // three config-dependent sections are marked `Unavailable` carrying the
+    // loader's own error, exactly as `rocky audit` already does for its
+    // blast-radius section. The command still exits non-zero.
+    let (cfg, config_error): (Option<RockyConfig>, Option<String>) =
+        match load_optional_project_config(Some(config_path)) {
+            Ok(cfg) => (cfg, None),
+            Err(e) => (
+                None,
+                Some(format!(
+                    "failed to load config from {}: {e:#}",
+                    config_path.display()
+                )),
+            ),
+        };
 
     // Fail closed on an absent state store: there is no history to project.
+    // The config error still rides along — a fresh project with a broken
+    // `rocky.toml` must not exit 0 just because there is no history yet.
     if !state_path.exists() {
-        return Ok(empty_brief(
+        let mut out = empty_brief(
             now,
             since,
             None,
             "state store not found — no runs, decisions, or metrics have been recorded yet",
-        ));
+        );
+        out.config_error = config_error;
+        return Ok(out);
     }
 
     // Read-only throughout — the cursor advance is the caller's concern.
@@ -227,7 +265,7 @@ pub fn compute_brief(
     // window and freezes are current, so it reads the full ledger, not the
     // `--since` slice.
     let autonomy = build_autonomy(cfg.as_ref(), &decisions, now);
-    let scheduler = build_scheduler(
+    let mut scheduler = build_scheduler(
         cfg.as_ref(),
         &store,
         since_ts,
@@ -235,12 +273,32 @@ pub fn compute_brief(
         MAX_HISTORY_SCAN,
     );
 
+    // The three config-dependent sections carry the LOADER's error rather than
+    // the absent-config note they would otherwise show (#1727). "no rocky.toml"
+    // and "your rocky.toml does not load" are different facts, and only the
+    // second one is actionable.
+    //
+    // Overwriting the note, not the numbers: each of the three already renders
+    // `Unavailable` with no computed values when handed `None`, so there is
+    // nothing fabricated to correct — only a reason to sharpen.
+    let mut cost = cost;
+    let mut autonomy = autonomy;
+    if let Some(err) = &config_error {
+        cost.availability = SectionAvailability::Unavailable;
+        cost.note = Some(err.clone());
+        autonomy.availability = SectionAvailability::Unavailable;
+        autonomy.note = Some(err.clone());
+        scheduler.availability = SectionAvailability::Unavailable;
+        scheduler.note = Some(err.clone());
+    }
+
     Ok(BriefOutput {
         version: VERSION.to_string(),
         command: "brief".to_string(),
         generated_at: now.to_rfc3339(),
         since_mode: since.mode(),
         since_timestamp: since_ts.map(|t| t.to_rfc3339()),
+        config_error: config_error.clone(),
         agent_activity,
         escalations,
         runs: runs_section,
@@ -1002,6 +1060,7 @@ fn empty_brief(
         generated_at: now.to_rfc3339(),
         since_mode: since.mode(),
         since_timestamp: since_ts.map(|t| t.to_rfc3339()),
+        config_error: None,
         agent_activity: BriefAgentActivitySection {
             availability: SectionAvailability::Unavailable,
             note: Some(note.clone()),
@@ -1111,20 +1170,18 @@ fn build_scheduler(
         .filter(|(_, p)| p.schedule().is_some())
         .map(|(name, _)| name.clone())
         .collect();
-    if scheduled.is_empty() {
-        return BriefSchedulerSection {
-            availability: SectionAvailability::NoData,
-            note: None,
-            scheduled_pipelines: 0,
-            paused: Vec::new(),
-            consecutive_failures: Vec::new(),
-            runs_in_window: 0,
-            failed_in_window: 0,
-            incident_count: 0,
-            latest_incident: None,
-        };
-    }
-
+    // NO early return on an empty `scheduled` list (#1727). Webhook ingress
+    // needs no `[schedule]` — it admits any pipeline in `config.pipelines` —
+    // and a failed webhook demand writes an incident bundle. Returning
+    // `NoData` here skipped both the incident inventory and the
+    // `Schedule|Webhook` run scan below, so a webhook-only project rendered
+    // "no data in window" with `incident_count: 0` while its incident
+    // directory held bundles.
+    //
+    // Everything below already handles an empty list: the cursor loop does not
+    // iterate, and the run scan selects on TRIGGER KIND rather than on the
+    // names in `scheduled`. `scheduled_pipelines: 0` is then the honest zero
+    // it always was.
     let mut paused = Vec::new();
     let mut failures = Vec::new();
     for name in &scheduled {
@@ -1898,6 +1955,7 @@ mod tests {
             generated_at: ts(12).to_rfc3339(),
             since_mode: BriefSinceMode::Hours24,
             since_timestamp: Some(ts(1).to_rfc3339()),
+            config_error: None,
             agent_activity: build_agent_activity(&refs),
             escalations: build_escalations(root.path(), &refs),
             runs: build_runs(&[]),
@@ -2102,7 +2160,15 @@ mod tests {
         assert!(md.contains("2 incident bundle(s)"), "{md}");
     }
 
-    /// No `[schedule]` block anywhere → `no_data`, never a fabricated zero row.
+    /// #1727. No `[schedule]` block anywhere is an honest `scheduled_pipelines:
+    /// 0`, NOT a short circuit.
+    ///
+    /// The old `NoData` early return skipped the incident inventory and the
+    /// `Schedule|Webhook` run scan below it. Webhook ingress needs no
+    /// `[schedule]` — it admits any pipeline in `config.pipelines` — and a
+    /// failed webhook demand writes an incident bundle, so a webhook-only
+    /// project reported "no data in window" with `incident_count: 0` while its
+    /// incident directory held bundles.
     #[test]
     fn scheduler_section_is_no_data_without_schedules() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2123,8 +2189,54 @@ mod tests {
             &tmp.path().join(".rocky"),
             MAX_HISTORY_SCAN,
         );
-        assert!(matches!(s.availability, SectionAvailability::NoData));
+        assert!(
+            matches!(s.availability, SectionAvailability::Available),
+            "an unscheduled project is answerable, not unanswerable: {s:?}"
+        );
         assert_eq!(s.scheduled_pipelines, 0);
+        assert_eq!(s.incident_count, 0, "no bundles were written");
+    }
+
+    /// #1727, the case the early return hid: a webhook-only project. No
+    /// `[schedule]` anywhere, and an incident bundle on disk.
+    #[test]
+    fn a_webhook_only_project_still_counts_its_incidents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+             [pipeline.gamma]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.gamma.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        let state_path = tmp.path().join("state.redb");
+        let store = StateStore::open(&state_path).unwrap();
+
+        let rocky_dir = tmp.path().join(".rocky");
+        let incidents = rocky_dir.join("incidents");
+        std::fs::create_dir_all(&incidents).unwrap();
+        // A name the incident writer itself produces.
+        let bundle = "20260906T120000Z-gamma-webhook.json";
+        assert!(
+            rocky_core::schedule::incidents::is_bundle_name(bundle),
+            "precondition: the fixture uses a real bundle name"
+        );
+        std::fs::write(incidents.join(bundle), "{}").unwrap();
+
+        let s = build_scheduler(
+            Some(&loaded(&config)),
+            &store,
+            None,
+            &rocky_dir,
+            MAX_HISTORY_SCAN,
+        );
+
+        assert_eq!(
+            s.incident_count, 1,
+            "the bundle is on disk; reporting 0 is the fabricated zero: {s:?}"
+        );
+        assert_eq!(s.scheduled_pipelines, 0, "and nothing IS scheduled");
     }
 
     /// With NO `rocky.toml` the section fails closed with a note — the digest
@@ -2332,54 +2444,95 @@ mod tests {
         state_path
     }
 
-    /// A present-but-unloadable `rocky.toml` refuses the whole digest, naming
-    /// the file. Restoring the three `.ok()` / degrading loads makes this fail
-    /// — `compute_brief` returns `Ok` with a cost section that shows no dollar
-    /// figures, exactly like a healthy project that never configured `[cost]`.
+    /// #1727. A present-but-unloadable `rocky.toml` DEGRADES the digest — it
+    /// no longer deletes it.
+    ///
+    /// Six of the nine sections take no config argument, and one of them — the
+    /// escalation list — has no other route since #1704 converted
+    /// `rocky review --queue` to refuse on the same error. Refusing the whole
+    /// digest cost an operator their review queue as well.
+    ///
+    /// Nothing is computed from defaults, which is #1667's rule: the three
+    /// config-dependent sections are `Unavailable` carrying the loader's own
+    /// error, and `config_error` is set so `run_brief` exits non-zero.
     #[test]
-    fn brief_refuses_a_present_but_unloadable_config() {
+    fn brief_degrades_on_a_present_but_unloadable_config() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let state_path = brief_state(root);
         let cfg = root.join("rocky.toml");
         std::fs::write(&cfg, BROKEN_CONFIG_1702).unwrap();
 
-        let err = compute_brief(root, &state_path, &cfg, BriefSince::Days7, ts(10))
-            .expect_err("a present but unloadable rocky.toml must refuse `rocky brief`");
-        let rendered = format!("{err:#}");
+        let out = compute_brief(root, &state_path, &cfg, BriefSince::Days7, ts(10))
+            .expect("the digest renders; the three config sections do not");
+
+        let err = out
+            .config_error
+            .as_deref()
+            .expect("the loader's error must reach the output, or the CLI exits 0");
         assert!(
-            rendered.contains(&cfg.display().to_string()),
-            "the refusal must name the config file: {rendered}"
+            err.contains(&cfg.display().to_string()),
+            "it must name the config file: {err}"
         );
         assert!(
-            rendered.contains("discovery-only") || rendered.contains("kind = \"discovery\""),
-            "the loader's own error must survive: {rendered}"
+            err.contains("discovery-only") || err.contains("kind = \"discovery\""),
+            "the loader's own error must survive: {err}"
+        );
+
+        // The three that need the config say so, with that same error.
+        for (name, availability, note) in [
+            ("cost", out.cost.availability, &out.cost.note),
+            ("autonomy", out.autonomy.availability, &out.autonomy.note),
+            ("scheduler", out.scheduler.availability, &out.scheduler.note),
+        ] {
+            assert!(
+                matches!(availability, SectionAvailability::Unavailable),
+                "{name} must not be computed from defaults"
+            );
+            assert_eq!(
+                note.as_deref(),
+                Some(err),
+                "{name} must carry the loader's error, not the absent-config note"
+            );
+        }
+
+        // THE POINT: the escalation list still renders. This is the assertion
+        // that fails on the pre-#1727 tree.
+        assert!(
+            !matches!(
+                out.escalations.availability,
+                SectionAvailability::Unavailable
+            ),
+            "the escalation list needs no config and has no other route: {:?}",
+            out.escalations
         );
     }
 
-    /// The refusal does not depend on there being a state store to project
-    /// from. The config is read BEFORE the absent-state-store short-circuit,
-    /// so a broken `rocky.toml` refuses on a fresh project too. Moving the
-    /// read below that short-circuit makes this fail while the test above
-    /// still passes.
+    /// #1727, the hole the degrade opens if the config error is dropped at the
+    /// absent-state-store short-circuit: a FRESH project with a broken
+    /// `rocky.toml` would render a fully-unavailable digest, set no
+    /// `config_error`, and exit 0 — silence in both directions.
     #[test]
-    fn brief_refuses_an_unloadable_config_without_a_state_store() {
+    fn an_unloadable_config_survives_the_absent_state_store_short_circuit() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let cfg = root.join("rocky.toml");
         std::fs::write(&cfg, BROKEN_CONFIG_1702).unwrap();
 
-        let err = compute_brief(
+        let out = compute_brief(
             root,
             &root.join("state.redb"),
             &cfg,
             BriefSince::Days7,
             ts(10),
         )
-        .expect_err("an absent state store must not excuse an unloadable config");
+        .expect("an absent state store yields a digest, not an error");
         assert!(
-            format!("{err:#}").contains(&cfg.display().to_string()),
-            "{err:#}"
+            out.config_error
+                .as_deref()
+                .is_some_and(|e| e.contains(&cfg.display().to_string())),
+            "an absent state store must not excuse an unloadable config: {:?}",
+            out.config_error
         );
     }
 
@@ -2414,17 +2567,30 @@ mod tests {
             out.scheduler.note
         );
 
+        // The discriminator, so this guard cannot pass just because the config
+        // leg was dropped altogether: the same project with a PRESENT but
+        // unloadable config is a different answer. It no longer refuses
+        // (#1727), but it carries the loader's error and a different note —
+        // "no rocky.toml" and "your rocky.toml does not load" must never read
+        // the same.
         std::fs::write(&cfg, BROKEN_CONFIG_1702).unwrap();
+        let broken = compute_brief(root, &state_path, &cfg, BriefSince::Days7, ts(10))
+            .expect("a broken config degrades the digest rather than deleting it");
         assert!(
-            compute_brief(root, &state_path, &cfg, BriefSince::Days7, ts(10)).is_err(),
-            "a present-but-broken config in the same project must refuse"
+            broken.config_error.is_some(),
+            "the CLI exits non-zero off this field"
+        );
+        let note = broken.scheduler.note.as_deref().unwrap_or_default();
+        assert!(
+            !note.contains("no rocky.toml"),
+            "a present-but-broken config must not be reported as an absent one: {note}"
         );
     }
 
     /// Honest failure (b): a config holding an unset `${VAR}` in an adapter
     /// connection field now LOADS. The scheduler section reaches its real
-    /// answer (`no_data` — the config declares no `[schedule]`) instead of the
-    /// `unavailable` the strict loader forced. The brief opens no warehouse
+    /// answer (an honest `scheduled_pipelines: 0` — the config declares no
+    /// `[schedule]`) instead of the `unavailable` the strict loader forced. The brief opens no warehouse
     /// connection, and tolerance is scoped to adapter connection fields, so no
     /// literal placeholder can reach the `[state]` durable-tier provider.
     #[test]
@@ -2443,9 +2609,16 @@ mod tests {
         let out = compute_brief(root, &state_path, &cfg, BriefSince::Days7, ts(10))
             .expect("an unset ${VAR} in adapter credentials must not refuse `rocky brief`");
         assert!(
-            matches!(out.scheduler.availability, SectionAvailability::NoData),
-            "the config loaded, so the scheduler section reports its real answer: {:?}",
+            out.config_error.is_none(),
+            "the tolerant loader accepted it, so the digest is not degraded: {:?}",
+            out.config_error
+        );
+        assert!(
+            matches!(out.scheduler.availability, SectionAvailability::Available),
+            "the config loaded, so the scheduler section reports its real answer — \
+             an honest `scheduled_pipelines: 0` since #1727, not a short circuit: {:?}",
             out.scheduler
         );
+        assert_eq!(out.scheduler.scheduled_pipelines, 0);
     }
 }
