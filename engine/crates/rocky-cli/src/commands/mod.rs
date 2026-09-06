@@ -163,7 +163,7 @@ pub use policy::{run_policy_check, run_policy_freeze, run_policy_test};
 pub use preview::{
     PreviewDiffAlgorithmSelector, run_preview_cost, run_preview_create, run_preview_diff,
 };
-pub use preview_rows::run_preview_rows;
+pub use preview_rows::{PreviewFailure, compute_preview_rows, run_preview_rows};
 pub use product::{
     run_product_approve, run_product_compile, run_product_journal, run_product_list,
     run_product_status, run_product_verify,

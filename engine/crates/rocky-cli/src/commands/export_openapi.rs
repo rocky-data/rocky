@@ -889,6 +889,88 @@ fn route_table() -> Vec<Route> {
         },
         Route {
             method: "get",
+            path: "/api/v1/models/{name}/rows",
+            operation_id: "getModelRows",
+            tag: "estate",
+            summary: "A bounded, masked sample of a model's rows",
+            description: "Runs the model's compiled SELECT against the pipeline's adapter \
+                 and returns at most `limit` rows, with classification-tagged columns \
+                 masked inline. The same bytes as `rocky preview rows <model> --output \
+                 json`. A remote adapter requires the `X-Rocky-Allow-Warehouse: true` \
+                 header on every request; a local DuckDB adapter needs none. One sample \
+                 runs at a time and is bounded by a 30 second timeout. The response \
+                 carries `Cache-Control: no-store`. Ad-hoc SQL is not exposed.",
+            path_params: &["name"],
+            query_params: &[
+                QueryParam {
+                    name: "limit",
+                    description: "Rows to return, 1 to 500. Defaults to 20.",
+                    allowed: &[],
+                },
+                QueryParam {
+                    name: "cte",
+                    description: "Sample one named CTE of the model instead of its output. \
+                         Refused when the model has any masked column.",
+                    allowed: &[],
+                },
+                QueryParam {
+                    name: "pipeline",
+                    description: "Which pipeline's adapter to run against. Required only \
+                         when the project declares more than one.",
+                    allowed: &[],
+                },
+            ],
+            header_params: &["X-Rocky-Allow-Warehouse"],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The sampled rows, masked, with the SQL that ran.",
+                    body: Body::Component("PreviewRowsOutput"),
+                },
+                Resp {
+                    status: "400",
+                    description: "`limit` is outside 1 to 500, or a name is not a valid \
+                         identifier.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                Resp {
+                    status: "403",
+                    description: "The adapter is remote and the request carried no \
+                         `X-Rocky-Allow-Warehouse: true` header.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                MODEL_NOT_FOUND,
+                Resp {
+                    status: "409",
+                    description: "An upstream is not materialized, or the target catalog \
+                         does not exist.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                Resp {
+                    status: "422",
+                    description: "The model does not compile to a single SELECT, has \
+                         compile errors, or has a masked column this adapter cannot \
+                         express — refused rather than served unmasked.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                ENGINE_BUSY_OR_NOT_READY,
+                Resp {
+                    status: "502",
+                    description: "The adapter would not connect, or the query failed.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                Resp {
+                    status: "504",
+                    description: "The sample did not finish within 30 seconds. The \
+                         warehouse may still be running the query.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
             path: "/api/v1/review/queue",
             operation_id: "getReviewQueue",
             tag: "review",
@@ -908,6 +990,39 @@ fn route_table() -> Vec<Route> {
                     status: "200",
                     description: "The ranked queue.",
                     body: Body::Component("ReviewQueueOutput"),
+                },
+                ENGINE_BUSY_OR_NOT_READY,
+                REVIEW_READ_FAILED,
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
+            path: "/api/v1/review/{plan_id}",
+            operation_id: "getReviewDiff",
+            tag: "review",
+            summary: "One plan's review diff",
+            description: "The plan's kind and the breaking-change findings against `HEAD`, \
+                 with `approved` always false — this route never writes the sign-off \
+                 marker. The same bytes as `rocky review <plan-id> --output json`. The \
+                 base is `HEAD` and is not a parameter: a ref from a query string would \
+                 be a subprocess argument. Two compiles per call, one at a time.",
+            path_params: &["plan_id"],
+            query_params: &[],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The plan's kind and its breaking-change findings.",
+                    body: Body::Component("ReviewOutput"),
+                },
+                PLAN_NOT_FOUND,
+                Resp {
+                    status: "409",
+                    description: "The plan's kind is never review-gated, so there is no \
+                         diff to take.",
+                    body: Body::Component("ErrorEnvelope"),
                 },
                 ENGINE_BUSY_OR_NOT_READY,
                 REVIEW_READ_FAILED,
@@ -1491,6 +1606,8 @@ mod tests {
             ("/api/v1/products/{name}/journal", "ProductJournalOutput"),
             ("/api/v1/review/queue", "ReviewQueueOutput"),
             ("/api/v1/review/{plan_id}/status", "ReviewStatusOutput"),
+            ("/api/v1/review/{plan_id}", "ReviewOutput"),
+            ("/api/v1/models/{name}/rows", "PreviewRowsOutput"),
             ("/api/v1/brief", "BriefOutput"),
             ("/api/v1/audit/scorecard", "AuditScorecardOutput"),
             ("/api/v1/custody/{subject}", "AuditForOutput"),

@@ -69,7 +69,7 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{FromRequestParts, Path, State};
-use axum::http::header::CONTENT_TYPE;
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, RETRY_AFTER};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware;
@@ -99,7 +99,7 @@ use crate::commands::{
     lineage_output, metrics_output, model_history_output, schedule_status_output, schemas_hash,
 };
 use crate::output::{
-    AuditForOutput, AuditOutput, AuditScorecardOutput, BriefOutput, ProjectOutput,
+    AuditForOutput, AuditOutput, AuditScorecardOutput, BriefOutput, ProjectOutput, ReviewOutput,
     ReviewQueueOutput, ReviewStatusOutput, ScorecardDimension,
 };
 use crate::output::{
@@ -184,7 +184,9 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/products/{name}", get(get_product))
         .route("/api/v1/products/{name}/journal", get(product_journal))
         .route("/api/v1/review/queue", get(review_queue))
+        .route("/api/v1/review/{plan_id}", get(review_diff))
         .route("/api/v1/review/{plan_id}/status", get(review_status))
+        .route("/api/v1/models/{name}/rows", get(model_rows))
         .route("/api/v1/brief", get(governor_brief))
         .route("/api/v1/audit", get(audit_ledger))
         .route("/api/v1/audit/scorecard", get(audit_scorecard))
@@ -347,6 +349,10 @@ impl<T: Serialize> IntoResponse for PrettyJson<T> {
 struct ApiError {
     status: StatusCode,
     envelope: ErrorEnvelope,
+    /// Seconds for a `Retry-After` header, on the refusals where the caller
+    /// should come back rather than give up. `None` on every other error, so
+    /// the header appears only where it means something.
+    retry_after_seconds: Option<u32>,
 }
 
 impl ApiError {
@@ -359,7 +365,15 @@ impl ApiError {
                 remediation_hint: hint.map(str::to_string),
                 running_job_id: None,
             },
+            retry_after_seconds: None,
         }
+    }
+
+    /// Attach a `Retry-After`, in seconds, to a refusal the caller should
+    /// retry.
+    fn retry_after(mut self, seconds: u32) -> Self {
+        self.retry_after_seconds = Some(seconds);
+        self
     }
 
     /// `503` — no compile result is available yet (the initial compile
@@ -581,7 +595,14 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, PrettyJson(self.envelope)).into_response()
+        let retry_after = self.retry_after_seconds;
+        let mut response = (self.status, PrettyJson(self.envelope)).into_response();
+        if let Some(seconds) = retry_after
+            && let Ok(value) = HeaderValue::from_str(&seconds.to_string())
+        {
+            response.headers_mut().insert(RETRY_AFTER, value);
+        }
+        response
     }
 }
 
@@ -775,6 +796,7 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "GET /api/v1/models/{name}/lineage/{column}",
         "GET /api/v1/models/{name}/history",
         "GET /api/v1/models/{name}/metrics",
+        "GET /api/v1/models/{name}/rows",
         "GET /api/v1/runs",
         "GET /api/v1/compile",
         "POST /api/v1/compile",
@@ -790,6 +812,7 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "GET /api/v1/products/{name}",
         "GET /api/v1/products/{name}/journal",
         "GET /api/v1/review/queue",
+        "GET /api/v1/review/{plan_id}",
         "GET /api/v1/review/{plan_id}/status",
         "GET /api/v1/brief",
         "GET /api/v1/audit",
@@ -826,6 +849,8 @@ fn capabilities() -> Vec<String> {
         "governor",
         "audit",
         "journal",
+        "review_diff",
+        "samples",
     ]
     .into_iter()
     .map(String::from)
@@ -1474,6 +1499,283 @@ fn is_plan_id(candidate: &str) -> bool {
         && candidate
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+// --- The live-compute routes: the review diff and the samples endpoint ---
+
+/// How long `GET /api/v1/review/{plan_id}` waits for the diff permit before
+/// refusing. A diff is local and ends in hundreds of milliseconds, so a short
+/// wait beats a refusal the caller would only retry into.
+const REVIEW_DIFF_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a warehouse sample may run before the route gives up. The query
+/// itself may keep running: cancelling one is adapter-specific and is not in
+/// this package, which the guide says plainly.
+const SAMPLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Largest `limit` the samples route accepts. The CLI takes any `u32`; a
+/// browser-reachable route does not, because the rows cross the wire and sit
+/// in a page.
+const MAX_SAMPLE_LIMIT: u32 = 500;
+
+/// Default `limit` when the caller names none — the CLI's own default.
+const DEFAULT_SAMPLE_LIMIT: u32 = 20;
+
+/// The per-request consent header for a warehouse-executing read.
+///
+/// A header, never a query parameter. The danger of a money-spending `GET` is
+/// that a `GET` is issued by things that are not the user: a browser prefetch,
+/// a link scanner, an `<img src>`, a restored tab. None of those can set a
+/// custom request header, and cross-origin script cannot either without a
+/// preflight this server does not grant. The header is what makes `GET` the
+/// right method here, not a ritual on top of it.
+const CONSENT_HEADER: &str = "x-rocky-allow-warehouse";
+
+/// Query string of `GET /api/v1/models/{name}/rows`.
+#[derive(Debug, Deserialize)]
+struct SampleQuery {
+    /// Rows to return, `1..=500`. Defaults to 20, the CLI's default.
+    limit: Option<u32>,
+    /// Preview one named CTE of the model instead of its output.
+    cte: Option<String>,
+    /// Which pipeline's adapter to run against; required only when the project
+    /// declares more than one.
+    pipeline: Option<String>,
+}
+
+/// `GET /api/v1/review/{plan_id}` — the review diff, canonical [`ReviewOutput`].
+///
+/// The same bytes as `rocky review <plan-id> --output json`: the plan's kind,
+/// the breaking-change findings against `HEAD`, and `approved: false`. It never
+/// writes the review marker — approving stays in the terminal, and `approve` is
+/// hard-coded `false` here rather than exposed.
+///
+/// The base is `HEAD` and is not a parameter. The CLI's `--base <ref>` reaches
+/// `git` as a subprocess argument, and refusing a ref from a query string is
+/// cheaper than validating one. A plan records no base of its own
+/// (`PersistedPlan` carries no such field), so there is nothing else this could
+/// resolve to today.
+///
+/// Refusals: an id that is not 64 lower-case hex, or that names no plan file,
+/// is `404 plan_not_found` before anything is read — which also keeps the
+/// `404` path from creating `.rocky/plans/`, as `read_plan` would on a miss. A
+/// plan the CLI refuses to review is `409 plan_not_reviewable`.
+async fn review_diff(
+    State(state): State<Arc<ServerState>>,
+    ApiPath(plan_id): ApiPath<String>,
+) -> Result<PrettyJson<ReviewOutput>, ApiError> {
+    if !is_plan_id(&plan_id) {
+        return Err(ApiError::plan_not_found(&plan_id));
+    }
+    let root = project_root_for(&state)?;
+    let config = state
+        .config_path
+        .clone()
+        .ok_or_else(ApiError::engine_not_ready)?;
+    if !plan_file_path(&root, &plan_id).is_file() {
+        return Err(ApiError::plan_not_found(&plan_id));
+    }
+
+    // Admission: one diff at a time, with a short wait. A caller that waits out
+    // the window is refused with `Retry-After` rather than queueing further.
+    let _permit = match tokio::time::timeout(
+        REVIEW_DIFF_WAIT,
+        Arc::clone(&state.review_diffs).acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "engine_busy",
+                "another review diff is in flight",
+                Some("retry in a moment; one diff runs at a time"),
+            )
+            .retry_after(2));
+        }
+    };
+
+    // The store gate, for the state read `compute_review` does internally, so
+    // this compile does not race the queue's. Held across the compile, the same
+    // trade `GET /api/v1/review/queue` already makes.
+    let _store = Arc::clone(&state.store_access)
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::internal("the state-store read queue is closed".to_string()))?;
+
+    // `compute_review` is `async` for its marker-writing path, which
+    // `approve = false` never enters; its compiles are synchronous work on this
+    // thread, which the permit above bounds to one worker at a time.
+    match crate::commands::compute_review(&root, &config, &plan_id, "HEAD", false).await {
+        Ok(output) => Ok(PrettyJson(output)),
+        Err(e) => {
+            let message = format!("{e:#}");
+            // The CLI refuses a plan whose kind is never review-gated. That is a
+            // statement about the plan, not a server fault.
+            if message.contains("not reviewable") || message.contains("human-authored") {
+                Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "plan_not_reviewable",
+                    message,
+                    Some("only agent-authored and marker-only plan kinds are review-gated"),
+                ))
+            } else {
+                Err(ApiError::internal(message))
+            }
+        }
+    }
+}
+
+/// `GET /api/v1/models/{name}/rows` — a bounded, masked sample, canonical
+/// [`PreviewRowsOutput`].
+///
+/// The same bytes as `rocky preview rows <model> --limit <n> [--cte <c>]
+/// [--pipeline <p>] --output json`, through the same `compute_preview_rows`
+/// core, so the gate, the masking refusal and the executed SQL cannot differ
+/// between the two callers.
+///
+/// Three bounds a browser-reachable route needs and the CLI does not:
+///
+/// * **Consent.** A remote adapter needs [`CONSENT_HEADER`] on every request. A
+///   local DuckDB adapter needs none, exactly as the CLI needs no
+///   `--allow-warehouse` there.
+/// * **A row cap.** `limit` is `1..=500`; anything else is `400`.
+/// * **A timeout.** The warehouse call is bounded by [`SAMPLE_TIMEOUT`], and
+///   only one sample runs at a time — a second is refused at once rather than
+///   queued behind a call that may take the whole 30 seconds.
+///
+/// The response carries `Cache-Control: no-store`: the body is warehouse rows,
+/// and `GET` is the one method a browser, a proxy or a service worker caches
+/// without being asked.
+///
+/// Ad-hoc SQL (`--sql-file`) is not exposed. A compiled model's `SELECT` is a
+/// different threat model from arbitrary SQL over HTTP, whatever the token.
+async fn model_rows(
+    State(state): State<Arc<ServerState>>,
+    ApiPath(name): ApiPath<String>,
+    ApiQuery(query): ApiQuery<SampleQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let config = state
+        .config_path
+        .clone()
+        .ok_or_else(ApiError::engine_not_ready)?;
+
+    let limit = query.limit.unwrap_or(DEFAULT_SAMPLE_LIMIT);
+    if limit == 0 || limit > MAX_SAMPLE_LIMIT {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            format!("limit must be between 1 and {MAX_SAMPLE_LIMIT}, got {limit}"),
+            Some("pass a smaller `limit`, or omit it for the default of 20"),
+        ));
+    }
+
+    let consented = headers
+        .get(CONSENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+
+    // One sample at a time, refused immediately rather than queued: waiting
+    // behind a call that may run the full timeout is worse for the caller than
+    // a refusal it can retry.
+    let Ok(permit) = Arc::clone(&state.warehouse_samples).try_acquire_owned() else {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "engine_busy",
+            "another sample is in flight",
+            Some("retry in a moment; one sample runs at a time"),
+        )
+        .retry_after(5));
+    };
+
+    let models_dir = state.models_dir.clone();
+    let cte = query.cte.clone();
+    let pipeline = query.pipeline.clone();
+    let sample = tokio::time::timeout(SAMPLE_TIMEOUT, async move {
+        let _held = permit;
+        crate::commands::compute_preview_rows(
+            &config,
+            &name,
+            cte.as_deref(),
+            limit,
+            consented,
+            pipeline.as_deref(),
+            &models_dir,
+            // Ad-hoc SQL is never reachable over HTTP.
+            None,
+        )
+        .await
+    })
+    .await;
+
+    match sample {
+        Ok(Ok(output)) => {
+            let mut response = PrettyJson(output).into_response();
+            response
+                .headers_mut()
+                .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            Ok(response)
+        }
+        Ok(Err(failure)) => Err(sample_failure_to_api_error(failure)),
+        Err(_) => Err(ApiError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "sample_timeout",
+            format!(
+                "the sample did not finish within {} seconds",
+                SAMPLE_TIMEOUT.as_secs()
+            ),
+            Some("the warehouse may still be running the query; narrow the model or lower `limit`"),
+        )),
+    }
+}
+
+/// Map a `PreviewFailure` onto the API error surface, one `error_kind` at a
+/// time.
+///
+/// The masking refusal is renamed here, which the CLI's single
+/// `unmaskable_column` kind does not do: `inline_mask_expr` can express a mask
+/// only on `databricks`, `snowflake` and `duckdb`, so on any other adapter
+/// **every** sample of a model with a masked column is refused, permanently.
+/// That caller needs to be told the adapter cannot express the strategy, which
+/// they can act on, rather than a bare "unmaskable column" they will read as a
+/// bug. The refusal itself is unchanged and stays fail-closed: nothing is ever
+/// served unmasked.
+fn sample_failure_to_api_error(failure: crate::commands::PreviewFailure) -> ApiError {
+    let status = match failure.kind.as_str() {
+        "model_not_found" => StatusCode::NOT_FOUND,
+        "warehouse_gated" => StatusCode::FORBIDDEN,
+        "invalid_model_name" | "invalid_cte_name" | "invalid_arguments" => StatusCode::BAD_REQUEST,
+        "unsupported_model_kind"
+        | "compile_error"
+        | "cte_error"
+        | "cte_masking_unverified"
+        | "adhoc_masking_blocked"
+        | "unmaskable_column" => StatusCode::UNPROCESSABLE_ENTITY,
+        "upstream_not_materialized" | "missing_catalog" => StatusCode::CONFLICT,
+        "config_error" | "pipeline_error" => StatusCode::SERVICE_UNAVAILABLE,
+        // An adapter that would not connect, or would not answer, failed
+        // upstream of this server.
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    let hint = match failure.kind.as_str() {
+        "warehouse_gated" => {
+            Some("set the `X-Rocky-Allow-Warehouse: true` header to run this against the warehouse")
+        }
+        "unmaskable_column" => Some(
+            "this adapter cannot express the column's mask strategy; change the strategy, or sample from an adapter that can",
+        ),
+        "upstream_not_materialized" => Some("run the pipeline first, then sample"),
+        _ => None,
+    };
+    let code = match failure.kind.as_str() {
+        // The one rename: the CLI's kind names the column, the route's names
+        // what the caller can do about it.
+        "unmaskable_column" => "masking_unsupported_by_adapter",
+        other => other,
+    };
+    ApiError::new(status, code, failure.message, hint)
 }
 
 // --- The governor routes: brief, scorecard, custody ---
@@ -2919,6 +3221,204 @@ mod tests {
         assert_eq!(served_json, expected_json);
         for (s, e) in served_stale.iter().zip(&expected_stale) {
             assert!((s - e).abs() <= 5, "staleness drifted: {s} vs {e}");
+        }
+    }
+
+    /// A project whose pipeline names a REMOTE adapter, so the samples route's
+    /// consent gate is the thing under test rather than DuckDB's exemption.
+    /// The gate runs before any compile and before the adapter is built, so
+    /// this needs no credentials and reaches no warehouse.
+    fn remote_adapter_project(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
+        let root = dir.join("remote");
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        let config = root.join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter]\ntype = \"databricks\"\nhost = \"example.invalid\"\n\
+             http_path = \"/sql/1.0/warehouses/x\"\ntoken = \"unused\"\n\n\
+             [pipeline.main]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.main.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        let state_path = root.join("models/.rocky-state.redb");
+        (root, config, state_path)
+    }
+
+    /// The samples route's three refusals that need no warehouse: the row cap,
+    /// the consent gate on a remote adapter, and an unknown model.
+    #[tokio::test]
+    async fn samples_refuses_a_bad_limit_a_missing_consent_and_an_unknown_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) = remote_adapter_project(dir.path());
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config),
+            &state_path,
+        ))
+        .await;
+        let client = reqwest::Client::new();
+
+        // The cap is checked before anything else, so it answers even on a
+        // project whose adapter would refuse.
+        for limit in ["0", "501", "100000"] {
+            let resp = client
+                .get(format!("{base}/api/v1/models/orders/rows?limit={limit}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "limit={limit}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "bad_request", "limit={limit}");
+        }
+
+        // A remote adapter without the consent header is refused BEFORE the
+        // compile, so an unknown model still answers 403 rather than 404 —
+        // which is the proof that the gate runs first.
+        let resp = client
+            .get(format!("{base}/api/v1/models/orders/rows"))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(status, 403, "{}: {}", err.code, err.message);
+        assert_eq!(err.code, "warehouse_gated");
+
+        // Consent is exactly the literal `true`, case-insensitively. With it the
+        // request gets past the gate and fails later, on the project; without
+        // it the gate refuses first, whatever else is wrong.
+        for (value, consents) in [
+            ("true", true),
+            ("TRUE", true),
+            ("false", false),
+            ("1", false),
+        ] {
+            let resp = client
+                .get(format!("{base}/api/v1/models/orders/rows"))
+                .header("x-rocky-allow-warehouse", value)
+                .send()
+                .await
+                .unwrap();
+            if consents {
+                assert_ne!(resp.status(), 403, "consent header {value:?} was ignored");
+            } else {
+                assert_eq!(resp.status(), 403, "consent header {value:?} was accepted");
+            }
+        }
+    }
+
+    /// One sample at a time: the second is refused at once, with `Retry-After`,
+    /// rather than queued behind a call that may run the full 30 seconds.
+    #[tokio::test]
+    async fn a_second_concurrent_sample_is_refused_immediately_with_retry_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) = remote_adapter_project(dir.path());
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let held = Arc::clone(&state.warehouse_samples)
+            .try_acquire_owned()
+            .expect("the permit starts free");
+        let base = spawn_router(state).await;
+
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/api/v1/models/orders/rows"))
+            .header("x-rocky-allow-warehouse", "true")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("5"),
+            "a refusal the caller should retry carries how long to wait"
+        );
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "engine_busy");
+        drop(held);
+    }
+
+    /// The review diff refuses the same two shapes the status route does, and
+    /// a 404 must not create the plans directory — `read_plan` would.
+    #[tokio::test]
+    async fn review_diff_refuses_unknown_plans_without_creating_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path, _) = review_fixture(dir.path());
+        let plans_dir = root.join(".rocky/plans");
+        let before: Vec<_> = std::fs::read_dir(&plans_dir)
+            .map(|entries| entries.filter_map(Result::ok).map(|e| e.path()).collect())
+            .unwrap_or_default();
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config),
+            &state_path,
+        ))
+        .await;
+
+        for shape in ["not-hex", &"f".repeat(64), &"A".repeat(64)] {
+            let resp = reqwest::get(format!("{base}/api/v1/review/{shape}"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 404, "{shape}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "plan_not_found", "{shape}");
+        }
+
+        let after: Vec<_> = std::fs::read_dir(&plans_dir)
+            .map(|entries| entries.filter_map(Result::ok).map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert_eq!(before, after, "a 404 wrote to the plans directory");
+    }
+
+    /// The diff permit admits one caller; a second waits and is then refused
+    /// with `Retry-After`, never queued indefinitely.
+    #[tokio::test]
+    async fn a_second_concurrent_review_diff_is_refused_after_its_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path, [a, ..]) = review_fixture(dir.path());
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let held = Arc::clone(&state.review_diffs)
+            .try_acquire_owned()
+            .expect("the permit starts free");
+        let base = spawn_router(state).await;
+
+        let started = std::time::Instant::now();
+        let resp = reqwest::get(format!("{base}/api/v1/review/{a}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+        assert!(
+            started.elapsed() >= REVIEW_DIFF_WAIT,
+            "the caller was refused before its wait elapsed"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("2"),
+        );
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "engine_busy");
+        drop(held);
+    }
+
+    /// Both live-compute routes are advertised, so an embedder can feature-
+    /// detect them instead of probing.
+    #[tokio::test]
+    async fn meta_advertises_the_live_compute_capabilities() {
+        let base = spawn_router(test_state()).await;
+        let meta: serde_json::Value = reqwest::get(format!("{base}/api/v1/meta"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let caps = meta["capabilities"].as_array().unwrap();
+        for capability in ["review_diff", "samples"] {
+            assert!(
+                caps.iter().any(|c| c == capability),
+                "missing {capability}: {caps:?}"
+            );
         }
     }
 
