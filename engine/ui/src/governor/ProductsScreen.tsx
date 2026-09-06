@@ -177,7 +177,13 @@ function JournalTable({ rows }: { rows: ProductJournalEntry[] }) {
       <table className="w-full table-fixed text-left text-sm">
         <colgroup>
           <col className="w-10" />
-          <col className="w-40" />
+          {/* `when` holds a fixed-width string — "2026-09-06 20:44:26 UTC" —
+              and w-40 sat within a few pixels of it, so some rows wrapped
+              "UTC" onto a second line and others did not, for no reason a
+              reader could see. w-44 clears it with room to spare. It cannot
+              be `whitespace-nowrap`: under `table-fixed` that overflows the
+              cell rather than widening it. */}
+          <col className="w-44" />
           <col />
           <col className="w-44" />
           <col className="w-48" />
