@@ -788,6 +788,12 @@ class RunOutput(BaseModel):
     Deliberately NOT folded into `tables_failed`, which stays a count of tables and models and never counts checks. This is a gate, not a tally: it is `false` when every failed check is warning-severity, and `false` whenever the pipeline sets `fail_on_error = false`. The raw per-check outcomes are in `check_results` either way — count those if you want the number of failed checks.
 
     `derive_run_status` reads it, so a run whose only failure is the check gate still reports `partial_failure` / `failure` here, in the persisted run record, and in the process exit code. Omitted from the JSON when `false`, so a run that did not trip the gate is unchanged on the wire.
+
+    # A resumed run can inherit this from the run it resumed (#1720)
+
+    One case sets it without a matching failure in this run's own `check_results`: a resume of a run that was itself gated. The resume re-copies only the tables the earlier run left, and check inputs are built only from the tables the current invocation copies — so a violation on a table the resume skipped is never re-evaluated. The verdict is therefore carried forward from the resumed run's `RunRecord::check_gate_failed` (state schema v25) rather than re-derived, so the resume cannot record `Success` while the gate stands.
+
+    A consumer that sees `check_gate_failed: true` with clean `check_results` is reading exactly that case; `resumed_from` names the run whose gate it is, and the process message says so too. Count `check_results` for this run's OWN failures; read this field for "may I treat the run as green?" — the answer there is no.
     """
     check_results: list[TableCheckOutput]
     command: str

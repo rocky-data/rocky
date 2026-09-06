@@ -156,14 +156,44 @@ pub struct Interrupted;
 /// distinguish partial success from a total failure (exit 1) or an
 /// interrupt (exit 130). The full JSON `RunOutput` has already been
 /// emitted on stdout by the time this is returned.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "{count} table(s) failed during parallel execution (run_id: {run_id}, use --resume {run_id} to retry)"
-)]
+///
+/// The advice half of the message is conditional on [`Self::check_gate_failed`]
+/// (#1720). `run.rs` returns this sentinel from the failed-copy branch, which
+/// runs BEFORE the check-gate branch and returns, so a run where a copy *and*
+/// a check failed never reaches [`CheckGateFailure`] and used to be told
+/// "use --resume … to retry" with nothing said about the checks. A resume
+/// re-copies the failed table and rebuilds its check inputs only from what it
+/// copies, so it re-runs none of the checks that gated the run.
+#[derive(Debug)]
 pub struct PartialFailure {
     pub count: usize,
     pub run_id: String,
+    /// Whether the same run ALSO failed its check gate. Changes the advice,
+    /// never the exit code — both shapes are exit 2.
+    pub check_gate_failed: bool,
 }
+
+impl std::fmt::Display for PartialFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.check_gate_failed {
+            return write!(
+                f,
+                "{} table(s) failed during parallel execution and this run also failed its \
+                 check gate (run_id: {}); `--resume {}` re-copies only the failed table(s) and \
+                 re-runs none of the checks that gated this run, so a resume cannot clear the \
+                 gate — fix the data and re-run the pipeline",
+                self.count, self.run_id, self.run_id
+            );
+        }
+        write!(
+            f,
+            "{} table(s) failed during parallel execution (run_id: {}, use --resume {} to retry)",
+            self.count, self.run_id, self.run_id
+        )
+    }
+}
+
+impl std::error::Error for PartialFailure {}
 
 /// Sentinel error signalling that `rocky run` completed its terminal state
 /// writes with no successful materialization (`RunStatus::Failure`). The
@@ -193,16 +223,46 @@ pub struct RunFailed {
 /// tables it copies, so a resume of this run would copy nothing and run no
 /// checks. `ensure_run_is_resumable` refuses it for the same reason; this
 /// message must not send the user there.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "{count} error-severity check(s) failed (run_id: {run_id}, see `check_results` in the JSON \
-     output); the data has already landed — fix the source and re-run the pipeline, a resume \
-     would copy nothing"
-)]
+///
+/// [`Self::inherited_from`] names the prior run when this one is a resume that
+/// inherited a still-standing gate (#1720). The count is then this run's OWN
+/// error-severity failures, which is `0` in the common case — the earlier
+/// violation is on a table this resume never re-copied, so it produced no
+/// check result to count. Reporting "0 error-severity check(s) failed" would
+/// be a lie about a run that is deliberately not green, so the message says
+/// which run raised the gate instead.
+#[derive(Debug)]
 pub struct CheckGateFailure {
     pub count: usize,
     pub run_id: String,
+    /// The run whose standing check gate this one inherited, or `None` when
+    /// the gate is this run's own.
+    pub inherited_from: Option<String>,
 }
+
+impl std::fmt::Display for CheckGateFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Some(prior) = &self.inherited_from else {
+            return write!(
+                f,
+                "{} error-severity check(s) failed (run_id: {}, see `check_results` in the \
+                 JSON output); the data has already landed — fix the source and re-run the \
+                 pipeline, a resume would copy nothing",
+                self.count, self.run_id
+            );
+        };
+        write!(
+            f,
+            "the check gate raised by run {prior} still stands (run_id: {}); this resume \
+             re-ran none of those checks — it builds its check inputs only from the tables it \
+             copied — and added {} error-severity failure(s) of its own. Fix the data and \
+             re-run the pipeline; resuming again cannot clear the gate",
+            self.run_id, self.count
+        )
+    }
+}
+
+impl std::error::Error for CheckGateFailure {}
 
 /// Map a finalized [`RunOutput`]'s derived status onto the CLI exit-code
 /// contract for the transformation / model-only execution paths.
@@ -223,6 +283,11 @@ pub(crate) fn run_status_exit_result(output: &RunOutput, run_id: &str) -> Result
         rocky_core::state::RunStatus::PartialFailure => Err(PartialFailure {
             count: output.tables_failed,
             run_id: run_id.to_string(),
+            // The replication path routes its compile-only failure here while
+            // the check gate may already be set, so the advice must reflect it
+            // (#1720). `false` on the transformation / model-only paths, which
+            // never stamp the gate — those messages are unchanged.
+            check_gate_failed: output.check_gate_failed,
         }
         .into()),
         rocky_core::state::RunStatus::Failure => Err(RunFailed {
@@ -310,6 +375,23 @@ fn replication_check_gate_failed(
     checks: &rocky_core::config::ChecksConfig,
 ) -> bool {
     checks.fail_on_error && output.check_failures_by_severity().0 > 0
+}
+
+/// The check-gate verdict this run reports: its own, OR a still-standing one
+/// inherited from the run it resumed (#1720).
+///
+/// [`replication_check_gate_failed`] can only see the checks THIS invocation
+/// ran, and the runner builds check inputs only from the tables this
+/// invocation copied. So a resume that re-copies one failed table evaluates
+/// exactly that table's checks — and reads clean on a violation the earlier
+/// run found on a table it skipped. Without the second term the resumed run
+/// derives `Success`, `StateStore::latest_successful_run` starts matching it,
+/// and every downstream `after` demand fires on data that is still violating.
+///
+/// `inherited_gate` is `None` for every run that is not a resume of a gated
+/// run, so the verdict is unchanged everywhere else.
+fn resolved_check_gate(this_run_gated: bool, inherited_gate: Option<&String>) -> bool {
+    this_run_gated || inherited_gate.is_some()
 }
 
 /// Arm a background watcher that hard-exits with code 130 on a *second*
@@ -1644,23 +1726,38 @@ fn ensure_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> 
 /// check, and exit 0 on data that is still violating. That false recovery is
 /// worse than the exit-0 bug this whole change closes, so it is refused here.
 ///
-/// The discriminator is deliberately neither the status alone nor the recorded
-/// check outcomes:
+/// The discriminator is the recorded gate verdict plus the copy checkpoint:
 ///
 /// ```text
-///   copied < planned            -> resume: real copy work remains
+///   copied < planned                  -> resume: real copy work remains
+///   copied == planned, gate stands    -> refuse: a resume re-runs no check
 ///   copied == planned, a model failed -> resume: the model phase re-runs
-///   copied == planned, no model failed -> refuse: a resume would do nothing
+///   copied == planned, nothing failed -> refuse: a resume would do nothing
 /// ```
 ///
-/// `RunRecord::check_outcomes` is NOT consulted, because it records no
+/// The gate row reads [`RunRecord::check_gate_failed`] (state schema v25,
+/// #1720): the run's own **severity-resolved** answer to "did the checks fail
+/// this run?", written by `to_run_record` from `RunOutput::check_gate_failed`.
+/// It is `false` for a warning-only failure and `false` for every run under
+/// `fail_on_error = false`, so keying on it cannot refuse a resume over a
+/// result the user declared advisory.
+///
+/// `RunRecord::check_outcomes` is still NOT consulted, because it records no
 /// severity: keying on it would refuse a legitimate resume over a
 /// `severity = "warning"` result, or over any result at all under
-/// `fail_on_error = false` — both of which the user declared advisory. The
-/// "did a model fail" question is severity-free: `to_run_record` writes one
-/// `models_executed` entry with `status: "failed"` per `RunOutput::errors`
-/// entry, and on the replication path those are exactly the compile failures
-/// and the failed copies. A check failure adds none.
+/// `fail_on_error = false` — both of which the user declared advisory.
+///
+/// The gate row is checked BEFORE the model row, because the model row admits
+/// exactly the run the gate row must refuse: a failed post-apply
+/// `verify_after` gate pushes a `<verify_after>` entry onto `RunOutput::errors`
+/// with no model involved, and `to_run_record` writes one `models_executed`
+/// entry with `status: "failed"` per errors entry. Ordered the other way, that
+/// entry alone would admit a resume of a fully-copied check-gated run — the
+/// laundering path #1720 reported.
+///
+/// The "did a model fail" question stays severity-free: on the replication path
+/// those failed entries are the compile failures, the failed copies, and the
+/// post-apply custody failures. A check failure adds none.
 ///
 /// `total_tables` is what the recorded run planned to copy *after* its own
 /// resume filtering, not the pipeline's whole table set. So a resume of a
@@ -1699,12 +1796,20 @@ fn ensure_the_resume_would_do_work(
 ) -> Result<()> {
     // A run that planned nothing — discovery returned no table, or an earlier
     // resume had already taken them all — left no copy checkpoint to reason
-    // about, and a resume of it re-plans from scratch. It also cannot have
-    // tripped the check gate: a check exists only for a table this invocation
-    // copied. Resumable.
+    // about, so the resume re-plans every table from scratch and every check
+    // runs again. Resumable whatever the recorded gate says: nothing is
+    // skipped, so nothing goes unchecked. (The older note here claimed such a
+    // run "cannot have tripped the check gate". Persisting the verdict made
+    // that claim checkable, so it is replaced by the one that does not depend
+    // on it.)
     if progress.total_tables == 0 {
         return Ok(());
     }
+    // A table that is not `Success` is re-attempted by the resume, because the
+    // resume filter admits only `Success` keys. Real copy work remains, so this
+    // stays resumable even when the gate stands — what keeps THAT honest is the
+    // carry-forward at the gate stamp, not a refusal here: the resumed run
+    // inherits the standing verdict and cannot record `Success` while it holds.
     if progress
         .tables
         .iter()
@@ -1720,6 +1825,19 @@ fn ensure_the_resume_would_do_work(
     if copied < progress.total_tables {
         return Ok(());
     }
+    // The checks gated this run and no copy work remains (#1720). A resume
+    // rebuilds its check inputs only from the tables it copies, so it would
+    // re-run NONE of the checks that gated the run, and would report clean on
+    // data that is still violating. Refused ahead of the `models_executed`
+    // branch below, which would otherwise admit exactly this run.
+    if record.check_gate_failed {
+        anyhow::bail!(
+            "nothing to resume: run {} was gated by its checks and copied every table it \
+             planned to copy, so a resume would copy nothing and would re-run none of those \
+             checks — fix the data and re-run the pipeline",
+            progress.run_id
+        );
+    }
     if record
         .models_executed
         .iter()
@@ -1732,6 +1850,51 @@ fn ensure_the_resume_would_do_work(
          so a resume would copy nothing and run no checks — re-run the pipeline",
         progress.run_id
     )
+}
+
+/// The prior run whose still-standing check gate an admitted resume inherits.
+///
+/// `Some(run_id)` when the run being resumed recorded
+/// [`rocky_core::state::RunRecord::check_gate_failed`]: an error-severity check
+/// failed (or could not be evaluated) while that pipeline's `fail_on_error`
+/// gate was on.
+///
+/// # Why an admitted resume has to inherit it
+///
+/// [`ensure_the_resume_would_do_work`] refuses a gated run only when no copy
+/// work remains. The commoner shape still resumes: one table failed to copy,
+/// and a *different*, already-copied table failed its check. The resume
+/// legitimately re-copies the failed table — but the runner builds its check
+/// inputs only from the tables the current invocation copies (#1670), so the
+/// standing violation is never re-evaluated. Left alone, that resume derives
+/// `Success`; `StateStore::latest_successful_run` matches on exactly
+/// `RunStatus::Success`, so every downstream `after` demand then fires on data
+/// that is still violating (#1720).
+///
+/// Carrying the verdict forward is the smaller of the two honest fixes. The
+/// larger one — re-evaluating the prior run's checks against the tables it
+/// copied — is a real feature (it can also CLEAR the gate) and is not
+/// attempted here.
+///
+/// # Independent of the resuming run's own `fail_on_error`
+///
+/// A run under `fail_on_error = false` never records a gate, so there is never
+/// anything to inherit from one. And a verdict that was severity-resolved
+/// while the gate was on is not erased by flipping the flag afterwards —
+/// letting it be erased would reopen this bug through the config instead of
+/// through the resume. Re-running the pipeline is what clears it.
+///
+/// `None` when this is not a resume, when the prior record is gone (the crash
+/// case [`ensure_run_is_resumable`] deliberately admits), or when the record
+/// predates state schema v25 — an unrecorded verdict reads `false`, so a
+/// pre-v25 run resumes exactly as it does today.
+fn inherited_check_gate(
+    state_store: &StateStore,
+    progress: Option<&RunProgress>,
+) -> Option<String> {
+    let progress = progress?;
+    let record = state_store.get_run(&progress.run_id).ok().flatten()?;
+    record.check_gate_failed.then(|| progress.run_id.clone())
 }
 
 fn resolve_resume_progress(
@@ -3047,6 +3210,10 @@ pub async fn run(
     );
     let resume_progress =
         resolve_resume_progress(&state_store, resume_run_id, resume_latest, &resume_scope)?;
+    // Read the prior run's persisted check-gate verdict here, while
+    // `resume_progress` is still in scope (it is consumed below). `None` for a
+    // non-resume run, so a plain run is byte-identical to before (#1720).
+    let inherited_gate = inherited_check_gate(&state_store, resume_progress.as_ref());
 
     // Suppress both the periodic and the end-of-run upload when either:
     // - the on-disk state was forward-incompatible (newer schema than this
@@ -3147,6 +3314,19 @@ pub async fn run(
     let concurrency = pipeline.execution.concurrency.max_concurrency();
     let mut output = RunOutput::new(filter.unwrap_or("").to_string(), 0, concurrency);
     output.shadow = shadow_config.is_some();
+    // Stamp an inherited gate HERE, not at the check-gate stamp far below
+    // (#1720). Several exit paths persist a `RunRecord` before that point —
+    // the SIGINT/SIGTERM path is the reachable one — and `derive_run_status`
+    // reads this field. Stamping late would let an interrupted resume of a
+    // gated run record without the standing verdict, and a resume of THAT
+    // interrupted run would then inherit nothing and could go green. The
+    // gate stamp below re-derives the same value from this run's own checks
+    // OR this inheritance, so the two agree by construction.
+    //
+    // The `false` is this run's OWN verdict, which is necessarily false here:
+    // no check has run yet. Written through the same helper as the stamp
+    // below so the two sites cannot drift apart.
+    output.check_gate_failed = resolved_check_gate(false, inherited_gate.as_ref());
     if let Some(ctx) = &idempotency_ctx {
         output.idempotency_key = Some(ctx.key.clone());
     }
@@ -4301,15 +4481,23 @@ pub async fn run(
                     &throttle,
                     &semaphore,
                     &mut semaphore_capacity,
-                    &mut output,
-                    &mut pending_checks,
-                    &mut source_batch_refs,
-                    &mut target_batch_refs,
-                    &mut freshness_batch_refs,
-                    &mut batch_asset_keys,
+                    &mut MaterializedSinks {
+                        output: &mut output,
+                        pending_checks: &mut pending_checks,
+                        source_batch_refs: &mut source_batch_refs,
+                        target_batch_refs: &mut target_batch_refs,
+                        freshness_batch_refs: &mut freshness_batch_refs,
+                        batch_asset_keys: &mut batch_asset_keys,
+                        assertion_targets: &mut assertion_targets,
+                        deferred_tags: &mut deferred_tags,
+                        deferred_watermarks: &mut deferred_watermarks,
+                    },
+                    &TableHookContext {
+                        registry: &hook_registry,
+                        run_id: &run_id,
+                        pipeline_name,
+                    },
                     &mut table_errors,
-                    &mut deferred_tags,
-                    &mut deferred_watermarks,
                     &shared_state,
                     &shared_run_id,
                     &mut total_completed,
@@ -4420,102 +4608,33 @@ pub async fn run(
                 .await;
             }
             Ok((_, Ok(TableOutcome::Materialized(tr)))) => {
-                let tr = *tr;
-                // Signal the adaptive throttle. The copy succeeded, but a
-                // post-copy `column_match` probe that came back rate-limited is
-                // still the warehouse asking us to slow down (#1666) — reading
-                // the whole task as a success there would widen the semaphore
-                // while it throttles.
-                if let Some(t) = &throttle {
-                    if tr.probe_rate_limited {
-                        t.on_rate_limit();
-                    } else {
-                        t.on_success();
-                    }
-                    adjust_semaphore(t, &semaphore, &mut semaphore_capacity);
-                }
-                // §P2.6 per-table emit: after_materialize on success.
-                let _ = hook_registry
-                    .fire(&HookContext::after_materialize(
-                        &run_id,
+                collect_materialized_table(
+                    *tr,
+                    &mut MaterializedSinks {
+                        output: &mut output,
+                        pending_checks: &mut pending_checks,
+                        source_batch_refs: &mut source_batch_refs,
+                        target_batch_refs: &mut target_batch_refs,
+                        freshness_batch_refs: &mut freshness_batch_refs,
+                        batch_asset_keys: &mut batch_asset_keys,
+                        assertion_targets: &mut assertion_targets,
+                        deferred_tags: &mut deferred_tags,
+                        deferred_watermarks: &mut deferred_watermarks,
+                    },
+                    Some(ThrottleSignal {
+                        throttle: &throttle,
+                        semaphore: &semaphore,
+                        capacity: &mut semaphore_capacity,
+                    }),
+                    &TableHookContext {
+                        registry: &hook_registry,
+                        run_id: &run_id,
                         pipeline_name,
-                        &tr.target_full_name,
-                        tr.materialization.duration_ms,
-                        tr.materialization.rows_copied,
-                    ))
-                    .await;
-                output.tables_copied += 1;
-                rocky_observe::metrics::METRICS.inc_tables_processed();
-                rocky_observe::metrics::METRICS
-                    .record_table_duration_ms(tr.materialization.duration_ms);
-                output.materializations.push(tr.materialization);
-
-                if tr.drift_checked {
-                    output.drift.tables_checked += 1;
-                }
-                if let Some(drift_action) = tr.drift_detected {
-                    // §P2.6 per-table emit: drift_detected. The
-                    // column-level list isn't plumbed through
-                    // `TableResult` today (see `DriftActionOutput`: just
-                    // table + action + reason), so we emit with an
-                    // empty columns slice — subscribers get the
-                    // table/action surface; column names are a
-                    // follow-up that threads the full DriftResult.
-                    let _ = hook_registry
-                        .fire(&HookContext::drift_detected(
-                            &run_id,
-                            pipeline_name,
-                            &tr.target_full_name,
-                            &[],
-                        ))
-                        .await;
-                    output.drift.tables_drifted += 1;
-                    output.drift.actions_taken.push(drift_action);
-                }
-
-                if let Some(check) = tr.column_match_check {
-                    let entry = pending_checks
-                        .entry(tr.target_full_name.clone())
-                        .or_insert_with(|| PendingCheck {
-                            asset_key: tr.asset_key.clone(),
-                            checks: Vec::new(),
-                        });
-                    entry.checks.push(check);
-                }
-
-                if let Some(src_ref) = tr.source_batch_ref {
-                    source_batch_refs.push(src_ref);
-                }
-                if let Some(tgt_ref) = tr.target_batch_ref {
-                    target_batch_refs.push(tgt_ref);
-                }
-                batch_asset_keys.push((tr.target_full_name.clone(), tr.asset_key.clone()));
-                assertion_targets.push((tr.target_ref.clone(), tr.asset_key.clone()));
-
-                if let Some(fresh_ref) = tr.freshness_batch_ref {
-                    freshness_batch_refs.push(fresh_ref);
-                }
-
-                if let Some(tags) = tr.deferred_tags {
-                    deferred_tags.push(tags);
-                }
-                if let Some(wm) = tr.deferred_watermark {
-                    deferred_watermarks.push(wm);
-                }
-
-                // Checkpoint: record successful table progress
-                checkpoint_table_progress(
+                    },
+                    true,
+                    total_completed - 1,
                     &shared_state,
                     &shared_run_id,
-                    rocky_core::state::TableProgress {
-                        index: total_completed - 1,
-                        table_key: tr.target_full_name,
-                        asset_key: tr.asset_key,
-                        status: rocky_core::state::TableStatus::Success,
-                        error: None,
-                        duration_ms: output.materializations.last().map_or(0, |m| m.duration_ms),
-                        completed_at: Utc::now(),
-                    },
                 )
                 .await;
             }
@@ -4857,44 +4976,41 @@ pub async fn run(
                         .await;
                     }
                     Ok(TableOutcome::Materialized(tr)) => {
-                        let tr = *tr;
+                        // The same collector the two drain paths use (#1718).
                         // The first attempt recorded this table Failed; the
                         // retry's Success replaces it (same key, last write
-                        // wins) so a later resume skips the table.
-                        checkpoint_table_progress(
+                        // wins) so a later resume skips the table — hence the
+                        // task's own `idx` as the checkpoint index rather than
+                        // a position in completion order.
+                        collect_materialized_table(
+                            *tr,
+                            &mut MaterializedSinks {
+                                output: &mut output,
+                                pending_checks: &mut pending_checks,
+                                source_batch_refs: &mut source_batch_refs,
+                                target_batch_refs: &mut target_batch_refs,
+                                freshness_batch_refs: &mut freshness_batch_refs,
+                                batch_asset_keys: &mut batch_asset_keys,
+                                assertion_targets: &mut assertion_targets,
+                                deferred_tags: &mut deferred_tags,
+                                deferred_watermarks: &mut deferred_watermarks,
+                            },
+                            // The spawn loop has joined: no permit is left to
+                            // issue, so the throttle is not signalled here.
+                            None,
+                            &TableHookContext {
+                                registry: &hook_registry,
+                                run_id: &run_id,
+                                pipeline_name,
+                            },
+                            // No per-table hook fires on the retry arm, as
+                            // before this change. See the parameter's doc.
+                            false,
+                            idx,
                             &shared_state,
                             &shared_run_id,
-                            rocky_core::state::TableProgress {
-                                index: idx,
-                                table_key: tr.target_full_name.clone(),
-                                asset_key: tr.asset_key.clone(),
-                                status: rocky_core::state::TableStatus::Success,
-                                error: None,
-                                duration_ms: tr.materialization.duration_ms,
-                                completed_at: Utc::now(),
-                            },
                         )
                         .await;
-                        output.tables_copied += 1;
-                        rocky_observe::metrics::METRICS.inc_tables_processed();
-                        output.materializations.push(tr.materialization);
-                        if tr.drift_checked {
-                            output.drift.tables_checked += 1;
-                        }
-                        if let Some(src_ref) = tr.source_batch_ref {
-                            source_batch_refs.push(src_ref);
-                        }
-                        if let Some(tgt_ref) = tr.target_batch_ref {
-                            target_batch_refs.push(tgt_ref);
-                        }
-                        assertion_targets.push((tr.target_ref.clone(), tr.asset_key.clone()));
-                        batch_asset_keys.push((tr.target_full_name.clone(), tr.asset_key));
-                        if let Some(tags) = tr.deferred_tags {
-                            deferred_tags.push(tags);
-                        }
-                        if let Some(wm) = tr.deferred_watermark {
-                            deferred_watermarks.push(wm);
-                        }
                         info!(table = task.target_table_name.as_str(), "retry succeeded");
                     }
                     Err(e) => {
@@ -5101,7 +5217,25 @@ pub async fn run(
     // three now read the same gate, so the JSON payload, the persisted
     // `RunRecord`, the idempotency outcome and the exit code give one answer
     // instead of three.
-    output.check_gate_failed = replication_check_gate_failed(&output, &pipeline.checks);
+    let this_run_gated = replication_check_gate_failed(&output, &pipeline.checks);
+    // A resumed run inherits the prior run's standing gate (#1720). The
+    // resume's check inputs cover only the tables IT copied, so a gate the
+    // prior run raised over a table this resume skipped is never re-evaluated.
+    // Without this `||` the resumed run derives `Success`, and
+    // `latest_successful_run` starts matching it — the laundering path. `None`
+    // on every run that is not a resume of a gated run, so nothing else moves.
+    output.check_gate_failed = resolved_check_gate(this_run_gated, inherited_gate.as_ref());
+    if let Some(prior) = &inherited_gate {
+        warn!(
+            resumed_from = prior.as_str(),
+            "resumed run inherits a standing check gate"
+        );
+        crate::status_line!(
+            "Check gate: run {prior} was gated by its checks and this resume re-ran none of \
+             them, so the gate still stands — this run cannot report success. Fix the data and \
+             re-run the pipeline."
+        );
+    }
 
     // Finding #1: whether the compiled-model phase completed cleanly, hoisted so
     // the recipe-manifest write (outside the model block below) can also skip on
@@ -5620,6 +5754,13 @@ pub async fn run(
         // already been written to stdout above; dagster
         // (`allow_partial=True`) reads stdout regardless of exit code
         // for code 2.
+        //
+        // The advice half depends on the check gate too (#1720). This branch
+        // returns before the check-gate branch below, so when a copy AND a
+        // check both failed this is the only message the operator sees — and
+        // "use --resume to retry" alone is wrong there: a resume re-copies the
+        // failed table and re-runs none of the checks that gated the run.
+        let gated = output.check_gate_failed;
         if matches!(
             output.derive_run_status(),
             rocky_core::state::RunStatus::PartialFailure
@@ -5627,8 +5768,16 @@ pub async fn run(
             return Err(PartialFailure {
                 count,
                 run_id: run_id.clone(),
+                check_gate_failed: gated,
             }
             .into());
+        }
+        if gated {
+            anyhow::bail!(
+                "{count} table(s) failed during parallel execution and this run also failed \
+                 its check gate (run_id: {run_id}); a resume re-runs none of the checks that \
+                 gated this run — fix the data and re-run the pipeline"
+            );
         }
         anyhow::bail!(
             "{count} table(s) failed during parallel execution (run_id: {run_id}, use --resume {run_id} to retry)"
@@ -5681,8 +5830,15 @@ pub async fn run(
             return Err(CheckGateFailure {
                 count,
                 run_id: run_id.clone(),
+                inherited_from: inherited_gate.clone(),
             }
             .into());
+        }
+        if let Some(prior) = &inherited_gate {
+            anyhow::bail!(
+                "the check gate raised by run {prior} still stands (run_id: {run_id}); this \
+                 resume re-ran none of those checks — fix the data and re-run the pipeline"
+            );
         }
         anyhow::bail!(
             "{count} error-severity check(s) failed (run_id: {run_id}, see `check_results` in the JSON output)"
@@ -12877,8 +13033,8 @@ async fn process_table(
     let mut probe_rate_limited = false;
     let column_match_check = if task.check_column_match {
         let (source_probe, target_probe) = tokio::join!(
-            warehouse.describe_table(&source_table),
-            warehouse.describe_table(&target_table),
+            probe_columns_after_copy(warehouse, &source_table),
+            probe_columns_after_copy(warehouse, &target_table),
         );
         let (check, rate_limited) = post_copy_column_match(
             &source_table,
@@ -13065,10 +13221,227 @@ fn adjust_semaphore(
     }
 }
 
+/// The run-level accumulators ONE materialized table contributes to.
+///
+/// Grouped so the single collector below can be called from all three places a
+/// `TableResult` is consumed without a twenty-argument call. Before #1718 each
+/// of those three places carried its own copy of the body and each forwarded a
+/// different subset: the spawn loop's inline drain never pushed
+/// `assertion_targets` (the only input to the assertion, null-rate, custom and
+/// cross-source-overlap check loops), and the auto-retry arm never forwarded
+/// `column_match_check`, `freshness_batch_ref` or the drift record. Writing the
+/// same work three times is what let them drift apart, so it is written once.
+struct MaterializedSinks<'a> {
+    output: &'a mut RunOutput,
+    pending_checks: &'a mut HashMap<String, PendingCheck>,
+    source_batch_refs: &'a mut Vec<TableRef>,
+    target_batch_refs: &'a mut Vec<TableRef>,
+    freshness_batch_refs: &'a mut Vec<TableRef>,
+    batch_asset_keys: &'a mut Vec<(String, Vec<String>)>,
+    /// Populated for EVERY materialized table, independent of the row-count and
+    /// freshness toggles: `run_batched_checks` drives assertions, null-rate,
+    /// custom checks and cross-source overlap from this list alone.
+    assertion_targets: &'a mut Vec<(TableRef, Vec<String>)>,
+    deferred_tags: &'a mut Vec<DeferredTagging>,
+    deferred_watermarks: &'a mut Vec<DeferredWatermark>,
+}
+
+/// The adaptive throttle's half of a completed task.
+///
+/// `Some` on the two drain paths inside the spawn phase, where the semaphore is
+/// still issuing permits and the AIMD feedback loop is live. `None` on the
+/// serial auto-retry arm, which runs after the spawn loop has joined: there is
+/// no permit left to hand out, so signalling there would only move the reported
+/// `output.execution.final_concurrency`. That difference is named here rather
+/// than left as an omission (#1718).
+struct ThrottleSignal<'a> {
+    throttle: &'a Option<AdaptiveThrottle>,
+    semaphore: &'a Semaphore,
+    capacity: &'a mut usize,
+}
+
+/// The per-table hook surface: the registry plus the two identifiers every
+/// `HookContext` constructor on this path needs.
+struct TableHookContext<'a> {
+    registry: &'a HookRegistry,
+    run_id: &'a str,
+    pipeline_name: &'a str,
+}
+
+/// The ONE place a materialized [`TableResult`] is consumed (#1718).
+///
+/// Called from the spawn loop's inline drain, the final collection loop and the
+/// auto-retry arm. Everything the run accumulates from a copied table lands
+/// here: the materialization record, drift bookkeeping, the `column_match`
+/// result, the row-count / freshness batch refs, `assertion_targets`, the
+/// deferred tags and watermark, and the success checkpoint.
+///
+/// Two things the callers still differ on, both named parameters rather than
+/// omissions:
+///
+/// - `throttle` — see [`ThrottleSignal`].
+/// - `emit_materialize_hooks` — `true` on the two drain paths. `false` on the
+///   auto-retry arm, which fires no per-table hook today: its first attempt
+///   already fired `materialize_error`, and turning a retried table into an
+///   `after_materialize` / `drift_detected` emit would start outbound webhooks
+///   on a path that sends none. That is a separate decision from this fix, so
+///   the flag records it instead of hiding it.
+///
+/// `checkpoint_index` is the caller's own index for the progress row: the drain
+/// paths pass `total_completed - 1` (their position in completion order), the
+/// retry arm passes the table's index in `tables_to_process`, which is the row
+/// its failed first attempt already wrote.
+#[allow(clippy::too_many_arguments)]
+async fn collect_materialized_table(
+    tr: TableResult,
+    sinks: &mut MaterializedSinks<'_>,
+    throttle: Option<ThrottleSignal<'_>>,
+    hooks: &TableHookContext<'_>,
+    emit_materialize_hooks: bool,
+    checkpoint_index: usize,
+    state: &Arc<StateStore>,
+    run_id: &str,
+) {
+    // Destructured exhaustively on purpose: a field added to `TableResult`
+    // stops compiling here until this collector says what happens to it. That
+    // is the mechanism that keeps the three call sites from diverging again.
+    let TableResult {
+        materialization,
+        drift_checked,
+        drift_detected,
+        column_match_check,
+        probe_rate_limited,
+        source_batch_ref,
+        target_batch_ref,
+        freshness_batch_ref,
+        asset_key,
+        target_full_name,
+        target_ref,
+        deferred_tags,
+        deferred_watermark,
+    } = tr;
+
+    // Signal the adaptive throttle. The copy succeeded, but a post-copy
+    // `column_match` probe that came back rate-limited is still the warehouse
+    // asking us to slow down (#1666) — reading the whole task as a success
+    // there would widen the semaphore while it throttles.
+    if let Some(signal) = throttle
+        && let Some(t) = signal.throttle
+    {
+        if probe_rate_limited {
+            t.on_rate_limit();
+        } else {
+            t.on_success();
+        }
+        adjust_semaphore(t, signal.semaphore, signal.capacity);
+    }
+
+    // §P2.6 per-table emit: after_materialize on success.
+    if emit_materialize_hooks {
+        let _ = hooks
+            .registry
+            .fire(&HookContext::after_materialize(
+                hooks.run_id,
+                hooks.pipeline_name,
+                &target_full_name,
+                materialization.duration_ms,
+                materialization.rows_copied,
+            ))
+            .await;
+    }
+
+    sinks.output.tables_copied += 1;
+    rocky_observe::metrics::METRICS.inc_tables_processed();
+    rocky_observe::metrics::METRICS.record_table_duration_ms(materialization.duration_ms);
+    let duration_ms = materialization.duration_ms;
+    sinks.output.materializations.push(materialization);
+
+    if drift_checked {
+        sinks.output.drift.tables_checked += 1;
+    }
+    if let Some(drift_action) = drift_detected {
+        // §P2.6 per-table emit: drift_detected. The column-level list isn't
+        // plumbed through `TableResult` today (see `DriftActionOutput`: just
+        // table + action + reason), so we emit with an empty columns slice —
+        // subscribers get the table/action surface; column names are a
+        // follow-up that threads the full DriftResult.
+        if emit_materialize_hooks {
+            let _ = hooks
+                .registry
+                .fire(&HookContext::drift_detected(
+                    hooks.run_id,
+                    hooks.pipeline_name,
+                    &target_full_name,
+                    &[],
+                ))
+                .await;
+        }
+        sinks.output.drift.tables_drifted += 1;
+        sinks.output.drift.actions_taken.push(drift_action);
+    }
+
+    if let Some(check) = column_match_check {
+        let entry = sinks
+            .pending_checks
+            .entry(target_full_name.clone())
+            .or_insert_with(|| PendingCheck {
+                asset_key: asset_key.clone(),
+                checks: Vec::new(),
+            });
+        entry.checks.push(check);
+    }
+
+    if let Some(src_ref) = source_batch_ref {
+        sinks.source_batch_refs.push(src_ref);
+    }
+    if let Some(tgt_ref) = target_batch_ref {
+        sinks.target_batch_refs.push(tgt_ref);
+    }
+    sinks
+        .batch_asset_keys
+        .push((target_full_name.clone(), asset_key.clone()));
+    sinks
+        .assertion_targets
+        .push((target_ref, asset_key.clone()));
+
+    if let Some(fresh_ref) = freshness_batch_ref {
+        sinks.freshness_batch_refs.push(fresh_ref);
+    }
+
+    if let Some(tags) = deferred_tags {
+        sinks.deferred_tags.push(tags);
+    }
+    if let Some(wm) = deferred_watermark {
+        sinks.deferred_watermarks.push(wm);
+    }
+
+    // Checkpoint: record successful table progress.
+    checkpoint_table_progress(
+        state,
+        run_id,
+        rocky_core::state::TableProgress {
+            index: checkpoint_index,
+            table_key: target_full_name,
+            asset_key,
+            status: rocky_core::state::TableStatus::Success,
+            error: None,
+            duration_ms,
+            completed_at: Utc::now(),
+        },
+    )
+    .await;
+}
+
 /// Processes a single completed task result during the spawn loop's inline
 /// drain pass (adaptive concurrency only). This avoids duplicating the
 /// result-handling logic from the main collection loop for results that
 /// arrive while we're still spawning tasks.
+///
+/// The materialized arm delegates to [`collect_materialized_table`], the one
+/// place a `TableResult` is consumed (#1718). The other three arms — pruned,
+/// failed and panicked — stay here: they are not a `TableResult` and they
+/// differ from the final drain's for reasons of their own (that divergence is
+/// tracked separately).
 #[allow(clippy::too_many_arguments)]
 async fn process_completed_result(
     result: Result<(usize, Result<TableOutcome, anyhow::Error>), tokio::task::JoinError>,
@@ -13076,15 +13449,9 @@ async fn process_completed_result(
     throttle: &Option<AdaptiveThrottle>,
     semaphore: &Semaphore,
     semaphore_capacity: &mut usize,
-    output: &mut RunOutput,
-    pending_checks: &mut HashMap<String, PendingCheck>,
-    source_batch_refs: &mut Vec<TableRef>,
-    target_batch_refs: &mut Vec<TableRef>,
-    freshness_batch_refs: &mut Vec<TableRef>,
-    batch_asset_keys: &mut Vec<(String, Vec<String>)>,
+    sinks: &mut MaterializedSinks<'_>,
+    hooks: &TableHookContext<'_>,
     table_errors: &mut Vec<TableError>,
-    deferred_tags: &mut Vec<DeferredTagging>,
-    deferred_watermarks: &mut Vec<DeferredWatermark>,
     shared_state: &Arc<StateStore>,
     shared_run_id: &str,
     total_completed: &mut usize,
@@ -13097,7 +13464,7 @@ async fn process_completed_result(
                 t.on_success();
                 adjust_semaphore(t, semaphore, semaphore_capacity);
             }
-            record_pruned(output, pruned);
+            record_pruned(sinks.output, pruned);
             checkpoint_planned_table(
                 shared_state,
                 shared_run_id,
@@ -13107,74 +13474,19 @@ async fn process_completed_result(
             .await;
         }
         Ok((_, Ok(TableOutcome::Materialized(tr)))) => {
-            let tr = *tr;
-            // Same rule as the inline collector in `run()`: the copy succeeded,
-            // but a post-copy `column_match` probe that came back rate-limited
-            // is still the warehouse asking us to slow down (#1666).
-            if let Some(t) = &throttle {
-                if tr.probe_rate_limited {
-                    t.on_rate_limit();
-                } else {
-                    t.on_success();
-                }
-                adjust_semaphore(t, semaphore, semaphore_capacity);
-            }
-            output.tables_copied += 1;
-            rocky_observe::metrics::METRICS.inc_tables_processed();
-            rocky_observe::metrics::METRICS
-                .record_table_duration_ms(tr.materialization.duration_ms);
-            output.materializations.push(tr.materialization);
-
-            if tr.drift_checked {
-                output.drift.tables_checked += 1;
-            }
-            if let Some(drift_action) = tr.drift_detected {
-                output.drift.tables_drifted += 1;
-                output.drift.actions_taken.push(drift_action);
-            }
-
-            if let Some(check) = tr.column_match_check {
-                let entry = pending_checks
-                    .entry(tr.target_full_name.clone())
-                    .or_insert_with(|| PendingCheck {
-                        asset_key: tr.asset_key.clone(),
-                        checks: Vec::new(),
-                    });
-                entry.checks.push(check);
-            }
-
-            if let Some(src_ref) = tr.source_batch_ref {
-                source_batch_refs.push(src_ref);
-            }
-            if let Some(tgt_ref) = tr.target_batch_ref {
-                target_batch_refs.push(tgt_ref);
-            }
-            batch_asset_keys.push((tr.target_full_name.clone(), tr.asset_key.clone()));
-
-            if let Some(fresh_ref) = tr.freshness_batch_ref {
-                freshness_batch_refs.push(fresh_ref);
-            }
-
-            if let Some(tags) = tr.deferred_tags {
-                deferred_tags.push(tags);
-            }
-            if let Some(wm) = tr.deferred_watermark {
-                deferred_watermarks.push(wm);
-            }
-
-            // Checkpoint: record successful table progress
-            checkpoint_table_progress(
+            collect_materialized_table(
+                *tr,
+                sinks,
+                Some(ThrottleSignal {
+                    throttle,
+                    semaphore,
+                    capacity: semaphore_capacity,
+                }),
+                hooks,
+                true,
+                *total_completed - 1,
                 shared_state,
                 shared_run_id,
-                rocky_core::state::TableProgress {
-                    index: *total_completed - 1,
-                    table_key: tr.target_full_name,
-                    asset_key: tr.asset_key,
-                    status: rocky_core::state::TableStatus::Success,
-                    error: None,
-                    duration_ms: output.materializations.last().map_or(0, |m| m.duration_ms),
-                    completed_at: Utc::now(),
-                },
             )
             .await;
         }
@@ -13289,6 +13601,45 @@ fn is_rate_limit_error(error_msg: &str) -> bool {
         || upper.contains("UC_REQUEST_LIMIT_EXCEEDED")
         || upper.contains("RATE LIMIT")
         || upper.contains("TOO MANY REQUESTS")
+}
+
+/// One post-copy `column_match` probe, with the same retryable question the
+/// pre-copy target probe asks: `warehouse.classify_failure(&e).is_retryable()`.
+///
+/// Before #1718 this read was a single attempt, and any failure that did not
+/// substring-match a rate-limit phrasing became a settled `not_evaluated`. Since
+/// #1671 that result fails the run (exit 2) on data that already landed, and
+/// `--resume` then refuses because every table was copied. A network blip on a
+/// metadata read is not a settled answer, so it is asked again.
+///
+/// Budget: **one extra attempt, no backoff.** The connectors already retry a
+/// transient request internally with backoff before it surfaces here (see
+/// `rocky-databricks`' `max_retries_per_run` budget), so a second layer of
+/// waiting would only lengthen the run; this attempt covers the failure that
+/// escaped that budget. A second failure is a genuinely unanswerable probe and
+/// still becomes `not_evaluated` — the probe never propagates, because the copy
+/// has already succeeded and failing the table here would move copied data into
+/// `tables_failed` and, on `incremental`, double-insert on the table retry
+/// (#1666).
+///
+/// A rate limit is deliberately NOT retried: a second request into the same
+/// limit is the wrong move, and the signal the run needs from it is the
+/// adaptive throttle's. The error returned is the LAST attempt's, so a retry
+/// that is itself rate-limited still reaches the throttle.
+async fn probe_columns_after_copy(
+    warehouse: &dyn WarehouseAdapter,
+    table: &TableRef,
+) -> AdapterResult<Vec<ColumnInfo>> {
+    match warehouse.describe_table(table).await {
+        Ok(columns) => Ok(columns),
+        Err(e) => {
+            if is_rate_limit_error(&e.to_string()) || !warehouse.classify_failure(&e).is_retryable()
+            {
+                return Err(e);
+            }
+            warehouse.describe_table(table).await
+        }
+    }
 }
 
 /// Build the `column_match` result from the post-copy probes of both sides.
@@ -14156,6 +14507,139 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                 .unwrap();
             assert_eq!(progress.run_id, "run-1");
         }
+    }
+
+    /// A gated run's record as `to_run_record` writes it: the persisted
+    /// check-gate verdict (state schema v25) plus the `models_executed` entry
+    /// with `status: "failed"` that a `<verify_after>` custody failure leaves
+    /// behind — a failed entry with no model involved.
+    fn seed_gated_run_record(store: &StateStore, run_id: &str, status: &str) {
+        let record: rocky_core::state::RunRecord = serde_json::from_value(serde_json::json!({
+            "run_id": run_id,
+            "started_at": "2026-08-30T00:00:00Z",
+            "finished_at": "2026-08-30T00:01:00Z",
+            "status": status,
+            "models_executed": [{
+                "model_name": "<verify_after>",
+                "started_at": "2026-08-30T00:00:30Z",
+                "finished_at": "2026-08-30T00:00:31Z",
+                "duration_ms": 0,
+                "status": "failed",
+                "sql_hash": "",
+            }],
+            "trigger": "Manual",
+            "config_hash": "test",
+            "check_gate_failed": true,
+        }))
+        .expect("minimal RunRecord deserializes");
+        store.record_run(&record).unwrap();
+    }
+
+    /// #1720. Every table this run planned copied, the checks gated it, AND a
+    /// failed `models_executed` entry is present — the `<verify_after>` shape,
+    /// which needs no `--all` and no model at all.
+    ///
+    /// On `main` the failed-model branch admits this resume. It then skips
+    /// every `Success` key, copies nothing, builds no check input, runs no
+    /// check, derives `Success`, exits 0, and records `Success` — and
+    /// `latest_successful_run` matches on exactly that, so every downstream
+    /// `after` demand fires on data that is still violating. The persisted
+    /// gate is read BEFORE the model branch, so the resume is refused.
+    #[test]
+    fn resume_refuses_a_complete_checkpoint_whose_checks_gated_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        store.init_run_progress("run-1", 2, Some(&scope)).unwrap();
+        complete_tables(&store, "run-1", 2);
+
+        for status in ["PartialFailure", "Failure"] {
+            seed_gated_run_record(&store, "run-1", status);
+            for (resume_run_id, resume_latest) in [(None, true), (Some("run-1"), false)] {
+                let err = resolve_resume_progress(&store, resume_run_id, resume_latest, &scope)
+                    .expect_err("a resume that re-runs none of the gating checks must refuse");
+                let message = format!("{err:#}");
+                assert!(
+                    message.contains("nothing to resume: run run-1")
+                        && message.contains("gated by its checks")
+                        && message.contains("re-run none of those checks"),
+                    "unexpected refusal for {status} {resume_run_id:?}/{resume_latest}: {message}"
+                );
+            }
+        }
+    }
+
+    /// The narrowing conjunct for the refusal above: a gated run with copy
+    /// work left is still admitted, because a resume of it does real work.
+    /// What keeps THAT honest is the carry-forward, not a refusal — see
+    /// `a_resume_of_a_gated_run_cannot_record_success`. Without this the fix
+    /// would refuse every recovery from a run that happened to fail a check.
+    #[test]
+    fn resume_allows_a_gated_run_that_still_has_tables_to_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        store.init_run_progress("run-1", 3, Some(&scope)).unwrap();
+        complete_tables(&store, "run-1", 2);
+        seed_gated_run_record(&store, "run-1", "PartialFailure");
+
+        for (resume_run_id, resume_latest) in [(None, true), (Some("run-1"), false)] {
+            let progress = resolve_resume_progress(&store, resume_run_id, resume_latest, &scope)
+                .expect("a gated run with a table left to copy still resumes")
+                .expect("the checkpoint resolves");
+            assert_eq!(progress.run_id, "run-1");
+            assert_eq!(
+                super::inherited_check_gate(&store, Some(&progress)).as_deref(),
+                Some("run-1"),
+                "the admitted resume must carry the standing gate forward"
+            );
+        }
+    }
+
+    /// Control (#1720): an ungated failed run is untouched. `main`'s
+    /// behaviour for a genuine copy failure — resume admitted, nothing
+    /// inherited — must be exactly preserved, or the fix would refuse the
+    /// recovery path it exists to protect.
+    #[test]
+    fn an_ungated_failed_run_resumes_and_inherits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        store.init_run_progress("run-1", 3, Some(&scope)).unwrap();
+        complete_tables(&store, "run-1", 2);
+        seed_run_record(&store, "run-1", "PartialFailure");
+
+        let progress = resolve_resume_progress(&store, Some("run-1"), false, &scope)
+            .expect("an ungated copy failure resumes")
+            .expect("the checkpoint resolves");
+        assert!(
+            super::inherited_check_gate(&store, Some(&progress)).is_none(),
+            "no gate was recorded, so nothing is inherited"
+        );
+        assert!(
+            super::inherited_check_gate(&store, None).is_none(),
+            "a run that is not a resume inherits nothing"
+        );
+    }
+
+    /// A record that predates state schema v25 has no `check_gate_failed` key
+    /// at all. It must read as "no gate recorded", so every pre-upgrade
+    /// checkpoint resumes exactly as it did before the field existed.
+    #[test]
+    fn a_pre_v25_record_inherits_no_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        store.init_run_progress("run-1", 3, Some(&scope)).unwrap();
+        complete_tables(&store, "run-1", 2);
+        // `seed_run_record` builds the record from a JSON object with no
+        // `check_gate_failed` key — the v24 blob shape.
+        seed_run_record(&store, "run-1", "PartialFailure");
+        let stored = store.get_run("run-1").unwrap().unwrap();
+        assert!(!stored.check_gate_failed);
+
+        let progress = store.get_run_progress("run-1").unwrap().unwrap();
+        assert!(super::inherited_check_gate(&store, Some(&progress)).is_none());
     }
 
     /// The other narrowing conjunct: an unfinished copy is real work, so it
@@ -15198,9 +15682,11 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let (mut source_refs, mut target_refs, mut freshness_refs) =
             (Vec::new(), Vec::new(), Vec::new());
         let mut batch_asset_keys = Vec::new();
+        let mut assertion_targets = Vec::new();
         let mut table_errors = Vec::new();
         let (mut deferred_tags, mut deferred_watermarks) = (Vec::new(), Vec::new());
         let mut total_completed = 0;
+        let hook_registry = HookRegistry::from_config(&Default::default());
 
         type CompletedResult =
             Result<(usize, Result<TableOutcome, anyhow::Error>), tokio::task::JoinError>;
@@ -15227,15 +15713,23 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                 &None,
                 &semaphore,
                 &mut semaphore_capacity,
-                &mut output,
-                &mut pending_checks,
-                &mut source_refs,
-                &mut target_refs,
-                &mut freshness_refs,
-                &mut batch_asset_keys,
+                &mut MaterializedSinks {
+                    output: &mut output,
+                    pending_checks: &mut pending_checks,
+                    source_batch_refs: &mut source_refs,
+                    target_batch_refs: &mut target_refs,
+                    freshness_batch_refs: &mut freshness_refs,
+                    batch_asset_keys: &mut batch_asset_keys,
+                    assertion_targets: &mut assertion_targets,
+                    deferred_tags: &mut deferred_tags,
+                    deferred_watermarks: &mut deferred_watermarks,
+                },
+                &TableHookContext {
+                    registry: &hook_registry,
+                    run_id: "run-1",
+                    pipeline_name: "p1",
+                },
                 &mut table_errors,
-                &mut deferred_tags,
-                &mut deferred_watermarks,
                 &store,
                 "run-1",
                 &mut total_completed,
@@ -20175,9 +20669,11 @@ timestamp_column = "ts"
         let (mut source_refs, mut target_refs, mut freshness_refs) =
             (Vec::new(), Vec::new(), Vec::new());
         let mut batch_asset_keys = Vec::new();
+        let mut assertion_targets = Vec::new();
         let mut table_errors = Vec::new();
         let (mut deferred_tags, mut deferred_watermarks) = (Vec::new(), Vec::new());
         let mut total_completed = 0;
+        let hook_registry = HookRegistry::from_config(&Default::default());
         let tasks = vec![task.clone()];
         state
             .init_run_progress("run-1", tasks.len(), Some(&test_resume_scope("p1")))
@@ -20188,15 +20684,23 @@ timestamp_column = "ts"
             &throttle,
             &semaphore,
             &mut semaphore_capacity,
-            &mut output,
-            &mut pending_checks,
-            &mut source_refs,
-            &mut target_refs,
-            &mut freshness_refs,
-            &mut batch_asset_keys,
+            &mut MaterializedSinks {
+                output: &mut output,
+                pending_checks: &mut pending_checks,
+                source_batch_refs: &mut source_refs,
+                target_batch_refs: &mut target_refs,
+                freshness_batch_refs: &mut freshness_refs,
+                batch_asset_keys: &mut batch_asset_keys,
+                assertion_targets: &mut assertion_targets,
+                deferred_tags: &mut deferred_tags,
+                deferred_watermarks: &mut deferred_watermarks,
+            },
+            &TableHookContext {
+                registry: &hook_registry,
+                run_id: "run-1",
+                pipeline_name: "p1",
+            },
             &mut table_errors,
-            &mut deferred_tags,
-            &mut deferred_watermarks,
             &state,
             "run-1",
             &mut total_completed,
@@ -20938,6 +21442,344 @@ backend = "local"
                 "{why}"
             );
         }
+    }
+
+    /// #1720, the higher-frequency shape — and the one the tool's own advice
+    /// used to steer an operator into. Three tables; two copy, one fails, and
+    /// one of the COPIED tables fails its row-count check. The run correctly
+    /// exits 2 and now records the gate.
+    ///
+    /// The resume is legitimately admitted (a real copy remains), and it
+    /// re-copies exactly the failed table. Check inputs are built only from
+    /// the tables the current invocation copies (#1670), so the earlier
+    /// violation is never re-evaluated: on `main` the resumed run has no
+    /// failed table and no check result, derives `Success`, exits 0, and
+    /// records `Success` — and `latest_successful_run` matches on exactly
+    /// `Success`, firing every downstream `after` demand on violating data.
+    ///
+    /// Walks the real chain: `replication_check_gate_failed` →
+    /// `to_run_record` → `record_run` → `inherited_check_gate` →
+    /// `resolved_check_gate` → `derive_run_status` → `to_run_record`.
+    #[test]
+    fn a_resume_of_a_gated_run_cannot_record_success() {
+        use rocky_core::state::{RunStatus, StateStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let checks = checks_config("row_count = true");
+        let now = chrono::Utc::now();
+
+        // --- the first run: 2 of 3 tables copied, 1 failed, and a row-count
+        // check failed on a table that DID copy.
+        let mut first = RunOutput::new(String::new(), 0, 3);
+        first.tables_copied = 2;
+        first.tables_failed = 1;
+        first
+            .check_results
+            .push(failing_check_bag(rocky_core::checks::check_row_count(
+                10, 7,
+            )));
+        first.check_gate_failed = super::replication_check_gate_failed(&first, &checks);
+        assert!(first.check_gate_failed, "an error-severity failure gates");
+
+        let first_record = first.to_run_record(
+            "run-1",
+            now,
+            now,
+            "cfg".to_string(),
+            rocky_core::state::RunTrigger::Manual,
+            first.derive_run_status(),
+            crate::output::RunRecordAudit::test_sentinels(),
+        );
+        assert!(
+            first_record.check_gate_failed,
+            "the severity-resolved verdict must reach the record"
+        );
+        store.record_run(&first_record).unwrap();
+        store.init_run_progress("run-1", 3, None).unwrap();
+        let progress = store.get_run_progress("run-1").unwrap().unwrap();
+
+        // --- the resume: it copies the one table that failed, and nothing
+        // else. It runs the checks for that table only, and they pass.
+        let inherited = super::inherited_check_gate(&store, Some(&progress));
+        assert_eq!(inherited.as_deref(), Some("run-1"));
+
+        let mut resumed = RunOutput::new(String::new(), 0, 1);
+        resumed.tables_copied = 1;
+        resumed.resumed_from = Some("run-1".to_string());
+        let own_gate = super::replication_check_gate_failed(&resumed, &checks);
+        assert!(!own_gate, "the resume re-ran none of the gating checks");
+        resumed.check_gate_failed = super::resolved_check_gate(own_gate, inherited.as_ref());
+
+        assert!(
+            !matches!(resumed.derive_run_status(), RunStatus::Success),
+            "a resume that re-ran none of the gating checks must not report Success"
+        );
+        assert!(matches!(
+            resumed.derive_run_status(),
+            RunStatus::PartialFailure
+        ));
+
+        // The resumed run's OWN record carries the gate too, so a resume of
+        // the resume inherits it in turn instead of clearing it by depth.
+        let resumed_record = resumed.to_run_record(
+            "run-2",
+            now,
+            now,
+            "cfg".to_string(),
+            rocky_core::state::RunTrigger::Manual,
+            resumed.derive_run_status(),
+            crate::output::RunRecordAudit::test_sentinels(),
+        );
+        assert!(
+            resumed_record.check_gate_failed,
+            "the standing gate must survive onto the resumed run's own record"
+        );
+        assert!(!matches!(resumed_record.status, RunStatus::Success));
+        store.record_run(&resumed_record).unwrap();
+        store.init_run_progress("run-2", 1, None).unwrap();
+        let progress2 = store.get_run_progress("run-2").unwrap().unwrap();
+        assert_eq!(
+            super::inherited_check_gate(&store, Some(&progress2)).as_deref(),
+            Some("run-2"),
+            "a resume of the resume inherits the same standing gate"
+        );
+    }
+
+    /// #1720. An interrupted resume must still record the standing gate.
+    ///
+    /// The SIGINT path persists its `RunRecord` well before the check-gate
+    /// stamp runs, so the inheritance is stamped onto the output the moment
+    /// it is created instead. Without that, an interrupted resume of a gated
+    /// run would record `check_gate_failed = false`, a resume of THAT run
+    /// would inherit nothing, and the violation would launder through the
+    /// interrupted run in the middle.
+    #[test]
+    fn an_interrupted_resume_still_records_the_standing_gate() {
+        use rocky_core::state::RunStatus;
+
+        let now = chrono::Utc::now();
+        let inherited = Some("run-1".to_string());
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        // Exactly what the runner does at output-creation time.
+        out.check_gate_failed = super::resolved_check_gate(false, inherited.as_ref());
+        out.tables_copied = 1;
+        out.interrupted = true;
+
+        let record = out.to_run_record(
+            "run-2",
+            now,
+            now,
+            "cfg".to_string(),
+            rocky_core::state::RunTrigger::Manual,
+            out.derive_run_status(),
+            crate::output::RunRecordAudit::test_sentinels(),
+        );
+        assert!(
+            record.check_gate_failed,
+            "an interrupt before the check-gate stamp must not drop the standing verdict"
+        );
+        assert!(!matches!(record.status, RunStatus::Success));
+    }
+
+    /// #1720, the ordering the test above depends on and cannot itself check.
+    ///
+    /// The inherited gate is stamped where the output is CREATED, not at the
+    /// check-gate stamp far below, because the SIGINT path persists its
+    /// `RunRecord` in between. No behavioural unit test reaches that — an
+    /// interrupt needs a real signal during a real run — and a mutation that
+    /// deletes the early stamp passes the whole `commands::run::` suite. So
+    /// the ordering is asserted over this file's own source, the shape
+    /// `rocky-mcp`'s `tools.rs` already uses for a claim about its own text.
+    ///
+    /// Both `find`s take the FIRST occurrence, which is the production site;
+    /// the copies inside this test are thousands of lines later.
+    #[test]
+    fn the_inherited_gate_is_stamped_before_the_interrupt_path_persists() {
+        let source = include_str!("run.rs");
+        let stamp = source
+            .find("output.check_gate_failed = resolved_check_gate(false, inherited_gate.as_ref());")
+            .expect("the early inherited-gate stamp is gone — see #1720");
+        let interrupt_persist = source
+            .find("// Persist interrupted RunRecord")
+            .expect("the interrupt path's persist comment moved; re-anchor this test");
+        assert!(
+            stamp < interrupt_persist,
+            "the inherited gate must be stamped before the interrupt path persists its \
+             RunRecord, or an interrupted resume of a gated run records no verdict and the \
+             resume after it inherits nothing (#1720)"
+        );
+    }
+
+    /// Control (#1720). A resume with nothing inherited is unchanged: the
+    /// verdict is the run's own, so an honest recovery from a copy failure
+    /// still reaches `Success` and still records `check_gate_failed = false`.
+    #[test]
+    fn a_resume_with_no_standing_gate_still_reaches_success() {
+        use rocky_core::state::RunStatus;
+
+        let checks = checks_config("row_count = true");
+        let now = chrono::Utc::now();
+        let mut resumed = RunOutput::new(String::new(), 0, 1);
+        resumed.tables_copied = 1;
+        resumed.resumed_from = Some("run-1".to_string());
+        resumed
+            .check_results
+            .push(failing_check_bag(rocky_core::checks::check_row_count(
+                10, 10,
+            )));
+
+        let own_gate = super::replication_check_gate_failed(&resumed, &checks);
+        resumed.check_gate_failed = super::resolved_check_gate(own_gate, None);
+
+        assert!(!resumed.check_gate_failed);
+        assert!(matches!(resumed.derive_run_status(), RunStatus::Success));
+        let record = resumed.to_run_record(
+            "run-2",
+            now,
+            now,
+            "cfg".to_string(),
+            rocky_core::state::RunTrigger::Manual,
+            resumed.derive_run_status(),
+            crate::output::RunRecordAudit::test_sentinels(),
+        );
+        assert!(!record.check_gate_failed);
+        assert!(matches!(record.status, RunStatus::Success));
+    }
+
+    /// Control (#1720). `fail_on_error = false` declares every check
+    /// advisory, so such a run records NO gate even with an error-severity
+    /// check failing — there is nothing for a later resume to inherit.
+    ///
+    /// This is also why flipping the flag after a gated run cannot erase the
+    /// verdict: a run that declared its checks advisory never wrote one.
+    #[test]
+    fn a_run_with_fail_on_error_off_records_no_gate_to_inherit() {
+        use rocky_core::state::RunStatus;
+
+        let now = chrono::Utc::now();
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.tables_copied = 2;
+        out.check_results
+            .push(failing_check_bag(rocky_core::checks::check_row_count(
+                10, 7,
+            )));
+        out.check_gate_failed =
+            super::replication_check_gate_failed(&out, &checks_config("fail_on_error = false"));
+
+        assert!(!out.check_gate_failed, "an advisory check never gates");
+        assert!(matches!(out.derive_run_status(), RunStatus::Success));
+        let record = out.to_run_record(
+            "run-advisory",
+            now,
+            now,
+            "cfg".to_string(),
+            rocky_core::state::RunTrigger::Manual,
+            out.derive_run_status(),
+            crate::output::RunRecordAudit::test_sentinels(),
+        );
+        assert!(
+            !record.check_gate_failed,
+            "nothing to inherit from a run that declared its checks advisory"
+        );
+    }
+
+    /// A healthy run is untouched (#1720): no check configured, nothing
+    /// copied wrong, `Success` in the payload and `check_gate_failed = false`
+    /// on the record.
+    #[test]
+    fn a_healthy_run_records_no_gate() {
+        use rocky_core::state::RunStatus;
+
+        let now = chrono::Utc::now();
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.tables_copied = 3;
+        out.check_gate_failed =
+            super::replication_check_gate_failed(&out, &checks_config("row_count = true"));
+
+        assert!(!out.check_gate_failed);
+        assert!(matches!(out.derive_run_status(), RunStatus::Success));
+        let record = out.to_run_record(
+            "run-healthy",
+            now,
+            now,
+            "cfg".to_string(),
+            rocky_core::state::RunTrigger::Manual,
+            out.derive_run_status(),
+            crate::output::RunRecordAudit::test_sentinels(),
+        );
+        assert!(!record.check_gate_failed);
+        assert!(matches!(record.status, RunStatus::Success));
+    }
+
+    /// #1720, the misdirected advice. The failed-copy branch returns before
+    /// the check-gate branch, so when a copy AND a check both failed this is
+    /// the only message the operator sees — and "use --resume to retry"
+    /// alone is wrong there. Without the gate the message is byte-identical
+    /// to before, so an honest copy failure reads exactly as it did.
+    #[test]
+    fn the_partial_failure_advice_names_the_check_gate_only_when_one_failed() {
+        let plain = super::PartialFailure {
+            count: 1,
+            run_id: "run-1".to_string(),
+            check_gate_failed: false,
+        }
+        .to_string();
+        assert_eq!(
+            plain,
+            "1 table(s) failed during parallel execution (run_id: run-1, use --resume run-1 to retry)",
+            "an ungated copy failure keeps its exact message"
+        );
+
+        let gated = super::PartialFailure {
+            count: 1,
+            run_id: "run-1".to_string(),
+            check_gate_failed: true,
+        }
+        .to_string();
+        assert!(
+            gated.contains("also failed its check gate")
+                && gated.contains("re-runs none of the checks")
+                && gated.contains("re-run the pipeline"),
+            "a copy + check failure must say the resume cannot clear the gate: {gated}"
+        );
+    }
+
+    /// #1720. A purely inherited gate has a count of `0` — the violation is
+    /// on a table this resume never re-copied, so it produced no check result
+    /// to count. "0 error-severity check(s) failed" would be a lie about a
+    /// run that is deliberately not green, so the message names the run that
+    /// raised the gate instead. The uninherited message is unchanged.
+    #[test]
+    fn the_check_gate_message_names_the_run_that_raised_an_inherited_gate() {
+        let own = super::CheckGateFailure {
+            count: 2,
+            run_id: "run-1".to_string(),
+            inherited_from: None,
+        }
+        .to_string();
+        assert!(
+            own.starts_with("2 error-severity check(s) failed (run_id: run-1")
+                && own.contains("a resume would copy nothing"),
+            "a run's own gate keeps its exact message: {own}"
+        );
+
+        let inherited = super::CheckGateFailure {
+            count: 0,
+            run_id: "run-2".to_string(),
+            inherited_from: Some("run-1".to_string()),
+        }
+        .to_string();
+        assert!(
+            !inherited.starts_with('0'),
+            "an inherited gate must not report a count of zero failures: {inherited}"
+        );
+        assert!(
+            inherited.contains("raised by run run-1")
+                && inherited.contains("re-ran none of those checks")
+                && inherited.contains("resuming again cannot clear the gate"),
+            "an inherited gate must name the run that raised it: {inherited}"
+        );
     }
 
     /// The stale-JSON-status defect: `merge_replication_compile_and_copy_errors`
@@ -26383,6 +27225,7 @@ auto_create_schemas = true
             check_outcomes: Vec::new(),
             pipeline: None,
             submission_id: None,
+            check_gate_failed: false,
         };
         state.record_run(&failed).unwrap();
 
@@ -27711,6 +28554,7 @@ auto_create_schemas = true
             check_outcomes: Vec::new(),
             pipeline: None,
             submission_id: None,
+            check_gate_failed: false,
         };
         store.record_run(&run).unwrap();
         // The prior build's LIVE artifact — the ledger row the liveness gate
@@ -27907,6 +28751,7 @@ auto_create_schemas = true
             check_outcomes: Vec::new(),
             pipeline: None,
             submission_id: None,
+            check_gate_failed: false,
         };
         store.record_run(&base_run).unwrap();
         store
@@ -28034,6 +28879,7 @@ auto_create_schemas = true
             check_outcomes: Vec::new(),
             pipeline: None,
             submission_id: None,
+            check_gate_failed: false,
         };
         store.record_run(&run).unwrap();
 
@@ -29018,6 +29864,7 @@ auto_create_schemas = true
                 check_outcomes: Vec::new(),
                 pipeline: None,
                 submission_id: None,
+                check_gate_failed: false,
             };
             store.record_run(&run).unwrap();
             // The prior build's LIVE artifact row — the liveness gate resolves
@@ -29320,6 +30167,7 @@ auto_create_schemas = true
                     check_outcomes: Vec::new(),
                     pipeline: None,
                     submission_id: None,
+                    check_gate_failed: false,
                 })
                 .unwrap();
             // The prior live_d build's LIVE artifact-ledger row — the liveness
@@ -32204,5 +33052,754 @@ value = "'{source}'"
             0,
             "a one-carrier group runs no query"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // #1718 — one collector for every materialized table.
+    // ---------------------------------------------------------------------
+
+    /// A `TableResult` produced by a real copy, so the collector tests below
+    /// assert on the shape production actually builds.
+    #[cfg(feature = "duckdb")]
+    async fn materialized_table_result(state: &Arc<StateStore>) -> TableResult {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (event_id INTEGER, user_id INTEGER, ts TIMESTAMP)",
+            "INSERT INTO src.events VALUES (1, 7, TIMESTAMP '2026-03-01 10:00:00')",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+        let pipeline = parse_pipeline(
+            r#"strategy = "full_refresh"
+timestamp_column = "ts"
+"#,
+        );
+        let mut task = column_match_task(vec![], vec![]);
+        // Every per-table check on, so the collector has one of each input to
+        // carry: `column_match_check`, the two row-count refs and the
+        // freshness ref.
+        task.check_row_count = true;
+        task.check_freshness = true;
+
+        let outcome = process_table(&adapter, state, &pipeline, &task, false)
+            .await
+            .expect("the copy must succeed");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+        *result
+    }
+
+    /// The accumulators a collector call fills, owned by the test.
+    #[cfg(feature = "duckdb")]
+    #[derive(Default)]
+    struct CollectedRun {
+        output: Option<RunOutput>,
+        pending_checks: HashMap<String, PendingCheck>,
+        source_refs: Vec<TableRef>,
+        target_refs: Vec<TableRef>,
+        freshness_refs: Vec<TableRef>,
+        batch_asset_keys: Vec<(String, Vec<String>)>,
+        assertion_targets: Vec<(TableRef, Vec<String>)>,
+        deferred_tags: Vec<DeferredTagging>,
+        deferred_watermarks: Vec<DeferredWatermark>,
+    }
+
+    #[cfg(feature = "duckdb")]
+    impl CollectedRun {
+        fn new() -> Self {
+            Self {
+                output: Some(RunOutput::new(String::new(), 0, 1)),
+                ..Default::default()
+            }
+        }
+
+        fn sinks(&mut self) -> MaterializedSinks<'_> {
+            MaterializedSinks {
+                output: self.output.as_mut().expect("output"),
+                pending_checks: &mut self.pending_checks,
+                source_batch_refs: &mut self.source_refs,
+                target_batch_refs: &mut self.target_refs,
+                freshness_batch_refs: &mut self.freshness_refs,
+                batch_asset_keys: &mut self.batch_asset_keys,
+                assertion_targets: &mut self.assertion_targets,
+                deferred_tags: &mut self.deferred_tags,
+                deferred_watermarks: &mut self.deferred_watermarks,
+            }
+        }
+
+        /// `(table, [check names])` — `PendingCheck` is not `Debug`.
+        fn check_names(&self) -> Vec<(String, Vec<String>)> {
+            let mut v: Vec<(String, Vec<String>)> = self
+                .pending_checks
+                .iter()
+                .map(|(k, p)| (k.clone(), p.checks.iter().map(|c| c.name.clone()).collect()))
+                .collect();
+            v.sort();
+            v
+        }
+    }
+
+    /// #1718, defect 1. `process_completed_result` is the drain the spawn loop
+    /// runs inline whenever a throttle is present, and `ConcurrencyMode::Adaptive`
+    /// is the default — so this is the collector a default-configured run uses
+    /// for every table that completes while the loop waits on the semaphore.
+    ///
+    /// It never pushed `assertion_targets`, which is the ONLY input to four
+    /// loops in `run_batched_checks`: assertions, null-rate, custom checks and
+    /// cross-source overlap. A table collected here therefore ran none of them,
+    /// and nothing reported the omission.
+    ///
+    /// Fails before the fix: `assertion_targets` is empty.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn the_inline_drain_contributes_every_check_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let tr = materialized_table_result(&state).await;
+        let target_full_name = tr.target_full_name.clone();
+
+        let tasks = vec![planned_task("events")];
+        state
+            .init_run_progress("run-1", tasks.len(), Some(&test_resume_scope("p1")))
+            .unwrap();
+
+        let semaphore = Semaphore::new(1);
+        let mut semaphore_capacity = 1;
+        let mut table_errors = Vec::new();
+        let mut total_completed = 0;
+        let hook_registry = HookRegistry::from_config(&Default::default());
+        let mut collected = CollectedRun::new();
+
+        process_completed_result(
+            Ok((0, Ok(TableOutcome::Materialized(Box::new(tr))))),
+            &tasks,
+            &None,
+            &semaphore,
+            &mut semaphore_capacity,
+            &mut collected.sinks(),
+            &TableHookContext {
+                registry: &hook_registry,
+                run_id: "run-1",
+                pipeline_name: "p1",
+            },
+            &mut table_errors,
+            &state,
+            "run-1",
+            &mut total_completed,
+        )
+        .await;
+
+        assert_eq!(
+            collected.assertion_targets.len(),
+            1,
+            "the inline drain must contribute the table's assertion target — it \
+             is the only input to the assertion, null-rate, custom and \
+             cross-source-overlap checks"
+        );
+        assert_eq!(collected.assertion_targets[0].0.table, "events");
+        // The inputs this collector already carried, pinned so the unification
+        // cannot drop one on the way.
+        assert!(
+            collected
+                .pending_checks
+                .get(&target_full_name)
+                .is_some_and(|p| p.checks.iter().any(|c| c.name == "column_match")),
+            "column_match must still land: {:?}",
+            collected.check_names()
+        );
+        assert_eq!(collected.freshness_refs.len(), 1, "freshness reference");
+        assert_eq!(collected.source_refs.len(), 1, "source row-count reference");
+        assert_eq!(collected.target_refs.len(), 1, "target row-count reference");
+        assert_eq!(collected.batch_asset_keys.len(), 1);
+        assert_eq!(collected.deferred_watermarks.len(), 1);
+        assert_eq!(collected.output.as_ref().unwrap().tables_copied, 1);
+    }
+
+    /// #1718, defect 2. `table_retries` defaults to 1, so a table whose first
+    /// copy failed and whose retry succeeded is an ordinary shape. The retry arm
+    /// forwarded the materialization, the batch refs and `assertion_targets` and
+    /// dropped `column_match_check` and `freshness_batch_ref` — on the class of
+    /// table most likely to be unhealthy, and fail-open against the #1598 /
+    /// #1671 gate.
+    ///
+    /// Drives the collector with exactly the arguments the retry arm passes: no
+    /// throttle signal (the spawn loop has joined), no per-table hook emit, and
+    /// the table's own index as the checkpoint row.
+    ///
+    /// Fails before the fix: no `column_match` result and no freshness
+    /// reference.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_retried_table_contributes_its_column_match_and_freshness() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let tr = materialized_table_result(&state).await;
+        let target_full_name = tr.target_full_name.clone();
+
+        let tasks = [planned_task("a"), planned_task("events")];
+        state
+            .init_run_progress("run-1", tasks.len(), Some(&test_resume_scope("p1")))
+            .unwrap();
+
+        let hook_registry = HookRegistry::from_config(&Default::default());
+        let mut collected = CollectedRun::new();
+
+        collect_materialized_table(
+            tr,
+            &mut collected.sinks(),
+            None,
+            &TableHookContext {
+                registry: &hook_registry,
+                run_id: "run-1",
+                pipeline_name: "p1",
+            },
+            false,
+            // The retry arm checkpoints at the task's own index, replacing the
+            // `Failed` row its first attempt wrote.
+            1,
+            &state,
+            "run-1",
+        )
+        .await;
+
+        assert!(
+            collected
+                .pending_checks
+                .get(&target_full_name)
+                .is_some_and(|p| p.checks.iter().any(|c| c.name == "column_match")),
+            "a retried table must still contribute its column_match result: {:?}",
+            collected.check_names()
+        );
+        assert_eq!(
+            collected.freshness_refs.len(),
+            1,
+            "a retried table must still contribute its freshness reference"
+        );
+        assert_eq!(collected.assertion_targets.len(), 1);
+        assert_eq!(collected.source_refs.len(), 1);
+        assert_eq!(collected.target_refs.len(), 1);
+
+        let progress = state.get_run_progress("run-1").unwrap().unwrap();
+        let row = progress
+            .tables
+            .iter()
+            .find(|t| t.index == 1)
+            .expect("the retry checkpoints at the task's own index");
+        assert_eq!(row.status, rocky_core::state::TableStatus::Success);
+    }
+
+    /// The structural half of #1718: there is exactly ONE place a materialized
+    /// `TableResult` is consumed, and all three call sites route through it.
+    ///
+    /// The divergence this fixes was only possible because the same work was
+    /// written three times. A second `assertion_targets.push(` in production
+    /// means a fourth copy of the body has appeared, and the check kinds it
+    /// forgets will be silent again.
+    #[test]
+    fn one_collector_consumes_every_materialized_table() {
+        // PRODUCTION code only — the test module below calls the collector too.
+        // Anchored on the module header, not on a bare `#[cfg(test)]`: this
+        // file has a test-only helper (`build_replication_strategy`) sitting in
+        // the middle of the production half, so cutting at the first
+        // `#[cfg(test)]` would drop everything after it from the scan.
+        let full = include_str!("run.rs");
+        let src = &full[..full
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the test module header")];
+
+        // Whitespace-stripped, so `cargo fmt` wrapping a call across lines
+        // cannot silently zero either count.
+        let compact: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            compact.matches(".assertion_targets.push(").count(),
+            1,
+            "`assertion_targets` must be pushed in exactly one place. It is the \
+             only input to the assertion, null-rate, custom and \
+             cross-source-overlap check loops, and a second push site means a \
+             second collector that can forget it (#1718)."
+        );
+        assert_eq!(
+            compact.matches("collect_materialized_table(").count(),
+            4,
+            "expected one definition plus three call sites — the spawn loop's \
+             inline drain, the final drain and the auto-retry arm (#1718)"
+        );
+    }
+
+    /// A DuckDB project with `count` source tables in one schema and a
+    /// `not_null` assertion on each. Returns the config path.
+    #[cfg(feature = "duckdb")]
+    async fn write_many_table_project(
+        dir: &std::path::Path,
+        count: usize,
+        concurrency: Option<usize>,
+    ) -> std::path::PathBuf {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let db_path = dir.join("warehouse.duckdb");
+        {
+            let warehouse = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+            warehouse
+                .execute_statement("CREATE SCHEMA raw__acme")
+                .await
+                .unwrap();
+            for i in 0..count {
+                warehouse
+                    .execute_statement(&format!(
+                        "CREATE TABLE raw__acme.t{i:02} AS SELECT {i} AS id"
+                    ))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let execution = match concurrency {
+            Some(n) => format!("\n[pipeline.rep.execution]\nconcurrency = {n}\n"),
+            None => String::new(),
+        };
+        let mut assertions = String::new();
+        for i in 0..count {
+            assertions.push_str(&format!(
+                "\n[[pipeline.rep.checks.assertions]]\ntable = \"t{i:02}\"\ntype = \"not_null\"\ncolumn = \"id\"\n"
+            ));
+        }
+
+        let config_path = dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{db}"
+
+[state]
+backend = "local"
+
+[pipeline.rep]
+type = "replication"
+strategy = "full_refresh"
+{execution}
+[pipeline.rep.source.discovery]
+adapter = "default"
+
+[pipeline.rep.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.rep.target]
+adapter = "default"
+catalog_template = "warehouse"
+schema_template = "staging__{{source}}"
+
+[pipeline.rep.target.governance]
+auto_create_schemas = true
+{assertions}"#,
+                db = db_path.display(),
+            ),
+        )
+        .unwrap();
+        config_path
+    }
+
+    /// Drives a full `run()` and returns the persisted record.
+    #[cfg(feature = "duckdb")]
+    async fn drive_run_for_record(
+        config_path: &std::path::Path,
+        state_path: &std::path::Path,
+        run_id: &str,
+    ) -> (anyhow::Result<()>, rocky_core::state::RunRecord) {
+        let result = super::run(
+            config_path,
+            std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(config_path).unwrap(),
+            ),
+            None,
+            Some("rep"),
+            state_path,
+            None,
+            false,
+            None,
+            false,
+            None,
+            false,
+            None,
+            &PartitionRunOptions::default(),
+            None,
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            Some(run_id),
+            None,
+            false,
+            None,
+        )
+        .await
+        .map(|_| ());
+        let store = StateStore::open(state_path).unwrap();
+        let record = store
+            .get_run(run_id)
+            .unwrap()
+            .expect("the run must persist a record");
+        (result, record)
+    }
+
+    /// #1718, end to end. More tables than the adaptive cap (32), under the
+    /// DEFAULT concurrency, with an assertion configured on every one.
+    ///
+    /// The spawn loop drains completed tasks inline whenever a throttle is
+    /// present, and `ConcurrencyMode::Adaptive` is `#[default]`. Once the
+    /// semaphore saturates that inline drain collects most of the table set —
+    /// and before this fix it contributed no assertion target, so those tables
+    /// ran no assertion at all.
+    ///
+    /// The same project under `ConcurrencyMode::Fixed` never takes the inline
+    /// path, so the two runs are each other's control: they must agree, and
+    /// both must report one assertion per table.
+    ///
+    /// Fails before the fix on the adaptive run: fewer than `TABLES` assertion
+    /// outcomes, and the two runs disagree.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_default_concurrency_runs_every_table_assertion() {
+        use rocky_core::state::RunStatus;
+
+        // Above the adaptive cap of 32, so the spawn loop must wait on the
+        // semaphore — and every wait guarantees a completed task for the next
+        // iteration's inline drain to collect.
+        const TABLES: usize = 40;
+
+        let adaptive_dir = tempfile::tempdir().unwrap();
+        let adaptive_config = write_many_table_project(adaptive_dir.path(), TABLES, None).await;
+        let (adaptive_result, adaptive_record) = drive_run_for_record(
+            &adaptive_config,
+            &adaptive_dir.path().join("state.redb"),
+            "run-adaptive",
+        )
+        .await;
+        adaptive_result.expect("the default-concurrency run must succeed");
+
+        let fixed_dir = tempfile::tempdir().unwrap();
+        let fixed_config = write_many_table_project(fixed_dir.path(), TABLES, Some(4)).await;
+        let (fixed_result, fixed_record) = drive_run_for_record(
+            &fixed_config,
+            &fixed_dir.path().join("state.redb"),
+            "run-fixed",
+        )
+        .await;
+        fixed_result.expect("the fixed-concurrency run must succeed");
+
+        let assertions = |record: &rocky_core::state::RunRecord| {
+            record
+                .check_outcomes
+                .iter()
+                .filter(|c| c.name == "not_null:id")
+                .count()
+        };
+
+        assert_eq!(
+            assertions(&adaptive_record),
+            TABLES,
+            "every table copied under the DEFAULT adaptive concurrency must run \
+             its assertion; the tables the spawn loop drained inline ran none \
+             (#1718). Outcomes: {:?}",
+            adaptive_record.check_outcomes
+        );
+        assert_eq!(
+            assertions(&fixed_record),
+            TABLES,
+            "the fixed-concurrency control must be unchanged"
+        );
+        assert_eq!(
+            adaptive_record.status,
+            RunStatus::Success,
+            "a healthy run stays a success"
+        );
+        assert_eq!(fixed_record.status, RunStatus::Success);
+
+        // The two runs are each other's control: the same project, the same
+        // data, one concurrency mode apart, must produce the same checks.
+        let sorted = |record: &rocky_core::state::RunRecord| {
+            let mut names: Vec<(String, bool)> = record
+                .check_outcomes
+                .iter()
+                .map(|c| (c.name.clone(), c.passed))
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            sorted(&adaptive_record),
+            sorted(&fixed_record),
+            "which concurrency mode a run uses must not change which checks run"
+        );
+    }
+
+    /// A DuckDB adapter whose post-copy `describe_table` for the target fails
+    /// the first `fail_first` times with `inject`, then answers normally.
+    /// `classify_failure` delegates to real DuckDB, so the injected message
+    /// selects the class the probe must react to.
+    #[cfg(feature = "duckdb")]
+    struct FlakyPostCopyDescribe<'a> {
+        inner: &'a rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+        copied: std::sync::atomic::AtomicBool,
+        target_describes: std::sync::atomic::AtomicUsize,
+        fail_first: usize,
+        inject: &'static str,
+        /// Message for the second and later failures, when `fail_first > 1`.
+        inject_again: &'static str,
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[async_trait::async_trait]
+    impl rocky_core::traits::WarehouseAdapter for FlakyPostCopyDescribe<'_> {
+        fn dialect(&self) -> &dyn rocky_core::traits::SqlDialect {
+            self.inner.dialect()
+        }
+
+        async fn execute_statement(&self, sql: &str) -> rocky_core::traits::AdapterResult<()> {
+            self.inner.execute_statement(sql).await
+        }
+
+        async fn execute_query(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::QueryResult> {
+            self.inner.execute_query(sql).await
+        }
+
+        async fn execute_statement_with_stats(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::ExecutionStats> {
+            let stats = self.inner.execute_statement_with_stats(sql).await?;
+            self.copied.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(stats)
+        }
+
+        fn classify_failure(
+            &self,
+            err: &rocky_core::traits::AdapterError,
+        ) -> rocky_core::failure_class::FailureClass {
+            self.inner.classify_failure(err)
+        }
+
+        async fn describe_table(
+            &self,
+            table: &rocky_ir::TableRef,
+        ) -> rocky_core::traits::AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+            if table.schema == "tgt" && self.copied.load(std::sync::atomic::Ordering::SeqCst) {
+                let seen = self
+                    .target_describes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if seen < self.fail_first {
+                    let msg = if seen == 0 {
+                        self.inject
+                    } else {
+                        self.inject_again
+                    };
+                    return Err(rocky_core::traits::AdapterError::msg(msg));
+                }
+            }
+            self.inner.describe_table(table).await
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn run_flaky_post_copy_probe(
+        fail_first: usize,
+        inject: &'static str,
+        inject_again: &'static str,
+    ) -> (TableResult, usize) {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (event_id INTEGER, user_id INTEGER)",
+            "INSERT INTO src.events VALUES (1, 7), (2, 8)",
+        ] {
+            inner.execute_statement(sql).await.unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let pipeline = parse_pipeline(r#"strategy = "full_refresh""#);
+        let task = column_match_task(vec![], vec![]);
+
+        let adapter = FlakyPostCopyDescribe {
+            inner: &inner,
+            copied: std::sync::atomic::AtomicBool::new(false),
+            target_describes: std::sync::atomic::AtomicUsize::new(0),
+            fail_first,
+            inject,
+            inject_again,
+        };
+        let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+            .await
+            .expect("a metadata read must never fail a table that copied");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+        let calls = adapter
+            .target_describes
+            .load(std::sync::atomic::Ordering::SeqCst);
+        (*result, calls)
+    }
+
+    /// `RunOutput` carrying one table's checks, for the real check gate.
+    #[cfg(feature = "duckdb")]
+    fn output_with_check(check: checks::CheckResult) -> RunOutput {
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.tables_copied = 1;
+        out.check_results.push(TableCheckOutput {
+            asset_key: vec!["test".into(), "events".into()],
+            checks: vec![check],
+        });
+        out
+    }
+
+    /// #1718 / #1678 review. The post-copy `column_match` probe treated ANY
+    /// adapter error that did not substring-match a rate-limit phrasing as a
+    /// settled `not_evaluated`. Since #1671 that fails the run — exit 2 on data
+    /// that already landed — and `--resume` then refuses, because every table
+    /// was copied. A network blip on a metadata read is not a settled answer.
+    ///
+    /// The probe now asks the question the PRE-copy probe fifty lines up asks:
+    /// `warehouse.classify_failure(&e).is_retryable()`. A retryable, non
+    /// rate-limit failure is asked again.
+    ///
+    /// Fails before the fix: `not_evaluated` is set, `passed` is false and the
+    /// real gate trips, which is exit 2.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_retryable_post_copy_probe_is_asked_again() {
+        // DuckDB classifies lock contention as `Transient(ServerBusy)`, so this
+        // is a retryable error that is NOT a rate limit.
+        let (result, calls) =
+            run_flaky_post_copy_probe(1, "IO Error: database is locked", "unused").await;
+
+        assert_eq!(calls, 2, "the retryable probe must be asked exactly twice");
+        let check = result
+            .column_match_check
+            .expect("the task enables column_match");
+        assert!(
+            check.not_evaluated.is_none(),
+            "a probe that answered on the retry is evaluated: {:?}",
+            check.not_evaluated
+        );
+        assert!(check.passed, "the copy produced matching columns");
+        assert!(
+            !result.probe_rate_limited,
+            "a lock-contention failure is not a rate limit"
+        );
+
+        // The consequence, through the real gate: exit 0, not 2.
+        let gate = super::replication_check_gate_failed(
+            &output_with_check(check),
+            &rocky_core::config::ChecksConfig {
+                fail_on_error: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            !gate,
+            "an answered probe must not fail a run whose data landed"
+        );
+    }
+
+    /// Control for the above: a probe that will not answer is still
+    /// `not_evaluated`, and is NOT retried. A permanent failure asked twice is
+    /// a wasted round trip, not a second opinion.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn an_unanswerable_post_copy_probe_is_still_not_evaluated() {
+        let (result, calls) =
+            run_flaky_post_copy_probe(1, "Catalog Error: injected permanent failure", "unused")
+                .await;
+
+        assert_eq!(calls, 1, "a permanent failure must not be retried");
+        let check = result
+            .column_match_check
+            .expect("the task enables column_match");
+        assert!(
+            check
+                .not_evaluated
+                .as_deref()
+                .is_some_and(|r| r.contains("injected permanent failure")),
+            "the reason must carry the adapter's own error: {:?}",
+            check.not_evaluated
+        );
+        assert!(!check.passed, "`not_evaluated` is fail-closed (#1602)");
+        assert!(!result.probe_rate_limited);
+
+        let gate = super::replication_check_gate_failed(
+            &output_with_check(check),
+            &rocky_core::config::ChecksConfig {
+                fail_on_error: true,
+                ..Default::default()
+            },
+        );
+        assert!(gate, "an unanswerable probe still gates the run");
+    }
+
+    /// A retry that is ITSELF rate-limited must still reach the adaptive
+    /// throttle. The retrying probe returns the LAST attempt's error, so the
+    /// rate-limit predicate reads the 429 rather than the blip that preceded it.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_retry_that_is_rate_limited_still_reaches_the_throttle() {
+        let (result, calls) = run_flaky_post_copy_probe(
+            2,
+            "IO Error: database is locked",
+            "429 Too Many Requests: UC_REQUEST_LIMIT_EXCEEDED",
+        )
+        .await;
+
+        assert_eq!(calls, 2, "one retry, bounded");
+        assert!(
+            result.probe_rate_limited,
+            "the retry's 429 must still be carried out to the throttle"
+        );
+        let check = result
+            .column_match_check
+            .expect("the task enables column_match");
+        assert!(
+            check
+                .not_evaluated
+                .as_deref()
+                .is_some_and(|r| r.contains("429")),
+            "the reason must carry the LAST attempt's error: {:?}",
+            check.not_evaluated
+        );
+    }
+
+    /// A rate limit is not retried: a second request into the same limit is the
+    /// wrong move, and the signal the run needs from it is the throttle's.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_rate_limited_post_copy_probe_is_not_retried() {
+        let (result, calls) = run_flaky_post_copy_probe(
+            1,
+            "429 Too Many Requests: UC_REQUEST_LIMIT_EXCEEDED",
+            "unused",
+        )
+        .await;
+
+        assert_eq!(calls, 1, "a rate limit must not be asked again immediately");
+        assert!(result.probe_rate_limited);
     }
 }
