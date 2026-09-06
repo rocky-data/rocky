@@ -401,7 +401,11 @@ pub async fn propose_governed_run_plan(
         // so the apply never reaches the mask-reconciling model leg — the
         // mask is never bound, `false` on both sides.
         false,
-    );
+    )
+    // A malformed surrogate-key spec must refuse rather than fingerprint the
+    // plan without it (#1730). `Compile` is the closest existing variant: the
+    // spec lives beside the model and this is a project that does not load.
+    .map_err(|e| ProposeError::Compile(format!("{e:#}")))?;
 
     // Gate on the models the apply will EXECUTE: the freshly-compiled
     // project narrowed by the plan's `--model` selection — mirroring how

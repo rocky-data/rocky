@@ -2409,6 +2409,40 @@ pub(crate) struct ExecutionExtras {
     effective_masks: BTreeMap<String, rocky_ir::MaskStrategy>,
 }
 
+/// The surrogate-key map both sides of the execution fingerprint must hash.
+///
+/// Filtered to the COMPILED model set and strict on a malformed spec — the
+/// derivation the apply-side choke-point already used. The plan side used
+/// `load_surrogate_keys_from_tree(models_dir).unwrap_or_default()` instead:
+/// unfiltered, and emptied on any `ModelError`. Two sides of one fingerprint,
+/// built by different functions over different sets (#1730).
+///
+/// What that cost:
+///
+/// - A `.sql` under `models/` that is not a compiled model is in the plan's
+///   map and not in the apply's, so the digests differ and `rocky apply`
+///   refuses a legitimate plan. Constructible: `load_models_from_dir_filtered`
+///   skips a file whose NAME is not valid UTF-8, while the surrogate-key load
+///   checks only the extension.
+/// - A malformed spec on such a file collapsed the plan side to an EMPTY map,
+///   so the plan was persisted with no surrogate key in its fingerprint at all
+///   — the fail-open direction, and the one the justifying comment claimed
+///   could not happen because the gate "must keep hashing the resolved whole".
+///   `.unwrap_or_default()` already made that false in the strongest way.
+pub(crate) fn resolved_surrogate_keys(
+    models_dir: &std::path::Path,
+    models: &[rocky_core::models::Model],
+) -> anyhow::Result<std::collections::HashMap<String, Vec<rocky_core::models::SurrogateKeySpec>>> {
+    let selected: std::collections::HashSet<std::path::PathBuf> = models
+        .iter()
+        .map(|m| std::path::PathBuf::from(&m.file_path))
+        .collect();
+    rocky_core::models::load_surrogate_keys_from_tree_filtered(models_dir, |path| {
+        selected.contains(path)
+    })
+    .context("invalid surrogate_key configuration")
+}
+
 impl ExecutionExtras {
     /// Assemble the extras from the already-loaded surrogate-key map, the
     /// compiled models (for `contract_path`s + classification tags), and the
@@ -4794,6 +4828,89 @@ pub async fn run_apply_inline_for_run(
 
 #[cfg(test)]
 mod tests {
+    /// #1730. Both sides of the execution fingerprint must build the
+    /// surrogate-key map with the SAME function over the SAME set.
+    ///
+    /// The plan side used `load_surrogate_keys_from_tree(models_dir)
+    /// .unwrap_or_default()`: unfiltered, and emptied on any `ModelError`. The
+    /// apply-side choke-point used the filtered, strict load. So a malformed
+    /// spec collapsed the plan side to an empty map — the plan was persisted
+    /// with no surrogate key in its fingerprint at all — while the apply side
+    /// refused. Fail-open on the side that writes the plan.
+    #[test]
+    fn a_malformed_surrogate_key_spec_refuses_instead_of_emptying_the_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("orders.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            models.join("orders.toml"),
+            "name = \"orders\"\ntarget = { catalog = \"c\", schema = \"s\", table = \"orders\" }\n[[surrogate_key]]\nname = \"sk\"\ncolumns = [\"id\"]\n",
+        )
+        .unwrap();
+
+        let compiled =
+            rocky_core::models::load_models_from_dir(&models, None).expect("the fixture loads");
+
+        // Control: a well-formed spec resolves, and the key is IN the map.
+        let ok = super::resolved_surrogate_keys(&models, &compiled)
+            .expect("a well-formed spec resolves");
+        assert!(
+            ok.contains_key("orders"),
+            "precondition: the map is what carries the key into the fingerprint: {ok:?}"
+        );
+
+        // Now break the spec. `.unwrap_or_default()` used to swallow this to an
+        // EMPTY map on the plan side and fingerprint the plan without it.
+        std::fs::write(
+            models.join("orders.toml"),
+            "name = \"orders\"\ntarget = { catalog = \"c\", schema = \"s\", table = \"orders\" }\n[[surrogate_key]]\nname = \"sk\"\ncolumns = \"not-a-list\"\n",
+        )
+        .unwrap();
+        let err = super::resolved_surrogate_keys(&models, &compiled)
+            .expect_err("a malformed spec must refuse, not empty the fingerprint");
+        assert!(
+            format!("{err:#}").contains("surrogate_key"),
+            "the refusal names what it could not read: {err:#}"
+        );
+    }
+
+    /// #1730, the other half of "the same set": the map is FILTERED to the
+    /// compiled models. A `.sql` under `models/` that is not a compiled model
+    /// was in the plan side's map and not in the apply side's, so the two
+    /// digests differed and `rocky apply` refused a legitimate plan.
+    #[test]
+    fn the_resolved_map_is_filtered_to_the_compiled_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        for name in ["orders", "shipments"] {
+            std::fs::write(models.join(format!("{name}.sql")), "SELECT 1 AS id\n").unwrap();
+            std::fs::write(
+                models.join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\ntarget = {{ catalog = \"c\", schema = \"s\", table = \"{name}\" }}\n[[surrogate_key]]\nname = \"sk\"\ncolumns = [\"id\"]\n"
+                ),
+            )
+            .unwrap();
+        }
+        let all =
+            rocky_core::models::load_models_from_dir(&models, None).expect("the fixture loads");
+        assert_eq!(all.len(), 2);
+
+        // Hand it ONE of the two, as a narrowed compile would.
+        let one: Vec<_> = all
+            .iter()
+            .filter(|m| m.config.name == "orders")
+            .cloned()
+            .collect();
+        let map = super::resolved_surrogate_keys(&models, &one).expect("resolves");
+        assert!(map.contains_key("orders"));
+        assert!(
+            !map.contains_key("shipments"),
+            "a model outside the compiled set must not enter the fingerprint: {map:?}"
+        );
+    }
 
     // ---- the policy gate fails closed on an unreadable config (#1559) ----
 
