@@ -288,6 +288,10 @@ async fn run_one_tick(
     let opts = TickOptions {
         dry_run: false,
         pipeline_filter: None,
+        // The tick takes its turn at the server's store gate, behind the HTTP
+        // reads, instead of polling the file lock they hold; see
+        // `ServerState::store_access`.
+        store_gate: Some(Arc::clone(&state.store_access)),
         config_path: config_path.to_path_buf(),
         rocky_dir: rocky_dir.to_path_buf(),
         // Describe the `scheduler.tick` span above so each child `rocky run`

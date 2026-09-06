@@ -3,9 +3,18 @@
 //!
 //! [`tick_once`] is the reconciler's single orchestration point. It is called by
 //! the `rocky tick` CLI and, later, by a resident loop; both pass the clock in
-//! as `now` — the core reads no wall clock, so every time-dependent path is
-//! deterministic under test. Children are launched through an injected
-//! [`Spawner`], so the whole reconciler runs without a built binary.
+//! as `now`, and every **scheduling decision** — is this occurrence due, is this
+//! claim past its grace, has this budget expired — reads that injected instant
+//! and nothing else, so it is deterministic under test. Children are launched
+//! through an injected [`Spawner`], so the whole reconciler runs without a built
+//! binary.
+//!
+//! The one thing `now` does **not** drive is the age of a file on disk. The
+//! webhook spool's `.done` tombstones are stamped from the host wall clock by
+//! `spool::dispose`, so `spool::sweep_tombstones` compares them against that
+//! same wall clock and takes no instant from the caller. Measuring a filesystem
+//! mtime against a logical clock let `rocky tick --now <future>` unlink every
+//! tombstone in one pass (#1716).
 //!
 //! The pass, in order:
 //!
@@ -31,9 +40,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use thiserror::Error;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::RockyConfig;
 use crate::state::{StateError, StateStore};
@@ -110,6 +121,18 @@ pub struct TickOptions {
     /// behavior: every pipeline in scope is evaluated. Shared (an `Arc` clone)
     /// with the serve loop and its [`SubprocessSpawner`].
     pub drain: Drain,
+    /// The process-wide state-store gate of a resident scheduler (`rocky serve`);
+    /// `None` for `rocky tick`.
+    ///
+    /// The server queues every one of its own store opens, its HTTP reads and
+    /// this tick alike, on one permit, so they take turns instead of racing for
+    /// redb's exclusive file lock. Without it a tick under sustained UI reads
+    /// polled that lock a few times and gave up as `state_busy`: measured at
+    /// eight polling clients, 43 of 67 ticks. The permit is held only while the
+    /// tick holds the store, and released around each child's window exactly as
+    /// the store itself is; a child, another process, contends the way it
+    /// always did.
+    pub store_gate: Option<Arc<Semaphore>>,
 }
 
 /// How many times the reconciler re-opens the state store after a child before
@@ -146,6 +169,16 @@ fn open_tick_store(state_path: &Path) -> Result<Option<StateStore>, TickError> {
     }
 }
 
+/// Take the resident server's store gate, when there is one. Waits its turn
+/// behind the server's own reads; never polls. A closed gate (the server is
+/// shutting down) behaves as no gate, so a tick never faults on it.
+async fn acquire_gate(gate: Option<&Arc<Semaphore>>) -> Option<OwnedSemaphorePermit> {
+    match gate {
+        Some(gate) => Arc::clone(gate).acquire_owned().await.ok(),
+        None => None,
+    }
+}
+
 /// Outcome of re-opening the store after a child's window.
 enum StoreReopen {
     /// The store is open again; the tick continues.
@@ -167,6 +200,11 @@ enum StoreReopen {
 struct PhaseStore {
     path: PathBuf,
     inner: Option<StateStore>,
+    /// The resident server's store gate, when there is one; taken before every
+    /// open and dropped with every close, so the tick and the server's reads
+    /// take turns.
+    gate: Option<Arc<Semaphore>>,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl PhaseStore {
@@ -183,12 +221,21 @@ impl PhaseStore {
     /// the `StateStore` value releases them.
     fn close(&mut self) {
         self.inner = None;
+        self.permit = None;
     }
 
     /// Re-open the store read-write after a child, retrying briefly on
     /// contention. A genuine fault propagates as [`TickError::State`]; exhausted
     /// contention is [`StoreReopen::Busy`], never an error.
     async fn reopen(&mut self) -> Result<StoreReopen, TickError> {
+        // Drop any permit still held BEFORE waiting for one. `close` already
+        // clears it on every real path, but `self.permit = acquire(..).await`
+        // evaluates its right-hand side first: called while a permit is held,
+        // that waits for a permit only its own holder can release — a silent
+        // hang rather than a failure. Clearing first makes the method safe
+        // whatever the caller did.
+        self.permit = None;
+        self.permit = acquire_gate(self.gate.as_ref()).await;
         for attempt in 1..=REOPEN_RETRY_ATTEMPTS {
             match StateStore::open(&self.path) {
                 Ok(store) => {
@@ -342,8 +389,11 @@ pub enum TickError {
 
 /// Evaluate all standing demand once and execute what is due.
 ///
-/// `now` is always injected — the reconciler core reads no wall clock. Children
-/// run through `spawner`, so the logic is testable without a binary.
+/// `now` is always injected, and it drives every scheduling decision — the core
+/// reads no wall clock to decide what is due. The one exception is the webhook
+/// spool's tombstone sweep, which ages files by their filesystem mtime and so
+/// reads the wall clock that stamped them (#1716). Children run through
+/// `spawner`, so the logic is testable without a binary.
 ///
 /// # Errors
 ///
@@ -393,6 +443,7 @@ pub async fn tick_once(
     //    store is a whole-tick busy-skip (exit 0), not a fault. The store is owned
     //    (not borrowed) so it can be released around each child spawn — the child
     //    opens the same file and must find both locks free.
+    let permit = acquire_gate(opts.store_gate.as_ref()).await;
     let Some(store) = open_tick_store(state_path)? else {
         report.state_busy = true;
         return Ok(report);
@@ -400,6 +451,8 @@ pub async fn tick_once(
     let mut phase = PhaseStore {
         path: state_path.to_path_buf(),
         inner: Some(store),
+        gate: opts.store_gate.clone(),
+        permit,
     };
 
     // 3. Resolve schedules in scope; invalid ones fail closed to skips.
@@ -519,8 +572,27 @@ pub async fn tick_once(
         // dir — the same argument `list_pending_files` takes above. Passing
         // `spool_dir(..)` resolved it twice and swept a path that never exists
         // (#1711); `SpoolDir` now makes that a compile error.
-        if let Err(e) = spool::sweep_tombstones(&opts.rocky_dir, now) {
-            tracing::warn!(error = %e, "webhook tombstone sweep failed");
+        //
+        // It deliberately does NOT take this tick's `now`. Tombstone ages are
+        // filesystem mtimes stamped from the host wall clock, so the sweep reads
+        // that clock; handing it the injected instant let `rocky tick --now
+        // <future>` erase the whole dedup window (#1716). The outcome is logged
+        // rather than discarded — this is the only place a tick deletes state an
+        // operator may need to reason about.
+        match spool::sweep_tombstones(&opts.rocky_dir) {
+            Ok(sweep) if sweep.swept > 0 || sweep.failed > 0 => tracing::info!(
+                swept = sweep.swept,
+                kept = sweep.kept,
+                failed = sweep.failed,
+                "webhook tombstone sweep"
+            ),
+            Ok(sweep) => tracing::debug!(
+                swept = 0,
+                kept = sweep.kept,
+                failed = 0,
+                "webhook tombstone sweep"
+            ),
+            Err(e) => tracing::warn!(error = %e, "webhook tombstone sweep failed"),
         }
     }
 
@@ -568,12 +640,14 @@ fn webhook_schedule(
 /// to a terminal state (spawning the child) and then dispose of the file.
 ///
 /// The reconciler is the single-threaded dedup authority. For a
-/// [`WebhookKind::Id`] demand it consults the `.done` tombstone *before*
-/// claiming, so an accept-side race (a redelivery landing a fresh file after
-/// consumption) can never cause a second run — the tombstone drops the
-/// duplicate. A pipeline no longer in config is finalized and disposed loudly so
-/// it never lingers forever; an unparseable file is quarantined, never silently
-/// deleted.
+/// [`WebhookKind::Id`] demand it consults the `.done` tombstone *before every
+/// other gate that could hold the file back* — the pause gate included — so an
+/// accept-side race (a redelivery landing a fresh file after consumption) can
+/// never cause a second run: the tombstone drops the duplicate on the first tick
+/// that sees it. Deferring a duplicate instead let a pause outlive its own
+/// tombstone and re-run the delivery on resume (#1716). A pipeline no longer in
+/// config is finalized and disposed loudly so it never lingers forever; an
+/// unparseable file is quarantined, never silently deleted.
 #[allow(clippy::too_many_arguments)]
 async fn consume_webhook_demands(
     config: &RockyConfig,
@@ -639,6 +713,21 @@ async fn consume_webhook_demands(
             continue;
         }
 
+        // Id-dedup authority: a tombstone means this delivery id already ran.
+        // Drop the (duplicate) pending file without running.
+        //
+        // This runs BEFORE the pause gate, and the order is load-bearing (#1716).
+        // A duplicate of an already-consumed delivery is not a demand to defer —
+        // it is a demand that must never exist again. Deferring it left the file
+        // pending across the pause; once #1714 made the sweep real, a pause
+        // longer than `spool::TOMBSTONE_TTL` outlived the tombstone, and on
+        // resume `is_tombstoned` was false and the duplicate ran a second time.
+        if demand_record.kind == WebhookKind::Id && spool::is_tombstoned(&path) {
+            if let Err(e) = spool::drop_pending(&path) {
+                tracing::warn!(error = %e, "failed to drop a duplicate webhook demand");
+            }
+            continue;
+        }
         // The runtime hold gates webhooks too — a paused pipeline DEFERS its
         // spooled demands rather than executing them (the bypass the #1334
         // red team confirmed) and rather than dropping them: the file stays
@@ -660,15 +749,6 @@ async fn consume_webhook_demands(
                 source: Some(DemandKind::Webhook),
                 reason: TickSkipReason::Paused,
             });
-            continue;
-        }
-
-        // Id-dedup authority: a tombstone means this delivery id already ran.
-        // Drop the (duplicate) pending file without running.
-        if demand_record.kind == WebhookKind::Id && spool::is_tombstoned(&path) {
-            if let Err(e) = spool::drop_pending(&path) {
-                tracing::warn!(error = %e, "failed to drop a duplicate webhook demand");
-            }
             continue;
         }
 
@@ -1726,6 +1806,7 @@ cron = "also invalid"
             member_budgets: BTreeMap::new(),
             state_path: state_path.clone(),
             drain: Drain::default(),
+            store_gate: None,
         };
         (state_path, dir, opts)
     }
@@ -1825,6 +1906,35 @@ cron = "also invalid"
         captured: Mutex<Vec<SpawnRequest>>,
         exit_code: i32,
         finished_at: DateTime<Utc>,
+    }
+
+    /// A spawner that takes the store gate during the child's window, the way
+    /// the resident server's job-record write does
+    /// (`JobsModelSpawner::record`). It must succeed: the tick releases its
+    /// permit with the store at `PhaseStore::close`, and if a future edit ever
+    /// held the permit across the spawn instead, this waits forever — a hung
+    /// scheduler, not a failed one. The bounded wait turns that into a failure.
+    struct GateProbingSpawner {
+        gate: Arc<Semaphore>,
+        acquired: Mutex<bool>,
+    }
+
+    #[async_trait]
+    impl Spawner for GateProbingSpawner {
+        async fn run(&self, _request: &SpawnRequest) -> RunOutcome {
+            let got = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                Arc::clone(&self.gate).acquire_owned(),
+            )
+            .await
+            .is_ok();
+            *self.acquired.lock().unwrap() = got;
+            RunOutcome {
+                exit_code: 0,
+                pid: Some(4243),
+                drain_interrupted: false,
+            }
+        }
     }
 
     #[async_trait]
@@ -2840,6 +2950,99 @@ freshness = true
         drop(held);
     }
 
+    // --- the store gate: a resident server's reads and ticks take turns --------
+
+    #[test]
+    fn tick_waits_at_the_store_gate_instead_of_busy_skipping() {
+        let (state_path, _dir, mut opts) = temp_env();
+        let config = cfg(CRON_ONLY);
+        let gate = Arc::new(Semaphore::new(1));
+        opts.store_gate = Some(gate.clone());
+        let rt = rt();
+        // A server read holds the gate. The tick must wait for its turn, not
+        // poll the store's file lock and give up as `state_busy`.
+        let held = rt.block_on(gate.clone().acquire_owned()).unwrap();
+        let spawner = CapturingSpawner::new(0);
+        let started = std::time::Instant::now();
+        let report = rt
+            .block_on(async {
+                let release = async {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    drop(held);
+                };
+                let (report, ()) = tokio::join!(
+                    tick_once(&config, &state_path, at(2026, 5, 2, 4, 0), &spawner, &opts),
+                    release
+                );
+                report
+            })
+            .unwrap();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(300),
+            "the tick ran before the gate was released"
+        );
+        assert!(
+            !report.state_busy,
+            "a held gate is a wait, never a busy skip: {report:?}"
+        );
+        assert_eq!(
+            report.evaluated.len(),
+            1,
+            "the pipeline was evaluated once the gate opened"
+        );
+        assert_eq!(
+            gate.available_permits(),
+            1,
+            "the tick returned its permit with the store"
+        );
+    }
+
+    #[test]
+    fn the_store_gate_is_free_during_a_child_window() {
+        let (state_path, _dir, mut opts) = temp_env();
+        let config = cfg(CRON_ONLY);
+        let gate = Arc::new(Semaphore::new(1));
+        opts.store_gate = Some(gate.clone());
+
+        // First sight anchors raw's cron and fires nothing.
+        let anchor = CapturingSpawner::new(0);
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            at(2026, 5, 1, 12, 0),
+            &anchor,
+            &opts,
+        ))
+        .unwrap();
+
+        // The occurrence fires. The spawner takes the gate mid-child, exactly as
+        // the server's job-record write does.
+        let spawner = GateProbingSpawner {
+            gate: gate.clone(),
+            acquired: Mutex::new(false),
+        };
+        let report = rt()
+            .block_on(tick_once(
+                &config,
+                &state_path,
+                at(2026, 5, 2, 4, 0),
+                &spawner,
+                &opts,
+            ))
+            .unwrap();
+
+        assert_eq!(report.executed.len(), 1, "the occurrence fired");
+        assert!(
+            *spawner.acquired.lock().unwrap(),
+            "the gate must be free while a child runs, or the scheduler deadlocks"
+        );
+        assert_eq!(
+            gate.available_permits(),
+            1,
+            "the tick returned its permit with the store"
+        );
+    }
+
     // --- owned-store lifecycle: the child can open the released store ----------
 
     #[test]
@@ -3484,19 +3687,47 @@ adapter = "db"
         found.pop().unwrap()
     }
 
-    /// Stamp `at` onto a tombstone's mtime.
+    /// Stamp a tombstone's mtime `back` before the host wall clock.
     ///
-    /// The sweep compares the mtime against the `now` handed to the tick, while
-    /// `dispose` stamps real wall-clock. `webhook_now()` is a fixed past
-    /// instant, so ageing a tombstone against wall-clock would leave it in the
-    /// tick's FUTURE and nothing would expire. Age relative to the tick instant.
-    fn age_tombstone(path: &std::path::Path, at: DateTime<Utc>) {
+    /// The sweep ages tombstones by their filesystem mtime against the same wall
+    /// clock `dispose` stamps them with — NOT against the `now` handed to the
+    /// tick (#1716). So a test ages relative to wall-clock, and `webhook_now()`
+    /// being a fixed past instant is irrelevant here.
+    fn age_tombstone(path: &std::path::Path, back: chrono::Duration) {
+        let at = std::time::SystemTime::now() - back.to_std().expect("a positive age");
         std::fs::File::options()
             .write(true)
             .open(path)
             .unwrap()
-            .set_modified(std::time::SystemTime::from(at))
+            .set_modified(at)
             .unwrap();
+    }
+
+    /// Force a duplicate pending file to coexist with its own tombstone — the
+    /// accept-side race `spool.rs` documents at the fast-path dedup: the
+    /// tombstone check passes just before `dispose`'s rename, so the hard link
+    /// lands after it. Hide the tombstone, accept the same token again, restore
+    /// it. Returns the tombstone path.
+    fn force_duplicate_beside_tombstone(
+        opts: &TickOptions,
+        pipeline: &str,
+        token: &str,
+    ) -> std::path::PathBuf {
+        let spool_path = spool::spool_dir(&opts.rocky_dir);
+        let tombstone = only_tombstone(&spool_path);
+        // Outside the spool directory, so neither the scan nor the sweep sees it.
+        let hidden = opts.rocky_dir.join("hidden-tombstone");
+        std::fs::rename(&tombstone, &hidden).unwrap();
+        accept_and_read_uid(&opts.rocky_dir, pipeline, spool::WebhookKind::Id, token);
+        std::fs::rename(&hidden, &tombstone).unwrap();
+        // The dedup filename is 64 hex chars, so stripping `.done` yields the
+        // pending path the duplicate was linked at.
+        assert!(
+            tombstone.with_extension("").exists(),
+            "the duplicate pending file is back on disk"
+        );
+        assert!(tombstone.exists(), "beside its own tombstone");
+        tombstone
     }
 
     /// #1711: the tick's tombstone sweep must run on the spool directory the
@@ -3530,7 +3761,7 @@ adapter = "db"
         let tombstone = only_tombstone(&spool_path);
         age_tombstone(
             &tombstone,
-            webhook_now() - spool::TOMBSTONE_TTL - chrono::Duration::hours(1),
+            spool::TOMBSTONE_TTL + chrono::Duration::hours(1),
         );
 
         // Tick 2 must sweep it. This is the assertion that fails on an
@@ -3578,10 +3809,10 @@ adapter = "db"
 
         let spool_path = spool::spool_dir(&opts.rocky_dir);
         let tombstone = only_tombstone(&spool_path);
-        // One hour INSIDE the window, measured from the tick's own instant.
+        // One hour INSIDE the window, measured from the host wall clock.
         age_tombstone(
             &tombstone,
-            webhook_now() - spool::TOMBSTONE_TTL + chrono::Duration::hours(1),
+            spool::TOMBSTONE_TTL - chrono::Duration::hours(1),
         );
         // A quarantined corruption sits alongside it. `list_pending_files`
         // skips it, and the sweep must too.
@@ -3632,7 +3863,7 @@ adapter = "db"
         let tombstone = only_tombstone(&spool_path);
         age_tombstone(
             &tombstone,
-            webhook_now() - spool::TOMBSTONE_TTL - chrono::Duration::hours(1),
+            spool::TOMBSTONE_TTL + chrono::Duration::hours(1),
         );
 
         // A second delivery lands while the pipeline is paused, so the next
@@ -3657,6 +3888,234 @@ adapter = "db"
             "the deferred delivery is still pending — the sweep left it alone"
         );
         assert_eq!(spawner.run_count(), 1, "the paused pipeline did not run");
+    }
+
+    // --- #1716: dedup must survive a pause, and `--now` must not erase it ----
+
+    /// #1716 item 1: a duplicate whose pipeline is paused must be DROPPED, not
+    /// deferred — otherwise it outlives its own tombstone and runs on resume.
+    ///
+    /// ```text
+    /// tick 1   accept evt-1 ─► run #1 ─► tombstone(evt-1)
+    /// race     hide tombstone ─► accept evt-1 again ─► restore tombstone
+    ///          (the accept-side race spool.rs documents)
+    /// pause    raw paused; tombstone aged past TOMBSTONE_TTL
+    /// tick 2   main: paused ⇒ defer, then the sweep unlinks the tombstone
+    ///          fix:  tombstone ⇒ drop the duplicate BEFORE the pause gate
+    /// resume   main: no tombstone ⇒ run #2   ← the defect
+    ///          fix:  nothing pending ⇒ still one run
+    /// ```
+    #[test]
+    fn a_paused_pipeline_drops_a_duplicate_instead_of_outliving_its_tombstone() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(WEBHOOK_TARGETS);
+        accept_and_read_uid(&opts.rocky_dir, "raw", spool::WebhookKind::Id, "evt-1");
+
+        let spawner = CapturingSpawner::new(0);
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            webhook_now(),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        assert_eq!(spawner.run_count(), 1, "the first delivery runs once");
+
+        let tombstone = force_duplicate_beside_tombstone(&opts, "raw", "evt-1");
+        with_store(&state_path, |store| {
+            store.set_schedule_paused("raw", true).unwrap();
+        });
+        age_tombstone(
+            &tombstone,
+            spool::TOMBSTONE_TTL + chrono::Duration::hours(1),
+        );
+
+        // Tick 2, paused. The duplicate must be dropped here, before the pause
+        // gate can defer it and before the sweep removes its tombstone. The
+        // observations are captured, not asserted, so the sequence runs to the
+        // end and the double run is what fails first.
+        let report = rt()
+            .block_on(tick_once(
+                &config,
+                &state_path,
+                webhook_now(),
+                &spawner,
+                &opts,
+            ))
+            .unwrap();
+        let pending_after_tick_2 = spool::list_pending_files(&opts.rocky_dir).unwrap();
+
+        // Tick 3, still paused: nothing left to do.
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            webhook_now(),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+
+        // Resume. On `main` the tombstone is gone by now and the duplicate runs
+        // a second time.
+        with_store(&state_path, |store| {
+            store.set_schedule_paused("raw", false).unwrap();
+        });
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            webhook_now(),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+
+        // The headline, asserted first: `main` reaches 2 here.
+        assert_eq!(
+            spawner.run_count(),
+            1,
+            "a delivery id consumed once must never run twice, pause or no pause"
+        );
+        assert!(
+            pending_after_tick_2.is_empty(),
+            "a duplicate is dropped while paused, never left pending"
+        );
+        assert!(
+            !report
+                .skipped
+                .iter()
+                .any(|s| s.source == Some(DemandKind::Webhook)),
+            "a dropped duplicate is not a deferral, so no webhook skip is recorded: {:?}",
+            report.skipped
+        );
+    }
+
+    /// Control for the reorder: on the SAME paused pipeline, the duplicate is
+    /// dropped and the genuinely new delivery is still deferred — one `paused`
+    /// skip, one pending file, and it fires on resume.
+    #[test]
+    fn a_paused_pipeline_still_defers_the_non_duplicate_beside_a_dropped_duplicate() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(WEBHOOK_TARGETS);
+        accept_and_read_uid(&opts.rocky_dir, "raw", spool::WebhookKind::Id, "evt-1");
+
+        let spawner = CapturingSpawner::new(0);
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            webhook_now(),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        assert_eq!(spawner.run_count(), 1);
+
+        // A duplicate of the consumed id, plus a genuinely new delivery.
+        force_duplicate_beside_tombstone(&opts, "raw", "evt-1");
+        accept_and_read_uid(&opts.rocky_dir, "raw", spool::WebhookKind::Id, "evt-2");
+        with_store(&state_path, |store| {
+            store.set_schedule_paused("raw", true).unwrap();
+        });
+
+        let report = rt()
+            .block_on(tick_once(
+                &config,
+                &state_path,
+                webhook_now(),
+                &spawner,
+                &opts,
+            ))
+            .unwrap();
+        assert_eq!(spawner.run_count(), 1, "a paused pipeline must not fire");
+        assert_eq!(
+            report
+                .skipped
+                .iter()
+                .filter(|s| s.pipeline == "raw"
+                    && s.source == Some(DemandKind::Webhook)
+                    && s.reason == TickSkipReason::Paused)
+                .count(),
+            1,
+            "exactly one deferral: the new delivery, not the dropped duplicate: {:?}",
+            report.skipped
+        );
+        let pending = spool::list_pending_files(&opts.rocky_dir).unwrap();
+        assert_eq!(pending.len(), 1, "only the new delivery is still pending");
+        assert_eq!(
+            spool::read_pending(&pending[0]).unwrap().token,
+            "evt-2",
+            "the file left pending is the non-duplicate"
+        );
+
+        // Resume: the deferred 202 fires, exactly once, and nothing else does.
+        with_store(&state_path, |store| {
+            store.set_schedule_paused("raw", false).unwrap();
+        });
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            webhook_now(),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        assert_eq!(spawner.run_count(), 2, "resume fires the deferred delivery");
+    }
+
+    /// #1716 item 2: `rocky tick --now <far future>` must not sweep a tombstone
+    /// written seconds ago.
+    ///
+    /// The sweep used to age tombstones against the injected `now`, so one
+    /// `rocky tick --now 2030-01-01T00:00:00Z` unlinked every tombstone on disk
+    /// and forgot every consumed delivery id. Ages are filesystem mtimes now, so
+    /// the injected clock cannot reach them.
+    #[test]
+    fn a_far_future_now_does_not_sweep_a_tombstone_written_seconds_ago() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(WEBHOOK_TARGETS);
+        accept_and_read_uid(&opts.rocky_dir, "raw", spool::WebhookKind::Id, "evt-1");
+
+        let spawner = CapturingSpawner::new(0);
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            webhook_now(),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        let tombstone = only_tombstone(&spool::spool_dir(&opts.rocky_dir));
+
+        // The replay/preview tick an operator is invited to run. Nothing is due
+        // (these pipelines have no schedule), so the sweep is all it does.
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            webhook_now() + chrono::Duration::days(1461),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+
+        assert!(
+            tombstone.exists(),
+            "a tombstone stamped seconds ago survives `--now` four years ahead"
+        );
+        // The consequence, stated directly: the dedup window is still closed.
+        assert_eq!(
+            spool::accept(
+                &opts.rocky_dir,
+                "raw",
+                spool::WebhookKind::Id,
+                "evt-1",
+                "bodyhash",
+                webhook_now(),
+            )
+            .unwrap(),
+            spool::AcceptOutcome::Duplicate,
+            "a redelivery of the consumed id is still deduplicated"
+        );
+        assert_eq!(spawner.run_count(), 1);
     }
 
     /// A delivery id shaped like a reserved control affix (`x.corrupt-9`) is

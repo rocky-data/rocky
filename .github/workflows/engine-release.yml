@@ -354,15 +354,32 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.licenses=Apache-2.0
           provenance: mode=max
-          sbom: true
+          # The SBOM generator is itself an image BuildKit pulls at build
+          # time; pinned by digest like every other release source, so a
+          # moved `:1` tag cannot change what attests the release.
+          sbom: generator=docker/buildkit-syft-scanner:1@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9
 
       # Pull what was pushed and run it once: the version it prints must be
       # the release's. A wrong binary in an archive, or a wrong tag, fails here
       # and keeps the release a draft.
-      - name: Smoke the pushed image
+      # Two checks, because a runner can execute only its own architecture.
+      # The amd64 image is RUN: a wrong binary in an archive, or a wrong tag,
+      # fails here and keeps the release a draft. The arm64 image cannot be
+      # run without emulation (one more trust root for one `--version`), so it
+      # is inspected instead: the manifest list must name both platforms, so a
+      # half-pushed index is caught even though its arm64 binary is unexecuted.
+      # The first user to run it on arm64 is the first to execute that binary,
+      # and the guide says to check `--version` against the release.
+      - name: Smoke the pushed image (amd64, executed)
         run: |
           docker run --rm "${IMAGE}:${{ steps.tags.outputs.version }}" --version | tee version.txt
           grep -Fx "rocky ${{ steps.tags.outputs.version }}" version.txt
+
+      - name: Check the manifest list names both platforms
+        run: |
+          docker buildx imagetools inspect "${IMAGE}:${{ steps.tags.outputs.version }}" | tee manifest.txt
+          grep -q "linux/amd64" manifest.txt
+          grep -q "linux/arm64" manifest.txt
 
   # Publish the draft, making the version resolvable by engine/install.sh.
   # Depends on `checksums` as well as `build` so checksums.txt is in place
