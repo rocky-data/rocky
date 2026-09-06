@@ -457,6 +457,72 @@ SELECT
 
 #[cfg(test)]
 mod tests {
+    /// #1738. The "rocky.toml already exists" guard must refuse a DANGLING
+    /// symlink, and must not write through it.
+    ///
+    /// `Path::exists()` is `metadata(..).is_ok()` and `metadata` follows a
+    /// symlink, so a `rocky.toml` pointing at a deleted file answered `false`,
+    /// the guard passed, and the `fs::write` that follows CREATED the link's
+    /// target — silently repointing a shared config path at a fresh template
+    /// instead of refusing. A write, not a delete, but not the refusal the
+    /// guard promises.
+    ///
+    /// The second assertion is the one that matters: refusing is only half of
+    /// it if the target got created on the way.
+    #[test]
+    fn init_refuses_a_dangling_rocky_toml_and_does_not_write_through_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let target = tmp.path().join("shared-config.toml");
+        std::os::unix::fs::symlink(&target, project.join("rocky.toml")).unwrap();
+        assert!(
+            !project.join("rocky.toml").exists(),
+            "precondition: Path::exists() follows the link and answers false"
+        );
+
+        let err = super::init(project.to_str().unwrap(), None)
+            .expect_err("a rocky.toml IS at that path, so init must refuse");
+        assert!(
+            err.to_string().contains("already exists"),
+            "the guard's own message: {err}"
+        );
+        assert!(
+            !target.exists(),
+            "init must not create the link's target — that repoints a shared \
+             config path at a fresh template"
+        );
+    }
+
+    /// The control, so the guard cannot pass by refusing everything: an empty
+    /// directory still scaffolds.
+    #[test]
+    fn init_still_scaffolds_into_an_empty_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("fresh");
+        super::init(project.to_str().unwrap(), None).expect("an absent config scaffolds");
+        assert!(project.join("rocky.toml").is_file());
+    }
+
+    /// And the case the guard was written for is unchanged.
+    #[test]
+    fn init_refuses_an_ordinary_existing_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("existing");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("rocky.toml"), "# mine\n").unwrap();
+
+        let err = super::init(project.to_str().unwrap(), None)
+            .expect_err("an existing config must refuse");
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(project.join("rocky.toml")).unwrap(),
+            "# mine\n",
+            "and it must not be clobbered"
+        );
+    }
+
     use super::*;
     use tempfile::TempDir;
 
