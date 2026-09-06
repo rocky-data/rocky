@@ -160,6 +160,28 @@ nullable = true
 required = ["amount"]
 TOML
         ;;
+    fulfillment-review)
+        # The U3-A3 screencast, which is three tapes and three browser scenes
+        # against ONE workspace — a plan id has to be the same in the terminal
+        # and in the browser, or a viewer who reads carefully sees a staged
+        # artifact. So this case is prepared once and NOT re-run between the
+        # tapes; record-screencast.sh drives them in order and holds a
+        # `rocky serve --ui` open across all of them.
+        #
+        # Credential-free: the POC's [fulfill.driver] is `replay`, so no
+        # ANTHROPIC_API_KEY is read.
+        cp -r "$POCS/03-ai/08-fulfillment-walking-skeleton/." "$scratch/"
+        clean_state "$scratch"
+        # The POC's own run.sh wipes these at the top; the tapes start from a
+        # cold product, so wipe them here instead of showing an `rm` on screen.
+        rm -rf "$scratch/products" "$scratch/expected" 2>/dev/null || true
+        rm -f "$scratch/models/revenue_daily.sql" \
+              "$scratch/models/revenue_daily.toml" \
+              "$scratch/models/revenue_daily.contract.toml" 2>/dev/null || true
+        # A persistent warehouse, so the apply materialises real revenue and
+        # the browser's sample panel has rows to show.
+        (cd "$scratch" && duckdb wh.duckdb < data/warehouse_seed.sql >/dev/null)
+        ;;
     *)
         echo "prepare.sh: unknown demo '$demo'" >&2
         exit 1

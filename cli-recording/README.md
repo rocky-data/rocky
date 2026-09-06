@@ -5,9 +5,25 @@ Reproducible terminal GIFs for the `rocky` CLI, rendered from
 file is the tracked source; the GIF is generated output (gitignored under
 `out/`).
 
-This records the *CLI/terminal*. The VS Code *extension* demos are a separate
-harness (Playwright drives a real VS Code instance) under
-[`editors/vscode/recording/`](../editors/vscode/recording/).
+This records the *CLI/terminal*. Two related harnesses:
+
+- [`browser/`](browser/) records the **browser UI** (`rocky serve --ui`) with
+  Playwright, for the fulfillment screencast.
+- [`editors/vscode/recording/`](../editors/vscode/recording/) records the
+  **VS Code extension**, driving a real VS Code instance.
+
+## The fulfillment screencast
+
+`./record-screencast.sh` is a different shape from the single-tape demos below:
+three tapes and three browser scenes, interleaved against **one** workspace,
+with one `rocky serve --ui` up throughout.
+
+That is not a preference. A plan id is 64 hex characters on screen; if the
+terminal shows one and the browser another, a viewer who reads carefully sees a
+staged artifact. So `prepare.sh fulfillment-review` runs once, and the three
+tapes resume in the workspace the previous one left rather than each starting
+clean. Do not drive them with `record.sh` — it prepares per invocation, which
+would wipe the state between beats.
 
 ## Usage
 

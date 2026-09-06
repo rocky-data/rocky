@@ -11,6 +11,10 @@ extension demos.
 
 ## Usage
 
+Normally you do not run this directly — `../record-screencast.sh` drives the
+tapes and these scenes in order against one workspace, which is what makes the
+plan id on screen the same in both halves. To run a scene on its own:
+
 ```bash
 cd cli-recording/browser
 npm install
