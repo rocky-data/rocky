@@ -4,18 +4,16 @@ import type { ProductStatusOutput } from "@rocky-types/product_status";
 import type { ReviewOutput } from "@rocky-types/review";
 import type { ReviewQueueOutput } from "@rocky-types/review_queue";
 import type { ReviewStatusOutput } from "@rocky-types/review_status";
+import statusFixture from "@rocky-fixtures/review_status.json";
 import { ApiError } from "../api";
 import { PlanDetail, type PlanLoaders, describeFinding, productNameFromId } from "./PlanDetail";
 
-const PLAN = "a".repeat(64);
-
-const STATUS: ReviewStatusOutput = {
-  version: "1.74.0",
-  command: "review_status",
-  plan_id: PLAN,
-  kind: "ai_authored",
-  reviewed: false,
-};
+// The status panel reads a payload captured from the live engine, so a shape
+// change there fails this test rather than passing against a hand-written
+// stand-in. The other three producers have no capture yet — the fixture roster
+// covers `review_status` only — so their payloads are written here, typed.
+const STATUS = statusFixture as ReviewStatusOutput;
+const PLAN = STATUS.plan_id;
 
 const DIFF: ReviewOutput = {
   version: "1.74.0",
@@ -51,7 +49,7 @@ const QUEUE: ReviewQueueOutput = {
       decision_ref: "2026-09-06T09:00:00Z|aaa|orders",
       timestamp: "2026-09-06T09:00:00Z",
       principal: "agent",
-      capability: "schema_change_breaking",
+      capability: "schema_change.breaking",
       model: "orders",
       rule_id: 2,
       reason: "a breaking schema change needs a human",
@@ -86,7 +84,7 @@ describe("PlanDetail", () => {
   it("shows the plan, its findings, the escalation and the approve command", async () => {
     render(<PlanDetail planId={PLAN} loaders={loaders()} />);
 
-    await screen.findByText("ai_authored");
+    await screen.findByText(STATUS.kind);
     expect(screen.getByText("awaiting a human")).toBeTruthy();
     await waitFor(() =>
       expect(screen.getByText(/orders.total changes type, INT64 to INT32/)).toBeTruthy(),
@@ -162,7 +160,7 @@ describe("PlanDetail", () => {
   it("reads no product at all when the plan is not product-bound", async () => {
     const product = vi.fn(async () => PRODUCT);
     render(<PlanDetail planId={PLAN} loaders={loaders({ product })} />);
-    await screen.findByText("ai_authored");
+    await screen.findByText(STATUS.kind);
     expect(screen.getByText("not product-bound")).toBeTruthy();
     expect(product).not.toHaveBeenCalled();
   });
@@ -188,7 +186,7 @@ describe("PlanDetail", () => {
 
   it("offers no control that could change anything", async () => {
     const { container } = render(<PlanDetail planId={PLAN} loaders={loaders()} />);
-    await screen.findByText("ai_authored");
+    await screen.findByText(STATUS.kind);
     // The sample panel's button is the only one, and it only reads.
     const buttons = Array.from(container.querySelectorAll("button")).map(
       (b) => b.textContent ?? "",
