@@ -116,7 +116,7 @@ function JournalRow({ entry }: { entry: ProductJournalEntry }) {
       <td className={`${cell} font-mono text-[11px] text-zinc-500 dark:text-zinc-400`}>
         {entry.seq}
       </td>
-      <td className={`${cell} whitespace-nowrap text-[11px] text-zinc-500 dark:text-zinc-400`}>
+      <td className={`${cell} text-[11px] text-zinc-500 dark:text-zinc-400`}>
         {formatInstant(entry.at ?? null)}
       </td>
       {/* The engine documents `event` as a label to render, not an enum to
@@ -125,11 +125,11 @@ function JournalRow({ entry }: { entry: ProductJournalEntry }) {
           truncates: a repair round's event carries the compiler errors that
           caused it, and a truncated one would hide the reason. */}
       <td className={`${cell} text-zinc-900 dark:text-zinc-100`}>{entry.event}</td>
-      <td className={`${cell} whitespace-nowrap text-[11px] text-zinc-500 dark:text-zinc-400`}>
+      <td className={`${cell} text-[11px] text-zinc-500 dark:text-zinc-400`}>
         {entry.from_state ? `${entry.from_state} → ` : ""}
         {entry.to_state}
       </td>
-      <td className={`${cell} text-[11px] text-zinc-500 dark:text-zinc-400`}>
+      <td className={`${cell} text-[11px] break-words text-zinc-500 dark:text-zinc-400`}>
         <div className="flex flex-wrap gap-x-3 gap-y-1">
           {entry.spec_digest != null && <span>spec {shortId(entry.spec_digest)}</span>}
           {entry.idempotency_key != null && <span>key {shortId(entry.idempotency_key)}</span>}
@@ -167,7 +167,21 @@ function JournalRow({ entry }: { entry: ProductJournalEntry }) {
 function JournalTable({ rows }: { rows: ProductJournalEntry[] }) {
   return (
     <div className="overflow-x-auto rounded-md border border-zinc-200 dark:border-zinc-700">
-      <table className="min-w-full text-left text-sm">
+      {/* `table-fixed` with declared widths, not auto layout. One repair-round
+          event carries the whole compiler error list, and under auto layout
+          that one cell widens its column past the container: every other
+          column is squeezed, their contents wrap, and EVERY row inherits the
+          height — measured at 115px each, 7217px for 82 rows, which is no
+          better than the cards this replaced. Fixed widths keep a long event
+          inside its own column. */}
+      <table className="w-full table-fixed text-left text-sm">
+        <colgroup>
+          <col className="w-10" />
+          <col className="w-40" />
+          <col />
+          <col className="w-44" />
+          <col className="w-48" />
+        </colgroup>
         <thead className="bg-zinc-50 text-[11px] text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
           <tr>
             <th scope="col" className="px-2 py-1.5 font-medium">
