@@ -6936,14 +6936,14 @@ async fn run_null_rate_checks(
     tref: &TableRef,
     cfg: &rocky_core::config::NullRateConfig,
 ) -> Vec<checks::CheckResult> {
+    // Every result built here is not-evaluated by construction, so none of
+    // them takes `cfg.severity`. Each keeps the `TestSeverity::Error` that
+    // `null_rate_not_evaluated` chose, so a null-rate query the engine could
+    // not run still gates (#1735).
     let every_column_not_evaluated = |reason: String| -> Vec<checks::CheckResult> {
         cfg.columns
             .iter()
-            .map(|col| {
-                let mut check = checks::null_rate_not_evaluated(col, cfg.threshold, reason.clone());
-                check.severity = cfg.severity;
-                check
-            })
+            .map(|col| checks::null_rate_not_evaluated(col, cfg.threshold, reason.clone()))
             .collect()
     };
 
@@ -7010,7 +7010,18 @@ async fn run_null_rate_checks(
                     )
                 }
             };
-            check.severity = cfg.severity;
+            // The configured severity describes a MEASURED rate — how loudly a
+            // column over the threshold is reported. A column the engine could
+            // not measure keeps the `TestSeverity::Error` its constructor
+            // chose, so it still gates (#1735).
+            //
+            // `severity = "warning"` used to silence both. An operator who
+            // wrote it to mean "a few nulls are only a warning" was also
+            // saying "a null-rate query I could not run is only a warning",
+            // and the run exited 0 with `status: "Success"`.
+            if check.not_evaluated.is_none() {
+                check.severity = cfg.severity;
+            }
             check
         })
         .collect()
@@ -31217,8 +31228,12 @@ table = "fct_events"
     }
 
     /// A null-rate query that fails used to skip the table. Every configured
-    /// column is reported as not evaluated instead, at the configured
-    /// severity.
+    /// column is reported as not evaluated instead.
+    ///
+    /// Those results keep the `TestSeverity::Error` their constructor chose,
+    /// NOT the configured severity (#1735) — see
+    /// `a_failed_null_rate_query_gates_even_when_the_configured_severity_is_warning`
+    /// for the exit code that turns on.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn a_null_rate_query_that_fails_reports_every_column_not_evaluated() {
@@ -31251,8 +31266,113 @@ table = "fct_events"
                 Some("the null-rate query failed: injected null-rate failure"),
                 "{result:?}"
             );
-            assert_eq!(result.severity, rocky_core::tests::TestSeverity::Warning);
+            assert_eq!(
+                result.severity,
+                rocky_core::tests::TestSeverity::Error,
+                "a column the engine could not measure keeps its own severity, \
+                 not the configured `warning`: {result:?}"
+            );
         }
+    }
+
+    /// FAILS ON `main` before #1735: `severity = "warning"` on `null_rate`
+    /// silenced a query the engine could not run at all. Every configured
+    /// column came back `not_evaluated`, `passed: false`, at warning
+    /// severity, the gate stayed clear, and the run exited 0 with
+    /// `status: "Success"`.
+    ///
+    /// The configured severity is about a column OVER THE THRESHOLD. A
+    /// null-rate query Rocky could not run is a different statement, and
+    /// keeps the `TestSeverity::Error` `null_rate_not_evaluated` chose.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_failed_null_rate_query_gates_even_when_the_configured_severity_is_warning() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.null_rate]\ncolumns = [\"id\"]\nthreshold = 0.5\nseverity = \"warning\"",
+        );
+
+        let failing = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT 'id' AS col",
+            reply: Intercept::Fail("injected null-rate failure"),
+        };
+        let (pending, _) = fx.run(&failing, None, None).await;
+
+        let result = the_result(&pending, &fx.target_key(), "null_rate:id");
+        assert_eq!(
+            result.not_evaluated.as_deref(),
+            Some("the null-rate query failed: injected null-rate failure"),
+            "{result:?}"
+        );
+        // The gate is asserted before the severity on purpose: it is the
+        // user-visible consequence, so a regression prints the exit code it
+        // changed, not just a field.
+        let (gated, status) = run_status_for(&fx, &pending);
+        assert!(
+            gated,
+            "an unevaluated null-rate check gates: {checks:?}",
+            checks = pending.get(&fx.target_key()).map(|p| &p.checks)
+        );
+        assert!(matches!(
+            status,
+            rocky_core::state::RunStatus::PartialFailure
+        ));
+        assert_eq!(
+            result.severity,
+            rocky_core::tests::TestSeverity::Error,
+            "a check the engine could not evaluate keeps its own severity: {result:?}"
+        );
+    }
+
+    /// The other half, unchanged: a MEASURED column over the threshold still
+    /// reports at the configured severity, and `severity = "warning"` still
+    /// keeps it advisory. The fix narrows the clobber; it does not remove the
+    /// key.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_measured_null_rate_violation_still_honours_severity_warning() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.null_rate]\ncolumns = [\"ts\"]\nthreshold = 0.0\nseverity = \"warning\"",
+        );
+
+        // The query ANSWERS: one row sampled, all of it null. The default
+        // `sample_percent = 10` would draw nothing from this one-row table,
+        // which is an empty sample rather than a measured violation.
+        let all_null = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT 'ts' AS col",
+            reply: Intercept::Rows(vec![vec![
+                serde_json::json!("ts"),
+                serde_json::json!(1),
+                serde_json::json!(1),
+            ]]),
+        };
+        let (pending, _) = fx.run(&all_null, None, None).await;
+
+        let result = the_result(&pending, &fx.target_key(), "null_rate:ts");
+        assert!(
+            !result.passed,
+            "a 1.0 null rate is over the 0.0 threshold: {result:?}"
+        );
+        assert!(
+            result.not_evaluated.is_none(),
+            "it was measured: {result:?}"
+        );
+        assert_eq!(
+            result.severity,
+            rocky_core::tests::TestSeverity::Warning,
+            "a measured result takes the configured severity: {result:?}"
+        );
+
+        let (gated, status) = run_status_for(&fx, &pending);
+        assert!(
+            !gated,
+            "a warning stays advisory: {checks:?}",
+            checks = pending.get(&fx.target_key()).map(|p| &p.checks)
+        );
+        assert!(matches!(status, rocky_core::state::RunStatus::Success));
     }
 
     /// The batch path reports an omitted freshness result too. Reading only
