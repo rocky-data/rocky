@@ -81,7 +81,7 @@ Implement these only when the system behind your adapter supports them.
 |-------|-----------|---------|
 | `DiscoveryAdapter` | Discover connectors/tables | `discover() -> DiscoveryResult` |
 | `GovernanceAdapter` | Tags, grants, bindings | `set_tags()`, `get_grants()`, `apply_grants()`, `revoke_grants()` |
-| `BatchCheckAdapter` | Batched quality checks | `batch_row_counts()`, `batch_freshness()` |
+| `BatchCheckAdapter` | Batched quality checks | `batch_row_counts()`, `batch_freshness()`, `supports_row_counts()`, `supports_freshness()` |
 | `TypeMapper` | Type normalization | `normalize_type()`, `types_compatible()` |
 
 ### Why discovery reports partial failures

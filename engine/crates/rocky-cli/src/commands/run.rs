@@ -2980,10 +2980,13 @@ pub async fn run(
     let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
     let warehouse_adapter = adapter_registry.warehouse_adapter(&pipeline.target.adapter)?;
 
-    // Batch check adapter (optional): present when the warehouse has an
-    // optimised UNION-ALL / information_schema path (Databricks today).
-    // When absent, run.rs falls back to per-table queries via the
-    // generic WarehouseAdapter methods — same observable behaviour.
+    // Batch check adapter (optional): present when the warehouse has any
+    // optimised UNION-ALL / information_schema path. Databricks batches all
+    // three operations; Snowflake and BigQuery batch the schema describe
+    // only, and say so per operation through `supports_row_counts` /
+    // `supports_freshness` (#1719). When absent — or when the adapter cannot
+    // batch a leg — run.rs falls back to per-table queries via the generic
+    // WarehouseAdapter methods, same observable behaviour.
     let batch_check_adapter: Option<Arc<dyn BatchCheckAdapter>> =
         adapter_registry.batch_check_adapter(&pipeline.target.adapter);
 
@@ -4056,8 +4059,9 @@ pub async fn run(
     // --- Batch column pre-fetch: replace N×2 DESCRIBE TABLE calls with
     //     one information_schema query per unique schema pair. ---
     // Only available when the warehouse implements BatchCheckAdapter
-    // (Databricks today); other adapters fall back to per-table DESCRIBE
-    // via WarehouseAdapter in process_table().
+    // (Databricks, Snowflake and BigQuery all implement
+    // `batch_describe_schema`); other adapters fall back to per-table
+    // DESCRIBE via WarehouseAdapter in process_table().
     if let Some(ref bc_adapter) = batch_check_adapter {
         // Collect unique (catalog, schema) pairs for source and target
         let source_schemas: std::collections::HashSet<(String, String)> = tables_to_process
@@ -5884,8 +5888,10 @@ async fn partition_overlap_key_carriers(
 /// and appends the results to `pending_checks`.
 ///
 /// Row count and freshness go through the warehouse's `BatchCheckAdapter`
-/// when it has one (one UNION ALL query) and fall back to one query per
-/// table otherwise. Assertions, custom checks, null-rate checks and the
+/// when it has one that says it can batch that leg (one UNION ALL query),
+/// and fall back to one query per table otherwise — no adapter, or an
+/// adapter whose `supports_row_counts` / `supports_freshness` says no. The
+/// decision is per leg (#1719). Assertions, custom checks, null-rate checks and the
 /// cross-source overlap check run per table through the plain
 /// `WarehouseAdapter`. Row-count anomalies detected on the way are pushed to
 /// `anomalies`.
