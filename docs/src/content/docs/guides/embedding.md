@@ -73,9 +73,34 @@ See [authoring with MCP](/concepts/mcp-authoring/) for the tool surface, and [op
 rocky --config rocky.toml serve --port 8080
 ```
 
-The read routes return the same payloads as the matching CLI command, byte for byte. `GET /api/v1/models/{name}/lineage` returns exactly what `rocky lineage <name> --output json` prints. `GET /api/v1/compile` matches `rocky compile --output json`. `GET /api/v1/products` matches `rocky product list --output json`, and `GET /api/v1/products/{name}` matches `rocky product status <name> --output json`, and `GET /api/v1/products/{name}/journal` matches `rocky product journal <name> --output json`. `GET /api/v1/review/queue` matches `rocky review --queue --output json`, except the two fields that derive from the request instant (`staleness_seconds` and `score`), and `GET /api/v1/review/{plan_id}/status` matches `rocky review <plan-id> --status --output json`. There is no approve route: approving happens in the terminal. The governor's three reads match too: `GET /api/v1/brief` matches `rocky brief --output json` except `generated_at` and `since_timestamp`, and never advances the digest cursor, so its `since` defaults to `7d` rather than the CLI's `last`; `GET /api/v1/audit/scorecard` matches `rocky audit --scorecard --output json` except `window_start`; `GET /api/v1/custody/{subject}` matches `rocky audit --for <subject> --output json`; `GET /api/v1/audit` matches `rocky audit --output json`, and with `?product=<name>` matches `rocky audit --product <name> --output json`. The window, grouping and product are query parameters, and the OpenAPI document lists their accepted values. A caller on the HTTP API and a caller on the SDK see identical data.
+The read routes return the same payloads as the matching CLI command, byte for byte. `GET /api/v1/models/{name}/lineage` returns exactly what `rocky lineage <name> --output json` prints. `GET /api/v1/compile` matches `rocky compile --output json`. `GET /api/v1/products` matches `rocky product list --output json`, and `GET /api/v1/products/{name}` matches `rocky product status <name> --output json`, and `GET /api/v1/products/{name}/journal` matches `rocky product journal <name> --output json`. `GET /api/v1/review/queue` matches `rocky review --queue --output json`, except the two fields that derive from the request instant (`staleness_seconds` and `score`), and `GET /api/v1/review/{plan_id}/status` matches `rocky review <plan-id> --status --output json`. `GET /api/v1/review/{plan_id}` matches `rocky review <plan-id> --output json`: the plan's kind and its breaking-change findings against `HEAD`, with `approved` always false. There is no approve route: approving happens in the terminal, and the diff route never writes the sign-off marker. The governor's three reads match too: `GET /api/v1/brief` matches `rocky brief --output json` except `generated_at` and `since_timestamp`, and never advances the digest cursor, so its `since` defaults to `7d` rather than the CLI's `last`; `GET /api/v1/audit/scorecard` matches `rocky audit --scorecard --output json` except `window_start`; `GET /api/v1/custody/{subject}` matches `rocky audit --for <subject> --output json`; `GET /api/v1/audit` matches `rocky audit --output json`, and with `?product=<name>` matches `rocky audit --product <name> --output json`. The window, grouping and product are query parameters, and the OpenAPI document lists their accepted values. A caller on the HTTP API and a caller on the SDK see identical data.
 
 Six routes have no CLI command to match: `GET /api/v1/health`, `/project`, `/models`, `/models/{name}`, `/dag/layers` and `/dag/status`. They still return typed payloads with published schemas; `GET /api/v1/meta` lists the `estate` capability for the five estate routes and `project` for the project route. `/project` is what the retired dashboard at `/` used to show: the config directory's name, the pipelines and adapters, the compiled model count, the diagnostics counts and the newest run. Model detail caps the SQL text at 256 KiB. A cut is reported in the body through `sql_truncated` and `sql_bytes`, so a reader never mistakes a cut text for the whole. Each type-checked column carries its structured `data_type`, which keeps a struct field's own nullability, and a `data_type_display` label such as `DECIMAL(10,2)` for showing to a person.
+
+### Two reads that compute, and what they cost
+
+Most read routes project state the engine already has. Two of them do work per request, so they carry bounds the others do not.
+
+`GET /api/v1/review/{plan_id}` compiles the project twice, once at the working tree and once at `HEAD`, to find what a plan would break. On a project of a thousand models each compile is about 140 milliseconds. One diff runs at a time; a second waits about two seconds and is then refused with `503` and a `Retry-After`. The base is always `HEAD` and is not a parameter, because a ref from a query string would become an argument to `git`.
+
+`GET /api/v1/models/{name}/rows` runs the model's compiled `SELECT` against the warehouse and returns at most `limit` rows, with classification-tagged columns masked. It is the same code `rocky preview rows` runs, so the two cannot answer differently.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+     -H "X-Rocky-Allow-Warehouse: true" \
+     "http://127.0.0.1:8080/api/v1/models/customer_orders/rows?limit=50"
+```
+
+Four things bound it:
+
+- **Consent, per request.** A remote adapter needs the `X-Rocky-Allow-Warehouse: true` header on every call. Without it the answer is `403 warehouse_gated`, before anything compiles. A local DuckDB adapter needs none. The header is not a formality: a `GET` is issued by things that are not the user, such as a browser prefetch or a restored tab, and none of those can set a custom header.
+- **A row cap.** `limit` is 1 to 500. Anything else is `400`.
+- **A timeout, and one at a time.** The call is given 30 seconds; past that the answer is `504 sample_timeout`, and the warehouse may still be running the query. A second concurrent sample is refused at once with `503` and a `Retry-After`, rather than queued behind a call that might take the full 30 seconds.
+- **No caching.** The response carries `Cache-Control: no-store`, because the body is warehouse rows.
+
+Masking is applied inline, and a sample that cannot be masked is refused rather than served. Two limits are worth knowing. Rocky can express a mask on Databricks, Snowflake and DuckDB; on any other adapter a model with a masked column is refused with `422 masking_unsupported_by_adapter`, every time. And the `hash` strategy is an unsalted SHA-256, so a column drawn from a small or guessable set, an email address or a phone number, is recoverable from its digest. Treat a hashed column as pseudonymous, not anonymous.
+
+Ad-hoc SQL is not exposed over HTTP. The CLI's `--sql-file` has no route: a compiled model's `SELECT` is a different thing from arbitrary SQL, whatever the token.
 
 ### Mutations are jobs you poll
 
