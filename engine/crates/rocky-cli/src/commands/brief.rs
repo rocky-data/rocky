@@ -1663,6 +1663,47 @@ fn section_status(availability: &SectionAvailability, note: &Option<String>) -> 
 
 #[cfg(test)]
 mod tests {
+    /// #1727. A degraded digest must not consume the `--since last` window.
+    ///
+    /// `run_brief` emits, then bails on `config_error`, then advances the
+    /// cursor. The order is the whole behaviour: if the bail moved below the
+    /// advance, a project with a broken `rocky.toml` would consume its window
+    /// on every run, and the six sections it COULD render would be silently
+    /// skipped for the next reader too — the exact silent-skip #1727 exists to
+    /// stop.
+    ///
+    /// Asserted over this file's own source because `run_brief` reads the
+    /// process cwd and prints to stdout, so no unit test reaches it — the same
+    /// shape `run.rs` uses for its stamp-ordering guards. The claim was a
+    /// comment with nothing behind it until this test.
+    ///
+    /// Every `find` takes the FIRST occurrence, which is the production site.
+    #[test]
+    fn a_degraded_digest_bails_before_the_cursor_advances() {
+        let source = include_str!("brief.rs");
+        let emit = source
+            .find("emit(&output, json)?;")
+            .expect("run_brief no longer emits before deciding; re-anchor this test");
+        let bail = source
+            .find("if let Some(err) = &output.config_error {")
+            .expect("the degraded-digest refusal is gone — see #1727");
+        let advance = source
+            .find(".set_last_brief_at(now)")
+            .expect("the cursor advance moved; re-anchor this test");
+
+        assert!(
+            emit < bail,
+            "the digest must be emitted BEFORE the refusal, or a wrapper parsing \
+             stdout loses the six sections that did render (#1727)"
+        );
+        assert!(
+            bail < advance,
+            "a degraded digest must not advance the `--since last` cursor: the \
+             sections it could not render would be silently skipped for the next \
+             reader too (#1727)"
+        );
+    }
+
     use super::*;
     use chrono::TimeZone;
     use rocky_core::config::PolicyCapability;
