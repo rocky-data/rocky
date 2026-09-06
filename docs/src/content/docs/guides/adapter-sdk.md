@@ -56,7 +56,7 @@ The public traits live in `engine/crates/rocky-adapter-sdk/src/traits.rs`. Every
 | `SqlDialect` | yes | Generate warehouse-specific SQL | `name`, `format_table_ref`, `create_table_as`, `insert_into`, `merge_into`, `describe_table_sql`, `drop_table_sql`, `create_catalog_sql`, `create_schema_sql`, `row_hash_expr`, `tablesample_clause`, `select_clause`, `watermark_where`, `insert_overwrite_partition` |
 | `DiscoveryAdapter` | no | Enumerate connectors / tables in a source system | `discover` |
 | `GovernanceAdapter` | no | Tags, grants, catalog/schema lifecycle | `set_tags`, `get_grants`, `apply_grants`, `revoke_grants` |
-| `BatchCheckAdapter` | no | Batched data-quality queries | `batch_row_counts`, `batch_freshness` |
+| `BatchCheckAdapter` | no | Batched data-quality queries | `batch_row_counts`, `batch_freshness`, and the `supports_row_counts` / `supports_freshness` capability predicates (both default to `true`) |
 | `LoaderAdapter` | no | File ingestion (CSV, Parquet, JSONL) | `load`, `supported_formats` |
 | `TypeMapper` | no | Cross-warehouse type normalization | `normalize_type`, `types_compatible` |
 

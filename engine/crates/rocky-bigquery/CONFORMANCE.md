@@ -31,7 +31,8 @@ are what actually exercise the adapter.
 | Dialect | `row_hash` | ⚪ not implemented | the trait method isn't on `SqlDialect` today; no adapter implements it. Conformance test references a future trait surface. |
 | Governance | `set_tags` | 🟡 partial — wired | `BigQueryGovernanceAdapter::set_tags` executes `ALTER SCHEMA ... SET OPTIONS(labels=[...])` for `TagTarget::Schema` and `ALTER TABLE ... SET OPTIONS(labels=[...])` for `TagTarget::Table`. `TagTarget::Catalog` (project-level labels) stays a warn-and-return because BQ projects do not support labels via SQL; that path needs the Resource Manager API. Adapter now wired through the CLI registry (was `NoopGovernanceAdapter` until the wiring landed). |
 | Governance | `get_grants` | ⚪ no-op by design | same as `set_tags` — IAM grants are REST-only, not SQL-issuable. |
-| BatchChecks | `batch_row_counts` / `batch_freshness` | 🟡 unit-tested | `BigQueryBatchCheckAdapter` is exercised by unit tests + the discover-path's `--with-schemas` warm-up code path. Not exercised in any current smoke driver. Adding `--with-schemas` to `live/discover/run.sh` would close this gap. |
+| BatchChecks | `batch_row_counts` / `batch_freshness` | ⚪ not implemented | `BigQueryBatchCheckAdapter` declares `supports_row_counts() == false` and `supports_freshness() == false`, so the runner never calls them and uses one query per table instead (#1719). |
+| BatchChecks | `batch_describe_schema` | 🟡 unit-tested | `BigQueryBatchCheckAdapter::batch_describe_schema` is exercised by unit tests + the discover-path's `--with-schemas` warm-up code path. Not exercised in any current smoke driver. Adding `--with-schemas` to `live/discover/run.sh` would close this gap. |
 | Discovery | `discover` | ✅ live | `live/discover/run.sh` |
 
 Legend: ✅ exercised live · 🟡 implicit / partial · ⚪ N/A or by design
