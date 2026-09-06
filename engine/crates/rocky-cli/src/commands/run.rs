@@ -1838,6 +1838,28 @@ fn ensure_the_resume_would_do_work(
             progress.run_id
         );
     }
+    // The post-apply verification did not confirm an auto-applied migration,
+    // and no copy work remains (#1732). Refused here, beside the check gate
+    // and AHEAD of the `models_executed` branch below — that branch is what
+    // admits this run today, because the failure was recorded as a synthetic
+    // `<verify_after>` entry with `status: "failed"` and the branch reads any
+    // failed entry as a model the resume re-runs. It is not a model. The
+    // resume would skip every `Success` key, copy nothing, verify nothing,
+    // and derive `Success` over a schema change nobody confirmed.
+    //
+    // A separate verdict from `check_gate_failed` on purpose: `verify_after`
+    // fails closed on a required check that is ABSENT, which the check gate
+    // cannot see, and `fail_on_error = false` keeps the check gate `false`
+    // while this one still trips.
+    if record.verify_after_failed {
+        anyhow::bail!(
+            "nothing to resume: run {} auto-applied schema drift that its verify_after gate \
+             could not confirm, and it copied every table it planned to copy — so a resume \
+             would copy nothing and would re-run no verification. There is no rollback on a \
+             warehouse target: review the applied change, then re-run the pipeline",
+            progress.run_id
+        );
+    }
     if record
         .models_executed
         .iter()
@@ -1895,6 +1917,31 @@ fn inherited_check_gate(
     let progress = progress?;
     let record = state_store.get_run(&progress.run_id).ok().flatten()?;
     record.check_gate_failed.then(|| progress.run_id.clone())
+}
+
+/// The prior run whose still-standing `verify_after` failure an admitted
+/// resume inherits (#1732).
+///
+/// Same shape and same reason as [`inherited_check_gate`], for a verdict that
+/// gate cannot carry. [`ensure_the_resume_would_do_work`] refuses only the
+/// EMPTY resume of an unverified run. The commoner shape still resumes: run N
+/// auto-applied additive drift, its `verify_after` gate could not confirm it,
+/// AND a table failed to copy. That resume is admitted on the failed table —
+/// legitimately, there is real work — but `finalize_drift_verify_after` only
+/// verifies drift THIS invocation auto-applied, so the earlier unconfirmed
+/// migration is never re-examined. Left alone, the resume derives `Success`
+/// and `StateStore::latest_successful_run` starts matching it.
+///
+/// `None` when this is not a resume, when the prior record is gone, or when
+/// the record predates state schema v26 — an unrecorded verdict reads `false`,
+/// so a pre-v26 run resumes exactly as it does today.
+fn inherited_verify_after(
+    state_store: &StateStore,
+    progress: Option<&RunProgress>,
+) -> Option<String> {
+    let progress = progress?;
+    let record = state_store.get_run(&progress.run_id).ok().flatten()?;
+    record.verify_after_failed.then(|| progress.run_id.clone())
 }
 
 fn resolve_resume_progress(
@@ -3214,6 +3261,10 @@ pub async fn run(
     // `resume_progress` is still in scope (it is consumed below). `None` for a
     // non-resume run, so a plain run is byte-identical to before (#1720).
     let inherited_gate = inherited_check_gate(&state_store, resume_progress.as_ref());
+    // The same read for the post-apply verification verdict (#1732). Kept as
+    // its own value, not folded into `inherited_gate`: the two carry different
+    // messages and a run can stand under either alone.
+    let inherited_verify = inherited_verify_after(&state_store, resume_progress.as_ref());
 
     // Suppress both the periodic and the end-of-run upload when either:
     // - the on-disk state was forward-incompatible (newer schema than this
@@ -3327,6 +3378,10 @@ pub async fn run(
     // no check has run yet. Written through the same helper as the stamp
     // below so the two sites cannot drift apart.
     output.check_gate_failed = resolved_check_gate(false, inherited_gate.as_ref());
+    // Same early stamp, same reason, for the inherited verification verdict:
+    // an interrupted resume must persist it too, or a resume of THAT run
+    // inherits nothing and can go green (#1732).
+    output.verify_after_failed = resolved_check_gate(false, inherited_verify.as_ref());
     if let Some(ctx) = &idempotency_ctx {
         output.idempotency_key = Some(ctx.key.clone());
     }
@@ -5225,6 +5280,24 @@ pub async fn run(
     // `latest_successful_run` starts matching it — the laundering path. `None`
     // on every run that is not a resume of a gated run, so nothing else moves.
     output.check_gate_failed = resolved_check_gate(this_run_gated, inherited_gate.as_ref());
+    // The inherited verification verdict rides alongside. This run's OWN
+    // `verify_after` has not run yet — it runs after the record is persisted,
+    // because it reads that record — so the failure branch there ORs itself in
+    // afterwards. Here the inheritance alone is enough to stop a resume of an
+    // unverified run from reporting green (#1732).
+    output.verify_after_failed =
+        resolved_check_gate(output.verify_after_failed, inherited_verify.as_ref());
+    if let Some(prior) = &inherited_verify {
+        warn!(
+            resumed_from = prior.as_str(),
+            "resumed run inherits an unconfirmed verify_after migration"
+        );
+        crate::status_line!(
+            "Verification: run {prior} auto-applied schema drift its verify_after gate could \
+             not confirm, and this resume re-ran no verification — so it still stands and this \
+             run cannot report success. Review the applied change, then re-run the pipeline."
+        );
+    }
     if let Some(prior) = &inherited_gate {
         warn!(
             resumed_from = prior.as_str(),
@@ -5577,6 +5650,19 @@ pub async fn run(
             failure_kind: crate::output::FailureKind::Unknown,
             cooldown_seconds: None,
         });
+        // Stamp the verdict BEFORE the re-persist below, so the record the
+        // resume gate reads carries it. The `<verify_after>` entry pushed
+        // above is what the gate would otherwise read, and it reads a failed
+        // entry as "a model failed, so the model phase re-runs on a resume" —
+        // but that entry is not a model, nothing re-runs, and the resume
+        // recorded `Success` over a migration this run could not confirm
+        // (#1732).
+        //
+        // Not folded into `check_gate_failed`: this gate fails CLOSED on a
+        // required check that is absent from the record, and absence is not a
+        // failing check, so the check gate stays `false` on exactly the shape
+        // that matters most.
+        output.verify_after_failed = true;
         // Re-persist so `rocky history` records a Failure (status is derived
         // from the now-failed tallies), and finalize idempotency as failed.
         persist_run_record(
@@ -13742,13 +13828,59 @@ mod tests {
     /// asymmetry from coming back: the singular `record_partition` cannot
     /// reappear in this file, because every use of it here would be a
     /// leading-key-only write.
+    /// This file's PRODUCTION half, whitespace-stripped, for the source-text
+    /// guards below.
+    ///
+    /// One helper because the anchor is the easy thing to get wrong, and
+    /// getting it wrong is silent. Cutting at the first `\n#[cfg(test)]` looks
+    /// right and is not: `build_replication_strategy` is a `#[cfg(test)]`
+    /// helper sitting ~1,600 lines ABOVE the test module, so that anchor ends
+    /// the scan there and every production line after it goes unread. A guard
+    /// that scans nothing passes (#1725).
+    ///
+    /// Whitespace is stripped so `cargo fmt` wrapping a call across lines
+    /// cannot silently zero a count. Write the needles without spaces to
+    /// match: `.record_partition(`, `batch_records(&record)`.
+    fn production_source() -> String {
+        let full = include_str!("run.rs");
+        let cut = full
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the test module header moved; re-anchor production_source()");
+        full[..cut].chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The anchor `production_source` does NOT use, and why. Pins the gap so a
+    /// later reader sees that the two differ and by how much, instead of
+    /// rediscovering it the way #1725 did.
+    #[test]
+    fn the_production_cut_reaches_past_the_mid_file_cfg_test_helper() {
+        let full = include_str!("run.rs");
+        let naive = full
+            .find("\n#[cfg(test)]")
+            .expect("a #[cfg(test)] attribute");
+        let anchored = full
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the test module header");
+        assert!(
+            naive < anchored,
+            "a #[cfg(test)] item sits above the test module — that is the whole \
+             reason production_source() anchors on the module header (#1725)"
+        );
+        let blind_spot = full[naive..anchored].lines().count();
+        assert!(
+            blind_spot > 100,
+            "the blind spot the naive anchor would create is {blind_spot} lines; if it \
+             has shrunk to nothing the mid-file #[cfg(test)] helper is gone and this \
+             test can go with it"
+        );
+    }
+
     #[test]
     fn every_partition_status_write_covers_the_whole_batch() {
         // PRODUCTION code only. This test's own body mentions the singular
         // form in its assertion message, and would otherwise match itself —
         // which it did on the first run.
-        let full = include_str!("run.rs");
-        let src = &full[..full.find("\n#[cfg(test)]").expect("a test module")];
+        let src = production_source();
         let singular = src.matches(".record_partition(").count();
         assert_eq!(
             singular, 0,
@@ -13758,7 +13890,7 @@ mod tests {
         );
         // And the batch helper is actually the thing being used.
         assert!(
-            src.contains("let batch_records ="),
+            src.contains("letbatch_records="),
             "the shared batch_records helper is gone — the three status writes can \
              drift apart again"
         );
@@ -17381,6 +17513,7 @@ auto_create_schemas = true
             tables_copied: 0,
             tables_failed: 0,
             check_gate_failed: false,
+            verify_after_failed: false,
             tables_skipped: 0,
             excluded_tables: vec![],
             resumed_from: None,
@@ -21557,6 +21690,178 @@ backend = "local"
         );
     }
 
+    /// #1732. The empty resume of a run whose `verify_after` gate could not
+    /// confirm an auto-applied migration.
+    ///
+    /// FAILS ON `main`: the failure is recorded as a synthetic
+    /// `<verify_after>` entry in `models_executed` with `status: "failed"`,
+    /// and the resume gate reads any failed entry as "a model failed, and the
+    /// model phase re-runs on a resume". That entry is not a model. The resume
+    /// skips every `Success` key, copies nothing, verifies nothing, and
+    /// derives `Success` over a schema change nobody confirmed.
+    ///
+    /// `check_gate_failed` is `false` throughout, on purpose: this is the
+    /// shape #1720's refusal cannot see (see
+    /// `drift_governance::tests::an_absent_required_check_fails_verify_after_while_the_check_gate_stays_false`).
+    #[test]
+    fn an_empty_resume_of_an_unverified_run_is_refused() {
+        use rocky_core::state::{RunStatus, StateStore, TableStatus};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let now = chrono::Utc::now();
+
+        // One table, copied. The run then auto-applied additive drift whose
+        // verify_after could not be confirmed.
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.tables_copied = 1;
+        out.tables_failed += 1;
+        out.errors.push(crate::output::TableErrorOutput {
+            asset_key: vec!["<verify_after>".to_string()],
+            error: "verify_after FAILED: row_count (absent — did not run)".to_string(),
+            failure_kind: crate::output::FailureKind::Unknown,
+            cooldown_seconds: None,
+        });
+        out.verify_after_failed = true;
+        assert!(
+            !out.check_gate_failed,
+            "the check gate cannot see an absent required check"
+        );
+
+        let record = out.to_run_record(
+            "run-1",
+            now,
+            now,
+            "cfg".to_string(),
+            rocky_core::state::RunTrigger::Manual,
+            out.derive_run_status(),
+            crate::output::RunRecordAudit::test_sentinels(),
+        );
+        assert!(
+            record.verify_after_failed,
+            "the verdict must reach the record the resume gate reads"
+        );
+        assert!(
+            record
+                .models_executed
+                .iter()
+                .any(|m| m.status.as_str() == "failed"),
+            "precondition: the synthetic entry is what admits the resume today"
+        );
+        store.record_run(&record).unwrap();
+        store.init_run_progress("run-1", 1, None).unwrap();
+        store
+            .record_table_progress(
+                "run-1",
+                &rocky_core::state::TableProgress {
+                    index: 0,
+                    table_key: "wh.raw.orders".to_string(),
+                    asset_key: vec!["wh".to_string(), "orders".to_string()],
+                    status: TableStatus::Success,
+                    error: None,
+                    duration_ms: 1,
+                    completed_at: now,
+                },
+            )
+            .unwrap();
+        let progress = store.get_run_progress("run-1").unwrap().unwrap();
+
+        let err = super::ensure_the_resume_would_do_work(&record, &progress)
+            .expect_err("a resume that would copy nothing and verify nothing must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("verify_after") && msg.contains("re-run no verification"),
+            "the refusal says what the resume would NOT do: {msg}"
+        );
+
+        // The control: the SAME record without the verdict is still admitted,
+        // which is exactly the behaviour on `main`.
+        let mut ungated = record.clone();
+        ungated.verify_after_failed = false;
+        assert!(
+            super::ensure_the_resume_would_do_work(&ungated, &progress).is_ok(),
+            "without the persisted verdict the synthetic entry admits the resume"
+        );
+
+        assert!(!matches!(record.status, RunStatus::Success));
+    }
+
+    /// #1732, the other half. A resume that IS legitimately admitted — a table
+    /// failed to copy, so real work remains — must not launder the standing
+    /// verification failure into a green record.
+    ///
+    /// `finalize_drift_verify_after` verifies only the drift the CURRENT
+    /// invocation auto-applied, so the earlier unconfirmed migration is never
+    /// re-examined. Without the carry-forward the resume has no failed table
+    /// of its own, derives `Success`, and `latest_successful_run` starts
+    /// matching it.
+    #[test]
+    fn a_resume_of_an_unverified_run_cannot_record_success() {
+        use rocky_core::state::{RunStatus, StateStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let now = chrono::Utc::now();
+
+        // Run 1: two of three tables copied, one failed, and the post-apply
+        // verification of an auto-applied migration could not be confirmed.
+        let mut first = RunOutput::new(String::new(), 0, 3);
+        first.tables_copied = 2;
+        first.tables_failed = 1;
+        first.verify_after_failed = true;
+        let first_record = first.to_run_record(
+            "run-1",
+            now,
+            now,
+            "cfg".to_string(),
+            rocky_core::state::RunTrigger::Manual,
+            first.derive_run_status(),
+            crate::output::RunRecordAudit::test_sentinels(),
+        );
+        assert!(first_record.verify_after_failed);
+        store.record_run(&first_record).unwrap();
+        store.init_run_progress("run-1", 3, None).unwrap();
+        let progress = store.get_run_progress("run-1").unwrap().unwrap();
+
+        // The resume copies the one failed table. It auto-applies no drift, so
+        // it runs no verification at all.
+        let inherited = super::inherited_verify_after(&store, Some(&progress));
+        assert_eq!(inherited.as_deref(), Some("run-1"));
+
+        let mut resumed = RunOutput::new(String::new(), 0, 1);
+        resumed.tables_copied = 1;
+        resumed.resumed_from = Some("run-1".to_string());
+        resumed.verify_after_failed =
+            super::resolved_check_gate(resumed.verify_after_failed, inherited.as_ref());
+
+        assert!(
+            !matches!(resumed.derive_run_status(), RunStatus::Success),
+            "a resume that re-ran no verification must not report Success"
+        );
+
+        let resumed_record = resumed.to_run_record(
+            "run-2",
+            now,
+            now,
+            "cfg".to_string(),
+            rocky_core::state::RunTrigger::Manual,
+            resumed.derive_run_status(),
+            crate::output::RunRecordAudit::test_sentinels(),
+        );
+        assert!(
+            resumed_record.verify_after_failed,
+            "the standing verdict must survive onto the resumed run's own record"
+        );
+        store.record_run(&resumed_record).unwrap();
+        store.init_run_progress("run-2", 1, None).unwrap();
+        let progress2 = store.get_run_progress("run-2").unwrap().unwrap();
+        assert_eq!(
+            super::inherited_verify_after(&store, Some(&progress2)).as_deref(),
+            Some("run-2"),
+            "a resume of the resume inherits it in turn instead of clearing it by depth"
+        );
+    }
+
     /// #1720. An interrupted resume must still record the standing gate.
     ///
     /// The SIGINT path persists its `RunRecord` well before the check-gate
@@ -21619,6 +21924,52 @@ backend = "local"
             "the inherited gate must be stamped before the interrupt path persists its \
              RunRecord, or an interrupted resume of a gated run records no verdict and the \
              resume after it inherits nothing (#1720)"
+        );
+    }
+
+    /// #1732. The stamp must exist, and it must land BEFORE the re-persist
+    /// that writes the record the resume gate later reads.
+    ///
+    /// This is a source-order guard for the same reason as
+    /// `the_inherited_gate_is_stamped_before_the_interrupt_path_persists`
+    /// above: no behavioural unit test reaches the site. Getting there needs a
+    /// real warehouse, a real additive drift, a policy rule with
+    /// `verify_after`, and a required check that does not run. Deleting
+    /// `output.verify_after_failed = true;` passes the entire
+    /// `commands::run::` suite — 1819 tests — because every test that asserts
+    /// the verdict sets it by hand.
+    ///
+    /// The ordering half matters as much as the existence half. There are two
+    /// `persist_run_record` calls around this branch: one before the gate runs
+    /// (the gate reads the record it writes) and one inside the failure branch.
+    /// The first necessarily writes `verify_after_failed: false`. If the stamp
+    /// landed after the second, the `false` would stand and the resume gate
+    /// would read it.
+    ///
+    /// Every `find` takes the FIRST occurrence, which is the production site;
+    /// the copies inside these tests are thousands of lines later.
+    #[test]
+    fn the_verify_after_verdict_is_stamped_before_the_failure_branch_repersists() {
+        let source = include_str!("run.rs");
+        let push = source
+            .find("asset_key: vec![\"<verify_after>\".to_string()],")
+            .expect("the <verify_after> error push is gone — re-anchor this test");
+        let stamp = source
+            .find("output.verify_after_failed = true;")
+            .expect("the verify_after verdict is never stamped — see #1732");
+        let repersist = source[push..]
+            .find("persist_run_record(")
+            .map(|i| push + i)
+            .expect("the failure branch no longer re-persists; re-anchor this test");
+        assert!(
+            push < stamp,
+            "the stamp belongs with the failure it records, right after the error push"
+        );
+        assert!(
+            stamp < repersist,
+            "the verdict must be stamped BEFORE the failure branch re-persists, or the \
+             record the resume gate reads carries the `false` written by the persist that \
+             ran before the gate (#1732)"
         );
     }
 
@@ -27237,6 +27588,7 @@ auto_create_schemas = true
             pipeline: None,
             submission_id: None,
             check_gate_failed: false,
+            verify_after_failed: false,
         };
         state.record_run(&failed).unwrap();
 
@@ -28566,6 +28918,7 @@ auto_create_schemas = true
             pipeline: None,
             submission_id: None,
             check_gate_failed: false,
+            verify_after_failed: false,
         };
         store.record_run(&run).unwrap();
         // The prior build's LIVE artifact — the ledger row the liveness gate
@@ -28763,6 +29116,7 @@ auto_create_schemas = true
             pipeline: None,
             submission_id: None,
             check_gate_failed: false,
+            verify_after_failed: false,
         };
         store.record_run(&base_run).unwrap();
         store
@@ -28891,6 +29245,7 @@ auto_create_schemas = true
             pipeline: None,
             submission_id: None,
             check_gate_failed: false,
+            verify_after_failed: false,
         };
         store.record_run(&run).unwrap();
 
@@ -29876,6 +30231,7 @@ auto_create_schemas = true
                 pipeline: None,
                 submission_id: None,
                 check_gate_failed: false,
+                verify_after_failed: false,
             };
             store.record_run(&run).unwrap();
             // The prior build's LIVE artifact row — the liveness gate resolves
@@ -30179,6 +30535,7 @@ auto_create_schemas = true
                     pipeline: None,
                     submission_id: None,
                     check_gate_failed: false,
+                    verify_after_failed: false,
                 })
                 .unwrap();
             // The prior live_d build's LIVE artifact-ledger row — the liveness
@@ -33424,18 +33781,9 @@ timestamp_column = "ts"
     #[test]
     fn one_collector_consumes_every_materialized_table() {
         // PRODUCTION code only — the test module below calls the collector too.
-        // Anchored on the module header, not on a bare `#[cfg(test)]`: this
-        // file has a test-only helper (`build_replication_strategy`) sitting in
-        // the middle of the production half, so cutting at the first
-        // `#[cfg(test)]` would drop everything after it from the scan.
-        let full = include_str!("run.rs");
-        let src = &full[..full
-            .find("\n#[cfg(test)]\nmod tests {")
-            .expect("the test module header")];
-
-        // Whitespace-stripped, so `cargo fmt` wrapping a call across lines
-        // cannot silently zero either count.
-        let compact: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        // Through the shared helper, which owns both the anchor and the
+        // whitespace stripping (#1725).
+        let compact = production_source();
         assert_eq!(
             compact.matches(".assertion_targets.push(").count(),
             1,
