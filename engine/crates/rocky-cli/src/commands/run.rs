@@ -21881,6 +21881,52 @@ backend = "local"
         );
     }
 
+    /// #1732. The stamp must exist, and it must land BEFORE the re-persist
+    /// that writes the record the resume gate later reads.
+    ///
+    /// This is a source-order guard for the same reason as
+    /// `the_inherited_gate_is_stamped_before_the_interrupt_path_persists`
+    /// above: no behavioural unit test reaches the site. Getting there needs a
+    /// real warehouse, a real additive drift, a policy rule with
+    /// `verify_after`, and a required check that does not run. Deleting
+    /// `output.verify_after_failed = true;` passes the entire
+    /// `commands::run::` suite — 1819 tests — because every test that asserts
+    /// the verdict sets it by hand.
+    ///
+    /// The ordering half matters as much as the existence half. There are two
+    /// `persist_run_record` calls around this branch: one before the gate runs
+    /// (the gate reads the record it writes) and one inside the failure branch.
+    /// The first necessarily writes `verify_after_failed: false`. If the stamp
+    /// landed after the second, the `false` would stand and the resume gate
+    /// would read it.
+    ///
+    /// Every `find` takes the FIRST occurrence, which is the production site;
+    /// the copies inside these tests are thousands of lines later.
+    #[test]
+    fn the_verify_after_verdict_is_stamped_before_the_failure_branch_repersists() {
+        let source = include_str!("run.rs");
+        let push = source
+            .find("asset_key: vec![\"<verify_after>\".to_string()],")
+            .expect("the <verify_after> error push is gone — re-anchor this test");
+        let stamp = source
+            .find("output.verify_after_failed = true;")
+            .expect("the verify_after verdict is never stamped — see #1732");
+        let repersist = source[push..]
+            .find("persist_run_record(")
+            .map(|i| push + i)
+            .expect("the failure branch no longer re-persists; re-anchor this test");
+        assert!(
+            push < stamp,
+            "the stamp belongs with the failure it records, right after the error push"
+        );
+        assert!(
+            stamp < repersist,
+            "the verdict must be stamped BEFORE the failure branch re-persists, or the \
+             record the resume gate reads carries the `false` written by the persist that \
+             ran before the gate (#1732)"
+        );
+    }
+
     /// Control (#1720). A resume with nothing inherited is unchanged: the
     /// verdict is the run's own, so an honest recovery from a copy failure
     /// still reaches `Success` and still records `check_gate_failed = false`.
