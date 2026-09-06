@@ -160,6 +160,63 @@ nullable = true
 required = ["amount"]
 TOML
         ;;
+    fulfillment-review)
+        # The U3-A3 screencast, which is three tapes and three browser scenes
+        # against ONE workspace — a plan id has to be the same in the terminal
+        # and in the browser, or a viewer who reads carefully sees a staged
+        # artifact. So this case is prepared once and NOT re-run between the
+        # tapes; record-screencast.sh drives them in order and holds a
+        # `rocky serve --ui` open across all of them.
+        #
+        # Credential-free: the POC's [fulfill.driver] is `replay`, so no
+        # ANTHROPIC_API_KEY is read.
+        cp -r "$POCS/03-ai/08-fulfillment-walking-skeleton/." "$scratch/"
+        clean_state "$scratch"
+        # The POC's own run.sh wipes these at the top; the tapes start from a
+        # cold product, so wipe them here instead of showing an `rm` on screen.
+        rm -rf "$scratch/products" "$scratch/expected" 2>/dev/null || true
+        rm -f "$scratch/models/revenue_daily.sql" \
+              "$scratch/models/revenue_daily.toml" \
+              "$scratch/models/revenue_daily.contract.toml" 2>/dev/null || true
+        # A persistent warehouse, so the apply materialises real revenue and
+        # the browser's sample panel has rows to show.
+        (cd "$scratch" && duckdb wh.duckdb < data/warehouse_seed.sql >/dev/null)
+        # The staleness beat backdates what was materialised. It lives in a
+        # file rather than inline in the tape for two reasons: vhs's parser
+        # cannot read escaped double quotes inside a `Type` string, and the
+        # tape can then show the SQL before running it. The schema is `out`,
+        # which is where the product spec's target puts it — `main` would be a
+        # duckdb error on screen.
+        cat > "$scratch/backdate.sql" <<'SQL'
+-- Age the materialised output past the product's freshness budget.
+UPDATE out.revenue_daily SET loaded_at = TIMESTAMP '2020-01-01 00:00:00';
+SQL
+        # A git baseline, so the approval marker does not name a person.
+        #
+        # The marker records the git identity that signed it, read from
+        # `git config --get user.email`. Without a repo here that resolves to
+        # whoever is at the keyboard, and their address then appears in the
+        # finished screencast. A repo-local identity keeps a person out of the
+        # frame.
+        #
+        # It does NOT make the breaking-change gate run, which an earlier
+        # version of this comment claimed. `rocky review` compiles BOTH sides,
+        # and this baseline is a project with no models at all — so compiling
+        # HEAD fails and the gate is skipped either way. The screen says so, in
+        # the engine's own words, which is the honest frame and the one U3-P1
+        # is careful to distinguish from a clean gate. A baseline that made the
+        # gate run would need a model committed before the loop writes one,
+        # which is a different demo than "a product built from a sentence".
+        (
+            cd "$scratch"
+            git init -q -b main
+            git config user.email "reviewer@example.com"
+            git config user.name "A Reviewer"
+            git config commit.gpgsign false
+            git add -A
+            git commit -q -m "baseline: the product's brief and its policy, before any model"
+        )
+        ;;
     *)
         echo "prepare.sh: unknown demo '$demo'" >&2
         exit 1

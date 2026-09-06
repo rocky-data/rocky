@@ -1,0 +1,13 @@
+{
+  "name": "rocky-screencast-browser",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Records the Rocky browser UI with Playwright, for the fulfillment screencast. Deliberately outside engine/ui's dependency tree — nothing here ships in the binary.",
+  "type": "module",
+  "scripts": {
+    "record": "node record.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.60.0"
+  }
+}
