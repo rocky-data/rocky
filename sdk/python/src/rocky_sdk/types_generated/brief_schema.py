@@ -673,6 +673,14 @@ class BriefOutput(BaseModel):
     Autonomy-budget degradations and active policy freezes — the dynamic tightening currently in force across the estate.
     """
     command: str
+    config_error: str | None = None
+    """
+    The project's `rocky.toml` is present and could not be loaded.
+
+    The digest still renders: six of its nine sections take no config at all, and one of those — the escalation list — has no other route, since `rocky review --queue` refuses on the same error (#1704). Nothing is computed from defaults: `cost`, `autonomy` and `scheduler` are `unavailable` carrying this same text as their note.
+
+    Present here as well as on those notes so a reader does not have to sniff note strings to learn the digest is degraded. `rocky brief` exits non-zero when it is set. Omitted from the JSON when the config loaded, or when the project has none (#1727).
+    """
     cost: BriefCostSection
     """
     Cost and budget burn across the window's runs.
