@@ -252,17 +252,45 @@ pub(crate) fn verify_policy_posture(config_path: &Path, parsed: &ParsedSpec) -> 
     let output_model = parsed.output_model();
     let block = paste_block(output_model);
 
-    if !config_path.is_file() {
-        return PostureResult::needs_input(
-            format!(
-                "rocky.toml not found at {} — fix the config, then re-run",
-                config_path.display()
-            ),
-            &block,
-        );
-    }
+    // The loader IS the presence probe. An `is_file()` gate in front of it
+    // reported "rocky.toml not found" for a config that was plainly there:
+    // `is_file()` follows a symlink, so a dangling `rocky.toml` answered
+    // false (#1729). The direction was always safe — this returns
+    // `needs_input` either way — but the reason it printed was untrue, and an
+    // operator cannot fix a broken symlink they are told does not exist.
     let config = match rocky_core::config::load_rocky_config(config_path) {
         Ok(config) => config,
+        // Nothing at the path. The config has to be created.
+        Err(rocky_core::config::ConfigError::FileNotFound { .. }) => {
+            return PostureResult::needs_input(
+                format!(
+                    "rocky.toml not found at {} — fix the config, then re-run",
+                    config_path.display()
+                ),
+                &block,
+            );
+        }
+        // An entry IS at the path and could not be read — a dangling symlink
+        // most often. The message already names the path and the link target.
+        Err(err @ rocky_core::config::ConfigError::UnreadableFile { .. }) => {
+            return PostureResult::needs_input(
+                format!("{err} — fix the config, then re-run"),
+                &block,
+            );
+        }
+        // The read itself failed for a reason that is not absence — a
+        // directory at the path, a permission denial. Say so; it does not
+        // reach the parser, so "does not parse" would be untrue.
+        Err(rocky_core::config::ConfigError::ReadFile(io_error)) => {
+            return PostureResult::needs_input(
+                format!(
+                    "rocky.toml at {} could not be read: {io_error} — fix the config, then \
+                     re-run",
+                    config_path.display()
+                ),
+                &block,
+            );
+        }
         Err(err) => {
             // A malformed `[policy]` hard-fails the engine's own config
             // load (serde deny_unknown_fields, unsigned integer types), so
@@ -2332,6 +2360,87 @@ effect = "require_review"
         write_file(&root.join("products/revenue_daily.toml"), SPEC_FIXTURE);
         let result = verify_policy_posture(&root.join("rocky.toml"), &parsed_d3());
         assert_eq!(result.status, VerifyStatus::NeedsInput);
+    }
+
+    /// A `rocky.toml` that is a dangling symlink is present, not missing.
+    /// `is_file()` followed the link and answered false, so `product verify`
+    /// printed "rocky.toml not found at <path>" about a file the operator can
+    /// see (#1729). The direction was always safe — still `needs_input` — but
+    /// the reason has to be true, or there is nothing to act on.
+    ///
+    /// `#[cfg(unix)]`: creating a symlink on Windows needs Developer Mode or
+    /// `SeCreateSymbolicLinkPrivilege`.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_config_symlink_reports_the_link_not_a_missing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        write_file(&root.join("products/revenue_daily.toml"), SPEC_FIXTURE);
+        let target = root.join("shared-prod.toml");
+        let config = root.join("rocky.toml");
+        std::os::unix::fs::symlink(&target, &config).expect("symlink");
+        assert!(
+            !config.is_file(),
+            "precondition: the probe this replaces reports the config as missing"
+        );
+
+        let result = verify_policy_posture(&config, &parsed_d3());
+        assert_eq!(
+            result.status,
+            VerifyStatus::NeedsInput,
+            "the direction is unchanged: still needs input, never a pass"
+        );
+        assert!(
+            !result.reason.contains("not found"),
+            "a config that is plainly there must not be reported as missing: {}",
+            result.reason
+        );
+        assert!(
+            result.reason.contains(&config.display().to_string())
+                && result.reason.contains(&target.display().to_string()),
+            "the reason must name the config path and the link target: {}",
+            result.reason
+        );
+    }
+
+    /// The control: nothing at the path still reads as a missing config, with
+    /// the message it always had.
+    #[test]
+    fn an_absent_config_still_reports_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        write_file(&root.join("products/revenue_daily.toml"), SPEC_FIXTURE);
+        let config = root.join("rocky.toml");
+
+        let result = verify_policy_posture(&config, &parsed_d3());
+        assert_eq!(result.status, VerifyStatus::NeedsInput);
+        assert!(
+            result.reason.contains("rocky.toml not found at"),
+            "absence keeps its own message: {}",
+            result.reason
+        );
+    }
+
+    /// A directory sitting where `rocky.toml` should be never reached the
+    /// parser, so "does not parse" was untrue for it too. It now says what it
+    /// is. `is_file()` was false here before, so this case also used to print
+    /// "not found".
+    #[test]
+    fn a_directory_at_the_config_path_reports_a_read_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        write_file(&root.join("products/revenue_daily.toml"), SPEC_FIXTURE);
+        let config = root.join("rocky.toml");
+        std::fs::create_dir_all(&config).expect("mkdir");
+
+        let result = verify_policy_posture(&config, &parsed_d3());
+        assert_eq!(result.status, VerifyStatus::NeedsInput);
+        assert!(
+            result.reason.contains("could not be read")
+                && result.reason.contains(&config.display().to_string()),
+            "a directory must be reported as unreadable, not as missing: {}",
+            result.reason
+        );
     }
 
     #[test]
