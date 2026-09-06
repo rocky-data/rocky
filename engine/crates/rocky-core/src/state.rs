@@ -678,7 +678,42 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   `fulfill::tests::the_data_red_state_round_trips_and_is_a_hard_error_on_an_older_reader`,
 ///   so "the version gate is what protects the downgrade" stays true by
 ///   test rather than by comment.
-const CURRENT_SCHEMA_VERSION: u32 = 24;
+///
+/// - **v25** — persists the check gate's verdict on the run record: a new
+///   serde-additive [`RunRecord::check_gate_failed`] flag. Not a table change
+///   — the redb table set is unchanged (`EXPECTED_TABLES` is untouched); no
+///   blob walk. A v24 blob (which lacks the field) forward-deserializes with
+///   it `false`, guarded by
+///   `test_v24_run_record_forward_deserializes_check_gate_failed_false`.
+///
+///   **What moved and why (#1720).** Before this, the severity-resolved
+///   answer to "did this run's checks gate it?" lived only on the CLI's
+///   in-memory `RunOutput` and was thrown away when the run ended. The
+///   resume gate therefore had to infer resumability from
+///   `models_executed`, which says nothing about check severity — so a run
+///   that correctly failed its check gate could be resumed, copy nothing,
+///   run no check, and record `Success`. Persisting the verdict is what
+///   lets `rocky run --resume` refuse that resume, and lets an admitted
+///   resume carry the standing gate forward instead of reporting green.
+///
+///   **On upgrade.** A v24 store opened by this binary is stamped v25 in
+///   place; every existing record is kept and reads back with
+///   `check_gate_failed = false`. That default is honest but lossy in one
+///   direction: a run that was gated by a pre-v25 binary has no persisted
+///   verdict, so a resume of it is admitted exactly as it is today. Only
+///   runs recorded by this binary onward carry the flag.
+///
+///   **On rollback.** Unlike v24, the blob itself is backward-safe: a v25
+///   `RunRecord` carries one extra key and serde ignores unknown keys, so a
+///   v24 binary would parse it if it ever reached it. It does not reach it:
+///   the version check runs at OPEN and `[state] on_schema_mismatch`
+///   engages there ([`SchemaMismatchPolicy::Fail`] refuses with the version
+///   pair; [`SchemaMismatchPolicy::Recreate`] bootstraps a fresh store).
+///   `Recreate` is the case to state plainly — it discards the run history,
+///   and with it every persisted gate verdict, so a rolled-back binary
+///   resumes a check-gated run the old way. Rolling back is not a way to
+///   clear a gate; re-running the pipeline is.
+const CURRENT_SCHEMA_VERSION: u32 = 25;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -2327,6 +2362,31 @@ pub struct RunRecord {
     /// must never match a demand to a run by pipeline + time.
     #[serde(default)]
     pub submission_id: Option<String>,
+
+    /// The check gate's severity-resolved verdict for this run (schema v25):
+    /// `true` when at least one **error-severity** check failed (or could not
+    /// be evaluated) **and** the pipeline's `[pipeline.<name>.checks]
+    /// fail_on_error` gate was on. The persisted twin of the CLI's
+    /// `RunOutput::check_gate_failed` (#1598), written by `to_run_record`.
+    ///
+    /// **Why it is persisted rather than re-derived.** [`Self::check_outcomes`]
+    /// records pass/fail with no severity and no knowledge of `fail_on_error`,
+    /// so a later reader cannot tell a gating failure from an advisory one.
+    /// Without this field the resume gate had to infer resumability from
+    /// [`Self::models_executed`], which is orthogonal to check severity — and
+    /// a run that correctly failed its checks could be resumed into a green
+    /// `Success` record (#1720).
+    ///
+    /// `false` on pre-v25 records and on every run that did not trip the gate,
+    /// including every run under `fail_on_error = false` — a pipeline that
+    /// declared its checks advisory never records a gate here, so there is
+    /// nothing for a later resume to inherit.
+    ///
+    /// Serde-defaulted so a v24 blob forward-deserializes with it `false`;
+    /// guarded by
+    /// `test_v24_run_record_forward_deserializes_check_gate_failed_false`.
+    #[serde(default)]
+    pub check_gate_failed: bool,
 }
 
 /// One executed data-quality check's pass/fail outcome, captured on a
@@ -6944,6 +7004,7 @@ mod tests {
             check_outcomes: Vec::new(),
             pipeline: None,
             submission_id: None,
+            check_gate_failed: false,
         }
     }
 
@@ -7015,6 +7076,78 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&stamped).unwrap()).unwrap();
         assert_eq!(round.pipeline.as_deref(), Some("raw"));
         assert_eq!(round.submission_id.as_deref(), Some("sub-123"));
+    }
+
+    /// v24 → v25 (#1720). A v24 `RunRecord` blob has no `check_gate_failed`
+    /// key at all. It must forward-deserialize with the field `false`, so a
+    /// store written by an older binary reads as "no gate recorded" and every
+    /// pre-v25 run resumes exactly as it did before the field existed.
+    ///
+    /// `false` is also the fail-OPEN direction, and that is deliberate and
+    /// bounded: a v24 record carries no verdict to honour, so refusing its
+    /// resume would refuse every legitimate pre-upgrade resume. Runs recorded
+    /// by this binary onward carry the real verdict.
+    #[test]
+    fn test_v24_run_record_forward_deserializes_check_gate_failed_false() {
+        let mut value = serde_json::to_value(minimal_run_record("run-v24", vec![]))
+            .expect("serialize run record");
+        let obj = value.as_object_mut().expect("record is an object");
+        assert!(
+            obj.remove("check_gate_failed").is_some(),
+            "a v25 record must actually carry the key this test strips"
+        );
+        let blob = serde_json::to_vec(&value).expect("reserialize without the field");
+
+        let record: RunRecord =
+            serde_json::from_slice(&blob).expect("a v24 RunRecord must forward-deserialize");
+        assert_eq!(record.run_id, "run-v24");
+        assert!(
+            !record.check_gate_failed,
+            "a v24 record has no recorded gate, so it must read false"
+        );
+
+        // A v25 record carrying the gate round-trips losslessly — the field is
+        // read back, not silently dropped on the way through redb's blob.
+        let mut gated = minimal_run_record("run-v25", vec![]);
+        gated.check_gate_failed = true;
+        let round: RunRecord =
+            serde_json::from_slice(&serde_json::to_vec(&gated).unwrap()).unwrap();
+        assert!(
+            round.check_gate_failed,
+            "a recorded gate must survive the blob round-trip"
+        );
+    }
+
+    /// The same contract through the real store, not just serde: a record
+    /// written with the gate set reads back with it set. This is the wire the
+    /// resume gate depends on — `record_run` → redb blob → `get_run`.
+    #[test]
+    fn a_recorded_check_gate_survives_the_state_store() {
+        let (store, _dir) = temp_store();
+        let mut gated = minimal_run_record("run-gated", vec![]);
+        gated.check_gate_failed = true;
+        store.record_run(&gated).expect("record the gated run");
+
+        let mut clean = minimal_run_record("run-clean", vec![]);
+        clean.check_gate_failed = false;
+        store.record_run(&clean).expect("record the clean run");
+
+        assert!(
+            store
+                .get_run("run-gated")
+                .expect("read back")
+                .expect("the gated run exists")
+                .check_gate_failed,
+            "the gate must survive record_run -> get_run"
+        );
+        assert!(
+            !store
+                .get_run("run-clean")
+                .expect("read back")
+                .expect("the clean run exists")
+                .check_gate_failed,
+            "a run with no gate must read back false"
+        );
     }
 
     #[test]
@@ -11901,7 +12034,11 @@ mod tests {
         // the new variant, which is the thing the open-time mismatch gate
         // reads: a 1.73.0 binary must refuse a v24 store at OPEN, before it
         // can reach a blob it cannot parse.
-        const EXPECTED_VERSION: u32 = 24;
+        // v25 adds `RunRecord::check_gate_failed` (#1720), a serde-additive
+        // field. NO table change — `EXPECTED_TABLES` is deliberately
+        // unchanged below — so this stanza moves the version only; guarded by
+        // `test_v24_run_record_forward_deserializes_check_gate_failed_false`.
+        const EXPECTED_VERSION: u32 = 25;
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",

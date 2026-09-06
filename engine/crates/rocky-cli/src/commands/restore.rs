@@ -1425,6 +1425,7 @@ mod tests {
                     check_outcomes: Vec::new(),
                     pipeline: None,
                     submission_id: None,
+                    check_gate_failed: false,
                 })
                 .unwrap();
         }
@@ -2486,6 +2487,7 @@ mod tests {
                         check_outcomes: Vec::new(),
                         pipeline: None,
                         submission_id: None,
+                        check_gate_failed: false,
                     })
                     .unwrap();
 
