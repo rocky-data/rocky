@@ -54,6 +54,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **On upgrade:** the state store schema moves v23 → v24. No table is added and no blob migration runs; a v23 store upgrades on the next read-write open. The bump is load-bearing: `observed_failing` is a new variant of the `fulfill_state` record's tagged enum, and a 1.73.0 binary cannot read a blob that carries it. **Rolling back is the part to plan for.** Remote state keys are qualified by schema version (`v23/state.redb` on an object store, `…v23:…` on Valkey), so a 1.73.0 binary never reads a v24 remote object. It reads whatever is under its own v23 key, which may be stale, and it cannot see progress recorded under v24. The incompatible-blob hazard is a **local** `state.redb` this version wrote. A 1.73.0 binary opening it either stops with a schema-mismatch error or, on the paths that honour `[state] on_schema_mismatch`, deletes the file and starts fresh under the default `recreate`. Do not point a 1.73.0 binary at a local state file written by this version, and do not share one local file between versions. `rocky doctor --check state_schema` reports the mismatch and exits 3. Which commands honour the key and which refuse is being pinned down in #1679. `fulfill_state` is local-only, so a re-run rebuilds the loop's position; see #1525 before relying on that loss being harmless.
 
 ### Fixed
+- **A model sidecar that was a dangling symlink read as absent, so the model compiled against defaults — different strategy, possibly a different target table, silently.**
+
+  `Path::exists()` is `std::fs::metadata(..).is_ok()`, and `metadata` **follows** a symlink. A file that is a symlink to a deleted target therefore answers `false`, and every caller that gated a read on that probe read a present file as absent and took its "there is none of this" branch.
+
+  #1729 fixed the three sites that gate the project `rocky.toml`. The same probe still gated model sidecars, seed sidecars, `rocky init` and `rocky ai-explain`'s sidecar rewrite.
+
+  The model-sidecar case had the widest blast radius: a `.sql` model's sidecar carries its target catalog/schema/table, its `strategy`, its `depends_on` and its contract wiring, so a dangling `models/orders.toml` did not fail the compile — the model built from `_defaults.toml` alone, with a different materialization strategy and possibly a different target table, and nothing said so. `rocky init`'s "rocky.toml already exists" guard passed on a dangling link and the write that followed **created the link's target**, repointing a shared config path at a fresh template instead of refusing.
+
+  All seven sites now use `rocky_core::path_presence::entry_is_present`, which stats the link itself instead of following it, so the read is attempted and its honest I/O error surfaces. A model read failure now names the file: `failed to read '<path>'` where it used to say only `failed to read model file: No such file or directory` — the same words the caller had used to conclude the file was absent, and wrong, because the file is there and its target is not.
+
+  The `state.redb` gates are deliberately unchanged: a dangling state store reads as "no state yet" and then does nothing, which is the CI-safe ephemeral-runner contract those branches exist for. (#1738)
+
 - **`rocky brief` no longer deletes six sections of the digest because the config would not load — and a webhook-only project stops reporting zero incidents.**
 
   Two independent defects in the same command.

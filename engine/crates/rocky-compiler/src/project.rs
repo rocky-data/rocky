@@ -627,7 +627,7 @@ fn load_single_rocky_model_with_db(
     // Sidecar config + contract resolution — unchanged from the
     // non-salsa path.
     let toml_path = path.with_extension("toml");
-    let config = if toml_path.exists() {
+    let config = if rocky_core::path_presence::entry_is_present(&toml_path) {
         models::load_model_pair_with_context(path, &toml_path, defaults, ctx)?.config
     } else {
         let catalog = defaults
