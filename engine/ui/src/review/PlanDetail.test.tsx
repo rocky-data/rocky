@@ -245,6 +245,44 @@ describe("PlanDetail", () => {
     expect(container.querySelector("form")).toBeNull();
   });
 
+  /// U2-P0's XSS row, the diff half — the sink that did not exist until this
+  /// lane did. A breaking finding names a model and a column, and neither is
+  /// the operator's: they come from whatever SQL an agent wrote.
+  it("renders a hostile model name, column and reason as text, never as markup", async () => {
+    const hostile = '<img src=x onerror="alert(1)">';
+    const { container } = render(
+      <PlanDetail
+        planId={PLAN}
+        loaders={loaders({
+          // Built from the typed finding above rather than written fresh, so
+          // the change's discriminant keeps its literal type.
+          diff: vi.fn(
+            async (): Promise<ReviewOutput> => ({
+              ...DIFF,
+              breaking_changes: (DIFF.breaking_changes ?? []).map((finding) => ({
+                ...finding,
+                change: { ...finding.change, model: hostile, column: hostile },
+              })),
+            }),
+          ),
+          queue: vi.fn(async () => ({
+            ...QUEUE,
+            pending: [{ ...QUEUE.pending[0], reason: `${hostile} needs a human` }],
+          })),
+        })}
+      />,
+    );
+
+    // Twice on the page: once as the escalation's reason, once inside the
+    // finding's description. Both are sinks; both must be text.
+    await screen.findByText(`${hostile} needs a human`);
+    const escaped = hostile.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    expect(screen.getAllByText(new RegExp(escaped)).length).toBeGreaterThanOrEqual(2);
+    // …and never as an element. React escapes by default; this fails loudly
+    // if anyone reaches for dangerouslySetInnerHTML in this lane.
+    expect(container.querySelector("img")).toBeNull();
+  });
+
   it("names a product from its identity, and describes every finding kind", () => {
     expect(productNameFromId("product:revenue_daily")).toBe("revenue_daily");
     expect(productNameFromId("revenue_daily")).toBe("revenue_daily");
