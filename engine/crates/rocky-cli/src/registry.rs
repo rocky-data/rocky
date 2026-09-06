@@ -610,9 +610,14 @@ impl AdapterRegistry {
     ///
     /// Databricks implements all three batch methods (UNION ALL row counts +
     /// freshness + `information_schema.columns` describe). Snowflake and
-    /// BigQuery batch only describe for now; their row-count / freshness
-    /// methods return "not yet implemented" so `run.rs` falls back to
-    /// per-table queries for those.
+    /// BigQuery batch only describe for now, and report that through
+    /// `BatchCheckAdapter::supports_row_counts` / `supports_freshness` so
+    /// `run.rs` falls back to per-table queries for those two legs (#1719).
+    ///
+    /// This returns `Some` for them on purpose: their `batch_describe_schema`
+    /// is real, and both `discover --with-schemas` and the run loop's column
+    /// pre-fetch use it. Returning `None` to express "cannot batch checks"
+    /// would cost those warehouses their batched schema describe.
     pub fn batch_check_adapter(&self, name: &str) -> Option<Arc<dyn BatchCheckAdapter>> {
         if let Some(connector) = self.connectors.get(name) {
             return Some(Arc::new(DatabricksBatchCheckAdapter::new(
