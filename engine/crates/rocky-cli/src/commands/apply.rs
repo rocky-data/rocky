@@ -9840,6 +9840,7 @@ schema_template = "s__{source}"
             pipeline: None,
             submission_id: None,
             check_gate_failed: false,
+            verify_after_failed: false,
         };
         store.record_run(&record).unwrap();
     }

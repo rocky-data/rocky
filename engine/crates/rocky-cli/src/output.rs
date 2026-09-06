@@ -289,6 +289,50 @@ pub struct RunOutput {
     /// "may I treat the run as green?" — the answer there is no.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub check_gate_failed: bool,
+    /// `true` when this run auto-applied additive schema drift whose
+    /// post-apply `verify_after` gate did not confirm it.
+    ///
+    /// The gate runs after the run record exists, because it reads that
+    /// record's check outcomes. It yields `Err` when a required check failed
+    /// **or did not run at all** — a required check that is absent from
+    /// `RunRecord::check_outcomes` fails it closed. There is no rollback
+    /// substrate on a plain warehouse target, so the migration stands until a
+    /// human reverts it.
+    ///
+    /// # Why this is its own field and not `check_gate_failed`
+    ///
+    /// The two verdicts do not imply one another, and the absent-check case is
+    /// exactly where they diverge:
+    ///
+    /// ```text
+    ///   a required check is ABSENT      -> verify_after fails closed
+    ///                                   -> nothing failed, so the check gate
+    ///                                      has nothing to gate on: false
+    ///   fail_on_error = false           -> every check is advisory, so the
+    ///                                      check gate is always false, while
+    ///                                      verify_after can still fail
+    /// ```
+    ///
+    /// In both, `check_gate_failed` is `false` while an auto-applied migration
+    /// stands unverified. Deriving one from the other would fail open on the
+    /// two shapes that matter most (#1732).
+    ///
+    /// # What reads it
+    ///
+    /// [`crate::commands::run`]'s resume gate, beside `check_gate_failed`. A
+    /// run that copied every table it planned and could not verify its own
+    /// migration has no copy work left for a resume to do, but it does carry a
+    /// synthetic `<verify_after>` entry in `models_executed` — and the resume
+    /// gate admits a run "because a model failed, and the model phase re-runs".
+    /// That entry is not a model, nothing re-runs, and the resume recorded
+    /// `Success` over an unconfirmed migration.
+    ///
+    /// Like `check_gate_failed`, an admitted resume inherits it: the resume
+    /// re-runs `verify_after` only for drift IT auto-applies, so an earlier
+    /// unverified migration is never re-examined. Omitted from the JSON when
+    /// `false`, so a run that verified cleanly is unchanged on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verify_after_failed: bool,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub tables_skipped: usize,
     /// Tables that the discovery adapter reported as enabled but that do not
@@ -4898,6 +4942,7 @@ impl RunOutput {
             tables_copied: 0,
             tables_failed: 0,
             check_gate_failed: false,
+            verify_after_failed: false,
             tables_skipped: 0,
             excluded_tables: vec![],
             resumed_from: None,
@@ -5272,6 +5317,13 @@ impl RunOutput {
             // or guessing from `models_executed` (which is orthogonal to it).
             // The resume gate reads exactly this field (#1720).
             check_gate_failed: self.check_gate_failed,
+            // The post-apply verification verdict, persisted for the same
+            // reason and read by the same refusal. Deliberately NOT derived
+            // from `check_gate_failed`: the two diverge on exactly the shapes
+            // that matter (a required check that is absent, and
+            // `fail_on_error = false`), so deriving one from the other fails
+            // open (#1732).
+            verify_after_failed: self.verify_after_failed,
         }
     }
 
@@ -5326,7 +5378,16 @@ impl RunOutput {
     /// meaning is a count of tables and models.
     pub fn derive_run_status(&self) -> rocky_core::state::RunStatus {
         let has_progress = self.tables_copied > 0 || !self.materializations.is_empty();
-        let has_problem = self.interrupted || self.tables_failed > 0 || self.check_gate_failed;
+        // `verify_after_failed` joins the gate for the same reason it exists: a
+        // resume that INHERITS it has `tables_failed == 0` of its own, so
+        // without this it derives `Success` and `latest_successful_run` starts
+        // matching a run whose auto-applied migration nobody confirmed
+        // (#1732). On the run that raised it, `tables_failed` was already
+        // incremented, so this changes nothing there.
+        let has_problem = self.interrupted
+            || self.tables_failed > 0
+            || self.check_gate_failed
+            || self.verify_after_failed;
         match (has_progress, has_problem) {
             (_, false) => rocky_core::state::RunStatus::Success,
             (true, true) => rocky_core::state::RunStatus::PartialFailure,

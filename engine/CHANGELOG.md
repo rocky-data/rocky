@@ -54,6 +54,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **On upgrade:** the state store schema moves v23 → v24. No table is added and no blob migration runs; a v23 store upgrades on the next read-write open. The bump is load-bearing: `observed_failing` is a new variant of the `fulfill_state` record's tagged enum, and a 1.73.0 binary cannot read a blob that carries it. **Rolling back is the part to plan for.** Remote state keys are qualified by schema version (`v23/state.redb` on an object store, `…v23:…` on Valkey), so a 1.73.0 binary never reads a v24 remote object. It reads whatever is under its own v23 key, which may be stale, and it cannot see progress recorded under v24. The incompatible-blob hazard is a **local** `state.redb` this version wrote. A 1.73.0 binary opening it either stops with a schema-mismatch error or, on the paths that honour `[state] on_schema_mismatch`, deletes the file and starts fresh under the default `recreate`. Do not point a 1.73.0 binary at a local state file written by this version, and do not share one local file between versions. `rocky doctor --check state_schema` reports the mismatch and exits 3. Which commands honour the key and which refuse is being pinned down in #1679. `fulfill_state` is local-only, so a re-run rebuilds the loop's position; see #1525 before relying on that loss being harmless.
 
 ### Fixed
+- **A resume could report `Success` over a schema migration whose verification failed.**
+
+  `rocky run` auto-applies additive schema drift under a policy rule, then verifies it with the rule's `verify_after` checks. When that verification fails there is no rollback on a warehouse target — the migration stands, and the run halts so a human can look at it.
+
+  The failure was recorded as a synthetic `<verify_after>` entry in the run record's `models_executed`, with `status: "failed"`. The resume gate reads any failed entry as "a model failed, and the model phase re-runs on a resume". That entry is not a model. Nothing re-ran:
+
+  ```
+  run 1   copies every table, auto-applies drift, verify_after FAILS -> exit 2
+  resume  skips every Success key -> copies nothing, verifies nothing -> Success
+  ```
+
+  `latest_successful_run` matches on exactly `Success`, so every downstream `after` demand then fired on a schema change nobody confirmed.
+
+  **Why #1720's fix did not already cover it.** That one persists the *check gate*, and the two verdicts diverge on exactly the shapes that matter here. `verify_after` fails **closed** on a required check that is ABSENT from the record — and an absent check is not a failing check, so the check gate has nothing to gate on and stays `false`. Under `[pipeline.<name>.checks] fail_on_error = false` the check gate is always `false` while `verify_after` can still fail. Deriving one from the other would fail open on both.
+
+  The verdict is now persisted in its own right, as `RunOutput.verify_after_failed` on the wire and `RunRecord::verify_after_failed` in the state store, and read by the resume gate beside the check gate. An admitted resume — one where a table really did fail to copy — inherits it too, because `verify_after` only ever verifies drift the current invocation applied.
+
+  **On upgrade:** the state store schema moves v25 → v26. No table is added and no blob migration runs; a v25 store upgrades on the next read-write open, and its existing records read back `verify_after_failed = false`. That default is lossy in one direction — a run that failed verification under an older binary has no persisted verdict, so a resume of it is admitted exactly as before. Rolling back has the same shape as v25: the blob itself is backward-safe, but the OPEN-time version check engages `[state] on_schema_mismatch` first, and `recreate` discards the run history along with every persisted verdict.
+
+  **On the wire:** `verify_after_failed` is omitted from `--output json` when `false`, so a run that verified cleanly is unchanged. (#1732)
+
 - **A tick whose webhook spool could not be read reported a clean idle tick to every machine that asked.**
 
   #1710 made the spool scan refuse a dangling `.rocky/pending-demands` symlink instead of reading it as an empty spool. That refusal reached a log line and nothing else. `rocky tick --output json` came back identical to a healthy idle tick in every health-bearing field — `skipped` empty, `counts` zero — and the resident scheduler's span carried nothing either. The state the refusal exists to stop reporting was still being reported.
