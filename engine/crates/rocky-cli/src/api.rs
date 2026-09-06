@@ -3613,6 +3613,7 @@ mod tests {
                 pipeline: None,
                 submission_id: None,
                 check_gate_failed: false,
+                verify_after_failed: false,
             })
             .expect("run recorded");
         store
