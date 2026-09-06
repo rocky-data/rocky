@@ -23765,7 +23765,8 @@ backend = "local"
             None,
             None,
             false, // transformation pipeline → mask NOT bound (finding #4)
-        );
+        )
+        .expect("the fixture's surrogate-key specs load");
         // Apply side: the choke-point's routing + governance identity are the
         // loaded config's, resolved for the same (None) env. The POC pipeline is
         // a TRANSFORMATION pipeline (→ `run_local`), which reconciles no masks, so
@@ -23829,7 +23830,8 @@ backend = "local"
             None,
             None,
             true, // replication full run → mask BOUND (finding #4)
-        );
+        )
+        .expect("the fixture's surrogate-key specs load");
         // Apply side: `reconciles_masks = true` binds `gate.resolved_mask`, which
         // the choke-point restricts to the executed models' tags — mirror that.
         let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
@@ -23855,7 +23857,8 @@ backend = "local"
             None,
             None,
             true, // replication full run → mask BOUND (finding #4)
-        );
+        )
+        .expect("the fixture's surrogate-key specs load");
         assert_ne!(
             caps.models_fingerprint, caps_redact.models_fingerprint,
             "a used [mask] change must move the replication plan fingerprint (#4/C bound)"

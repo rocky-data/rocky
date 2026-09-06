@@ -1243,7 +1243,7 @@ fn build_and_persist_run_plan(
         Some(state_path),
         env,
         bind_masks,
-    );
+    )?;
     let plan_id = write_plan_governed(&cwd, PlanKind::Run, &run_plan, principal, capabilities)
         .context("failed to write run plan")?;
 
@@ -1279,7 +1279,14 @@ pub fn compute_embedded_capabilities(
     // does not reach the mask leg never checks the gate, so a wrong-`true` is
     // harmless; a wrong-`false` would false-refuse).
     bind_masks: bool,
-) -> EmbeddedCapabilities {
+    // Returns `Result` since #1730: the surrogate-key map folded into the
+    // execution fingerprint is now loaded by the SAME filtered, strict
+    // derivation the apply-side choke-point uses. A malformed spec used to
+    // collapse this side to an empty map through `.unwrap_or_default()`, so
+    // the plan was persisted with no surrogate key in its fingerprint at all —
+    // and the comment below claimed the gate "must keep hashing the resolved
+    // whole" while that call made it false.
+) -> anyhow::Result<EmbeddedCapabilities> {
     use crate::plan_store::CURRENT_FINGERPRINT_VERSION;
     use rocky_compiler::compile::{self, CompilerConfig};
 
@@ -1329,7 +1336,7 @@ pub fn compute_embedded_capabilities(
     };
 
     if !models_dir.is_dir() {
-        return failed(config_identity); // fail-closed
+        return Ok(failed(config_identity)); // fail-closed
     }
 
     let identity = config_identity.clone().unwrap_or_default();
@@ -1370,7 +1377,7 @@ pub fn compute_embedded_capabilities(
         };
         match compile::compile(&config) {
             Ok(r) => r,
-            Err(_) => return failed(config_identity),
+            Err(_) => return Ok(failed(config_identity)),
         }
     };
     // Capture the REVIEWED source-schema snapshot (finding #2) — the exact
@@ -1394,7 +1401,7 @@ pub fn compute_embedded_capabilities(
     // swap of either is refused even though `config`+`sql` are byte-identical —
     // built from the SAME `models_dir` the apply choke-point re-reads.
     let extras = crate::commands::apply::ExecutionExtras::build(
-        &rocky_core::models::load_surrogate_keys_from_tree(models_dir).unwrap_or_default(),
+        &crate::commands::apply::resolved_surrogate_keys(models_dir, &head.project.models)?,
         &head.project.models,
         &resolved_mask,
     );
@@ -1412,14 +1419,14 @@ pub fn compute_embedded_capabilities(
         // per-model classification (fail-closed to breaking). Keep the
         // fingerprint so the TOCTOU gate still binds.
         Err(_) => {
-            return EmbeddedCapabilities {
+            return Ok(EmbeddedCapabilities {
                 diff_available: false,
                 changed: std::collections::BTreeMap::new(),
                 models_fingerprint,
                 config_identity,
                 fingerprint_version: CURRENT_FINGERPRINT_VERSION,
                 reviewed_source_schemas,
-            };
+            });
         }
     };
 
@@ -1444,14 +1451,14 @@ pub fn compute_embedded_capabilities(
         }
     }
 
-    EmbeddedCapabilities {
+    Ok(EmbeddedCapabilities {
         diff_available: true,
         changed,
         models_fingerprint,
         config_identity,
         fingerprint_version: CURRENT_FINGERPRINT_VERSION,
         reviewed_source_schemas,
-    }
+    })
 }
 
 /// Build a canonical, sorted source-state snapshot from the discovered
