@@ -71,6 +71,7 @@ describe("App", () => {
       <App
         engine={<span>engine slot</span>}
         estate={<span>estate slot</span>}
+        review={<span>review slot</span>}
         governor={<span>governor slot</span>}
       />,
     );
@@ -82,9 +83,7 @@ describe("App", () => {
     expect(window.location.pathname).toBe("/ui/estate");
 
     screen.getByRole("link", { name: "Review" }).click();
-    await waitFor(() =>
-      expect(screen.getByText("The review screen is not built yet")).toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.getByText("review slot")).toBeInTheDocument());
     expect(window.location.pathname).toBe("/ui/review");
   });
 });
