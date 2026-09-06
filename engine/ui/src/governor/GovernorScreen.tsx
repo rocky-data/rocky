@@ -3,6 +3,7 @@ import { navigateTo, pathForLane, useSegments } from "../router";
 import { AuditScreen } from "./AuditScreen";
 import { BriefScreen } from "./BriefScreen";
 import { CustodyScreen } from "./CustodyScreen";
+import { ProductsScreen } from "./ProductsScreen";
 import { ScorecardScreen } from "./ScorecardScreen";
 
 const TABS = [
@@ -10,33 +11,50 @@ const TABS = [
   { id: "scorecard", label: "Scorecard", producer: "GET /api/v1/audit/scorecard" },
   { id: "custody", label: "Custody", producer: "GET /api/v1/custody/{subject}" },
   { id: "audit", label: "Audit", producer: "GET /api/v1/audit" },
+  { id: "products", label: "Products", producer: "GET /api/v1/products/{name}/journal" },
 ] as const;
 
 type Tab = (typeof TABS)[number]["id"];
 
 function tabFromSegment(segment: string | undefined): Tab {
-  return segment === "scorecard" || segment === "custody" || segment === "audit" ? segment : "brief";
+  switch (segment) {
+    case "scorecard":
+    case "custody":
+    case "audit":
+    case "products":
+      return segment;
+    default:
+      return "brief";
+  }
 }
 
 /**
  * The governor lane: the brief, the trust scorecard, the custody
- * drill-down and the audit browse, one tab each, deep-linked at
- * `/ui/governor/<screen>` (`/ui/governor/custody/<subject>` for a subject).
+ * drill-down, the audit browse and the product timelines, one tab each,
+ * deep-linked at `/ui/governor/<screen>` (`/ui/governor/custody/<subject>`
+ * for a subject, `/ui/governor/products/<name>` for one product).
+ *
+ * The product timeline lives here rather than in a lane of its own: it
+ * answers the question the other four answer — what happened, and who decided
+ * it — for the same reader.
  */
 export function GovernorScreen({
   brief,
   scorecard,
   custody,
   audit,
+  products,
 }: {
   brief?: ReactNode;
   scorecard?: ReactNode;
   custody?: (subject: string | null) => ReactNode;
   audit?: ReactNode;
+  products?: (name: string | null) => ReactNode;
 }) {
   const segments = useSegments();
   const tab = tabFromSegment(segments[1]);
   const subject = tab === "custody" && segments[2] ? decodeURIComponent(segments[2]) : null;
+  const productName = tab === "products" && segments[2] ? decodeURIComponent(segments[2]) : null;
 
   let screen: ReactNode;
   switch (tab) {
@@ -51,6 +69,9 @@ export function GovernorScreen({
       break;
     case "audit":
       screen = audit ?? <AuditScreen />;
+      break;
+    case "products":
+      screen = products ? products(productName) : <ProductsScreen name={productName} />;
       break;
   }
 
