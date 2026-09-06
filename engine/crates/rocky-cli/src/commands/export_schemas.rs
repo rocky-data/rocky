@@ -164,6 +164,13 @@ pub(crate) fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<AuditForOutput>("audit_for"),
         entry::<AuditScorecardOutput>("audit_scorecard"),
         entry::<BriefOutput>("brief"),
+        // `rocky snapshot` and `rocky docs` both print typed JSON and both
+        // were missing from this roster, so no schema was exported and the
+        // SDK, the Dagster bindings and the VS Code types knew nothing of
+        // either shape — the two exceptions to the rule that every
+        // `--output json` payload is covered (#1699).
+        entry::<crate::output::SnapshotOutput>("snapshot"),
+        entry::<crate::output::DocsOutput>("docs"),
         // Plan/apply spine (Cluster 3 B, Phase 2–3)
         entry::<ApplyOutput>("apply"),
         entry::<PromotePlan>("plan_promote"),

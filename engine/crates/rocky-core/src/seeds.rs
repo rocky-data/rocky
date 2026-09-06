@@ -373,7 +373,7 @@ pub fn discover_seeds(dir: &Path) -> Result<Vec<SeedFile>, SeedError> {
 
         // Look for optional sidecar TOML.
         let sidecar_path = dir.join(format!("{stem}.toml"));
-        let config = if sidecar_path.is_file() {
+        let config = if crate::path_presence::entry_is_present(&sidecar_path) {
             let content =
                 std::fs::read_to_string(&sidecar_path).map_err(|e| SeedError::ReadFile {
                     path: sidecar_path.display().to_string(),
