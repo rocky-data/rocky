@@ -4345,11 +4345,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             poll_interval_seconds,
             drain_timeout_seconds,
         } => {
-            let config = if cli.config.exists() {
-                Some(cli.config.as_path())
-            } else {
-                None
-            };
+            // Presence only, and it REFUSES on a path that has an entry it
+            // cannot read. `cli.config.exists()` followed a symlink, so a
+            // dangling `rocky.toml` read as "no config" and serve started
+            // config-less: no [mask]/[freshness] on any compile, the default
+            // schema-cache posture, and the webhook spool relocated to
+            // ./.rocky (#1729). `None` is still the honest no-config answer.
+            let config = rocky_cli::commands::resolve_serve_config_path(&cli.config)?;
             // The store `serve` reads. An explicit `--state-path` is the hard
             // override, as everywhere. A resolved namespace — the
             // `--state-namespace` flag, or the config's `[state] namespacing`

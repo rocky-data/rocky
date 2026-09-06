@@ -189,7 +189,7 @@ pub use run::{
 pub use run_dag_exec::run_with_dag;
 pub use run_watch::run_watch as run_with_watch;
 pub use seed::run_seed;
-pub use serve::run_serve;
+pub use serve::{resolve_serve_config_path, run_serve};
 pub use shell::run_shell;
 pub use snapshot::run_snapshot;
 pub use state::{state_clear_schema_cache, state_retention_sweep, state_schedule_hold, state_show};
