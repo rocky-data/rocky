@@ -151,6 +151,10 @@ pub const SCHEDULER_STATE_BUSY: &str = "rocky.scheduler.state_busy";
 
 /// Whether a drain was signalled mid-tick, cutting evaluation short.
 pub const SCHEDULER_DRAINED: &str = "rocky.scheduler.drained";
+/// True when the webhook spool could not be read this tick, so no pending
+/// demand was consumed. A fault, not contention: an absent spool directory
+/// reads as an empty list and never sets this (#1731).
+pub const SCHEDULER_SPOOL_UNREADABLE: &str = "rocky.scheduler.spool_unreadable";
 
 // ---------------------------------------------------------------------------
 // Enumerations
@@ -222,6 +226,7 @@ mod tests {
         SCHEDULER_LOCK_OVERRIDDEN,
         SCHEDULER_STATE_BUSY,
         SCHEDULER_DRAINED,
+        SCHEDULER_SPOOL_UNREADABLE,
     ];
 
     /// Every canonical key must use the `rocky.<resource>.<field>` shape
