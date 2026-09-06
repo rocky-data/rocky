@@ -93,6 +93,7 @@ impl DuckDbConnector {
                     Value::UInt(n) => serde_json::Value::String(n.to_string()),
                     Value::UBigInt(n) => serde_json::Value::String(n.to_string()),
                     Value::HugeInt(n) => serde_json::Value::String(n.to_string()),
+                    Value::UHugeInt(n) => serde_json::Value::String(n.to_string()),
                     Value::Float(n) => serde_json::Value::String(n.to_string()),
                     Value::Double(n) => serde_json::Value::String(n.to_string()),
                     Value::Text(s) => serde_json::Value::String(s),
@@ -110,6 +111,52 @@ impl DuckDbConnector {
                                 .unwrap_or_default(),
                         )
                     }
+                    // A DATE is days since the Unix epoch. `run_content_addressed`
+                    // parses this cell back with `%Y-%m-%d` to build a
+                    // `Date32Array`, so the format is a contract, not a
+                    // presentation choice.
+                    Value::Date32(days) => serde_json::Value::String(
+                        chrono::DateTime::from_timestamp(i64::from(days) * 86_400, 0)
+                            .map(|dt| dt.date_naive().to_string())
+                            .unwrap_or_default(),
+                    ),
+                    Value::Time64(unit, val) => {
+                        let (secs, nanos) = match unit {
+                            duckdb::types::TimeUnit::Second => (val, 0),
+                            duckdb::types::TimeUnit::Millisecond => {
+                                (val.div_euclid(1_000), val.rem_euclid(1_000) * 1_000_000)
+                            }
+                            duckdb::types::TimeUnit::Microsecond => {
+                                (val.div_euclid(1_000_000), val.rem_euclid(1_000_000) * 1_000)
+                            }
+                            duckdb::types::TimeUnit::Nanosecond => {
+                                (val.div_euclid(1_000_000_000), val.rem_euclid(1_000_000_000))
+                            }
+                        };
+                        serde_json::Value::String(
+                            u32::try_from(secs)
+                                .ok()
+                                .and_then(|s| {
+                                    chrono::NaiveTime::from_num_seconds_from_midnight_opt(
+                                        s,
+                                        nanos as u32,
+                                    )
+                                })
+                                .map(|t| t.format("%H:%M:%S%.f").to_string())
+                                .unwrap_or_default(),
+                        )
+                    }
+                    // Exact by construction: DuckDB's own decimal carrier
+                    // renders its digits, where `f64` would round them.
+                    Value::Decimal(d) => serde_json::Value::String(d.to_string()),
+                    Value::Enum(s) => serde_json::Value::String(s),
+                    // Deliberately left: the composite and binary carriers
+                    // (`Blob`, `Geometry`, `List`, `Array`, `Struct`, `Map`,
+                    // `Union`). Each needs a JSON shape decided on its own —
+                    // base64, a nested array, an object — and more than twenty
+                    // call sites read these cells. They are a separate change;
+                    // until then they arrive as their `Debug` form, which is
+                    // wrong but at least visibly so.
                     _ => serde_json::Value::String(format!("{val:?}")),
                 };
                 values.push(json_val);
@@ -183,6 +230,61 @@ impl DuckDbConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `DATE` is the shape `run_content_addressed` parses back, and the
+    /// shape a person reads in `rocky preview rows`. Before the `Date32` arm
+    /// existed it fell to the wildcard and arrived as `Date32(20701)`, which
+    /// the content-addressed path then refused to parse.
+    #[test]
+    fn a_date_column_is_an_iso_date_not_the_drivers_debug_form() {
+        let db = DuckDbConnector::in_memory().unwrap();
+        let result = db.execute_sql("SELECT DATE '2026-09-05' AS day").unwrap();
+        assert_eq!(result.rows[0][0], "2026-09-05");
+    }
+
+    /// The epoch itself, and a date before it — the arm converts through a
+    /// signed day offset, so a negative one must not wrap.
+    #[test]
+    fn a_date_before_the_epoch_is_still_an_iso_date() {
+        let db = DuckDbConnector::in_memory().unwrap();
+        let result = db
+            .execute_sql("SELECT DATE '1970-01-01' AS epoch, DATE '1969-07-20' AS before")
+            .unwrap();
+        assert_eq!(result.rows[0][0], "1970-01-01");
+        assert_eq!(result.rows[0][1], "1969-07-20");
+    }
+
+    #[test]
+    fn a_time_column_is_a_clock_time() {
+        let db = DuckDbConnector::in_memory().unwrap();
+        let result = db
+            .execute_sql("SELECT TIME '13:45:30' AS t, TIME '00:00:00.5' AS frac")
+            .unwrap();
+        assert_eq!(result.rows[0][0], "13:45:30");
+        assert_eq!(result.rows[0][1], "00:00:00.500");
+    }
+
+    /// A `DECIMAL` renders its own digits. Routing it through `f64` would
+    /// round them, which is the whole reason the type exists.
+    #[test]
+    fn a_decimal_column_keeps_its_digits() {
+        let db = DuckDbConnector::in_memory().unwrap();
+        let result = db
+            .execute_sql("SELECT CAST('1234.50' AS DECIMAL(10,2)) AS amount")
+            .unwrap();
+        assert_eq!(result.rows[0][0], "1234.50");
+    }
+
+    /// `HugeInt`'s unsigned twin was mapped; this one was not, and fell to the
+    /// wildcard beside it.
+    #[test]
+    fn an_unsigned_huge_int_is_its_digits() {
+        let db = DuckDbConnector::in_memory().unwrap();
+        let result = db
+            .execute_sql("SELECT CAST(340282366920938463463374607431768211455 AS UHUGEINT) AS n")
+            .unwrap();
+        assert_eq!(result.rows[0][0], "340282366920938463463374607431768211455");
+    }
 
     #[test]
     fn test_in_memory() {
