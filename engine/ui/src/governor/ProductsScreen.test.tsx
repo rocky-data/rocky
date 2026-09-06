@@ -207,6 +207,29 @@ describe("ProductsScreen", () => {
     expect(screen.getByText("engine_not_ready")).toBeTruthy();
   });
 
+  /// U2-P0's XSS row, the timeline half. A journal event is a string the
+  /// engine composed from a compiler error, a check failure or an agent's
+  /// output — none of it the operator's, and this screen renders it verbatim
+  /// on purpose, so verbatim has to mean text.
+  it("renders a hostile event and product name as text, never as markup", async () => {
+    const hostile = '<img src=x onerror="alert(1)">';
+    const { container } = render(
+      <ProductsScreen
+        name="revenue_daily"
+        loaders={loaders({
+          journal: vi.fn(async () => ({
+            ...JOURNAL,
+            count: 1,
+            rows: [{ seq: 1, at: "2026-09-05T08:00:00Z", event: hostile, to_state: "observing" }],
+          })),
+        })}
+      />,
+    );
+
+    expect(await screen.findByText(hostile)).toBeTruthy();
+    expect(container.querySelector("img")).toBeNull();
+  });
+
   it("builds a product path that survives an awkward name", () => {
     expect(productPath("revenue daily")).toBe("/ui/governor/products/revenue%20daily");
   });
