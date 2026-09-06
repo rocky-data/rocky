@@ -29,6 +29,13 @@ export interface ApiClientOptions {
   storage?: { getItem: (k: string) => string | null };
   /** Defaults to `""` (same origin). Tests pass an absolute base. */
   base?: string;
+  /**
+   * Extra request headers. The one caller today is the samples panel, which
+   * must send `X-Rocky-Allow-Warehouse: true` — and only when the viewer has
+   * asked for rows, never on a page load. Kept out of the default so a header
+   * that spends money is always written at its call site.
+   */
+  headers?: Record<string, string>;
 }
 
 /**
@@ -40,7 +47,7 @@ export async function apiGet<T>(path: string, options: ApiClientOptions = {}): P
   const doFetch = options.fetch ?? fetch;
   const storage = options.storage ?? sessionStorage;
   const base = options.base ?? "";
-  const headers: Record<string, string> = { Accept: "application/json" };
+  const headers: Record<string, string> = { Accept: "application/json", ...options.headers };
   const token = storage.getItem(TOKEN_STORAGE_KEY);
   if (token) headers.Authorization = `Bearer ${token}`;
 

@@ -4,6 +4,7 @@ import { ApiError, apiGet } from "./api";
 import { EmptyState, StatusCard } from "./components";
 import { EstateScreen } from "./estate/EstateScreen";
 import { GovernorScreen } from "./governor/GovernorScreen";
+import { ReviewScreen } from "./review/ReviewScreen";
 import { LANES, navigate, pathForLane, useLane, type Lane } from "./router";
 import { currentToken } from "./token";
 
@@ -118,18 +119,23 @@ export function EnginePanel({
   }
 }
 
-/** What each lane shows. The review and governor screens are U3 and U4. */
-function LaneScreen({ lane, estate, governor }: { lane: Lane; estate: ReactNode; governor: ReactNode }) {
+/** What each lane shows. */
+function LaneScreen({
+  lane,
+  estate,
+  review,
+  governor,
+}: {
+  lane: Lane;
+  estate: ReactNode;
+  review: ReactNode;
+  governor: ReactNode;
+}) {
   switch (lane) {
     case "estate":
       return <>{estate}</>;
     case "review":
-      return (
-        <EmptyState
-          title="The review screen is not built yet"
-          detail="U3: the pending plan, its diff, samples, blast radius and policy verdict."
-        />
-      );
+      return <>{review}</>;
     case "governor":
       return <>{governor}</>;
   }
@@ -138,10 +144,12 @@ function LaneScreen({ lane, estate, governor }: { lane: Lane; estate: ReactNode;
 export function App({
   engine,
   estate,
+  review,
   governor,
 }: {
   engine?: ReactNode;
   estate?: ReactNode;
+  review?: ReactNode;
   governor?: ReactNode;
 }) {
   const lane = useLane();
@@ -183,6 +191,7 @@ export function App({
           <LaneScreen
             lane={lane}
             estate={estate ?? <EstateScreen />}
+            review={review ?? <ReviewScreen />}
             governor={governor ?? <GovernorScreen />}
           />
         </main>
