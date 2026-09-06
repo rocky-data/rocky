@@ -3,8 +3,9 @@
 //! The only operation currently implemented is `batch_describe_schema`,
 //! which replaces N `DESCRIBE TABLE` calls with one
 //! `INFORMATION_SCHEMA.COLUMNS` query per schema. `batch_row_counts` and
-//! `batch_freshness` remain unimplemented — callers fall back to the
-//! per-table [`WarehouseAdapter`] path for those.
+//! `batch_freshness` remain unimplemented, and this adapter declares that
+//! through `supports_row_counts()` / `supports_freshness()` so callers fall
+//! back to the per-table [`WarehouseAdapter`] path for those (#1719).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -60,12 +61,27 @@ fn generate_batch_describe_sql(catalog: &str, schema: &str) -> Result<String, Ba
 
 #[async_trait]
 impl BatchCheckAdapter for SnowflakeBatchCheckAdapter {
+    // Snowflake could batch both with a UNION ALL over the supplied tables,
+    // but it is not wired yet. The capability says so; the methods below are
+    // unreachable through it.
+    //
+    // These used to return `Err("not yet implemented")` as the fallback
+    // signal, and the fallback the comment promised was never written. Since
+    // #1655/#1700 the runner folds a failed leg into a `not_evaluated` check
+    // at error severity, so every row-count and freshness check on Snowflake
+    // failed on healthy data and gated the run (#1719).
+    fn supports_row_counts(&self) -> bool {
+        false
+    }
+
+    fn supports_freshness(&self) -> bool {
+        false
+    }
+
     async fn batch_row_counts(&self, _tables: &[TableRef]) -> AdapterResult<Vec<RowCountResult>> {
-        // Snowflake could batch these with a UNION ALL over the supplied
-        // tables, but it's not wired yet. Return an error so `run.rs` falls
-        // back to per-table row-count queries via `WarehouseAdapter`.
         Err(AdapterError::msg(
-            "batch_row_counts not yet implemented for Snowflake",
+            "batch_row_counts is not implemented for Snowflake and \
+             supports_row_counts() reports false — this call ignored the capability",
         ))
     }
 
@@ -75,7 +91,8 @@ impl BatchCheckAdapter for SnowflakeBatchCheckAdapter {
         _timestamp_col: &str,
     ) -> AdapterResult<Vec<FreshnessResult>> {
         Err(AdapterError::msg(
-            "batch_freshness not yet implemented for Snowflake",
+            "batch_freshness is not implemented for Snowflake and \
+             supports_freshness() reports false — this call ignored the capability",
         ))
     }
 

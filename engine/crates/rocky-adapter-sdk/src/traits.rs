@@ -710,13 +710,32 @@ pub trait GovernanceAdapter: Send + Sync {
 
 /// Execute batched data quality checks.
 ///
-/// If not implemented, Rocky falls back to sequential per-table checks.
+/// The operations are independent: an adapter may batch one and not another.
+/// An adapter that cannot batch an operation says so through
+/// `supports_row_counts` / `supports_freshness` and Rocky falls back to
+/// sequential per-table checks. It must **not** say so by returning `Err` —
+/// an `Err` means the query ran and failed, and Rocky reports that as a
+/// failed check (#1719).
 #[async_trait]
 pub trait BatchCheckAdapter: Send + Sync {
+    /// Whether this adapter can answer `batch_row_counts`. `false` sends the
+    /// caller to the per-table `SELECT COUNT(*)` path.
+    fn supports_row_counts(&self) -> bool {
+        true
+    }
+
+    /// Whether this adapter can answer `batch_freshness`. `false` sends the
+    /// caller to the per-table `SELECT MAX(<timestamp_column>)` path.
+    fn supports_freshness(&self) -> bool {
+        true
+    }
+
     /// Execute row count queries for multiple tables in a single batch.
+    /// Called only when `supports_row_counts` returns `true`.
     async fn batch_row_counts(&self, tables: &[TableRef]) -> AdapterResult<Vec<RowCountResult>>;
 
     /// Execute freshness queries for multiple tables in a single batch.
+    /// Called only when `supports_freshness` returns `true`.
     async fn batch_freshness(
         &self,
         tables: &[TableRef],

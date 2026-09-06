@@ -1,8 +1,9 @@
 //! Batched warehouse operations for BigQuery.
 //!
-//! Only `batch_describe_schema` is implemented; `batch_row_counts` and
-//! `batch_freshness` return "not yet implemented" so the run loop falls
-//! back to per-table queries via the generic `WarehouseAdapter` path.
+//! Only `batch_describe_schema` is implemented; this adapter declares that
+//! through `supports_row_counts()` / `supports_freshness()` so the run loop
+//! falls back to per-table queries via the generic `WarehouseAdapter` path
+//! (#1719).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -100,9 +101,22 @@ fn parse_describe_rows(rows: &[Vec<serde_json::Value>]) -> HashMap<String, Vec<C
 
 #[async_trait]
 impl BatchCheckAdapter for BigQueryBatchCheckAdapter {
+    // Not wired yet. The capability says so; the methods below are
+    // unreachable through it. They used to return `Err("not yet
+    // implemented")` as the fallback signal, which the runner read as a
+    // query that failed and gated the run on healthy data (#1719).
+    fn supports_row_counts(&self) -> bool {
+        false
+    }
+
+    fn supports_freshness(&self) -> bool {
+        false
+    }
+
     async fn batch_row_counts(&self, _tables: &[TableRef]) -> AdapterResult<Vec<RowCountResult>> {
         Err(AdapterError::msg(
-            "batch_row_counts not yet implemented for BigQuery",
+            "batch_row_counts is not implemented for BigQuery and \
+             supports_row_counts() reports false — this call ignored the capability",
         ))
     }
 
@@ -112,7 +126,8 @@ impl BatchCheckAdapter for BigQueryBatchCheckAdapter {
         _timestamp_col: &str,
     ) -> AdapterResult<Vec<FreshnessResult>> {
         Err(AdapterError::msg(
-            "batch_freshness not yet implemented for BigQuery",
+            "batch_freshness is not implemented for BigQuery and \
+             supports_freshness() reports false — this call ignored the capability",
         ))
     }
 
