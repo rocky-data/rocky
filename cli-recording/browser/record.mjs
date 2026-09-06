@@ -1,6 +1,6 @@
 // Record the Rocky browser UI against a live `rocky serve --ui`.
 //
-//   node record.mjs <scene> --url <printed-url> [--out <dir>]
+//   node record.mjs <scene> --url <printed-url> [--plan <id>] [--out <dir>]
 //
 // `<printed-url>` is the address `rocky serve --ui` prints at start, token
 // fragment and all: http://127.0.0.1:<port>/ui/#token=<secret>. The SPA reads
@@ -25,7 +25,7 @@ const HERE = import.meta.dirname;
 
 function usage(msg) {
   if (msg) console.error(`record.mjs: ${msg}`);
-  console.error("usage: node record.mjs <scene> --url <printed-url> [--out <dir>]");
+  console.error("usage: node record.mjs <scene> --url <printed-url> [--plan <id>] [--out <dir>]");
   console.error("scenes:", Object.keys(SCENES).join(", "));
   process.exit(2);
 }
@@ -44,6 +44,10 @@ function flag(name) {
 const url = flag("url") ?? process.env.ROCKY_UI_URL;
 if (!url) usage("--url is required (the address `rocky serve --ui` printed)");
 const outDir = path.resolve(flag("out") ?? path.join(HERE, "out"));
+// Some scenes run after the plan has been approved, and an approval marker
+// empties the review queue — so they cannot find the plan by clicking it.
+const plan = flag("plan") ?? process.env.ROCKY_UI_PLAN ?? null;
+if (scene.needsPlan && !plan) usage(`scene "${sceneName}" needs --plan <id>`);
 
 // The canvas matches the terminal tapes (1200x700) so the two halves intercut
 // without a letterbox. Playwright records the viewport, not the window.
@@ -74,7 +78,7 @@ page.on("console", (m) => {
 let failure = null;
 try {
   await page.goto(url, { waitUntil: "domcontentloaded" });
-  await scene.run(page);
+  await scene.run(page, { plan });
 } catch (e) {
   failure = e;
 }

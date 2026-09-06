@@ -57,10 +57,24 @@ mkdir -p "$OUT"
 echo "▶ preparing the workspace (once — every tape and scene shares it)"
 ./prepare.sh "$DEMO" || exit 1
 
+# Refuse to start on a port something else already answers. `/health` needs no
+# token, so a stale server from a previous run answers it happily — and the
+# recording would then film a DIFFERENT workspace than the tapes are driving,
+# which is the one failure this whole script exists to prevent. It cost a run
+# to learn: "Address already in use" went to the log, the health poll passed
+# against the old process, and the browser filmed an empty review queue.
+if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/api/v1/health" >/dev/null 2>&1; then
+    echo "record-screencast.sh: something already answers on :$PORT." >&2
+    echo "  stop it, or set ROCKY_SCREENCAST_PORT to a free port." >&2
+    exit 1
+fi
+
 echo "▶ starting rocky serve --ui on :$PORT"
+# `exec` so $! is the rocky process itself, not a subshell whose child would
+# survive the trap.
 (
     cd "$WS" || exit 1
-    ROCKY_SERVE_TOKEN="$TOKEN" ROCKY_SERVE_TOKEN_SCOPE=read-only \
+    exec env ROCKY_SERVE_TOKEN="$TOKEN" ROCKY_SERVE_TOKEN_SCOPE=read-only \
         rocky serve --ui --port "$PORT"
 ) > "$OUT/serve.log" 2>&1 &
 SERVER=$!
@@ -71,11 +85,17 @@ cleanup() {
 trap cleanup EXIT
 
 for _ in $(seq 1 60); do
+    kill -0 "$SERVER" 2>/dev/null || break
     curl -fsS "http://127.0.0.1:$PORT/api/v1/health" >/dev/null 2>&1 && break
     sleep 0.5
 done
+if ! kill -0 "$SERVER" 2>/dev/null; then
+    echo "record-screencast.sh: the server exited — see $OUT/serve.log" >&2
+    tail -3 "$OUT/serve.log" >&2
+    exit 1
+fi
 if ! curl -fsS "http://127.0.0.1:$PORT/api/v1/health" >/dev/null 2>&1; then
-    echo "record-screencast.sh: the server never came up — see $OUT/serve.log" >&2
+    echo "record-screencast.sh: the server never answered — see $OUT/serve.log" >&2
     exit 1
 fi
 URL="http://127.0.0.1:$PORT/ui/#token=$TOKEN"
@@ -88,16 +108,18 @@ tape() {
 
 scene() {
     echo "▶ browser scene $1"
-    (cd browser && node record.mjs "$1" --url "$URL" --out "$OUT") \
+    (cd browser && node record.mjs "$@" --url "$URL" --out "$OUT") \
         || { echo "browser scene $1 failed" >&2; exit 1; }
 }
 
 tape 1
-scene review
 
-# The deny and the approve name a plan id. Take it from the queue the tape just
-# printed rather than hard-coding one: the tape types `$PLAN`, and the id the
-# viewer saw in the queue output is the id the shell expands.
+# The plan id, read from the queue the tape just printed rather than
+# hard-coded: the tape types `$PLAN`, so the id the viewer saw in the queue
+# output is the id the shell expands. It is also what the later browser scenes
+# navigate to — after tape 2's approve the review queue is EMPTY, because an
+# approval marker resolves the escalation, so a scene that filmed after the
+# approve could not find the plan by clicking it.
 PLAN=$(cd "$WS" && rocky --output json review --queue 2>/dev/null | jq -r '.pending[0].plan_id')
 if [ -z "$PLAN" ] || [ "$PLAN" = "null" ]; then
     echo "record-screencast.sh: no plan is waiting for review after tape 1." >&2
@@ -107,8 +129,9 @@ fi
 echo "  plan $PLAN"
 printf 'export PLAN=%s\n' "$PLAN" > "$WS/.screencast-env"
 
+scene review
 tape 2
-scene samples
+scene samples --plan "$PLAN"
 
 tape 3
 scene journal

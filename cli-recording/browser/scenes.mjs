@@ -68,13 +68,14 @@ export const SCENES = {
    */
   samples: {
     description: "the sample panel — a button first, then real rows",
-    async run(page) {
+    // This scene films AFTER the approve, and an approval marker empties the
+    // review queue — the plan can no longer be reached by clicking it. So the
+    // plan id is passed in and the page is opened by address.
+    needsPlan: true,
+    async run(page, { plan }) {
       await page.waitForFunction(() => !window.location.hash.includes("token="));
 
-      await goto(page, "/ui/review");
-      const first = page.locator('section[aria-label="The review queue"] a').first();
-      await first.waitFor();
-      await first.click();
+      await goto(page, `/ui/review/${plan}`);
 
       const panel = page.locator('section[aria-label="Sample rows"]');
       await panel.waitFor();
