@@ -68,7 +68,11 @@ const PRODUCT: ProductStatusOutput = {
   name: "revenue_daily",
   spec_present: true,
   spec_digest: "sha256:1111",
+  output_model: "revenue_daily",
 } as unknown as ProductStatusOutput;
+
+/** The queue after a sign-off: the escalation is resolved, so nothing pends. */
+const EMPTY_QUEUE: ReviewQueueOutput = { ...QUEUE, total: 0, pending: [] };
 
 function loaders(overrides: Partial<PlanLoaders> = {}): PlanLoaders {
   return {
@@ -81,6 +85,52 @@ function loaders(overrides: Partial<PlanLoaders> = {}): PlanLoaders {
 }
 
 describe("PlanDetail", () => {
+  /// The queue is not a durable source for the model name: an approval marker
+  /// resolves the escalation, so the entry disappears exactly when the table
+  /// it built starts existing. Reading the queue alone meant the panel could
+  /// never show real rows for a product's first plan.
+  it("still offers a sample after the plan is signed off and has left the queue", async () => {
+    render(
+      <PlanDetail
+        planId={PLAN}
+        loaders={loaders({
+          // The live capture is of a plan that is not product-bound, so the
+          // binding is set here: this test is about a product's plan.
+          status: vi.fn(async () => ({
+            ...STATUS,
+            reviewed: true,
+            product_id: "product:revenue_daily",
+          })),
+          queue: vi.fn(async () => EMPTY_QUEUE),
+        })}
+      />,
+    );
+
+    // Two cards say "signed off" once a marker exists — the review status and
+    // the approval. Either is enough to know the queue has released the plan.
+    await screen.findAllByText("signed off");
+    const panel = await screen.findByRole("region", { name: "Sample rows" });
+    expect(panel.textContent).toContain("revenue_daily");
+    expect(screen.getByRole("button", { name: /Show \d+ rows/ })).toBeTruthy();
+  });
+
+  /// Absent is not empty. A missing panel would read as "this plan touches no
+  /// data", which is a different claim with a different fix.
+  it("says it has no model to sample rather than dropping the panel", async () => {
+    render(
+      <PlanDetail
+        planId={PLAN}
+        loaders={loaders({
+          status: vi.fn(async () => ({ ...STATUS, reviewed: true, product_id: undefined })),
+          queue: vi.fn(async () => EMPTY_QUEUE),
+        })}
+      />,
+    );
+
+    await screen.findByText("no model to sample");
+    expect(screen.queryByRole("button", { name: /Show \d+ rows/ })).toBeNull();
+  });
+
   it("shows the plan, its findings, the escalation and the approve command", async () => {
     render(<PlanDetail planId={PLAN} loaders={loaders()} />);
 
