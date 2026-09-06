@@ -651,7 +651,7 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    let permit = Arc::clone(&state.store_reads)
+    let permit = Arc::clone(&state.store_access)
         .acquire_owned()
         .await
         .map_err(|_| ApiError::internal("the state-store read queue is closed".to_string()))?;
@@ -2032,10 +2032,15 @@ pub(crate) fn sweep_interrupted_jobs(state_path: &std::path::Path) -> anyhow::Re
 /// own: without the download-side preservation, a run-download's wholesale file
 /// replace would still wipe the local `jobs` rows.)
 pub(crate) async fn persist_job(
+    state: &ServerState,
     state_path: std::path::PathBuf,
     job: PersistedJob,
 ) -> anyhow::Result<()> {
+    // The write takes its turn at the process's store gate like every other
+    // open in this process; see `store_read`.
+    let permit = Arc::clone(&state.store_access).acquire_owned().await?;
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let _held = permit;
         let store = rocky_core::state::StateStore::open(&state_path)?;
         store.record_job(&job)?;
         Ok(())
@@ -2138,7 +2143,7 @@ async fn submit_job(
     // either both happen or neither does. (A durable record briefly visible with no
     // cache entry is fine — a concurrent read serves it and declines to cache it,
     // exactly as it would for any in-flight record it did not launch.)
-    if let Err(e) = persist_job(state_path.clone(), record.clone()).await {
+    if let Err(e) = persist_job(&state, state_path.clone(), record.clone()).await {
         tracing::warn!(error = %e, job_id = %job_id,
             "could not persist initial job record; in-memory only until it settles");
     }
@@ -2159,7 +2164,7 @@ async fn submit_job(
         done.result = result;
         done.error = error;
         task_state.jobs.upsert(done.clone()).await;
-        if let Err(e) = persist_job(state_path, done.clone()).await {
+        if let Err(e) = persist_job(&task_state, state_path, done.clone()).await {
             tracing::warn!(error = %e, job_id = %done.job_id,
                 "could not persist terminal job record; /runs is the reconcile surface");
         }
@@ -3918,7 +3923,39 @@ mod tests {
     async fn ui_mode_refuses_foreign_hosts_and_origins_before_routing() {
         let base = spawn_router(ui_state(&["ui.internal"], &["https://app.example"])).await;
         let client = reqwest::Client::new();
-        for path in ["/ui/", "/api/v1/health"] {
+        // The liveness route is the one exemption: a kubelet probes it with
+        // the pod IP as `Host`, which no `--allowed-host` can anticipate.
+        for (name, value) in [
+            ("host", "10.244.0.7:8080"),
+            ("origin", "http://evil.example"),
+        ] {
+            let resp = client
+                .get(format!("{base}/api/v1/health"))
+                .header(name, value)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "health must answer any {name}");
+        }
+        // A request that names nobody is refused, not waved through: HTTP/1.0
+        // without a Host header, sent by hand because every client adds one.
+        {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let addr = base.trim_start_matches("http://").to_string();
+            for (path, expected) in [("/ui/", "421"), ("/api/v1/health", "200")] {
+                let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+                stream
+                    .write_all(format!("GET {path} HTTP/1.0\r\n\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                let mut buf = Vec::new();
+                stream.read_to_end(&mut buf).await.unwrap();
+                let head = String::from_utf8_lossy(&buf);
+                let status = head.split(' ').nth(1).unwrap_or("");
+                assert_eq!(status, expected, "{path} without a Host header: {head}");
+            }
+        }
+        for path in ["/ui/"] {
             let resp = client
                 .get(format!("{base}{path}"))
                 .header("host", "evil.example")

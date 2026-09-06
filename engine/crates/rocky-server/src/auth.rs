@@ -377,6 +377,14 @@ fn forbidden_read_only_response() -> Response {
 /// `421`, and a present `Origin` that is neither the server's own nor an
 /// `--allowed-origin` entry is answered `403`. Both carry the envelope.
 /// Without `--ui` the guard is off, so existing embedders see no change.
+///
+/// Two edges the first version got wrong. The liveness route
+/// (`AUTH_EXEMPT_PATHS`) is exempt: a kubelet probes it with the pod IP as
+/// `Host`, a name the server cannot know, and the route carries no token and
+/// no data. And a request with no `Host` at all (HTTP/1.0, or HTTP/2 where
+/// the name travels as `:authority`) is checked against the URI's authority
+/// and refused when that is absent too, so the guard never waves through the
+/// absence of the header it exists to check.
 pub async fn require_known_host(
     State(state): State<Arc<ServerState>>,
     request: Request,
@@ -385,16 +393,31 @@ pub async fn require_known_host(
     let Some(ui) = state.ui.as_ref() else {
         return next.run(request).await;
     };
-    if let Some(host) = request.headers().get(header::HOST) {
-        let accepted = host.to_str().is_ok_and(|h| ui.host_allowed(h));
-        if !accepted {
-            return envelope_response(
-                StatusCode::MISDIRECTED_REQUEST,
-                "host_not_allowed",
-                "the request's Host header does not name this server",
-                "reach the UI by a loopback name, the bind host, or a name passed with --allowed-host",
-            );
-        }
+    // The liveness route is exempt. A kubelet or a load balancer probes it
+    // with the pod's IP as `Host`, a name this server cannot know in advance,
+    // and the route carries no token and no data: refusing it would only turn
+    // a healthy pod unready. Everything else must name this server.
+    if AUTH_EXEMPT_PATHS.contains(&request.uri().path()) {
+        return next.run(request).await;
+    }
+    // HTTP/1.1 carries the name in `Host`; HTTP/2 carries it in `:authority`,
+    // which hyper exposes on the URI. A request with neither names nobody
+    // and is refused: the guard fails closed, it does not wave through the
+    // absence of the one header it exists to check.
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| request.uri().authority().map(|a| a.as_str().to_owned()));
+    let accepted = host.as_deref().is_some_and(|h| ui.host_allowed(h));
+    if !accepted {
+        return envelope_response(
+            StatusCode::MISDIRECTED_REQUEST,
+            "host_not_allowed",
+            "the request's Host header does not name this server",
+            "reach the UI by a loopback name, the bind host, or a name passed with --allowed-host",
+        );
     }
     if let Some(origin) = request.headers().get(header::ORIGIN) {
         let accepted = origin
