@@ -21387,6 +21387,35 @@ backend = "local"
         assert!(!matches!(record.status, RunStatus::Success));
     }
 
+    /// #1720, the ordering the test above depends on and cannot itself check.
+    ///
+    /// The inherited gate is stamped where the output is CREATED, not at the
+    /// check-gate stamp far below, because the SIGINT path persists its
+    /// `RunRecord` in between. No behavioural unit test reaches that — an
+    /// interrupt needs a real signal during a real run — and a mutation that
+    /// deletes the early stamp passes the whole `commands::run::` suite. So
+    /// the ordering is asserted over this file's own source, the shape
+    /// `rocky-mcp`'s `tools.rs` already uses for a claim about its own text.
+    ///
+    /// Both `find`s take the FIRST occurrence, which is the production site;
+    /// the copies inside this test are thousands of lines later.
+    #[test]
+    fn the_inherited_gate_is_stamped_before_the_interrupt_path_persists() {
+        let source = include_str!("run.rs");
+        let stamp = source
+            .find("output.check_gate_failed = resolved_check_gate(false, inherited_gate.as_ref());")
+            .expect("the early inherited-gate stamp is gone — see #1720");
+        let interrupt_persist = source
+            .find("// Persist interrupted RunRecord")
+            .expect("the interrupt path's persist comment moved; re-anchor this test");
+        assert!(
+            stamp < interrupt_persist,
+            "the inherited gate must be stamped before the interrupt path persists its \
+             RunRecord, or an interrupted resume of a gated run records no verdict and the \
+             resume after it inherits nothing (#1720)"
+        );
+    }
+
     /// Control (#1720). A resume with nothing inherited is unchanged: the
     /// verdict is the run's own, so an honest recovery from a copy failure
     /// still reaches `Success` and still records `check_gate_failed = false`.
