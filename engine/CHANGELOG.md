@@ -60,6 +60,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   `Date32`, `Time64`, `Decimal`, `Enum` and `UHugeInt` now have arms. `Decimal` renders its own digits rather than going through `f64`, which would round them; `UHugeInt` was a plain omission beside the `HugeInt` arm above it. The composite and binary carriers (`Blob`, `Geometry`, `List`, `Array`, `Struct`, `Map`, `Union`) still reach the wildcard: each needs a JSON shape decided on its own, and more than twenty call sites read these cells. The wildcard now says so, so the remaining list is a decision rather than an omission.
 
+- **`severity = "warning"` on `null_rate` or a `[[checks.custom]]` entry silenced a check the engine could not run at all.**
+
+  The configured severity was written over every result of those two kinds, measured or not. `null_rate_not_evaluated` and `custom_not_evaluated` choose `Error` on purpose, so a check Rocky could not evaluate still gates. The clobber undid that choice.
+
+  So a null-rate query that failed produced one `not_evaluated`, `passed: false` result per configured column, all at warning severity. Both check gates count error-severity failures only, so the gate stayed clear and the run exited **0** with `status: "Success"`. A `[[checks.custom]]` entry whose query failed behaved the same way.
+
+  ```
+  severity = "warning", the query FAILS
+  before   every column not_evaluated at Warning -> gate clear -> exit 0, Success
+  after    every column not_evaluated at Error   -> gate trips -> non-zero
+  ```
+
+  The configured severity now applies to a measured result only. It describes a column over the threshold, or a real violation count — not a query Rocky could not run. A measured violation still reports at the configured severity, so `severity = "warning"` keeps meaning "this is advisory" for the case it was written for.
+
+  **This changes an exit code, on two pipeline surfaces.** `null_rate` runs on replication pipelines only, where a tripped gate is exit 2, `PartialFailure`. `[[checks.custom]]` runs on **both** replication and quality pipelines: on a quality pipeline the same result now trips `error_failures > 0 && fail_on_error`, so the run exits 1 with `quality pipeline failed: N error-severity check(s) failed` and persists a `Failure` record where it previously persisted `Success`. A project that set `severity = "warning"` on either check kind, and whose check queries fail, moves from a clean exit to a failing one.
+
+  That is the same correction #1719 made for `freshness`; these were the two kinds it left. `cross_source_overlap` and `[[assertions]]` still take the configured severity on an unevaluated result — see #1741. (#1735)
+
 - **`rocky state retention sweep` could delete run history a project's `rocky.toml` said to keep, because a dangling symlink read as "no config at all".**
 
   `Path::exists()` is `std::fs::metadata(..).is_ok()`, and `metadata` **follows** a symlink. A `rocky.toml` that is a symlink to a deleted file therefore answered `false`. Three commands decided whether to load the config with that probe, so #1668's refusal was unreachable at all three: the probe said "no config" and each one carried on.

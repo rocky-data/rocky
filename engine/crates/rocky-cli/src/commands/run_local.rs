@@ -734,27 +734,30 @@ pub(crate) async fn run_custom_checks(
                             check = custom.name.as_str(),
                             "custom check returned no parseable count; failing the check"
                         );
-                        let mut check = rocky_core::checks::custom_not_evaluated(
+                        // No `severity = severity` here: a check the engine
+                        // could not evaluate keeps the `TestSeverity::Error`
+                        // `custom_not_evaluated` chose, so it still gates
+                        // (#1735). The configured severity is about a
+                        // measured violation count.
+                        results.push(rocky_core::checks::custom_not_evaluated(
                             &custom.name,
                             &sql,
                             custom.threshold,
                             "the custom check query returned no readable count",
-                        );
-                        check.severity = severity;
-                        results.push(check);
+                        ));
                     }
                 }
             }
             Err(e) => {
                 warn!(error = %e, check = custom.name.as_str(), "custom check query failed");
-                let mut check = rocky_core::checks::custom_not_evaluated(
+                // Same as the unparseable-count arm: a query Rocky could not
+                // run keeps its constructor's Error severity (#1735).
+                results.push(rocky_core::checks::custom_not_evaluated(
                     &custom.name,
                     &sql,
                     custom.threshold,
                     format!("the custom check query failed: {e}"),
-                );
-                check.severity = severity;
-                results.push(check);
+                ));
             }
         }
     }
@@ -771,14 +774,15 @@ pub(crate) fn custom_checks_not_evaluated(
     customs
         .iter()
         .map(|custom| {
-            let mut check = rocky_core::checks::custom_not_evaluated(
+            // Every result here is not-evaluated by construction, so none
+            // takes `custom.severity` — each keeps its constructor's
+            // `TestSeverity::Error` and still gates (#1735).
+            rocky_core::checks::custom_not_evaluated(
                 &custom.name,
                 &custom.sql,
                 custom.threshold,
                 reason,
-            );
-            check.severity = custom.severity;
-            check
+            )
         })
         .collect()
 }
@@ -2420,6 +2424,150 @@ auto_create_schemas = true
         );
         assert!(results[1].passed, "a genuine 0 <= threshold still passes");
         assert!(results[1].not_evaluated.is_none());
+    }
+
+    /// FAILS ON `main` before #1735: `severity = "warning"` on a
+    /// `[[checks.custom]]` entry silenced a query the engine could not run.
+    /// The result landed in the warning bucket, so the gate stayed clear and
+    /// the run exited 0 with `status: "Success"`.
+    ///
+    /// The configured severity describes a MEASURED violation count. A query
+    /// Rocky could not run is a different statement, and keeps the
+    /// `TestSeverity::Error` `custom_not_evaluated` chose.
+    #[tokio::test]
+    async fn a_custom_check_the_engine_could_not_run_keeps_error_severity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("severity.duckdb");
+        {
+            let a = DuckDbWarehouseAdapter::open(&db).expect("open");
+            a.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
+                .await
+                .unwrap();
+            a.execute_statement("CREATE TABLE main.t AS SELECT 1 AS id")
+                .await
+                .unwrap();
+        }
+        let warehouse = DuckDbWarehouseAdapter::open(&db).expect("reopen");
+
+        // (1) the query itself fails, (2) it answers with an unparseable
+        // cell, (3) it answers with a real count over the threshold.
+        let broken = rocky_core::config::CustomCheckConfig {
+            name: "query_fails".to_string(),
+            sql: "SELECT * FROM main.no_such_table".to_string(),
+            threshold: 0,
+            severity: rocky_core::tests::TestSeverity::Warning,
+        };
+        let unparseable = rocky_core::config::CustomCheckConfig {
+            name: "bad_count".to_string(),
+            sql: "SELECT 'not-a-number'".to_string(),
+            threshold: 0,
+            severity: rocky_core::tests::TestSeverity::Warning,
+        };
+        let measured = rocky_core::config::CustomCheckConfig {
+            name: "real_violations".to_string(),
+            sql: "SELECT 7".to_string(),
+            threshold: 0,
+            severity: rocky_core::tests::TestSeverity::Warning,
+        };
+
+        let results =
+            super::run_custom_checks(&warehouse, "main.t", &[broken, unparseable, measured]).await;
+
+        assert_eq!(results.len(), 3);
+        for result in &results[..2] {
+            assert!(result.not_evaluated.is_some(), "{result:?}");
+            assert_eq!(
+                result.severity,
+                rocky_core::tests::TestSeverity::Error,
+                "a check the engine could not evaluate keeps its own severity, \
+                 not the configured `warning`: {result:?}"
+            );
+        }
+
+        // The other half, unchanged: a MEASURED violation still reports at
+        // the configured severity. The fix narrows the clobber; it does not
+        // remove the key.
+        assert!(!results[2].passed, "7 > 0: {:?}", results[2]);
+        assert!(results[2].not_evaluated.is_none(), "{:?}", results[2]);
+        assert_eq!(
+            results[2].severity,
+            rocky_core::tests::TestSeverity::Warning,
+            "a measured result takes the configured severity: {:?}",
+            results[2]
+        );
+    }
+
+    /// The severity field is not the point — the exit code is. A custom check
+    /// runs on BOTH surfaces, so this asserts the gate a QUALITY pipeline
+    /// reads, through the same function `run_quality` reads it through.
+    ///
+    /// `run_quality` bails on `error_failures > 0 && fail_on_error`
+    /// (`run_local.rs`), and `error_failures` is
+    /// `count_failures_by_severity` -> `RunOutput::check_failures_by_severity`.
+    /// Before #1735 a failed custom query at `severity = "warning"` landed in
+    /// the warning bucket, so a quality run exited 0 and persisted `Success`.
+    #[tokio::test]
+    async fn a_failed_custom_query_trips_the_quality_gate_despite_severity_warning() {
+        use crate::output::{RunOutput, TableCheckOutput};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("gate.duckdb");
+        {
+            let a = DuckDbWarehouseAdapter::open(&db).expect("open");
+            a.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
+                .await
+                .unwrap();
+            a.execute_statement("CREATE TABLE main.t AS SELECT 1 AS id")
+                .await
+                .unwrap();
+        }
+        let warehouse = DuckDbWarehouseAdapter::open(&db).expect("reopen");
+
+        let broken = rocky_core::config::CustomCheckConfig {
+            name: "query_fails".to_string(),
+            sql: "SELECT * FROM main.no_such_table".to_string(),
+            threshold: 0,
+            severity: rocky_core::tests::TestSeverity::Warning,
+        };
+
+        let checks = super::run_custom_checks(&warehouse, "main.t", &[broken]).await;
+
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        output.check_results.push(TableCheckOutput {
+            asset_key: vec!["main".to_string(), "t".to_string()],
+            checks,
+        });
+
+        let (error_failures, warning_failures) = super::count_failures_by_severity(&output);
+        assert_eq!(
+            (error_failures, warning_failures),
+            (1, 0),
+            "a query the engine could not run belongs in the ERROR bucket, \
+             which is the one the quality gate counts: {:?}",
+            output.check_results
+        );
+    }
+
+    /// The table-unaddressable path builds the same results, so it carries
+    /// the same rule: not-evaluated keeps `Error`, whatever the config says.
+    #[test]
+    fn custom_checks_not_evaluated_keeps_error_severity() {
+        let warning = rocky_core::config::CustomCheckConfig {
+            name: "c".to_string(),
+            sql: "SELECT 0".to_string(),
+            threshold: 0,
+            severity: rocky_core::tests::TestSeverity::Warning,
+        };
+        let results =
+            super::custom_checks_not_evaluated(&[warning], "the table ref would not format");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].not_evaluated.is_some(), "{:?}", results[0]);
+        assert_eq!(
+            results[0].severity,
+            rocky_core::tests::TestSeverity::Error,
+            "{:?}",
+            results[0]
+        );
     }
 
     #[test]
