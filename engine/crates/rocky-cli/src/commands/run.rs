@@ -13742,13 +13742,59 @@ mod tests {
     /// asymmetry from coming back: the singular `record_partition` cannot
     /// reappear in this file, because every use of it here would be a
     /// leading-key-only write.
+    /// This file's PRODUCTION half, whitespace-stripped, for the source-text
+    /// guards below.
+    ///
+    /// One helper because the anchor is the easy thing to get wrong, and
+    /// getting it wrong is silent. Cutting at the first `\n#[cfg(test)]` looks
+    /// right and is not: `build_replication_strategy` is a `#[cfg(test)]`
+    /// helper sitting ~1,600 lines ABOVE the test module, so that anchor ends
+    /// the scan there and every production line after it goes unread. A guard
+    /// that scans nothing passes (#1725).
+    ///
+    /// Whitespace is stripped so `cargo fmt` wrapping a call across lines
+    /// cannot silently zero a count. Write the needles without spaces to
+    /// match: `.record_partition(`, `batch_records(&record)`.
+    fn production_source() -> String {
+        let full = include_str!("run.rs");
+        let cut = full
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the test module header moved; re-anchor production_source()");
+        full[..cut].chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The anchor `production_source` does NOT use, and why. Pins the gap so a
+    /// later reader sees that the two differ and by how much, instead of
+    /// rediscovering it the way #1725 did.
+    #[test]
+    fn the_production_cut_reaches_past_the_mid_file_cfg_test_helper() {
+        let full = include_str!("run.rs");
+        let naive = full
+            .find("\n#[cfg(test)]")
+            .expect("a #[cfg(test)] attribute");
+        let anchored = full
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the test module header");
+        assert!(
+            naive < anchored,
+            "a #[cfg(test)] item sits above the test module — that is the whole \
+             reason production_source() anchors on the module header (#1725)"
+        );
+        let blind_spot = full[naive..anchored].lines().count();
+        assert!(
+            blind_spot > 100,
+            "the blind spot the naive anchor would create is {blind_spot} lines; if it \
+             has shrunk to nothing the mid-file #[cfg(test)] helper is gone and this \
+             test can go with it"
+        );
+    }
+
     #[test]
     fn every_partition_status_write_covers_the_whole_batch() {
         // PRODUCTION code only. This test's own body mentions the singular
         // form in its assertion message, and would otherwise match itself —
         // which it did on the first run.
-        let full = include_str!("run.rs");
-        let src = &full[..full.find("\n#[cfg(test)]").expect("a test module")];
+        let src = production_source();
         let singular = src.matches(".record_partition(").count();
         assert_eq!(
             singular, 0,
@@ -13758,7 +13804,7 @@ mod tests {
         );
         // And the batch helper is actually the thing being used.
         assert!(
-            src.contains("let batch_records ="),
+            src.contains("letbatch_records="),
             "the shared batch_records helper is gone — the three status writes can \
              drift apart again"
         );
@@ -33424,18 +33470,9 @@ timestamp_column = "ts"
     #[test]
     fn one_collector_consumes_every_materialized_table() {
         // PRODUCTION code only — the test module below calls the collector too.
-        // Anchored on the module header, not on a bare `#[cfg(test)]`: this
-        // file has a test-only helper (`build_replication_strategy`) sitting in
-        // the middle of the production half, so cutting at the first
-        // `#[cfg(test)]` would drop everything after it from the scan.
-        let full = include_str!("run.rs");
-        let src = &full[..full
-            .find("\n#[cfg(test)]\nmod tests {")
-            .expect("the test module header")];
-
-        // Whitespace-stripped, so `cargo fmt` wrapping a call across lines
-        // cannot silently zero either count.
-        let compact: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        // Through the shared helper, which owns both the anchor and the
+        // whitespace stripping (#1725).
+        let compact = production_source();
         assert_eq!(
             compact.matches(".assertion_targets.push(").count(),
             1,
