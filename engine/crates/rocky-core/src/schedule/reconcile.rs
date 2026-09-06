@@ -361,6 +361,29 @@ pub struct TickReport {
     /// are left for the next process to pick up. Always `false` for `rocky tick`
     /// (its drain is never raised).
     pub drained: bool,
+    /// The webhook spool could not be READ this tick, so no pending demand was
+    /// consumed. Carries the scan's own reason; `None` on every healthy tick.
+    ///
+    /// This is a fault, not contention. `list_pending_files` returns `Ok` with
+    /// an empty list when the spool directory is simply absent — the ordinary
+    /// shape for a project that takes no webhooks — and only errs when
+    /// something IS at that path and cannot be read: a dangling symlink, a
+    /// permission denial, a file where a directory belongs. The next tick will
+    /// not fix any of those.
+    ///
+    /// Carried here rather than as a [`SkippedDemand`] because that struct
+    /// names the pipeline it belongs to and this belongs to none of them — the
+    /// scan fails before any pipeline is known. The CLI turns it into the
+    /// pipeline-less `spool_unreadable` skip entry, the shape
+    /// `tick_in_progress` and `state_busy` already use, so the wire keeps one
+    /// flat skip-reason contract instead of gaining a parallel flag.
+    ///
+    /// #1710 made the scan refuse instead of reading a dangling link as an
+    /// empty spool. The refusal reached only a `tracing::warn!`, so every
+    /// machine-readable surface of that tick — the JSON, the counts, the
+    /// scheduler's metrics — still described a clean idle tick, which is the
+    /// state the refusal exists to stop reporting (#1731).
+    pub spool_unreadable: Option<String>,
 }
 
 /// A fault that fails the whole tick closed — it runs nothing.
@@ -662,7 +685,11 @@ async fn consume_webhook_demands(
     let files = match spool::list_pending_files(&opts.rocky_dir) {
         Ok(f) => f,
         Err(e) => {
+            // Record before returning: the log line was the ONLY trace of this
+            // until #1731, so a JSON consumer, the tick counts and the resident
+            // scheduler's metrics all described a healthy idle tick.
             tracing::warn!(error = %e, "scanning the webhook spool failed; skipping this tick");
+            report.spool_unreadable = Some(e.to_string());
             return Ok(WebhookConsume::Done);
         }
     };
@@ -3740,6 +3767,72 @@ adapter = "db"
     /// so the sweep returned `Ok(0)` and the tombstone stayed forever. The
     /// unit test in `spool.rs` could not see it: it calls `sweep_tombstones`
     /// directly with the right path, proving the callee and not the caller.
+    #[test]
+    fn a_dangling_spool_symlink_is_carried_on_the_report_not_just_the_log() {
+        let (state_path, dir, opts) = temp_env();
+        let config = cfg(WEBHOOK_TARGETS);
+
+        // Something IS at the spool path, and it cannot be read. #1710 made the
+        // scan refuse this instead of reading it as an empty spool; the refusal
+        // reached only a `tracing::warn!`, so every machine-readable surface of
+        // the tick still described a clean idle tick (#1731).
+        let spool_path = spool::spool_dir(&opts.rocky_dir).as_path().to_path_buf();
+        std::fs::create_dir_all(&opts.rocky_dir).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("gone"), &spool_path).unwrap();
+
+        let spawner = CapturingSpawner::new(0);
+        let report = rt()
+            .block_on(tick_once(
+                &config,
+                &state_path,
+                webhook_now(),
+                &spawner,
+                &opts,
+            ))
+            .expect("the tick itself still completes; only the webhook step is skipped");
+
+        let reason = report
+            .spool_unreadable
+            .as_deref()
+            .expect("the refusal must reach the report, not just the log");
+        assert!(
+            reason.contains("cannot be read"),
+            "the reason carries the scan's own words: {reason}"
+        );
+        assert_eq!(spawner.run_count(), 0, "nothing was consumed");
+    }
+
+    /// The control, and the reason this can be a hard signal rather than a
+    /// warning: the ORDINARY shape does not set it. A project that takes no
+    /// webhooks has no `.rocky/pending-demands` at all, `list_pending_files`
+    /// answers with an empty list, and the tick is clean.
+    #[test]
+    fn an_absent_spool_is_not_reported_as_unreadable() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(WEBHOOK_TARGETS);
+        assert!(
+            !spool::spool_dir(&opts.rocky_dir).as_path().exists(),
+            "precondition: no spool directory"
+        );
+
+        let spawner = CapturingSpawner::new(0);
+        let report = rt()
+            .block_on(tick_once(
+                &config,
+                &state_path,
+                webhook_now(),
+                &spawner,
+                &opts,
+            ))
+            .unwrap();
+
+        assert!(
+            report.spool_unreadable.is_none(),
+            "an absent spool is an empty spool, not a fault: {:?}",
+            report.spool_unreadable
+        );
+    }
+
     #[test]
     fn a_tick_sweeps_an_expired_tombstone_from_the_spool_the_scheduler_writes() {
         let (state_path, _dir, opts) = temp_env();

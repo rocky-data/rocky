@@ -343,6 +343,28 @@ fn build_tick_output(
         });
     }
 
+    // The webhook spool could not be read, so no pending demand was consumed.
+    // Pipeline-less, because the scan fails before any pipeline is known, but
+    // `webhook`-sourced, because that is the demand source it silenced.
+    //
+    // #1710 made the scan refuse instead of reading a dangling symlink as an
+    // empty spool. The refusal reached only a log line, so this JSON — the
+    // contract the Python SDK and the VS Code extension read — was byte-
+    // identical to a healthy idle tick in every health-bearing field (#1731).
+    if let Some(reason) = &report.spool_unreadable {
+        tracing::warn!(
+            reason = reason.as_str(),
+            "webhook spool unreadable this tick"
+        );
+        skipped.push(SkippedDemandOutput {
+            pipeline: None,
+            source: Some("webhook".to_string()),
+            reason: "spool_unreadable".to_string(),
+            resume_at: None,
+            missed: None,
+        });
+    }
+
     // The store was held by another `rocky` process. When it could not be opened
     // at all, no per-demand skip exists yet, so synthesize a pipeline-less
     // `state_busy` entry; a mid-tick reopen contention already pushed a
@@ -606,6 +628,43 @@ freshness = true
         );
     }
 
+    /// #1731. The refusal must reach the JSON, which is the contract the
+    /// Python SDK and the VS Code extension read. Before this, a tick whose
+    /// spool could not be read came back byte-identical to a healthy idle tick
+    /// in every health-bearing field.
+    #[test]
+    fn an_unreadable_spool_reaches_the_json_as_a_pipeline_less_skip() {
+        let report = TickReport {
+            spool_unreadable: Some(
+                "the webhook spool at '/p/.rocky/pending-demands' cannot be read: dangling symlink"
+                    .to_string(),
+            ),
+            ..TickReport::default()
+        };
+        let out = build_tick_output(&report, ts("2026-05-02T03:05:00Z"), false, 0);
+
+        let entry = out
+            .skipped
+            .iter()
+            .find(|s| s.reason == "spool_unreadable")
+            .expect("the refusal must be on the wire, not only in the log");
+        assert!(
+            entry.pipeline.is_none(),
+            "the scan fails before any pipeline is known"
+        );
+        assert_eq!(
+            entry.source.as_deref(),
+            Some("webhook"),
+            "pipeline-less, but it is the webhook source that was silenced"
+        );
+        assert_eq!(out.counts.skipped, 1, "and it counts as a skip");
+
+        // The control: a healthy tick is unchanged on the wire.
+        let clean = build_tick_output(&TickReport::default(), ts("2026-05-02T03:05:00Z"), false, 0);
+        assert!(clean.skipped.is_empty());
+        assert_eq!(clean.counts.skipped, 0);
+    }
+
     #[test]
     fn maps_executed_skipped_and_counts() {
         let report = TickReport {
@@ -651,6 +710,7 @@ freshness = true
             lock_overridden: false,
             state_busy: false,
             drained: false,
+            spool_unreadable: None,
         };
 
         let out = build_tick_output(&report, ts("2026-05-02T03:05:00Z"), false, 42);
