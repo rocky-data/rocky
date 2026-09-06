@@ -178,6 +178,19 @@ Each assertion takes an optional `severity`, either `error` (the default) or `wa
 - `severity = "warning"` — a failing assertion appears in `check_results[]` with `passed = false` and `severity = "warning"`. It never fails the pipeline.
 - `fail_on_error = false` at the pipeline level downgrades every `error` to a non-fatal result. Use it for shadow runs and observation modes.
 
+For the replication checks, `severity` describes a check that ran and found a problem. It does not apply to a check Rocky could not run at all.
+
+A check whose query fails is reported with `passed = false` and a `not_evaluated` field saying why. For `row_count`, `freshness`, `null_rate` and `[[checks.custom]]`, that result always carries `severity = "error"`, whatever the config says, so it fails the run.
+
+```
+the query answers, the data is bad   -> your severity   (warning stays advisory)
+the query never ran                  -> always error    (the run fails)
+```
+
+The two say different things. Writing `severity = "warning"` on `freshness` means "a stale table is only a warning". It does not mean "a freshness query I could not run is only a warning" — that is an unknown, not a tolerated result.
+
+`cross_source_overlap` and the `[[assertions]]` blocks differ: their unevaluated results carry the configured severity, so `severity = "warning"` does keep an unevaluated one advisory there.
+
 ```toml
 [pipeline.silver.checks]
 fail_on_error = true  # default
