@@ -437,6 +437,7 @@ mod retention_sweep_config_tests {
     fn aged_run(id: &str, days_old: i64) -> RunRecord {
         let at = chrono::Utc::now() - chrono::Duration::days(days_old);
         RunRecord {
+            check_gate_failed: false,
             run_id: id.to_string(),
             started_at: at,
             finished_at: at,
