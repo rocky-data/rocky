@@ -139,7 +139,7 @@ scene journal
 echo
 echo "✓ recorded into $OUT"
 ls -la "$OUT"
-echo
-echo "Next: intercut in the order terminal-1, review, terminal-2, samples,"
-echo "terminal-3, journal. The browser scenes are .webm; the tapes are .gif."
-echo "The cut is an mp4, not a GIF — minutes of screen content."
+
+# The takes are on disk now, so a failed cut costs an ffmpeg run, not a
+# re-record. ./intercut.sh re-cuts from them alone.
+./intercut.sh "$OUT"

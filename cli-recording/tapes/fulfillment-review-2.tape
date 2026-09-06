@@ -23,7 +23,9 @@ Set Theme "Dracula"
 
 Hide
 Type "cd scratch/fulfillment-review" Enter
-Type "export RUST_LOG=error ROCKY_SUPPRESS_DEPRECATION=1" Enter
+# ROCKY_SCRUB_HOST keeps the recording machine's hostname out of the
+# approval marker, and out of the frame.
+Type "export RUST_LOG=error ROCKY_SUPPRESS_DEPRECATION=1 ROCKY_SCRUB_HOST=1" Enter
 Type "source .screencast-env" Enter
 Type 'export PS1="> "' Enter
 Type "clear" Enter

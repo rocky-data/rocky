@@ -21,7 +21,9 @@ Set Theme "Dracula"
 
 Hide
 Type "cd scratch/fulfillment-review" Enter
-Type "export RUST_LOG=error ROCKY_SUPPRESS_DEPRECATION=1" Enter
+# ROCKY_SCRUB_HOST keeps the recording machine's hostname out of the
+# approval marker, and out of the frame.
+Type "export RUST_LOG=error ROCKY_SUPPRESS_DEPRECATION=1 ROCKY_SCRUB_HOST=1" Enter
 Type 'export PS1="> "' Enter
 Type "clear" Enter
 Show
@@ -35,8 +37,10 @@ Sleep 7s
 # 2. Staleness is OBSERVED, not enforced. Backdate what was materialised and
 #    the loop reports the lag against the spec's budget — it does not fail the
 #    product, because "too old" is a judgment its owner makes, not the engine.
-Type "duckdb wh.duckdb \"UPDATE main.revenue_daily SET loaded_at = TIMESTAMP '2020-01-01'\"" Sleep 400ms Enter
+Type "cat backdate.sql" Sleep 400ms Enter
 Sleep 3s
+Type "duckdb wh.duckdb < backdate.sql" Sleep 400ms Enter
+Sleep 2s
 Type "rocky fulfill revenue_daily" Sleep 400ms Enter
 Sleep 10s
 
