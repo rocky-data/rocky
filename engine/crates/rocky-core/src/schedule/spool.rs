@@ -382,6 +382,20 @@ pub fn accept_journaled(
 /// the path and, for a symlink, its target. The kind is deliberately not
 /// `NotFound`, so a caller matching on the kind cannot reinstate the
 /// conflation this branch closes.
+/// The refusal every spool read site returns for a path that IS there and
+/// cannot be read.
+///
+/// One helper because the three sites must not drift on the wording: the
+/// reconciler surfaces the scan's text verbatim as the tick's
+/// `spool_unreadable` reason (#1731), and an operator comparing two of these
+/// should not have to wonder whether the difference means anything.
+fn unreadable_spool(dir: &SpoolDir, detail: &str) -> io::Error {
+    io::Error::other(format!(
+        "the webhook spool at '{}' cannot be read: {detail}",
+        dir.as_path().display()
+    ))
+}
+
 pub fn list_pending_files(rocky_dir: &Path) -> io::Result<Vec<PathBuf>> {
     let dir = spool_dir(rocky_dir);
     let mut out = Vec::new();
@@ -392,10 +406,7 @@ pub fn list_pending_files(rocky_dir: &Path) -> io::Result<Vec<PathBuf>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => match classify_not_found(dir.as_path()) {
             PathPresence::Absent => return Ok(out),
             PathPresence::Present { detail } => {
-                return Err(io::Error::other(format!(
-                    "the webhook spool at '{}' cannot be read: {detail}",
-                    dir.display()
-                )));
+                return Err(unreadable_spool(&dir, &detail));
             }
         },
         Err(e) => return Err(e),
@@ -531,7 +542,10 @@ pub fn count_corrupt(rocky_dir: &Path) -> io::Result<usize> {
     let dir = spool_dir(rocky_dir);
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => match classify_not_found(dir.as_path()) {
+            PathPresence::Absent => return Ok(0),
+            PathPresence::Present { detail } => return Err(unreadable_spool(&dir, &detail)),
+        },
         Err(e) => return Err(e),
     };
     let mut n = 0;
@@ -584,7 +598,10 @@ pub fn sweep_tombstones(rocky_dir: &Path) -> io::Result<TombstoneSweep> {
     let dir = spool_dir(rocky_dir);
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(TombstoneSweep::default()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => match classify_not_found(dir.as_path()) {
+            PathPresence::Absent => return Ok(TombstoneSweep::default()),
+            PathPresence::Present { detail } => return Err(unreadable_spool(&dir, &detail)),
+        },
         Err(e) => return Err(e),
     };
     // `TOMBSTONE_TTL` is a 24-hour constant, so this conversion cannot fail;
@@ -1113,6 +1130,51 @@ mod tests {
     /// ticked on. The error names the path and the target so the operator can
     /// fix the link without a second look at the disk.
     #[cfg(unix)]
+    /// #1713. The scan discriminated; the other two read sites did not, so the
+    /// module had one site that told absence from unreadability and two that
+    /// did not, with nothing recording the difference as deliberate.
+    ///
+    /// `sweep_tombstones` returning `Ok(0)` was not a wrong answer about the
+    /// world — nothing sits behind a dangling link, so "swept 0" is true — but
+    /// it was a wrong answer about WHY, and #1714 made it run on every
+    /// non-dry-run tick, so the "not reachable in production" note that
+    /// justified it no longer held.
+    #[test]
+    fn every_spool_read_site_tells_absence_from_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rocky_dir = tmp.path().join(".rocky");
+        std::fs::create_dir_all(&rocky_dir).unwrap();
+
+        // Absent: all three answer with the benign empty result.
+        assert!(list_pending_files(&rocky_dir).unwrap().is_empty());
+        assert_eq!(count_corrupt(&rocky_dir).unwrap(), 0);
+        assert_eq!(sweep_tombstones(&rocky_dir).unwrap().swept, 0);
+
+        // Present and unreadable: all three refuse, with the same words.
+        std::os::unix::fs::symlink(tmp.path().join("gone"), spool_dir(&rocky_dir).as_path())
+            .unwrap();
+        let scan = list_pending_files(&rocky_dir).expect_err("the scan refuses");
+        let corrupt = count_corrupt(&rocky_dir).expect_err("count_corrupt refuses");
+        let sweep = sweep_tombstones(&rocky_dir).expect_err("the sweep refuses");
+        for (name, err) in [
+            ("scan", &scan),
+            ("count_corrupt", &corrupt),
+            ("sweep", &sweep),
+        ] {
+            assert!(
+                err.to_string().contains("cannot be read"),
+                "{name} must say the spool is unreadable, not answer zero: {err}"
+            );
+        }
+        assert_eq!(
+            scan.to_string(),
+            sweep.to_string(),
+            "one wording across the sites — the reconciler surfaces the scan's \
+             text verbatim as the tick's spool_unreadable reason (#1731)"
+        );
+        assert_eq!(scan.to_string(), corrupt.to_string());
+    }
+
     #[test]
     fn a_dangling_spool_symlink_refuses_instead_of_reading_as_empty() {
         let dir = tempfile::tempdir().unwrap();
