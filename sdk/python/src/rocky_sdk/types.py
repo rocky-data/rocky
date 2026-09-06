@@ -466,6 +466,14 @@ class RunResult(BaseModel):
     #: and when ``fail_on_error = false``. Count :attr:`check_results` for the
     #: number of failed checks. Omitted from the wire when ``False``.
     check_gate_failed: bool = False
+    #: ``True`` when the run auto-applied additive schema drift whose post-apply
+    #: ``verify_after`` gate did not confirm it. A separate verdict from
+    #: :attr:`check_gate_failed`, not derivable from it: ``verify_after`` fails
+    #: closed on a required check that is *absent* from the run record, and an
+    #: absent check is not a failing one, so the check gate stays ``False``.
+    #: There is no rollback on a warehouse target — the migration stands until a
+    #: human reverts it. Omitted from the wire when ``False``.
+    verify_after_failed: bool = False
     #: Tables short-circuited via the idempotency key. Defaults to 0.
     tables_skipped: int = 0
     materializations: list[MaterializationInfo]

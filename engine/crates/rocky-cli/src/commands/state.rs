@@ -438,6 +438,7 @@ mod retention_sweep_config_tests {
         let at = chrono::Utc::now() - chrono::Duration::days(days_old);
         RunRecord {
             check_gate_failed: false,
+            verify_after_failed: false,
             run_id: id.to_string(),
             started_at: at,
             finished_at: at,

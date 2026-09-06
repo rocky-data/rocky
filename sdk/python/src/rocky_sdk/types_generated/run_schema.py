@@ -868,4 +868,24 @@ class RunOutput(BaseModel):
     Total number of failed tables/models for the run, **including** pre-execution compile failures: a model that fails to type-check is counted here even though it never reached the execution phase. This is the authoritative failure count — consumers should key overall pass/fail on the top-level `tables_failed` / `status` / `errors`, not on `execution.tables_failed`, which counts only execution-phase (copy / runtime) failures and excludes models excluded before execution.
     """
     tables_skipped: conint(ge=0) | None = None
+    verify_after_failed: bool | None = None
+    """
+    `true` when this run auto-applied additive schema drift whose post-apply `verify_after` gate did not confirm it.
+
+    The gate runs after the run record exists, because it reads that record's check outcomes. It yields `Err` when a required check failed **or did not run at all** — a required check that is absent from `RunRecord::check_outcomes` fails it closed. There is no rollback substrate on a plain warehouse target, so the migration stands until a human reverts it.
+
+    # Why this is its own field and not `check_gate_failed`
+
+    The two verdicts do not imply one another, and the absent-check case is exactly where they diverge:
+
+    ```text a required check is ABSENT      -> verify_after fails closed -> nothing failed, so the check gate has nothing to gate on: false fail_on_error = false           -> every check is advisory, so the check gate is always false, while verify_after can still fail ```
+
+    In both, `check_gate_failed` is `false` while an auto-applied migration stands unverified. Deriving one from the other would fail open on the two shapes that matter most (#1732).
+
+    # What reads it
+
+    [`crate::commands::run`]'s resume gate, beside `check_gate_failed`. A run that copied every table it planned and could not verify its own migration has no copy work left for a resume to do, but it does carry a synthetic `<verify_after>` entry in `models_executed` — and the resume gate admits a run "because a model failed, and the model phase re-runs". That entry is not a model, nothing re-runs, and the resume recorded `Success` over an unconfirmed migration.
+
+    Like `check_gate_failed`, an admitted resume inherits it: the resume re-runs `verify_after` only for drift IT auto-applies, so an earlier unverified migration is never re-examined. Omitted from the JSON when `false`, so a run that verified cleanly is unchanged on the wire.
+    """
     version: str

@@ -713,7 +713,38 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   and with it every persisted gate verdict, so a rolled-back binary
 ///   resumes a check-gated run the old way. Rolling back is not a way to
 ///   clear a gate; re-running the pipeline is.
-const CURRENT_SCHEMA_VERSION: u32 = 25;
+///
+/// - **v26** — persists the post-apply verification verdict beside the check
+///   gate: a new serde-additive [`RunRecord::verify_after_failed`] flag. Same
+///   shape as v25 in every respect — no table change, no blob walk, and a v25
+///   blob forward-deserializes with it `false`, guarded by
+///   `test_v25_run_record_forward_deserializes_verify_after_failed_false`.
+///
+///   **Why a second flag and not a wider `check_gate_failed` (#1732).** The
+///   two verdicts do not imply one another, and they diverge on exactly the
+///   shapes that matter. `verify_after` fails **closed** on a required check
+///   that is ABSENT from `check_outcomes`; absence is not a failing check, so
+///   the check gate has nothing to gate on and stays `false`. And under
+///   `[pipeline.<name>.checks] fail_on_error = false` every check is
+///   advisory, so the check gate is *always* `false` while `verify_after` can
+///   still fail. In both, an auto-applied migration stands unverified while
+///   `check_gate_failed` says the run was fine. Folding the two would fail
+///   open on precisely the runs this flag exists to catch.
+///
+///   **What it buys.** The resume gate can refuse a run that copied every
+///   table it planned and could not verify its own migration. Before this,
+///   that run carried a synthetic `<verify_after>` entry in
+///   `models_executed`, and the resume gate reads a failed entry as "a model
+///   failed, and the model phase re-runs on a resume" — but that entry is not
+///   a model, nothing re-runs, and the resume recorded `Success` over an
+///   unconfirmed schema migration.
+///
+///   **On upgrade and rollback.** Identical to v25: a v25 store is stamped
+///   v26 in place, existing records read back `false` (honest but lossy for
+///   runs recorded before this binary), and the blob is backward-safe while
+///   the OPEN-time version check is what actually engages
+///   `[state] on_schema_mismatch`.
+const CURRENT_SCHEMA_VERSION: u32 = 26;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -2387,6 +2418,31 @@ pub struct RunRecord {
     /// `test_v24_run_record_forward_deserializes_check_gate_failed_false`.
     #[serde(default)]
     pub check_gate_failed: bool,
+    /// `true` when this run auto-applied additive schema drift whose
+    /// post-apply `verify_after` gate did not confirm it. The persisted twin
+    /// of `RunOutput::verify_after_failed`, written by `to_run_record`.
+    ///
+    /// **Why it is not [`Self::check_gate_failed`].** The gate fails **closed**
+    /// on a required check that is ABSENT from [`Self::check_outcomes`], and
+    /// absence is not a failing check — so the check gate has nothing to gate
+    /// on and stays `false`. Under `fail_on_error = false` the check gate is
+    /// always `false` while this one can still trip. In both, a migration
+    /// stands unverified while `check_gate_failed` reports the run was fine
+    /// (#1732).
+    ///
+    /// **Why it is not re-derived at read time.** The verdict depends on the
+    /// policy in force when the run executed, on which checks that policy
+    /// required, and on which of them the run recorded — a later reader has
+    /// the last of those and not the first two.
+    ///
+    /// `false` on pre-v26 records and on every run that verified cleanly or
+    /// auto-applied no drift at all.
+    ///
+    /// Serde-defaulted so a v25 blob forward-deserializes with it `false`;
+    /// guarded by
+    /// `test_v25_run_record_forward_deserializes_verify_after_failed_false`.
+    #[serde(default)]
+    pub verify_after_failed: bool,
 }
 
 /// One executed data-quality check's pass/fail outcome, captured on a
@@ -7005,6 +7061,7 @@ mod tests {
             pipeline: None,
             submission_id: None,
             check_gate_failed: false,
+            verify_after_failed: false,
         }
     }
 
@@ -7076,6 +7133,49 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&stamped).unwrap()).unwrap();
         assert_eq!(round.pipeline.as_deref(), Some("raw"));
         assert_eq!(round.submission_id.as_deref(), Some("sub-123"));
+    }
+
+    /// v25 → v26 (#1732). A v25 `RunRecord` blob has no `verify_after_failed`
+    /// key at all. It must forward-deserialize with the field `false`, for the
+    /// same reason and with the same bounded fail-open as the v25 bump below:
+    /// a v25 record carries no verification verdict to honour, so refusing its
+    /// resume would refuse every legitimate pre-upgrade resume.
+    ///
+    /// The pair matters as much as either field: a record can carry
+    /// `check_gate_failed = false` and `verify_after_failed = true` at once,
+    /// and that combination is the whole point — `verify_after` fails closed
+    /// on a required check that is ABSENT, which the check gate cannot see.
+    #[test]
+    fn test_v25_run_record_forward_deserializes_verify_after_failed_false() {
+        let mut value = serde_json::to_value(minimal_run_record("run-v25", vec![]))
+            .expect("serialize run record");
+        let obj = value.as_object_mut().expect("record is an object");
+        assert!(
+            obj.remove("verify_after_failed").is_some(),
+            "precondition: the field is serialized, so removing it models a v25 blob"
+        );
+        let blob = serde_json::to_vec(&value).expect("reserialize without the field");
+
+        let record: RunRecord =
+            serde_json::from_slice(&blob).expect("a v25 RunRecord must forward-deserialize");
+        assert_eq!(record.run_id, "run-v25");
+        assert!(
+            !record.verify_after_failed,
+            "a pre-v26 record reads as no verification verdict recorded"
+        );
+
+        // A v26 record carrying the flag round-trips, and carries it
+        // INDEPENDENTLY of the check gate.
+        let mut unverified = minimal_run_record("run-v26", vec![]);
+        unverified.verify_after_failed = true;
+        assert!(!unverified.check_gate_failed);
+        let round: RunRecord =
+            serde_json::from_slice(&serde_json::to_vec(&unverified).unwrap()).unwrap();
+        assert!(round.verify_after_failed);
+        assert!(
+            !round.check_gate_failed,
+            "the two verdicts are separate on the wire, not derived from each other"
+        );
     }
 
     /// v24 → v25 (#1720). A v24 `RunRecord` blob has no `check_gate_failed`
@@ -12038,7 +12138,11 @@ mod tests {
         // field. NO table change — `EXPECTED_TABLES` is deliberately
         // unchanged below — so this stanza moves the version only; guarded by
         // `test_v24_run_record_forward_deserializes_check_gate_failed_false`.
-        const EXPECTED_VERSION: u32 = 25;
+        // v26 adds `RunRecord::verify_after_failed` (#1732), the same
+        // serde-additive shape. NO table change either — so this stanza moves
+        // the version only; guarded by
+        // `test_v25_run_record_forward_deserializes_verify_after_failed_false`.
+        const EXPECTED_VERSION: u32 = 26;
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",
