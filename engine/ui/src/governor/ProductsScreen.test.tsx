@@ -108,13 +108,37 @@ describe("ProductsScreen", () => {
     render(<ProductsScreen name="revenue_daily" loaders={loaders()} />);
 
     await screen.findByText("spec approved");
-    const rows = screen.getAllByRole("listitem").map((li) => li.textContent ?? "");
-    expect(rows).toHaveLength(3);
-    expect(rows[0]).toContain("spec approved");
-    expect(rows[1]).toContain("change proposed");
+    // One header row plus one per journal row — nothing is filtered out.
+    const rows = screen.getAllByRole("row").map((tr) => tr.textContent ?? "");
+    expect(rows).toHaveLength(4);
+    expect(rows[1]).toContain("spec approved");
+    expect(rows[2]).toContain("change proposed");
     // The engine calls `event` a label to render, not an enum to switch on.
-    expect(rows[2]).toContain("quarantine lifted by the observer");
-    expect(rows[1]).toContain("spec_approved → proposed");
+    expect(rows[3]).toContain("quarantine lifted by the observer");
+    expect(rows[2]).toContain("spec_approved → proposed");
+  });
+
+  /// A filter would have to decide which events matter, and deciding that
+  /// means switching on `event`. The count says what the table holds, so a
+  /// reader can tell "all of it" from "some of it" without counting rows.
+  it("says how many rows the journal has, and shows that many", async () => {
+    const many = Array.from({ length: 40 }, (_, i) => ({
+      seq: i + 1,
+      at: "2026-09-05T08:00:00Z",
+      event: `ownership acquired ${i + 1}`,
+      to_state: "observing",
+    }));
+    render(
+      <ProductsScreen
+        name="revenue_daily"
+        loaders={loaders({
+          journal: vi.fn(async () => ({ ...JOURNAL, count: many.length, rows: many })),
+        })}
+      />,
+    );
+
+    await screen.findByText("40 rows, oldest first, as the engine recorded them.");
+    expect(screen.getAllByRole("row")).toHaveLength(many.length + 1);
   });
 
   it("links a row that names a plan to that plan's review page", async () => {

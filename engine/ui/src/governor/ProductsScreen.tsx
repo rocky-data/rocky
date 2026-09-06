@@ -110,37 +110,90 @@ export function ProductList({ load }: { load: () => Promise<ProductListOutput> }
 }
 
 function JournalRow({ entry }: { entry: ProductJournalEntry }) {
+  const cell = "px-2 py-1.5 align-top";
   return (
-    <li className="border-l-2 border-zinc-200 py-2 pl-3 dark:border-zinc-700">
-      <div className="flex flex-wrap items-baseline gap-2">
-        <span className="font-mono text-[11px] text-zinc-500 dark:text-zinc-400">#{entry.seq}</span>
-        {/* The engine documents `event` as a label to render, not an enum to
-            switch on. Rendering the string means an event a newer engine adds
-            shows up here instead of vanishing. */}
-        <span className="text-sm font-medium text-zinc-900 dark:text-zinc-100">{entry.event}</span>
-        <span className="text-[11px] text-zinc-500 dark:text-zinc-400">
-          {entry.from_state ? `${entry.from_state} → ` : ""}
-          {entry.to_state}
-        </span>
-      </div>
-      <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-zinc-500 dark:text-zinc-400">
-        <span>{formatInstant(entry.at ?? null)}</span>
-        {entry.spec_digest != null && <span>spec {shortId(entry.spec_digest)}</span>}
-        {entry.idempotency_key != null && <span>key {shortId(entry.idempotency_key)}</span>}
-        {entry.plan_id != null && (
-          <a
-            href={reviewPath(entry.plan_id)}
-            onClick={(clicked) => {
-              clicked.preventDefault();
-              navigateTo(reviewPath(entry.plan_id as string));
-            }}
-            className="font-mono text-sky-700 underline-offset-2 hover:underline dark:text-sky-400"
-          >
-            plan {shortId(entry.plan_id)}
-          </a>
-        )}
-      </div>
-    </li>
+    <tr className="border-t border-zinc-100 dark:border-zinc-800">
+      <td className={`${cell} font-mono text-[11px] text-zinc-500 dark:text-zinc-400`}>
+        {entry.seq}
+      </td>
+      <td className={`${cell} whitespace-nowrap text-[11px] text-zinc-500 dark:text-zinc-400`}>
+        {formatInstant(entry.at ?? null)}
+      </td>
+      {/* The engine documents `event` as a label to render, not an enum to
+          switch on. Rendering the string means an event a newer engine adds
+          shows up here instead of vanishing. The cell wraps rather than
+          truncates: a repair round's event carries the compiler errors that
+          caused it, and a truncated one would hide the reason. */}
+      <td className={`${cell} text-zinc-900 dark:text-zinc-100`}>{entry.event}</td>
+      <td className={`${cell} whitespace-nowrap text-[11px] text-zinc-500 dark:text-zinc-400`}>
+        {entry.from_state ? `${entry.from_state} → ` : ""}
+        {entry.to_state}
+      </td>
+      <td className={`${cell} text-[11px] text-zinc-500 dark:text-zinc-400`}>
+        <div className="flex flex-wrap gap-x-3 gap-y-1">
+          {entry.spec_digest != null && <span>spec {shortId(entry.spec_digest)}</span>}
+          {entry.idempotency_key != null && <span>key {shortId(entry.idempotency_key)}</span>}
+          {entry.plan_id != null && (
+            <a
+              href={reviewPath(entry.plan_id)}
+              onClick={(clicked) => {
+                clicked.preventDefault();
+                navigateTo(reviewPath(entry.plan_id as string));
+              }}
+              className="font-mono text-sky-700 underline-offset-2 hover:underline dark:text-sky-400"
+            >
+              plan {shortId(entry.plan_id)}
+            </a>
+          )}
+        </div>
+      </td>
+    </tr>
+  );
+}
+
+/**
+ * The journal as a table, every row present and in the engine's order.
+ *
+ * It is a table rather than a sequence of cards because of what the engine
+ * actually writes: one product driven through the loop once produced **82
+ * rows** — ownership taken and released around every phase, driver groups
+ * started and ended, two repair rounds, four observations. Eighty-two cards is
+ * not a timeline a person reads; eighty-two table rows is.
+ *
+ * Nothing is hidden and nothing is summarised. A filter would have to decide
+ * which events matter, and deciding that means switching on `event`, which is
+ * exactly what this screen must not do.
+ */
+function JournalTable({ rows }: { rows: ProductJournalEntry[] }) {
+  return (
+    <div className="overflow-x-auto rounded-md border border-zinc-200 dark:border-zinc-700">
+      <table className="min-w-full text-left text-sm">
+        <thead className="bg-zinc-50 text-[11px] text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
+          <tr>
+            <th scope="col" className="px-2 py-1.5 font-medium">
+              #
+            </th>
+            <th scope="col" className="px-2 py-1.5 font-medium">
+              when
+            </th>
+            <th scope="col" className="px-2 py-1.5 font-medium">
+              what happened
+            </th>
+            <th scope="col" className="px-2 py-1.5 font-medium">
+              state
+            </th>
+            <th scope="col" className="px-2 py-1.5 font-medium">
+              pinned to
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((entry) => (
+            <JournalRow key={entry.seq} entry={entry} />
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
@@ -226,11 +279,13 @@ export function ProductTimeline({
             The fulfillment loop has not run for this product, so its journal is empty.
           </p>
         ) : (
-          <ol className="space-y-1">
-            {journal.value.rows.map((entry) => (
-              <JournalRow key={entry.seq} entry={entry} />
-            ))}
-          </ol>
+          <>
+            <p className="text-xs text-zinc-600 dark:text-zinc-300">
+              {journal.value.count} {journal.value.count === 1 ? "row" : "rows"}, oldest first, as
+              the engine recorded them.
+            </p>
+            <JournalTable rows={journal.value.rows} />
+          </>
         )}
       </section>
     </div>
