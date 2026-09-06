@@ -1394,6 +1394,40 @@ mod tests {
         }
     }
 
+    /// The seam between the adapter that produces a cell and the converter
+    /// that reads it back. Both halves are exercised for real: DuckDB runs the
+    /// query, and its own `QueryResult` is what the converter is handed.
+    ///
+    /// Hand-built `QueryResult` fixtures cannot catch this — they encode the
+    /// format the test author believed in. Until the `Value::Date32` arm
+    /// existed, DuckDB emitted `Date32(20701)` here and this conversion failed
+    /// with `failed to parse date "Date32(20701)"`, so a content-addressed
+    /// write of any model with a DATE column could not build its batch.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_duckdb_date_column_converts_to_a_date32_array() {
+        use rocky_core::traits::WarehouseAdapter;
+
+        let adapter = rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory().unwrap();
+        let result = adapter
+            .execute_query("SELECT DATE '2026-09-05' AS day")
+            .await
+            .unwrap();
+
+        let typed_cols = vec![col("day", RockyType::Date, false)];
+        let batch = query_result_to_record_batch(&typed_cols, &result)
+            .expect("a DuckDB DATE cell must convert");
+
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Date32Array>()
+            .expect("Date32Array");
+        // 2026-09-05 is 20701 days after the Unix epoch — the same number the
+        // driver held, now carried as a date rather than as its Debug string.
+        assert_eq!(arr.value(0), 20701);
+    }
+
     #[test]
     fn parse_s3_url_basic() {
         let (bucket, prefix) = parse_s3_url("s3://my-bucket/path/to/table").unwrap();
