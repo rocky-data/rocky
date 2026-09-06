@@ -106,6 +106,31 @@ describe("SamplePanel", () => {
     }
   });
 
+  /// U2-P0's XSS row, the sample half. Every value here comes from a
+  /// warehouse: a column name, a cell, and the SQL the engine ran. None of it
+  /// is the operator's, so all of it is hostile input as far as this page is
+  /// concerned.
+  it("renders hostile column names, cells and SQL as text, never as markup", async () => {
+    const hostile = '<img src=x onerror="alert(1)">';
+    const load = vi.fn(async () => ({
+      ...SAMPLE,
+      columns: [hostile, "total"],
+      rows: [[hostile, 1]],
+      executed_sql: `SELECT '${hostile}' FROM t`,
+    }));
+    const { container } = render(<SamplePanel model="orders" load={load} />);
+
+    fireEvent.click(screen.getByRole("button", { name: `Show ${SAMPLE_LIMIT} rows` }));
+    await screen.findByRole("table");
+    // Present as text — dropping it would hide what is really in the column.
+    expect(screen.getAllByText(hostile).length).toBeGreaterThan(0);
+    expect(screen.getByText(new RegExp(`SELECT '${hostile.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}'`)))
+      .toBeTruthy();
+    // …and never as an element. React escapes by default; this fails loudly
+    // if anyone reaches for dangerouslySetInnerHTML here.
+    expect(container.querySelector("img")).toBeNull();
+  });
+
   it("carries no consent on a read that is not a sample", async () => {
     const fetchMock = vi.fn(async () => new Response("{}", { status: 200 }));
     await apiGet("review/queue", {
