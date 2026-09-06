@@ -1841,13 +1841,55 @@ pub struct FreshnessResult {
 /// Optional batch check execution for warehouses that support
 /// batched queries (e.g., UNION ALL aggregation).
 ///
-/// If not implemented, rocky-core falls back to sequential per-table checks.
+/// The three batched operations are independent: an adapter may batch one
+/// and not another. Snowflake and BigQuery batch `batch_describe_schema`
+/// only.
+///
+/// # Saying "I cannot batch this" (#1719)
+///
+/// An adapter that cannot batch an operation says so through
+/// [`supports_row_counts`](Self::supports_row_counts) /
+/// [`supports_freshness`](Self::supports_freshness), and the caller runs the
+/// per-table [`WarehouseAdapter`] path instead. It must **not** say so by
+/// returning `Err`: an `Err` means the query ran and failed, which the
+/// replication runner reports as a check it could not evaluate — a failed
+/// check that gates the run. Snowflake and BigQuery used to return
+/// `Err("not yet implemented")` as a fallback signal, and every row-count and
+/// freshness check on those warehouses failed on healthy data.
 #[async_trait]
 pub trait BatchCheckAdapter: Send + Sync {
+    /// Whether this adapter can answer [`batch_row_counts`](Self::batch_row_counts).
+    ///
+    /// Defaults to `true`: the method has no default body, so an adapter that
+    /// implements the trait at all has written one. An adapter that returns
+    /// `false` is never asked, and the caller falls back to one
+    /// `SELECT COUNT(*)` per table through [`WarehouseAdapter`].
+    fn supports_row_counts(&self) -> bool {
+        true
+    }
+
+    /// Whether this adapter can answer [`batch_freshness`](Self::batch_freshness).
+    ///
+    /// Defaults to `true`, on the same reasoning as
+    /// [`supports_row_counts`](Self::supports_row_counts). An adapter that
+    /// returns `false` is never asked, and the caller falls back to one
+    /// `SELECT MAX(<timestamp_column>)` per table.
+    fn supports_freshness(&self) -> bool {
+        true
+    }
+
     /// Execute row count queries for multiple tables in a single batch.
+    ///
+    /// Called only when [`supports_row_counts`](Self::supports_row_counts)
+    /// returns `true`. An `Err` from here is a query that failed, never
+    /// "unimplemented".
     async fn batch_row_counts(&self, tables: &[TableRef]) -> AdapterResult<Vec<RowCountResult>>;
 
     /// Execute freshness queries for multiple tables in a single batch.
+    ///
+    /// Called only when [`supports_freshness`](Self::supports_freshness)
+    /// returns `true`. An `Err` from here is a query that failed, never
+    /// "unimplemented".
     async fn batch_freshness(
         &self,
         tables: &[TableRef],

@@ -3143,10 +3143,13 @@ pub async fn run(
     let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
     let warehouse_adapter = adapter_registry.warehouse_adapter(&pipeline.target.adapter)?;
 
-    // Batch check adapter (optional): present when the warehouse has an
-    // optimised UNION-ALL / information_schema path (Databricks today).
-    // When absent, run.rs falls back to per-table queries via the
-    // generic WarehouseAdapter methods — same observable behaviour.
+    // Batch check adapter (optional): present when the warehouse has any
+    // optimised UNION-ALL / information_schema path. Databricks batches all
+    // three operations; Snowflake and BigQuery batch the schema describe
+    // only, and say so per operation through `supports_row_counts` /
+    // `supports_freshness` (#1719). When absent — or when the adapter cannot
+    // batch a leg — run.rs falls back to per-table queries via the generic
+    // WarehouseAdapter methods, same observable behaviour.
     let batch_check_adapter: Option<Arc<dyn BatchCheckAdapter>> =
         adapter_registry.batch_check_adapter(&pipeline.target.adapter);
 
@@ -4236,8 +4239,9 @@ pub async fn run(
     // --- Batch column pre-fetch: replace N×2 DESCRIBE TABLE calls with
     //     one information_schema query per unique schema pair. ---
     // Only available when the warehouse implements BatchCheckAdapter
-    // (Databricks today); other adapters fall back to per-table DESCRIBE
-    // via WarehouseAdapter in process_table().
+    // (Databricks, Snowflake and BigQuery all implement
+    // `batch_describe_schema`); other adapters fall back to per-table
+    // DESCRIBE via WarehouseAdapter in process_table().
     if let Some(ref bc_adapter) = batch_check_adapter {
         // Collect unique (catalog, schema) pairs for source and target
         let source_schemas: std::collections::HashSet<(String, String)> = tables_to_process
@@ -6040,8 +6044,10 @@ async fn partition_overlap_key_carriers(
 /// and appends the results to `pending_checks`.
 ///
 /// Row count and freshness go through the warehouse's `BatchCheckAdapter`
-/// when it has one (one UNION ALL query) and fall back to one query per
-/// table otherwise. Assertions, custom checks, null-rate checks and the
+/// when it has one that says it can batch that leg (one UNION ALL query),
+/// and fall back to one query per table otherwise — no adapter, or an
+/// adapter whose `supports_row_counts` / `supports_freshness` says no. The
+/// decision is per leg (#1719). Assertions, custom checks, null-rate checks and the
 /// cross-source overlap check run per table through the plain
 /// `WarehouseAdapter`. Row-count anomalies detected on the way are pushed to
 /// `anomalies`.
@@ -6102,8 +6108,9 @@ async fn run_batched_checks(
     let mut freshness_failures: Vec<(String, String)> = Vec::new();
 
     // Batch checks dispatch through the BatchCheckAdapter trait when the
-    // warehouse provides one (UNION ALL batching). Otherwise, fall back to
-    // per-table queries via the generic WarehouseAdapter.
+    // warehouse provides one AND that adapter says it can batch the leg
+    // (UNION ALL batching). Otherwise, fall back to per-table queries via the
+    // generic WarehouseAdapter.
     //
     // Both paths report the same way: a query that could not answer for a
     // table reports that table's check as `not_evaluated` with the reason,
@@ -6111,201 +6118,227 @@ async fn run_batched_checks(
     // round-trips and in blast radius — one batched leg is a single query for
     // every table it was handed, so its failure names them all, while the
     // per-table path names only the table whose own query failed.
-    let (source_counts, target_counts, freshness_results): (
-        Vec<BatchRowCountResult>,
-        Vec<BatchRowCountResult>,
-        Vec<BatchFreshnessResult>,
-    ) = if let Some(bc) = batch_check {
-        // `join!`, not `try_join!`. `try_join!` returned the first leg's
-        // error, cancelled the other two, and `?` ended the run — after the
-        // data had already been written and before any table's checks were
-        // reported (#1655). Every leg now runs to completion and a failed one
-        // is folded into the failure maps above.
-        let (src, tgt, fresh) = tokio::join!(
-            async {
-                if row_count_enabled {
-                    bc.batch_row_counts(source_batch_refs).await
-                } else {
-                    Ok(vec![])
-                }
-            },
-            async {
-                if row_count_enabled {
-                    bc.batch_row_counts(target_batch_refs).await
-                } else {
-                    Ok(vec![])
-                }
-            },
-            async {
-                if freshness_enabled {
-                    bc.batch_freshness(freshness_batch_refs, &pipeline.timestamp_column)
-                        .await
-                } else {
-                    Ok(vec![])
-                }
-            },
-        );
+    //
+    // The capability is read per leg (#1719). Snowflake and BigQuery batch
+    // the schema describe but not row counts or freshness, and used to say so
+    // by returning `Err` from the batch method — indistinguishable from a
+    // query that failed, which #1700 folds into a `not_evaluated` check at
+    // error severity. A leg the adapter cannot batch is never asked. It takes
+    // the per-table path instead, which is the fallback those adapters'
+    // comments always promised and nobody had written.
 
-        // A failed row-count leg contributes no measurements, and every table
-        // it covered gets the reason. Reported by the same code that reports
-        // a per-table failure, so the two paths emit the same check shape.
-        fn fold_row_count_leg(
-            leg: AdapterResult<Vec<BatchRowCountResult>>,
-            refs: &[TableRef],
-            side: &str,
-            failures: &mut HashMap<String, String>,
-        ) -> Vec<BatchRowCountResult> {
-            match leg {
-                Ok(rows) => rows,
-                Err(e) => {
-                    warn!(
-                        side,
-                        tables = refs.len(),
-                        error = %e,
-                        "the batch row count query failed — reporting its tables as not evaluated"
-                    );
-                    let reason = format!("the batch row count query failed: {e}");
-                    for br in refs {
-                        failures.insert(br.full_name(), reason.clone());
-                    }
-                    Vec::new()
-                }
-            }
-        }
-
-        let src = fold_row_count_leg(src, source_batch_refs, "source", &mut source_count_failures);
-        let tgt = fold_row_count_leg(tgt, target_batch_refs, "target", &mut target_count_failures);
-        let fresh = match fresh {
+    // A failed row-count leg contributes no measurements, and every table
+    // it covered gets the reason. Reported by the same code that reports
+    // a per-table failure, so the two paths emit the same check shape.
+    fn fold_row_count_leg(
+        leg: AdapterResult<Vec<BatchRowCountResult>>,
+        refs: &[TableRef],
+        side: &str,
+        failures: &mut HashMap<String, String>,
+    ) -> Vec<BatchRowCountResult> {
+        match leg {
             Ok(rows) => rows,
             Err(e) => {
                 warn!(
-                    tables = freshness_batch_refs.len(),
+                    side,
+                    tables = refs.len(),
                     error = %e,
-                    "the batch freshness query failed — reporting its tables as not evaluated"
+                    "the batch row count query failed — reporting its tables as not evaluated"
                 );
-                let reason = format!("the batch freshness query failed: {e}");
-                for br in freshness_batch_refs {
-                    freshness_failures.push((br.full_name(), reason.clone()));
+                let reason = format!("the batch row count query failed: {e}");
+                for br in refs {
+                    failures.insert(br.full_name(), reason.clone());
                 }
                 Vec::new()
             }
-        };
-        (src, tgt, fresh)
-    } else {
-        // Per-table fallback via WarehouseAdapter for adapters with no
-        // BatchCheckAdapter implementation.
-        let dialect = warehouse.dialect();
-        let mut src_counts = Vec::new();
-        let mut tgt_counts = Vec::new();
-        let mut fresh_results: Vec<BatchFreshnessResult> = Vec::new();
+        }
+    }
 
-        if row_count_enabled {
-            // A side that fails is recorded as missing, with the reason. It
-            // used to default to 0, and 0 matched an empty or equally
-            // unreadable other side (#1602).
-            for (refs, counts, failures) in [
-                (
-                    source_batch_refs,
-                    &mut src_counts,
-                    &mut source_count_failures,
-                ),
-                (
-                    target_batch_refs,
-                    &mut tgt_counts,
-                    &mut target_count_failures,
-                ),
-            ] {
-                for br in refs {
-                    let table_ref = dialect
-                        .format_table_ref(&br.catalog, &br.schema, &br.table)
-                        .map_err(anyhow::Error::from)?;
-                    let sql = format!("SELECT COUNT(*) FROM {table_ref}");
-                    match warehouse.execute_query(&sql).await {
-                        Ok(result) => {
-                            match checks::cell_as_u64(result.rows.first().and_then(|r| r.first())) {
-                                Some(count) => counts.push(BatchRowCountResult {
-                                    table: br.clone(),
-                                    count,
-                                }),
-                                None => {
-                                    warn!(
-                                        table = br.table.as_str(),
-                                        "per-table row count returned no readable count"
-                                    );
-                                    failures.insert(
-                                        br.full_name(),
-                                        "the row count query returned no readable count"
-                                            .to_string(),
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(table = br.table.as_str(), error = %e, "per-table row count failed");
-                            failures
-                                .insert(br.full_name(), format!("the row count query failed: {e}"));
+    /// One `SELECT COUNT(*)` per table, for a row-count leg nothing batches.
+    ///
+    /// A table whose query fails, or answers with a cell that does not read
+    /// as a count, is recorded in `failures` with the reason and contributes
+    /// no measurement. It used to default to 0, and 0 matched an empty or
+    /// equally unreadable other side (#1602).
+    async fn per_table_row_counts(
+        warehouse: &dyn WarehouseAdapter,
+        refs: &[TableRef],
+        failures: &mut HashMap<String, String>,
+    ) -> Result<Vec<BatchRowCountResult>> {
+        let dialect = warehouse.dialect();
+        let mut counts = Vec::new();
+        for br in refs {
+            let table_ref = dialect
+                .format_table_ref(&br.catalog, &br.schema, &br.table)
+                .map_err(anyhow::Error::from)?;
+            let sql = format!("SELECT COUNT(*) FROM {table_ref}");
+            match warehouse.execute_query(&sql).await {
+                Ok(result) => {
+                    match checks::cell_as_u64(result.rows.first().and_then(|r| r.first())) {
+                        Some(count) => counts.push(BatchRowCountResult {
+                            table: br.clone(),
+                            count,
+                        }),
+                        None => {
+                            warn!(
+                                table = br.table.as_str(),
+                                "per-table row count returned no readable count"
+                            );
+                            failures.insert(
+                                br.full_name(),
+                                "the row count query returned no readable count".to_string(),
+                            );
                         }
                     }
                 }
+                Err(e) => {
+                    warn!(table = br.table.as_str(), error = %e, "per-table row count failed");
+                    failures.insert(br.full_name(), format!("the row count query failed: {e}"));
+                }
             }
         }
+        Ok(counts)
+    }
 
-        if freshness_enabled {
-            for br in freshness_batch_refs {
-                let table_ref = dialect
-                    .format_table_ref(&br.catalog, &br.schema, &br.table)
-                    .map_err(anyhow::Error::from)?;
-                let sql = format!("SELECT MAX({}) FROM {table_ref}", pipeline.timestamp_column);
-                match warehouse.execute_query(&sql).await {
-                    Ok(result) => {
-                        // `MAX()` over an empty table is NULL: there is no row
-                        // to be fresh, and no check is emitted (unchanged). A
-                        // non-NULL cell that does not read as a timestamp — a
-                        // DATE or numeric `timestamp_column`, say — is a check
-                        // the engine could not evaluate, and used to be
-                        // dropped without a trace.
-                        match result.rows.first().and_then(|r| r.first()) {
-                            Some(cell) if cell.is_null() => {
-                                fresh_results.push(BatchFreshnessResult {
-                                    table: br.clone(),
-                                    max_timestamp: None,
-                                });
-                            }
-                            Some(cell) => match cell.as_str().and_then(parse_freshness_timestamp) {
-                                Some(ts) => fresh_results.push(BatchFreshnessResult {
-                                    table: br.clone(),
-                                    max_timestamp: Some(ts),
-                                }),
-                                None => {
-                                    warn!(table = br.table.as_str(), cell = %cell, "per-table freshness check returned an unreadable timestamp");
-                                    freshness_failures.push((
-                                        br.full_name(),
-                                        format!("could not read {cell} as a timestamp"),
-                                    ));
-                                }
-                            },
+    /// One `SELECT MAX(<timestamp_column>)` per table, for a freshness leg
+    /// nothing batches. A table the query could not answer for is recorded in
+    /// `freshness_failures`, in table order, and contributes no measurement.
+    async fn per_table_freshness(
+        warehouse: &dyn WarehouseAdapter,
+        refs: &[TableRef],
+        timestamp_column: &str,
+        freshness_failures: &mut Vec<(String, String)>,
+    ) -> Result<Vec<BatchFreshnessResult>> {
+        let dialect = warehouse.dialect();
+        let mut fresh_results: Vec<BatchFreshnessResult> = Vec::new();
+        for br in refs {
+            let table_ref = dialect
+                .format_table_ref(&br.catalog, &br.schema, &br.table)
+                .map_err(anyhow::Error::from)?;
+            let sql = format!("SELECT MAX({timestamp_column}) FROM {table_ref}");
+            match warehouse.execute_query(&sql).await {
+                Ok(result) => {
+                    // `MAX()` over an empty table is NULL: there is no row
+                    // to be fresh, and no check is emitted (unchanged). A
+                    // non-NULL cell that does not read as a timestamp — a
+                    // DATE or numeric `timestamp_column`, say — is a check
+                    // the engine could not evaluate, and used to be
+                    // dropped without a trace.
+                    match result.rows.first().and_then(|r| r.first()) {
+                        Some(cell) if cell.is_null() => {
+                            fresh_results.push(BatchFreshnessResult {
+                                table: br.clone(),
+                                max_timestamp: None,
+                            });
+                        }
+                        Some(cell) => match cell.as_str().and_then(parse_freshness_timestamp) {
+                            Some(ts) => fresh_results.push(BatchFreshnessResult {
+                                table: br.clone(),
+                                max_timestamp: Some(ts),
+                            }),
                             None => {
-                                warn!(
-                                    table = br.table.as_str(),
-                                    "per-table freshness check returned no rows"
-                                );
+                                warn!(table = br.table.as_str(), cell = %cell, "per-table freshness check returned an unreadable timestamp");
                                 freshness_failures.push((
                                     br.full_name(),
-                                    "the freshness query returned no rows".to_string(),
+                                    format!("could not read {cell} as a timestamp"),
                                 ));
                             }
+                        },
+                        None => {
+                            warn!(
+                                table = br.table.as_str(),
+                                "per-table freshness check returned no rows"
+                            );
+                            freshness_failures.push((
+                                br.full_name(),
+                                "the freshness query returned no rows".to_string(),
+                            ));
                         }
                     }
-                    Err(e) => {
-                        warn!(table = br.table.as_str(), error = %e, "per-table freshness check failed");
-                        freshness_failures
-                            .push((br.full_name(), format!("the freshness query failed: {e}")));
-                    }
+                }
+                Err(e) => {
+                    warn!(table = br.table.as_str(), error = %e, "per-table freshness check failed");
+                    freshness_failures
+                        .push((br.full_name(), format!("the freshness query failed: {e}")));
                 }
             }
         }
+        Ok(fresh_results)
+    }
 
-        (src_counts, tgt_counts, fresh_results)
+    // Which legs this adapter can batch. `None` — no batch adapter, or one
+    // that cannot batch this leg — sends the leg to the per-table path.
+    let row_count_batch = batch_check.filter(|bc| bc.supports_row_counts());
+    let freshness_batch = batch_check.filter(|bc| bc.supports_freshness());
+
+    // `join!`, not `try_join!`. `try_join!` returned the first leg's
+    // error, cancelled the other two, and `?` ended the run — after the
+    // data had already been written and before any table's checks were
+    // reported (#1655). Every leg now runs to completion and a failed one
+    // is folded into the failure maps above. A leg nothing batches yields
+    // `None` here and is answered one table at a time below.
+    let (batched_source, batched_target, batched_freshness) = tokio::join!(
+        async {
+            match row_count_batch.filter(|_| row_count_enabled) {
+                Some(bc) => Some(bc.batch_row_counts(source_batch_refs).await),
+                None => None,
+            }
+        },
+        async {
+            match row_count_batch.filter(|_| row_count_enabled) {
+                Some(bc) => Some(bc.batch_row_counts(target_batch_refs).await),
+                None => None,
+            }
+        },
+        async {
+            match freshness_batch.filter(|_| freshness_enabled) {
+                Some(bc) => Some(
+                    bc.batch_freshness(freshness_batch_refs, &pipeline.timestamp_column)
+                        .await,
+                ),
+                None => None,
+            }
+        },
+    );
+
+    let (source_counts, target_counts) = match (batched_source, batched_target) {
+        (Some(src), Some(tgt)) => (
+            fold_row_count_leg(src, source_batch_refs, "source", &mut source_count_failures),
+            fold_row_count_leg(tgt, target_batch_refs, "target", &mut target_count_failures),
+        ),
+        // Source first, then target, the order the per-table path has always
+        // queried in.
+        _ if row_count_enabled => (
+            per_table_row_counts(warehouse, source_batch_refs, &mut source_count_failures).await?,
+            per_table_row_counts(warehouse, target_batch_refs, &mut target_count_failures).await?,
+        ),
+        _ => (Vec::new(), Vec::new()),
+    };
+
+    let freshness_results: Vec<BatchFreshnessResult> = match batched_freshness {
+        Some(Ok(rows)) => rows,
+        Some(Err(e)) => {
+            warn!(
+                tables = freshness_batch_refs.len(),
+                error = %e,
+                "the batch freshness query failed — reporting its tables as not evaluated"
+            );
+            let reason = format!("the batch freshness query failed: {e}");
+            for br in freshness_batch_refs {
+                freshness_failures.push((br.full_name(), reason.clone()));
+            }
+            Vec::new()
+        }
+        None if freshness_enabled => {
+            per_table_freshness(
+                warehouse,
+                freshness_batch_refs,
+                &pipeline.timestamp_column,
+                &mut freshness_failures,
+            )
+            .await?
+        }
+        None => Vec::new(),
     };
 
     // Measured counts by full table name. A table absent from a map has no
@@ -6474,7 +6507,18 @@ async fn run_batched_checks(
             )
         });
         for (key, mut check) in measured.chain(unevaluated) {
-            check.severity = freshness_cfg.severity;
+            // The configured severity applies to a MEASURED result — how
+            // loudly a stale table is reported. A check the engine could not
+            // evaluate keeps the `TestSeverity::Error` its constructor chose,
+            // so it still gates (#1719).
+            //
+            // `severity = "warning"` used to silence both. An operator who
+            // wrote it to mean "a stale table is only a warning" was also
+            // saying "a freshness query I could not run is only a warning",
+            // and the run exited 0 with `status: "Success"`.
+            if check.not_evaluated.is_none() {
+                check.severity = freshness_cfg.severity;
+            }
             if let Some((_, asset_key)) = batch_asset_keys.iter().find(|(k, _)| *k == key) {
                 let entry = pending_checks.entry(key).or_insert_with(|| PendingCheck {
                     asset_key: asset_key.clone(),
@@ -31081,7 +31125,9 @@ table = "fct_events"
     }
 
     /// A freshness query that fails used to be logged and dropped. It is
-    /// reported as not evaluated, at the configured severity.
+    /// reported as not evaluated, at the `TestSeverity::Error` its
+    /// constructor chose — NOT at the configured severity, which describes a
+    /// stale table rather than a query Rocky could not run (#1719).
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn a_freshness_check_whose_query_fails_is_not_evaluated() {
@@ -31103,7 +31149,9 @@ table = "fct_events"
             Some("the freshness query failed: injected MAX failure"),
             "{result:?}"
         );
-        assert_eq!(result.severity, rocky_core::tests::TestSeverity::Warning);
+        // `severity = "warning"` is configured, and this result keeps Error:
+        // an unevaluated check must still gate (#1719).
+        assert_eq!(result.severity, rocky_core::tests::TestSeverity::Error);
         assert!(
             matches!(
                 result.details,
@@ -31396,6 +31444,431 @@ table = "fct_events"
             "an empty table has no freshness to measure: {checks:?}",
             checks = pending.get(&fx.target_key()).map(|p| &p.checks)
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // #1719: an adapter that CANNOT batch a leg.
+    //
+    // Snowflake and BigQuery returned `Err("not yet implemented")` from
+    // `batch_row_counts` / `batch_freshness` and called it a fallback signal.
+    // #1700 folds a failed leg into a `not_evaluated` check at error
+    // severity, so the sentinel failed every check on healthy data.
+    //
+    //   before: cannot batch ─► Err ─► not_evaluated (Error) ─► exit 2
+    //   after:  cannot batch ─► per-table query ─► a real measurement
+    //           query failed  ─► Err ─► not_evaluated (Error)  (unchanged)
+    // ---------------------------------------------------------------------
+
+    /// The count a batched leg answers with. Never 1, so it cannot be
+    /// confused with the seeded fixture's one row per table: the count itself
+    /// says which path ran.
+    #[cfg(feature = "duckdb")]
+    const BATCHED_COUNT: u64 = 7;
+
+    /// A `BatchCheckAdapter` that declares per leg whether it can batch, and
+    /// counts every call so a test can prove an unsupported leg is never
+    /// asked.
+    #[cfg(feature = "duckdb")]
+    struct CapabilityBatchCheck {
+        row_counts: bool,
+        freshness: bool,
+        row_count_calls: std::sync::atomic::AtomicUsize,
+        freshness_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(feature = "duckdb")]
+    impl CapabilityBatchCheck {
+        fn new(row_counts: bool, freshness: bool) -> Self {
+            Self {
+                row_counts,
+                freshness,
+                row_count_calls: std::sync::atomic::AtomicUsize::new(0),
+                freshness_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn row_count_calls(&self) -> usize {
+            self.row_count_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn freshness_calls(&self) -> usize {
+            self.freshness_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[async_trait::async_trait]
+    impl BatchCheckAdapter for CapabilityBatchCheck {
+        fn supports_row_counts(&self) -> bool {
+            self.row_counts
+        }
+
+        fn supports_freshness(&self) -> bool {
+            self.freshness
+        }
+
+        async fn batch_row_counts(
+            &self,
+            tables: &[TableRef],
+        ) -> rocky_core::traits::AdapterResult<Vec<BatchRowCountResult>> {
+            self.row_count_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if !self.row_counts {
+                // What Snowflake and BigQuery return. Reachable only if the
+                // runner asked a leg the adapter said it cannot batch.
+                return Err(rocky_core::traits::AdapterError::msg(
+                    "batch_row_counts not yet implemented",
+                ));
+            }
+            Ok(tables
+                .iter()
+                .map(|t| BatchRowCountResult {
+                    table: t.clone(),
+                    count: BATCHED_COUNT,
+                })
+                .collect())
+        }
+
+        async fn batch_freshness(
+            &self,
+            tables: &[TableRef],
+            _timestamp_col: &str,
+        ) -> rocky_core::traits::AdapterResult<Vec<BatchFreshnessResult>> {
+            self.freshness_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if !self.freshness {
+                return Err(rocky_core::traits::AdapterError::msg(
+                    "batch_freshness not yet implemented",
+                ));
+            }
+            Ok(tables
+                .iter()
+                .map(|t| BatchFreshnessResult {
+                    table: t.clone(),
+                    max_timestamp: Some(Utc::now()),
+                })
+                .collect())
+        }
+
+        async fn batch_describe_schema(
+            &self,
+            _catalog: &str,
+            _schema: &str,
+        ) -> rocky_core::traits::AdapterResult<HashMap<String, Vec<ColumnInfo>>> {
+            Ok(HashMap::new())
+        }
+    }
+
+    /// Makes the seeded rows current, so a MEASURED freshness check passes.
+    /// The fixture seeds a fixed 2026-01-01 timestamp, which is stale against
+    /// any threshold a test would write.
+    #[cfg(feature = "duckdb")]
+    async fn make_seeded_rows_fresh(inner: &rocky_duckdb::adapter::DuckDbWarehouseAdapter) {
+        for sql in [
+            "UPDATE src.orders SET ts = now()::TIMESTAMP",
+            "UPDATE tgt.orders SET ts = now()::TIMESTAMP",
+        ] {
+            inner.execute_statement(sql).await.unwrap();
+        }
+    }
+
+    /// Both checks on, one healthy table, everything current.
+    #[cfg(feature = "duckdb")]
+    fn both_checks_fixture() -> BatchedCheckFixture {
+        BatchedCheckFixture::new(
+            "row_count = true\n\n[pipeline.bronze.checks.freshness]\nthreshold_seconds = 3600",
+        )
+    }
+
+    /// (a) FAILS ON `main`: the Snowflake / BigQuery shape. The adapter
+    /// batches neither leg, so both take the per-table path and produce real
+    /// measurements, and the run is not gated.
+    ///
+    /// On `main` there was no capability to read: both legs were called, both
+    /// returned `Err`, and every table reported `row_count` and `freshness`
+    /// as not evaluated at error severity — `PartialFailure`, exit 2, on
+    /// healthy data.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn an_adapter_that_batches_neither_leg_measures_per_table_and_does_not_gate() {
+        let inner = seeded_duckdb().await;
+        make_seeded_rows_fresh(&inner).await;
+        let fx = both_checks_fixture();
+
+        let cannot = CapabilityBatchCheck::new(false, false);
+        let (pending, _) = fx.run(&inner, Some(&cannot), None).await;
+
+        let rc = the_result(&pending, &fx.target_key(), "row_count");
+        assert!(
+            rc.passed && rc.not_evaluated.is_none(),
+            "the per-table path measures the row count: {rc:?}"
+        );
+        assert!(
+            matches!(
+                rc.details,
+                rocky_core::checks::CheckDetails::RowCount {
+                    source_count: 1,
+                    target_count: 1
+                }
+            ),
+            "one row per side, counted per table: {rc:?}"
+        );
+
+        let fresh = the_result(&pending, &fx.target_key(), "freshness");
+        assert!(
+            fresh.passed && fresh.not_evaluated.is_none(),
+            "the per-table path measures freshness: {fresh:?}"
+        );
+
+        // The legs it cannot batch are never asked. Saying "I cannot" and
+        // returning an error are different channels now.
+        assert_eq!(cannot.row_count_calls(), 0, "an unsupported leg is asked");
+        assert_eq!(cannot.freshness_calls(), 0, "an unsupported leg is asked");
+
+        let (gated, status) = run_status_for(&fx, &pending);
+        assert!(
+            !gated,
+            "healthy data must not gate: {checks:?}",
+            checks = pending.get(&fx.target_key()).map(|p| &p.checks)
+        );
+        assert!(matches!(status, rocky_core::state::RunStatus::Success));
+    }
+
+    /// (a′) The capability is per leg. An adapter that batches row counts but
+    /// not freshness gets the batched count AND a per-table freshness
+    /// measurement in the same run.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn an_adapter_that_batches_only_row_counts_falls_back_for_freshness_alone() {
+        let inner = seeded_duckdb().await;
+        make_seeded_rows_fresh(&inner).await;
+        let fx = both_checks_fixture();
+
+        let partial = CapabilityBatchCheck::new(true, false);
+        let (pending, _) = fx.run(&inner, Some(&partial), None).await;
+
+        let rc = the_result(&pending, &fx.target_key(), "row_count");
+        assert!(
+            matches!(
+                rc.details,
+                rocky_core::checks::CheckDetails::RowCount {
+                    source_count: BATCHED_COUNT,
+                    target_count: BATCHED_COUNT
+                }
+            ),
+            "the row-count leg still batches: {rc:?}"
+        );
+        assert_eq!(partial.row_count_calls(), 2, "source leg and target leg");
+
+        let fresh = the_result(&pending, &fx.target_key(), "freshness");
+        assert!(
+            fresh.passed && fresh.not_evaluated.is_none(),
+            "freshness falls back to the per-table query: {fresh:?}"
+        );
+        assert_eq!(partial.freshness_calls(), 0, "the unsupported leg is asked");
+
+        let (gated, _) = run_status_for(&fx, &pending);
+        assert!(
+            !gated,
+            "{checks:?}",
+            checks = pending.get(&fx.target_key()).map(|p| &p.checks)
+        );
+    }
+
+    /// (b) CONTROL, unchanged by #1719: a leg that GENUINELY fails still
+    /// folds into `not_evaluated` and still gates the run (#1700). The
+    /// capability changes what "cannot batch" means, not what a failed query
+    /// means.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_batched_leg_that_genuinely_fails_is_still_not_evaluated_and_still_gates() {
+        let inner = seeded_duckdb().await;
+        make_seeded_rows_fresh(&inner).await;
+        let fx = both_checks_fixture();
+
+        // Declares it can batch both, and the row-count query fails.
+        let failing = LegFailingBatchCheck::failing(FailingLeg::BothRowCounts);
+        let (pending, _) = fx.run(&inner, Some(&failing), None).await;
+
+        let rc = the_result(&pending, &fx.target_key(), "row_count");
+        assert!(!rc.passed, "{rc:?}");
+        assert_eq!(
+            rc.not_evaluated.as_deref(),
+            Some(
+                "source: the batch row count query failed: injected src batch COUNT failure; \
+                 target: the batch row count query failed: injected tgt batch COUNT failure"
+            ),
+            "{rc:?}"
+        );
+        assert_eq!(rc.severity, rocky_core::tests::TestSeverity::Error);
+
+        let (gated, status) = run_status_for(&fx, &pending);
+        assert!(
+            gated,
+            "a failed query still gates (#1700): {checks:?}",
+            checks = pending.get(&fx.target_key()).map(|p| &p.checks)
+        );
+        assert!(matches!(
+            status,
+            rocky_core::state::RunStatus::PartialFailure
+        ));
+    }
+
+    /// (c) FAILS ON `main`: `severity = "warning"` on freshness used to
+    /// silence a leg the engine could not run at all. The run exited 0 with
+    /// `status: "Success"`.
+    ///
+    /// The configured severity is about a STALE table. A freshness query
+    /// Rocky could not run is a different statement, and keeps the
+    /// `TestSeverity::Error` `freshness_not_evaluated` chose.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_failed_freshness_leg_gates_even_when_the_configured_severity_is_warning() {
+        let inner = seeded_duckdb().await;
+        make_seeded_rows_fresh(&inner).await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.freshness]\nthreshold_seconds = 3600\nseverity = \"warning\"",
+        );
+
+        let failing = LegFailingBatchCheck::failing(FailingLeg::Freshness);
+        let (pending, _) = fx.run(&inner, Some(&failing), None).await;
+
+        let fresh = the_result(&pending, &fx.target_key(), "freshness");
+        assert_eq!(
+            fresh.not_evaluated.as_deref(),
+            Some("the batch freshness query failed: injected batch MAX failure"),
+            "{fresh:?}"
+        );
+        // The gate is asserted before the severity on purpose: it is the
+        // user-visible consequence, so a regression prints the exit code it
+        // changed, not just a field.
+        let (gated, status) = run_status_for(&fx, &pending);
+        assert!(
+            gated,
+            "an unevaluated check gates: {checks:?}",
+            checks = pending.get(&fx.target_key()).map(|p| &p.checks)
+        );
+        assert!(matches!(
+            status,
+            rocky_core::state::RunStatus::PartialFailure
+        ));
+        assert_eq!(
+            fresh.severity,
+            rocky_core::tests::TestSeverity::Error,
+            "a check the engine could not evaluate keeps its own severity: {fresh:?}"
+        );
+    }
+
+    /// The other half of (c), unchanged: a MEASURED stale table still reports
+    /// at the configured severity, and `severity = "warning"` still keeps it
+    /// advisory. The fix narrows the clobber; it does not remove the key.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_measured_stale_table_still_honours_severity_warning() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.freshness]\nthreshold_seconds = 3600\nseverity = \"warning\"",
+        );
+
+        // Answered, and long past the threshold: a measurement that fails.
+        let stale = LegFailingBatchCheck {
+            max_timestamp: Some(Utc::now() - chrono::Duration::days(30)),
+            ..LegFailingBatchCheck::healthy()
+        };
+        let (pending, _) = fx.run(&inner, Some(&stale), None).await;
+
+        let fresh = the_result(&pending, &fx.target_key(), "freshness");
+        assert!(!fresh.passed, "30 days is past the threshold: {fresh:?}");
+        assert!(fresh.not_evaluated.is_none(), "it was measured: {fresh:?}");
+        assert_eq!(
+            fresh.severity,
+            rocky_core::tests::TestSeverity::Warning,
+            "a measured result takes the configured severity: {fresh:?}"
+        );
+
+        let (gated, status) = run_status_for(&fx, &pending);
+        assert!(
+            !gated,
+            "a warning stays advisory: {checks:?}",
+            checks = pending.get(&fx.target_key()).map(|p| &p.checks)
+        );
+        assert!(matches!(status, rocky_core::state::RunStatus::Success));
+    }
+
+    /// (d) The Databricks shape — the one adapter that really batches — is
+    /// untouched: both legs batch, the batched answers are what the checks
+    /// report, and the run is not gated.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn an_adapter_that_batches_both_legs_is_unchanged() {
+        let inner = seeded_duckdb().await;
+        let fx = both_checks_fixture();
+
+        let batches = CapabilityBatchCheck::new(true, true);
+        let (pending, _) = fx.run(&inner, Some(&batches), None).await;
+
+        let rc = the_result(&pending, &fx.target_key(), "row_count");
+        assert!(rc.passed && rc.not_evaluated.is_none(), "{rc:?}");
+        assert!(
+            matches!(
+                rc.details,
+                rocky_core::checks::CheckDetails::RowCount {
+                    source_count: BATCHED_COUNT,
+                    target_count: BATCHED_COUNT
+                }
+            ),
+            "the batched answer is what is reported: {rc:?}"
+        );
+        let fresh = the_result(&pending, &fx.target_key(), "freshness");
+        assert!(fresh.passed && fresh.not_evaluated.is_none(), "{fresh:?}");
+
+        assert_eq!(batches.row_count_calls(), 2, "source leg and target leg");
+        assert_eq!(batches.freshness_calls(), 1);
+
+        let (gated, status) = run_status_for(&fx, &pending);
+        assert!(
+            !gated,
+            "{checks:?}",
+            checks = pending.get(&fx.target_key()).map(|p| &p.checks)
+        );
+        assert!(matches!(status, rocky_core::state::RunStatus::Success));
+    }
+
+    /// (e) The DuckDB shape — no `BatchCheckAdapter` at all — is untouched:
+    /// per-table queries, real measurements, no gate.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_warehouse_with_no_batch_adapter_is_unchanged() {
+        let inner = seeded_duckdb().await;
+        make_seeded_rows_fresh(&inner).await;
+        let fx = both_checks_fixture();
+
+        let (pending, _) = fx.run(&inner, None, None).await;
+
+        let rc = the_result(&pending, &fx.target_key(), "row_count");
+        assert!(rc.passed && rc.not_evaluated.is_none(), "{rc:?}");
+        assert!(
+            matches!(
+                rc.details,
+                rocky_core::checks::CheckDetails::RowCount {
+                    source_count: 1,
+                    target_count: 1
+                }
+            ),
+            "{rc:?}"
+        );
+        let fresh = the_result(&pending, &fx.target_key(), "freshness");
+        assert!(fresh.passed && fresh.not_evaluated.is_none(), "{fresh:?}");
+
+        let (gated, status) = run_status_for(&fx, &pending);
+        assert!(
+            !gated,
+            "{checks:?}",
+            checks = pending.get(&fx.target_key()).map(|p| &p.checks)
+        );
+        assert!(matches!(status, rocky_core::state::RunStatus::Success));
     }
 
     /// A row whose counts do not parse used to be skipped, leaving that column
