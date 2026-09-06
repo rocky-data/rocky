@@ -189,7 +189,7 @@ the query never ran                  -> always error    (the run fails)
 
 The two say different things. Writing `severity = "warning"` on `freshness` means "a stale table is only a warning". It does not mean "a freshness query I could not run is only a warning" — that is an unknown, not a tolerated result.
 
-`cross_source_overlap` and the `[[assertions]]` blocks differ: their unevaluated results carry the configured severity, so `severity = "warning"` does keep an unevaluated one advisory there.
+`cross_source_overlap` and the `[[assertions]]` blocks differ today: their unevaluated results carry the configured severity, so `severity = "warning"` does keep an unevaluated one advisory there. That difference is a known gap, not a design — see [#1741](https://github.com/rocky-data/rocky/issues/1741).
 
 ```toml
 [pipeline.silver.checks]

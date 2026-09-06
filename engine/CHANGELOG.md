@@ -52,17 +52,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The configured severity was written over every result of those two kinds, measured or not. `null_rate_not_evaluated` and `custom_not_evaluated` choose `Error` on purpose, so a check Rocky could not evaluate still gates. The clobber undid that choice.
 
-  So a null-rate query that failed produced one `not_evaluated`, `passed: false` result per configured column, all at warning severity. The replication gate counts error-severity failures only, so it stayed clear and the run exited **0** with `status: "Success"`. A `[[checks.custom]]` entry whose query failed behaved the same way.
+  So a null-rate query that failed produced one `not_evaluated`, `passed: false` result per configured column, all at warning severity. Both check gates count error-severity failures only, so the gate stayed clear and the run exited **0** with `status: "Success"`. A `[[checks.custom]]` entry whose query failed behaved the same way.
 
   ```
   severity = "warning", the query FAILS
   before   every column not_evaluated at Warning -> gate clear -> exit 0, Success
-  after    every column not_evaluated at Error   -> gate trips -> exit 2, PartialFailure
+  after    every column not_evaluated at Error   -> gate trips -> non-zero
   ```
 
   The configured severity now applies to a measured result only. It describes a column over the threshold, or a real violation count — not a query Rocky could not run. A measured violation still reports at the configured severity, so `severity = "warning"` keeps meaning "this is advisory" for the case it was written for.
 
-  **This changes an exit code.** A project that set `severity = "warning"` on either check kind, and whose check queries fail, moves from exit 0 to exit 2. That is the same correction #1719 made for `freshness`; these were the two kinds it left. (#1735)
+  **This changes an exit code, on two pipeline surfaces.** `null_rate` runs on replication pipelines only, where a tripped gate is exit 2, `PartialFailure`. `[[checks.custom]]` runs on **both** replication and quality pipelines: on a quality pipeline the same result now trips `error_failures > 0 && fail_on_error`, so the run exits 1 with `quality pipeline failed: N error-severity check(s) failed` and persists a `Failure` record where it previously persisted `Success`. A project that set `severity = "warning"` on either check kind, and whose check queries fail, moves from a clean exit to a failing one.
+
+  That is the same correction #1719 made for `freshness`; these were the two kinds it left. `cross_source_overlap` and `[[assertions]]` still take the configured severity on an unevaluated result — see #1741. (#1735)
 
 - **`rocky state retention sweep` could delete run history a project's `rocky.toml` said to keep, because a dangling symlink read as "no config at all".**
 

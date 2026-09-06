@@ -2497,6 +2497,57 @@ auto_create_schemas = true
         );
     }
 
+    /// The severity field is not the point — the exit code is. A custom check
+    /// runs on BOTH surfaces, so this asserts the gate a QUALITY pipeline
+    /// reads, through the same function `run_quality` reads it through.
+    ///
+    /// `run_quality` bails on `error_failures > 0 && fail_on_error`
+    /// (`run_local.rs`), and `error_failures` is
+    /// `count_failures_by_severity` -> `RunOutput::check_failures_by_severity`.
+    /// Before #1735 a failed custom query at `severity = "warning"` landed in
+    /// the warning bucket, so a quality run exited 0 and persisted `Success`.
+    #[tokio::test]
+    async fn a_failed_custom_query_trips_the_quality_gate_despite_severity_warning() {
+        use crate::output::{RunOutput, TableCheckOutput};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("gate.duckdb");
+        {
+            let a = DuckDbWarehouseAdapter::open(&db).expect("open");
+            a.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
+                .await
+                .unwrap();
+            a.execute_statement("CREATE TABLE main.t AS SELECT 1 AS id")
+                .await
+                .unwrap();
+        }
+        let warehouse = DuckDbWarehouseAdapter::open(&db).expect("reopen");
+
+        let broken = rocky_core::config::CustomCheckConfig {
+            name: "query_fails".to_string(),
+            sql: "SELECT * FROM main.no_such_table".to_string(),
+            threshold: 0,
+            severity: rocky_core::tests::TestSeverity::Warning,
+        };
+
+        let checks = super::run_custom_checks(&warehouse, "main.t", &[broken]).await;
+
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        output.check_results.push(TableCheckOutput {
+            asset_key: vec!["main".to_string(), "t".to_string()],
+            checks,
+        });
+
+        let (error_failures, warning_failures) = super::count_failures_by_severity(&output);
+        assert_eq!(
+            (error_failures, warning_failures),
+            (1, 0),
+            "a query the engine could not run belongs in the ERROR bucket, \
+             which is the one the quality gate counts: {:?}",
+            output.check_results
+        );
+    }
+
     /// The table-unaddressable path builds the same results, so it carries
     /// the same rule: not-evaluated keeps `Error`, whatever the config says.
     #[test]
