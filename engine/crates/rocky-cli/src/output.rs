@@ -269,6 +269,24 @@ pub struct RunOutput {
     /// gate still reports `partial_failure` / `failure` here, in the persisted
     /// run record, and in the process exit code. Omitted from the JSON when
     /// `false`, so a run that did not trip the gate is unchanged on the wire.
+    ///
+    /// # A resumed run can inherit this from the run it resumed (#1720)
+    ///
+    /// One case sets it without a matching failure in this run's own
+    /// `check_results`: a resume of a run that was itself gated. The resume
+    /// re-copies only the tables the earlier run left, and check inputs are
+    /// built only from the tables the current invocation copies — so a
+    /// violation on a table the resume skipped is never re-evaluated. The
+    /// verdict is therefore carried forward from the resumed run's
+    /// `RunRecord::check_gate_failed` (state schema v25) rather than
+    /// re-derived, so the resume cannot record `Success` while the gate
+    /// stands.
+    ///
+    /// A consumer that sees `check_gate_failed: true` with clean
+    /// `check_results` is reading exactly that case; `resumed_from` names the
+    /// run whose gate it is, and the process message says so too. Count
+    /// `check_results` for this run's OWN failures; read this field for
+    /// "may I treat the run as green?" — the answer there is no.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub check_gate_failed: bool,
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -5248,6 +5266,12 @@ impl RunOutput {
             check_outcomes,
             pipeline: None,
             submission_id: None,
+            // The severity-resolved check-gate verdict, persisted so a later
+            // reader can ask "did the checks gate this run?" without
+            // re-deriving it from `check_outcomes` (which carries no severity)
+            // or guessing from `models_executed` (which is orthogonal to it).
+            // The resume gate reads exactly this field (#1720).
+            check_gate_failed: self.check_gate_failed,
         }
     }
 
