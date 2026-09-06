@@ -130,6 +130,11 @@ pub fn state_clear_schema_cache(state_path: &Path, dry_run: bool, output_json: b
 /// and quality snapshots accordingly.
 ///
 /// Behaviour:
+/// - No `rocky.toml` at `config_path` → the defaults apply. That is the init
+///   flow, and the only case that sweeps without reading a policy.
+/// - A `rocky.toml` that is present but cannot be loaded → **refuses**. The
+///   sweep deletes rows and nothing puts them back, so a config that might
+///   have said `max_age_days = 3650` must never be skipped in silence.
 /// - Missing `state.redb` → emits a zero-count report and exits cleanly,
 ///   matching `state clear-schema-cache` (CI-safe on ephemeral runners).
 /// - `dry_run = true` runs the planner but skips every write transaction
@@ -143,14 +148,30 @@ pub fn state_retention_sweep(
 ) -> Result<()> {
     // Read the policy from rocky.toml so the same sweep semantics apply
     // whether the operator runs the command manually or it's wired into a
-    // future scheduled hook. `config_path` may not exist (init flow) — in
-    // that case we sweep with the defaults.
-    let policy = if config_path.exists() {
-        let cfg = load_rocky_config(config_path)
-            .with_context(|| format!("loading rocky config at {}", config_path.display()))?;
-        cfg.state.retention
-    } else {
-        StateRetentionConfig::default()
+    // future scheduled hook.
+    //
+    // The loader IS the probe. A `config_path.exists()` gate in front of it
+    // was a second source of truth that disagreed with the loader: `exists()`
+    // is `metadata(..).is_ok()`, which FOLLOWS a symlink, so a `rocky.toml`
+    // symlink whose target is gone answered `false`. The project's
+    // `[state.retention]` was never read, the defaults applied, and the sweep
+    // deleted run history the config said to keep — exit 0, no warning,
+    // irreversible (#1729). `ConfigError::FileNotFound` is the one signal that
+    // means "this project has no config" (#1668); every other error is a
+    // config that IS there and could not be read, and the sweep refuses on it.
+    let policy = match load_rocky_config(config_path) {
+        Ok(cfg) => cfg.state.retention,
+        // The init flow: no rocky.toml at all. Sweep with the defaults.
+        Err(rocky_core::config::ConfigError::FileNotFound { .. }) => {
+            StateRetentionConfig::default()
+        }
+        // A config is there and could not be loaded — a dangling symlink, a
+        // directory, a parse error, an unresolved `${VAR}`. Fail closed: this
+        // sweep is irreversible.
+        Err(e) => {
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("loading rocky config at {}", config_path.display()));
+        }
     };
 
     if !state_path.exists() {
@@ -399,6 +420,195 @@ mod tests {
         // File exists but the table is empty.
         assert!(path.exists());
         state_clear_schema_cache(&path, false, false).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod retention_sweep_config_tests {
+    //! `rocky state retention sweep` deletes rows and nothing puts them back.
+    //! What decides how many it deletes is `[state.retention]` in `rocky.toml`,
+    //! so how the command decides whether that file is THERE is a data-loss
+    //! surface (#1729).
+
+    use super::*;
+    use rocky_core::state::{RunRecord, RunStatus, RunTrigger, StateStore};
+
+    /// One aged run record. `started_at` is what the sweep buckets on.
+    fn aged_run(id: &str, days_old: i64) -> RunRecord {
+        let at = chrono::Utc::now() - chrono::Duration::days(days_old);
+        RunRecord {
+            run_id: id.to_string(),
+            started_at: at,
+            finished_at: at,
+            status: RunStatus::Success,
+            models_executed: Vec::new(),
+            trigger: RunTrigger::Manual,
+            config_hash: "c".to_string(),
+            triggering_identity: None,
+            session_source: rocky_core::state::SessionSource::Cli,
+            git_commit: None,
+            git_branch: None,
+            idempotency_key: None,
+            target_catalog: None,
+            hostname: "host".to_string(),
+            rocky_version: "0.0.0-test".to_string(),
+            check_outcomes: Vec::new(),
+            pipeline: None,
+            submission_id: None,
+        }
+    }
+
+    /// A store holding `n` runs, every one older than the 365-day default.
+    /// `min_runs_kept` defaults to 100, so `n` must exceed it for the default
+    /// policy to delete anything at all — otherwise a green test would prove
+    /// only that the store was empty.
+    fn store_with_aged_runs(state_path: &std::path::Path, n: usize) {
+        let store = StateStore::open(state_path).unwrap();
+        for i in 0..n {
+            store
+                .record_run(&aged_run(&format!("r{i}"), 500 + i as i64))
+                .unwrap();
+        }
+        assert_eq!(
+            store.list_runs(1000).unwrap().len(),
+            n,
+            "precondition: the store really holds the aged rows"
+        );
+    }
+
+    fn run_count(state_path: &std::path::Path) -> usize {
+        StateStore::open_read_only(state_path)
+            .unwrap()
+            .list_runs(1000)
+            .unwrap()
+            .len()
+    }
+
+    const KEEP_EVERYTHING: &str = "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+                                   [state.retention]\nmax_age_days = 3650\n";
+
+    /// The #1729 data-loss case. `rocky.toml` is a symlink whose target is
+    /// gone, and it declares `max_age_days = 3650`. `config_path.exists()` is
+    /// `metadata(..).is_ok()`, which FOLLOWS the link, so the probe answered
+    /// `false`, the 3650 was never read, the 365-day defaults applied, and the
+    /// sweep deleted run history — exit 0, no warning, irreversible.
+    ///
+    /// The sweep must refuse, name the config path AND the link target, and
+    /// leave every row where it was.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_config_symlink_refuses_the_sweep_and_deletes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("shared-prod.toml");
+        std::fs::write(&target, KEEP_EVERYTHING).unwrap();
+        let config = tmp.path().join("rocky.toml");
+        std::os::unix::fs::symlink(&target, &config).unwrap();
+        std::fs::remove_file(&target).unwrap();
+        assert!(
+            !config.exists(),
+            "precondition: the probe this replaces reports the config as absent"
+        );
+
+        // A real store with real rows past the default cutoff — otherwise the
+        // `!state_path.exists()` early return below would carry the test.
+        let state_path = tmp.path().join("state.redb");
+        store_with_aged_runs(&state_path, 105);
+
+        let err = state_retention_sweep(&config, &state_path, false, false)
+            .expect_err("a config that is present but unreadable must refuse the sweep");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(&config.display().to_string())
+                && rendered.contains(&target.display().to_string()),
+            "the refusal must name the config path and the link target it could not \
+             resolve, got: {rendered}"
+        );
+
+        assert_eq!(
+            run_count(&state_path),
+            105,
+            "a refused sweep must delete nothing; on the defaults it would have dropped 5"
+        );
+    }
+
+    /// The control that proves the assertion above is about the refusal and
+    /// not about an inert sweep: with the SAME store and the SAME `rocky.toml`
+    /// resolving, the sweep runs and the defaults delete.
+    #[cfg(unix)]
+    #[test]
+    fn the_same_store_loses_rows_when_the_config_reads_as_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_path = tmp.path().join("state.redb");
+        store_with_aged_runs(&state_path, 105);
+
+        // No rocky.toml at all — the init flow, and the one case that sweeps
+        // on the defaults. `min_runs_kept = 100` keeps 100 of the 105.
+        let absent = tmp.path().join("rocky.toml");
+        state_retention_sweep(&absent, &state_path, false, false)
+            .expect("no rocky.toml is the documented init flow and must still sweep");
+        assert_eq!(
+            run_count(&state_path),
+            100,
+            "the defaults delete past 365 days, keeping min_runs_kept = 100"
+        );
+    }
+
+    /// The other honest-failure control: a `rocky.toml` that is plainly there
+    /// and readable is unchanged — its `max_age_days = 3650` is read and every
+    /// aged row survives.
+    #[test]
+    fn a_real_config_is_read_and_its_policy_applies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("rocky.toml");
+        std::fs::write(&config, KEEP_EVERYTHING).unwrap();
+
+        let state_path = tmp.path().join("state.redb");
+        store_with_aged_runs(&state_path, 105);
+
+        state_retention_sweep(&config, &state_path, false, false)
+            .expect("a readable config must sweep as before");
+        assert_eq!(
+            run_count(&state_path),
+            105,
+            "max_age_days = 3650 must keep every row the defaults would have dropped"
+        );
+    }
+
+    /// A `rocky.toml` symlink that RESOLVES is an ordinary config: followed,
+    /// read, and its policy applied. The fix discriminates on presence, never
+    /// on whether the path happens to be a link.
+    #[cfg(unix)]
+    #[test]
+    fn a_resolvable_config_symlink_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("shared-prod.toml");
+        std::fs::write(&target, KEEP_EVERYTHING).unwrap();
+        let config = tmp.path().join("rocky.toml");
+        std::os::unix::fs::symlink(&target, &config).unwrap();
+
+        let state_path = tmp.path().join("state.redb");
+        store_with_aged_runs(&state_path, 105);
+
+        state_retention_sweep(&config, &state_path, false, false)
+            .expect("a symlink that resolves must sweep as before");
+        assert_eq!(run_count(&state_path), 105, "the linked policy must apply");
+    }
+
+    /// A config that is present and MALFORMED already refused before this
+    /// change (`exists()` was true, the loader errored). Pinned so the new
+    /// match arm cannot quietly turn it into "absent, sweep on defaults".
+    #[test]
+    fn a_malformed_config_still_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("rocky.toml");
+        std::fs::write(&config, "this is not = = valid toml\n").unwrap();
+
+        let state_path = tmp.path().join("state.redb");
+        store_with_aged_runs(&state_path, 105);
+
+        state_retention_sweep(&config, &state_path, false, false)
+            .expect_err("a config that does not parse must refuse, as it always did");
+        assert_eq!(run_count(&state_path), 105, "and delete nothing");
     }
 }
 

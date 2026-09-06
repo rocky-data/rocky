@@ -6593,6 +6593,62 @@ pub fn load_optional_project_config(
     }
 }
 
+/// Decide whether a project HAS a `rocky.toml` at `path`, without reading or
+/// parsing it.
+///
+/// ```text
+///   nothing at `path`                -> Ok(None)        no config (ordinary)
+///   an entry that stats              -> Ok(Some(path))  a config is here
+///   an entry that cannot be stat-ed  -> Err(UnreadableFile)  refuse
+/// ```
+///
+/// # Why this exists, and why [`Path::exists`] is not it
+///
+/// [`Path::exists`] is `std::fs::metadata(..).is_ok()`, and `metadata`
+/// **follows** symlinks. A `rocky.toml` symlink whose target is gone therefore
+/// answers `false` — the project plainly has a config, and the probe reports
+/// none. A caller that gates its config load on that probe never reaches
+/// [`ConfigError::UnreadableFile`] at all, so #1668's refusal is unreachable
+/// and the command runs on defaults (#1729).
+///
+/// The discriminator is the one [`crate::path_presence`] already holds:
+/// [`std::fs::symlink_metadata`] stats the link instead of following it, so it
+/// still succeeds for a dangling link.
+///
+/// # Use the loader instead where you can
+///
+/// This is for the callers that must NOT parse — `rocky serve` binds a config
+/// path and starts even when the file is malformed, because the server reloads
+/// it per compile. Every caller that is about to load the config anyway should
+/// call the loader and read [`ConfigError::FileNotFound`] as "absent" instead:
+/// that leaves one source of truth rather than two that can disagree.
+///
+/// Presence is proven at the instant of the call, and nothing holds the path
+/// afterwards. A caller that loads later still has to handle a config that
+/// went away in between.
+pub fn config_path_if_present(path: &Path) -> Result<Option<&Path>, ConfigError> {
+    match std::fs::metadata(path) {
+        // An entry is here and resolves. Unchanged from `Path::exists()`.
+        Ok(_) => Ok(Some(path)),
+        // The read said "not found", which covers two different worlds.
+        // `classify_not_found` is the one place that tells them apart.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match classify_not_found(path) {
+            PathPresence::Absent => Ok(None),
+            PathPresence::Present { detail } => Err(ConfigError::UnreadableFile {
+                path: path.to_path_buf(),
+                detail,
+            }),
+        },
+        // Could not even stat the path — most often the parent directory is
+        // not traversable. Absence is unproven, so refuse. `Path::exists()`
+        // reported `false` here and let the caller run on defaults.
+        Err(e) => Err(ConfigError::UnreadableFile {
+            path: path.to_path_buf(),
+            detail: format!("the path could not be inspected: {e}"),
+        }),
+    }
+}
+
 /// A validator in the [`CONFIG_VALIDATORS`] chain: pure, panic-free, and
 /// independent of every other validator's outcome.
 type ConfigValidator = fn(&RockyConfig) -> Vec<ConfigError>;
@@ -7104,6 +7160,108 @@ mod tests {
         assert!(
             matches!(err, ConfigError::UnreadableFile { .. }),
             "the refusal must be the present-but-unreadable variant, got: {err:?}"
+        );
+    }
+
+    // ---- the presence probe, for the callers that must not parse (#1729) ----
+
+    /// The #1729 defect, at the primitive. `Path::exists()` is
+    /// `metadata(..).is_ok()`, and `metadata` follows the link, so a dangling
+    /// `rocky.toml` answered `false` and every caller gated on it ran against
+    /// defaults. The probe must refuse and name both the config path and the
+    /// link target, so the refusal is fixable without a second look at disk.
+    #[cfg(unix)]
+    #[test]
+    fn presence_probe_refuses_a_dangling_config_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("shared-prod.toml");
+        let link = dir.path().join("rocky.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        // The probe this replaces. Pinned so the test states the defect it
+        // closes rather than describing it.
+        assert!(
+            !link.exists(),
+            "precondition: Path::exists follows the link"
+        );
+
+        let err = config_path_if_present(&link).expect_err("a dangling config must refuse");
+        assert!(
+            matches!(err, ConfigError::UnreadableFile { .. }),
+            "a present-but-unreadable config, not absence, got: {err:?}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(&link.display().to_string())
+                && rendered.contains(&target.display().to_string()),
+            "the refusal must name the config path and the link target, got: {rendered}"
+        );
+    }
+
+    /// The ordinary cases, which must not change: nothing at the path is still
+    /// "this project has no config", and a real file is still present. These
+    /// are the two answers `Path::exists()` got right.
+    #[test]
+    fn presence_probe_keeps_absence_and_a_real_file_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let absent = dir.path().join("rocky.toml");
+        assert!(
+            config_path_if_present(&absent)
+                .expect("absence is not an error")
+                .is_none(),
+            "nothing at the path must still be the config-less answer"
+        );
+
+        std::fs::write(
+            &absent,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config_path_if_present(&absent).expect("a real config is present"),
+            Some(absent.as_path()),
+            "a readable config must resolve to its own path"
+        );
+    }
+
+    /// A symlink that resolves — including a chain of them — is present, and a
+    /// malformed config is present too. The probe answers presence only; it
+    /// never parses, so `serve` still binds a config it cannot parse.
+    #[cfg(unix)]
+    #[test]
+    fn presence_probe_follows_a_resolvable_chain_and_never_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.toml");
+        std::fs::write(&real, "this is not valid toml = = =\n").unwrap();
+        let middle = dir.path().join("middle.toml");
+        std::os::unix::fs::symlink(&real, &middle).unwrap();
+        let head = dir.path().join("rocky.toml");
+        std::os::unix::fs::symlink(&middle, &head).unwrap();
+
+        assert_eq!(
+            config_path_if_present(&head).expect("a resolvable chain is present"),
+            Some(head.as_path()),
+            "symlink -> symlink -> real file must read as present"
+        );
+        assert!(
+            parse_rocky_config(&head).is_err(),
+            "precondition: the file it points at does not parse, and the probe did not care"
+        );
+    }
+
+    /// A path whose PARENT does not exist is still absence, not a refusal —
+    /// both the read and the stat report `NotFound`, which is the healthy
+    /// "not created yet" case a `--config` under a fresh directory hits.
+    #[test]
+    fn presence_probe_treats_a_missing_parent_as_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("no-such-dir").join("rocky.toml");
+        assert!(
+            config_path_if_present(&nested)
+                .expect("a missing parent is not an error")
+                .is_none(),
+            "a missing parent directory must stay absent"
         );
     }
 

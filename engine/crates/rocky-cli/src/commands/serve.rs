@@ -52,6 +52,48 @@ use rocky_server::auth::{ServeToken, TokenScope};
 /// burst. A flood guard shared across all callers, not a per-sender quota.
 const WEBHOOK_RATE_LIMIT_RPS: f64 = 10.0;
 
+/// Which `rocky.toml`, if any, this `rocky serve` binds — the decision behind
+/// `run_serve`'s `config_path` argument.
+///
+/// ```text
+///   nothing at `config`               -> Ok(None)          config-less serve
+///   a config that stats               -> Ok(Some(config))  bind it
+///   an entry that cannot be stat-ed   -> Err              refuse to start
+/// ```
+///
+/// `None` is a legitimate answer: `rocky serve --models models/` over a
+/// directory with no project around it is the documented standalone flow, and
+/// it must keep starting. Only a path that HAS an entry and cannot be read
+/// becomes a refusal.
+///
+/// # Why this is not a config load
+///
+/// A `rocky.toml` that is present and malformed still binds. The server
+/// reloads the config on every compile and degrades on a load error there
+/// (`rocky_server::state::ServerState::recompile`), so refusing here would
+/// change what a malformed config does to `serve` — a different question from
+/// the one #1729 asks. What changes is only the answer to "is a config here
+/// at all", which `Path::exists()` got wrong for a dangling symlink: it
+/// follows the link, answered `false`, and `serve` then ran as if the
+/// operator had passed no `--config` at all. That silently emptied `[mask]`,
+/// `[classifications.allow_unmasked]` and `[freshness]` so W004 and W005 went
+/// quiet on every compile, defaulted the `[cache.schemas]` posture, and — via
+/// the `PathBuf::from("rocky.toml")` fallback below — moved the scheduler's
+/// webhook spool from the project the operator named to `./.rocky` in the
+/// current directory.
+///
+/// Lives here, not in `main.rs`, so a test crosses the same code production
+/// runs — the reason `build_serve_state` exists.
+pub fn resolve_serve_config_path(config: &Path) -> Result<Option<&Path>> {
+    rocky_core::config::config_path_if_present(config).map_err(|e| {
+        anyhow::Error::new(e).context(
+            "refusing to start: `rocky serve` cannot tell whether this project has a config, \
+             and starting without one would compile with no [mask], no [freshness] and the \
+             default schema-cache posture, and spool webhook demands to ./.rocky",
+        )
+    })
+}
+
 /// Execute `rocky serve`.
 ///
 /// When `scheduler` is set, a resident reconciler loop runs alongside the HTTP
@@ -683,5 +725,110 @@ mod tests {
         let err = resolve_serve_token(Some("s3cret".into()), Some("readonly".into()))
             .expect_err("a typo must not resolve to a full-scope token");
         assert!(err.to_string().contains("unknown token scope"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod serve_config_presence_tests {
+    //! `rocky serve` binds one `rocky.toml` for the lifetime of the process.
+    //! Getting "is there a config here" wrong does not fail — it starts a
+    //! server that answers a different project (#1729).
+    //!
+    //! The symlink cases are `#[cfg(unix)]`: creating a symlink on Windows
+    //! needs Developer Mode or `SeCreateSymbolicLinkPrivilege`, so the test
+    //! would fail for a reason unrelated to the discriminator. The fix itself
+    //! is portable.
+
+    use super::resolve_serve_config_path;
+
+    /// The #1729 defect. A dangling `rocky.toml` answered `false` to
+    /// `Path::exists()`, so `serve` started as though no `--config` had been
+    /// given: empty `[mask]` / `allow_unmasked` / `[freshness]` on every
+    /// compile, the default schema-cache posture, and the scheduler's webhook
+    /// spool moved from the named project to `./.rocky` in the current
+    /// directory. It must refuse to start and name the link.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_config_symlink_refuses_to_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("prod.toml");
+        let config = tmp.path().join("rocky.toml");
+        std::os::unix::fs::symlink(&target, &config).unwrap();
+        assert!(
+            !config.exists(),
+            "precondition: the probe this replaces reports the config as absent"
+        );
+
+        let err = resolve_serve_config_path(&config)
+            .expect_err("a config that is present but unreadable must refuse");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(&config.display().to_string())
+                && rendered.contains(&target.display().to_string()),
+            "the refusal must name the config path and the link target, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("refusing to start"),
+            "and say the server did not start, got: {rendered}"
+        );
+    }
+
+    /// The control. `rocky serve --models models/` over a directory with no
+    /// project around it is a documented flow, and `None` is its honest
+    /// answer. It must keep starting.
+    #[test]
+    fn no_config_at_all_still_starts_config_less() {
+        let tmp = tempfile::tempdir().unwrap();
+        let absent = tmp.path().join("rocky.toml");
+        assert_eq!(
+            resolve_serve_config_path(&absent).expect("absence is not an error"),
+            None,
+            "no rocky.toml must still resolve to the config-less serve"
+        );
+    }
+
+    /// A config that is there binds, and — the boundary this fix deliberately
+    /// does NOT move — a config that is there and does not parse binds too.
+    /// The server reloads the config per compile and degrades on a load error
+    /// there; refusing here would answer a different question from #1729's.
+    #[test]
+    fn a_present_config_binds_even_when_it_does_not_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let good = tmp.path().join("rocky.toml");
+        std::fs::write(&good, "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n").unwrap();
+        assert_eq!(
+            resolve_serve_config_path(&good).expect("a readable config binds"),
+            Some(good.as_path())
+        );
+
+        let bad = tmp.path().join("broken.toml");
+        std::fs::write(&bad, "not = = toml\n").unwrap();
+        assert_eq!(
+            resolve_serve_config_path(&bad).expect("a malformed config still binds"),
+            Some(bad.as_path()),
+            "serve must not start refusing malformed configs it accepted before"
+        );
+    }
+
+    /// A symlink that resolves is an ordinary config. The discriminator is
+    /// presence, never "is this path a link".
+    #[cfg(unix)]
+    #[test]
+    fn a_resolvable_config_symlink_binds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("prod.toml");
+        std::fs::write(
+            &target,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n",
+        )
+        .unwrap();
+        let config = tmp.path().join("rocky.toml");
+        std::os::unix::fs::symlink(&target, &config).unwrap();
+        assert_eq!(
+            resolve_serve_config_path(&config).expect("a resolvable symlink binds"),
+            Some(config.as_path()),
+            "and it binds the path the operator typed, not the resolved target"
+        );
     }
 }
