@@ -1079,7 +1079,7 @@ async fn get_model(
         sql,
         sql_truncated,
         sql_bytes: model.sql.len(),
-        file_path: model.file_path.clone(),
+        file_path: model.file_path.display().to_string(),
         columns: schema
             .columns
             .iter()
