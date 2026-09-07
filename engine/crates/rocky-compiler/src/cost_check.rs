@@ -198,7 +198,7 @@ mod tests {
                 target_table_declared: String::new(),
             },
             sql: "SELECT 1 AS x".to_string(),
-            file_path: format!("models/{name}.sql"),
+            file_path: format!("models/{name}.sql").into(),
             contract_path: None,
         }
     }

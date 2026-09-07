@@ -1469,7 +1469,7 @@ fn lint_config(
                     "model '{}' declares name='{}' which matches its filename — you can omit it",
                     model.config.name, model.config.name
                 ),
-                file: Some(model.file_path.clone()),
+                file: Some(model.file_path.display().to_string()),
                 field: Some("name".into()),
             });
         }
@@ -1490,7 +1490,7 @@ fn lint_config(
                     "model '{}' declares target.table='{}' which matches name — you can omit it",
                     model.config.name, model.config.target.table
                 ),
-                file: Some(model.file_path.clone()),
+                file: Some(model.file_path.display().to_string()),
                 field: Some("target.table".into()),
             });
         }

@@ -551,14 +551,17 @@ pub(super) fn load_transformation_models(
                      models sharing a name cannot both be built — rename one.",
                     model.config.name,
                     first,
-                    model.file_path,
+                    model.file_path.display(),
                 );
             }
 
-            seen_here.insert(model.config.name.clone(), model.file_path.clone());
+            seen_here.insert(
+                model.config.name.clone(),
+                model.file_path.display().to_string(),
+            );
             file_of_name.insert(
                 model.config.name.clone(),
-                (canonical, model.file_path.clone()),
+                (canonical, model.file_path.display().to_string()),
             );
             models.push(model);
         }
