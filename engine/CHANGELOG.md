@@ -68,6 +68,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      after    not_evaluated, severity=Error    ->  error bucket    ->  gate fires  ->  exit 2
   ```
 
+  The **quality pipeline's `row_count`** had the same defect a fourth time, and worse: its failure arm was hand-built rather than going through a constructor, so it set `not_evaluated: None` — telling every consumer the check had run — and described a row-count check as `CheckDetails::Custom` with a fabricated `result_value: 0, threshold: 1`. It now uses `row_count_not_evaluated`, which gets all three right.
+
   **Breaking:** a project with an advisory check whose query has been failing will start failing the run. That is the point — the previous exit code said the data was fine when nothing had been read. `cross_source_overlap_not_applicable` is unchanged: a keyless sibling passes, and a passing check never reaches the severity buckets. Refs #1741.
 
 - **A model sidecar that was a dangling symlink read as absent, so the model compiled against defaults — different strategy, possibly a different target table, silently.**
