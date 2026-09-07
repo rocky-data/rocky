@@ -21654,20 +21654,24 @@ backend = "local"
             Some("email".to_string()),
             "the assertion query failed: no such column: emial",
         );
-        assert_eq!(
-            never_ran.severity,
-            TestSeverity::Error,
-            "an unevaluated check is never advisory"
-        );
-
+        // The gate first, deliberately: this test has to fail on the EXIT
+        // CODE when the fix is reverted, not on a severity field a reader
+        // could dismiss as cosmetic.
         let mut gated = RunOutput::new(String::new(), 0, 1);
         gated.tables_copied = 1;
-        gated.check_results.push(failing_check_bag(never_ran));
+        gated
+            .check_results
+            .push(failing_check_bag(never_ran.clone()));
         gated.check_gate_failed = super::replication_check_gate_failed(&gated, &config);
         assert!(gated.check_gate_failed, "a check that never ran gates");
         assert!(
             matches!(gated.derive_run_status(), RunStatus::PartialFailure),
             "and the run does not exit 0"
+        );
+        assert_eq!(
+            never_ran.severity,
+            TestSeverity::Error,
+            "an unevaluated check is never advisory"
         );
 
         // Measured, violated, advisory: still does not gate.
