@@ -4,7 +4,12 @@ import type { ProductJournalOutput } from "@rocky-types/product_journal";
 import type { ProductListOutput } from "@rocky-types/product_list";
 import type { ProductStatusOutput } from "@rocky-types/product_status";
 import { ApiError } from "../api";
-import { ProductsScreen, type ProductLoaders, productPath } from "./ProductsScreen";
+import {
+  ProductsScreen,
+  type ProductLoaders,
+  describeSpecTrouble,
+  productPath,
+} from "./ProductsScreen";
 
 const PLAN = "d".repeat(64);
 
@@ -27,7 +32,9 @@ const LIST: ProductListOutput = {
     {
       name: "deleted_product",
       spec_present: false,
-      spec_error: "spec-file-missing",
+      // `SpecRejected`'s Display is `[<code>] <message>`; the code is what
+      // the screen words its label from, so the fixture must carry it.
+      spec_error: "[spec-file-missing] spec file not found: products/gone.toml",
       fulfill_state: null,
       journal_rows: 2,
       artifact_problems: 1,
@@ -159,7 +166,7 @@ describe("ProductsScreen", () => {
     // A deleted spec still lists, with the loader's own reason — hiding it
     // would make a removed product look like one that never existed.
     expect(screen.getByText("deleted_product")).toBeTruthy();
-    expect(screen.getByText(/no spec file: spec-file-missing/)).toBeTruthy();
+    expect(screen.getByText(/no spec file/)).toBeTruthy();
     expect(screen.getByText("the loop has not run")).toBeTruthy();
   });
 
@@ -291,5 +298,32 @@ describe("ProductsScreen", () => {
 
   it("builds a product path that survives an awkward name", () => {
     expect(productPath("revenue daily")).toBe("/ui/governor/products/revenue%20daily");
+  });
+
+  /// Only `spec-file-missing` means the file is gone. A spec that exists and
+  /// cannot be read, or one that parses badly, must not be reported as a
+  /// deletion — the reader would go looking for a removal that never happened.
+  describe("describeSpecTrouble", () => {
+    it("says the file is gone only when the loader said it was missing", () => {
+      expect(describeSpecTrouble("[spec-file-missing] spec file not found: a.toml")).toBe(
+        "no spec file",
+      );
+      expect(describeSpecTrouble(null)).toBe("no spec file");
+    });
+
+    it("does not call an unreadable spec a missing one", () => {
+      expect(
+        describeSpecTrouble("[spec-file-unreadable] spec file exists but could not be read: a.toml"),
+      ).toBe("spec file unreadable");
+    });
+
+    it("does not call a rejected spec a missing one", () => {
+      expect(describeSpecTrouble("[not-toml] products/a.toml is not valid TOML")).toBe(
+        "spec file unusable",
+      );
+      expect(describeSpecTrouble("[product-name-mismatch] declares product.name = 'x'")).toBe(
+        "spec file unusable",
+      );
+    });
   });
 });
