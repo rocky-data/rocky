@@ -33,7 +33,7 @@ function QueueRow({ entry, now }: { entry: ReviewQueueEntry; now?: number }) {
           }}
           className="font-mono text-sm text-sky-700 underline-offset-2 hover:underline dark:text-sky-400"
         >
-          {shortId(entry.plan_id)}
+          <span title={entry.plan_id}>{shortId(entry.plan_id)}</span>
         </a>
         <span className="text-[11px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
           {entry.capability} · {entry.principal}

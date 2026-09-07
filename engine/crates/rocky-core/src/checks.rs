@@ -333,18 +333,22 @@ pub fn check_cross_source_overlap(
 /// evaluated — a refused key expression, a `keys`/`key_expr`
 /// misconfiguration, or a query that failed.
 ///
-/// Always fails. A check Rocky declined to run must stay in the tally and must
-/// not report a zero overlap count as if it had measured one.
+/// Always fails, and always at [`TestSeverity::Error`] (#1741). A check Rocky
+/// declined to run must stay in the tally and must not report a zero overlap
+/// count as if it had measured one. The configured severity grades a
+/// *measurement* — how bad is this much overlap — so it has nothing to say
+/// about a group that was never measured. Honouring it here meant a
+/// `severity = "warning"` group whose key expression was refused never
+/// reached the error bucket, so the run exited 0.
 pub fn cross_source_overlap_not_evaluated(
     name: impl Into<String>,
     contributing_tables: Vec<String>,
     reason: impl Into<String>,
-    severity: TestSeverity,
 ) -> CheckResult {
     CheckResult {
         name: name.into(),
         passed: false,
-        severity,
+        severity: TestSeverity::Error,
         not_evaluated: Some(reason.into()),
         details: CheckDetails::CrossSourceOverlap {
             overlap_count: 0,
@@ -567,17 +571,22 @@ pub fn check_assertion(
 /// A row-level assertion the engine could not evaluate: the SQL could not be
 /// generated, the query failed, it returned no readable count, or the table
 /// could not be addressed. Always fails; `failing_rows` is a placeholder.
+///
+/// Always [`TestSeverity::Error`] (#1741). The declared severity grades a
+/// *measured* violation — how bad are N failing rows — and says nothing about
+/// an assertion that never ran. Reading it here made a `severity = "warning"`
+/// assertion silently non-gating whenever its query failed, which is the one
+/// case where the run learned nothing at all.
 pub fn assertion_not_evaluated(
     name: impl Into<String>,
     kind: impl Into<String>,
     column: Option<String>,
-    severity: TestSeverity,
     reason: impl Into<String>,
 ) -> CheckResult {
     CheckResult {
         name: name.into(),
         passed: false,
-        severity,
+        severity: TestSeverity::Error,
         not_evaluated: Some(reason.into()),
         details: CheckDetails::Assertion {
             kind: kind.into(),
@@ -1057,7 +1066,6 @@ mod tests {
             "x",
             vec!["cat.s1.t".into()],
             "key expression refused",
-            TestSeverity::Error,
         );
         assert!(!skipped.passed, "a check that did not run must not pass");
         assert_eq!(
@@ -1074,7 +1082,9 @@ mod tests {
     }
 
     /// `not_evaluated` is one field for every check kind, and it is absent
-    /// from the wire form of a check that ran (#1602).
+    /// from the wire form of a check that ran (#1602). Every such constructor
+    /// is also hard-coded to [`TestSeverity::Error`] (#1741) — none of them
+    /// takes a severity, so a check that did not run cannot be advisory.
     #[test]
     fn not_evaluated_constructors_fail_and_round_trip_through_json() {
         let cases: Vec<CheckResult> = vec![
@@ -1085,7 +1095,6 @@ mod tests {
                 "not_null:id",
                 "not_null",
                 Some("id".into()),
-                TestSeverity::Warning,
                 "the assertion query returned no readable count",
             ),
             custom_not_evaluated("no_dupes", "SELECT 1", 0, "custom check query failed: boom"),
@@ -1093,13 +1102,18 @@ mod tests {
                 "cross_source_overlap:shopify.orders",
                 vec!["cat.s1.orders".into()],
                 "key expression refused",
-                TestSeverity::Error,
             ),
         ];
         for check in &cases {
             assert!(
                 !check.passed,
                 "{}: a check that did not run must not pass",
+                check.name
+            );
+            assert_eq!(
+                check.severity,
+                TestSeverity::Error,
+                "{}: a check that did not run is never advisory (#1741)",
                 check.name
             );
             let reason = check
