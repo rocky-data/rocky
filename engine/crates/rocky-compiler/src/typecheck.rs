@@ -438,7 +438,11 @@ fn compute_model_typecheck(
 
     // Extract references from this model's SQL if available.
     let ref_map = if let Some(model) = model_by_name.get(model_name) {
-        collect_references(&model.sql, &model.file_path, model_names)
+        collect_references(
+            &model.sql,
+            &model.file_path.display().to_string(),
+            model_names,
+        )
     } else {
         ReferenceMap::default()
     };
@@ -607,7 +611,10 @@ fn compute_model_typecheck(
     // Step 6: Enrich diagnostics with the model's file path as a SourceSpan
     // when they don't already have one. This gives miette a file to render.
     if let Some(model) = model_by_name.get(model_name) {
-        let file_path = &model.file_path;
+        // `SourceSpan.file` is what miette renders, so a lossy string is the
+        // right type at this seam — unlike the affected-set comparison in
+        // `compile.rs`, nothing here is matched against a real path (#1730).
+        let file_path = model.file_path.display().to_string();
         for diag in &mut diagnostics {
             if diag.span.is_none() {
                 diag.span = Some(SourceSpan {
@@ -2491,7 +2498,7 @@ mod tests {
                 target_table_declared: String::new(),
             },
             sql: sql.to_string(),
-            file_path: format!("models/{name}.sql"),
+            file_path: format!("models/{name}.sql").into(),
             contract_path: None,
         }
     }
@@ -4228,7 +4235,7 @@ mod tests {
             sql: format!(
                 "SELECT {time_column} FROM upstream WHERE {time_column} >= @start_date AND {time_column} < @end_date"
             ),
-            file_path: format!("models/{name}.sql"),
+            file_path: format!("models/{name}.sql").into(),
             contract_path: None,
         }
     }

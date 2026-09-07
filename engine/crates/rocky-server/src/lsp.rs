@@ -606,9 +606,9 @@ impl RockyLsp {
     /// sidecar is fine: the AI edit creates the `[freshness]` block in a
     /// fresh file via [`end_of_document_position`] on the empty text.
     async fn load_model_sidecar(
-        model_file_path: &str,
+        model_file_path: &std::path::Path,
     ) -> Option<(tower_lsp::lsp_types::Url, String)> {
-        let sidecar_path = std::path::Path::new(model_file_path).with_extension("toml");
+        let sidecar_path = model_file_path.with_extension("toml");
         let text = tokio::fs::read_to_string(&sidecar_path)
             .await
             .unwrap_or_default();
@@ -709,7 +709,7 @@ impl RockyLsp {
 
         for d in &result.diagnostics {
             let file = if let Some(model) = result.project.model(&d.model) {
-                model.file_path.clone()
+                model.file_path.display().to_string()
             } else {
                 continue;
             };
@@ -1314,7 +1314,7 @@ impl LanguageServer for RockyLsp {
                     let mut diags_by_file: HashMap<String, Vec<Diagnostic>> = HashMap::new();
                     for d in &result.diagnostics {
                         let file = if let Some(model) = result.project.model(&d.model) {
-                            model.file_path.clone()
+                            model.file_path.display().to_string()
                         } else {
                             continue;
                         };

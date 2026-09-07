@@ -1607,7 +1607,7 @@ mod tests {
                 target_table_declared: String::new(),
             },
             sql: format!("SELECT * FROM upstream_{name}"),
-            file_path: format!("models/{name}.sql"),
+            file_path: format!("models/{name}.sql").into(),
             contract_path: None,
         }
     }

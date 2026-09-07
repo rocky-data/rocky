@@ -4,7 +4,7 @@
 //! type check → validate contracts → produce `CompileResult`.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -417,7 +417,10 @@ pub fn compile_project(
     let file_paths: HashMap<String, String> = project
         .models
         .iter()
-        .map(|m| (m.config.name.clone(), m.file_path.clone()))
+        // Rendered, not compared: this map feeds a diagnostic's `file` field.
+        // The lossy conversion is correct HERE and is now visible, instead of
+        // being baked into the type every consumer shares (#1730).
+        .map(|m| (m.config.name.clone(), m.file_path.display().to_string()))
         .collect();
     let blast_radius_diagnostics =
         blast_radius::detect_select_star_blast_radius(&semantic_graph, &file_paths);
@@ -537,10 +540,17 @@ pub fn compile_incremental(
     //    graph so we catch upstream shifts and newly-added models.
     let mut affected: HashSet<String> = HashSet::new();
 
-    let changed_paths: HashSet<PathBuf> = changed_files.iter().cloned().collect();
+    // #1730. This comparison is why `Model::file_path` is a `PathBuf`. It was
+    // a `String` built with `display()`, rebuilt here into a `PathBuf` and
+    // compared against the watcher's real path — so on a path component that
+    // is not valid UTF-8 the two could never be equal, the model was never
+    // marked affected, and its stale typed result and `reference_map` survived
+    // the edit. That breaks the invariant AGENT_REVIEW.md names as priority 3:
+    // incremental output must equal from-scratch output for the same final
+    // state. Both sides are now the bytes the filesystem gave us.
+    let changed_paths: HashSet<&Path> = changed_files.iter().map(PathBuf::as_path).collect();
     for m in &project.models {
-        let path = PathBuf::from(&m.file_path);
-        if changed_paths.contains(&path) {
+        if changed_paths.contains(m.file_path.as_path()) {
             affected.insert(m.config.name.clone());
         }
     }
@@ -641,7 +651,10 @@ pub fn compile_incremental(
     let file_paths: HashMap<String, String> = project
         .models
         .iter()
-        .map(|m| (m.config.name.clone(), m.file_path.clone()))
+        // Rendered, not compared: this map feeds a diagnostic's `file` field.
+        // The lossy conversion is correct HERE and is now visible, instead of
+        // being baked into the type every consumer shares (#1730).
+        .map(|m| (m.config.name.clone(), m.file_path.display().to_string()))
         .collect();
     let blast_radius_diagnostics =
         blast_radius::detect_select_star_blast_radius(&semantic_graph, &file_paths);
