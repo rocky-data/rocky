@@ -159,8 +159,62 @@ describe("PlanDetail", () => {
 
     await screen.findByText("no single model to sample");
     expect(screen.queryByRole("button", { name: /Show \d+ rows/ })).toBeNull();
-    // and it says which of the two reasons applies, quoting what it was given
+    // and it quotes what it was given, naming the capability the engine sent
     expect(screen.getByText(/backfill: 3 model\(s\)/)).toBeTruthy();
+  });
+
+  /// Backfill is not the only capability whose queue `model` holds a sentence:
+  /// gc and restore write one too. The card must not call those a backfill —
+  /// a restore covers one tombstoned model and a gc is a deletion.
+  it("does not describe a restore plan as a backfill", async () => {
+    const restore: ReviewQueueOutput = {
+      ...QUEUE,
+      pending: [
+        {
+          ...QUEUE.pending[0],
+          capability: "restore",
+          model: "restore: 1 tombstoned model",
+          blast_radius: undefined,
+        },
+      ],
+    };
+
+    render(
+      <PlanDetail
+        planId={PLAN}
+        loaders={loaders({
+          status: vi.fn(async () => ({ ...STATUS, product_id: undefined })),
+          queue: vi.fn(async () => restore),
+        })}
+      />,
+    );
+
+    await screen.findByText("no single model to sample");
+    expect(screen.getByText(/this restore plan/)).toBeTruthy();
+    expect(screen.queryByText(/a backfill covers/)).toBeNull();
+  });
+
+  /// "The queue does not name this plan" and "the queue could not be read" are
+  /// different facts. Collapsing them told a reader an escalation was resolved
+  /// when the server had refused the request.
+  it("says the queue was refused rather than claiming the plan is not in it", async () => {
+    render(
+      <PlanDetail
+        planId={PLAN}
+        loaders={loaders({
+          queue: vi.fn(async () => {
+            throw new ApiError(503, {
+              code: "state_unreadable",
+              message: "the state store could not be read",
+            });
+          }),
+        })}
+      />,
+    );
+
+    // The queue feeds several panels, so its refusal shows in more than one.
+    await screen.findAllByText(/state_unreadable/);
+    expect(screen.queryByText("not in the queue")).toBeNull();
   });
 
   it("shows the plan, its findings, the escalation and the approve command", async () => {

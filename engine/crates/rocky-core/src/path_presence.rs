@@ -12,7 +12,7 @@
 use std::path::Path;
 
 /// What a `NotFound` from an operation on a path actually means.
-pub(crate) enum PathPresence {
+pub enum PathPresence {
     /// Nothing is at this path. The `NotFound` meant what it said, and the
     /// caller's ordinary "there is none of this yet" answer is correct.
     Absent,
@@ -40,7 +40,7 @@ pub(crate) enum PathPresence {
 ///
 /// The detail sentences are deliberately entry-neutral: the same helper backs
 /// a file read and a directory read, so nothing here says "file".
-pub(crate) fn classify_not_found(path: &Path) -> PathPresence {
+pub fn classify_not_found(path: &Path) -> PathPresence {
     match std::fs::symlink_metadata(path) {
         // Nothing at this path. Genuinely absent — unchanged behaviour, and
         // the case every caller depends on.

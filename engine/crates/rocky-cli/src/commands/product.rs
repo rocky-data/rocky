@@ -1607,19 +1607,55 @@ pub(crate) fn product_status_in(
         .join(rocky_core::product::commit::STAGING_JOURNAL)
         .is_file();
 
+    // `Path::exists()` answers false for every metadata error, not just for a
+    // path that is not there — so a store the process may not stat produced a
+    // status reading "the loop has not run", "approval none" and an empty
+    // journal. On a screen a reviewer trusts before approving, an unreadable
+    // store must refuse, never render as a healthy empty one. `rocky-core`
+    // already owns the discriminator this needs (#1668, #1707).
     let store = match state_path {
-        Some(path) if path.exists() => Some(open_state_store_read_only(path)?),
-        _ => None,
+        Some(path) => match std::fs::metadata(path) {
+            Ok(_) => Some(open_state_store_read_only(path)?),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                match rocky_core::path_presence::classify_not_found(path) {
+                    // Genuinely nothing there: no store yet is the ordinary
+                    // case, and an empty status is the honest answer.
+                    rocky_core::path_presence::PathPresence::Absent => None,
+                    rocky_core::path_presence::PathPresence::Present { detail } => {
+                        anyhow::bail!("{} cannot be read: {detail}", path.display())
+                    }
+                }
+            }
+            Err(err) => anyhow::bail!("{} cannot be read: {err}", path.display()),
+        },
+        None => None,
     };
     if let Some(store) = store {
         if let Some(record) = store.product_approval_get(product_name)? {
+            // `snapshot_intact: false` is an accusation — it says the bytes a
+            // human approved no longer match. Only a snapshot that was READ
+            // may earn it. A snapshot that could not be read has proven
+            // nothing, and saying "not intact" there cries tampering over a
+            // permission bit. Absent still earns false: the approved bytes are
+            // genuinely gone, which is the thing the field exists to report.
             let snapshot_file = root.join(&record.snapshot_path);
-            let intact = if snapshot_file.is_file() {
-                std::fs::read(&snapshot_file)
-                    .map(|bytes| content_digest(&bytes) == record.spec_digest)
-                    .unwrap_or(false)
-            } else {
-                false
+            let intact = match std::fs::read(&snapshot_file) {
+                Ok(bytes) => content_digest(&bytes) == record.spec_digest,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    match rocky_core::path_presence::classify_not_found(&snapshot_file) {
+                        rocky_core::path_presence::PathPresence::Absent => false,
+                        rocky_core::path_presence::PathPresence::Present { detail } => {
+                            anyhow::bail!(
+                                "the approval snapshot {} cannot be read: {detail}",
+                                snapshot_file.display()
+                            )
+                        }
+                    }
+                }
+                Err(err) => anyhow::bail!(
+                    "the approval snapshot {} cannot be read: {err}",
+                    snapshot_file.display()
+                ),
             };
             output.snapshot_intact = Some(intact);
             output.spec_matches_approval = parsed
@@ -3901,5 +3937,52 @@ effect = "require_review"
         let status = product_status_in(&root, None, "revenue_daily").expect("status");
         assert!(status.staging_journal_present);
         assert!(journal.is_file(), "status never mutates");
+    }
+
+    /// No state store yet is the ordinary case: an empty status is honest.
+    #[test]
+    fn a_state_path_that_is_simply_absent_still_reports_a_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, config) = project_with_config(dir.path(), &passing_config());
+        product_compile_in(&root, &config, None, "revenue_daily").expect("phase A");
+
+        let missing = dir.path().join("no-store-here.redb");
+        let status =
+            product_status_in(&root, Some(&missing), "revenue_daily").expect("absent is fine");
+        assert!(status.approval.is_none());
+        assert_eq!(status.journal_rows, 0);
+    }
+
+    /// A store that IS there and cannot be read must refuse. `Path::exists()`
+    /// answered false for a metadata error, so the screen rendered "the loop
+    /// has not run", "approval none" and an empty journal over a store nobody
+    /// could open — a healthy-looking answer built on no evidence.
+    #[cfg(unix)]
+    #[test]
+    fn a_state_store_that_cannot_be_read_refuses_instead_of_reporting_an_empty_one() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, config) = project_with_config(dir.path(), &passing_config());
+        product_compile_in(&root, &config, None, "revenue_daily").expect("phase A");
+
+        // A directory the process may not search, with the store path inside.
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).expect("mkdir");
+        let store = locked.join("state.redb");
+        std::fs::write(&store, b"not really a store").expect("write");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let result = product_status_in(&root, Some(&store), "revenue_daily");
+
+        // Restore before asserting, so a failure cannot leave an unremovable dir.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("restore");
+
+        let err = result.expect_err("an unreadable store must refuse");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("cannot be read"),
+            "the refusal must say the store could not be read, got: {text}"
+        );
     }
 }
