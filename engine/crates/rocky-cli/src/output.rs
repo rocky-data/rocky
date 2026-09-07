@@ -5282,6 +5282,11 @@ impl RunOutput {
         // Flatten every executed check's pass/fail across all tables so a later
         // reader (the `verify_after` policy gate) can confirm a named check ran
         // and passed without re-executing it.
+        //
+        // `not_evaluated` rides along because `passed` alone cannot tell a
+        // measured pass from a check that ran and measured nothing, and the
+        // gate would confirm the second (#1715). It is in scope here; before
+        // v27 it was dropped at this line.
         let check_outcomes = self
             .check_results
             .iter()
@@ -5289,6 +5294,7 @@ impl RunOutput {
             .map(|c| rocky_core::state::CheckOutcome {
                 name: c.name.clone(),
                 passed: c.passed,
+                not_evaluated: c.not_evaluated.clone(),
             })
             .collect();
 
@@ -6947,6 +6953,87 @@ mod run_record_tests {
         );
         assert_eq!(record.check_outcomes.len(), 1);
         assert!(!record.check_outcomes[0].passed);
+    }
+
+    /// The wire this fix exists to close (#1715). The REAL producer
+    /// (`to_run_record`) feeds the REAL consumer
+    /// (`unverified_required_checks`, which is what both `verify_after` gates
+    /// call), so a hand-built outcome cannot hide the drop.
+    ///
+    /// Before v27 the map at the construction site kept `{ name, passed }` and
+    /// discarded `not_evaluated`, so a passing-but-unmeasured overlap check
+    /// reached the gate indistinguishable from a real reading and confirmed a
+    /// rule requiring it.
+    ///
+    /// Deleting `not_evaluated: c.not_evaluated.clone()` from `to_run_record`
+    /// fails this test. Deleting the gate's `NotEvaluated` arm fails it too.
+    #[test]
+    fn an_unmeasured_passing_check_reaches_the_gate_as_unverifiable() {
+        use rocky_core::tests::TestSeverity;
+
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.tables_copied = 1;
+        out.check_results.push(checks_for(
+            "orders",
+            vec![
+                // The reachable shape: passes, measures nothing (#1706).
+                rocky_core::checks::cross_source_overlap_not_applicable(
+                    "cross_source_overlap:duckdb.orders",
+                    vec!["duckdb.orders".to_string()],
+                    "only one contributing table carries the configured key",
+                    TestSeverity::Error,
+                ),
+                // A genuine reading, to prove the refusal is not blanket.
+                rocky_core::checks::check_row_count(10, 10),
+            ],
+        ));
+
+        let started = fixed_start();
+        let record = out.to_run_record(
+            "run-1715",
+            started,
+            started + chrono::Duration::seconds(1),
+            String::new(),
+            RunTrigger::Manual,
+            out.derive_run_status(),
+            RunRecordAudit::test_sentinels(),
+        );
+
+        // The reason survives the persist. `passed` alone still says "true".
+        let overlap = record
+            .check_outcomes
+            .iter()
+            .find(|c| c.name == "cross_source_overlap:duckdb.orders")
+            .expect("the overlap outcome is persisted");
+        assert!(overlap.passed, "the shape under test is a PASSING outcome");
+        assert_eq!(
+            overlap.not_evaluated.as_deref(),
+            Some("only one contributing table carries the configured key"),
+            "the reason must survive to_run_record — dropping it here is the bug"
+        );
+
+        // The gate refuses it, and names why.
+        let refused = rocky_core::state::unverified_required_checks(
+            &record.check_outcomes,
+            &["cross_source_overlap:duckdb.orders".to_string()],
+        );
+        assert_eq!(refused.len(), 1, "an unmeasured pass is not a confirmation");
+        assert!(
+            refused[0].contains("not evaluated")
+                && refused[0].contains("only one contributing table"),
+            "the refusal names the recorded reason, got {:?}",
+            refused[0]
+        );
+
+        // A measured pass is still confirmed — the gate did not become blanket.
+        assert!(
+            rocky_core::state::unverified_required_checks(
+                &record.check_outcomes,
+                &["row_count".to_string()],
+            )
+            .is_empty(),
+            "a check that measured something and passed still confirms"
+        );
     }
 
     /// The new field is omitted from the wire when the gate did not trip, so

@@ -495,23 +495,12 @@ pub(crate) fn finalize_drift_verify_after(
         return Ok(());
     }
 
-    // AND-aggregate this run's recorded check outcomes by name. A run recorded
-    // under this id must exist (the finalizer runs after `record_run`); an
-    // absent run leaves the map empty ⇒ every required check reads as "absent"
-    // ⇒ fail closed.
-    let outcomes = match store.get_run(run_id) {
-        Ok(Some(record)) => {
-            let mut map: std::collections::BTreeMap<&str, bool> = std::collections::BTreeMap::new();
-            for c in &record.check_outcomes {
-                map.entry(c.name.as_str())
-                    .and_modify(|p| *p &= c.passed)
-                    .or_insert(c.passed);
-            }
-            map.into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect::<std::collections::BTreeMap<String, bool>>()
-        }
-        _ => std::collections::BTreeMap::new(),
+    // This run's recorded check outcomes. A run recorded under this id must
+    // exist (the finalizer runs after `record_run`); an absent run leaves the
+    // list empty ⇒ every required check reads as "absent" ⇒ fail closed.
+    let outcomes: Vec<rocky_core::state::CheckOutcome> = match store.get_run(run_id) {
+        Ok(Some(record)) => record.check_outcomes,
+        _ => Vec::new(),
     };
 
     let mut halted: Vec<String> = Vec::new();
@@ -530,14 +519,10 @@ pub(crate) fn finalize_drift_verify_after(
         if required.is_empty() {
             continue;
         }
-        let mut failures: Vec<String> = Vec::new();
-        for name in &required {
-            match outcomes.get(name) {
-                Some(true) => {}
-                Some(false) => failures.push(format!("{name} (failed)")),
-                None => failures.push(format!("{name} (absent — did not run)")),
-            }
-        }
+        // Fail closed on a check that did not run, failed, or ran and measured
+        // nothing — through the same implementation the two-step `rocky apply`
+        // gate calls, so the two cannot answer "confirmed" differently.
+        let failures = rocky_core::state::unverified_required_checks(&outcomes, &required);
         let passed = failures.is_empty();
         let reason = if passed {
             format!(
@@ -859,6 +844,7 @@ mod tests {
                 .map(|(n, p)| CheckOutcome {
                     name: n.to_string(),
                     passed: *p,
+                    not_evaluated: None,
                 })
                 .collect(),
             pipeline: None,
@@ -962,6 +948,71 @@ mod tests {
             .unwrap();
         store.record_run(&run_with_checks("run-3", &[])).unwrap();
         assert!(finalize_drift_verify_after(Some(&store), "run-3", Some(&policy)).is_err());
+    }
+
+    /// 🔴 #1715, the drift-governance half. A required check that ran,
+    /// measured nothing, and passed must fail the finalizer closed — the same
+    /// answer the two-step `rocky apply` gate gives, because both call
+    /// `unverified_required_checks`.
+    ///
+    /// This is the surface that matters most: the migration has ALREADY
+    /// landed when the finalizer runs, and before v27 an auto-applied schema
+    /// change was confirmed by a check with no reading behind it.
+    #[test]
+    fn a_required_check_that_measured_nothing_fails_verify_after_closed() {
+        let (store, _d) = temp_store();
+        let policy = granting_policy(&["cross_source_overlap:duckdb.orders"], None);
+        store
+            .record_policy_decision(&applied_decision("run-1715", "wh.raw.orders"))
+            .unwrap();
+
+        // The reachable shape (#1706): passes, measures nothing.
+        let mut record =
+            run_with_checks("run-1715", &[("cross_source_overlap:duckdb.orders", true)]);
+        record.check_outcomes[0].not_evaluated =
+            Some("only one contributing table carries the configured key".to_string());
+        assert!(
+            record.check_outcomes[0].passed,
+            "the shape under test is a PASSING outcome"
+        );
+        assert!(
+            !record.check_gate_failed,
+            "nothing failed, so the run's own check gate stays false — this is \
+             the same blind spot as the absent case"
+        );
+        store.record_run(&record).unwrap();
+
+        let err = finalize_drift_verify_after(Some(&store), "run-1715", Some(&policy))
+            .expect_err("a check that measured nothing cannot confirm the migration");
+        assert!(
+            err.to_string().contains("not evaluated")
+                && err.to_string().contains("only one contributing table"),
+            "the refusal names why nothing was measured: {err}"
+        );
+
+        let rows = verify_rows(&store, "run-1715");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].effect, PolicyEffect::Deny);
+    }
+
+    /// The companion to the above: a check that DID measure and passed still
+    /// confirms, so the refusal is about the reading and not about the check
+    /// name. Without this, deleting the passing arm would read as a fix.
+    #[test]
+    fn a_required_check_that_measured_and_passed_still_confirms() {
+        let (store, _d) = temp_store();
+        let policy = granting_policy(&["row_count"], None);
+        store
+            .record_policy_decision(&applied_decision("run-ok", "wh.raw.orders"))
+            .unwrap();
+        store
+            .record_run(&run_with_checks("run-ok", &[("row_count", true)]))
+            .unwrap();
+        assert!(
+            finalize_drift_verify_after(Some(&store), "run-ok", Some(&policy)).is_ok(),
+            "a measured pass still confirms the migration"
+        );
+        assert_eq!(verify_rows(&store, "run-ok")[0].effect, PolicyEffect::Allow);
     }
 
     #[test]
