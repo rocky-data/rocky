@@ -5,7 +5,7 @@ import type { ReviewQueueEntry, ReviewQueueOutput } from "@rocky-types/review_qu
 import type { ReviewStatusOutput } from "@rocky-types/review_status";
 import { apiGet } from "../api";
 import { StatusCard } from "../components";
-import { useResource } from "../estate/useResource";
+import { type Resource, useResource } from "../estate/useResource";
 import { formatInstant, shortId } from "../format";
 import { CustodyLink } from "../governor/links";
 import { ResourceState } from "./ResourceState";
@@ -158,7 +158,29 @@ function SpecDrift({
   );
 }
 
-function Escalation({ entry, planId }: { entry: ReviewQueueEntry | null; planId: string }) {
+function Escalation({
+  entry,
+  queue,
+  planId,
+}: {
+  entry: ReviewQueueEntry | null;
+  queue: Resource<ReviewQueueOutput>;
+  planId: string;
+}) {
+  // "The queue does not name this plan" and "the queue could not be read" are
+  // different facts, and only the first is safe to state. Collapsing them told
+  // a reader that an escalation had been resolved when the server had in fact
+  // refused the request.
+  if (queue.kind !== "ready") {
+    return (
+      <section aria-label="Why it needs a human" className="space-y-2">
+        <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+          Why it needs a human
+        </h3>
+        <ResourceState resource={queue} loadingLine="reading the review queue…" />
+      </section>
+    );
+  }
   if (entry === null) {
     return (
       <StatusCard
@@ -325,7 +347,7 @@ export function PlanDetail({
         </section>
       )}
 
-      <Escalation entry={entry} planId={planId} />
+      <Escalation entry={entry} queue={queue} planId={planId} />
 
       {productId !== null &&
         (product.kind === "ready" ? (
@@ -344,15 +366,18 @@ export function PlanDetail({
       ) : (
         // Absent is not empty. A missing panel reads as "this plan touches no
         // data"; say instead that the screen could not work out which model to
-        // sample, which is a different thing and has a different fix. And say
-        // WHICH of the two reasons applies — a backfill has models, just not one
-        // this screen can name.
+        // sample, which is a different thing and has a different fix.
+        //
+        // Say only what the payload supports. Backfill is not the only
+        // capability whose `model` field holds a sentence — gc and restore
+        // write one too — so quote the sentence and name the capability the
+        // engine gave, rather than describing a backfill the plan may not be.
         <StatusCard
           label="sample rows"
           value="no single model to sample"
           sub={
             entry !== null
-              ? `The queue describes this plan as "${entry.model}", which names no single model — a backfill covers a set of them, and this panel reads one model at a time. Sample them from the estate screen instead.`
+              ? `The queue describes this ${entry.capability} plan as "${entry.model}", which is not a model name this panel can read rows from. Sample the models it touches from the estate screen instead.`
               : "Neither the review queue nor the product names a model for this plan, so there is nothing to read rows from. A plan that is not product-bound and no longer in the queue has no model on this screen."
           }
         />
