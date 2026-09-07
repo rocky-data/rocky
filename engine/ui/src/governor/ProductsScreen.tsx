@@ -55,6 +55,14 @@ function ProductRow({ entry }: { entry: ProductListEntry }) {
           {entry.spec_error ?? "the loader gave no reason"}
         </p>
       )}
+      {entry.staging_journal_present && (
+        // Same fact as the standing panel's card: a compile was interrupted
+        // and its artifacts may be half applied. A row that hides it reads as
+        // a finished product.
+        <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">
+          a commit was interrupted: a staging journal is still on disk
+        </p>
+      )}
       <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-zinc-600 sm:grid-cols-4 dark:text-zinc-300">
         <div>
           <dt className="text-zinc-500 dark:text-zinc-400">journal rows</dt>
@@ -277,6 +285,20 @@ function Standing({ status }: { status: ProductStatusOutput }) {
           value="broken"
           tone="risk"
           sub="The approved snapshot's bytes no longer digest to the recorded value. The approval cannot be trusted to describe what was approved."
+        />
+      )}
+      {status.staging_journal_present && (
+        // The engine reports a pending staging journal and deliberately does
+        // NOT resolve it — the next compile does. Until then the committed
+        // artifacts may be a half-applied set, so a reviewer reading this page
+        // is looking at a product mid-commit. The producer has always said so;
+        // this screen used to drop it, which made an interrupted compile look
+        // like a finished one.
+        <StatusCard
+          label="staging journal"
+          value="a commit was interrupted"
+          tone="risk"
+          sub="A staging journal is still on disk, so the last compile did not finish applying its artifacts. Status only reports this — the next `rocky product compile` resolves it."
         />
       )}
       {status.artifact_problems !== undefined && status.artifact_problems.length > 0 && (

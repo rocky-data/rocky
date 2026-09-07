@@ -615,6 +615,19 @@ async fn collect_health_checks(
         checks.push(check);
     }
 
+    // N+1. Webhook spool health. Deliberately NOT folded into
+    //      `scheduler_check`: that one is silent when no pipeline declares a
+    //      `[schedule]`, and a webhook needs no schedule — `webhook_trigger`
+    //      accepts a demand for any pipeline in `config.pipelines`. So a
+    //      project with zero `[schedule]` blocks can still quarantine demands,
+    //      and folding this in would have warned exactly where it was not
+    //      needed and stayed silent where it was (#1712).
+    if should_run("spool", check_filter)
+        && let Some(check) = spool_check(config_path, &mut suggestions)
+    {
+        checks.push(check);
+    }
+
     (checks, suggestions)
 }
 
@@ -841,6 +854,101 @@ fn state_concurrency_check(
 ///
 /// Works for both `rocky serve --scheduler` and cron-driven `rocky tick`, since
 /// both write the same `tick.lock` heartbeat and `schedule_state`.
+/// Quarantined webhook demands sitting in the spool.
+///
+/// A `.corrupt-*` file is payload the engine could not parse and deliberately
+/// did NOT delete, so that a human can look at it. Until this check existed
+/// nothing told anyone: `count_corrupt` had no production caller, and a
+/// quarantined demand was invisible outside a directory listing (#1712).
+///
+/// **Silent only when the spool is genuinely absent.** A project that has
+/// never received a webhook has no spool directory and nothing to report, so
+/// emitting a healthy check there would be noise on every `rocky doctor` run.
+///
+/// Absence is decided with [`rocky_core::path_presence::classify_not_found`],
+/// not `Path::exists()`. `exists()` follows symlinks, so a spool that is a
+/// symlink to a deleted directory answers `false` and would be reported as
+/// "no webhooks here" — the shape of #1668/#1707/#1739. A path that is present
+/// but cannot be inspected is a WARNING, not silence: absence is unproven, and
+/// a spool nobody can read is exactly the state this check exists to surface.
+fn spool_check(config_path: &Path, suggestions: &mut Vec<String>) -> Option<HealthCheck> {
+    use rocky_core::path_presence::{PathPresence, classify_not_found};
+    use rocky_core::schedule::spool;
+
+    let start = Instant::now();
+    let rocky_dir = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join(".rocky");
+    let dir = spool::spool_dir(&rocky_dir);
+
+    // Does the spool exist at all? `read_dir` answers NotFound for both "never
+    // created" and "the symlink dangles", so ask the discriminator.
+    if std::fs::read_dir(dir.as_path()).is_err() {
+        match classify_not_found(dir.as_path()) {
+            // Nothing here. No webhook has ever been spooled: stay silent.
+            PathPresence::Absent => return None,
+            PathPresence::Present { detail } => {
+                suggestions.push(format!(
+                    "inspect {} — the webhook spool is present but unreadable, so \
+                     queued demands cannot be counted",
+                    dir.as_path().display()
+                ));
+                return Some(HealthCheck {
+                    name: "spool".into(),
+                    status: HealthStatus::Warning,
+                    message: format!(
+                        "the webhook spool cannot be read: {detail}. Quarantined \
+                         demands cannot be counted."
+                    ),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    details: vec![("spool".into(), dir.as_path().display().to_string())],
+                });
+            }
+        }
+    }
+
+    let (status, message) = match spool::count_corrupt(&rocky_dir) {
+        Ok(0) => (
+            HealthStatus::Healthy,
+            "no quarantined webhook demands".to_string(),
+        ),
+        Ok(n) => {
+            suggestions.push(format!(
+                "inspect the {n} quarantined webhook demand(s) in {} — each is a \
+                 payload the engine could not parse; delete them once handled",
+                dir.as_path().display()
+            ));
+            (
+                HealthStatus::Warning,
+                format!(
+                    "{n} quarantined webhook demand(s) — payload the engine could \
+                     not parse and did not delete"
+                ),
+            )
+        }
+        Err(e) => {
+            suggestions.push(format!(
+                "inspect {} — the webhook spool could not be counted",
+                dir.as_path().display()
+            ));
+            (
+                HealthStatus::Warning,
+                format!("the webhook spool could not be counted: {e}"),
+            )
+        }
+    };
+
+    Some(HealthCheck {
+        name: "spool".into(),
+        status,
+        message,
+        duration_ms: start.elapsed().as_millis() as u64,
+        details: vec![("spool".into(), dir.as_path().display().to_string())],
+    })
+}
+
 fn scheduler_check(
     config_path: &Path,
     state_path: &Path,
@@ -1084,6 +1192,101 @@ mod tests {
     // -----------------------------------------------------------------------
     // should_run filter logic
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // #1712: quarantined webhook demands were invisible. `count_corrupt` had
+    // no production caller, so a `.corrupt-*` file — payload the engine could
+    // not parse and deliberately did not delete — showed up nowhere.
+    // -----------------------------------------------------------------------
+
+    /// A project that has never received a webhook has no spool, and a healthy
+    /// "0 quarantined demands" line on every `rocky doctor` run would be noise.
+    /// Silence is right here, and it is the ONLY case where it is right.
+    #[test]
+    fn spool_check_is_silent_when_no_spool_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let mut suggestions = Vec::new();
+        assert!(super::spool_check(&config_path, &mut suggestions).is_none());
+        assert!(suggestions.is_empty());
+    }
+
+    #[test]
+    fn spool_check_reports_healthy_when_the_spool_holds_no_corrupt_demands() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let spool = dir.path().join(".rocky").join("pending-demands");
+        std::fs::create_dir_all(&spool).unwrap();
+        // An ordinary queued demand is not a quarantined one.
+        std::fs::write(spool.join("abc123"), "{}").unwrap();
+
+        let mut suggestions = Vec::new();
+        let check = super::spool_check(&config_path, &mut suggestions).expect("spool exists");
+        assert!(matches!(check.status, HealthStatus::Healthy), "{check:?}");
+        assert!(suggestions.is_empty());
+    }
+
+    #[test]
+    fn spool_check_warns_and_counts_quarantined_demands() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let spool = dir.path().join(".rocky").join("pending-demands");
+        std::fs::create_dir_all(&spool).unwrap();
+        std::fs::write(spool.join("abc123"), "{}").unwrap();
+        std::fs::write(spool.join("def456.corrupt-1757000000"), "not json").unwrap();
+        std::fs::write(spool.join("ghi789.corrupt-1757000001"), "also not json").unwrap();
+
+        let mut suggestions = Vec::new();
+        let check = super::spool_check(&config_path, &mut suggestions).expect("spool exists");
+        assert!(matches!(check.status, HealthStatus::Warning), "{check:?}");
+        assert!(check.message.contains('2'), "names the count: {check:?}");
+        assert_eq!(suggestions.len(), 1, "{suggestions:?}");
+        assert!(
+            suggestions[0].contains("pending-demands"),
+            "points at the directory: {suggestions:?}"
+        );
+    }
+
+    /// The discriminator for the whole check. A spool that is a symlink to a
+    /// deleted directory answers `false` to `Path::exists()`, because `exists`
+    /// follows the link — so an `exists()`-based silence condition would report
+    /// "this project has no webhooks" for a spool that is right there and
+    /// broken. That is #1668 / #1707 / #1739, and this test is what stops it
+    /// being written a fourth time.
+    ///
+    /// Present-but-unreadable is a WARNING, never silence: absence is unproven,
+    /// and a spool nobody can read is exactly what this check exists to surface.
+    #[cfg(unix)]
+    #[test]
+    fn spool_check_warns_on_a_dangling_symlink_rather_than_reading_it_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let rocky = dir.path().join(".rocky");
+        std::fs::create_dir_all(&rocky).unwrap();
+
+        let gone = dir.path().join("a-directory-that-was-deleted");
+        std::os::unix::fs::symlink(&gone, rocky.join("pending-demands")).unwrap();
+        assert!(
+            !rocky.join("pending-demands").exists(),
+            "the fixture must exhibit the condition: exists() follows the link \
+             and answers false"
+        );
+
+        let mut suggestions = Vec::new();
+        let check = super::spool_check(&config_path, &mut suggestions)
+            .expect("a dangling spool is NOT absent");
+        assert!(matches!(check.status, HealthStatus::Warning), "{check:?}");
+        assert!(
+            check.message.contains("cannot be read"),
+            "says what is wrong: {check:?}"
+        );
+        assert_eq!(suggestions.len(), 1, "{suggestions:?}");
+    }
 
     #[test]
     fn should_run_no_filter_always_matches() {

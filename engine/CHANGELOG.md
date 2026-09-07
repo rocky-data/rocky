@@ -56,6 +56,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **On upgrade:** the state store schema moves v23 → v24. No table is added and no blob migration runs; a v23 store upgrades on the next read-write open. The bump is load-bearing: `observed_failing` is a new variant of the `fulfill_state` record's tagged enum, and a 1.73.0 binary cannot read a blob that carries it. **Rolling back is the part to plan for.** Remote state keys are qualified by schema version (`v23/state.redb` on an object store, `…v23:…` on Valkey), so a 1.73.0 binary never reads a v24 remote object. It reads whatever is under its own v23 key, which may be stale, and it cannot see progress recorded under v24. The incompatible-blob hazard is a **local** `state.redb` this version wrote. A 1.73.0 binary opening it either stops with a schema-mismatch error or, on the paths that honour `[state] on_schema_mismatch`, deletes the file and starts fresh under the default `recreate`. Do not point a 1.73.0 binary at a local state file written by this version, and do not share one local file between versions. `rocky doctor --check state_schema` reports the mismatch and exits 3. Which commands honour the key and which refuse is being pinned down in #1679. `fulfill_state` is local-only, so a re-run rebuilds the loop's position; see #1525 before relying on that loss being harmless.
 
 ### Fixed
+- **`anomaly_threshold_pct = 0` turned row-count anomaly detection fully ON instead of off, which is the opposite of what it documented.**
+
+  The field's doc comment and the published reference page both said "Set to 0 to disable". The comparison is `is_anomaly = deviation_pct > threshold_pct`, so `0` flagged every table whose row count moved at all — an operator following the documentation to silence anomaly detection got an anomaly on every run where anything changed.
+
+  ```
+  anomaly_threshold_pct = 0, a table whose count moved 1%
+     before   0 < 1        ->  anomaly  ->  warning on every run
+     after    disabled     ->  no anomaly, and the reason says so
+  ```
+
+  `0` (or any negative value) now disables detection, guarded inside `detect_anomaly` so every caller gets the documented behaviour rather than just the replication runner. Nothing had pinned the old behaviour — every existing test passes `50.0`.
+
+  **Breaking:** a project that set `0` and has been living with the resulting noise will stop seeing those anomalies. That is the setting doing what it always said it did. A project wanting maximum sensitivity should set a small positive value such as `0.1` rather than `0`.
+
 - **A check the engine could not run kept the severity you declared, so a `severity = "warning"` check that failed to execute cleared the gate and the run exited 0.**
 
   Severity grades a *measurement*: it says how bad three null rows are, or how bad this much overlap is. A check whose query failed produced no measurement to grade, but `assertion_not_evaluated` and `cross_source_overlap_not_evaluated` carried the declared severity through anyway. `check_failures_by_severity` then filed the failure in the warning bucket, `replication_check_gate_failed` reads only the error bucket, and a run that verified nothing about a column reported success.
