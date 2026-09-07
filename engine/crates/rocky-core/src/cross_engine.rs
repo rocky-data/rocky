@@ -257,9 +257,16 @@ pub fn validate_cross_engine_config(
             && !config.adapters.contains_key(adapter_name)
         {
             // Find which pipeline this model belongs to (best effort).
+            // Walk real path components rather than splitting a rendered
+            // string on '/': that separator is wrong on Windows, and on a
+            // component that is not valid UTF-8 the rendered form cannot match
+            // any configured pipeline name. `filter_map` skips such a
+            // component instead of mangling it — a pipeline name is always
+            // UTF-8, so a component that is not one can never be the match.
             let pipeline_name = model
                 .file_path
-                .split('/')
+                .components()
+                .filter_map(|c| c.as_os_str().to_str())
                 .find(|seg| config.pipelines.contains_key(*seg))
                 .unwrap_or("unknown")
                 .to_owned();
@@ -1026,7 +1033,7 @@ mod tests {
                 target_table_declared: String::new(),
             },
             sql: format!("SELECT * FROM upstream_{name}"),
-            file_path: format!("models/{name}.sql"),
+            file_path: format!("models/{name}.sql").into(),
             contract_path: None,
         }
     }

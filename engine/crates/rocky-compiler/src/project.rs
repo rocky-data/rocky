@@ -696,7 +696,10 @@ fn load_single_rocky_model_with_db(
     Ok(Model {
         config,
         sql,
-        file_path: path.display().to_string(),
+        // The second of the two lossy constructions #1730 names. Both are
+        // now the bytes the filesystem gave us; rendering happens where a
+        // diagnostic needs a string, not here.
+        file_path: path.to_path_buf(),
         contract_path,
     })
 }
@@ -734,7 +737,7 @@ mod tests {
                 target_table_declared: String::new(),
             },
             sql: sql.to_string(),
-            file_path: format!("models/{name}.sql"),
+            file_path: format!("models/{name}.sql").into(),
             contract_path: None,
         }
     }

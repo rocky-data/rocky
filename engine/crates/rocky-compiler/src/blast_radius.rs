@@ -146,7 +146,7 @@ mod tests {
                 target_table_declared: String::new(),
             },
             sql: sql.to_string(),
-            file_path: format!("models/{name}.sql"),
+            file_path: format!("models/{name}.sql").into(),
             contract_path: None,
         }
     }
@@ -154,7 +154,7 @@ mod tests {
     fn file_paths_for(models: &[Model]) -> HashMap<String, String> {
         models
             .iter()
-            .map(|m| (m.config.name.clone(), m.file_path.clone()))
+            .map(|m| (m.config.name.clone(), m.file_path.display().to_string()))
             .collect()
     }
 

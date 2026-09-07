@@ -466,7 +466,7 @@ mod tests {
                 target_table_declared: String::new(),
             },
             sql: sql.to_string(),
-            file_path: "models/shipments.sql".to_string(),
+            file_path: "models/shipments.sql".into(),
             contract_path: None,
         }
     }
