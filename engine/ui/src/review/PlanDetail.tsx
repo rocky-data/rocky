@@ -262,7 +262,7 @@ export function PlanDetail({
     return (
       <section aria-label="The plan" className="space-y-3">
         <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-          Plan {shortId(planId)}
+          Plan <span title={planId}>{shortId(planId)}</span>
         </h2>
         <ResourceState resource={status} loadingLine="reading the plan…" />
       </section>
@@ -298,7 +298,7 @@ export function PlanDetail({
     <div className="space-y-4">
       <section aria-label="The plan" className="space-y-2">
         <h2 className="font-mono text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-          {shortId(planId)}
+          <span title={planId}>{shortId(planId)}</span>
         </h2>
         <div className="grid gap-2 sm:grid-cols-3">
           <StatusCard label="kind" value={status.value.kind} />

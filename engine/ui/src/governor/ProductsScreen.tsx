@@ -5,7 +5,7 @@ import type { ProductStatusOutput } from "@rocky-types/product_status";
 import { apiGet } from "../api";
 import { StatusCard } from "../components";
 import { useResource } from "../estate/useResource";
-import { formatInstant, shortId } from "../format";
+import { elideMiddle, formatInstant, shortId } from "../format";
 import { navigateTo, pathForLane } from "../router";
 import { ResourceState } from "../review/ResourceState";
 import { reviewPath } from "../review/paths";
@@ -131,8 +131,15 @@ function JournalRow({ entry }: { entry: ProductJournalEntry }) {
       </td>
       <td className={`${cell} text-[11px] break-words text-zinc-500 dark:text-zinc-400`}>
         <div className="flex flex-wrap gap-x-3 gap-y-1">
-          {entry.spec_digest != null && <span>spec {shortId(entry.spec_digest)}</span>}
-          {entry.idempotency_key != null && <span>key {shortId(entry.idempotency_key)}</span>}
+          {entry.spec_digest != null && (
+            <span title={entry.spec_digest}>spec {shortId(entry.spec_digest)}</span>
+          )}
+          {entry.idempotency_key != null && (
+            // Not `shortId`: every key for this product begins
+            // `product:<name>@`, so a leading slice distinguishes nothing, and
+            // the product name is already the page title (#1756).
+            <span title={entry.idempotency_key}>key {elideMiddle(entry.idempotency_key)}</span>
+          )}
           {entry.plan_id != null && (
             <a
               href={reviewPath(entry.plan_id)}
@@ -141,6 +148,7 @@ function JournalRow({ entry }: { entry: ProductJournalEntry }) {
                 navigateTo(reviewPath(entry.plan_id as string));
               }}
               className="font-mono text-sky-700 underline-offset-2 hover:underline dark:text-sky-400"
+              title={entry.plan_id}
             >
               plan {shortId(entry.plan_id)}
             </a>
@@ -224,7 +232,13 @@ function Standing({ status }: { status: ProductStatusOutput }) {
         <StatusCard label="loop state" value={status.fulfill_state ?? "the loop has not run"} />
         <StatusCard
           label="working spec"
-          value={status.spec_digest ? shortId(status.spec_digest) : "not present"}
+          value={
+            status.spec_digest ? (
+              <span title={status.spec_digest}>{shortId(status.spec_digest)}</span>
+            ) : (
+              "not present"
+            )
+          }
           tone={status.spec_error ? "risk" : "muted"}
           sub={status.spec_error ?? undefined}
         />

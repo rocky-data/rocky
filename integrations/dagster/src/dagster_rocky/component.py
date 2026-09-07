@@ -213,6 +213,18 @@ DEFAULT_CHECK_NAMES: tuple[str, ...] = (
     ANOMALY_CHECK_NAME,
 )
 
+#: The checks for which "the engine reported nothing" genuinely means "nothing
+#: is wrong". Both are EVENT checks: the engine emits a result only when it has
+#: an anomaly or an exception to report, so silence is the clean verdict and a
+#: passing placeholder states the truth.
+#:
+#: Every other check is a MEASUREMENT. Silence there means the measurement was
+#: not taken, which is not the same as taking it and finding nothing — so its
+#: placeholder reports ``passed=False`` (#1645). This is the same rule the
+#: engine settled in #1741 one layer down: a check that did not run is not a
+#: check that passed.
+PASS_BY_ABSENCE_CHECK_NAMES: frozenset[str] = frozenset({ANOMALY_CHECK_NAME, COMPLIANCE_CHECK_NAME})
+
 
 @dataclass(frozen=True)
 class RockyTableProps:
@@ -4096,17 +4108,35 @@ def _emit_placeholder_checks(
             continue
 
         materialized = cs.asset_key in materialized_keys
-        if materialized:
-            reason = f"not produced by rocky (check type: {cs.name})"
-            severity = dg.AssetCheckSeverity.ERROR
-        else:
+        if not materialized:
             reason = "table not materialized"
             severity = dg.AssetCheckSeverity.WARN
+            passed = False
+        elif cs.name in PASS_BY_ABSENCE_CHECK_NAMES:
+            # An event check. No event means no anomaly, so silence IS the
+            # clean verdict and the placeholder states it.
+            reason = f"no {cs.name} reported by rocky"
+            severity = dg.AssetCheckSeverity.WARN
+            passed = True
+        else:
+            # A measurement the engine did not take. This used to report
+            # `passed=True` on a materialized table, so a `row_count` switched
+            # off in `rocky.toml` — or one the engine simply never emitted —
+            # showed a green badge for a measurement nobody made (#1645). The
+            # `status` metadata was already honest; the verdict was not, and
+            # the badge shows the verdict.
+            #
+            # WARN, not ERROR: a missing measurement is a gap in evidence, not
+            # a detected fault, and an unproduced check should not fail a run
+            # that was otherwise fine.
+            reason = f"not produced by rocky (check type: {cs.name})"
+            severity = dg.AssetCheckSeverity.WARN
+            passed = False
 
         yield dg.AssetCheckResult(
             asset_key=cs.asset_key,
             check_name=cs.name,
-            passed=materialized,
+            passed=passed,
             severity=severity,
             metadata={"status": dg.MetadataValue.text(reason)},
         )

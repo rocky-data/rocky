@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { NOT_RECORDED, formatDuration, formatInstant, orNotRecorded, shortId } from "./format";
+import {
+  NOT_RECORDED,
+  elideMiddle,
+  formatDuration,
+  formatInstant,
+  orNotRecorded,
+  shortId,
+} from "./format";
 
 describe("orNotRecorded", () => {
   it("renders null, undefined and the empty string as the status, and values as text", () => {
@@ -41,8 +48,40 @@ describe("formatInstant", () => {
 });
 
 describe("shortId", () => {
-  it("keeps short ids and cuts long ones to twelve characters", () => {
+  it("keeps short ids whole and marks a cut with an ellipsis", () => {
     expect(shortId("run-1")).toBe("run-1");
-    expect(shortId("a".repeat(64))).toBe("a".repeat(12));
+    expect(shortId("a".repeat(64))).toBe(`${"a".repeat(12)}…`);
+  });
+
+  it("does not mark an id that was not cut", () => {
+    // Exactly at the limit: twelve characters are shown, nothing was dropped,
+    // so an ellipsis would claim a truncation that did not happen.
+    expect(shortId("a".repeat(12))).toBe("a".repeat(12));
+    expect(shortId("a".repeat(13))).toBe(`${"a".repeat(12)}…`);
+  });
+});
+
+describe("elideMiddle", () => {
+  it("keeps both ends of a compound identifier", () => {
+    // #1756: `shortId` renders every key for one product identically, because
+    // they all begin `product:<name>@`. The tail is what distinguishes them.
+    const key = "product:revenue_daily@sha256:5b1bf5c@21";
+    expect(elideMiddle(key)).toBe("product:re…1bf5c@21");
+    expect(elideMiddle(key)).toContain("@21");
+  });
+
+  it("distinguishes two keys that shortId renders identically", () => {
+    const a = "product:revenue_daily@sha256:5b1bf5c@21";
+    const b = "product:revenue_daily@sha256:5b1bf5c@22";
+    expect(shortId(a)).toBe(shortId(b));
+    expect(elideMiddle(a)).not.toBe(elideMiddle(b));
+  });
+
+  it("returns a value unchanged rather than rendering it longer", () => {
+    // head + tail + the ellipsis is 19 characters, so anything at or under
+    // that gains nothing from eliding.
+    expect(elideMiddle("a".repeat(19))).toBe("a".repeat(19));
+    expect(elideMiddle("a".repeat(20)).length).toBeLessThan(20);
+    expect(elideMiddle("short")).toBe("short");
   });
 });

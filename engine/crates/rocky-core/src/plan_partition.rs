@@ -437,7 +437,7 @@ mod tests {
                 target_table_declared: String::new(),
             },
             sql: "SELECT d FROM x WHERE d >= @start_date AND d < @end_date".into(),
-            file_path: format!("models/{name}.sql"),
+            file_path: format!("models/{name}.sql").into(),
             contract_path: None,
         }
     }
@@ -710,7 +710,7 @@ mod tests {
                 target_table_declared: String::new(),
             },
             sql: String::new(),
-            file_path: String::new(),
+            file_path: std::path::PathBuf::new(),
             contract_path: None,
         };
         let (state, _dir) = temp_state();

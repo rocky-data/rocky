@@ -4,7 +4,7 @@
 //! type check → validate contracts → produce `CompileResult`.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -417,7 +417,10 @@ pub fn compile_project(
     let file_paths: HashMap<String, String> = project
         .models
         .iter()
-        .map(|m| (m.config.name.clone(), m.file_path.clone()))
+        // Rendered, not compared: this map feeds a diagnostic's `file` field.
+        // The lossy conversion is correct HERE and is now visible, instead of
+        // being baked into the type every consumer shares (#1730).
+        .map(|m| (m.config.name.clone(), m.file_path.display().to_string()))
         .collect();
     let blast_radius_diagnostics =
         blast_radius::detect_select_star_blast_radius(&semantic_graph, &file_paths);
@@ -537,10 +540,17 @@ pub fn compile_incremental(
     //    graph so we catch upstream shifts and newly-added models.
     let mut affected: HashSet<String> = HashSet::new();
 
-    let changed_paths: HashSet<PathBuf> = changed_files.iter().cloned().collect();
+    // #1730. This comparison is why `Model::file_path` is a `PathBuf`. It was
+    // a `String` built with `display()`, rebuilt here into a `PathBuf` and
+    // compared against the watcher's real path — so on a path component that
+    // is not valid UTF-8 the two could never be equal, the model was never
+    // marked affected, and its stale typed result and `reference_map` survived
+    // the edit. That breaks the invariant AGENT_REVIEW.md names as priority 3:
+    // incremental output must equal from-scratch output for the same final
+    // state. Both sides are now the bytes the filesystem gave us.
+    let changed_paths: HashSet<&Path> = changed_files.iter().map(PathBuf::as_path).collect();
     for m in &project.models {
-        let path = PathBuf::from(&m.file_path);
-        if changed_paths.contains(&path) {
+        if changed_paths.contains(m.file_path.as_path()) {
             affected.insert(m.config.name.clone());
         }
     }
@@ -641,7 +651,10 @@ pub fn compile_incremental(
     let file_paths: HashMap<String, String> = project
         .models
         .iter()
-        .map(|m| (m.config.name.clone(), m.file_path.clone()))
+        // Rendered, not compared: this map feeds a diagnostic's `file` field.
+        // The lossy conversion is correct HERE and is now visible, instead of
+        // being baked into the type every consumer shares (#1730).
+        .map(|m| (m.config.name.clone(), m.file_path.display().to_string()))
         .collect();
     let blast_radius_diagnostics =
         blast_radius::detect_select_star_blast_radius(&semantic_graph, &file_paths);
@@ -852,6 +865,178 @@ fn decimal_family_type(upper: &str) -> RockyType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write `count` independent single-column models into `dir`.
+    ///
+    /// Independent on purpose: nothing but the changed-path comparison may
+    /// mark one affected, so there is no upstream shift and no transitive
+    /// dependent to do it instead.
+    #[cfg(test)]
+    fn write_flat_models(dir: &std::path::Path, count: usize) {
+        // Directory-level target defaults, so each sidecar stays one line.
+        std::fs::write(
+            dir.join("_defaults.toml"),
+            "[target]\ncatalog = \"analytics\"\nschema = \"marts\"\n",
+        )
+        .expect("write _defaults.toml");
+        for i in 0..count {
+            let name = format!("m{i:02}");
+            std::fs::write(
+                dir.join(format!("{name}.toml")),
+                format!("name = \"{name}\"\n"),
+            )
+            .expect("write sidecar");
+            std::fs::write(dir.join(format!("{name}.sql")), "SELECT 1 AS id\n")
+                .expect("write model");
+        }
+    }
+
+    /// The companion to the non-UTF-8 test below, on an ordinary ASCII path so
+    /// it runs on every platform.
+    ///
+    /// It exists because the Linux-only test cannot be executed on macOS or
+    /// Windows, and an unrunnable test is an unverified one. This pins
+    /// everything that test depends on except the invalid byte: that twelve
+    /// models clear the `total < 10` guardrail, that one edited model keeps
+    /// `affected.len() * 2 <= total` so the incremental path is actually
+    /// taken, and that the equality assertion detects a stale typed result.
+    ///
+    /// There were no tests over `compile_incremental` before this.
+    #[test]
+    fn an_edited_model_is_re_typechecked_on_the_incremental_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("create models dir");
+
+        const TOTAL: usize = 12;
+        write_flat_models(&models_dir, TOTAL);
+
+        let config = CompilerConfig {
+            models_dir: models_dir.clone(),
+            ..Default::default()
+        };
+
+        let first = compile(&config).expect("first compile");
+        assert_eq!(
+            first.type_check.typed_models.len(),
+            TOTAL,
+            "twelve models, so `total < 10` cannot send this to a full compile"
+        );
+
+        let edited = models_dir.join("m00.sql");
+        std::fs::write(&edited, "SELECT 1 AS id, 2 AS qty\n").expect("rewrite m00");
+
+        let incremental = compile_incremental(&config, std::slice::from_ref(&edited), &first)
+            .expect("incremental");
+        let scratch = compile(&config).expect("from-scratch compile");
+
+        assert_eq!(
+            incremental.type_check.typed_models["m00"], scratch.type_check.typed_models["m00"],
+            "incremental output must equal from-scratch output"
+        );
+        assert_eq!(incremental.type_check.typed_models["m00"].len(), 2);
+
+        // The untouched models still carry their typed result, which is the
+        // reuse the incremental path exists for. If this were a full compile
+        // in disguise it would still hold — the point is that it must not
+        // REGRESS while the edited model is refreshed.
+        assert_eq!(incremental.type_check.typed_models["m11"].len(), 1);
+    }
+
+    /// 🔴 #1730. A model under a directory whose name is not valid UTF-8 must
+    /// still be marked affected when the watcher reports it changed.
+    ///
+    /// Asserted as the invariant `AGENT_REVIEW.md` calls priority 3 —
+    /// incremental output must equal from-scratch output for the same final
+    /// state — rather than by reaching into the affected set, so the test pins
+    /// the property and not the implementation.
+    ///
+    /// Before the fix, `Model::file_path` was a `String` built with
+    /// `display()`. The seed rebuilt a `PathBuf` from it and compared against
+    /// the watcher's real path; the lossy round-trip replaced the invalid byte
+    /// with U+FFFD, so the two could never be equal, the model was never
+    /// affected, and its stale typed columns survived the edit.
+    ///
+    /// **Twelve models, not one, and that is load-bearing.** `compile_incremental`
+    /// has a guardrail — `if total < 10 || affected.len() * 2 > total { return
+    /// compile(config) }` — so a small project falls through to a FULL compile
+    /// and would produce the correct answer whether or not the seed matched.
+    /// A one-model version of this test passes with the bug still in place.
+    /// Twelve independent models with one edited keeps `1 * 2 <= 12`, which is
+    /// the only shape that actually reaches the incremental path.
+    ///
+    /// Compiled on every unix so it cannot rot unnoticed, but only Linux can
+    /// create the directory: a component that is not valid UTF-8 is
+    /// representable there, while macOS APFS and Windows NTFS reject it at
+    /// creation. The defect is unreachable on those targets for the same
+    /// reason the test is. The skip is fail-closed on Linux — if creation
+    /// fails THERE the test panics rather than passing quietly.
+    #[cfg(unix)]
+    #[test]
+    fn a_changed_model_under_a_non_utf8_dir_is_re_typechecked() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // 0xFF is not valid UTF-8 in any position, so `display()` renders this
+        // component as U+FFFD and the round-trip cannot recover it.
+        let models_dir = tmp.path().join(OsString::from_vec(b"models_\xff".to_vec()));
+        if let Err(e) = std::fs::create_dir_all(&models_dir) {
+            if cfg!(target_os = "linux") {
+                panic!(
+                    "linux must be able to create a non-UTF-8 directory; \
+                     without it this test asserts nothing: {e}"
+                );
+            }
+            return;
+        }
+
+        // Twelve independent models — see the guardrail note above. Independent
+        // so that nothing but the path comparison can mark `m00` affected: no
+        // upstream shift, no transitive dependent.
+        const TOTAL: usize = 12;
+        write_flat_models(&models_dir, TOTAL);
+
+        let config = CompilerConfig {
+            models_dir: models_dir.clone(),
+            ..Default::default()
+        };
+
+        let first = compile(&config).expect("first compile");
+        assert_eq!(
+            first.type_check.typed_models.len(),
+            TOTAL,
+            "precondition: every model typed, so the guardrail's `total` is 12"
+        );
+        assert_eq!(
+            first.type_check.typed_models["m00"].len(),
+            1,
+            "precondition: m00 starts with one column"
+        );
+
+        // Edit one, then hand the incremental path the watcher's REAL path —
+        // the same bytes on disk, not a rendering of them.
+        let edited = models_dir.join("m00.sql");
+        std::fs::write(&edited, "SELECT 1 AS id, 2 AS qty\n").expect("rewrite m00");
+
+        let incremental = compile_incremental(&config, std::slice::from_ref(&edited), &first)
+            .expect("incremental");
+        let scratch = compile(&config).expect("from-scratch compile");
+
+        assert_eq!(
+            incremental.type_check.typed_models["m00"], scratch.type_check.typed_models["m00"],
+            "incremental output must equal from-scratch output for the same \
+             final state; a stale typed result here means the edit was never \
+             seen (#1730)"
+        );
+        assert_eq!(
+            incremental.type_check.typed_models["m00"].len(),
+            2,
+            "and the new column is really there, so the assertion above cannot \
+             pass by both sides being stale"
+        );
+    }
 
     /// Contract diagnostics are serialized into `rocky compile --output json`
     /// and the dagster fixture corpus is byte-diffed in CI, so two runs of the

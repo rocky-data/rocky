@@ -1222,8 +1222,15 @@ pub(crate) fn extract_declared_fields(raw_toml: &str) -> DeclaredModelFields {
 pub struct Model {
     pub config: ModelConfig,
     pub sql: String,
-    /// Path to the source file (for diagnostics).
-    pub file_path: String,
+    /// Path to the source file.
+    ///
+    /// A `PathBuf` rather than a `String` because four sites join against it
+    /// by comparing to a real filesystem path, and a `String` built with
+    /// `display()` is lossy: on a path component that is not valid UTF-8 the
+    /// two can never be equal, and every miss is silent (#1730). The worst of
+    /// them seeds the incremental typecheck's affected set, so a model edited
+    /// under such a directory kept its stale typed result.
+    pub file_path: std::path::PathBuf,
     /// Path to an auto-discovered `<stem>.contract.toml` file, if present
     /// alongside the model's `.sql` file. The contract itself is parsed by
     /// the compiler crate — we only stash the path here to avoid a
@@ -1453,7 +1460,10 @@ pub fn load_model_pair_with_context(
     Ok(Model {
         config,
         sql,
-        file_path: sql_path.display().to_string(),
+        // The whole point of #1730: `display().to_string()` here is
+        // `to_string_lossy`, and four sites downstream compare the result to a
+        // real filesystem path. Keep the bytes.
+        file_path: sql_path.to_path_buf(),
         contract_path,
     })
 }
@@ -1516,7 +1526,10 @@ pub fn parse_model_inline_with_context(
     Ok(Model {
         config,
         sql: sql.to_string(),
-        file_path: file_path.to_string(),
+        // Lossless: this parser's `file_path` is a `&str` label supplied by
+        // the caller (a synthetic name like "fct_orders.sql"), never a path
+        // read off the filesystem, so widening it cannot lose bytes.
+        file_path: std::path::PathBuf::from(file_path),
         contract_path,
     })
 }

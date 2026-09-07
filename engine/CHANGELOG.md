@@ -56,6 +56,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **On upgrade:** the state store schema moves v23 → v24. No table is added and no blob migration runs; a v23 store upgrades on the next read-write open. The bump is load-bearing: `observed_failing` is a new variant of the `fulfill_state` record's tagged enum, and a 1.73.0 binary cannot read a blob that carries it. **Rolling back is the part to plan for.** Remote state keys are qualified by schema version (`v23/state.redb` on an object store, `…v23:…` on Valkey), so a 1.73.0 binary never reads a v24 remote object. It reads whatever is under its own v23 key, which may be stale, and it cannot see progress recorded under v24. The incompatible-blob hazard is a **local** `state.redb` this version wrote. A 1.73.0 binary opening it either stops with a schema-mismatch error or, on the paths that honour `[state] on_schema_mismatch`, deletes the file and starts fresh under the default `recreate`. Do not point a 1.73.0 binary at a local state file written by this version, and do not share one local file between versions. `rocky doctor --check state_schema` reports the mismatch and exits 3. Which commands honour the key and which refuse is being pinned down in #1679. `fulfill_state` is local-only, so a re-run rebuilds the loop's position; see #1525 before relying on that loss being harmless.
 
 ### Fixed
+- **A check the engine could not run kept the severity you declared, so a `severity = "warning"` check that failed to execute cleared the gate and the run exited 0.**
+
+  Severity grades a *measurement*: it says how bad three null rows are, or how bad this much overlap is. A check whose query failed produced no measurement to grade, but `assertion_not_evaluated` and `cross_source_overlap_not_evaluated` carried the declared severity through anyway. `check_failures_by_severity` then filed the failure in the warning bucket, `replication_check_gate_failed` reads only the error bucket, and a run that verified nothing about a column reported success.
+
+  The declared severity is now ignored for a check that did not run — every `*_not_evaluated` constructor is `TestSeverity::Error`, matching the four (`row_count`, `freshness`, `null_rate`, `custom`) that already were. A measured violation is unaffected and still grades at the severity you set.
+
+  ```
+  severity = "warning", query fails
+     before   not_evaluated, severity=Warning  ->  warning bucket  ->  gate clear  ->  exit 0
+     after    not_evaluated, severity=Error    ->  error bucket    ->  gate fires  ->  exit 2
+  ```
+
+  The **quality pipeline's `row_count`** had the same defect a fourth time, and worse: its failure arm was hand-built rather than going through a constructor, so it set `not_evaluated: None` — telling every consumer the check had run — and described a row-count check as `CheckDetails::Custom` with a fabricated `result_value: 0, threshold: 1`. It now uses `row_count_not_evaluated`, which gets all three right.
+
+  **Breaking:** a project with an advisory check whose query has been failing will start failing the run. That is the point — the previous exit code said the data was fine when nothing had been read. `cross_source_overlap_not_applicable` is unchanged: a keyless sibling passes, and a passing check never reaches the severity buckets. Refs #1741.
+
 - **A model sidecar that was a dangling symlink read as absent, so the model compiled against defaults — different strategy, possibly a different target table, silently.**
 
   `Path::exists()` is `std::fs::metadata(..).is_ok()`, and `metadata` **follows** a symlink. A file that is a symlink to a deleted target therefore answers `false`, and every caller that gated a read on that probe read a present file as absent and took its "there is none of this" branch.

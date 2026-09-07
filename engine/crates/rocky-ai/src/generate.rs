@@ -423,7 +423,7 @@ fn build_generated_model(
         } else {
             source.to_string()
         },
-        file_path: format!("generated/{name}.{format}"),
+        file_path: format!("generated/{name}.{format}").into(),
         contract_path: None,
     }
 }
@@ -536,7 +536,7 @@ mod tests {
                 target_table_declared: String::new(),
             },
             sql: sql.to_string(),
-            file_path: format!("upstream/{name}.sql"),
+            file_path: format!("upstream/{name}.sql").into(),
             contract_path: None,
         }
     }

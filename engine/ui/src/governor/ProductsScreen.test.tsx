@@ -91,7 +91,66 @@ function loaders(overrides: Partial<ProductLoaders> = {}): ProductLoaders {
   };
 }
 
+/**
+ * Two journal rows whose idempotency keys differ ONLY in the trailing
+ * sequence number — the shape the engine really writes. The fixture above
+ * uses `key-abc`, which is under the truncation limit, so it never exercised
+ * the rendering at all (#1756).
+ */
+const REAL_KEY_JOURNAL: ProductJournalOutput = {
+  ...JOURNAL,
+  count: 2,
+  rows: [
+    {
+      seq: 1,
+      at: "2026-09-05T08:00:00Z",
+      event: "change proposed",
+      to_state: "proposed",
+      idempotency_key: "product:revenue_daily@sha256:5b1bf5c@21",
+    },
+    {
+      seq: 2,
+      at: "2026-09-05T09:00:00Z",
+      event: "change proposed",
+      to_state: "proposed",
+      idempotency_key: "product:revenue_daily@sha256:5b1bf5c@22",
+    },
+  ],
+};
+
 describe("ProductsScreen", () => {
+  it("renders two idempotency keys distinguishably (#1756)", async () => {
+    render(
+      <ProductsScreen
+        name="revenue_daily"
+        loaders={loaders({ journal: vi.fn(async () => REAL_KEY_JOURNAL) })}
+      />,
+    );
+
+    await screen.findAllByText("change proposed");
+
+    const full = [
+      "product:revenue_daily@sha256:5b1bf5c@21",
+      "product:revenue_daily@sha256:5b1bf5c@22",
+    ];
+
+    // The full key is always recoverable, which is what `shortId`'s own doc
+    // comment promised and no call site did.
+    for (const key of full) {
+      expect(document.querySelector(`[title="${key}"]`)).toBeTruthy();
+    }
+
+    // And the two rows do not read identically. Before the fix both rendered
+    // as `key product:reve` — cut mid-word, no ellipsis, and indistinguishable.
+    const rendered = Array.from(document.querySelectorAll("[title]"))
+      .filter((el) => full.includes(el.getAttribute("title") ?? ""))
+      .map((el) => el.textContent ?? "");
+    expect(rendered).toHaveLength(2);
+    expect(rendered[0]).not.toBe(rendered[1]);
+    expect(rendered[0]).toContain("@21");
+    expect(rendered[1]).toContain("@22");
+  });
+
   it("lists every product, including one whose spec file is gone", async () => {
     render(<ProductsScreen name={null} loaders={loaders()} />);
 
