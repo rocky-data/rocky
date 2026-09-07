@@ -5333,6 +5333,66 @@ mod tests {
         assert_eq!(parsed.upstream_models, vec!["upstream".to_string()]);
     }
 
+    /// The sibling of `ai_action_skipped_on_rocky_dsl_file`, for the OTHER
+    /// `.rocky` skip. `build_contract_quickfix` had no test naming this branch
+    /// at all, so when the `PathBuf` migration turned its `ends_with(".rocky")`
+    /// from a substring test into a whole-component one — silently, with no
+    /// compile error — the whole suite stayed green (#1730).
+    ///
+    /// A `.rocky` model must get no textual quick-fix: the DSL has its own
+    /// auto-fix path, and appending a SQL projection column to it would emit
+    /// syntactically invalid source.
+    #[test]
+    fn contract_quickfix_skipped_on_rocky_dsl_file() {
+        let model = synth_model(
+            "downstream",
+            "from upstream\nselect { id }\n",
+            "/tmp/m/downstream.rocky",
+            vec!["upstream".into()],
+        );
+        let mut typed: indexmap::IndexMap<String, Vec<rocky_compiler::types::TypedColumn>> =
+            indexmap::IndexMap::new();
+        typed.insert(
+            "upstream".to_string(),
+            vec![rocky_compiler::types::TypedColumn {
+                name: "email".to_string(),
+                data_type: rocky_ir::types::RockyType::Unknown,
+                nullable: true,
+            }],
+        );
+
+        assert!(
+            build_contract_quickfix(
+                "E010",
+                "required column 'email' missing from model output",
+                &model,
+                &typed,
+            )
+            .is_none(),
+            "a .rocky model must take the DSL auto-fix path, not a SQL text edit"
+        );
+
+        // The control: the identical case on a `.sql` model DOES produce a fix,
+        // so the assertion above cannot pass because the inputs were wrong.
+        let sql_model = synth_model(
+            "downstream",
+            "SELECT id FROM upstream\n",
+            "/tmp/m/downstream.sql",
+            vec!["upstream".into()],
+        );
+        assert!(
+            build_contract_quickfix(
+                "E010",
+                "required column 'email' missing from model output",
+                &sql_model,
+                &typed,
+            )
+            .is_some(),
+            "precondition: this input yields a quick-fix on a .sql model, so \
+             the skip above is about the extension and nothing else"
+        );
+    }
+
     #[test]
     fn ai_action_skipped_on_rocky_dsl_file() {
         let model = synth_model(
