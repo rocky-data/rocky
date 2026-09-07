@@ -855,10 +855,19 @@ fn build_queue(
     let mut entries: Vec<ReviewQueueEntry> = outstanding
         .into_iter()
         .map(|d| {
-            let blast_radius = compiled
-                .as_ref()
-                .and_then(|r| blast_radius_of(r, &d.model))
-                .map(|(_, transitive)| transitive.len() as u64);
+            // A plan-level escalation (backfill / gc / restore) names its
+            // models in `models`; an ordinary row's `model` IS the graph key.
+            // `graph_keys` yields the right one, and the WIDEST radius among
+            // them ranks the plan — a plan is as risky as its riskiest model.
+            // `max()` over no resolvable key is `None`, which is the honest
+            // "unknown" this ranking already degrades on; it must never
+            // collapse to `Some(0)`, which would claim a measured zero.
+            let blast_radius = compiled.as_ref().and_then(|r| {
+                d.graph_keys()
+                    .filter_map(|m| blast_radius_of(r, m))
+                    .map(|(_, transitive)| transitive.len() as u64)
+                    .max()
+            });
             let classification_weight = classification_weight(d.capability);
             let staleness_seconds = (now - d.timestamp).num_seconds().max(0);
             let score = queue_score(blast_radius, classification_weight, staleness_seconds);
@@ -947,7 +956,7 @@ pub(crate) fn select_outstanding<'a>(
 }
 
 /// Record the "this plan awaits review" escalation for an unconditionally
-/// review-gated plan (gc / backfill) at **plan creation**.
+/// review-gated plan (gc / backfill / restore) at **plan creation**.
 ///
 /// Those plans never pass through `evaluate_apply_policy` before their apply
 /// bails on the missing review marker, so without this row the decision-driven
@@ -955,6 +964,15 @@ pub(crate) fn select_outstanding<'a>(
 /// even though `compute_review` was built to approve them. One plan-level row
 /// (a representative `model` summary, not one row per affected model) keeps
 /// the ledger lean.
+///
+/// `model_summary` is the human label — `"backfill: 3 model(s)"` — and is what
+/// the queue and the `decision_ref` display. `models` carries the graph keys
+/// behind it. The two are separate on purpose: the summary is not a model name,
+/// so a ranking or a `--for <model>` match that reads it finds nothing (#1766).
+/// Pass every model the plan touches; passing an empty slice records the row
+/// with no keys, which reads back as "blast radius unknown" — honest, but it
+/// forfeits the ranking, so do it only when the set genuinely cannot be
+/// resolved.
 ///
 /// Best-effort like every other ledger write: the review-marker gate at apply
 /// is the safety boundary, the ledger is the trail — a locked or unreadable
@@ -964,15 +982,17 @@ pub(crate) fn record_plan_review_escalation(
     plan_id: &str,
     principal: PolicyPrincipal,
     capability: PolicyCapability,
-    model: &str,
+    model_summary: &str,
+    models: Vec<String>,
     reason: &str,
 ) {
     let record = PolicyDecisionRecord {
+        models,
         timestamp: Utc::now(),
         plan_id: plan_id.to_string(),
         principal,
         capability,
-        model: model.to_string(),
+        model: model_summary.to_string(),
         effect: PolicyEffect::RequireReview,
         rule_id: None,
         reason: reason.to_string(),
@@ -993,8 +1013,16 @@ pub(crate) fn record_plan_review_escalation(
 
 /// Composite priority score: `(blast + 1) × classification_weight ×
 /// (1 + staleness_hours)`. Higher sorts first. An unknown blast radius
-/// (compile failed / model removed) contributes as zero so the entry still
-/// ranks on class and age rather than dropping out.
+/// contributes as zero so the entry still ranks on class and age rather than
+/// dropping out.
+///
+/// **What "unknown" covers**, stated in full because an earlier version of this
+/// comment named only the first two and was therefore false: the project failed
+/// to compile; the model is gone from the graph; the row is a pre-v28
+/// plan-level escalation, which recorded no model set and whose `model` is a
+/// label no graph resolves; or the row named models and none of them resolve.
+/// Zero is the ranking's honest floor for every one of those — it is not a
+/// measured radius of zero, which is `Some(0)`.
 fn queue_score(
     blast_radius: Option<u64>,
     classification_weight: u32,
@@ -1301,6 +1329,7 @@ mod tests {
         cap: PolicyCapability,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            models: Vec::new(),
             timestamp: Utc.with_ymd_and_hms(2026, 7, 7, 0, 0, secs).unwrap(),
             plan_id: plan_id.to_string(),
             principal: PolicyPrincipal::Agent,
@@ -1778,6 +1807,213 @@ mod tests {
             ))
             .unwrap();
         state_path
+    }
+
+    // --- #1766: a plan-level escalation's blast radius ------------------
+    //
+    // `record_plan_review_escalation` puts a human SUMMARY in `model`
+    // ("backfill: 3 model(s)", "gc: 9 artifact(s) across 4 model(s)",
+    // "restore: orders (a1b2c3...)"). None of those is a graph key, so the
+    // ranking's `blast_radius_of` lookup missed on every plan-level row and
+    // the whole class ranked on class and age alone. The `models` set is what
+    // it looks up now.
+
+    /// A four-model graph on disk: `a -> b -> c` and `a -> d`.
+    ///
+    /// Transitive downstream counts: a=3, b=1, c=0, d=0.
+    fn write_blast_graph(models_dir: &Path) {
+        std::fs::create_dir_all(models_dir).unwrap();
+        for (name, sql) in [
+            ("a", "SELECT id FROM source.raw.t"),
+            ("b", "SELECT id FROM a"),
+            ("c", "SELECT id FROM b"),
+            ("d", "SELECT id FROM a"),
+        ] {
+            std::fs::write(models_dir.join(format!("{name}.sql")), sql).unwrap();
+            std::fs::write(
+                models_dir.join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                     [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{name}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    /// Back a plan id with a file so `select_outstanding` keeps its row.
+    fn touch_plan_file(root: &Path, plan_id: &str) {
+        let plans = root.join(".rocky").join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        std::fs::write(plans.join(format!("{plan_id}.json")), "{}").unwrap();
+    }
+
+    /// **The fixture the plan asked for.** Two pending gc plans, ranked.
+    ///
+    /// This is the case nobody had checked: backfill's collision was
+    /// documented, gc's was assumed to be "the same code shape" without
+    /// anyone running it. It is the same USER-VISIBLE consequence — two gc
+    /// plans, one that would delete a leaf and one that would delete a model
+    /// three others read from, arriving in the queue indistinguishable.
+    ///
+    /// The discriminator is deliberate: `gc_aaa` (the harmless one) sorts
+    /// FIRST on the plan-id tie-break, so under the old lookup — where both
+    /// radii are unknown and both scores equal — it leads the queue. It only
+    /// drops to second if the ranking actually resolved `gc_bbb`'s models.
+    /// Reverting `graph_keys()` to `&d.model` makes this test fail.
+    #[test]
+    fn two_pending_gc_plans_rank_by_what_they_would_delete_not_by_age() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let models_dir = root.join("models");
+        write_blast_graph(&models_dir);
+        let state_path = root.join("state.redb");
+
+        // gc_aaa evicts from `c`, a leaf: nothing downstream.
+        touch_plan_file(root, "gc_aaa");
+        record_plan_review_escalation(
+            &state_path,
+            "gc_aaa",
+            PolicyPrincipal::Human,
+            PolicyCapability::Gc,
+            "gc: 1 artifact(s) across 1 model(s)",
+            vec!["c".to_string()],
+            "gc plan awaits review",
+        );
+        // gc_bbb evicts from `b`, which `c` reads from.
+        touch_plan_file(root, "gc_bbb");
+        record_plan_review_escalation(
+            &state_path,
+            "gc_bbb",
+            PolicyPrincipal::Human,
+            PolicyCapability::Gc,
+            "gc: 1 artifact(s) across 1 model(s)",
+            vec!["b".to_string()],
+            "gc plan awaits review",
+        );
+
+        let out = compute_review_queue(root, &root.join("rocky.toml"), &state_path, &models_dir)
+            .expect("the queue must rank");
+        assert_eq!(out.total, 2);
+        assert_eq!(
+            out.pending[0].plan_id, "gc_bbb",
+            "the gc plan with something downstream must outrank the leaf one; \
+             it does not sort first on id, so only the blast radius can put it there"
+        );
+        assert_eq!(out.pending[0].blast_radius, Some(1));
+        assert_eq!(out.pending[1].plan_id, "gc_aaa");
+        assert_eq!(
+            out.pending[1].blast_radius,
+            Some(0),
+            "a leaf's radius is a MEASURED zero, which must not read as unknown"
+        );
+        // The label is untouched, so the drill keys and the display are too.
+        assert_eq!(out.pending[0].model, "gc: 1 artifact(s) across 1 model(s)");
+        assert!(
+            out.pending[0]
+                .decision_ref
+                .ends_with("|gc: 1 artifact(s) across 1 model(s)"),
+            "the decision_ref still ends in the label: {}",
+            out.pending[0].decision_ref
+        );
+    }
+
+    /// A backfill ranks on its WIDEST model, not its first or its last.
+    ///
+    /// `blast_radius_of` takes one name, so the fix has to choose. A backfill
+    /// closure is exactly the case where the choice shows: the seed `a` is the
+    /// riskiest model in the plan and the leaves are harmless, and a plan is
+    /// as risky as its riskiest member. Ordering the set differently must not
+    /// change the answer, which is what the two plans pin.
+    #[test]
+    fn a_backfill_ranks_on_its_widest_model_whatever_the_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let models_dir = root.join("models");
+        write_blast_graph(&models_dir);
+        let state_path = root.join("state.redb");
+
+        for (plan_id, models) in [
+            ("bf_widest_last", vec!["c", "d", "a"]),
+            ("bf_widest_first", vec!["a", "c", "d"]),
+        ] {
+            touch_plan_file(root, plan_id);
+            record_plan_review_escalation(
+                &state_path,
+                plan_id,
+                PolicyPrincipal::Agent,
+                PolicyCapability::Backfill,
+                "backfill: 3 model(s)",
+                models.into_iter().map(str::to_string).collect(),
+                "backfill plan awaits review",
+            );
+        }
+
+        let out = compute_review_queue(root, &root.join("rocky.toml"), &state_path, &models_dir)
+            .expect("the queue must rank");
+        assert_eq!(out.total, 2);
+        for e in &out.pending {
+            assert_eq!(
+                e.blast_radius,
+                Some(3),
+                "{} must rank on `a` (b, c, d downstream), not on a leaf",
+                e.plan_id
+            );
+        }
+    }
+
+    /// **The empty set is reachable, and it must rank as unknown.**
+    ///
+    /// Three ways to get here, and all of them end in the same honest answer:
+    /// a pre-v28 row (no `models` key in the blob at all), a row whose models
+    /// were all deleted from the graph since, and a caller that resolved no
+    /// model set to record. None of them may produce a measured `Some(0)` —
+    /// that would claim "nothing downstream" about a plan nobody could look
+    /// up, and rank it above a real leaf on the tie-break.
+    #[test]
+    fn a_plan_level_row_with_no_resolvable_model_ranks_unknown_not_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let models_dir = root.join("models");
+        write_blast_graph(&models_dir);
+        let state_path = root.join("state.redb");
+
+        // (1) Empty set — a pre-v28 row reads back exactly like this.
+        touch_plan_file(root, "p_empty");
+        record_plan_review_escalation(
+            &state_path,
+            "p_empty",
+            PolicyPrincipal::Agent,
+            PolicyCapability::Backfill,
+            "backfill: 2 model(s)",
+            Vec::new(),
+            "backfill plan awaits review",
+        );
+        // (2) A set naming only models the graph does not have.
+        touch_plan_file(root, "p_gone");
+        record_plan_review_escalation(
+            &state_path,
+            "p_gone",
+            PolicyPrincipal::Agent,
+            PolicyCapability::Backfill,
+            "backfill: 1 model(s)",
+            vec!["deleted_since".to_string()],
+            "backfill plan awaits review",
+        );
+
+        let out = compute_review_queue(root, &root.join("rocky.toml"), &state_path, &models_dir)
+            .expect("the queue must rank");
+        assert_eq!(
+            out.total, 2,
+            "both rows still LIST — unknown is not a drop-out"
+        );
+        for e in &out.pending {
+            assert_eq!(
+                e.blast_radius, None,
+                "{} resolves no model, so its radius is unknown, never a measured zero",
+                e.plan_id
+            );
+        }
     }
 
     /// A present-but-unloadable `rocky.toml` refuses the queue, and the error

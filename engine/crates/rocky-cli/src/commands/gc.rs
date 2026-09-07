@@ -843,6 +843,20 @@ fn build_gc_plan(candidates: &[EvictionCandidate], min_age_days: i64) -> Option<
 /// The representative `model` field for the gc plan's single review-escalation
 /// ledger row — a plan-scope summary, since one reclamation plan spans many
 /// artifacts and models and one row per artifact would bloat the ledger.
+/// The distinct model names a gc plan would evict from, sorted and deduplicated.
+///
+/// The graph keys behind [`gc_plan_scope_summary`]'s count, recorded on the
+/// plan's review escalation so the queue can compute its blast radius. Empty
+/// only for a plan with no evictions, which `build_gc_plan` never produces.
+fn gc_plan_models(plan: &GcPlan) -> Vec<String> {
+    plan.evictions
+        .iter()
+        .map(|e| e.model_name.clone())
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect()
+}
+
 fn gc_plan_scope_summary(plan: &GcPlan) -> String {
     let models: BTreeSet<&str> = plan
         .evictions
@@ -930,6 +944,9 @@ pub(crate) fn run_gc_plan_in(
         principal,
         PolicyCapability::Gc,
         &gc_plan_scope_summary(&plan),
+        // The summary above counts models; these name them, so two pending gc
+        // plans rank by what they would delete rather than by age (#1766).
+        gc_plan_models(&plan),
         "gc plan awaits review — deletion is unconditionally review-gated (even a human gc \
          goes through review, never a direct delete)",
     );
@@ -4347,6 +4364,7 @@ auto_create_schemas = true
         // A ledger-only freeze row for THIS principal → deny. This is the
         // marker-blind bypass the review caught: no marker exists at all.
         let freeze = rocky_core::state::PolicyDecisionRecord {
+            models: Vec::new(),
             timestamp: Utc::now(),
             plan_id: "freeze:unit".to_string(),
             principal: PolicyPrincipal::Human,
@@ -4472,6 +4490,7 @@ auto_create_schemas = true
                         let store = StateStore::open(&self.path).unwrap();
                         store
                             .record_policy_decision(&rocky_core::state::PolicyDecisionRecord {
+                                models: Vec::new(),
                                 timestamp: Utc::now(),
                                 plan_id: "freeze:mid-seam".to_string(),
                                 principal: PolicyPrincipal::Human,

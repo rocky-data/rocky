@@ -786,7 +786,39 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   there. `Recreate` discards run history, so a rolled-back binary has no
 ///   outcome to misread at all. Rolling back is not a way to clear this
 ///   gate; re-running the pipeline with a real reading is.
-const CURRENT_SCHEMA_VERSION: u32 = 27;
+///
+/// - **v28** — records the real model names behind a **plan-level** review
+///   escalation: a new serde-additive [`PolicyDecisionRecord::models`] set.
+///   Not a table change — the redb table set is unchanged (`EXPECTED_TABLES` is
+///   untouched); no blob walk. A v27 blob (which lacks the field) forward-
+///   deserializes with it empty, guarded by
+///   `test_v27_policy_decision_forward_deserializes_models_empty`.
+///
+///   **What it fixes (#1766).** `PolicyDecisionRecord::model` is the graph key
+///   on an ordinary evaluation row, but the three plan-level escalation sites
+///   put a human summary there instead: `"backfill: 3 model(s)"`,
+///   `"gc: 9 artifact(s) across 4 model(s)"`, `"restore: orders (a1b2c3…)"`.
+///   None of those resolves in the compiled graph, so
+///   `rocky review --queue` ranked every one of them with an unknown blast
+///   radius — two pending backfills, or two pending gc plans, separated only by
+///   age — and `rocky audit --for <model>` could not find them at all. The
+///   field carries the graph keys beside the label so both work, without
+///   changing the label, the `decision_ref`, or the one-row-per-plan
+///   cardinality the review queue's approve path depends on.
+///
+///   **On upgrade.** A v27 store is stamped v28 in place and every existing
+///   record is kept. Its decisions read back with `models` empty, which
+///   [`PolicyDecisionRecord::graph_keys`] treats as "fall back to `model`" —
+///   exactly today's behaviour, so a pre-v28 plan-level row still ranks with an
+///   unknown blast radius rather than a wrong one. Only rows recorded by this
+///   binary onward carry the set.
+///
+///   **On rollback.** The blob is backward-safe in the serde sense (one extra
+///   key, ignored) *and* in meaning: a v27 binary reads only `model`, which is
+///   unchanged, so it behaves exactly as it does today. It does not reach the
+///   blob anyway — the version check runs at OPEN and `[state]
+///   on_schema_mismatch` engages there.
+const CURRENT_SCHEMA_VERSION: u32 = 28;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -6065,6 +6097,20 @@ pub struct PolicyDecisionRecord {
     pub capability: crate::config::PolicyCapability,
     /// The model the decision was about — the concrete scope that matched.
     pub model: String,
+    /// The graph keys this decision covers, when [`Self::model`] cannot be one.
+    ///
+    /// Empty on an ordinary evaluation row, where `model` **is** the graph key
+    /// and this field would only repeat it. Non-empty on a **plan-level**
+    /// escalation (`backfill` / `gc` / `restore`), where `model` is a
+    /// human-readable summary — `"backfill: 3 model(s)"` — that no graph lookup
+    /// can resolve. Those rows record the real model names here so a consumer
+    /// can compute a blast radius or match `rocky audit --for <model>` without
+    /// parsing the label.
+    ///
+    /// Read through [`Self::graph_keys`], never directly: an empty vec means
+    /// "fall back to `model`", not "this decision covers no model".
+    #[serde(default)]
+    pub models: Vec<String>,
     /// The resolved verdict.
     pub effect: crate::config::PolicyEffect,
     /// Index of the winning `[[policy.rules]]` entry, or `None` for the
@@ -6087,6 +6133,30 @@ pub struct PolicyDecisionRecord {
     /// forward-deserializes with it absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_apply: Option<AutoApplyCustody>,
+}
+
+impl PolicyDecisionRecord {
+    /// Every graph key this decision names, for a blast-radius lookup or a
+    /// `--for <model>` match.
+    ///
+    /// Yields [`Self::models`] when that set is non-empty — a plan-level
+    /// escalation, whose [`Self::model`] is a human label no graph can resolve
+    /// — and otherwise the single `model`, which **is** the graph key on an
+    /// ordinary evaluation row. A pre-v28 plan-level row has an empty set, so
+    /// it falls back to its label; the label does not resolve, and the caller
+    /// sees the same "unknown" it sees today rather than a wrong radius.
+    ///
+    /// Never yields nothing: the fallback arm always produces one key. A caller
+    /// that ends up with no *resolvable* key is looking at a real absence
+    /// (compile failed, model removed, or a pre-v28 row), not an empty input.
+    pub fn graph_keys(&self) -> impl Iterator<Item = &str> {
+        let fallback = if self.models.is_empty() {
+            Some(self.model.as_str())
+        } else {
+            None
+        };
+        self.models.iter().map(String::as_str).chain(fallback)
+    }
 }
 
 /// Custody detail attached to a [`PolicyDecisionRecord`] when the run loop
@@ -11637,6 +11707,7 @@ mod tests {
         let (store, _dir) = temp_store();
         // Two decisions with distinct timestamps → forward scan is oldest-first.
         let earlier = PolicyDecisionRecord {
+            models: Vec::new(),
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-07-07T10:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
@@ -11651,6 +11722,7 @@ mod tests {
             auto_apply: None,
         };
         let later = PolicyDecisionRecord {
+            models: Vec::new(),
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-07-07T11:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
@@ -11674,12 +11746,122 @@ mod tests {
         assert_eq!(all[1], later);
     }
 
+    /// A pre-v28 policy decision — one whose blob has no `models` key — must
+    /// forward-deserialize with the set EMPTY, and an empty set must fall back
+    /// to `model`, which is what every consumer read before v28.
+    ///
+    /// Guards the v28 bump. The fallback half is the load-bearing one: if an
+    /// empty set yielded no graph key at all, every pre-v28 plan-level row
+    /// would silently stop matching `rocky audit --for <model>` on the rows
+    /// where `model` IS the key — the ordinary rows, which are almost all of
+    /// them.
+    #[test]
+    fn test_v27_policy_decision_forward_deserializes_models_empty() {
+        use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+
+        // A full record serialized with `models` stripped — a v27 blob.
+        let record = PolicyDecisionRecord {
+            models: vec!["dim_customer".to_string()],
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-09-07T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            plan_id: "plan_v27".to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::Backfill,
+            model: "backfill: 1 model(s)".to_string(),
+            effect: PolicyEffect::RequireReview,
+            rule_id: None,
+            reason: "backfill plan awaits review".to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+        };
+        let mut value = serde_json::to_value(&record).expect("serialize record");
+        value
+            .as_object_mut()
+            .expect("record is an object")
+            .remove("models");
+        let blob = serde_json::to_vec(&value).expect("reserialize without field");
+
+        let read: PolicyDecisionRecord = serde_json::from_slice(&blob)
+            .expect("pre-v28 PolicyDecisionRecord must forward-deserialize");
+        assert_eq!(read.plan_id, "plan_v27");
+        assert!(
+            read.models.is_empty(),
+            "a v27 blob has no model set; it must read back empty, not fail"
+        );
+        assert_eq!(
+            read.graph_keys().collect::<Vec<_>>(),
+            vec!["backfill: 1 model(s)"],
+            "an empty set falls back to `model` — the exact key every pre-v28 \
+             consumer looked up, so a pre-v28 row behaves as it always did"
+        );
+    }
+
+    /// `graph_keys` yields the model set when there is one and the single
+    /// `model` when there is not — and NEVER yields nothing.
+    ///
+    /// "Never nothing" is the property the ranking depends on. A caller that
+    /// resolves no key is looking at a real absence (a label that is not a
+    /// model, a deleted model, a failed compile), which ranks as unknown. If
+    /// `graph_keys` could itself be empty, "unknown" would also swallow a
+    /// plumbing bug — the two would be indistinguishable at the call site.
+    #[test]
+    fn graph_keys_prefers_the_set_and_always_yields_at_least_one_key() {
+        use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+
+        let base = PolicyDecisionRecord {
+            models: Vec::new(),
+            timestamp: Utc::now(),
+            plan_id: "p".to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::Backfill,
+            model: "backfill: 2 model(s)".to_string(),
+            effect: PolicyEffect::RequireReview,
+            rule_id: None,
+            reason: String::new(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+        };
+
+        // No set: the label is the only candidate. It will not resolve in any
+        // graph, but it is a key, so the caller reports "unknown" rather than
+        // being handed an empty iterator it cannot tell from a bug.
+        assert_eq!(
+            base.graph_keys().collect::<Vec<_>>(),
+            vec!["backfill: 2 model(s)"]
+        );
+
+        // With a set: the set wins outright and the label is NOT yielded. The
+        // label is display text; letting it through would make
+        // `audit --for "backfill: 2 model(s)"` a working query by accident.
+        let with_models = PolicyDecisionRecord {
+            models: vec!["dim_customer".to_string(), "fct_orders".to_string()],
+            ..base.clone()
+        };
+        assert_eq!(
+            with_models.graph_keys().collect::<Vec<_>>(),
+            vec!["dim_customer", "fct_orders"]
+        );
+
+        // An ordinary row: `model` is the graph key and there is no set.
+        let ordinary = PolicyDecisionRecord {
+            models: Vec::new(),
+            model: "fct_orders".to_string(),
+            ..base
+        };
+        assert_eq!(
+            ordinary.graph_keys().collect::<Vec<_>>(),
+            vec!["fct_orders"]
+        );
+    }
+
     #[test]
     fn test_v17_policy_decision_forward_deserializes_auto_apply_none() {
         use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
 
         // A full v17 record serialized with `auto_apply` stripped.
         let record = PolicyDecisionRecord {
+            models: Vec::new(),
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-07-07T10:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),

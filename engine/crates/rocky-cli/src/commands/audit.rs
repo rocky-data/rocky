@@ -329,7 +329,13 @@ fn build_decisions_link(
         .iter()
         .filter(|d| match kind {
             AuditSubjectKind::Plan => d.plan_id == selector,
-            _ => d.model == selector,
+            // `graph_keys` is the model set on a plan-level escalation and the
+            // single `model` on an ordinary row, so a backfill / gc / restore
+            // escalation is now findable by the models it actually touches —
+            // it never was, because its `model` holds a summary that matches no
+            // selector a user would type (#1766). The row still DISPLAYS that
+            // summary; the summary itself is no longer a selector.
+            _ => d.graph_keys().any(|m| m == selector),
         })
         .collect();
     // Newest first.
@@ -1283,6 +1289,7 @@ mod tests {
         effect: PolicyEffect,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            models: Vec::new(),
             timestamp: Utc.with_ymd_and_hms(2026, 7, 7, 0, 0, secs).unwrap(),
             plan_id: plan_id.to_string(),
             principal: PolicyPrincipal::Agent,
@@ -1306,6 +1313,91 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    /// `rocky audit --for <model>` finds a plan-level escalation by the models
+    /// it touches, and no longer by the label it displays.
+    ///
+    /// Before #1766 the filter compared the selector to `model`, which on a
+    /// backfill / gc / restore row holds a summary — `"backfill: 3 model(s)"`.
+    /// A user auditing `dim_customer` got "no policy decisions recorded for
+    /// this subject" while a backfill of `dim_customer` sat pending review.
+    ///
+    /// The last assertion is the one that pins the trade: the label stops
+    /// being a working selector. It was never a model name, so nothing a user
+    /// would type is lost — but it IS a behaviour change, so it is asserted
+    /// rather than left to be discovered.
+    #[test]
+    fn a_plan_level_decision_is_found_by_its_models_not_by_its_label() {
+        use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+
+        let label = "backfill: 2 model(s)";
+        let plan_level = PolicyDecisionRecord {
+            models: vec!["dim_customer".to_string(), "fct_orders".to_string()],
+            timestamp: Utc::now(),
+            plan_id: "planBF".to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::Backfill,
+            model: label.to_string(),
+            effect: PolicyEffect::RequireReview,
+            rule_id: None,
+            reason: "backfill plan awaits review".to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+        };
+        let decisions = vec![plan_level];
+
+        for wanted in ["dim_customer", "fct_orders"] {
+            let link = build_decisions_link(AuditSubjectKind::Model, wanted, &decisions);
+            assert_eq!(
+                link.total, 1,
+                "auditing '{wanted}' must reach the backfill that touches it"
+            );
+            assert_eq!(link.availability, SectionAvailability::Available);
+        }
+
+        // A model the plan does not touch still misses.
+        let miss = build_decisions_link(AuditSubjectKind::Model, "agg_daily", &decisions);
+        assert_eq!(miss.total, 0);
+
+        // The label is display text, not a selector.
+        let by_label = build_decisions_link(AuditSubjectKind::Model, label, &decisions);
+        assert_eq!(
+            by_label.total, 0,
+            "the summary in `model` is not a graph key and must not match as one"
+        );
+    }
+
+    /// An ORDINARY decision row — the overwhelming majority — is unaffected:
+    /// its `model` is the graph key and it carries no separate set, so it is
+    /// still found by exactly the name it records.
+    ///
+    /// This is the regression half of the test above. `graph_keys()` falls
+    /// back to `model` when the set is empty; drop that fallback and every
+    /// ordinary `rocky audit --for <model>` returns nothing, which the
+    /// plan-level test alone would not catch.
+    #[test]
+    fn an_ordinary_decision_is_still_found_by_its_model() {
+        use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+
+        let decisions = vec![PolicyDecisionRecord {
+            models: Vec::new(),
+            timestamp: Utc::now(),
+            plan_id: "planA".to_string(),
+            principal: PolicyPrincipal::Human,
+            capability: PolicyCapability::SchemaChangeAdditive,
+            model: "dim_customer".to_string(),
+            effect: PolicyEffect::Allow,
+            rule_id: Some(0),
+            reason: "allow by rule 0".to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+        }];
+
+        let link = build_decisions_link(AuditSubjectKind::Model, "dim_customer", &decisions);
+        assert_eq!(link.total, 1);
+        let miss = build_decisions_link(AuditSubjectKind::Model, "fct_orders", &decisions);
+        assert_eq!(miss.total, 0);
     }
 
     #[test]
@@ -1521,6 +1613,7 @@ mod tests {
         reason: &str,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            models: Vec::new(),
             timestamp: Utc.with_ymd_and_hms(2026, 7, 7, 0, 0, secs).unwrap(),
             plan_id: plan_id.to_string(),
             principal: PolicyPrincipal::Agent,
@@ -1680,6 +1773,7 @@ mod tests {
         effect: PolicyEffect,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            models: Vec::new(),
             timestamp: Utc.with_ymd_and_hms(2026, 7, 7, 0, 0, secs).unwrap(),
             plan_id: plan_id.to_string(),
             principal,

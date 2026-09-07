@@ -5144,6 +5144,7 @@ mod tests {
             let store = StateStore::open(&pod_a).unwrap();
             store
                 .record_policy_decision(&PolicyDecisionRecord {
+                    models: Vec::new(),
                     timestamp: now,
                     plan_id: "plan-1".into(),
                     principal: PolicyPrincipal::Agent,
@@ -5158,6 +5159,7 @@ mod tests {
                 .unwrap();
             store
                 .record_policy_decision(&PolicyDecisionRecord {
+                    models: Vec::new(),
                     timestamp: now,
                     plan_id: "plan-1".into(),
                     principal: PolicyPrincipal::Agent,
@@ -5594,6 +5596,7 @@ mod tests {
 
     fn seam_policy_record(plan_id: &str) -> crate::state::PolicyDecisionRecord {
         crate::state::PolicyDecisionRecord {
+            models: Vec::new(),
             timestamp: chrono::Utc::now(),
             plan_id: plan_id.to_string(),
             principal: crate::config::PolicyPrincipal::Agent,

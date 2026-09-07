@@ -325,6 +325,10 @@ pub(crate) fn run_backfill_in(
         PolicyPrincipal::Agent,
         PolicyCapability::Backfill,
         &format!("backfill: {} model(s)", ordered.len()),
+        // The label above is a summary, not a graph key. These are the keys:
+        // every model in the resolved closure, so the queue can rank the plan
+        // by its widest downstream radius instead of by age alone (#1766).
+        ordered.clone(),
         "backfill plan awaits review — backfills are unconditionally review-gated (blast \
          radius hides in scoped rebuilds)",
     );
