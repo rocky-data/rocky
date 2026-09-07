@@ -744,7 +744,49 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   runs recorded before this binary), and the blob is backward-safe while
 ///   the OPEN-time version check is what actually engages
 ///   `[state] on_schema_mismatch`.
-const CURRENT_SCHEMA_VERSION: u32 = 26;
+///
+/// - **v27** — records whether each persisted check outcome actually measured
+///   anything: a new serde-additive [`CheckOutcome::not_evaluated`] reason.
+///   Not a table change — the redb table set is unchanged (`EXPECTED_TABLES`
+///   is untouched); no blob walk. A v26 blob (whose outcomes lack the key)
+///   forward-deserializes with it `None`, guarded by
+///   `test_v26_check_outcome_forward_deserializes_not_evaluated_none`.
+///
+///   **What it fixes (#1715).** `CheckOutcome` stored only `{ name, passed }`,
+///   and both `verify_after` gates read `Some(true)` as "ran and passed". The
+///   gates are written fail-closed for a check that is ABSENT — "did not run,
+///   cannot be confirmed". A check that ran and measured nothing is that same
+///   case, and it satisfied the gate. Since #1706 that outcome is reachable:
+///   `cross_source_overlap_not_applicable` passes with a reason and an
+///   `overlap_count: 0` placeholder, so a rule requiring that check was
+///   confirmed by a reading nobody took.
+///
+///   **Why on `CheckOutcome` and not `RunRecord`.** The distinction is
+///   per-check, not per-run. A run can record twenty outcomes of which one
+///   measured nothing, and only a rule naming THAT check should be refused.
+///   A run-level flag would refuse every rule on the run or none.
+///
+///   **This is the first bump to a NESTED record.** v25 and v26 added fields
+///   to `RunRecord` itself; this one adds to the elements of
+///   `RunRecord::check_outcomes`. The serde mechanism is the same, so the
+///   forward-read guard is written against a `RunRecord` blob whose OUTCOMES
+///   have the key stripped, not the record.
+///
+///   **On upgrade.** A v26 store is stamped v27 in place and every existing
+///   record is kept. Its outcomes read back `None` — honest, because a v26
+///   run's gates could not have consulted a field that did not exist, so
+///   nothing is being reinterpreted after the fact. Only runs recorded by
+///   this binary onward can carry a reason.
+///
+///   **On rollback.** The blob is backward-safe in the serde sense — a v27
+///   outcome carries at most one extra key and serde ignores unknown keys —
+///   but the read is NOT safe in meaning: a v26 binary parses an unevaluated
+///   pass and confirms it, which is the bug. It does not reach it, because
+///   the version check runs at OPEN and `[state] on_schema_mismatch` engages
+///   there. `Recreate` discards run history, so a rolled-back binary has no
+///   outcome to misread at all. Rolling back is not a way to clear this
+///   gate; re-running the pipeline with a real reading is.
+const CURRENT_SCHEMA_VERSION: u32 = 27;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -2455,7 +2497,121 @@ pub struct CheckOutcome {
     /// lists.
     pub name: String,
     /// Whether the check passed.
+    ///
+    /// Read this to learn whether the check FAILED. It does not tell you the
+    /// check measured anything — see [`CheckOutcome::not_evaluated`].
     pub passed: bool,
+    /// Set when the run could not measure this check, carrying the reason.
+    /// Mirrors `rocky_core::checks::CheckResult::not_evaluated`, which is
+    /// where it is copied from.
+    ///
+    /// A `passed: true` outcome carrying this is a check that ran, measured
+    /// nothing, and declined to call that a failure. `passed` alone cannot
+    /// tell the two apart, so a gate that reads only `passed` confirms a
+    /// check it has no reading for (#1715).
+    ///
+    /// Almost always `None`: every `*_not_evaluated` constructor sets
+    /// `passed: false`, so an unevaluated outcome normally arrives as a plain
+    /// failure. The exception is the shape this field exists for —
+    /// `cross_source_overlap_not_applicable`, which passes because the
+    /// configuration does not apply to the group (#1654, #1706).
+    ///
+    /// `None` on pre-v27 records, which is the honest reading: a record
+    /// written before this field existed carries no unevaluated outcome to
+    /// find, because the gates that consume it also predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_evaluated: Option<String>,
+}
+
+/// Why a `verify_after` rule could not confirm one of the checks it requires.
+///
+/// Returned by [`unverified_required_checks`], which is the single place both
+/// `verify_after` gates — the two-step `rocky apply` gate and the post-apply
+/// drift-governance finalizer — decide what "confirmed" means. One
+/// implementation, so the two cannot drift apart on the question this type
+/// answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnverifiedCheck {
+    /// The run recorded the check and it failed.
+    Failed,
+    /// The run recorded the check as passing, but it measured nothing, so
+    /// there is no reading to confirm. Carries the recorded reason.
+    NotEvaluated(String),
+    /// No outcome under this name — the check did not run.
+    Absent,
+}
+
+impl UnverifiedCheck {
+    /// The operator-facing reason, rendered as `<name> (<reason>)`.
+    ///
+    /// Kept beside the variants so both gates report an unconfirmed check the
+    /// same way.
+    pub fn describe(&self, name: &str) -> String {
+        match self {
+            Self::Failed => format!("{name} (failed)"),
+            Self::NotEvaluated(reason) => {
+                format!("{name} (not evaluated: {reason} — nothing was measured)")
+            }
+            Self::Absent => format!("{name} (absent — did not run)"),
+        }
+    }
+}
+
+/// Resolve which of `required` a run's `outcomes` fail to confirm.
+///
+/// Returns one entry per unconfirmed check, in `required` order, already
+/// rendered by [`UnverifiedCheck::describe`]. An empty return means every
+/// required check ran, measured something, and passed.
+///
+/// **Aggregation.** A check name can appear once per table, so occurrences are
+/// folded together and the name is confirmed only if EVERY occurrence
+/// confirms. `Failed` outranks `NotEvaluated` in the report, because a
+/// measured failure is the more actionable thing to tell an operator.
+///
+/// **Why an unevaluated pass is not a pass.** The gate's contract is "confirm
+/// a named check ran and passed". It is written fail-closed for a check that
+/// is absent — "did not run, cannot be confirmed". A check that ran and
+/// measured nothing is that same case wearing `passed: true`, and before
+/// #1715 it satisfied the gate.
+pub fn unverified_required_checks(outcomes: &[CheckOutcome], required: &[String]) -> Vec<String> {
+    // Key present ⇒ the name ran at least once. `None` ⇒ every occurrence so
+    // far confirmed; `Some(v)` ⇒ one did not, and why.
+    let mut folded: std::collections::BTreeMap<&str, Option<UnverifiedCheck>> =
+        std::collections::BTreeMap::new();
+
+    for c in outcomes {
+        // `passed: false` stays a plain failure whether or not it also carries
+        // a reason — that is the pre-#1715 behaviour and this does not widen
+        // it. The one outcome that changes meaning is a PASSING one that
+        // measured nothing.
+        let verdict = if !c.passed {
+            Some(UnverifiedCheck::Failed)
+        } else {
+            c.not_evaluated
+                .as_ref()
+                .map(|r| UnverifiedCheck::NotEvaluated(r.clone()))
+        };
+        let slot = folded.entry(c.name.as_str()).or_insert(None);
+        match slot {
+            // A measured failure is the more actionable report, so it stands
+            // over an unevaluated sibling occurrence.
+            Some(UnverifiedCheck::Failed) => {}
+            _ => {
+                if verdict.is_some() {
+                    *slot = verdict;
+                }
+            }
+        }
+    }
+
+    required
+        .iter()
+        .filter_map(|name| match folded.get(name.as_str()) {
+            Some(Some(verdict)) => Some(verdict.describe(name)),
+            Some(None) => None,
+            None => Some(UnverifiedCheck::Absent.describe(name)),
+        })
+        .collect()
 }
 
 /// Default-value contract for `RunRecord.hostname` on v5→v6 upgrade.
@@ -7094,10 +7250,12 @@ mod tests {
             CheckOutcome {
                 name: "row_count".to_string(),
                 passed: true,
+                not_evaluated: None,
             },
             CheckOutcome {
                 name: "not_null:email".to_string(),
                 passed: false,
+                not_evaluated: None,
             },
         ];
         let round: RunRecord =
@@ -7133,6 +7291,184 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&stamped).unwrap()).unwrap();
         assert_eq!(round.pipeline.as_deref(), Some("raw"));
         assert_eq!(round.submission_id.as_deref(), Some("sub-123"));
+    }
+
+    /// v26 → v27 (#1715). A v26 `RunRecord` blob's check outcomes have no
+    /// `not_evaluated` key at all. They must forward-deserialize with it
+    /// `None`.
+    ///
+    /// `None` is the honest reading rather than a fail-open default: a v26 run
+    /// was gated by a binary that could not consult this field, so reading its
+    /// outcomes as "measured" reinterprets nothing that was ever decided
+    /// differently. Runs recorded by this binary onward carry the real reason.
+    ///
+    /// This is the first bump to a NESTED record, so the blob under test is a
+    /// `RunRecord` whose OUTCOMES have the key stripped — stripping it from
+    /// the record itself would test nothing.
+    #[test]
+    fn test_v26_check_outcome_forward_deserializes_not_evaluated_none() {
+        let mut v27 = minimal_run_record("run-v26", vec![]);
+        v27.check_outcomes = vec![CheckOutcome {
+            name: "cross_source_overlap:duckdb.orders".to_string(),
+            passed: true,
+            not_evaluated: Some("only one contributing table carries the key".to_string()),
+        }];
+
+        let mut value = serde_json::to_value(&v27).expect("serialize run record");
+        let outcomes = value
+            .get_mut("check_outcomes")
+            .and_then(|v| v.as_array_mut())
+            .expect("check_outcomes is an array");
+        assert!(
+            outcomes[0]
+                .as_object_mut()
+                .expect("an outcome is an object")
+                .remove("not_evaluated")
+                .is_some(),
+            "precondition: a v27 outcome carries the key this test strips"
+        );
+        let blob = serde_json::to_vec(&value).expect("reserialize without the key");
+
+        let record: RunRecord =
+            serde_json::from_slice(&blob).expect("a v26 RunRecord must forward-deserialize");
+        assert_eq!(record.run_id, "run-v26");
+        assert_eq!(record.check_outcomes.len(), 1);
+        assert!(
+            record.check_outcomes[0].not_evaluated.is_none(),
+            "a v26 outcome reads as no reason recorded"
+        );
+        assert!(record.check_outcomes[0].passed);
+
+        // A v27 outcome carrying the reason round-trips losslessly — the field
+        // survives redb's blob rather than being dropped on the way through.
+        let round: RunRecord = serde_json::from_slice(&serde_json::to_vec(&v27).unwrap()).unwrap();
+        assert_eq!(round.check_outcomes, v27.check_outcomes);
+
+        // An evaluated outcome emits no key at all, so a run whose checks all
+        // measured something serializes byte-identically to v26.
+        let mut plain = minimal_run_record("run-plain", vec![]);
+        plain.check_outcomes = vec![CheckOutcome {
+            name: "row_count".to_string(),
+            passed: true,
+            not_evaluated: None,
+        }];
+        let emitted = serde_json::to_value(&plain).unwrap();
+        assert!(
+            emitted["check_outcomes"][0].get("not_evaluated").is_none(),
+            "an evaluated outcome adds nothing to the wire"
+        );
+    }
+
+    /// The gate's own truth table, at the one function both `verify_after`
+    /// gates call. Each row is a shape the gate must answer, and the two
+    /// middle rows are the #1715 fix.
+    #[test]
+    fn unverified_required_checks_truth_table() {
+        let outcome = |name: &str, passed: bool, reason: Option<&str>| CheckOutcome {
+            name: name.to_string(),
+            passed,
+            not_evaluated: reason.map(str::to_string),
+        };
+        let req = |n: &str| vec![n.to_string()];
+
+        // Measured and passed ⇒ confirmed.
+        assert!(
+            unverified_required_checks(&[outcome("row_count", true, None)], &req("row_count"))
+                .is_empty()
+        );
+
+        // Measured and failed ⇒ refused as a failure.
+        let failed =
+            unverified_required_checks(&[outcome("row_count", false, None)], &req("row_count"));
+        assert_eq!(failed, vec!["row_count (failed)".to_string()]);
+
+        // 🔴 Passed but measured nothing ⇒ refused, naming the reason.
+        let unmeasured = unverified_required_checks(
+            &[outcome("overlap", true, Some("one carrier only"))],
+            &req("overlap"),
+        );
+        assert_eq!(unmeasured.len(), 1);
+        assert!(
+            unmeasured[0].contains("not evaluated") && unmeasured[0].contains("one carrier only"),
+            "{:?}",
+            unmeasured[0]
+        );
+
+        // Never ran ⇒ refused as absent (unchanged).
+        assert_eq!(
+            unverified_required_checks(&[], &req("row_count")),
+            vec!["row_count (absent — did not run)".to_string()]
+        );
+
+        // A failed occurrence outranks an unevaluated one under the same name:
+        // the measured failure is the more actionable thing to report.
+        let mixed = unverified_required_checks(
+            &[
+                outcome("overlap", true, Some("one carrier only")),
+                outcome("overlap", false, None),
+            ],
+            &req("overlap"),
+        );
+        assert_eq!(mixed, vec!["overlap (failed)".to_string()]);
+
+        // A measured pass does NOT rescue an unevaluated occurrence of the
+        // same name — every occurrence must confirm.
+        let partial = unverified_required_checks(
+            &[
+                outcome("overlap", true, None),
+                outcome("overlap", true, Some("one carrier only")),
+            ],
+            &req("overlap"),
+        );
+        assert_eq!(partial.len(), 1, "one blind occurrence blinds the name");
+        assert!(partial[0].contains("not evaluated"));
+
+        // …in either order.
+        let reversed = unverified_required_checks(
+            &[
+                outcome("overlap", true, Some("one carrier only")),
+                outcome("overlap", true, None),
+            ],
+            &req("overlap"),
+        );
+        assert_eq!(reversed.len(), 1, "order must not decide the verdict");
+
+        // A `passed: false` outcome that also carries a reason stays a plain
+        // failure — pre-#1715 behaviour, deliberately not widened.
+        assert_eq!(
+            unverified_required_checks(
+                &[outcome("row_count", false, Some("the query failed"))],
+                &req("row_count"),
+            ),
+            vec!["row_count (failed)".to_string()]
+        );
+
+        // Unrequired outcomes are ignored, however broken.
+        assert!(
+            unverified_required_checks(
+                &[outcome("something_else", true, Some("blind"))],
+                &req("row_count"),
+            ) == vec!["row_count (absent — did not run)".to_string()]
+        );
+
+        // Multiple required names report in `required` order.
+        let many = unverified_required_checks(
+            &[
+                outcome("a", false, None),
+                outcome("b", true, Some("blind")),
+                outcome("c", true, None),
+            ],
+            &[
+                "c".to_string(),
+                "b".to_string(),
+                "a".to_string(),
+                "d".to_string(),
+            ],
+        );
+        assert_eq!(many.len(), 3, "c confirms; b, a and d do not: {many:?}");
+        assert!(many[0].starts_with("b ("));
+        assert!(many[1].starts_with("a ("));
+        assert!(many[2].starts_with("d ("));
     }
 
     /// v25 → v26 (#1732). A v25 `RunRecord` blob has no `verify_after_failed`
@@ -12142,7 +12478,7 @@ mod tests {
         // serde-additive shape. NO table change either — so this stanza moves
         // the version only; guarded by
         // `test_v25_run_record_forward_deserializes_verify_after_failed_false`.
-        const EXPECTED_VERSION: u32 = 26;
+        const EXPECTED_VERSION: u32 = 27;
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",

@@ -3414,35 +3414,24 @@ fn run_verify_after(
         .get_run(run_id)
         .with_context(|| format!("failed to read run '{run_id}' from state store"))?;
 
-    // AND-aggregate every occurrence of each check name: any `false` occurrence
-    // fails the name. Presence in the map ⇒ the check ran at least once.
-    let mut outcomes: BTreeMap<&str, bool> = BTreeMap::new();
-    if let Some(record) = run.as_ref() {
-        for c in &record.check_outcomes {
-            outcomes
-                .entry(c.name.as_str())
-                .and_modify(|passed| *passed &= c.passed)
-                .or_insert(c.passed);
-        }
-    }
-
     let mut failures: Vec<String> = Vec::new();
-    if run.is_none() {
+    match run.as_ref() {
         // The run this apply produced could not be found — treat every required
         // check as unverifiable and halt (fail closed).
-        for name in required {
-            failures.push(format!(
-                "{name} (apply run '{run_id}' not found — unverifiable)"
-            ));
-        }
-    } else {
-        for name in required {
-            match outcomes.get(name.as_str()) {
-                Some(true) => {}
-                Some(false) => failures.push(format!("{name} (failed)")),
-                // Fail closed: a named check that did not run cannot be confirmed.
-                None => failures.push(format!("{name} (absent — did not run)")),
+        None => {
+            for name in required {
+                failures.push(format!(
+                    "{name} (apply run '{run_id}' not found — unverifiable)"
+                ));
             }
+        }
+        // Fail closed on a check that did not run, failed, or ran and measured
+        // nothing. `unverified_required_checks` is the single implementation of
+        // that question — the drift-governance finalizer calls the same one, so
+        // the two gates cannot drift apart on what "confirmed" means.
+        Some(record) => {
+            failures =
+                rocky_core::state::unverified_required_checks(&record.check_outcomes, required);
         }
     }
     let passed = failures.is_empty();
@@ -9952,6 +9941,7 @@ schema_template = "s__{source}"
                 .map(|(n, p)| CheckOutcome {
                     name: n.to_string(),
                     passed: *p,
+                    not_evaluated: None,
                 })
                 .collect(),
             pipeline: None,
@@ -10030,6 +10020,80 @@ schema_template = "s__{source}"
         )
         .expect_err("an absent named check fails closed");
         assert!(err.to_string().contains("absent"), "{}", err);
+    }
+
+    /// Record a run whose single check PASSED but measured nothing — the
+    /// `cross_source_overlap_not_applicable` shape (#1706). Separate from
+    /// `record_run_with_checks` because the whole point is that `passed: true`
+    /// no longer settles the question.
+    fn record_run_with_unmeasured_check(state_path: &Path, name: &str, reason: &str) -> String {
+        use rocky_core::state::{CheckOutcome, StateStore};
+        let now = chrono::Utc::now();
+        let run_id = format!("run-{}", now.timestamp_nanos_opt().unwrap_or(0));
+        record_run_with_checks_id(state_path, &run_id, now, &[(name, true)]);
+
+        let store = StateStore::open(state_path).unwrap();
+        let mut record = store.get_run(&run_id).unwrap().expect("run was recorded");
+        record.check_outcomes = vec![CheckOutcome {
+            name: name.to_string(),
+            passed: true,
+            not_evaluated: Some(reason.to_string()),
+        }];
+        store.record_run(&record).unwrap();
+        run_id
+    }
+
+    /// 🔴 #1715. A check that ran, measured nothing, and passed is the ABSENT
+    /// case wearing `passed: true`. The gate is written fail-closed for absent
+    /// — "did not run, cannot be confirmed" — so it must refuse this too.
+    ///
+    /// Before v27 `CheckOutcome` carried only `{ name, passed }` and this
+    /// apply passed its gate on a reading nobody took.
+    #[test]
+    fn verify_after_fails_closed_when_named_check_measured_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.redb");
+        let run_id = record_run_with_unmeasured_check(
+            &state,
+            "cross_source_overlap:duckdb.orders",
+            "only one contributing table carries the configured key",
+        );
+        let err = super::run_verify_after(
+            "plan-x",
+            PolicyPrincipal::Agent,
+            &["cross_source_overlap:duckdb.orders".to_string()],
+            &run_id,
+            &state,
+        )
+        .expect_err("a passing check that measured nothing cannot confirm the gate");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not evaluated") && msg.contains("only one contributing table"),
+            "the halt names why nothing was measured: {msg}"
+        );
+        // Still the halt-only posture — the migration has landed either way.
+        assert!(msg.contains("HAS ALREADY LANDED"), "halt-only state: {msg}");
+    }
+
+    /// The refusal above is not blanket: a check that measured something and
+    /// passed still confirms the gate. Without this, deleting the `passed`
+    /// arm entirely would look like a fix.
+    #[test]
+    fn verify_after_still_passes_a_check_that_measured_and_passed() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.redb");
+        let run_id = record_run_with_checks(&state, &[("row_count", true)]);
+        assert!(
+            super::run_verify_after(
+                "plan-x",
+                PolicyPrincipal::Agent,
+                &["row_count".to_string()],
+                &run_id,
+                &state,
+            )
+            .is_ok(),
+            "a measured pass still confirms"
+        );
     }
 
     #[test]
