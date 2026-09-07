@@ -606,9 +606,9 @@ impl RockyLsp {
     /// sidecar is fine: the AI edit creates the `[freshness]` block in a
     /// fresh file via [`end_of_document_position`] on the empty text.
     async fn load_model_sidecar(
-        model_file_path: &str,
+        model_file_path: &std::path::Path,
     ) -> Option<(tower_lsp::lsp_types::Url, String)> {
-        let sidecar_path = std::path::Path::new(model_file_path).with_extension("toml");
+        let sidecar_path = model_file_path.with_extension("toml");
         let text = tokio::fs::read_to_string(&sidecar_path)
             .await
             .unwrap_or_default();
@@ -709,7 +709,7 @@ impl RockyLsp {
 
         for d in &result.diagnostics {
             let file = if let Some(model) = result.project.model(&d.model) {
-                model.file_path.clone()
+                model.file_path.display().to_string()
             } else {
                 continue;
             };
@@ -757,7 +757,7 @@ impl RockyLsp {
             .project
             .models
             .iter()
-            .find(|m| std::path::Path::new(&m.file_path) == file_path)
+            .find(|m| m.file_path == file_path)
     }
 
     /// Get the word at a cursor position in document text.
@@ -1314,7 +1314,7 @@ impl LanguageServer for RockyLsp {
                     let mut diags_by_file: HashMap<String, Vec<Diagnostic>> = HashMap::new();
                     for d in &result.diagnostics {
                         let file = if let Some(model) = result.project.model(&d.model) {
-                            model.file_path.clone()
+                            model.file_path.display().to_string()
                         } else {
                             continue;
                         };
@@ -2985,7 +2985,11 @@ pub(crate) fn build_contract_quickfix(
     typed_models: &indexmap::IndexMap<String, Vec<rocky_compiler::types::TypedColumn>>,
 ) -> Option<(TextEdit, String)> {
     // 1. `.rocky` DSL files use a different syntax — skip.
-    if model.file_path.ends_with(".rocky") {
+    // `extension()`, not `ends_with`: on a `Path` the latter compares whole
+    // COMPONENTS, so `.ends_with(".rocky")` is false for
+    // `downstream.rocky` and this skip would silently stop firing
+    // (#1730). It was a substring check while `file_path` was a String.
+    if model.file_path.extension().is_some_and(|e| e == "rocky") {
         return None;
     }
 
@@ -3152,7 +3156,11 @@ pub(crate) fn build_ai_contract_action(
     uri: &tower_lsp::lsp_types::Url,
     diag: &Diagnostic,
 ) -> Option<CodeAction> {
-    if model.file_path.ends_with(".rocky") {
+    // `extension()`, not `ends_with`: on a `Path` the latter compares whole
+    // COMPONENTS, so `.ends_with(".rocky")` is false for
+    // `downstream.rocky` and this skip would silently stop firing
+    // (#1730). It was a substring check while `file_path` was a String.
+    if model.file_path.extension().is_some_and(|e| e == "rocky") {
         return None;
     }
 
@@ -5323,6 +5331,72 @@ mod tests {
         assert_eq!(parsed.diagnostic_code, "E010");
         assert_eq!(parsed.model_name, "downstream");
         assert_eq!(parsed.upstream_models, vec!["upstream".to_string()]);
+    }
+
+    /// The sibling of `ai_action_skipped_on_rocky_dsl_file`, for the OTHER
+    /// `.rocky` skip. `build_contract_quickfix` had no test naming this branch
+    /// at all, so when the `PathBuf` migration turned its `ends_with(".rocky")`
+    /// from a substring test into a whole-component one — silently, with no
+    /// compile error — the whole suite stayed green (#1730).
+    ///
+    /// A `.rocky` model must get no textual quick-fix: the DSL has its own
+    /// auto-fix path, and appending a SQL projection column to it would emit
+    /// syntactically invalid source.
+    #[test]
+    fn contract_quickfix_skipped_on_rocky_dsl_file() {
+        // Deliberately VALID SQL in a file named `.rocky`. A DSL body would
+        // fail the SQL parse further down and return `None` for that reason
+        // instead, which is what made the pre-existing test — and the first
+        // draft of this one — pass with the skip broken. The extension must be
+        // the only thing that can produce `None` here.
+        let model = synth_model(
+            "downstream",
+            "SELECT id FROM upstream\n",
+            "/tmp/m/downstream.rocky",
+            vec!["upstream".into()],
+        );
+        let mut typed: indexmap::IndexMap<String, Vec<rocky_compiler::types::TypedColumn>> =
+            indexmap::IndexMap::new();
+        typed.insert(
+            "upstream".to_string(),
+            vec![rocky_compiler::types::TypedColumn {
+                name: "email".to_string(),
+                data_type: rocky_ir::types::RockyType::Unknown,
+                nullable: true,
+            }],
+        );
+
+        assert!(
+            build_contract_quickfix(
+                "E010",
+                "required column 'email' missing from model output",
+                &model,
+                &typed,
+            )
+            .is_none(),
+            "a .rocky model must take the DSL auto-fix path even when its body \
+             happens to parse as SQL — the extension decides"
+        );
+
+        // The control: the identical case on a `.sql` model DOES produce a fix,
+        // so the assertion above cannot pass because the inputs were wrong.
+        let sql_model = synth_model(
+            "downstream",
+            "SELECT id FROM upstream\n",
+            "/tmp/m/downstream.sql",
+            vec!["upstream".into()],
+        );
+        assert!(
+            build_contract_quickfix(
+                "E010",
+                "required column 'email' missing from model output",
+                &sql_model,
+                &typed,
+            )
+            .is_some(),
+            "precondition: this input yields a quick-fix on a .sql model, so \
+             the skip above is about the extension and nothing else"
+        );
     }
 
     #[test]

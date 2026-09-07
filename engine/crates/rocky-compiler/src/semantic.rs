@@ -509,7 +509,7 @@ mod tests {
                 target_table_declared: String::new(),
             },
             sql: sql.to_string(),
-            file_path: format!("models/{name}.sql"),
+            file_path: format!("models/{name}.sql").into(),
             contract_path: None,
         }
     }

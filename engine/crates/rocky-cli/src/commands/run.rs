@@ -24637,7 +24637,7 @@ auto_create_schemas = true
             Model {
                 config: toml::from_str(&toml).expect("model config"),
                 sql: "SELECT 1".into(),
-                file_path: String::new(),
+                file_path: std::path::PathBuf::new(),
                 contract_path: None,
             }
         };
