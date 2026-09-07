@@ -127,8 +127,40 @@ describe("PlanDetail", () => {
       />,
     );
 
-    await screen.findByText("no model to sample");
+    await screen.findByText("no single model to sample");
     expect(screen.queryByRole("button", { name: /Show \d+ rows/ })).toBeNull();
+  });
+
+  /// A backfill escalation puts a display sentence in the queue's `model`
+  /// field — "backfill: 3 model(s)". Feeding that to the samples route earns a
+  /// 400 `invalid_model_name` on every click, so the offer must not be made.
+  it("does not offer to sample a backfill, whose queue entry names no single model", async () => {
+    const backfill: ReviewQueueOutput = {
+      ...QUEUE,
+      pending: [
+        {
+          ...QUEUE.pending[0],
+          capability: "backfill",
+          model: "backfill: 3 model(s)",
+          blast_radius: undefined,
+        },
+      ],
+    };
+
+    render(
+      <PlanDetail
+        planId={PLAN}
+        loaders={loaders({
+          status: vi.fn(async () => ({ ...STATUS, product_id: undefined })),
+          queue: vi.fn(async () => backfill),
+        })}
+      />,
+    );
+
+    await screen.findByText("no single model to sample");
+    expect(screen.queryByRole("button", { name: /Show \d+ rows/ })).toBeNull();
+    // and it says which of the two reasons applies, quoting what it was given
+    expect(screen.getByText(/backfill: 3 model\(s\)/)).toBeTruthy();
   });
 
   it("shows the plan, its findings, the escalation and the approve command", async () => {
