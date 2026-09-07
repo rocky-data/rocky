@@ -6792,7 +6792,6 @@ async fn run_batched_checks(
                                     name,
                                     contributing,
                                     e.clone(),
-                                    overlap_cfg.severity,
                                 ),
                             );
                             continue;
@@ -6837,7 +6836,6 @@ async fn run_batched_checks(
                                 name,
                                 contributing,
                                 reason,
-                                overlap_cfg.severity,
                             )
                         } else {
                             // Exactly one carrier. A single table cannot
@@ -6904,7 +6902,6 @@ async fn run_batched_checks(
                                     name,
                                     contributing,
                                     e.to_string(),
-                                    overlap_cfg.severity,
                                 ),
                             );
                             continue;
@@ -6983,7 +6980,6 @@ async fn run_batched_checks(
                                     name,
                                     contributing,
                                     e.to_string(),
-                                    overlap_cfg.severity,
                                 ),
                             );
                         }
@@ -21568,12 +21564,16 @@ backend = "local"
         use rocky_core::tests::TestSeverity;
 
         let failed_error = rocky_core::checks::check_row_count(10, 7);
-        let failed_warning = rocky_core::checks::assertion_not_evaluated(
+        // A MEASURED violation the user declared advisory. Before #1741 this
+        // row used `assertion_not_evaluated`, which could no longer produce a
+        // warning: a check that never ran is always an error now.
+        let failed_warning = rocky_core::checks::check_assertion(
             "not_null:name",
             "not_null",
             Some("name".to_string()),
+            3,
+            false,
             TestSeverity::Warning,
-            "the assertion query failed",
         );
         // Hard-coded error severity: a check the engine could not evaluate
         // gates exactly as a violated one does (#1602).
@@ -21624,6 +21624,72 @@ backend = "local"
                 "{why}"
             );
         }
+    }
+
+    /// #1741, walked to the exit code. A `not_null` test the user declared
+    /// `severity = "warning"` whose QUERY FAILED. The run measured nothing
+    /// about that column, so it must not clear the gate.
+    ///
+    /// Before this fix `assertion_not_evaluated` carried the declared
+    /// `Warning` through: `check_failures_by_severity` bucketed it as a
+    /// warning, `replication_check_gate_failed` reads only the error bucket,
+    /// the gate stayed clear, and `derive_run_status` returned `Success` —
+    /// exit 0 on a run whose check never ran. The advisory grade belongs to a
+    /// measured violation, and this one had no measurement to grade.
+    ///
+    /// The second half is the discriminator: the SAME assertion, measured and
+    /// violated at warning severity, still does not gate. The fix separates
+    /// "you told me 3 nulls are tolerable" from "I never counted".
+    #[test]
+    fn an_advisory_assertion_that_could_not_run_still_gates() {
+        use rocky_core::state::RunStatus;
+        use rocky_core::tests::TestSeverity;
+
+        let config = checks_config("row_count = true");
+
+        // Declared advisory, but the query failed: nothing was measured.
+        let never_ran = rocky_core::checks::assertion_not_evaluated(
+            "not_null:email",
+            "not_null",
+            Some("email".to_string()),
+            "the assertion query failed: no such column: emial",
+        );
+        assert_eq!(
+            never_ran.severity,
+            TestSeverity::Error,
+            "an unevaluated check is never advisory"
+        );
+
+        let mut gated = RunOutput::new(String::new(), 0, 1);
+        gated.tables_copied = 1;
+        gated.check_results.push(failing_check_bag(never_ran));
+        gated.check_gate_failed = super::replication_check_gate_failed(&gated, &config);
+        assert!(gated.check_gate_failed, "a check that never ran gates");
+        assert!(
+            matches!(gated.derive_run_status(), RunStatus::PartialFailure),
+            "and the run does not exit 0"
+        );
+
+        // Measured, violated, advisory: still does not gate.
+        let measured_warning = rocky_core::checks::check_assertion(
+            "not_null:email",
+            "not_null",
+            Some("email".to_string()),
+            3,
+            false,
+            TestSeverity::Warning,
+        );
+        let mut advisory = RunOutput::new(String::new(), 0, 1);
+        advisory.tables_copied = 1;
+        advisory
+            .check_results
+            .push(failing_check_bag(measured_warning));
+        advisory.check_gate_failed = super::replication_check_gate_failed(&advisory, &config);
+        assert!(
+            !advisory.check_gate_failed,
+            "a measured violation keeps the severity the user declared"
+        );
+        assert!(matches!(advisory.derive_run_status(), RunStatus::Success));
     }
 
     /// #1720, the higher-frequency shape — and the one the tool's own advice
@@ -32461,6 +32527,12 @@ table = "fct_events"
     /// A target whose reference cannot be formatted used to have its
     /// assertions and custom checks skipped without a trace. Each is reported
     /// as not evaluated instead.
+    ///
+    /// The config declares `severity = "warning"`, and this is #1741 end to
+    /// end: the assertion still comes back at ERROR severity, because Rocky
+    /// never addressed the table and so measured nothing to grade. Until this
+    /// fix the declared `Warning` survived, the error bucket stayed empty,
+    /// and a run that checked nothing exited 0.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn assertions_and_custom_checks_on_an_unaddressable_table_are_not_evaluated() {
@@ -32489,7 +32561,11 @@ table = "fct_events"
                 .is_some_and(|r| r.starts_with("could not address the table: ")),
             "{assertion:?}"
         );
-        assert_eq!(assertion.severity, rocky_core::tests::TestSeverity::Warning);
+        assert_eq!(
+            assertion.severity,
+            rocky_core::tests::TestSeverity::Error,
+            "declared advisory, but never evaluated: it gates (#1741)"
+        );
         let custom = the_result(&pending, &key, "no_dupes");
         assert!(!custom.passed, "{custom:?}");
         assert!(

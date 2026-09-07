@@ -805,7 +805,6 @@ pub(crate) fn table_assertions_not_evaluated(
                 assertion.resolved_name(),
                 rocky_core::tests::test_type_kind(&assertion.test.test_type),
                 assertion.test.column.clone(),
-                assertion.test.severity,
                 reason,
             )
         })
@@ -847,7 +846,6 @@ pub(crate) async fn run_table_assertions(
                     name,
                     kind,
                     test.column.clone(),
-                    test.severity,
                     format!("could not generate the assertion SQL: {e}"),
                 ));
                 continue;
@@ -876,7 +874,6 @@ pub(crate) async fn run_table_assertions(
                         name,
                         kind,
                         test.column.clone(),
-                        test.severity,
                         "the assertion query returned no readable count",
                     ));
                 }
@@ -887,7 +884,6 @@ pub(crate) async fn run_table_assertions(
                     name,
                     kind,
                     test.column.clone(),
-                    test.severity,
                     format!("the assertion query failed: {e}"),
                 ));
             }
@@ -2584,7 +2580,6 @@ auto_create_schemas = true
                 "cross_source_overlap_duckdb_t",
                 vec!["cat.s1.t".into(), "cat.s2.t".into()],
                 "key expression refused",
-                rocky_core::tests::TestSeverity::Error,
             )],
         });
 
