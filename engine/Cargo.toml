@@ -107,7 +107,17 @@ tokio = { version = "1", features = ["full"] }
 # Transitively pulls schemars 1.x; the rest of the workspace uses schemars
 # 0.8. The dual-major is disjoint (rmcp's `#[tool]` param structs derive
 # schemars 1.x; Rocky's `*Output` structs derive 0.8) and compiles cleanly.
-rmcp = { version = "3.0", features = ["server", "macros", "transport-io"] }
+# PINNED EXACT, deliberately. `"3.0"` is a caret range, so it accepts 3.2.0,
+# and under 3.2.0 a client that asks for ProtocolVersion 2026-07-28 is handed
+# back 2024-11-05 — the server's FALLBACK — instead of its own request. That
+# is a silent protocol downgrade for every MCP client Rocky serves, and it
+# drops `resultType` from their results. rocky-mcp's
+# `result_type_reaches_a_2026_07_28_client_and_no_other` catches it; PR #1775
+# is the bump held on that failure. Only the lockfile was keeping 3.1.4, so
+# the range is now exact. Raise it after the negotiation change in 3.2.0 is
+# understood — NOT by narrowing `supported_protocol_versions`, which is the
+# very extreme that test was written to distinguish from a real fix.
+rmcp = { version = "=3.1.4", features = ["server", "macros", "transport-io"] }
 
 # HTTP
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "http2"] }
