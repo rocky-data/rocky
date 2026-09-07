@@ -51,7 +51,8 @@ function ProductRow({ entry }: { entry: ProductListEntry }) {
         // A deleted spec still lists. Hiding it would make a product that was
         // removed look like one that never existed.
         <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">
-          no spec file: {entry.spec_error ?? "the loader gave no reason"}
+          {describeSpecTrouble(entry.spec_error)}:{" "}
+          {entry.spec_error ?? "the loader gave no reason"}
         </p>
       )}
       <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-zinc-600 sm:grid-cols-4 dark:text-zinc-300">
@@ -223,6 +224,22 @@ function JournalTable({ rows }: { rows: ProductJournalEntry[] }) {
       </table>
     </div>
   );
+}
+
+/**
+ * How to word a missing-or-broken spec.
+ *
+ * `spec_error` is `[<code>] <message>` (`SpecRejected`'s Display). The code
+ * discriminates: only `spec-file-missing` means the file is gone. Everything
+ * else — unreadable, not TOML, a rejected field — means the file is there and
+ * cannot be used, which has a different fix. Saying "no spec file" for all of
+ * them tells a reviewer a product was deleted when it is sitting right there.
+ */
+export function describeSpecTrouble(specError: string | null | undefined): string {
+  if (specError === null || specError === undefined) return "no spec file";
+  if (specError.startsWith("[spec-file-missing]")) return "no spec file";
+  if (specError.startsWith("[spec-file-unreadable]")) return "spec file unreadable";
+  return "spec file unusable";
 }
 
 function Standing({ status }: { status: ProductStatusOutput }) {

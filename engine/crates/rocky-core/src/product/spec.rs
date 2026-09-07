@@ -907,14 +907,32 @@ pub fn parse_spec_bytes(raw: &[u8], source_name: &str) -> SpecResult<ParsedSpec>
 ///
 /// # Errors
 ///
-/// Returns `spec-file-missing` when the path is not a readable file, plus any
+/// Returns `spec-file-missing` when the path does not exist,
+/// `spec-file-unreadable` when it exists but could not be read, plus any
 /// rejection from [`parse_spec_bytes`].
+///
+/// Those two are deliberately separate codes. A deleted spec and a spec the
+/// process may not open are different situations with different fixes, and
+/// every surface downstream — `rocky product status`, `product list`, the
+/// governor screen — words its refusal from this code. Reporting an
+/// unreadable file as "not found" tells a reviewer the product was removed
+/// when it is sitting right there.
 pub fn parse_spec_file(path: &std::path::Path) -> SpecResult<ParsedSpec> {
     let raw = std::fs::read(path).map_err(|err| {
-        SpecRejected::new(
-            "spec-file-missing",
-            format!("spec file not found: {} ({err})", path.display()),
-        )
+        if err.kind() == std::io::ErrorKind::NotFound {
+            SpecRejected::new(
+                "spec-file-missing",
+                format!("spec file not found: {} ({err})", path.display()),
+            )
+        } else {
+            SpecRejected::new(
+                "spec-file-unreadable",
+                format!(
+                    "spec file exists but could not be read: {} ({err})",
+                    path.display()
+                ),
+            )
+        }
     })?;
     parse_spec_bytes(&raw, &path.display().to_string())
 }
@@ -1271,5 +1289,48 @@ include = ["stripe.*"]"#,
         assert_eq!(freshness.max_lag_seconds().expect("parses"), 86_400);
         assert_eq!(freshness.severity, Some(FreshnessSeverity::Error));
         assert_eq!(product.trust.agent, "propose_only");
+    }
+
+    /// A path that does not exist is missing. Every surface downstream words
+    /// its refusal from this code, so it has to mean only the one thing.
+    #[test]
+    fn an_absent_spec_file_is_reported_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reject =
+            parse_spec_file(&dir.path().join("products/nothing.toml")).expect_err("must reject");
+        assert_eq!(reject.code, "spec-file-missing");
+    }
+
+    /// A spec the process cannot open is NOT missing. Saying so tells a
+    /// reviewer the product was deleted when it is sitting right there.
+    #[cfg(unix)]
+    #[test]
+    fn a_spec_file_that_cannot_be_read_is_not_reported_missing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("revenue_daily.toml");
+        std::fs::write(&path, VALID).expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let reject = parse_spec_file(&path).expect_err("must reject");
+        // Root ignores the mode bits, so only assert when the read really failed.
+        assert_eq!(reject.code, "spec-file-unreadable");
+        assert!(
+            reject.message.contains("could not be read"),
+            "message must not claim absence: {}",
+            reject.message
+        );
+    }
+
+    /// A directory where a file belongs also exists — reporting it missing
+    /// sends the reader looking for a deletion that never happened.
+    #[test]
+    fn a_directory_in_the_specs_place_is_not_reported_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("revenue_daily.toml");
+        std::fs::create_dir(&path).expect("mkdir");
+        let reject = parse_spec_file(&path).expect_err("must reject");
+        assert_eq!(reject.code, "spec-file-unreadable");
     }
 }
