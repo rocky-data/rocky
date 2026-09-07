@@ -21,8 +21,8 @@ const ANTHROPIC_API_KEY_VAR: &str = "ANTHROPIC_API_KEY";
 
 /// Pick the validation format for a model from its source file path: `.rocky`
 /// files are Rocky DSL, everything else (notably `.sql`) is raw SQL.
-fn proposed_source_format(file_path: &str) -> &'static str {
-    if std::path::Path::new(file_path)
+fn proposed_source_format(file_path: &std::path::Path) -> &'static str {
+    if file_path
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("rocky"))
     {
@@ -417,7 +417,7 @@ pub async fn run_ai_sync(
                         );
                     }
                     std::fs::write(&model.file_path, &proposal.proposed_source)?;
-                    println!("Updated: {}", model.file_path);
+                    println!("Updated: {}", model.file_path.display());
                 }
             }
         } else if !proposals.is_empty() {
@@ -589,10 +589,22 @@ mod tests {
 
     #[test]
     fn proposed_source_format_detects_rocky_and_sql() {
-        assert_eq!(proposed_source_format("models/orders.rocky"), "rocky");
-        assert_eq!(proposed_source_format("models/orders.ROCKY"), "rocky");
-        assert_eq!(proposed_source_format("models/orders.sql"), "sql");
-        assert_eq!(proposed_source_format("models/orders"), "sql");
+        assert_eq!(
+            proposed_source_format(std::path::Path::new("models/orders.rocky")),
+            "rocky"
+        );
+        assert_eq!(
+            proposed_source_format(std::path::Path::new("models/orders.ROCKY")),
+            "rocky"
+        );
+        assert_eq!(
+            proposed_source_format(std::path::Path::new("models/orders.sql")),
+            "sql"
+        );
+        assert_eq!(
+            proposed_source_format(std::path::Path::new("models/orders")),
+            "sql"
+        );
     }
 
     /// `ai-sync --apply` must validate a proposal before writing. An
@@ -605,7 +617,7 @@ mod tests {
         std::fs::write(&model_path, original).unwrap();
 
         let bad_proposal = "this is not sql at all ;;;";
-        let format = proposed_source_format(model_path.to_str().unwrap());
+        let format = proposed_source_format(&model_path);
 
         // Mirror the apply gate: validate first, only write on success.
         let validation =

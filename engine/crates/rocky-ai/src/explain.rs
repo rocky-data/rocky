@@ -77,15 +77,28 @@ pub async fn explain_model(
 /// surface the message to the user, who is expected to fix or remove
 /// the file before retrying.
 pub fn save_intent_to_config(model: &Model, intent: &str) -> Result<(), std::io::Error> {
-    let toml_path = if model.file_path.ends_with(".rocky") {
-        format!("{}.toml", model.file_path)
-    } else if model.file_path.ends_with(".sql") {
-        model.file_path.replace(".sql", ".toml")
+    // Built on the path itself rather than on a rendered string (#1730): the
+    // result is opened for writing, so a lossy round-trip would write to a
+    // different file than the one the model came from.
+    //
+    // The `.sql` arm now uses `with_extension`, which is the derivation the
+    // loader itself uses (`project.rs:629`, `models.rs:1603`). The previous
+    // `replace(".sql", ".toml")` rewrote EVERY occurrence, so a model under a
+    // directory whose name contains `.sql` was redirected into a sibling tree.
+    //
+    // The two appending arms are preserved exactly as they were. The `.rocky`
+    // arm is wrong — it writes `flow.rocky.toml` while the loader reads
+    // `flow.toml` — but that is a separate defect with a user-visible output
+    // path, tracked on its own rather than folded into this change.
+    let toml_path = if model.file_path.extension().is_some_and(|e| e == "sql") {
+        model.file_path.with_extension("toml")
     } else {
-        format!("{}.toml", model.file_path)
+        let mut appended = model.file_path.clone().into_os_string();
+        appended.push(".toml");
+        std::path::PathBuf::from(appended)
     };
 
-    let path = std::path::Path::new(&toml_path);
+    let path = toml_path.as_path();
 
     // Read existing config or start fresh. Refuse to clobber a sidecar
     // that exists but doesn't parse — overwriting it would delete the
@@ -131,10 +144,10 @@ mod save_intent_tests {
     use rocky_core::models::{Model, ModelConfig, StrategyConfig, TargetConfig};
     use std::io::Write;
 
-    fn make_model(file_path: String) -> Model {
+    fn make_model(file_path: impl Into<std::path::PathBuf>) -> Model {
         Model {
             sql: String::new(),
-            file_path,
+            file_path: file_path.into(),
             contract_path: None,
             config: ModelConfig {
                 name: "test_model".to_string(),

@@ -4827,7 +4827,7 @@ FROM {{ ref('stg_events') }}
             .map(|im| Model {
                 config: im.config.clone(),
                 sql: im.sql.clone(),
-                file_path: format!("models/{}.sql", im.name),
+                file_path: format!("models/{}.sql", im.name).into(),
                 contract_path: None,
             })
             .collect();

@@ -210,7 +210,7 @@ fn compile_inner(
                 }
                 result.diagnostics.push(build_p001_diagnostic(
                     &model.config.name,
-                    &model.file_path,
+                    &model.file_path.display().to_string(),
                     &issue,
                 ));
                 portability_errors = true;
@@ -367,7 +367,7 @@ fn compile_inner(
             .models
             .iter()
             .filter(|model| in_scope(&model.config.name))
-            .map(|m| (m.file_path.clone(), m.sql.clone()))
+            .map(|m| (m.file_path.display().to_string(), m.sql.clone()))
             .collect(),
     };
 
