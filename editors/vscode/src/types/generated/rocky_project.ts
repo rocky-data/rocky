@@ -1208,7 +1208,9 @@ export interface ReplicationPipelineConfig {
  */
 export interface ChecksConfig {
   /**
-   * Row count anomaly detection threshold (percentage deviation from baseline). Default: 50.0 (50% deviation triggers anomaly). Set to 0 to disable.
+   * Row count anomaly detection threshold (percentage deviation from baseline). Default: 50.0 (50% deviation triggers anomaly).
+   *
+   * `0` disables detection. It used to do the opposite — the comparison is `deviation_pct > threshold_pct`, so `0` flagged every table whose count moved at all, and an operator following this sentence to turn detection off turned it maximally on. A negative value disables it too.
    */
   anomaly_threshold_pct?: number;
   /**

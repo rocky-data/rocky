@@ -386,7 +386,7 @@ See [Data quality checks](/concepts/data-quality-checks/) for what each one mean
 | `freshness` | table | | `{ threshold_seconds = N, overrides = { ... } }`. |
 | `null_rate` | table | | `{ columns = [...], threshold = 0.0–1.0, sample_percent = 10 }`. |
 | `custom` | list | `[]` | Custom SQL checks. Each entry has `name`, `sql`, and optional `threshold`. |
-| `anomaly_threshold_pct` | float | `50.0` | Row count deviation percentage that triggers an anomaly. Set to 0 to disable. |
+| `anomaly_threshold_pct` | float | `50.0` | Row count deviation percentage that triggers an anomaly. Set to 0 (or a negative value) to disable detection. |
 | `quarantine` | table | | `{ mode = "split" \| "tag" \| "drop" }`. See below. |
 | `assertions` | list | `[]` | Repeated `[[assertions]]` blocks (DQX parity). See below. |
 | `cross_source_overlap` | table | | Flags the same business key appearing across sibling sources that feed one consolidation target. See [Cross-source duplicate detection](#cross-source-duplicate-detection). |
