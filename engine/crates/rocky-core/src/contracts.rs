@@ -867,35 +867,46 @@ mod tests {
         );
     }
 
-    /// The regression #1646 opened, stated as data rather than as types:
-    /// BigQuery reports a default-precision numeric as the bare string
-    /// `NUMERIC` while the column really holds (38,9). Before #1646 the
-    /// fabricated `Decimal(38,0)` refused this for the wrong reason; after
-    /// it, nothing refused it at all and staging was promoted.
+    /// Blast-radius control for #1721, at the GATE rather than the mapper.
+    ///
+    /// Refusing an uncomparable landed type widens what a refusal covers
+    /// from "does not fit" to "could not be read", so every type string the
+    /// normalizer does not know now blocks a load that used to promote. The
+    /// mapper-level control (`test_healthy_describe_decimals_stay_concrete`)
+    /// proves those strings parse; this one proves the GATE still passes
+    /// them, which is the property an ordinary run actually depends on.
+    ///
+    /// Strings are the ones the adapters really emit from a live `DESCRIBE`
+    /// — see that test's doc comment for the per-adapter sources.
     #[test]
-    fn test_typed_bare_bigquery_numeric_does_not_satisfy_a_narrower_contract() {
-        let contract = ContractConfig {
-            required_columns: vec![RequiredColumn {
-                name: "amount".into(),
-                data_type: "NUMERIC(10,2)".into(),
-                nullable: true,
-            }],
-            ..Default::default()
-        };
-        let landed = vec![col_n("amount", "NUMERIC", true)];
-        let result = validate_contract_typed(&contract, &landed);
-        assert!(
-            !result.passed,
-            "a bare NUMERIC must not satisfy NUMERIC(10,2): {result:?}"
-        );
-        assert!(
-            result
-                .violations
-                .iter()
-                .any(|v| v.rule == "unverifiable_landed_type" && v.column == "amount"),
-            "violations: {:?}",
-            result.violations
-        );
+    fn test_healthy_adapter_describe_output_still_passes_the_gate() {
+        for (landed, declared) in [
+            ("DECIMAL(10,2)", "DECIMAL(10,2)"),
+            ("decimal(10,2)", "DECIMAL(10,2)"),
+            ("NUMBER(38,0)", "NUMBER(38,0)"),
+            ("BIGINT", "BIGINT"),
+            ("INTEGER", "BIGINT"),
+            ("VARCHAR", "VARCHAR"),
+            ("STRING", "VARCHAR"),
+            ("BOOLEAN", "BOOLEAN"),
+            ("TIMESTAMP", "TIMESTAMP"),
+            ("DOUBLE", "DOUBLE"),
+        ] {
+            let contract = ContractConfig {
+                required_columns: vec![RequiredColumn {
+                    name: "c".into(),
+                    data_type: declared.into(),
+                    nullable: true,
+                }],
+                ..Default::default()
+            };
+            let result = validate_contract_typed(&contract, &[col_n("c", landed, true)]);
+            assert!(
+                result.passed,
+                "landed '{landed}' against '{declared}' must still pass: {:?}",
+                result.violations
+            );
+        }
     }
 
     /// The declared side has the same hole: a contract type string the
@@ -1024,15 +1035,27 @@ mod tests {
         }
     }
 
-    /// The bare BigQuery case (#1646). `INFORMATION_SCHEMA.COLUMNS.data_type`
-    /// reports a default-precision column as a bare `NUMERIC` — the live
-    /// sweep in `rocky-bigquery/tests/dialect_sweep_live.rs` asserts exactly
-    /// that string after an `ALTER ... SET DATA TYPE NUMERIC`. Read as
-    /// `DECIMAL(38,0)` it refused a correct load, because
-    /// `is_assignable(Decimal(38,0), Decimal(38,9))` fails on integer digits.
-    /// It is now unread, so the column is reported and the load promotes.
+    /// The bare BigQuery case (#1646), and the ACCEPTED COST of #1721.
+    ///
+    /// `INFORMATION_SCHEMA.COLUMNS.data_type` reports a default-precision
+    /// column as a bare `NUMERIC` — the live sweep in
+    /// `rocky-bigquery/tests/dialect_sweep_live.rs` asserts exactly that
+    /// string after an `ALTER ... SET DATA TYPE NUMERIC`.
+    ///
+    /// ```text
+    ///   before #1646   Decimal(38,0)  ->  38 > 29 integer digits  ->  REFUSED (wrong reason)
+    ///   after  #1646   Unknown        ->  warning                 ->  PROMOTED (no comparison)
+    ///   after  #1721   Unknown        ->  REFUSED (uncomparable)
+    /// ```
+    ///
+    /// This contract would have fitted, and it is refused anyway. That is
+    /// deliberate and is the price of the decision: the gate declines to
+    /// certify a column it could not compare, rather than guessing in
+    /// either direction. The remedy is nameable, which the fabricated
+    /// `Decimal(38,0)` never was — declare a type Rocky parses, or make the
+    /// source report a precise one.
     #[test]
-    fn test_typed_bare_numeric_is_reported_not_refused() {
+    fn test_typed_bare_numeric_refuses_even_where_the_data_would_have_fitted() {
         let contract = ContractConfig {
             required_columns: vec![RequiredColumn {
                 name: "amount".into(),
@@ -1044,25 +1067,26 @@ mod tests {
         let result = validate_contract_typed(&contract, &[col_n("amount", "NUMERIC", true)]);
 
         assert!(
-            result.passed,
-            "a bare NUMERIC must not refuse a NUMERIC(38,9) contract: {:?}",
-            result.violations
+            !result.passed,
+            "an uncomparable landed type refuses even when the data would fit: {result:?}"
         );
-        assert!(result.violations.is_empty());
-        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
-        let w = &result.warnings[0];
+        let v = &result.violations[0];
+        assert_eq!(v.rule, "unverifiable_landed_type");
         assert!(
-            w.contains("'amount'") && w.contains("'NUMERIC'") && w.contains("'NUMERIC(38,9)'"),
-            "the warning must name the column and both type strings: {w}"
+            v.message.contains("'amount'")
+                && v.message.contains("'NUMERIC'")
+                && v.message.contains("'NUMERIC(38,9)'"),
+            "the refusal must name the column and both type strings: {}",
+            v.message
         );
     }
 
-    /// The other half of #1646: a contract written `NUMERIC(38,0)` used to
-    /// accept a landed bare `NUMERIC`, which on BigQuery holds nine decimal
-    /// places. It is still not refused — `passed` is computed from
-    /// violations only — but it is no longer silent.
+    /// The other half of #1646, and the defect #1721 exists to close: a
+    /// contract written `NUMERIC(38,0)` accepted a landed bare `NUMERIC`,
+    /// which on BigQuery holds nine decimal places. #1646 made it noisy;
+    /// its own comment conceded "it is still not refused". Now it is.
     #[test]
-    fn test_typed_bare_numeric_against_narrow_contract_is_reported() {
+    fn test_typed_bare_numeric_against_narrow_contract_refuses() {
         let contract = ContractConfig {
             required_columns: vec![RequiredColumn {
                 name: "amount".into(),
@@ -1073,12 +1097,15 @@ mod tests {
         };
         let result = validate_contract_typed(&contract, &[col_n("amount", "NUMERIC", true)]);
 
-        assert!(result.violations.is_empty());
+        assert!(
+            !result.passed,
+            "a bare NUMERIC holding (38,9) must not satisfy NUMERIC(38,0): {result:?}"
+        );
         assert_eq!(
-            result.warnings.len(),
+            result.violations.len(),
             1,
-            "the landed bare NUMERIC must be reported, not accepted silently: {:?}",
-            result.warnings
+            "violations: {:?}",
+            result.violations
         );
     }
 
