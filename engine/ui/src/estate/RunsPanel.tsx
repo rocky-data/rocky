@@ -52,7 +52,7 @@ export function RunsPanel({ history, now }: { history: HistoryOutput; now?: numb
           {history.runs.map((run) => (
             <tr key={run.run_id} className="border-t border-zinc-100 dark:border-zinc-800">
               <td className="pr-3 font-mono" title={run.run_id}>
-                {shortId(run.run_id)}
+                <span title={run.run_id}>{shortId(run.run_id)}</span>
               </td>
               <td className="pr-3">{formatInstant(run.started_at, now)}</td>
               <td className={`pr-3 font-medium ${TONE_TEXT[statusTone(run.status)]}`}>

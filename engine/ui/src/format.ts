@@ -45,7 +45,34 @@ function formatAgo(deltaMs: number): string {
   return `${Math.round(hours / 24)} d ago`;
 }
 
-/** The first 12 characters of a long id, for a table cell; the full id goes in `title`. */
+/**
+ * The first 12 characters of a long id, for a table cell, with an ellipsis so
+ * a truncation reads as one. Put the full id in `title` at the call site.
+ *
+ * Right for an id whose HEAD identifies it — a hex digest, a run id. A
+ * compound id whose tail is the distinguishing part wants `elideMiddle`
+ * instead: every fulfillment idempotency key for one product begins
+ * `product:<name>@`, so twelve leading characters of it distinguish nothing
+ * (#1756).
+ */
 export function shortId(id: string): string {
-  return id.length > 12 ? id.slice(0, 12) : id;
+  return id.length > 12 ? `${id.slice(0, 12)}…` : id;
+}
+
+/**
+ * Keeps both ends of a compound identifier and elides the middle:
+ * `product:revenue_daily@sha256:5b1bf5c@21` renders as `product:re…1bf5c@21`,
+ * keeping the digest tail and the sequence number that tell two keys apart.
+ *
+ * Used where the tail carries the distinguishing part. It reads the string as
+ * text and knows nothing about any identifier's grammar, so a key whose shape
+ * changes still renders, just with a different slice shown.
+ *
+ * Returns the input unchanged when eliding would not make it shorter, so a
+ * value near the limit never renders LONGER than it is.
+ */
+export function elideMiddle(value: string, head = 10, tail = 8): string {
+  if (head < 0 || tail < 0) return value;
+  if (value.length <= head + tail + 1) return value;
+  return `${value.slice(0, head)}…${value.slice(value.length - tail)}`;
 }
