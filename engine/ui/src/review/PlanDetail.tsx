@@ -25,6 +25,12 @@ export const defaultPlanLoaders: PlanLoaders = {
   product: (name) => apiGet<ProductStatusOutput>(`products/${encodeURIComponent(name)}`),
 };
 
+/**
+ * What the samples route will accept as a model name — the same shape as
+ * `rocky_sql::validation::validate_identifier` (`^[a-zA-Z0-9_]+$`).
+ */
+const MODEL_NAME = /^[a-zA-Z0-9_]+$/;
+
 /** A `product:<name>` identity reduced to the name the products route takes. */
 export function productNameFromId(productId: string): string {
   return productId.startsWith("product:") ? productId.slice("product:".length) : productId;
@@ -276,8 +282,17 @@ export function PlanDetail({
   //
   // The product's own status carries `output_model`, and this screen already
   // reads it for the spec-drift card, so the fallback costs no request.
+  //
+  // The queue entry's `model` is not always a model name. A backfill escalation
+  // puts a display sentence there — "backfill: 3 model(s)" — and feeding that to
+  // the samples route earns a 400 `invalid_model_name` on every click. So take
+  // the field only when it could be a name. The server stays the authority
+  // (`rocky_sql::validation::validate_identifier`, `^[a-zA-Z0-9_]+$`); this only
+  // withholds an offer the server would refuse, so a drift here declines to ask
+  // rather than asking wrongly.
+  const named = entry?.model !== undefined && MODEL_NAME.test(entry.model) ? entry.model : null;
   const model =
-    entry?.model ?? (product.kind === "ready" ? (product.value.output_model ?? null) : null);
+    named ?? (product.kind === "ready" ? (product.value.output_model ?? null) : null);
 
   return (
     <div className="space-y-4">
@@ -329,11 +344,17 @@ export function PlanDetail({
       ) : (
         // Absent is not empty. A missing panel reads as "this plan touches no
         // data"; say instead that the screen could not work out which model to
-        // sample, which is a different thing and has a different fix.
+        // sample, which is a different thing and has a different fix. And say
+        // WHICH of the two reasons applies — a backfill has models, just not one
+        // this screen can name.
         <StatusCard
           label="sample rows"
-          value="no model to sample"
-          sub="Neither the review queue nor the product names a model for this plan, so there is nothing to read rows from. A plan that is not product-bound and no longer in the queue has no model on this screen."
+          value="no single model to sample"
+          sub={
+            entry !== null
+              ? `The queue describes this plan as "${entry.model}", which names no single model — a backfill covers a set of them, and this panel reads one model at a time. Sample them from the estate screen instead.`
+              : "Neither the review queue nor the product names a model for this plan, so there is nothing to read rows from. A plan that is not product-bound and no longer in the queue has no model on this screen."
+          }
         />
       )}
 
