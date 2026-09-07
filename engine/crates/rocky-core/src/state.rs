@@ -6406,9 +6406,20 @@ pub fn detect_anomaly(
         100.0 // went from 0 to non-zero
     };
 
-    let is_anomaly = deviation_pct > threshold_pct;
+    // `threshold_pct <= 0` DISABLES detection, which is what the config field
+    // has always documented ("Set to 0 to disable") and the opposite of what
+    // this comparison did on its own: `deviation_pct > 0.0` flags every table
+    // whose count moved at all, so an operator following the documentation to
+    // turn anomaly detection OFF turned it maximally ON.
+    //
+    // Guarded here rather than at the call site so every caller of
+    // `detect_anomaly` gets the documented behaviour, not just the one in
+    // `run.rs`.
+    let is_anomaly = threshold_pct > 0.0 && deviation_pct > threshold_pct;
 
-    let reason = if is_anomaly {
+    let reason = if threshold_pct <= 0.0 {
+        "anomaly detection is disabled (anomaly_threshold_pct = 0)".to_string()
+    } else if is_anomaly {
         if (current_count as f64) < avg {
             format!(
                 "row count dropped {deviation_pct:.1}% (expected ~{avg:.0}, got {current_count})"
@@ -7178,6 +7189,69 @@ mod tests {
         let result = detect_anomaly("tbl", 500, &history, 50.0);
         assert!(result.is_anomaly);
         assert!(result.reason.contains("spiked"));
+    }
+
+    /// `anomaly_threshold_pct = 0` DISABLES detection. The config field has
+    /// documented that since it shipped, and the published reference page says
+    /// it too — but the comparison is `deviation_pct > threshold_pct`, so `0`
+    /// flagged every table whose row count moved at all.
+    ///
+    /// An operator following the documentation to turn anomaly detection OFF
+    /// turned it maximally ON, and got an anomaly on every run where anything
+    /// changed. Nothing pinned the behaviour: every existing test passes 50.0.
+    #[test]
+    fn a_zero_threshold_disables_detection_rather_than_flagging_everything() {
+        let history = vec![
+            CheckSnapshot {
+                timestamp: Utc::now(),
+                row_count: 100,
+            },
+            CheckSnapshot {
+                timestamp: Utc::now(),
+                row_count: 100,
+            },
+        ];
+
+        // A 400% spike — unmissable at any real threshold.
+        let spike = detect_anomaly("tbl", 500, &history, 0.0);
+        assert!(!spike.is_anomaly, "0 disables detection: {}", spike.reason);
+        assert!(
+            spike.reason.contains("disabled"),
+            "and says so, rather than implying it measured and cleared: {}",
+            spike.reason
+        );
+
+        // The discriminator: the SAME input at the default threshold IS an
+        // anomaly, so the test cannot pass because the fixture is uneventful.
+        let at_default = detect_anomaly("tbl", 500, &history, 50.0);
+        assert!(at_default.is_anomaly, "{}", at_default.reason);
+
+        // A negative threshold is disabled too, rather than flagging every
+        // table including unchanged ones.
+        let negative = detect_anomaly("tbl", 100, &history, -1.0);
+        assert!(!negative.is_anomaly, "{}", negative.reason);
+    }
+
+    /// The other side, so the guard is not a blanket off-switch: an ordinary
+    /// small positive threshold still detects, and still ignores noise below
+    /// it.
+    #[test]
+    fn a_small_positive_threshold_still_detects() {
+        let history = vec![
+            CheckSnapshot {
+                timestamp: Utc::now(),
+                row_count: 100,
+            },
+            CheckSnapshot {
+                timestamp: Utc::now(),
+                row_count: 100,
+            },
+        ];
+
+        // 5% move against a 1% threshold: an anomaly.
+        assert!(detect_anomaly("tbl", 105, &history, 1.0).is_anomaly);
+        // 5% move against a 10% threshold: not one.
+        assert!(!detect_anomaly("tbl", 105, &history, 10.0).is_anomaly);
     }
 
     #[test]
