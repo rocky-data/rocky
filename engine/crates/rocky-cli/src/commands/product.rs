@@ -1030,10 +1030,7 @@ pub(crate) fn product_compile_in(
     // Compile is a READER of the approval (when one exists): the snapshot
     // bytes must still digest to the recorded value, or the approval is
     // tampered and nothing proceeds.
-    let state_store = match state_path {
-        Some(path) if path.exists() => Some(open_state_store(path)?),
-        _ => None,
-    };
+    let state_store = open_store_if_present(state_path, open_state_store)?;
     let approval = match &state_store {
         Some(store) => store.product_approval_get(product_name)?,
         None => None,
@@ -1548,6 +1545,38 @@ pub fn run_product_approve(
 // status
 // ---------------------------------------------------------------------------
 
+/// Open the state store at `path`, or `None` when there is genuinely no store.
+///
+/// Every product verb needs this and each one used to spell it `path.exists()`,
+/// which answers **false for every metadata error** — not only for a path that
+/// is not there. A store the process could not stat therefore read as "no store
+/// yet", and each caller carried on with its empty-world answer: `status`
+/// reported a product that had never run, `compile` proceeded as though no
+/// approval existed, and the name and journal readers dropped every record the
+/// store held.
+///
+/// The discriminator is `rocky-core`'s, written for #1668 and #1707, and this
+/// is the single place the product verbs reach it. Absent stays absent — no
+/// store yet is the ordinary case. Anything else refuses.
+fn open_store_if_present<T>(
+    path: Option<&Path>,
+    open: impl FnOnce(&Path) -> Result<T>,
+) -> Result<Option<T>> {
+    let Some(path) = path else { return Ok(None) };
+    match std::fs::metadata(path) {
+        Ok(_) => Ok(Some(open(path)?)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            match rocky_core::path_presence::classify_not_found(path) {
+                rocky_core::path_presence::PathPresence::Absent => Ok(None),
+                rocky_core::path_presence::PathPresence::Present { detail } => {
+                    anyhow::bail!("{} cannot be read: {detail}", path.display())
+                }
+            }
+        }
+        Err(err) => anyhow::bail!("{} cannot be read: {err}", path.display()),
+    }
+}
+
 /// The read-only status report. Never mutates: a pending staging journal
 /// is REPORTED, not recovered — the next compile resolves it.
 pub(crate) fn product_status_in(
@@ -1613,23 +1642,7 @@ pub(crate) fn product_status_in(
     // journal. On a screen a reviewer trusts before approving, an unreadable
     // store must refuse, never render as a healthy empty one. `rocky-core`
     // already owns the discriminator this needs (#1668, #1707).
-    let store = match state_path {
-        Some(path) => match std::fs::metadata(path) {
-            Ok(_) => Some(open_state_store_read_only(path)?),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                match rocky_core::path_presence::classify_not_found(path) {
-                    // Genuinely nothing there: no store yet is the ordinary
-                    // case, and an empty status is the honest answer.
-                    rocky_core::path_presence::PathPresence::Absent => None,
-                    rocky_core::path_presence::PathPresence::Present { detail } => {
-                        anyhow::bail!("{} cannot be read: {detail}", path.display())
-                    }
-                }
-            }
-            Err(err) => anyhow::bail!("{} cannot be read: {err}", path.display()),
-        },
-        None => None,
-    };
+    let store = open_store_if_present(state_path, open_state_store_read_only)?;
     if let Some(store) = store {
         if let Some(record) = store.product_approval_get(product_name)? {
             // `snapshot_intact: false` is an accusation — it says the bytes a
@@ -1715,8 +1728,7 @@ pub(crate) fn product_names_in(root: &Path, state_path: Option<&Path>) -> Result
         }
     }
 
-    if let Some(path) = state_path.filter(|path| path.exists()) {
-        let store = open_state_store_read_only(path)?;
+    if let Some(store) = open_store_if_present(state_path, open_state_store_read_only)? {
         names.extend(store.fulfill_state_product_names()?);
         names.extend(store.product_approval_product_names()?);
     }
@@ -1795,23 +1807,24 @@ pub(crate) fn product_journal_in(
     if !known.iter().any(|name| name == product_name) {
         return Ok(None);
     }
-    let rows: Vec<ProductJournalEntry> = match state_path {
-        Some(path) if path.exists() => open_state_store_read_only(path)?
-            .fulfill_journal_rows(product_name)?
-            .into_iter()
-            .map(|row| ProductJournalEntry {
-                seq: row.seq,
-                at: row.at,
-                event: row.event,
-                from_state: row.from_state,
-                to_state: row.to_state,
-                spec_digest: row.spec_digest,
-                plan_id: row.plan_id,
-                idempotency_key: row.idempotency_key,
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
+    let rows: Vec<ProductJournalEntry> =
+        match open_store_if_present(state_path, open_state_store_read_only)? {
+            Some(store) => store
+                .fulfill_journal_rows(product_name)?
+                .into_iter()
+                .map(|row| ProductJournalEntry {
+                    seq: row.seq,
+                    at: row.at,
+                    event: row.event,
+                    from_state: row.from_state,
+                    to_state: row.to_state,
+                    spec_digest: row.spec_digest,
+                    plan_id: row.plan_id,
+                    idempotency_key: row.idempotency_key,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
     Ok(Some(ProductJournalOutput {
         version: VERSION.to_string(),
         command: "product_journal".to_string(),
@@ -3951,6 +3964,63 @@ effect = "require_review"
             product_status_in(&root, Some(&missing), "revenue_daily").expect("absent is fine");
         assert!(status.approval.is_none());
         assert_eq!(status.journal_rows, 0);
+    }
+
+    /// Compile reads the approval so it can refuse a tampered snapshot — the
+    /// comment above that read calls it load-bearing. An unreadable store used
+    /// to yield `None`, so compile proceeded as though no approval existed and
+    /// the tamper check never ran. That is the gate failing OPEN.
+    #[cfg(unix)]
+    #[test]
+    fn compile_refuses_an_unreadable_store_instead_of_skipping_the_approval_check() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, config) = project_with_config(dir.path(), &passing_config());
+
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).expect("mkdir");
+        let store = locked.join("state.redb");
+        std::fs::write(&store, b"not really a store").expect("write");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let result = product_compile_in(&root, &config, Some(&store), "revenue_daily");
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("restore");
+
+        let err = result.expect_err("compile must refuse a store it cannot read");
+        assert!(
+            format!("{err:#}").contains("cannot be read"),
+            "got: {err:#}"
+        );
+    }
+
+    /// The name roll-call feeds `product list` AND the journal's existence
+    /// check. An unreadable store used to drop every store-only product, so a
+    /// journal request for one answered "no such product".
+    #[cfg(unix)]
+    #[test]
+    fn the_product_roll_call_refuses_a_store_it_cannot_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, _config) = project_with_config(dir.path(), &passing_config());
+
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).expect("mkdir");
+        let store = locked.join("state.redb");
+        std::fs::write(&store, b"not really a store").expect("write");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let result = product_names_in(&root, Some(&store));
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("restore");
+
+        let err = result.expect_err("the roll-call must refuse a store it cannot read");
+        assert!(
+            format!("{err:#}").contains("cannot be read"),
+            "got: {err:#}"
+        );
     }
 
     /// A store that IS there and cannot be read must refuse. `Path::exists()`
