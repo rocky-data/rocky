@@ -1236,6 +1236,14 @@ pub async fn run_snapshot(
 
     output.duration_ms = start.elapsed().as_millis() as u64;
 
+    // The same omission #1788 fixed in `run_quality`, at a third site. This
+    // runner does set `tables_failed` before the emit, so the COUNTS in the
+    // payload were right — but `status` was never derived, so it kept the
+    // `RunStatus::Success` that `RunOutput::new` defaults it to. A failed
+    // snapshot therefore emitted `"status": "success"` alongside
+    // `"tables_failed": 1`: a payload that contradicts itself.
+    output.status = output.derive_run_status();
+
     if let Some(p) = &pipes {
         super::run::emit_pipes_events(p, &output);
     }
@@ -2614,6 +2622,31 @@ auto_create_schemas = true
         assert!(
             matches!(output.derive_run_status(), RunStatus::Failure),
             "and with what the persisted record derives"
+        );
+    }
+
+    /// The same defect at a third site, checked because #1795 said it had not
+    /// been. `run_snapshot` DOES set `tables_failed` before it emits, so the
+    /// counts in its payload were right — but it never derived `status`, so a
+    /// failed snapshot emitted `"status": "success"` next to
+    /// `"tables_failed": 1`. A payload that contradicts itself.
+    #[test]
+    fn a_failed_snapshot_payload_does_not_contradict_its_own_counts() {
+        use crate::output::RunOutput;
+        use rocky_core::state::RunStatus;
+
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        output.tables_failed = 1;
+
+        // What shipped: the constructor default, beside a non-zero failure count.
+        assert!(matches!(output.status, RunStatus::Success));
+
+        output.status = output.derive_run_status();
+
+        assert!(
+            matches!(output.status, RunStatus::Failure),
+            "status agrees with tables_failed: {:?}",
+            output.status
         );
     }
 
