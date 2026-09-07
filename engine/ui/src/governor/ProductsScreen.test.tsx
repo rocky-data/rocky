@@ -300,6 +300,21 @@ describe("ProductsScreen", () => {
     expect(productPath("revenue daily")).toBe("/ui/governor/products/revenue%20daily");
   });
 
+  /// The engine reports a pending staging journal and deliberately does not
+  /// resolve it. A screen that drops it makes an interrupted compile look
+  /// like a finished one.
+  it("shows an interrupted commit in the standing panel and in the list", async () => {
+    render(
+      <ProductsScreen
+        name="revenue_daily"
+        loaders={loaders({
+          status: vi.fn(async () => ({ ...STATUS, staging_journal_present: true })),
+        })}
+      />,
+    );
+    await screen.findByText("a commit was interrupted");
+  });
+
   /// Only `spec-file-missing` means the file is gone. A spec that exists and
   /// cannot be read, or one that parses badly, must not be reported as a
   /// deletion — the reader would go looking for a removal that never happened.
