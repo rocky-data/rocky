@@ -56,13 +56,17 @@ Every recipe below keys off the process exit code. Rocky uses a distinct code pe
 | Code | Meaning | Emitted by |
 |------|---------|------------|
 | `0` | Success | every command |
-| `1` | Generic hard failure (config error, unreadable state, or an error raised *after* some models already materialized — a budget breach, say) | most commands |
-| `2` | **Partial success** — some models materialized, some failed | `rocky run` |
+| `1` | Generic hard failure (config error, unreadable state, or an error raised *after* some models already materialized — a budget breach, say). For `rocky tick`, also an unreadable webhook spool | most commands |
+| `2` | **Partial success** — some models materialized, some failed | `rocky run`, `rocky tick` |
 | `3` | A Critical health check | `rocky doctor` |
 | `4` | Compile and tests passed but advisory warnings were emitted | `rocky ci` |
 | `130` | Interrupted by SIGINT or SIGTERM | `rocky run` |
 
 A scheduled `rocky run` returns `0`, `1`, `2`, or `130`. Codes `3` and `4` come from `rocky doctor` and `rocky ci`. Run those as a pre-flight (below) or in CI.
+
+**`rocky tick` and the webhook spool.** A tick that cannot read `.rocky/pending-demands` exits `1`, even when everything it did run succeeded. The scan fails only when something *is* at that path and cannot be read — a dangling symlink, a permission fault. A spool directory that does not exist yet reads as "no pending demand" and exits `0`, so this never fires on a project that has not used webhooks.
+
+It is worth a page rather than a ticket. Nothing about it clears on its own, and while it stands, every webhook-triggered pipeline is silently not firing. That is also why it outranks exit `2`: a failing run is already visible in the tick's report and in run history, and letting it win would hide the spool fault for as long as the run kept failing.
 
 ### What to alert on
 

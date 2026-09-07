@@ -158,28 +158,78 @@ pub async fn run_tick(
         render_text(&output);
     }
 
-    // Exit 2 when any executed run failed or was partial (mirrors `rocky run`).
     // The JSON has already been emitted, so a wrapper parsing stdout still sees
     // the full report before the process exits non-zero.
-    let unhealthy = output.counts.failed + output.counts.partial;
-    if unhealthy > 0 {
+    match tick_verdict(&report, &output) {
+        TickVerdict::Ok => Ok(()),
+        TickVerdict::SpoolUnreadable(reason) => Err(anyhow::anyhow!(
+            "the webhook spool could not be read, so no pending demand was \
+             consumed this tick: {reason}. Scheduled work still ran — see the \
+             report above. This does not clear on its own; fix the path at \
+             `.rocky/pending-demands`."
+        )),
+        TickVerdict::Unhealthy { count, run_id } => Err(PartialFailure {
+            count,
+            run_id,
+            // `rocky tick` reports the reconciler's own tally, not a
+            // replication run's check gate — there is no gate to report here.
+            check_gate_failed: false,
+        }
+        .into()),
+    }
+}
+
+/// What `rocky tick` reports to its caller once the report has been emitted.
+///
+/// Extracted from [`run_tick`] so the PRECEDENCE between the two non-zero arms
+/// is assertable without a config, a state store and a spawner.
+#[derive(Debug, PartialEq, Eq)]
+enum TickVerdict {
+    /// Exit 0.
+    Ok,
+    /// Exit 1 — the webhook spool could not be read. Carries the reason.
+    SpoolUnreadable(String),
+    /// Exit 2 — an executed run failed or was partial (mirrors `rocky run`).
+    Unhealthy { count: usize, run_id: String },
+}
+
+/// Decide the tick's exit posture.
+///
+/// **`SpoolUnreadable` outranks `Unhealthy`, deliberately.** A failed run is
+/// per-tick and already loud: it is in `counts.failed`, in `executed`, and in
+/// the run's own record. An unreadable spool is neither. It is silent — #1710
+/// made the scan refuse instead of reading a dangling link as an empty spool,
+/// and #1752 put the reason in the JSON and on the scheduler's span, but
+/// neither reached the exit code, and no first-party consumer of `rocky tick`
+/// reads its JSON at all (#1731). And it does not self-heal: the scan errs
+/// only when something IS at the spool path and cannot be read, so the next
+/// tick fixes nothing.
+///
+/// Ordering them the other way would let a run that keeps failing mask the
+/// persistent fault indefinitely — the same invisibility this arm exists to
+/// end, one layer up.
+///
+/// An ABSENT spool directory is not this case: it reads as an empty list and
+/// returns [`TickVerdict::Ok`] exactly as it always has. Nor is a dry run —
+/// `consume_webhook_demands` is `!dry_run`-gated, so `spool_unreadable` is
+/// always `None` there.
+fn tick_verdict(report: &TickReport, output: &TickOutput) -> TickVerdict {
+    if let Some(reason) = &report.spool_unreadable {
+        return TickVerdict::SpoolUnreadable(reason.clone());
+    }
+
+    let count = output.counts.failed + output.counts.partial;
+    if count > 0 {
         let run_id = output
             .executed
             .iter()
             .find(|e| e.outcome != "success")
             .map(|e| e.submission_id.clone())
             .unwrap_or_default();
-        return Err(PartialFailure {
-            count: unhealthy,
-            run_id,
-            // `rocky tick` reports the reconciler's own tally, not a
-            // replication run's check gate — there is no gate to report here.
-            check_gate_failed: false,
-        }
-        .into());
+        return TickVerdict::Unhealthy { count, run_id };
     }
 
-    Ok(())
+    TickVerdict::Ok
 }
 
 /// Resolve each freshness-scheduled transformation pipeline's member-model
@@ -663,6 +713,89 @@ freshness = true
         let clean = build_tick_output(&TickReport::default(), ts("2026-05-02T03:05:00Z"), false, 0);
         assert!(clean.skipped.is_empty());
         assert_eq!(clean.counts.skipped, 0);
+    }
+
+    /// Build a report + output pair whose only executed run FAILED, so the
+    /// exit-2 arm is live. Used to prove the precedence, not just the arm.
+    fn unhealthy_pair(spool_unreadable: Option<&str>) -> (TickReport, TickOutput) {
+        let report = TickReport {
+            spool_unreadable: spool_unreadable.map(str::to_string),
+            ..TickReport::default()
+        };
+        let mut output = build_tick_output(&report, ts("2026-05-02T03:05:00Z"), false, 0);
+        output.counts.failed = 1;
+        output.executed.push(ExecutedRunOutput {
+            pipeline: "raw".to_string(),
+            source: "cron".to_string(),
+            logical_ts: ts("2026-05-02T03:05:00Z"),
+            submission_id: "sub-9".to_string(),
+            exit_code: 1,
+            outcome: "failed".to_string(),
+            attempts: 1,
+        });
+        (report, output)
+    }
+
+    /// 🔴 #1731. An unreadable spool must reach the EXIT CODE, not only the
+    /// JSON. The realistic out-of-process caller is a cron entry checking
+    /// `$?`, and no first-party consumer of `rocky tick` reads its JSON.
+    #[test]
+    fn an_unreadable_spool_is_a_non_zero_tick() {
+        let report = TickReport {
+            spool_unreadable: Some("dangling symlink".to_string()),
+            ..TickReport::default()
+        };
+        let output = build_tick_output(&report, ts("2026-05-02T03:05:00Z"), false, 0);
+
+        assert_eq!(
+            tick_verdict(&report, &output),
+            TickVerdict::SpoolUnreadable("dangling symlink".to_string()),
+            "the reason rides the verdict so the operator sees it on stderr"
+        );
+    }
+
+    /// 🔴 #1731, the arm that keeps the fix from re-opening the hole it
+    /// closes. A tick can be BOTH unhealthy and spool-unreadable. If exit 2
+    /// won, a run that keeps failing would mask the persistent spool fault
+    /// indefinitely — the same invisibility one layer up.
+    #[test]
+    fn an_unreadable_spool_outranks_a_failed_run() {
+        let (report, output) = unhealthy_pair(Some("dangling symlink"));
+        assert!(
+            output.counts.failed > 0,
+            "precondition: the exit-2 arm is genuinely live"
+        );
+        assert_eq!(
+            tick_verdict(&report, &output),
+            TickVerdict::SpoolUnreadable("dangling symlink".to_string()),
+            "the silent, persistent fault must not hide behind the loud one"
+        );
+    }
+
+    /// The control for the arm above: with a readable spool the same failing
+    /// run still reports exit 2, carrying the run id. Without this, returning
+    /// `SpoolUnreadable` unconditionally would look like a fix.
+    #[test]
+    fn a_failed_run_with_a_readable_spool_is_still_exit_two() {
+        let (report, output) = unhealthy_pair(None);
+        assert_eq!(
+            tick_verdict(&report, &output),
+            TickVerdict::Unhealthy {
+                count: 1,
+                run_id: "sub-9".to_string(),
+            },
+        );
+    }
+
+    /// An ABSENT spool is not a fault. `list_pending_files` reads a missing
+    /// directory as an empty list, so `spool_unreadable` stays `None` and the
+    /// tick exits 0 exactly as it always has — the contract change is scoped
+    /// to a spool that is present and cannot be read.
+    #[test]
+    fn a_healthy_tick_is_still_exit_zero() {
+        let report = TickReport::default();
+        let output = build_tick_output(&report, ts("2026-05-02T03:05:00Z"), false, 0);
+        assert_eq!(tick_verdict(&report, &output), TickVerdict::Ok);
     }
 
     #[test]
