@@ -73,7 +73,7 @@ chrono-tz = "0.10"
 # Cron occurrence math for the schedule reconciler. croner declares no MSRV,
 # so the version is pinned exactly — a patch bump could raise the required
 # toolchain past the workspace's 1.88 floor without warning.
-croner = "=3.0.1"
+croner = "=4.0.0"
 
 # JSON Schema generation (Phase 2 — codegen source of truth for dagster + vscode types)
 schemars = { version = "0.8", features = ["chrono", "indexmap2"] }
