@@ -5344,9 +5344,14 @@ mod tests {
     /// syntactically invalid source.
     #[test]
     fn contract_quickfix_skipped_on_rocky_dsl_file() {
+        // Deliberately VALID SQL in a file named `.rocky`. A DSL body would
+        // fail the SQL parse further down and return `None` for that reason
+        // instead, which is what made the pre-existing test — and the first
+        // draft of this one — pass with the skip broken. The extension must be
+        // the only thing that can produce `None` here.
         let model = synth_model(
             "downstream",
-            "from upstream\nselect { id }\n",
+            "SELECT id FROM upstream\n",
             "/tmp/m/downstream.rocky",
             vec!["upstream".into()],
         );
@@ -5369,7 +5374,8 @@ mod tests {
                 &typed,
             )
             .is_none(),
-            "a .rocky model must take the DSL auto-fix path, not a SQL text edit"
+            "a .rocky model must take the DSL auto-fix path even when its body \
+             happens to parse as SQL — the extension decides"
         );
 
         // The control: the identical case on a `.sql` model DOES produce a fix,
