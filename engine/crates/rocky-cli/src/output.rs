@@ -6892,30 +6892,42 @@ mod run_record_tests {
         assert!(matches!(out.derive_run_status(), RunStatus::Success));
     }
 
-    /// A check the engine could not evaluate (#1595 / #1602) is a failure in
-    /// its OWN severity bucket: `not_evaluated` always carries
-    /// `passed: false`, and a check the user declared advisory does not become
-    /// gating by failing to run.
+    /// Severity grades a MEASUREMENT, so it only ever reaches the buckets from
+    /// a check that ran (#1741). A `not_evaluated` failure is always an error;
+    /// only a measured violation can land in the warning bucket.
+    ///
+    /// This replaces `..._buckets_not_evaluated_by_its_own_severity`, whose
+    /// name asserted the behaviour #1741 removes: a declared-advisory check
+    /// used to stay advisory when it failed to run, so a broken query cleared
+    /// the gate on a run that had measured nothing.
     #[test]
-    fn check_failures_by_severity_buckets_not_evaluated_by_its_own_severity() {
+    fn check_failures_by_severity_buckets_every_unevaluated_check_as_an_error() {
         use rocky_core::tests::TestSeverity;
         let mut out = RunOutput::new(String::new(), 0, 1);
         out.check_results.push(checks_for(
             "orders",
             vec![
-                // Hard-coded error severity, so a broken row_count gates.
+                // Neither ran. Both gate, whatever the config declared.
                 rocky_core::checks::row_count_not_evaluated("the source query failed"),
                 rocky_core::checks::assertion_not_evaluated(
                     "not_null:name",
                     "not_null",
                     Some("name".to_string()),
-                    TestSeverity::Warning,
                     "the assertion query failed",
+                ),
+                // Ran, violated, declared advisory: the one warning.
+                rocky_core::checks::check_assertion(
+                    "not_null:email",
+                    "not_null",
+                    Some("email".to_string()),
+                    3,
+                    false,
+                    TestSeverity::Warning,
                 ),
                 rocky_core::checks::check_row_count(10, 10),
             ],
         ));
-        assert_eq!(out.check_failures_by_severity(), (1, 1));
+        assert_eq!(out.check_failures_by_severity(), (2, 1));
     }
 
     /// The whole point of the gate being a separate field: the persisted
