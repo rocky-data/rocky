@@ -31,7 +31,12 @@ import dagster as dg
 import pytest
 
 from dagster_rocky import EMPTY_FOR_PARTITION_METADATA_KEY, RockyResource, TenantConfig
-from dagster_rocky.component import RockyComponent, _emit_results
+from dagster_rocky.component import (
+    RockyComponent,
+    _emit_placeholder_checks,
+    _emit_results,
+)
+from dagster_rocky.observability import ANOMALY_CHECK_NAME
 from dagster_rocky.types import RunResult
 
 
@@ -694,7 +699,18 @@ def test_pruned_placeholder_carries_prior_failure_end_to_end(tmp_path):
                         "passed": False,
                         "source_count": 100,
                         "target_count": 90,
-                    }
+                    },
+                    # A REAL passing verdict, so the carry-forward assertion
+                    # below rests on an evaluation the engine actually made.
+                    # It used to rest on the placeholder's green, which was
+                    # #1645 itself: `column_match` was never produced, and
+                    # `passed=materialized` reported it as passing anyway.
+                    {
+                        "name": "column_match",
+                        "passed": True,
+                        "source_columns": ["id"],
+                        "target_columns": ["id"],
+                    },
                 ],
             }
         ],
@@ -746,8 +762,90 @@ def test_pruned_placeholder_carries_prior_failure_end_to_end(tmp_path):
     # `column_match`, not `freshness`: this discover payload declares no
     # `[checks.freshness]`, so the `freshness` spec is not declared at all
     # (#1645). Any other declared default check proves the same carry-forward.
+    assert _checks_by_name(result_1)["column_match"].passed is True  # Monday: real pass
     assert tuesday_checks["column_match"].passed is True
     assert tuesday_checks["column_match"].metadata["rocky/pruned_unchanged"].value is True
+
+    # And the other half of #1645, visible in the same story: `row_count_anomaly`
+    # is declared on every asset and the engine reported none, on either day.
+    # It is an EVENT check, so silence is the clean verdict and it stays green.
+    assert tuesday_checks[ANOMALY_CHECK_NAME].passed is True
+
+
+def test_an_unproduced_measurement_check_does_not_report_passed():
+    """#1645. A declared check the engine did not produce is NOT a passing
+    check on a materialized table.
+
+    `_build_check_specs` declares `row_count` and `column_match` on every
+    asset, and both can be switched off in `rocky.toml` — so the engine
+    routinely emits no result for a check Dagster has declared. The
+    placeholder reported `passed=materialized`, which on a table that copied
+    fine meant a green badge for a measurement nobody made. The `status`
+    metadata said "not produced by rocky"; the verdict said pass, and the
+    badge shows the verdict.
+
+    The two EVENT checks are the deliberate exception: the engine emits
+    `row_count_anomaly` / `compliance_exception` only when it has one to
+    report, so silence there really is the clean verdict.
+
+    Same rule as #1741 one layer down in the engine: a check that did not run
+    is not a check that passed.
+    """
+    orders = dg.AssetKey(["orders"])
+    specs = [
+        dg.AssetCheckSpec(name="row_count", asset=orders),
+        dg.AssetCheckSpec(name="column_match", asset=orders),
+        dg.AssetCheckSpec(name=ANOMALY_CHECK_NAME, asset=orders),
+    ]
+
+    results = {
+        r.check_name: r
+        for r in _emit_placeholder_checks(
+            check_specs=specs,
+            selected_keys={orders},
+            yielded_checks=set(),
+            materialized_keys={orders},
+        )
+    }
+
+    assert set(results) == {"row_count", "column_match", ANOMALY_CHECK_NAME}
+
+    # The table materialized, so these are not "not materialized" — the engine
+    # simply produced no measurement, and that is not a pass.
+    for name in ("row_count", "column_match"):
+        assert results[name].passed is False, name
+        assert results[name].severity == dg.AssetCheckSeverity.WARN, name
+        assert "not produced by rocky" in results[name].metadata["status"].value
+
+    # No anomaly reported means no anomaly. This one stays green.
+    assert results[ANOMALY_CHECK_NAME].passed is True
+
+
+def test_an_unproduced_check_on_an_unmaterialized_table_is_unchanged():
+    """The other arm, so the fix above is not read as covering it: a table
+    that did not materialize keeps its own WARN placeholder and its own
+    reason. That includes the event checks — nothing was copied, so silence
+    says nothing about anomalies either."""
+    orders = dg.AssetKey(["orders"])
+    specs = [
+        dg.AssetCheckSpec(name="row_count", asset=orders),
+        dg.AssetCheckSpec(name=ANOMALY_CHECK_NAME, asset=orders),
+    ]
+
+    results = {
+        r.check_name: r
+        for r in _emit_placeholder_checks(
+            check_specs=specs,
+            selected_keys={orders},
+            yielded_checks=set(),
+            materialized_keys=set(),
+        )
+    }
+
+    for name in ("row_count", ANOMALY_CHECK_NAME):
+        assert results[name].passed is False, name
+        assert results[name].severity == dg.AssetCheckSeverity.WARN, name
+        assert results[name].metadata["status"].value == "table not materialized", name
 
 
 def test_prune_without_satisfy_empty_outputs_warns(caplog):
