@@ -385,6 +385,59 @@ pub async fn run_transformation(
     super::run::run_status_exit_result(&output, run_id)
 }
 
+/// Builds the quality pipeline's `row_count` check from the count query's
+/// outcome.
+///
+/// Extracted so the failure arm is reachable from a test: `run_quality` does
+/// not return its `RunOutput`, and the persisted `CheckOutcome` carries no
+/// severity, so the distinction this function exists to make was not
+/// observable anywhere.
+///
+/// The rule (#1741, and #1719/#1735 before it): `severity` grades a
+/// MEASUREMENT. A count the engine obtained is graded at the configured
+/// severity; a query that FAILED measured nothing and takes the
+/// `TestSeverity::Error` `row_count_not_evaluated` chose, so it still gates.
+///
+/// The failure arm used to be built by hand with `not_evaluated: None` and the
+/// configured severity — so a `severity = "warning"` quality pipeline whose
+/// count query failed stayed out of the error bucket and exited 0, while every
+/// consumer read `not_evaluated: None` as "this check ran". It also described a
+/// row-count check as `CheckDetails::Custom` with a fabricated
+/// `result_value: 0, threshold: 1`.
+fn quality_row_count_check(
+    queried: rocky_core::traits::AdapterResult<rocky_core::traits::QueryResult>,
+    configured: rocky_core::tests::TestSeverity,
+) -> rocky_core::checks::CheckResult {
+    use rocky_core::checks::{CheckDetails, CheckResult};
+
+    match queried {
+        Ok(result) => {
+            let count: u64 = result
+                .rows
+                .first()
+                .and_then(|r| r.first())
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                })
+                .unwrap_or(0);
+            CheckResult {
+                name: "row_count".into(),
+                passed: count > 0,
+                severity: configured,
+                not_evaluated: None,
+                details: CheckDetails::RowCount {
+                    source_count: count,
+                    target_count: count,
+                },
+            }
+        }
+        Err(e) => {
+            rocky_core::checks::row_count_not_evaluated(format!("the row count query failed: {e}"))
+        }
+    }
+}
+
 /// Execute `rocky run` for a quality pipeline.
 ///
 /// Runs data quality checks against the specified tables without any data movement.
@@ -412,8 +465,6 @@ pub async fn run_quality(
     // the reconciler can answer `after`/`freshness` demands on this pipeline.
     pipeline_name: &str,
 ) -> Result<()> {
-    use rocky_core::checks::{CheckDetails, CheckResult};
-
     let start = Instant::now();
 
     let pipes = crate::pipes::PipesEmitter::detect();
@@ -488,46 +539,13 @@ pub async fn run_quality(
 
                 // Row count check
                 if pipeline.checks.row_count.enabled() {
-                    match warehouse_adapter
+                    let queried = warehouse_adapter
                         .execute_query(&format!("SELECT COUNT(*) FROM {full_table}"))
-                        .await
-                    {
-                        Ok(result) => {
-                            let count: u64 = result
-                                .rows
-                                .first()
-                                .and_then(|r| r.first())
-                                .and_then(|v| {
-                                    v.as_u64()
-                                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                                })
-                                .unwrap_or(0);
-                            checks.push(CheckResult {
-                                name: "row_count".into(),
-                                passed: count > 0,
-                                severity: row_count_severity,
-                                not_evaluated: None,
-                                details: CheckDetails::RowCount {
-                                    source_count: count,
-                                    target_count: count,
-                                },
-                            });
-                        }
-                        Err(e) => {
-                            checks.push(CheckResult {
-                                name: "row_count".into(),
-                                passed: false,
-                                severity: row_count_severity,
-                                not_evaluated: None,
-                                details: CheckDetails::Custom {
-                                    query: format!("SELECT COUNT(*) FROM {full_table}"),
-                                    result_value: 0,
-                                    threshold: 1,
-                                },
-                            });
-                            warn!(error = %e, table = %full_table, "row count query failed");
-                        }
+                        .await;
+                    if let Err(e) = &queried {
+                        warn!(error = %e, table = %full_table, "row count query failed");
                     }
+                    checks.push(quality_row_count_check(queried, row_count_severity));
                 }
 
                 // Custom checks — shared with the replication runner (run.rs)
@@ -2420,6 +2438,76 @@ auto_create_schemas = true
         );
         assert!(results[1].passed, "a genuine 0 <= threshold still passes");
         assert!(results[1].not_evaluated.is_none());
+    }
+
+    /// FAILS ON `main` before #1741, the same shape a fourth time, in the
+    /// QUALITY pipeline's `row_count`. Its failure arm was hand-built with
+    /// `not_evaluated: None` and the configured severity, so a
+    /// `severity = "warning"` quality pipeline whose `SELECT COUNT(*)` failed
+    /// produced a warning-severity failure that never reached the error
+    /// bucket, and the run exited 0. Consumers read `not_evaluated: None` as
+    /// "this check ran", and the details said `CheckDetails::Custom` with a
+    /// fabricated `result_value: 0, threshold: 1` for a row-count check.
+    ///
+    /// The query is failed the way it fails in production: the table named in
+    /// the config is not in the database.
+    #[tokio::test]
+    async fn a_quality_row_count_query_that_failed_keeps_error_severity() {
+        use rocky_core::checks::CheckDetails;
+        use rocky_core::tests::TestSeverity;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("quality.duckdb");
+        {
+            let a = DuckDbWarehouseAdapter::open(&db).expect("open");
+            a.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
+                .await
+                .unwrap();
+            a.execute_statement("CREATE TABLE main.present AS SELECT 1 AS id")
+                .await
+                .unwrap();
+        }
+        let warehouse = DuckDbWarehouseAdapter::open(&db).expect("reopen");
+
+        // The table the config names does not exist, so the count query errors.
+        let failed = warehouse
+            .execute_query("SELECT COUNT(*) FROM main.absent")
+            .await;
+        assert!(failed.is_err(), "the fixture must actually fail the query");
+        let check = super::quality_row_count_check(failed, TestSeverity::Warning);
+
+        assert!(!check.passed, "{check:?}");
+        assert_eq!(
+            check.severity,
+            TestSeverity::Error,
+            "declared advisory, but nothing was counted: it gates (#1741): {check:?}"
+        );
+        assert!(
+            check
+                .not_evaluated
+                .as_deref()
+                .is_some_and(|r| r.starts_with("the row count query failed: ")),
+            "carries the reason instead of claiming it ran: {check:?}"
+        );
+        assert!(
+            matches!(check.details, CheckDetails::RowCount { .. }),
+            "a row-count check reports row-count details, not a fabricated \
+             Custom result: {check:?}"
+        );
+
+        // The other half, unchanged: a MEASURED count still reports at the
+        // configured severity.
+        let measured = warehouse
+            .execute_query("SELECT COUNT(*) FROM main.present")
+            .await;
+        let check = super::quality_row_count_check(measured, TestSeverity::Warning);
+        assert!(check.passed, "one row is a pass: {check:?}");
+        assert!(check.not_evaluated.is_none(), "{check:?}");
+        assert_eq!(
+            check.severity,
+            TestSeverity::Warning,
+            "a measured result takes the configured severity: {check:?}"
+        );
     }
 
     /// FAILS ON `main` before #1735: `severity = "warning"` on a
