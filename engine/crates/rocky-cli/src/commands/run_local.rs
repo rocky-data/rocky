@@ -438,6 +438,41 @@ fn quality_row_count_check(
     }
 }
 
+/// Records that a schema-wide quality target could not be EXPANDED, as a
+/// failing check the engine could not evaluate.
+///
+/// A `[[pipeline.x.tables]]` entry with no `table` names a whole schema, and
+/// Rocky enumerates it with `list_tables_sql`. When that SQL cannot be built or
+/// cannot be run, no table is known — so every check for that target is
+/// unevaluated.
+///
+/// Both arms used to `continue` after a `warn!`, emitting NO `CheckResult` at
+/// all. Nothing reached either severity bucket, `error_failures` stayed 0, and
+/// a run that had checked nothing persisted `Success` and exited 0. A dropped
+/// permission or a renamed schema read as a clean bill of health.
+///
+/// `custom_not_evaluated` is the right constructor rather than a
+/// convenience: the list-tables statement genuinely IS a query Rocky could not
+/// evaluate, and the constructor is hard-coded to `TestSeverity::Error`, so
+/// this lands in the error bucket and the existing
+/// `error_failures > 0 && fail_on_error` path fails the run (#1741).
+fn checks_for_unexpandable_target(
+    output: &mut RunOutput,
+    table_ref: &rocky_core::config::TableRef,
+    list_sql: &str,
+    reason: String,
+) {
+    output.check_results.push(TableCheckOutput {
+        asset_key: vec![table_ref.catalog.clone(), table_ref.schema.clone()],
+        checks: vec![rocky_core::checks::custom_not_evaluated(
+            "schema_expansion",
+            list_sql,
+            0,
+            reason,
+        )],
+    });
+}
+
 /// Execute `rocky run` for a quality pipeline.
 ///
 /// Runs data quality checks against the specified tables without any data movement.
@@ -500,7 +535,13 @@ pub async fn run_quality(
                             catalog = table_ref.catalog.as_str(),
                             schema = table_ref.schema.as_str(),
                             error = %e,
-                            "failed to build list-tables SQL — skipping"
+                            "failed to build list-tables SQL"
+                        );
+                        checks_for_unexpandable_target(
+                            &mut output,
+                            table_ref,
+                            "",
+                            format!("could not build the list-tables SQL: {e}"),
                         );
                         continue;
                     }
@@ -516,7 +557,13 @@ pub async fn run_quality(
                             catalog = table_ref.catalog.as_str(),
                             schema = table_ref.schema.as_str(),
                             error = %e,
-                            "failed to list tables in schema — skipping"
+                            "failed to list tables in schema"
+                        );
+                        checks_for_unexpandable_target(
+                            &mut output,
+                            table_ref,
+                            &list_sql,
+                            format!("could not list the tables in this schema: {e}"),
                         );
                         continue;
                     }
@@ -2507,6 +2554,63 @@ auto_create_schemas = true
             check.severity,
             TestSeverity::Warning,
             "a measured result takes the configured severity: {check:?}"
+        );
+    }
+
+    /// #1741 follow-up, found by the independent review of #1780. A
+    /// schema-wide quality target — a `[[pipeline.x.tables]]` entry with no
+    /// `table`, so Rocky enumerates the schema with `list_tables_sql` — used
+    /// to `continue` after a `warn!` when that enumeration failed.
+    ///
+    /// No `CheckResult` was emitted at all, so nothing reached either severity
+    /// bucket, `error_failures` stayed 0, and a run that had checked NOTHING
+    /// persisted `Success` and exited 0. A dropped permission or a renamed
+    /// schema read as a clean bill of health.
+    ///
+    /// Asserted through `check_failures_by_severity`, the same function
+    /// `run_quality` calls to decide `error_failures`, so this pins the number
+    /// that drives the exit code rather than the presence of a struct.
+    #[test]
+    fn a_schema_target_that_cannot_be_expanded_reaches_the_error_bucket() {
+        use crate::output::RunOutput;
+        use rocky_core::tests::TestSeverity;
+
+        let table_ref = rocky_core::config::TableRef {
+            catalog: "cat".into(),
+            schema: "raw".into(),
+            table: None,
+        };
+
+        let mut output = RunOutput::new(String::new(), 0, 0);
+        assert_eq!(
+            output.check_failures_by_severity(),
+            (0, 0),
+            "a run with no targets has nothing in either bucket"
+        );
+
+        super::checks_for_unexpandable_target(
+            &mut output,
+            &table_ref,
+            "SHOW TABLES IN cat.raw",
+            "could not list the tables in this schema: permission denied".to_string(),
+        );
+
+        assert_eq!(
+            output.check_failures_by_severity(),
+            (1, 0),
+            "an unexpandable target is an ERROR-bucket failure, which is what \
+             `error_failures > 0 && fail_on_error` reads to fail the run"
+        );
+
+        let bag = &output.check_results[0];
+        assert_eq!(bag.asset_key, vec!["cat".to_string(), "raw".to_string()]);
+        let check = &bag.checks[0];
+        assert!(!check.passed);
+        assert_eq!(check.severity, TestSeverity::Error);
+        assert_eq!(
+            check.not_evaluated.as_deref(),
+            Some("could not list the tables in this schema: permission denied"),
+            "carries the warehouse's own reason, not a summary"
         );
     }
 
