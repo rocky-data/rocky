@@ -1085,6 +1085,11 @@ mod tests {
     /// from the wire form of a check that ran (#1602). Every such constructor
     /// is also hard-coded to [`TestSeverity::Error`] (#1741) — none of them
     /// takes a severity, so a check that did not run cannot be advisory.
+    ///
+    /// All SEVEN are listed below. Keep them in step with
+    /// `grep -c "^pub fn .*_not_evaluated" checks.rs`: this list said "every
+    /// constructor" while covering six, and the missing one
+    /// (`column_match_not_evaluated`) was found by review, not by the test.
     #[test]
     fn not_evaluated_constructors_fail_and_round_trip_through_json() {
         let cases: Vec<CheckResult> = vec![
@@ -1098,6 +1103,10 @@ mod tests {
                 "the assertion query returned no readable count",
             ),
             custom_not_evaluated("no_dupes", "SELECT 1", 0, "custom check query failed: boom"),
+            // Omitted until the independent review of #1780 caught it: the
+            // test's doc comment claimed to cover EVERY such constructor and
+            // covered six of seven.
+            column_match_not_evaluated("the column list could not be read"),
             cross_source_overlap_not_evaluated(
                 "cross_source_overlap:shopify.orders",
                 vec!["cat.s1.orders".into()],
