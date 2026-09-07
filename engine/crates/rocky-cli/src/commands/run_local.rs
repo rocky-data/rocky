@@ -473,6 +473,36 @@ fn checks_for_unexpandable_target(
     });
 }
 
+/// Brings a quality run's `tables_failed` and `status` into agreement with the
+/// verdict its checks produced, before anything is emitted or persisted.
+///
+/// `RunOutput::derive_run_status` keys only on
+/// `tables_copied`/`tables_failed`/`interrupted` and IGNORES `check_results`,
+/// and nothing else in `run_quality` touches `tables_failed`. So a quality run
+/// with FAILING error-severity checks derived `Success`, and the schedule
+/// reconciler would treat a failed quality gate as a satisfied
+/// `after`/`freshness` demand. This maps the SAME condition the exit code uses
+/// (`error_failures > 0 && fail_on_error`) onto `tables_failed`.
+///
+/// It also stamps `status`, which `run_quality` never derived at all — the
+/// field kept the `RunStatus::Success` that `RunOutput::new` defaults it to,
+/// whatever the checks found.
+///
+/// **Call this before the JSON emit** (#1788). Doing the correction afterwards
+/// left the payload saying `"status": "success"` while the persisted record
+/// said `Failure` and the process exited non-zero — three signals, two of them
+/// right. `status`'s own doc comment promises consumers they "no longer need to
+/// re-derive status from counts themselves", and `rocky-sdk` and
+/// `dagster-rocky` are those consumers. `#1604` governs HOW the payload is
+/// printed (through `print_json`, so `COMPACT_JSON` is honoured), not when it
+/// is built, so nothing there depended on the stale value.
+fn finalize_quality_status(output: &mut RunOutput, error_failures: usize, fail_on_error: bool) {
+    if error_failures > 0 && fail_on_error {
+        output.tables_failed = error_failures;
+    }
+    output.status = output.derive_run_status();
+}
+
 /// Execute `rocky run` for a quality pipeline.
 ///
 /// Runs data quality checks against the specified tables without any data movement.
@@ -674,6 +704,9 @@ pub async fn run_quality(
 
     let (error_failures, warning_failures) = count_failures_by_severity(&output);
 
+    // Called BEFORE the JSON emit below, not after (#1788).
+    finalize_quality_status(&mut output, error_failures, pipeline.checks.fail_on_error);
+
     if output_json {
         // Through `print_json`, not the pretty serializer directly: the watch
         // loop sets `COMPACT_JSON` to promise one compact object per line,
@@ -699,21 +732,6 @@ pub async fn run_quality(
             output.check_results.len(),
             output.duration_ms
         );
-    }
-
-    // Quality status trap: `RunOutput::derive_run_status` keys only on
-    // `tables_copied`/`tables_failed`/`interrupted` and IGNORES `check_results`,
-    // and `run_quality` never touches `tables_failed` — so a quality run with
-    // FAILING error-severity checks would otherwise persist as `Success`, and the
-    // schedule reconciler would treat a failed quality gate as a satisfied
-    // `after`/`freshness` demand. Map the SAME condition the exit code uses
-    // (`error_failures > 0 && fail_on_error`) into `tables_failed` so the
-    // recorded status derives to `Failure` and AGREES with the non-zero exit
-    // below. Done after the JSON emit above so the `--output json` payload is
-    // unchanged — the persisted record, not the payload, carries the corrected
-    // status.
-    if error_failures > 0 && pipeline.checks.fail_on_error {
-        output.tables_failed = error_failures;
     }
 
     // Persist the canonical `RunRecord` (before the failure bail, so a failed
@@ -2555,6 +2573,88 @@ auto_create_schemas = true
             TestSeverity::Warning,
             "a measured result takes the configured severity: {check:?}"
         );
+    }
+
+    /// #1788. A quality run that fails its check gate emitted
+    /// `"status": "success"` in its JSON while the persisted record said
+    /// `Failure` and the process exited non-zero.
+    ///
+    /// Two faults composed. `run_quality` never derived `status` at all, so the
+    /// field kept the `RunStatus::Success` that `RunOutput::new` defaults it
+    /// to; and the `tables_failed` correction ran AFTER the payload was
+    /// already printed. `status`'s doc comment promises consumers they "no
+    /// longer need to re-derive status from counts themselves" — and
+    /// `rocky-sdk` and `dagster-rocky` are those consumers.
+    #[test]
+    fn a_failed_quality_gate_is_stamped_onto_the_payload_not_just_the_record() {
+        use crate::output::{RunOutput, TableCheckOutput};
+        use rocky_core::state::RunStatus;
+
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        output.check_results.push(TableCheckOutput {
+            asset_key: vec!["cat".into(), "raw".into(), "orders".into()],
+            checks: vec![rocky_core::checks::row_count_not_evaluated(
+                "the row count query failed",
+            )],
+        });
+
+        // The default the payload used to ship, whatever the checks found.
+        assert!(matches!(output.status, RunStatus::Success));
+        let (error_failures, _) = super::count_failures_by_severity(&output);
+        assert_eq!(error_failures, 1);
+
+        super::finalize_quality_status(&mut output, error_failures, true);
+
+        assert_eq!(output.tables_failed, 1);
+        assert!(
+            matches!(output.status, RunStatus::Failure),
+            "the emitted payload agrees with the exit code: {:?}",
+            output.status
+        );
+        assert!(
+            matches!(output.derive_run_status(), RunStatus::Failure),
+            "and with what the persisted record derives"
+        );
+    }
+
+    /// The discriminator: `fail_on_error = false` is a documented escape hatch
+    /// that deliberately exits 0, so the payload must keep saying `success`.
+    /// Without this the fix could be "always report Failure when any check
+    /// failed", which would be a different and wrong change.
+    #[test]
+    fn fail_on_error_false_keeps_the_payload_successful() {
+        use crate::output::{RunOutput, TableCheckOutput};
+        use rocky_core::state::RunStatus;
+
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        output.check_results.push(TableCheckOutput {
+            asset_key: vec!["cat".into(), "raw".into(), "orders".into()],
+            checks: vec![rocky_core::checks::row_count_not_evaluated(
+                "the row count query failed",
+            )],
+        });
+
+        super::finalize_quality_status(&mut output, 1, false);
+
+        assert_eq!(output.tables_failed, 0);
+        assert!(
+            matches!(output.status, RunStatus::Success),
+            "{:?}",
+            output.status
+        );
+    }
+
+    /// A clean quality run is unchanged: no failures, `Success`, and the
+    /// stamping does not invent a `tables_failed`.
+    #[test]
+    fn a_clean_quality_run_is_unchanged() {
+        use crate::output::RunOutput;
+        use rocky_core::state::RunStatus;
+
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        super::finalize_quality_status(&mut output, 0, true);
+        assert_eq!(output.tables_failed, 0);
+        assert!(matches!(output.status, RunStatus::Success));
     }
 
     /// #1741 follow-up, found by the independent review of #1780. A
