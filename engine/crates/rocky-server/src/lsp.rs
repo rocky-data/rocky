@@ -757,7 +757,7 @@ impl RockyLsp {
             .project
             .models
             .iter()
-            .find(|m| std::path::Path::new(&m.file_path) == file_path)
+            .find(|m| m.file_path == file_path)
     }
 
     /// Get the word at a cursor position in document text.
@@ -2985,7 +2985,11 @@ pub(crate) fn build_contract_quickfix(
     typed_models: &indexmap::IndexMap<String, Vec<rocky_compiler::types::TypedColumn>>,
 ) -> Option<(TextEdit, String)> {
     // 1. `.rocky` DSL files use a different syntax — skip.
-    if model.file_path.ends_with(".rocky") {
+    // `extension()`, not `ends_with`: on a `Path` the latter compares whole
+    // COMPONENTS, so `.ends_with(".rocky")` is false for
+    // `downstream.rocky` and this skip would silently stop firing
+    // (#1730). It was a substring check while `file_path` was a String.
+    if model.file_path.extension().is_some_and(|e| e == "rocky") {
         return None;
     }
 
@@ -3152,7 +3156,11 @@ pub(crate) fn build_ai_contract_action(
     uri: &tower_lsp::lsp_types::Url,
     diag: &Diagnostic,
 ) -> Option<CodeAction> {
-    if model.file_path.ends_with(".rocky") {
+    // `extension()`, not `ends_with`: on a `Path` the latter compares whole
+    // COMPONENTS, so `.ends_with(".rocky")` is false for
+    // `downstream.rocky` and this skip would silently stop firing
+    // (#1730). It was a substring check while `file_path` was a String.
+    if model.file_path.extension().is_some_and(|e| e == "rocky") {
         return None;
     }
 

@@ -926,8 +926,8 @@ mod tests {
         let edited = models_dir.join("m00.sql");
         std::fs::write(&edited, "SELECT 1 AS id, 2 AS qty\n").expect("rewrite m00");
 
-        let incremental =
-            compile_incremental(&config, &[edited.clone()], &first).expect("incremental");
+        let incremental = compile_incremental(&config, std::slice::from_ref(&edited), &first)
+            .expect("incremental");
         let scratch = compile(&config).expect("from-scratch compile");
 
         assert_eq!(
@@ -983,11 +983,12 @@ mod tests {
         // component as U+FFFD and the round-trip cannot recover it.
         let models_dir = tmp.path().join(OsString::from_vec(b"models_\xff".to_vec()));
         if let Err(e) = std::fs::create_dir_all(&models_dir) {
-            assert!(
-                !cfg!(target_os = "linux"),
-                "linux must be able to create a non-UTF-8 directory; without it \
-                 this test asserts nothing: {e}"
-            );
+            if cfg!(target_os = "linux") {
+                panic!(
+                    "linux must be able to create a non-UTF-8 directory; \
+                     without it this test asserts nothing: {e}"
+                );
+            }
             return;
         }
 
@@ -1019,8 +1020,8 @@ mod tests {
         let edited = models_dir.join("m00.sql");
         std::fs::write(&edited, "SELECT 1 AS id, 2 AS qty\n").expect("rewrite m00");
 
-        let incremental =
-            compile_incremental(&config, &[edited.clone()], &first).expect("incremental");
+        let incremental = compile_incremental(&config, std::slice::from_ref(&edited), &first)
+            .expect("incremental");
         let scratch = compile(&config).expect("from-scratch compile");
 
         assert_eq!(
