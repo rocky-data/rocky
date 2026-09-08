@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ListAdapterEntry": {
+      "properties": {
+        "adapter_type": {
+          "type": "string"
+        },
+        "host": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "adapter_type",
+        "name"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky list adapters`.",
+  "properties": {
+    "adapters": {
+      "items": {
+        "$ref": "#/definitions/ListAdapterEntry"
+      },
+      "type": "array"
+    },
+    "command": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "adapters",
+    "command",
+    "version"
+  ],
+  "title": "ListAdaptersOutput",
+  "type": "object"
+}
