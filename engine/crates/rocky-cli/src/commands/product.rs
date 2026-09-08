@@ -536,15 +536,52 @@ pub(crate) fn check_product_collisions(
             ),
         ));
     }
+    // A scan that cannot LIST the other products cannot clear this one. Every
+    // fold below used to answer "no collision" for a reading nobody took:
+    // `read_dir` failing for any reason returned `Ok(())`; `.flatten()`
+    // dropped an entry that errored; `is_dir()` dropped a state dir that
+    // could not be stat-ed; `is_file()` dropped a manifest that could not be.
+    // `rocky product verify` then reported PASS and compile proceeded with
+    // duplicate output ownership (#1817). Only a PROVEN absence — no
+    // fulfillment dir yet, no manifest in a peer — is a clean answer.
     let fulfillment_root = project_root.join(".rocky").join("fulfillment");
-    let Ok(entries) = std::fs::read_dir(&fulfillment_root) else {
-        return Ok(());
+    let unreadable = |path: &Path, why: &str| {
+        SpecRejected::new(
+            "fulfillment-dir-unreadable",
+            format!(
+                "{} cannot be read: {why}. The collision check cannot see the other \
+                 products, so it cannot clear this one.",
+                path.display()
+            ),
+        )
     };
-    let mut state_dirs: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .collect();
+    let entries = match std::fs::read_dir(&fulfillment_root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            match rocky_core::path_presence::classify_not_found(&fulfillment_root) {
+                rocky_core::path_presence::PathPresence::Absent => return Ok(()),
+                rocky_core::path_presence::PathPresence::Present { detail } => {
+                    return Err(unreadable(&fulfillment_root, &detail));
+                }
+            }
+        }
+        Err(err) => return Err(unreadable(&fulfillment_root, &err.to_string())),
+    };
+    let mut state_dirs: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| unreadable(&fulfillment_root, &err.to_string()))?;
+        let path = entry.path();
+        // A state dir may legitimately be a symlink (an operator relocating
+        // storage), so the directory test follows it — but a link that does
+        // not resolve, or an entry that cannot be stat-ed, is not "not a
+        // directory": it is a peer this scan cannot see.
+        let is_dir = std::fs::metadata(&path)
+            .map_err(|err| unreadable(&path, &err.to_string()))?
+            .is_dir();
+        if is_dir {
+            state_dirs.push(path);
+        }
+    }
     state_dirs.sort();
     for state_dir in state_dirs {
         let dir_name = state_dir
@@ -555,15 +592,24 @@ pub(crate) fn check_product_collisions(
             continue;
         }
         let other_manifest_path = state_dir.join(MANIFEST_FILENAME);
-        if !other_manifest_path.is_file() {
-            continue;
-        }
-        let raw = std::fs::read(&other_manifest_path).map_err(|err| {
+        let manifest_unreadable = |why: &str| {
             SpecRejected::new(
                 "manifest-unreadable",
-                format!("{} is unreadable: {err}", other_manifest_path.display()),
+                format!("{} is unreadable: {why}", other_manifest_path.display()),
             )
-        })?;
+        };
+        let raw = match std::fs::read(&other_manifest_path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                match rocky_core::path_presence::classify_not_found(&other_manifest_path) {
+                    rocky_core::path_presence::PathPresence::Absent => continue,
+                    rocky_core::path_presence::PathPresence::Present { detail } => {
+                        return Err(manifest_unreadable(&detail));
+                    }
+                }
+            }
+            Err(err) => return Err(manifest_unreadable(&err.to_string())),
+        };
         let other = Manifest::from_json_bytes(&raw)?;
         if other.output_model == parsed.output_model() {
             return Err(SpecRejected::new(
@@ -2667,6 +2713,73 @@ effect = "require_review"
             .expect("clean");
     }
 
+    /// #1817: a fulfillment dir the process cannot LIST is not "no other
+    /// products". `let Ok(entries) = read_dir(..) else { return Ok(()) }`
+    /// cleared the product on a reading nobody took, and `rocky product
+    /// verify` reported PASS. Skips when the process can read through mode
+    /// 000 (root), because then the condition was never built.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_fulfillment_dir_refuses_the_collision_check() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        let fulfillment = root.join(".rocky").join("fulfillment");
+        std::fs::create_dir_all(&fulfillment).expect("mkdir");
+        std::fs::set_permissions(&fulfillment, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod");
+
+        let reproduced = std::fs::read_dir(&fulfillment).is_err();
+        let result = check_product_collisions(&root, &parsed_d3(), "products/revenue_daily.toml");
+        std::fs::set_permissions(&fulfillment, std::fs::Permissions::from_mode(0o755)).ok();
+
+        if !reproduced {
+            eprintln!("skipping: this process can list a mode-000 directory");
+            return;
+        }
+        let error = result.expect_err("a scan that cannot list the peers cannot clear this one");
+        assert_eq!(error.code, "fulfillment-dir-unreadable", "{error}");
+        assert!(error.message.contains("cannot be read"), "{error}");
+    }
+
+    /// The ancestor shape of the same defect: `.rocky/fulfillment` is a
+    /// symlink to nowhere. `read_dir` reports `NotFound`, which the old scan
+    /// read as "no fulfillment dir yet" — but an entry IS there.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_fulfillment_dir_refuses_the_collision_check() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        let rocky = root.join(".rocky");
+        std::fs::create_dir_all(&rocky).expect("mkdir");
+        std::os::unix::fs::symlink(dir.path().join("gone"), rocky.join("fulfillment"))
+            .expect("symlink");
+
+        let error = check_product_collisions(&root, &parsed_d3(), "products/revenue_daily.toml")
+            .expect_err("a dangling fulfillment dir is present, not absent");
+        assert_eq!(error.code, "fulfillment-dir-unreadable", "{error}");
+        assert!(error.message.contains("cannot be resolved"), "{error}");
+    }
+
+    /// A peer whose manifest is a dangling symlink is a peer this scan cannot
+    /// see — `is_file()` answered false and the peer was skipped as if it
+    /// claimed nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_peer_with_a_dangling_manifest_refuses_the_collision_check() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        let peer = root.join(state_dir_rel("other_product"));
+        std::fs::create_dir_all(&peer).expect("mkdir");
+        std::os::unix::fs::symlink(dir.path().join("gone"), peer.join(MANIFEST_FILENAME))
+            .expect("symlink");
+
+        let error = check_product_collisions(&root, &parsed_d3(), "products/revenue_daily.toml")
+            .expect_err("an unreadable peer manifest cannot be read as 'claims nothing'");
+        assert_eq!(error.code, "manifest-unreadable", "{error}");
+    }
+
     #[test]
     fn collision_check_reads_the_layout_lower_writes() {
         // Guard the seam: the collision check must read the same
@@ -4053,6 +4166,36 @@ effect = "require_review"
         assert!(
             text.contains("cannot be read"),
             "the refusal must say the store could not be read, got: {text}"
+        );
+    }
+
+    /// #1817: the same store under a DANGLING ancestor. `metadata` reports
+    /// `NotFound` — and so did the leaf-only discriminator, because
+    /// `symlink_metadata(state.redb)` fails the same way under a broken
+    /// parent. The store read as "no store yet" and status reported a healthy
+    /// product that had never run. No root caveat: a dangling link needs no
+    /// permissions to build.
+    #[cfg(unix)]
+    #[test]
+    fn a_state_store_under_a_dangling_ancestor_refuses_instead_of_reporting_an_empty_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, config) = project_with_config(dir.path(), &passing_config());
+        product_compile_in(&root, &config, None, "revenue_daily").expect("phase A");
+
+        let state_home = dir.path().join("state-home");
+        std::os::unix::fs::symlink(dir.path().join("gone"), &state_home).expect("symlink");
+        let store = state_home.join("state.redb");
+        assert!(
+            std::fs::metadata(&store).is_err() && std::fs::symlink_metadata(&store).is_err(),
+            "precondition: both probes the old code trusted report the store missing"
+        );
+
+        let err = product_status_in(&root, Some(&store), "revenue_daily")
+            .expect_err("a store under a dangling ancestor is not an absent store");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("cannot be read") && text.contains("cannot be resolved"),
+            "the refusal must name the broken ancestor, got: {text}"
         );
     }
 }
