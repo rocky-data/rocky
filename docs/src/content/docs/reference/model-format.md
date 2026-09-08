@@ -381,7 +381,9 @@ type = "row_count_range"
 min = 1
 ```
 
-`filter` and `expression` are user-supplied SQL passed through verbatim, so treat them with the same trust as any SQL you run against the warehouse.
+`expression` is bounded. Rocky parses it under the target dialect and refuses anything that is not one boolean expression over the model's own columns: a subquery, a qualified function name (`schema.fn(...)`), or a function outside its allowlist of pure scalar functions is refused when the test SQL is generated, before anything runs. Comparisons, `CASE`, `CAST`, and functions such as `coalesce`, `length`, `lower` and `date_trunc` pass; anything that can read a file, a secret, session state or a remote endpoint does not. The refusal names the function.
+
+`filter` is not bounded. It is passed through verbatim, so treat it with the same trust as any SQL you run against the warehouse.
 
 ### `[[use_test]]`
 
