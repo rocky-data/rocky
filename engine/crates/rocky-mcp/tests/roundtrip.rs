@@ -2253,6 +2253,49 @@ async fn draft_check_rejects_smuggled_sidecar_config() {
     client.cancel().await.unwrap();
 }
 
+/// #1524: an `expression` check that reaches outside the row is refused at
+/// AUTHORING time, before the sidecar write — not committed and refused
+/// later at `rocky test`. A DuckDB `read_text` sits in scalar position and
+/// passes every structural gate; only the content boundary catches it.
+/// The sidecar must be byte-identical afterwards, and the refusal must
+/// name the function so the agent can act on it.
+#[tokio::test]
+async fn draft_check_rejects_an_unbounded_expression_before_the_write() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let before = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    let spec = "[[tests]]\ntype = \"expression\"\n\
+                expression = \"read_text('/etc/passwd') IS NULL\"\n";
+    let args = serde_json::json!({ "model": "orders", "spec": spec })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .expect("draft_check call");
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "an expression calling a read primitive is an error"
+    );
+    let err = result.structured_content.expect("structured envelope");
+    assert_eq!(err["code"], serde_json::json!("invalid_argument"));
+    assert!(
+        err["message"].as_str().unwrap().contains("read_text"),
+        "the refused function is named: {err:?}"
+    );
+
+    let after = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    assert_eq!(after, before, "a refused expression writes nothing");
+
+    client.cancel().await.unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // draft_metadata (FF-WP1)
 // ---------------------------------------------------------------------------

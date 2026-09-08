@@ -1163,6 +1163,53 @@ target = { catalog = "c", schema = "s", table = "t" }
         assert!(err.to_string().contains("expression"));
     }
 
+    /// The content boundary (#1524) is WIRED into the generator, not only
+    /// defined in `rocky_sql::check_expression`. Each case is one refusal
+    /// class; the generator must surface it as a `TestGenError`, which is
+    /// what makes a refused check visible in the executed/deferred counts
+    /// instead of running. The last case proves an ordinary predicate
+    /// still generates — a boundary that refuses the ordinary case is a
+    /// bug, not a control.
+    #[test]
+    fn test_expression_content_boundary_is_wired() {
+        let decl = |expression: &str| TestDecl {
+            test_type: TestType::Expression {
+                expression: expression.into(),
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        for (expression, must_mention) in [
+            ("read_text('/etc/passwd') IS NULL", "read_text"),
+            ("amount > (SELECT max(amount) FROM other)", "subquery"),
+            ("project.dataset.remote_fn(amount) IS NULL", "qualified"),
+            ("amount > 0) OR 1=1 --", "past the end"),
+        ] {
+            let err = generate_test_sql(&decl(expression), "orders")
+                .expect_err(&format!("{expression} must be refused at generation"));
+            assert!(
+                err.to_string().contains(must_mention),
+                "{expression}: the refusal must say why — got: {err}"
+            );
+        }
+        // Dialect is threaded: the same DuckDB read primitive is refused
+        // under the DuckDB parser, not only the generic one.
+        let duck = rocky_sql::check_expression::dialect_for("duckdb");
+        assert!(
+            rocky_sql::check_expression::validate_check_expression(
+                "ctx",
+                "read_text('/etc/passwd') IS NULL",
+                duck.as_ref()
+            )
+            .is_err()
+        );
+        assert_eq!(
+            generate_test_sql(&decl("coalesce(amount, 0) >= 0"), "orders").unwrap(),
+            "SELECT COUNT(*) FROM orders WHERE NOT (coalesce(amount, 0) >= 0)"
+        );
+    }
+
     #[test]
     fn test_row_count_range_no_bounds() {
         let decl = TestDecl {
