@@ -122,6 +122,46 @@ def test_check_metadata_surfaces_advisory_severity():
     assert check_metadata(failing)["severity"].value == "warning"
 
 
+def test_passing_unmeasured_check_shows_the_reason_beside_the_severity():
+    """The #1785 shape: ``passed=True`` *and* ``not_evaluated`` set.
+
+    ``cross_source_overlap_not_applicable`` is the one constructor that reports
+    a passing check carrying a not-evaluated reason, and it takes the
+    operator's configured severity. So a viewer sees ``severity: warning`` for
+    a group Rocky never measured.
+
+    That reads wrong only if the severity stands alone. Both fields must be
+    present, because each answers a different question:
+
+        severity      is this check advisory?      configured intent
+        not_evaluated did this check measure?      what actually happened
+
+    Together they are accurate; either alone is not. This pins the pair, which
+    is what nothing asserted before — the existing not-evaluated coverage is
+    the ``passed=False`` / ``severity="error"`` shape.
+    """
+    check = CheckResult(
+        name="cross_source_overlap",
+        passed=True,
+        severity="warning",
+        overlap_count=0,
+        not_evaluated="only one sibling declares a key, so no overlap was computed",
+    )
+    metadata = check_metadata(check)
+
+    assert "not_evaluated" in metadata, (
+        "a passing check that measured nothing must still say so; without this "
+        "the severity is the only thing a reader sees"
+    )
+    assert "only one sibling declares a key" in metadata["not_evaluated"].value
+    assert metadata["severity"].value == "warning"
+
+    # And the severity mapping is unchanged by it: an unmeasured advisory check
+    # stays WARN, so it does not degrade asset health on the strength of a
+    # reading nobody took.
+    assert dagster_check_severity(check) == dg.AssetCheckSeverity.WARN
+
+
 def test_check_metadata_omits_default_error_severity():
     """The implicit ``error`` default is not surfaced — it would clutter every
     check's panel with no added signal."""
