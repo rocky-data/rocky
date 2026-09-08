@@ -1847,10 +1847,17 @@ fn sql_type_to_rocky(dt: &ast::DataType) -> RockyType {
                 precision: *p as u8,
                 scale: 0,
             },
-            ast::ExactNumberInfo::None => RockyType::Decimal {
-                precision: 38,
-                scale: 0,
-            },
+            // A bare `DECIMAL` / `NUMERIC` names no digits, so Rocky does
+            // not know the type — the same answer `warehouse_type_to_rocky`
+            // gives for the bare string since #1646. Guessing (38,0) here
+            // was the third normaliser reading one column differently from
+            // the other two, and it is what made a CAST able to manufacture
+            // a passing contract check (#1721).
+            //
+            // `Precision(p)` above is NOT a guess: SQL defines DECIMAL(p) as
+            // DECIMAL(p, 0), so the scale is stated by the standard rather
+            // than invented here.
+            ast::ExactNumberInfo::None => RockyType::Unknown,
         },
         ast::DataType::Varchar(_)
         | ast::DataType::Char(_)
@@ -2469,6 +2476,52 @@ mod tests {
     use crate::project::Project;
     use crate::semantic::build_semantic_graph;
     use rocky_core::models::{Model, ModelConfig, StrategyConfig, TargetConfig};
+
+    /// The decimal arms of the THIRD normaliser (#1721).
+    ///
+    /// Rocky has three type normalisers and this one had drifted: a bare
+    /// `DECIMAL` / `NUMERIC` became `Decimal(38,0)` here while
+    /// `warehouse_type_to_rocky` had returned `Unknown` for the same bare
+    /// string since #1646. One typecheck pass therefore read one column two
+    /// ways depending on which side it arrived from, and a `CAST(x AS
+    /// NUMERIC)` could manufacture a passing contract check.
+    ///
+    /// No test covered this arm before, which is why the drift survived two
+    /// issues about it. Stated as a table so a future edit has to disagree
+    /// with the standard explicitly.
+    #[test]
+    fn bare_decimal_is_unknown_while_stated_digits_stay_concrete() {
+        use sqlparser::ast::{DataType, ExactNumberInfo};
+
+        // A bare name states no digits, so it is not a type Rocky knows.
+        assert_eq!(
+            sql_type_to_rocky(&DataType::Numeric(ExactNumberInfo::None)),
+            RockyType::Unknown,
+            "bare NUMERIC must not become a made-up decimal"
+        );
+        assert_eq!(
+            sql_type_to_rocky(&DataType::Decimal(ExactNumberInfo::None)),
+            RockyType::Unknown,
+            "bare DECIMAL must not become a made-up decimal"
+        );
+
+        // DECIMAL(p) is DECIMAL(p, 0) by the SQL standard — stated, not
+        // guessed, so it stays concrete.
+        assert_eq!(
+            sql_type_to_rocky(&DataType::Decimal(ExactNumberInfo::Precision(10))),
+            RockyType::Decimal {
+                precision: 10,
+                scale: 0
+            }
+        );
+        assert_eq!(
+            sql_type_to_rocky(&DataType::Numeric(ExactNumberInfo::PrecisionAndScale(38, 9))),
+            RockyType::Decimal {
+                precision: 38,
+                scale: 9
+            }
+        );
+    }
 
     fn make_model(name: &str, sql: &str) -> Model {
         Model {
