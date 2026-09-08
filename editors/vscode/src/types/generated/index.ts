@@ -348,3 +348,8 @@ export type { ProductJournalOutput, ProductJournalEntry } from "./product_journa
 export type { SnapshotOutput, SnapshotStepOutput } from "./snapshot";
 // `rocky docs` — generated project documentation.
 export type { DocsOutput } from "./docs";
+// `rocky list <pipelines|adapters|models|sources>` — project inventory (#1760).
+export type { ListPipelinesOutput, ListPipelineEntry } from "./list_pipelines";
+export type { ListAdaptersOutput, ListAdapterEntry } from "./list_adapters";
+export type { ListModelsOutput, ListModelEntry } from "./list_models";
+export type { ListSourcesOutput, ListSourceEntry } from "./list_sources";

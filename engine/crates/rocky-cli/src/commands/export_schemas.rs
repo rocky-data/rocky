@@ -171,6 +171,15 @@ pub(crate) fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         // `--output json` payload is covered (#1699).
         entry::<crate::output::SnapshotOutput>("snapshot"),
         entry::<crate::output::DocsOutput>("docs"),
+        // The four `rocky list` verbs, missing for the same reason and found
+        // the same way — except mechanically this time, by the roots test
+        // below rather than by reading the roster (#1760). Each is printed
+        // through `print_json` in `commands/list.rs`, so each is a real
+        // `--output json` surface that had no schema and no bindings.
+        entry::<crate::output::ListPipelinesOutput>("list_pipelines"),
+        entry::<crate::output::ListAdaptersOutput>("list_adapters"),
+        entry::<crate::output::ListModelsOutput>("list_models"),
+        entry::<crate::output::ListSourcesOutput>("list_sources"),
         // Plan/apply spine (Cluster 3 B, Phase 2–3)
         entry::<ApplyOutput>("apply"),
         entry::<PromotePlan>("plan_promote"),
