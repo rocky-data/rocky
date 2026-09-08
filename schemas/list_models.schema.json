@@ -1,0 +1,57 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ListModelEntry": {
+      "properties": {
+        "depends_on": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "has_contract": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "strategy": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "depends_on",
+        "has_contract",
+        "name",
+        "strategy",
+        "target"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky list models`.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "models": {
+      "items": {
+        "$ref": "#/definitions/ListModelEntry"
+      },
+      "type": "array"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "models",
+    "version"
+  ],
+  "title": "ListModelsOutput",
+  "type": "object"
+}

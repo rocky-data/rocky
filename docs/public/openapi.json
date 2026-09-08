@@ -10048,6 +10048,225 @@
         ],
         "type": "object"
       },
+      "ListAdapterEntry": {
+        "properties": {
+          "adapter_type": {
+            "type": "string"
+          },
+          "host": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "adapter_type",
+          "name"
+        ],
+        "type": "object"
+      },
+      "ListAdaptersOutput": {
+        "description": "JSON output for `rocky list adapters`.",
+        "properties": {
+          "adapters": {
+            "items": {
+              "$ref": "#/components/schemas/ListAdapterEntry"
+            },
+            "type": "array"
+          },
+          "command": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "adapters",
+          "command",
+          "version"
+        ],
+        "type": "object"
+      },
+      "ListModelEntry": {
+        "properties": {
+          "depends_on": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "has_contract": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "strategy": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "depends_on",
+          "has_contract",
+          "name",
+          "strategy",
+          "target"
+        ],
+        "type": "object"
+      },
+      "ListModelsOutput": {
+        "description": "JSON output for `rocky list models`.",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/ListModelEntry"
+            },
+            "type": "array"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "models",
+          "version"
+        ],
+        "type": "object"
+      },
+      "ListPipelineEntry": {
+        "properties": {
+          "concurrency": {
+            "type": "string"
+          },
+          "depends_on": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          },
+          "pipeline_type": {
+            "type": "string"
+          },
+          "source_adapter": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target_adapter": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "concurrency",
+          "depends_on",
+          "name",
+          "pipeline_type",
+          "target_adapter"
+        ],
+        "type": "object"
+      },
+      "ListPipelinesOutput": {
+        "description": "JSON output for `rocky list pipelines`.",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "pipelines": {
+            "items": {
+              "$ref": "#/components/schemas/ListPipelineEntry"
+            },
+            "type": "array"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "pipelines",
+          "version"
+        ],
+        "type": "object"
+      },
+      "ListSourceEntry": {
+        "properties": {
+          "adapter": {
+            "type": "string"
+          },
+          "catalog": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "components": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "discovery_adapter": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pipeline": {
+            "type": "string"
+          },
+          "schema_prefix": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "adapter",
+          "components",
+          "pipeline"
+        ],
+        "type": "object"
+      },
+      "ListSourcesOutput": {
+        "description": "JSON output for `rocky list sources`.",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/ListSourceEntry"
+            },
+            "type": "array"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "sources",
+          "version"
+        ],
+        "type": "object"
+      },
       "LoadFileFormat": {
         "description": "File format for load pipelines, parsed from TOML.\n\nMirrors `rocky_adapter_sdk::FileFormat` but lives in rocky-core to avoid a hard dependency from config parsing to the adapter SDK.",
         "enum": [
