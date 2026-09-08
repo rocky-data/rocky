@@ -163,12 +163,23 @@ pub fn validate_contract(
                                     contract_col.name, expected_type
                                 ),
                             )
+                            // Do NOT suggest a CAST here. `infer_expr_type`'s
+                            // cast arm takes the type purely from the target
+                            // (`sql_type_to_rocky(data_type)`, typecheck.rs);
+                            // only `nullable` reads the input expression. So a
+                            // CAST silences this diagnostic whatever the value
+                            // really is — and for a bare decimal target it
+                            // resolves to Decimal(38,0), the exact fabricated
+                            // type #1646 removed from the load gate. Advice
+                            // that manufactures the answer is worse than no
+                            // advice (#1721).
                             .with_suggestion(format!(
                                 "give `rocky compile` source schemas so `{0}`'s type resolves — \
                                  `rocky discover --with-schemas` fills the cache, or use \
                                  `rocky compile --with-seed`; `rocky test` and `rocky ci` always \
-                                 compile without them. A CAST to {1} only helps when the value it \
-                                 casts already has a known type",
+                                 compile without them. Do not add a CAST to silence this: a cast \
+                                 takes its type from the target, so it would report {1} whatever \
+                                 the column actually holds",
                                 contract_col.name, expected_type
                             )),
                         );
