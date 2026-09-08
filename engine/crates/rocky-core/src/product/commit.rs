@@ -3971,6 +3971,111 @@ mod tests {
         );
     }
 
+    /// A refusal that fires MID-LOOP, after an earlier entry was already
+    /// restored, leaves a state the next run handles correctly — and the run
+    /// after the operator fixes the file finishes the rollback.
+    ///
+    /// The independent review of this fix traced the replay by hand and
+    /// asked for executable evidence, because the other two tests put the
+    /// offending entry first, so nothing had been mutated when they refused.
+    /// Producer-generated journals carry one artifact plus the manifest, so
+    /// this shape needs a forged-but-permissible journal: the contract
+    /// (restored from its backup on the first pass) ahead of the sidecar
+    /// (unreadable, refuses).
+    ///
+    ///   run 1: contract restored from .ff-prev, sidecar refuses, journal kept
+    ///   run 2: contract has no backup left -> untouched; sidecar refuses again
+    ///   run 3: sidecar readable -> identified as this generation's -> removed;
+    ///          journal deleted; RolledBack
+    #[cfg(unix)]
+    #[test]
+    fn a_mid_loop_refusal_replays_without_touching_the_restored_entry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: `geteuid` is an always-safe libc call with no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).expect("mkdir");
+        let parsed = parsed_d3();
+
+        // Entry 1: a contract with a journal-recorded backup.
+        let contract = contract_rel(&parsed);
+        let contract_final = project.join(&contract);
+        std::fs::create_dir_all(contract_final.parent().expect("parent")).expect("mkdir");
+        write_file(&contract_final, b"new-generation contract");
+        let backup = prev_sibling(&contract_final);
+        write_file(&backup, b"previous contract");
+
+        // Entry 2: a brand-new sidecar the process cannot read.
+        let sidecar = sidecar_rel(&parsed);
+        let sidecar_final = project.join(&sidecar);
+        std::fs::create_dir_all(sidecar_final.parent().expect("parent")).expect("mkdir");
+        write_file(&sidecar_final, b"new-generation sidecar");
+        std::fs::set_permissions(&sidecar_final, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod");
+
+        // No manifest final: the commit never happened, so this rolls back.
+        let journal = write_journal(
+            &project,
+            "revenue_daily",
+            &forged_journal_payload(&[
+                serde_json::json!({
+                    "final": contract,
+                    "staged_sha": content_digest(b"new-generation contract"),
+                    "has_prev": true,
+                }),
+                serde_json::json!({
+                    "final": sidecar,
+                    "staged_sha": content_digest(b"new-generation sidecar"),
+                    "has_prev": false,
+                }),
+            ]),
+        );
+
+        // Run 1: the contract is restored, then the sidecar refuses.
+        let first = recover_generation(&project, &parsed).expect_err("run 1 refuses");
+        assert_eq!(first.code, "commit-io", "{first}");
+        assert_eq!(
+            std::fs::read(&contract_final).expect("restored"),
+            b"previous contract",
+            "the entry BEFORE the refusal was restored from its backup"
+        );
+        assert!(!backup.exists(), "the backup was consumed by the restore");
+        assert!(journal.is_file(), "the journal survives the refusal");
+
+        // Run 2: nothing further happens to the restored entry; the same
+        // refusal fires again. This is the replay the review traced by hand.
+        let second = recover_generation(&project, &parsed).expect_err("run 2 refuses");
+        assert_eq!(second.code, "commit-io", "{second}");
+        assert_eq!(
+            std::fs::read(&contract_final).expect("still restored"),
+            b"previous contract",
+            "the restored entry is left exactly as run 1 left it"
+        );
+        assert!(journal.is_file());
+
+        // Run 3: the operator fixed the file; recovery finishes the rollback.
+        std::fs::set_permissions(&sidecar_final, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod back");
+        let action = recover_generation(&project, &parsed).expect("run 3 completes");
+        assert_eq!(action, RecoveryAction::RolledBack);
+        assert!(
+            !sidecar_final.exists(),
+            "the now-identified brand-new sidecar is removed"
+        );
+        assert_eq!(
+            std::fs::read(&contract_final).expect("intact"),
+            b"previous contract"
+        );
+        assert!(
+            !journal.exists(),
+            "a completed rollback retires the journal"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn forged_journal_with_symlink_escape_is_refused() {
