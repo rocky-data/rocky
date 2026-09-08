@@ -1155,15 +1155,24 @@ required_columns = [
         );
     }
 
-    /// A column that lands with a type outside Rocky's type map (DuckDB sniffs
-    /// `12:34:56` as `TIME`, which `warehouse_type_to_rocky` does not know)
-    /// still promotes, and the gate result says the declared type was not
-    /// checked, naming the column and both types (#1614). Exercises the whole
-    /// path: COPY into staging, live `DESCRIBE`, `validate_contract_typed`,
-    /// promote.
+    /// A column that lands with a type outside Rocky's type map REFUSES the
+    /// load (#1721). DuckDB sniffs `12:34:56` as `TIME`, which
+    /// `warehouse_type_to_rocky` does not know, so the gate cannot say
+    /// whether it satisfies the declared `TIMESTAMP` — and an unanswered
+    /// question must not promote staging.
+    ///
+    /// This is the end-to-end proof for the whole change: COPY into staging,
+    /// live `DESCRIBE`, `validate_contract_typed`, then the refusal path that
+    /// drops staging and leaves the target absent. The unit tests in
+    /// `rocky-core` assert the verdict; this one asserts the DATA never
+    /// lands, which is the property that actually matters.
+    ///
+    /// Until #1614 the landed type was fabricated; #1614 stopped inventing
+    /// it and #1646 removed the last fabrication, which left this column
+    /// promoted on no comparison at all.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
-    async fn test_contract_gate_reports_a_landed_type_it_cannot_compare() {
+    async fn test_contract_gate_refuses_a_landed_type_it_cannot_compare() {
         use rocky_core::contracts::ContractConfig;
         use rocky_duckdb::DuckDbConnector;
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
@@ -1206,23 +1215,36 @@ required_columns = [
             ..LoadOptions::default()
         };
 
-        let (rows, _bytes, result) =
-            load_with_contract_gate(&loader, &wh, &source, &target, &options, &contract)
-                .await
-                .expect("an uncomparable type is reported, not refused");
-        assert_eq!(rows, 1);
-        let result = result.expect("gate result should be present");
-        assert!(result.passed, "violations: {:?}", result.violations);
-        assert_eq!(
-            result.warnings.len(),
-            1,
-            "one warning for the one unchecked column: {:?}",
-            result.warnings
-        );
-        let w = &result.warnings[0];
+        let err = load_with_contract_gate(&loader, &wh, &source, &target, &options, &contract)
+            .await
+            .expect_err("an uncomparable landed type must refuse the load");
+
+        // The consequence first: no rows reached the target. A refusal that
+        // still promotes is the defect, so this fails before any message
+        // assertion can pass it.
+        let landed_target = wh.describe_table(&to_ir_table_ref(&target)).await;
         assert!(
-            w.contains("'at'") && w.contains("'TIME'") && w.contains("'TIMESTAMP'"),
-            "the warning must name the column, the landed type and the declared type: {w}"
+            landed_target.map(|c| c.is_empty()).unwrap_or(true),
+            "the gate refused, so the target must not have been created or promoted"
+        );
+
+        let gate = err
+            .downcast_ref::<ContractGateError>()
+            .expect("the refusal must be a contract-gate error");
+        assert!(!gate.0.passed);
+        let v = gate
+            .0
+            .violations
+            .iter()
+            .find(|v| v.column == "at")
+            .expect("violations: the uncomparable column must be named");
+        assert_eq!(v.rule, "unverifiable_landed_type");
+        assert!(
+            v.message.contains("'at'")
+                && v.message.contains("'TIME'")
+                && v.message.contains("'TIMESTAMP'"),
+            "the refusal must name the column, the landed type and the declared type: {}",
+            v.message
         );
     }
 
