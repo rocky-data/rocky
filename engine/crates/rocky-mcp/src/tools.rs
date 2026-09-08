@@ -4584,6 +4584,9 @@ impl RockyMcpServer {
         // bare top-level key) smuggled alongside a valid `[[tests]]` block is
         // rejected instead of being appended verbatim into the model's sidecar.
         validate_check_spec(&spec)?;
+        // Content gate for `expression` checks (#1524): refuse a bad
+        // expression when it is WRITTEN, not when it is later run.
+        validate_check_spec_expressions(&spec)?;
         let paths = self.resolve_draft_paths(&args.model)?;
         if !self.model_source_exists(&paths.stem) {
             return Err(ToolError::model_not_found(&paths.stem));
@@ -7312,6 +7315,61 @@ fn validate_check_spec(spec: &str) -> Result<(), Json<ToolError>> {
                  column = \"id\"",
             ));
         }
+    }
+    Ok(())
+}
+
+/// Content gate for the `expression` checks in a `draft_check` spec (#1524).
+///
+/// Applies the same boundary `rocky test` enforces at generation time —
+/// one boolean expression, no subquery, no qualified function, only
+/// allowlisted pure scalar functions — but BEFORE the sidecar write, so an
+/// expression that can never run is refused at authoring time with the
+/// reason, rather than committed and refused later. Direct file writers
+/// bypass this tool entirely; the generation-time check is the backstop
+/// for them.
+///
+/// Parses under the generic dialect: the MCP server does not resolve the
+/// target warehouse here. A broader dialect can only accept MORE syntax,
+/// and acceptance still has to clear the function and subquery walk.
+fn validate_check_spec_expressions(spec: &str) -> Result<(), Json<ToolError>> {
+    // `validate_check_spec` already proved this parses and holds a `tests`
+    // array; a second parse is cheaper than threading the table through.
+    let Ok(parsed) = toml::from_str::<toml::Table>(spec) else {
+        return Ok(());
+    };
+    let Some(tests) = parsed.get("tests").and_then(toml::Value::as_array) else {
+        return Ok(());
+    };
+    let dialect = rocky_sql::check_expression::dialect_for("generic");
+    for (index, test) in tests.iter().enumerate() {
+        let Some(table) = test.as_table() else {
+            continue;
+        };
+        if table.get("type").and_then(toml::Value::as_str) != Some("expression") {
+            continue;
+        }
+        // A missing `expression` is the generator's `MissingExpression`;
+        // this gate judges content, not presence.
+        let Some(expression) = table.get("expression").and_then(toml::Value::as_str) else {
+            continue;
+        };
+        let context = format!("draft_check `tests[{index}]` expression");
+        rocky_sql::check_expression::validate_check_expression(
+            &context,
+            expression,
+            dialect.as_ref(),
+        )
+        .map_err(|err| {
+            ToolError::invalid_argument(
+                err.to_string(),
+                "An expression check is one boolean expression over the model's own columns \
+                 — comparisons, CASE, CAST, and pure scalar functions such as coalesce, \
+                 length, lower or date_trunc. It may not contain a subquery, a qualified \
+                 function, or a warehouse function that reads files, secrets, session state \
+                 or remote endpoints.",
+            )
+        })?;
     }
     Ok(())
 }

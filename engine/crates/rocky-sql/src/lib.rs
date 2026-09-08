@@ -1,3 +1,4 @@
+pub mod check_expression;
 pub mod consumed_columns;
 pub mod defer;
 pub mod determinism;

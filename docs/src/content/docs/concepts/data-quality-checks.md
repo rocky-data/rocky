@@ -157,7 +157,7 @@ filter = "region = 'US'"
 | `unique_expr` | set | `key_expr: String` | A derived **key expression** is unique across rows (`GROUP BY <expr> HAVING COUNT(*) > 1`). For when the meaningful identity is a *computed* value (e.g. a surrogate built to be stable across a multi-tenant union) that neither `unique` (single column) nor `composite` (column tuple) can express. `key_expr` is passed through as written (like `expression`), subject to the one narrow refusal described under **Filters**. NULL keys are not excluded — use `filter` to scope them out. |
 | `accepted_values` | row | `values: [String]` | Every non-NULL value is in the fixed set. |
 | `relationships` | row | `to_table`, `to_column` | Every non-NULL value exists in `to_table.to_column` (referential integrity). |
-| `expression` | row | `expression: String` | Custom SQL boolean predicate must hold per row. |
+| `expression` | row | `expression: String` | Custom SQL boolean predicate must hold per row. Bounded: one expression over the row's own columns, calling only allowlisted pure scalar functions — no subquery, no qualified function. See **Filters** below. |
 | `row_count_range` | table | `min`, `max` (both optional) | Table row count falls within the inclusive range. |
 | `in_range` | row | `min`, `max` (both optional, numeric) | Column's values fall within the numeric range. NULLs pass. |
 | `regex_match` | row | `pattern: String` | Column matches the dialect-specific regex. NULLs pass. Patterns are validated against a strict allowlist (no single quotes, backticks, or semicolons). |
@@ -264,7 +264,16 @@ One check does apply, to `filter`, `expression` and `key_expr` alike. Rocky refu
 
 The check runs when Rocky builds the query, and it names the field and the table so you know which line to fix.
 
-Be clear about what this does not do. It stops the fragment ending Rocky's statement and starting another. It does **not** make the fragment a single expression: Rocky does not track parentheses, so a fragment can still close the parenthesis Rocky wraps it in and add its own clauses. And it does not limit what the expression may read — a subquery runs with the same warehouse credentials as the rest of the pipeline. Treat a check expression as code you are running, because it is.
+Be clear about what this check does not do. It stops the fragment ending Rocky's statement and starting another. It does **not** make the fragment a single expression: Rocky does not track parentheses here, so a `filter` or `key_expr` can still close the parenthesis Rocky wraps it in and add its own clauses. And it does not limit what a `filter` or `key_expr` may read — a subquery runs with the same warehouse credentials as the rest of the pipeline. Treat those two as code you are running, because they are.
+
+`expression` gets a second, stronger gate. Rocky parses it under the target dialect and refuses it unless it is exactly one boolean expression over the row's own columns:
+
+- anything left over after one expression — so it cannot close Rocky's parenthesis and add clauses;
+- any subquery, in any position;
+- any qualified function name, such as `schema.fn(...)` — that is how user-defined, remote and plugin functions are reached;
+- any function that is not on Rocky's allowlist of pure scalar functions.
+
+Comparisons, `CASE`, `CAST`, `BETWEEN`, `IN (...)` with literals, and functions such as `coalesce`, `nullif`, `abs`, `round`, `length`, `lower`, `upper`, `trim`, `regexp_like`, `now` and `date_trunc` pass. Functions that read a file, a secret, a session variable or a remote endpoint do not, whatever their name looks like — DuckDB's `read_text`, Snowflake's `GETVARIABLE` and Databricks' `secret` all sit in ordinary scalar position and are refused by name. The refusal names the function. The gate runs when Rocky builds the test SQL, before anything executes, so a refused check is reported as refused rather than silently skipped. The same gate runs when an agent authors a check through the `draft_check` MCP tool, so a bad expression is refused when written.
 
 ### Row quarantine
 

@@ -74,6 +74,45 @@ pub enum ValidationError {
         context: String,
         token: &'static str,
     },
+
+    // ---- `expression` check content (#1524) -------------------------------
+    // An expression check is interpolated into `WHERE NOT (<expression>)` and
+    // executed with the project's warehouse credentials. These four refuse
+    // anything that is not one boolean expression over the model's own
+    // columns. See `crate::check_expression`.
+    #[error(
+        "{context}: expression does not parse as a single SQL expression ({detail}). An \
+         expression check is one boolean expression over the model's columns, e.g. \
+         `amount >= 0`"
+    )]
+    ExpressionUnparseable { context: String, detail: String },
+
+    #[error(
+        "{context}: expression continues past the end of one expression. Only a single \
+         boolean expression is accepted — no trailing clauses, commas or operators"
+    )]
+    ExpressionTrailingTokens { context: String },
+
+    #[error(
+        "{context}: expression contains a subquery. An expression check may only read the \
+         row's own columns; it cannot read other tables"
+    )]
+    ExpressionSubquery { context: String },
+
+    #[error(
+        "{context}: expression calls `{function}`, which is not on the allowlist of pure \
+         scalar functions an expression check may use. Warehouse functions can read files, \
+         secrets, session state or remote endpoints, so only a named set is permitted. To \
+         extend it, add the function to `CHECK_EXPRESSION_FUNCTIONS` in rocky-sql"
+    )]
+    ExpressionFunctionNotAllowed { context: String, function: String },
+
+    #[error(
+        "{context}: expression calls the qualified function `{function}`. Qualified names \
+         reach user-defined, remote or plugin functions, which are never allowed in an \
+         expression check"
+    )]
+    ExpressionQualifiedFunction { context: String, function: String },
 }
 
 /// Validates a SQL identifier (catalog, schema, table, column names).

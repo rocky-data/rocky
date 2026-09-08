@@ -508,15 +508,31 @@ fn generate_test_sql_inner(
                 return Err(TestGenError::MissingExpression);
             }
             // Expression is user-supplied SQL — we cannot validate it as an
-            // identifier. The gate below refuses anything that could END this
-            // statement and start another. It does NOT make the fragment one
-            // expression: parentheses are not tracked, so the fragment can
-            // still close the `NOT (` below and add clauses. Nor does it bound
-            // reads — a subquery or a DuckDB `read_csv` still runs with the
-            // project's credentials. See `reject_statement_terminator`.
-            validation::reject_statement_terminator(
-                &format!("expression test `expression` on {table}"),
+            // identifier. Two gates, in order:
+            //
+            // 1. `reject_statement_terminator` refuses anything that could END
+            //    this statement and start another, without parsing.
+            // 2. `validate_check_expression` parses the fragment under the
+            //    target dialect and refuses anything that is not ONE boolean
+            //    expression calling only allowlisted pure scalar functions:
+            //    trailing tokens (so it cannot close the `NOT (` below and
+            //    add clauses), any subquery, any qualified function, any
+            //    function off the list. This is the content boundary #1524
+            //    asked for — a DuckDB `read_text`, a Snowflake `GETVARIABLE`,
+            //    a BigQuery remote function all sit in scalar position and
+            //    are refused by name.
+            //
+            // Both run at generation time, which is before execution on every
+            // path, so a refused check shows in the deferred/executed counts
+            // rather than vanishing.
+            let context = format!("expression test `expression` on {table}");
+            validation::reject_statement_terminator(&context, expression)?;
+            let sql_dialect =
+                rocky_sql::check_expression::dialect_for(dialect.map_or("generic", |d| d.name()));
+            rocky_sql::check_expression::validate_check_expression(
+                &context,
                 expression,
+                sql_dialect.as_ref(),
             )?;
             Ok(format!(
                 "SELECT COUNT(*) FROM {table} WHERE {}NOT ({expression})",
@@ -1145,6 +1161,53 @@ target = { catalog = "c", schema = "s", table = "t" }
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("expression"));
+    }
+
+    /// The content boundary (#1524) is WIRED into the generator, not only
+    /// defined in `rocky_sql::check_expression`. Each case is one refusal
+    /// class; the generator must surface it as a `TestGenError`, which is
+    /// what makes a refused check visible in the executed/deferred counts
+    /// instead of running. The last case proves an ordinary predicate
+    /// still generates — a boundary that refuses the ordinary case is a
+    /// bug, not a control.
+    #[test]
+    fn test_expression_content_boundary_is_wired() {
+        let decl = |expression: &str| TestDecl {
+            test_type: TestType::Expression {
+                expression: expression.into(),
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        for (expression, must_mention) in [
+            ("read_text('/etc/passwd') IS NULL", "read_text"),
+            ("amount > (SELECT max(amount) FROM other)", "subquery"),
+            ("project.dataset.remote_fn(amount) IS NULL", "qualified"),
+            ("amount > 0) OR 1=1 --", "past the end"),
+        ] {
+            let err = generate_test_sql(&decl(expression), "orders")
+                .expect_err(&format!("{expression} must be refused at generation"));
+            assert!(
+                err.to_string().contains(must_mention),
+                "{expression}: the refusal must say why — got: {err}"
+            );
+        }
+        // Dialect is threaded: the same DuckDB read primitive is refused
+        // under the DuckDB parser, not only the generic one.
+        let duck = rocky_sql::check_expression::dialect_for("duckdb");
+        assert!(
+            rocky_sql::check_expression::validate_check_expression(
+                "ctx",
+                "read_text('/etc/passwd') IS NULL",
+                duck.as_ref()
+            )
+            .is_err()
+        );
+        assert_eq!(
+            generate_test_sql(&decl("coalesce(amount, 0) >= 0"), "orders").unwrap(),
+            "SELECT COUNT(*) FROM orders WHERE NOT (coalesce(amount, 0) >= 0)"
+        );
     }
 
     #[test]
