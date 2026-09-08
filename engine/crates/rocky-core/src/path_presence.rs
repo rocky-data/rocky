@@ -308,6 +308,69 @@ mod classify_tests {
         );
     }
 
+    /// The fix-sensitive half of the bare-relative case, in a CHILD PROCESS
+    /// so it can own its working directory: the child chdirs into a temp
+    /// directory, removes search permission from it, and asks the walk about
+    /// a bare `rocky.toml`. Old code stat-ed the empty parent, got NotFound,
+    /// and answered Absent; the walk now lands on `.`, whose stat fails with
+    /// PermissionDenied, and refuses. The parent asserts on the child's
+    /// printed verdict. Skips (via the child) under root, which can search a
+    /// mode-000 directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_bare_relative_leaf_under_an_unsearchable_cwd_is_present() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD: &str = "ROCKY_PATH_PRESENCE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // ---- child ----
+            let dir = tempfile::tempdir().unwrap();
+            let home = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir.path()).unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Looking up `.` INSIDE the working directory needs search
+            // permission on it, so this stat failing IS the condition; under
+            // root it succeeds and the child reports a skip.
+            let reproduced = std::fs::symlink_metadata(".").is_err();
+            let verdict = super::classify_ancestors(std::path::Path::new("rocky.toml"));
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).ok();
+            std::env::set_current_dir(home).ok();
+            if !reproduced {
+                println!("CHILD_VERDICT=skip");
+                return;
+            }
+            match verdict {
+                PathPresence::Present { .. } => println!("CHILD_VERDICT=present"),
+                PathPresence::Absent => println!("CHILD_VERDICT=absent"),
+            }
+            return;
+        }
+        // ---- parent ----
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "path_presence::classify_tests::a_bare_relative_leaf_under_an_unsearchable_cwd_is_present",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("spawn the child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let verdict = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("CHILD_VERDICT="))
+            .unwrap_or_else(|| panic!("the child printed no verdict; stdout:\n{stdout}"));
+        match verdict {
+            "skip" => eprintln!("skipping: the child can search a mode-000 directory (root)"),
+            "present" => {}
+            other => panic!(
+                "a bare leaf under an unsearchable working directory must be PRESENT, the \
+                 walk answered {other} — the empty-parent hole"
+            ),
+        }
+    }
+
     /// `models/` — the spelling a glob base produces. With the trailing
     /// separator the OS resolves the last component as a directory, so a
     /// leaf stat FOLLOWS the link and a dangling one reads as `NotFound`; the

@@ -117,8 +117,33 @@ pub fn walk_model_dirs(root: &Path) -> (Vec<PathBuf>, Vec<ModelWalkError>) {
             // silent drop this walk exists to close, reintroduced one level
             // down.
             match entry {
-                Ok(entry) if entry.path().is_dir() => subdirs.push(entry.path()),
-                Ok(_) => {}
+                // `is_dir()` folded every metadata failure into "not a
+                // directory", so a subdirectory that is a dangling link was
+                // never pushed and never reported (#1817). Follow the link —
+                // a live `staging -> shared` must keep loading — but refuse
+                // to lose one that does not resolve.
+                Ok(entry) => match std::fs::metadata(entry.path()) {
+                    Ok(metadata) if metadata.is_dir() => subdirs.push(entry.path()),
+                    Ok(_) => {}
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                        match crate::path_presence::classify_not_found(&entry.path()) {
+                            crate::path_presence::PathPresence::Absent => {}
+                            crate::path_presence::PathPresence::Present { detail } => {
+                                errors.push(ModelWalkError::ReadDir {
+                                    dir: entry.path(),
+                                    source: std::io::Error::new(
+                                        std::io::ErrorKind::NotFound,
+                                        detail,
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    Err(source) => errors.push(ModelWalkError::ReadDir {
+                        dir: entry.path(),
+                        source,
+                    }),
+                },
                 Err(source) => errors.push(ModelWalkError::DirEntry {
                     dir: dir.clone(),
                     source,
@@ -231,6 +256,27 @@ mod tests {
             format!("{}", errors[0]).contains("cannot be resolved"),
             "the error names the broken link: {}",
             errors[0]
+        );
+    }
+
+    /// A SUBDIRECTORY that is a dangling link. The stack-pop check only sees
+    /// what the listing pushed, and `is_dir()` never pushed this — so the
+    /// round-two fix reported a dangling root and still walked past a
+    /// dangling child in silence.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_subdirectory_is_reported_not_silently_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("models");
+        mk(&root, "a");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), root.join("staging")).unwrap();
+        let (dirs, errors) = walk_model_dirs(&root);
+        assert_eq!(dirs, vec![root.clone(), root.join("a")]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let text = format!("{}", errors[0]);
+        assert!(
+            text.contains("staging") && text.contains("cannot be resolved"),
+            "the error names the broken child: {text}"
         );
     }
 

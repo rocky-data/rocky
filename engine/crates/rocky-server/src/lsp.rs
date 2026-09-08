@@ -468,6 +468,19 @@ impl RockyLsp {
             }
             Err(e) => {
                 info!(error = %e, "LSP compilation failed");
+                // The log line above is the only place this failure went.
+                // The editor was left with NOTHING: no diagnostic (none was
+                // built), no message. A models directory that is a dangling
+                // link, a `_defaults.toml` that cannot be read, a contract
+                // that cannot be resolved — each produced a silent, empty
+                // editor (#1817). Tell the client, so the silence is not
+                // mistaken for a clean project.
+                self.client
+                    .show_message(
+                        tower_lsp::lsp_types::MessageType::ERROR,
+                        format!("Rocky: compiling the project's models failed: {e}"),
+                    )
+                    .await;
                 // `ProjectError::RockyParse` aborts the compile pipeline
                 // before any `Diagnostic` is built, so the LSP would
                 // otherwise leave the editor with no feedback at all.
@@ -1021,8 +1034,12 @@ impl LanguageServer for RockyLsp {
             let models_path = path.join("models");
             // `exists()` follows a symlink, so a `models` entry that is a
             // dangling link read as "no models project" and the server sat
-            // silent over it. Anything but a proven absence is a project;
-            // the compile that follows reports the broken link (#1817).
+            // silent over it. Anything but a proven absence is a project.
+            // The compile that follows then FAILS on the broken link, and
+            // that failure reaches the editor as an error message from the
+            // `recompile` failure arm — before this change it only reached
+            // the server log, so admitting the project here would have
+            // moved the silence rather than removed it (#1817).
             if rocky_core::path_presence::entry_is_present(&models_path) {
                 *self.models_dir.write().await = Some(models_path.display().to_string());
                 info!(path = %models_path.display(), "LSP found models directory");

@@ -338,19 +338,38 @@ fn load_project_models_partial_with(
     // silent-drop family this walk exists to close.
     let (dirs, walk_errors) = rocky_core::model_walk::walk_model_dirs(models_dir);
     let mut all = Vec::new();
-    // Walk errors FIRST. A strict caller surfaces the first error, and the
-    // walk's is the one that names the right object: with `models` a
-    // dangling link, the walk says so, while the per-directory load that
-    // follows blames `models/_defaults.toml` — a leaf under the broken
-    // root, which exists exactly as much as the root does (#1817).
-    let mut errors: Vec<anyhow::Error> = walk_errors.into_iter().map(anyhow::Error::new).collect();
+    // The ROOT's walk error first, every other error in traversal order after.
+    //
+    // A strict caller surfaces only the first error, so the order decides
+    // what the operator is told. With `models` itself a dangling link, the
+    // walk's root error is the one that names the right object; the per-
+    // directory load that follows blames `models/_defaults.toml`, a leaf
+    // under the broken root that exists exactly as much as the root does
+    // (#1817). But ONLY the root's: putting every walk error first let a
+    // depth-ceiling breach deep in the tree outrank a parse error in the
+    // root model the operator can actually act on (#1822, round three).
+    let (root_walk, deeper_walk): (Vec<_>, Vec<_>) = walk_errors
+        .into_iter()
+        .partition(|e| walk_error_dir(e) == models_dir);
+    let mut errors: Vec<anyhow::Error> = root_walk.into_iter().map(anyhow::Error::new).collect();
     for dir in dirs {
         match load_one(&dir) {
             Ok(models) => all.extend(models),
             Err(e) => errors.push(e),
         }
     }
+    errors.extend(deeper_walk.into_iter().map(anyhow::Error::new));
     (all, errors)
+}
+
+/// The directory a walk error is about, whichever variant it is.
+fn walk_error_dir(e: &rocky_core::model_walk::ModelWalkError) -> &Path {
+    use rocky_core::model_walk::ModelWalkError;
+    match e {
+        ModelWalkError::ReadDir { dir, .. }
+        | ModelWalkError::DirEntry { dir, .. }
+        | ModelWalkError::DepthCeiling { dir, .. } => dir,
+    }
 }
 
 /// Load one directory's models, naming that directory in the error.
@@ -645,6 +664,42 @@ mod tests {
     /// that ignores the mode), the scenario did not reproduce and asserting on
     /// it would be asserting on nothing. Skipping loudly beats a green test
     /// that never exercised the path.
+    /// The other half of the ordering rule (#1822, round three): a walk error
+    /// DEEPER in the tree must not outrank a load error in the root. Here the
+    /// root holds a model whose frontmatter does not parse, and a subdirectory
+    /// is a dangling link. The parse error is the one the operator can act on;
+    /// it comes first, and the dangling subdirectory is still reported after.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_parse_error_outranks_a_deeper_walk_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).expect("mkdir");
+        write(
+            &models.join("broken.sql"),
+            "---toml\nname = \n---\nSELECT 1 AS id\n",
+        );
+        std::os::unix::fs::symlink(tmp.path().join("gone"), models.join("staging"))
+            .expect("symlink");
+
+        let (_, errors) = load_project_models_partial(&models, None);
+        assert_eq!(
+            errors.len(),
+            2,
+            "one parse error, one walk error: {errors:?}"
+        );
+        let first = format!("{:#}", errors[0]);
+        let second = format!("{:#}", errors[1]);
+        assert!(
+            first.contains("broken.sql") || first.contains("frontmatter"),
+            "the actionable root error comes first: {first}"
+        );
+        assert!(
+            second.contains("staging") && second.contains("cannot be resolved"),
+            "the dangling subdirectory is still reported, after it: {second}"
+        );
+    }
+
     /// #1817, review round two: with `models` a dangling link the walker
     /// reports the root honestly, but the per-directory load ran first and
     /// blamed `models/_defaults.toml` — a leaf under the broken root, which
