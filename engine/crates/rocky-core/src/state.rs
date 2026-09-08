@@ -6136,26 +6136,32 @@ pub struct PolicyDecisionRecord {
 }
 
 impl PolicyDecisionRecord {
-    /// Every graph key this decision names, for a blast-radius lookup or a
-    /// `--for <model>` match.
+    /// Every key this decision can be looked up or matched by: the
+    /// [`Self::models`] set, then [`Self::model`].
     ///
-    /// Yields [`Self::models`] when that set is non-empty — a plan-level
-    /// escalation, whose [`Self::model`] is a human label no graph can resolve
-    /// — and otherwise the single `model`, which **is** the graph key on an
-    /// ordinary evaluation row. A pre-v28 plan-level row has an empty set, so
-    /// it falls back to its label; the label does not resolve, and the caller
-    /// sees the same "unknown" it sees today rather than a wrong radius.
+    /// **Additive, not exclusive.** `model` is always yielded, even when the
+    /// set is non-empty. On an ordinary evaluation row it is the graph key and
+    /// the set is empty. On a plan-level escalation it is a human label —
+    /// `"backfill: 3 model(s)"` — which resolves in no graph, so including it
+    /// costs one failed lookup and removes nothing.
     ///
-    /// Never yields nothing: the fallback arm always produces one key. A caller
-    /// that ends up with no *resolvable* key is looking at a real absence
-    /// (compile failed, model removed, or a pre-v28 row), not an empty input.
+    /// Removing nothing is the point. The label is not only display text: the
+    /// audit screen builds a custody link out of it
+    /// (`engine/ui/src/governor/AuditScreen.tsx`, `subject={entry.model}`), so
+    /// a matcher that stopped accepting the label would turn a working link
+    /// into "no policy decisions recorded for this subject". That link is
+    /// generated, not typed, so "nobody would type that" is not a reason to
+    /// drop it.
+    ///
+    /// Never yields nothing: `model` is always there. A caller that ends up
+    /// with no *resolvable* key is looking at a real absence (compile failed,
+    /// model removed, or a pre-v28 row that recorded no set), not an empty
+    /// input it cannot tell from a plumbing bug.
     pub fn graph_keys(&self) -> impl Iterator<Item = &str> {
-        let fallback = if self.models.is_empty() {
-            Some(self.model.as_str())
-        } else {
-            None
-        };
-        self.models.iter().map(String::as_str).chain(fallback)
+        self.models
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(self.model.as_str()))
     }
 }
 
@@ -11831,16 +11837,17 @@ mod tests {
             vec!["backfill: 2 model(s)"]
         );
 
-        // With a set: the set wins outright and the label is NOT yielded. The
-        // label is display text; letting it through would make
-        // `audit --for "backfill: 2 model(s)"` a working query by accident.
+        // With a set: the set comes first and the label is STILL yielded. The
+        // label resolves in no graph, so it costs one failed lookup — and it
+        // keeps the audit screen's `subject={entry.model}` custody link
+        // working, which an exclusive matcher would have broken.
         let with_models = PolicyDecisionRecord {
             models: vec!["dim_customer".to_string(), "fct_orders".to_string()],
             ..base.clone()
         };
         assert_eq!(
             with_models.graph_keys().collect::<Vec<_>>(),
-            vec!["dim_customer", "fct_orders"]
+            vec!["dim_customer", "fct_orders", "backfill: 2 model(s)"]
         );
 
         // An ordinary row: `model` is the graph key and there is no set.

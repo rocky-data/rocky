@@ -100,9 +100,14 @@ pub fn compute_audit(state_path: &Path, product: Option<AuditProductScope>) -> R
     let entries: Vec<AuditDecisionEntry> = decisions
         .into_iter()
         .filter(|d| {
+            // `graph_keys`, not `d.model`, for the same reason the `--for`
+            // matcher uses it: a plan-level escalation's `model` is a summary,
+            // so a backfill or gc that touches the product's OUTPUT MODEL was
+            // filtered out of the product's own custody chain (#1766). It now
+            // matches on the models it recorded, and still on the summary.
             product
                 .as_ref()
-                .is_none_or(|scope| d.model == scope.output_model)
+                .is_none_or(|scope| d.graph_keys().any(|m| m == scope.output_model))
         })
         .map(to_decision_entry)
         .collect();
@@ -329,12 +334,12 @@ fn build_decisions_link(
         .iter()
         .filter(|d| match kind {
             AuditSubjectKind::Plan => d.plan_id == selector,
-            // `graph_keys` is the model set on a plan-level escalation and the
-            // single `model` on an ordinary row, so a backfill / gc / restore
-            // escalation is now findable by the models it actually touches —
-            // it never was, because its `model` holds a summary that matches no
-            // selector a user would type (#1766). The row still DISPLAYS that
-            // summary; the summary itself is no longer a selector.
+            // `graph_keys` yields the recorded model set AND `model`, so a
+            // backfill / gc / restore escalation is now findable by the models
+            // it actually touches — it never was, because its `model` holds a
+            // summary no user would type (#1766). Purely additive: the summary
+            // still matches too, which the audit screen depends on
+            // (`AuditScreen.tsx` renders `subject={entry.model}`).
             _ => d.graph_keys().any(|m| m == selector),
         })
         .collect();
@@ -1360,11 +1365,16 @@ mod tests {
         let miss = build_decisions_link(AuditSubjectKind::Model, "agg_daily", &decisions);
         assert_eq!(miss.total, 0);
 
-        // The label is display text, not a selector.
+        // The label still matches. `engine/ui/src/governor/AuditScreen.tsx`
+        // renders `<CustodyLink subject={entry.model} />`, so the label IS a
+        // live selector on a link the UI generates. Making the models set
+        // exclusive would have turned that link into "no policy decisions
+        // recorded for this subject" — a regression, not a tidy-up.
         let by_label = build_decisions_link(AuditSubjectKind::Model, label, &decisions);
         assert_eq!(
-            by_label.total, 0,
-            "the summary in `model` is not a graph key and must not match as one"
+            by_label.total, 1,
+            "the audit screen builds a custody link out of this exact string; \
+             it must keep resolving"
         );
     }
 
@@ -1398,6 +1408,53 @@ mod tests {
         assert_eq!(link.total, 1);
         let miss = build_decisions_link(AuditSubjectKind::Model, "fct_orders", &decisions);
         assert_eq!(miss.total, 0);
+    }
+
+    /// A product's custody chain includes a plan-level escalation that touches
+    /// its output model.
+    ///
+    /// `rocky audit --product <p>` scopes the ledger to the product's
+    /// `output.model`. It compared that to `PolicyDecisionRecord::model`, which
+    /// on a backfill / gc / restore row is a summary — so a gc plan proposing
+    /// to delete the product's own output was absent from the product's
+    /// custody chain, on the screen a governor would look at to decide.
+    #[test]
+    fn a_products_custody_chain_includes_a_plan_level_row_touching_its_output_model() {
+        use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+
+        let row = |models: Vec<&str>, model: &str| PolicyDecisionRecord {
+            models: models.into_iter().map(str::to_string).collect(),
+            timestamp: Utc::now(),
+            plan_id: "planGC".to_string(),
+            principal: PolicyPrincipal::Human,
+            capability: PolicyCapability::Gc,
+            model: model.to_string(),
+            effect: PolicyEffect::RequireReview,
+            rule_id: None,
+            reason: "gc plan awaits review".to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+        };
+
+        // The gc plan would evict from `revenue_daily`, the product's output.
+        let touching = row(
+            vec!["revenue_daily", "staging_orders"],
+            "gc: 4 artifact(s) across 2 model(s)",
+        );
+        assert!(
+            touching.graph_keys().any(|m| m == "revenue_daily"),
+            "the product's output model is one of the recorded keys"
+        );
+
+        // A gc plan that touches only unrelated models must NOT join the chain.
+        let unrelated = row(
+            vec!["staging_orders"],
+            "gc: 1 artifact(s) across 1 model(s)",
+        );
+        assert!(
+            !unrelated.graph_keys().any(|m| m == "revenue_daily"),
+            "scoping must still exclude a plan that does not touch the product"
+        );
     }
 
     #[test]
