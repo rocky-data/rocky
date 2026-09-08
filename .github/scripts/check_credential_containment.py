@@ -63,7 +63,7 @@ DOCKER_SETUP_BUILDX_SOURCE = (
     "docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e"
 )
 DEPLOY_PAGES_SOURCE = (
-    "actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128"
+    "actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346"
 )
 UPLOAD_PAGES_ARTIFACT_SOURCE = (
     "actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9"
@@ -80,7 +80,7 @@ GH_RELEASE_SOURCE = (
     "softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228"
 )
 TAIKI_INSTALL_SOURCE = (
-    "taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1"
+    "taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8"
 )
 # Actions a job may run when it is not reachable from a pull request. Release,
 # publish and deployment workflows never execute candidate code, so the
