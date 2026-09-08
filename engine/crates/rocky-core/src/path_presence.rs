@@ -60,6 +60,13 @@ pub enum PathPresence {
 /// The detail sentences are deliberately entry-neutral: the same helper backs
 /// a file read and a directory read, so nothing here says "file".
 pub fn classify_not_found(path: &Path) -> PathPresence {
+    // A trailing separator makes the OS resolve the last component AS A
+    // DIRECTORY, so `symlink_metadata("models/")` follows the link it was
+    // supposed to inspect and reports a dangling one as `NotFound` — the
+    // exact answer this function exists to second-guess. `components()`
+    // drops the trailing separator (and any `.` segments) without touching
+    // the filesystem, so the stat below lands on the entry itself.
+    let path = path.components().as_path();
     match std::fs::symlink_metadata(path) {
         // Nothing at this path itself. Whether that is ABSENCE depends on what
         // the path runs through — a dangling ancestor produces exactly this
@@ -110,8 +117,8 @@ pub fn classify_not_found(path: &Path) -> PathPresence {
 ///   Err(NotFound)                      keep walking: never-created chain
 ///   Err(other)                         Present: could not be inspected
 ///   Ok, symlink, canonicalize fails    Present: dangling ancestor
-///   Ok, symlink, resolves              Absent:  a live link, nothing below it
-///   Ok, directory                      Absent:  nothing below it was created
+///   Ok, symlink, resolves              Absent if searchable, else Present
+///   Ok, directory                      Absent if searchable, else Present
 ///   Ok, anything else                  Present: a non-directory where a
 ///                                               directory belongs
 ///   no ancestor left                   Absent
@@ -138,7 +145,7 @@ fn classify_ancestors(path: &Path) -> PathPresence {
             }
             Ok(metadata) if metadata.is_symlink() => {
                 return if dir.canonicalize().is_ok() {
-                    PathPresence::Absent
+                    searchable_or_present(dir)
                 } else {
                     PathPresence::Present {
                         detail: match std::fs::read_link(dir) {
@@ -157,7 +164,7 @@ fn classify_ancestors(path: &Path) -> PathPresence {
                     }
                 };
             }
-            Ok(metadata) if metadata.is_dir() => return PathPresence::Absent,
+            Ok(metadata) if metadata.is_dir() => return searchable_or_present(dir),
             Ok(_) => {
                 return PathPresence::Present {
                     detail: format!("its ancestor '{}' is not a directory", dir.display()),
@@ -166,6 +173,35 @@ fn classify_ancestors(path: &Path) -> PathPresence {
         }
     }
     PathPresence::Absent
+}
+
+/// The first live ancestor is a directory. Nothing below it stats — but is
+/// that because nothing is there, or because this process cannot look?
+///
+/// Statting the directory ENTRY only needs search permission on its parent.
+/// Statting `dir/.` needs search permission on `dir` itself, which is the
+/// permission a lookup inside it needs. So `dir/.` is the portable probe for
+/// "can this process see into here": it succeeds on every healthy directory
+/// and fails — however the platform spells the failure — on one that denies
+/// search. On Linux and macOS the leaf stat already reports `PermissionDenied`
+/// for that case and never reaches the walk; this probe is for a filesystem
+/// that masks the lookup failure as `NotFound`, which is the one shape the
+/// walk would otherwise read as absence.
+///
+/// What this does not close: a platform whose `dir/.` normalises back to
+/// `dir` before the check (Windows does) answers "searchable" for any
+/// directory that exists. There the masked case stays open; it is recorded
+/// here rather than claimed closed.
+fn searchable_or_present(dir: &Path) -> PathPresence {
+    match std::fs::symlink_metadata(dir.join(".")) {
+        Ok(_) => PathPresence::Absent,
+        Err(probe_error) => PathPresence::Present {
+            detail: format!(
+                "its ancestor directory '{}' exists but cannot be searched: {probe_error}",
+                dir.display()
+            ),
+        },
+    }
 }
 
 /// Is there an entry at `path`, of any kind?
@@ -190,9 +226,13 @@ fn classify_ancestors(path: &Path) -> PathPresence {
 /// fail-open this helper exists to replace. A `NotFound` leaf goes through
 /// [`classify_not_found`], so a dangling ancestor answers `true` here too and
 /// the caller's read surfaces the honest error (#1817). Every caller of this
-/// function propagates that read error rather than folding it, which is what
+/// function either propagates that read error or refuses outright on `true`
+/// (`rocky init` refuses to scaffold over it) — none folds it — which is what
 /// makes `true` the safe direction.
 pub fn entry_is_present(path: &Path) -> bool {
+    // Same trailing-separator rule as `classify_not_found`: stat the entry,
+    // not what a directory-shaped spelling of it resolves to.
+    let path = path.components().as_path();
     match std::fs::symlink_metadata(path) {
         Ok(_) => true,
         Err(stat_error) if stat_error.kind() == std::io::ErrorKind::NotFound => {
@@ -235,6 +275,29 @@ mod classify_tests {
         );
     }
 
+    /// `models/` — the spelling a glob base produces. With the trailing
+    /// separator the OS resolves the last component as a directory, so a
+    /// leaf stat FOLLOWS the link and a dangling one reads as `NotFound`; the
+    /// walk then finds a healthy parent and calls it absent. Found by
+    /// `locate_models_dir`'s test, where the fix was invisible until the
+    /// separator was stripped.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_spelled_with_a_trailing_separator_is_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("models");
+        std::os::unix::fs::symlink(dir.path().join("gone"), &link).unwrap();
+        let mut spelled = link.into_os_string();
+        spelled.push("/");
+        let with_slash = std::path::PathBuf::from(spelled);
+        assert!(
+            std::fs::symlink_metadata(&with_slash).is_err(),
+            "precondition: the trailing separator makes the stat follow the link"
+        );
+        assert!(is_present(&with_slash).is_some(), "the entry IS there");
+        assert!(super::entry_is_present(&with_slash));
+    }
+
     /// Two levels up is the same defect; the walk must not stop at the parent.
     #[cfg(unix)]
     #[test]
@@ -274,13 +337,49 @@ mod classify_tests {
         assert!(is_present(&link.join("orders.toml")).is_none());
     }
 
-    /// An ancestor the process may not search. On Linux and macOS the LEAF
-    /// stat already reports `PermissionDenied` rather than `NotFound`, so the
-    /// existing "fails another way" arm refuses — but that mapping was the
-    /// reviewer's least-confident point, so it is pinned here rather than
-    /// assumed, and the walk's own EACCES arm covers a filesystem that masks
-    /// it as `NotFound`. Skips when the process can stat through mode 000
-    /// (root), because then the condition was never built.
+    /// The walk's own answer for an unsearchable ancestor, reached DIRECTLY —
+    /// bypassing the leaf stat that, on Linux and macOS, reports
+    /// `PermissionDenied` and never lets the walk run. This is the shape a
+    /// filesystem that masks the lookup failure as `NotFound` would produce:
+    /// the leaf says "nothing here", the walk stats `locked` fine (that needs
+    /// search on its PARENT), and only the `locked/.` probe can tell that the
+    /// process cannot see inside. Reverting the probe makes this fail.
+    /// Skips when the process can stat through mode 000 (root).
+    #[cfg(unix)]
+    #[test]
+    fn the_walk_refuses_an_unsearchable_ancestor_even_when_the_leaf_says_not_found() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let leaf = locked.join("rocky.toml");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let reproduced = std::fs::symlink_metadata(locked.join(".")).is_err();
+        let verdict = super::classify_ancestors(&leaf);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
+
+        if !reproduced {
+            eprintln!("skipping: this process can search a mode-000 directory");
+            return;
+        }
+        match verdict {
+            PathPresence::Present { detail } => assert!(
+                detail.contains("cannot be searched"),
+                "the walk must say WHY it refused: {detail}"
+            ),
+            PathPresence::Absent => panic!(
+                "the walk stat-ed `locked` and called everything below it absent — the \
+                 masked-NotFound hole (#1822 review, finding 1)"
+            ),
+        }
+    }
+
+    /// The leaf-stat path for the same condition, kept as a pin: on Linux and
+    /// macOS the LEAF reports `PermissionDenied`, and the "fails another way"
+    /// arm refuses before the walk. Not fix-sensitive for the walk — the test
+    /// above is — but it pins the mapping the walk's comment relies on.
     #[cfg(unix)]
     #[test]
     fn an_unsearchable_ancestor_is_present() {

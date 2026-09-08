@@ -517,12 +517,16 @@ fn load_rocky_models_with_db_filtered(
     include: &impl Fn(&Path) -> bool,
     project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
 ) -> Result<Vec<Model>, ProjectError> {
-    if !dir.exists() {
+    // Same rule as `rocky_core::models`: absent is empty, anything else is
+    // read and refuses with the honest error. `exists()` followed a symlink,
+    // so a dangling models dir compiled empty and a dangling `_defaults.toml`
+    // silently dropped the directory's strategy (#1817).
+    if !rocky_core::path_presence::entry_is_present(dir) {
         return Ok(Vec::new());
     }
 
     let defaults_path = dir.join("_defaults.toml");
-    let defaults = if defaults_path.exists() {
+    let defaults = if rocky_core::path_presence::entry_is_present(&defaults_path) {
         Some(models::load_dir_defaults(&defaults_path)?)
     } else {
         None
@@ -686,8 +690,10 @@ fn load_single_rocky_model_with_db(
         }
     };
 
+    // A dangling contract link is a contract that is there and cannot be
+    // read, not an absent one (#1817). Handed on; the contract read reports it.
     let contract_file = path.with_extension("contract.toml");
-    let contract_path = if contract_file.exists() {
+    let contract_path = if rocky_core::path_presence::entry_is_present(&contract_file) {
         Some(contract_file)
     } else {
         None

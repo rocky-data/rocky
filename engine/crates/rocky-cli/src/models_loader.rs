@@ -174,7 +174,21 @@ pub fn locate_models_dir(models_glob: &str, config_path: &Path) -> Result<Models
         )
     })?;
     if !exists {
-        return Ok(ModelsDir::Absent(models_dir));
+        // `try_exists` reports a dangling symlink as `Ok(false)` — the one
+        // metadata failure it does fold. A models directory that is a link to
+        // nowhere is not an absent one (#1817): the project would compile
+        // empty and report success. Ask the shared discriminator.
+        match rocky_core::path_presence::classify_not_found(&models_dir) {
+            rocky_core::path_presence::PathPresence::Absent => {
+                return Ok(ModelsDir::Absent(models_dir));
+            }
+            rocky_core::path_presence::PathPresence::Present { detail } => {
+                anyhow::bail!(
+                    "models directory '{}' cannot be read: {detail}",
+                    models_dir.display()
+                );
+            }
+        }
     }
     // Confine to the project root. Both sides canonicalized so intra-project
     // symlinks resolve before the prefix check (macOS `/tmp` is itself a
@@ -579,19 +593,25 @@ mod tests {
             ModelsDir::Absent(_)
         ));
 
-        // Broken symlink: still just missing.
+        // Broken symlink: `try_exists` still answers `Ok(false)` for it — that
+        // row of the #1336 table is unchanged — but it is no longer ACCEPTED as
+        // absence. An entry is there, aimed at nothing; calling that "no models
+        // directory" compiled the project empty and reported success (#1817).
+        // The shared discriminator decides now, and it refuses.
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(root.join("nowhere"), root.join("dangling"))
                 .expect("symlink");
             assert!(
-                matches!(
-                    locate_models_dir("dangling/**", &config)
-                        .expect("a broken symlink is not an error"),
-                    ModelsDir::Absent(_)
-                ),
-                "a dangling symlink resolves to NotFound, which is an absence"
+                !root
+                    .join("dangling")
+                    .try_exists()
+                    .expect("try_exists answers"),
+                "precondition: try_exists folds the dangling link to false, as #1336 pinned"
             );
+            let err = locate_models_dir("dangling/**", &config)
+                .expect_err("a dangling symlink is a broken models dir, not an absent one");
+            assert!(format!("{err:#}").contains("cannot be resolved"), "{err:#}");
         }
 
         // A regular file where a directory component must be.
@@ -621,6 +641,32 @@ mod tests {
     /// that ignores the mode), the scenario did not reproduce and asserting on
     /// it would be asserting on nothing. Skipping loudly beats a green test
     /// that never exercised the path.
+    /// #1817. `try_exists` answers `Ok(false)` for a dangling symlink — the
+    /// #1336 note called that out and left it. A models dir that is a link
+    /// to nowhere then reported `Absent`, the pipeline loaded no models, and
+    /// the DAG reported success with no nodes.
+    #[cfg(unix)]
+    #[test]
+    fn locate_models_dir_errors_when_the_directory_is_a_dangling_link() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let config = root.join("rocky.toml");
+        std::fs::write(&config, "").expect("write config");
+        std::os::unix::fs::symlink(root.join("gone"), root.join("models")).expect("symlink");
+
+        let err = locate_models_dir("models/**", &config)
+            .expect_err("a models dir that is there and cannot be resolved is not absent");
+        assert!(
+            format!("{err:#}").contains("cannot be resolved"),
+            "the error names the broken link: {err:#}"
+        );
+        // The control: a directory nobody created is still `Absent`.
+        assert!(matches!(
+            locate_models_dir("never/**", &config).expect("absent"),
+            ModelsDir::Absent(_)
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn locate_models_dir_errors_when_the_directory_cannot_be_reached() {

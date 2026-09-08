@@ -574,10 +574,23 @@ pub(crate) fn check_product_collisions(
         // A state dir may legitimately be a symlink (an operator relocating
         // storage), so the directory test follows it — but a link that does
         // not resolve, or an entry that cannot be stat-ed, is not "not a
-        // directory": it is a peer this scan cannot see.
-        let is_dir = std::fs::metadata(&path)
-            .map_err(|err| unreadable(&path, &err.to_string()))?
-            .is_dir();
+        // directory": it is a peer this scan cannot see. One exception, and
+        // it is a PROVEN one: an unrelated entry (`.DS_Store`, an editor swap
+        // file) that vanished between the listing and the stat. Nothing is
+        // there now, so it can conceal nothing, and refusing on it would fail
+        // `rocky product verify` on a race the scan has no stake in.
+        let is_dir = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata.is_dir(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                match rocky_core::path_presence::classify_not_found(&path) {
+                    rocky_core::path_presence::PathPresence::Absent => continue,
+                    rocky_core::path_presence::PathPresence::Present { detail } => {
+                        return Err(unreadable(&path, &detail));
+                    }
+                }
+            }
+            Err(err) => return Err(unreadable(&path, &err.to_string())),
+        };
         if is_dir {
             state_dirs.push(path);
         }
@@ -2760,6 +2773,28 @@ effect = "require_review"
             .expect_err("a dangling fulfillment dir is present, not absent");
         assert_eq!(error.code, "fulfillment-dir-unreadable", "{error}");
         assert!(error.message.contains("cannot be resolved"), "{error}");
+    }
+
+    /// A peer STATE DIR that is a dangling symlink. `path.is_dir()` answered
+    /// false and the peer was filtered out as "not a directory" — but an
+    /// entry is there, aimed at nothing, and whatever it once held cannot be
+    /// scanned. The #1822 review named this as the mutation the first tests
+    /// could not catch: restoring the `is_dir()` fold leaves the other
+    /// fulfillment-dir tests green, and only this one fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_peer_state_dir_refuses_the_collision_check() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        let fulfillment = root.join(".rocky").join("fulfillment");
+        std::fs::create_dir_all(&fulfillment).expect("mkdir");
+        std::os::unix::fs::symlink(dir.path().join("gone"), fulfillment.join("other_product"))
+            .expect("symlink");
+
+        let error = check_product_collisions(&root, &parsed_d3(), "products/revenue_daily.toml")
+            .expect_err("a peer that cannot be entered cannot be cleared");
+        assert_eq!(error.code, "fulfillment-dir-unreadable", "{error}");
+        assert!(error.message.contains("other_product"), "{error}");
     }
 
     /// A peer whose manifest is a dangling symlink is a peer this scan cannot

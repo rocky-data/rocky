@@ -76,9 +76,31 @@ pub fn walk_model_dirs(root: &Path) -> (Vec<PathBuf>, Vec<ModelWalkError>) {
         dirs.push(dir.clone());
 
         // Only descend when there is something to descend into, so an absent
-        // root stays a non-error rather than failing `read_dir`.
-        if !dir.is_dir() {
-            continue;
+        // root stays a non-error rather than failing `read_dir`. `is_dir()`
+        // folded every metadata failure into "nothing to descend into", so a
+        // root (or a subdirectory) that is a dangling link was skipped with
+        // nothing said — the silent drop this walk exists to close (#1817).
+        // Only a PROVEN absence is a non-error now; a link to nowhere and an
+        // unstatable entry are reported, and `read_dir` says why.
+        match std::fs::metadata(&dir) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => continue,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                match crate::path_presence::classify_not_found(&dir) {
+                    crate::path_presence::PathPresence::Absent => continue,
+                    crate::path_presence::PathPresence::Present { detail } => {
+                        errors.push(ModelWalkError::ReadDir {
+                            dir,
+                            source: std::io::Error::new(std::io::ErrorKind::NotFound, detail),
+                        });
+                        continue;
+                    }
+                }
+            }
+            Err(source) => {
+                errors.push(ModelWalkError::ReadDir { dir, source });
+                continue;
+            }
         }
 
         let entries = match std::fs::read_dir(&dir) {
@@ -191,6 +213,25 @@ mod tests {
         let (dirs, errors) = walk_model_dirs(&root);
         assert_eq!(dirs, vec![root]);
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// #1817. A root that is a dangling symlink is not an absent root: an
+    /// entry is there, and `is_dir()` folded the broken link into "nothing to
+    /// descend into" with no error. It is yielded AND reported.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_root_is_reported_not_silently_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("models");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &root).unwrap();
+        let (dirs, errors) = walk_model_dirs(&root);
+        assert_eq!(dirs, vec![root.clone()]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            format!("{}", errors[0]).contains("cannot be resolved"),
+            "the error names the broken link: {}",
+            errors[0]
+        );
     }
 
     /// Hidden directories were never excluded and stay walked — an exclusion
