@@ -2515,7 +2515,9 @@ mod tests {
             }
         );
         assert_eq!(
-            sql_type_to_rocky(&DataType::Numeric(ExactNumberInfo::PrecisionAndScale(38, 9))),
+            sql_type_to_rocky(&DataType::Numeric(ExactNumberInfo::PrecisionAndScale(
+                38, 9
+            ))),
             RockyType::Decimal {
                 precision: 38,
                 scale: 9
