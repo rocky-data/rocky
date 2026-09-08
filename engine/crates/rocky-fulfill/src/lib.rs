@@ -46,6 +46,7 @@
 
 pub mod briefs;
 pub mod driver;
+pub mod handoff;
 mod inventory;
 pub mod machine;
 pub mod step;

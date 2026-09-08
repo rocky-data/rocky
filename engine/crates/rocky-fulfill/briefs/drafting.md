@@ -47,3 +47,10 @@ a human will decide.
 Stop when compile/test are green; you cannot and must not propose.
 The runner performs its own verification and the governed hand-off to
 human review after you are gone.
+
+Your last `draft_model` call is your hand-off. The tool records what it
+wrote for the runner, and the runner commits `models/{model}.sql` and
+`models/{model}.toml` only if they still match that record when you
+are gone. Do not edit those two files by any other route after your
+final `draft_model`: the runner will refuse the round rather than
+commit bytes nobody handed off.

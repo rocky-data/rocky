@@ -44,3 +44,8 @@ the data honestly allows; a human reads this before anything ships.
 Stop when compile and test are green. Everything you write is
 re-verified from disk and then goes to a human for review;
 you cannot and must not propose.
+
+Your last `draft_model` call is your hand-off: the runner commits
+`models/{model}.sql` and `models/{model}.toml` only if they still match
+what that call wrote. Do not touch them by any other route afterwards,
+or the round is refused rather than committed.
