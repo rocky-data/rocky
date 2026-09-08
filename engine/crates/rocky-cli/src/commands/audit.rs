@@ -100,9 +100,14 @@ pub fn compute_audit(state_path: &Path, product: Option<AuditProductScope>) -> R
     let entries: Vec<AuditDecisionEntry> = decisions
         .into_iter()
         .filter(|d| {
+            // `graph_keys`, not `d.model`, for the same reason the `--for`
+            // matcher uses it: a plan-level escalation's `model` is a summary,
+            // so a backfill or gc that touches the product's OUTPUT MODEL was
+            // filtered out of the product's own custody chain (#1766). It now
+            // matches on the models it recorded, and still on the summary.
             product
                 .as_ref()
-                .is_none_or(|scope| d.model == scope.output_model)
+                .is_none_or(|scope| d.graph_keys().any(|m| m == scope.output_model))
         })
         .map(to_decision_entry)
         .collect();
@@ -329,7 +334,13 @@ fn build_decisions_link(
         .iter()
         .filter(|d| match kind {
             AuditSubjectKind::Plan => d.plan_id == selector,
-            _ => d.model == selector,
+            // `graph_keys` yields the recorded model set AND `model`, so a
+            // backfill / gc / restore escalation is now findable by the models
+            // it actually touches — it never was, because its `model` holds a
+            // summary no user would type (#1766). Purely additive: the summary
+            // still matches too, which the audit screen depends on
+            // (`AuditScreen.tsx` renders `subject={entry.model}`).
+            _ => d.graph_keys().any(|m| m == selector),
         })
         .collect();
     // Newest first.
@@ -749,6 +760,49 @@ pub(crate) fn blast_radius_of(
     seen.remove(model);
     let transitive: Vec<String> = seen.into_iter().collect();
     Some((direct, transitive))
+}
+
+/// The transitive downstream models reached by **all** of `models`, unioned and
+/// deduplicated — or `None` if any one of them is absent from the graph.
+///
+/// The queue's aggregation rule for a plan-level escalation, factored out
+/// beside [`blast_radius_of`] so there is one derivation of "how far does this
+/// reach" rather than a second one invented at the call site.
+///
+/// **Union, not `max`.** The glossary defines a blast radius as the *set* of
+/// downstream models, and [`build_blast_radius_link`] already unions across
+/// subjects. `max` throws away disjoint closures: a plan over two unrelated
+/// roots with three downstream models each reaches six, and `max` calls it
+/// three — the same number as a plan over one of them. `sum` has the opposite
+/// fault and double-counts an overlap. The deduplicated union is the only one
+/// of the three that counts each reached model once.
+///
+/// **All-or-nothing, and this is the load-bearing half.** If any named model is
+/// absent, the answer is `None` — unknown — not a partial count. A plan over a
+/// live leaf and a since-deleted model would otherwise resolve the leaf to an
+/// empty set and report a **measured zero**, which reads as "nothing
+/// downstream" about a plan half of which could not be looked up at all.
+/// Unknown and zero are different answers and only one of them is honest here.
+///
+/// **The plan's own models are NOT removed**, which is where this parts company
+/// with [`build_blast_radius_link`]'s subject removal — deliberately, so the
+/// difference is on the record rather than an oversight. That function answers
+/// "what else does this subject reach", so excluding the subject is right. A
+/// backfill's model list is a transitively closed set by construction, so
+/// removing its members would make **every** backfill measure exactly zero and
+/// re-open the ranking collapse this exists to fix. Here the question is how
+/// much the plan's change reaches, and a model rebuilt because another member
+/// changed is part of that reach.
+pub(crate) fn blast_radius_union<'a>(
+    result: &compile::CompileResult,
+    models: impl IntoIterator<Item = &'a str>,
+) -> Option<BTreeSet<String>> {
+    let mut union: BTreeSet<String> = BTreeSet::new();
+    for model in models {
+        let (_, transitive) = blast_radius_of(result, model)?;
+        union.extend(transitive);
+    }
+    Some(union)
 }
 
 /// Render the custody chain as a concise human-readable report.
@@ -1283,6 +1337,7 @@ mod tests {
         effect: PolicyEffect,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            models: Vec::new(),
             timestamp: Utc.with_ymd_and_hms(2026, 7, 7, 0, 0, secs).unwrap(),
             plan_id: plan_id.to_string(),
             principal: PolicyPrincipal::Agent,
@@ -1306,6 +1361,192 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    /// `rocky audit --for <model>` finds a plan-level escalation by the models
+    /// it touches, and no longer by the label it displays.
+    ///
+    /// Before #1766 the filter compared the selector to `model`, which on a
+    /// backfill / gc / restore row holds a summary — `"backfill: 3 model(s)"`.
+    /// A user auditing `dim_customer` got "no policy decisions recorded for
+    /// this subject" while a backfill of `dim_customer` sat pending review.
+    ///
+    /// The last assertion is the one that pins the trade: the label stops
+    /// being a working selector. It was never a model name, so nothing a user
+    /// would type is lost — but it IS a behaviour change, so it is asserted
+    /// rather than left to be discovered.
+    #[test]
+    fn a_plan_level_decision_is_found_by_its_models_not_by_its_label() {
+        use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+
+        let label = "backfill: 2 model(s)";
+        let plan_level = PolicyDecisionRecord {
+            models: vec!["dim_customer".to_string(), "fct_orders".to_string()],
+            timestamp: Utc::now(),
+            plan_id: "planBF".to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::Backfill,
+            model: label.to_string(),
+            effect: PolicyEffect::RequireReview,
+            rule_id: None,
+            reason: "backfill plan awaits review".to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+        };
+        let decisions = vec![plan_level];
+
+        for wanted in ["dim_customer", "fct_orders"] {
+            let link = build_decisions_link(AuditSubjectKind::Model, wanted, &decisions);
+            assert_eq!(
+                link.total, 1,
+                "auditing '{wanted}' must reach the backfill that touches it"
+            );
+            assert_eq!(link.availability, SectionAvailability::Available);
+        }
+
+        // A model the plan does not touch still misses.
+        let miss = build_decisions_link(AuditSubjectKind::Model, "agg_daily", &decisions);
+        assert_eq!(miss.total, 0);
+
+        // The label still matches. `engine/ui/src/governor/AuditScreen.tsx`
+        // renders `<CustodyLink subject={entry.model} />`, so the label IS a
+        // live selector on a link the UI generates. Making the models set
+        // exclusive would have turned that link into "no policy decisions
+        // recorded for this subject" — a regression, not a tidy-up.
+        let by_label = build_decisions_link(AuditSubjectKind::Model, label, &decisions);
+        assert_eq!(
+            by_label.total, 1,
+            "the audit screen builds a custody link out of this exact string; \
+             it must keep resolving"
+        );
+    }
+
+    /// An ORDINARY decision row — the overwhelming majority — is unaffected:
+    /// its `model` is the graph key and it carries no separate set, so it is
+    /// still found by exactly the name it records.
+    ///
+    /// This is the regression half of the test above. `graph_keys()` falls
+    /// back to `model` when the set is empty; drop that fallback and every
+    /// ordinary `rocky audit --for <model>` returns nothing, which the
+    /// plan-level test alone would not catch.
+    #[test]
+    fn an_ordinary_decision_is_still_found_by_its_model() {
+        use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+
+        let decisions = vec![PolicyDecisionRecord {
+            models: Vec::new(),
+            timestamp: Utc::now(),
+            plan_id: "planA".to_string(),
+            principal: PolicyPrincipal::Human,
+            capability: PolicyCapability::SchemaChangeAdditive,
+            model: "dim_customer".to_string(),
+            effect: PolicyEffect::Allow,
+            rule_id: Some(0),
+            reason: "allow by rule 0".to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+        }];
+
+        let link = build_decisions_link(AuditSubjectKind::Model, "dim_customer", &decisions);
+        assert_eq!(link.total, 1);
+        let miss = build_decisions_link(AuditSubjectKind::Model, "fct_orders", &decisions);
+        assert_eq!(miss.total, 0);
+    }
+
+    /// A product's custody chain includes a plan-level escalation that touches
+    /// its output model — driven through `compute_audit`, not through the
+    /// accessor.
+    ///
+    /// `rocky audit --product <p>` scopes the ledger to the product's
+    /// `output.model`. It compared that to `PolicyDecisionRecord::model`, which
+    /// on a backfill / gc / restore row is a summary — so a gc plan proposing
+    /// to delete the product's own output was **absent from the product's
+    /// custody chain**, on the screen a governor reads to decide.
+    ///
+    /// An earlier version of this test called `graph_keys()` directly and
+    /// proved nothing about the filter: restoring `d.model == scope.output_model`
+    /// at the call site left it green. It now goes through `compute_audit`, so
+    /// the production plumbing is what is under test.
+    #[test]
+    fn a_products_custody_chain_includes_a_plan_level_row_touching_its_output_model() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let state_path = root.join("state.redb");
+
+        let plan_level = |plan_id: &str, models: Vec<&str>, label: &str| PolicyDecisionRecord {
+            models: models.into_iter().map(str::to_string).collect(),
+            timestamp: Utc.with_ymd_and_hms(2026, 9, 8, 0, 0, 1).unwrap(),
+            plan_id: plan_id.to_string(),
+            principal: PolicyPrincipal::Human,
+            capability: PolicyCapability::Gc,
+            model: label.to_string(),
+            effect: PolicyEffect::RequireReview,
+            rule_id: None,
+            reason: "gc plan awaits review".to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+        };
+
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            // An ordinary row about the output model — matched before and after.
+            store
+                .record_policy_decision(&decision(
+                    1,
+                    "plan-ordinary",
+                    "revenue_daily",
+                    PolicyEffect::Allow,
+                ))
+                .unwrap();
+            // A gc plan that WOULD DELETE the product's output model. Its
+            // `model` is a summary, so the old filter dropped it.
+            store
+                .record_policy_decision(&plan_level(
+                    "plan-gc-hits",
+                    vec!["revenue_daily", "staging_orders"],
+                    "gc: 4 artifact(s) across 2 model(s)",
+                ))
+                .unwrap();
+            // A gc plan touching only unrelated models — must STAY out.
+            store
+                .record_policy_decision(&plan_level(
+                    "plan-gc-misses",
+                    vec!["staging_orders"],
+                    "gc: 1 artifact(s) across 1 model(s)",
+                ))
+                .unwrap();
+        }
+
+        fs::create_dir_all(root.join("products")).unwrap();
+        fs::write(
+            root.join("products/daily_revenue.toml"),
+            SPEC_FIXTURE.replace("name   = \"revenue_daily\"", "name   = \"daily_revenue\""),
+        )
+        .unwrap();
+        let scope = resolve_product_scope(root, "daily_revenue").unwrap();
+        assert_eq!(scope.output_model, "revenue_daily");
+
+        let scoped = compute_audit(&state_path, Some(scope)).unwrap();
+        let plans: Vec<&str> = scoped
+            .decisions
+            .iter()
+            .map(|d| d.plan_id.as_str())
+            .collect();
+
+        assert!(
+            plans.contains(&"plan-gc-hits"),
+            "a gc plan that would delete this product's output model belongs in \
+             its custody chain; got {plans:?}"
+        );
+        assert!(
+            plans.contains(&"plan-ordinary"),
+            "the ordinary row must still match — the fix is additive, not a swap"
+        );
+        assert!(
+            !plans.contains(&"plan-gc-misses"),
+            "scoping must still exclude a plan that does not touch the product; \
+             got {plans:?}"
+        );
     }
 
     #[test]
@@ -1521,6 +1762,7 @@ mod tests {
         reason: &str,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            models: Vec::new(),
             timestamp: Utc.with_ymd_and_hms(2026, 7, 7, 0, 0, secs).unwrap(),
             plan_id: plan_id.to_string(),
             principal: PolicyPrincipal::Agent,
@@ -1680,6 +1922,7 @@ mod tests {
         effect: PolicyEffect,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            models: Vec::new(),
             timestamp: Utc.with_ymd_and_hms(2026, 7, 7, 0, 0, secs).unwrap(),
             plan_id: plan_id.to_string(),
             principal,

@@ -322,6 +322,9 @@ pub(crate) fn run_restore_plan_in(
             tombstone.model_name,
             short_hash(&tombstone.blake3_hash)
         ),
+        // The label wraps the name in a sentence, so it is not a graph key.
+        // The bare name is (#1766).
+        vec![tombstone.model_name.clone()],
         "restore plan awaits review — restoration is unconditionally review-gated (even a human \
          restore goes through review, mirroring gc's symmetric-caution posture)",
     );

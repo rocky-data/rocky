@@ -594,6 +594,7 @@ pub fn run_policy_freeze(
             });
         }
         let record = PolicyDecisionRecord {
+            models: Vec::new(),
             timestamp: now,
             plan_id: plan_id.clone(),
             principal: p,
@@ -1417,6 +1418,7 @@ max_retries = 0
         let _serial = rocky_core::state_sync::remote_testing::serial_guard();
         let harness = CrossPodHarness::new_s3_like();
         let winner = PolicyDecisionRecord {
+            models: Vec::new(),
             timestamp: chrono::Utc::now(),
             plan_id: "existing-run-winner".to_string(),
             principal: PolicyPrincipal::Agent,

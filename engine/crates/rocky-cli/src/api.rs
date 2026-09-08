@@ -3147,6 +3147,9 @@ mod tests {
                 PolicyPrincipal::Agent,
                 capability,
                 model,
+                // These fixtures model an ORDINARY row, whose `model` is
+                // already the graph key — no separate model set.
+                Vec::new(),
                 "test escalation",
             );
         }
@@ -3159,6 +3162,7 @@ mod tests {
             PolicyPrincipal::Agent,
             PolicyCapability::Apply,
             "ghost",
+            Vec::new(),
             "decision-only custody row",
         );
         (root, config, state_path, [a, b, c])
@@ -3618,6 +3622,7 @@ mod tests {
             .expect("run recorded");
         store
             .record_policy_decision(&PolicyDecisionRecord {
+                models: Vec::new(),
                 timestamp: now - chrono::Duration::minutes(30),
                 plan_id: "freeze:global".to_string(),
                 principal: PolicyPrincipal::Human,
@@ -3932,6 +3937,7 @@ mod tests {
         StateStore::open(&state_path)
             .unwrap()
             .record_policy_decision(&PolicyDecisionRecord {
+                models: Vec::new(),
                 timestamp: chrono::Utc::now() - chrono::Duration::minutes(5),
                 plan_id: "plan-revenue-daily".to_string(),
                 principal: PolicyPrincipal::Agent,

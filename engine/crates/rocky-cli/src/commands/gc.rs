@@ -843,16 +843,28 @@ fn build_gc_plan(candidates: &[EvictionCandidate], min_age_days: i64) -> Option<
 /// The representative `model` field for the gc plan's single review-escalation
 /// ledger row — a plan-scope summary, since one reclamation plan spans many
 /// artifacts and models and one row per artifact would bloat the ledger.
-fn gc_plan_scope_summary(plan: &GcPlan) -> String {
-    let models: BTreeSet<&str> = plan
-        .evictions
+/// The distinct model names a gc plan would evict from, sorted and deduplicated.
+///
+/// The graph keys behind [`gc_plan_scope_summary`]'s count, recorded on the
+/// plan's review escalation so the queue can compute its blast radius. Empty
+/// only for a plan with no evictions, which `build_gc_plan` never produces.
+fn gc_plan_models(plan: &GcPlan) -> Vec<String> {
+    plan.evictions
         .iter()
-        .map(|e| e.model_name.as_str())
-        .collect();
+        .map(|e| e.model_name.clone())
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect()
+}
+
+fn gc_plan_scope_summary(plan: &GcPlan) -> String {
+    // ONE derivation, shared with the escalation's model set. Counting the
+    // models here separately would let the label say "4 model(s)" while the
+    // recorded set carries 3, and nothing would catch the drift.
     format!(
         "gc: {} artifact(s) across {} model(s)",
         plan.evictions.len(),
-        models.len()
+        gc_plan_models(plan).len()
     )
 }
 
@@ -930,6 +942,9 @@ pub(crate) fn run_gc_plan_in(
         principal,
         PolicyCapability::Gc,
         &gc_plan_scope_summary(&plan),
+        // The summary above counts models; these name them, so two pending gc
+        // plans rank by what they would delete rather than by age (#1766).
+        gc_plan_models(&plan),
         "gc plan awaits review — deletion is unconditionally review-gated (even a human gc \
          goes through review, never a direct delete)",
     );
@@ -2661,6 +2676,55 @@ auto_create_schemas = true
         }
     }
 
+    /// The gc escalation's LABEL and its recorded MODEL SET are one
+    /// derivation, so the count in the text can never disagree with the names.
+    ///
+    /// `gc_plan_scope_summary` used to count a `BTreeSet` it built itself,
+    /// beside the set `gc_plan_models` builds for the ledger row. They agreed
+    /// by coincidence. This pins that they cannot drift: four evictions across
+    /// two distinct models, one of them repeated, must read "2 model(s)" and
+    /// record exactly those two names, deduplicated and sorted.
+    #[test]
+    fn the_gc_label_and_the_recorded_model_set_come_from_one_derivation() {
+        let eviction = |model: &str, hash: &str| GcPlanEviction {
+            model_name: model.to_string(),
+            run_id: "r1".to_string(),
+            blake3_hash: hash.to_string(),
+            file_path: format!("s3://b/{hash}.parquet"),
+            size_bytes: 100,
+            commit_version: 0,
+            written_at: "2026-09-07T00:00:00Z".to_string(),
+            recipe_hash: None,
+            input_hash: None,
+            input_proof_class: None,
+            env_hash: None,
+            hash_scheme: None,
+        };
+        let plan = GcPlan {
+            version: VERSION.to_string(),
+            min_age_days: 7,
+            total_bytes: 400,
+            evictions: vec![
+                eviction("orders", "aa"),
+                eviction("events", "bb"),
+                eviction("orders", "cc"),
+                eviction("orders", "dd"),
+            ],
+        };
+
+        let models = gc_plan_models(&plan);
+        assert_eq!(
+            models,
+            vec!["events".to_string(), "orders".to_string()],
+            "deduplicated and sorted — these are the graph keys the queue looks up"
+        );
+        assert_eq!(
+            gc_plan_scope_summary(&plan),
+            format!("gc: 4 artifact(s) across {} model(s)", models.len()),
+            "the label's count IS the recorded set's length, not a second count"
+        );
+    }
+
     #[test]
     fn build_gc_plan_returns_none_on_empty_ledger() {
         let dir = TempDir::new().unwrap();
@@ -3903,6 +3967,36 @@ auto_create_schemas = true
         assert_eq!(queue.pending[0].capability, PolicyCapability::Gc);
         assert_eq!(queue.excluded_non_plan_rows, 0);
 
+        // #1766: the escalation carries the models the plan would evict from,
+        // beside the summary in `model`. This is the only assertion that
+        // reaches the PRODUCTION call site — the ranking tests in `review.rs`
+        // hand `record_plan_review_escalation` a set they made up, so replacing
+        // `gc_plan_models(&plan)` with `Vec::new()` at gc.rs would leave every
+        // one of them green.
+        let decision = {
+            let store = StateStore::open_read_only(&state_path).unwrap();
+            store
+                .list_policy_decisions()
+                .unwrap()
+                .into_iter()
+                .find(|d| d.plan_id == plan_id)
+                .expect("the gc plan's escalation row")
+        };
+        assert_eq!(
+            decision.models,
+            vec!["orders".to_string()],
+            "the recorded keys are the evicted models, not the summary"
+        );
+        assert!(
+            decision.model.contains("model(s)"),
+            "and the summary is untouched: {}",
+            decision.model
+        );
+        // No models dir in this fixture, so the compile fails and the radius is
+        // honestly unknown. Asserted so the `None` here reads as the degrade it
+        // is, rather than as a silent absence of the fix.
+        assert_eq!(queue.pending[0].blast_radius, None);
+
         // 3. Approve through the exact core the MCP review_queue tool calls.
         let review = crate::commands::review::compute_review(root, &config, &plan_id, "HEAD", true)
             .await
@@ -4347,6 +4441,7 @@ auto_create_schemas = true
         // A ledger-only freeze row for THIS principal → deny. This is the
         // marker-blind bypass the review caught: no marker exists at all.
         let freeze = rocky_core::state::PolicyDecisionRecord {
+            models: Vec::new(),
             timestamp: Utc::now(),
             plan_id: "freeze:unit".to_string(),
             principal: PolicyPrincipal::Human,
@@ -4472,6 +4567,7 @@ auto_create_schemas = true
                         let store = StateStore::open(&self.path).unwrap();
                         store
                             .record_policy_decision(&rocky_core::state::PolicyDecisionRecord {
+                                models: Vec::new(),
                                 timestamp: Utc::now(),
                                 plan_id: "freeze:mid-seam".to_string(),
                                 principal: PolicyPrincipal::Human,

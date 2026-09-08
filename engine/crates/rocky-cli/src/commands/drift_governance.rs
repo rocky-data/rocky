@@ -321,6 +321,7 @@ impl DriftGovernor {
         }
 
         let record = PolicyDecisionRecord {
+            models: Vec::new(),
             timestamp: chrono::Utc::now(),
             plan_id: decision_plan_id(&self.run_id),
             principal: PolicyPrincipal::Agent,
@@ -543,6 +544,7 @@ pub(crate) fn finalize_drift_verify_after(
         // carrying `rule_id` is exactly the pair
         // `budget_failures_in_window` counts against the granting rule.
         let record = PolicyDecisionRecord {
+            models: Vec::new(),
             timestamp: chrono::Utc::now(),
             plan_id: decision_plan.clone(),
             principal: PolicyPrincipal::Agent,
@@ -793,6 +795,7 @@ mod tests {
     /// attached. Written by `govern` under `autoapply:<run_id>`.
     fn applied_decision(run_id: &str, model: &str) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            models: Vec::new(),
             timestamp: chrono::Utc::now(),
             plan_id: decision_plan_id(run_id),
             principal: PolicyPrincipal::Agent,
@@ -1040,6 +1043,7 @@ mod tests {
             PolicyPrincipal::Human => "human",
         };
         PolicyDecisionRecord {
+            models: Vec::new(),
             timestamp: now,
             plan_id: format!("{}{label}:{}", policy::FREEZE_PLAN_PREFIX, now.to_rfc3339()),
             principal,
@@ -1141,6 +1145,7 @@ mod tests {
             .unwrap();
         store
             .record_policy_decision(&PolicyDecisionRecord {
+                models: Vec::new(),
                 timestamp: chrono::Utc::now(),
                 plan_id: decision_plan_id("run-b1"),
                 principal: PolicyPrincipal::Agent,

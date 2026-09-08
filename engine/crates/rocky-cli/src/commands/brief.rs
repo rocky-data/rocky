@@ -1721,6 +1721,7 @@ mod tests {
         rule_id: Option<usize>,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            models: Vec::new(),
             timestamp: ts(h),
             plan_id: format!("plan-{model}-{h}"),
             principal,

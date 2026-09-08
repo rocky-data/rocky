@@ -2102,6 +2102,7 @@ pub(crate) fn evaluate_apply_policy_core(
         }
 
         record(&PolicyDecisionRecord {
+            models: Vec::new(),
             timestamp: now,
             plan_id: plan_id.to_string(),
             principal,
@@ -3447,6 +3448,7 @@ fn run_verify_after(
     // Best-effort custody entry — the gate below is the safety boundary; the
     // ledger is the trail.
     let record = PolicyDecisionRecord {
+        models: Vec::new(),
         timestamp: chrono::Utc::now(),
         plan_id: plan_id.to_string(),
         principal,
@@ -5926,6 +5928,7 @@ auto_create_schemas = true
         let store = StateStore::open(state_path)?;
         let now = chrono::Utc::now();
         store.record_policy_decision(&PolicyDecisionRecord {
+            models: Vec::new(),
             timestamp: now,
             plan_id: format!(
                 "{}agent:{}",
