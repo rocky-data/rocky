@@ -2831,17 +2831,46 @@ pub async fn run(
             // The handle is dropped immediately — redb is single-writer, and
             // this open exists to apply the policy and read one bit, not to
             // hold state open across the run.
-            {
+            //
+            // Gated on the models directory being PRESENT, because the no-op
+            // arm (`models = "models/**"` with no such directory) is defined
+            // by mutating nothing — `run_local` opens no store there, and
+            // `noop_transformation_with_existing_state_file_skips_sessionless_sweep`
+            // asserts the state file stays byte-identical. Opening it here to
+            // apply a policy would be exactly the sessionless mutation that
+            // test exists to forbid.
+            if matches!(
+                &models_dir_decision,
+                super::run_local::ModelsDirDecision::Present(_)
+            ) {
                 let policy_store = rocky_core::state::StateStore::open_with_policy(
                     state_path,
                     rocky_cfg.state.on_schema_mismatch,
-                )
-                .with_context(|| {
-                    format!(
-                        "failed to open state store at {}",
-                        state_path.display()
-                    )
-                })?;
+                );
+                // The open can still fail — a corrupt store, or a newer one
+                // under `on_schema_mismatch = "fail"`. A bare `?` here would
+                // return with the session still alive, and dropping a live
+                // `RemoteStateSession` without finalize/abandon leaks the
+                // remote lock (it panics in debug). Every other arm abandons
+                // first; so does this one. Found by mutation-checking the
+                // test below, which reverted the policy open and hit exactly
+                // this path.
+                let policy_store = match policy_store {
+                    Ok(store) => store,
+                    Err(e) => {
+                        // `abandon` consumes the session, so take it out of
+                        // the Option rather than borrowing.
+                        if let Some(session) = tx_session.take() {
+                            session
+                                .abandon("transformation state store open failed")
+                                .await;
+                        }
+                        return Err(anyhow::Error::new(e).context(format!(
+                            "failed to open state store at {}",
+                            state_path.display()
+                        )));
+                    }
+                };
                 // Forward-incompat recreate ⇒ never push the downgraded
                 // ledger back over newer shared state. The other three
                 // honouring arms carry this; the transformation arm was safe
@@ -2995,13 +3024,23 @@ pub async fn run(
             // Same policy application as the transformation arm above
             // (#1679). See that block for why it lives at the dispatch site.
             {
-                let policy_store = rocky_core::state::StateStore::open_with_policy(
+                // A bare `?` here would return with the session still
+                // alive, and dropping a live `RemoteStateSession` without
+                // finalize/abandon leaks the remote lock. Same obligation as
+                // the transformation arm above.
+                let policy_store = match rocky_core::state::StateStore::open_with_policy(
                     state_path,
                     rocky_cfg.state.on_schema_mismatch,
-                )
-                .with_context(|| {
-                    format!("failed to open state store at {}", state_path.display())
-                })?;
+                ) {
+                    Ok(store) => store,
+                    Err(e) => {
+                        session.abandon("state store open failed").await;
+                        return Err(anyhow::Error::new(e).context(format!(
+                            "failed to open state store at {}",
+                            state_path.display()
+                        )));
+                    }
+                };
                 if policy_store.was_recreated_for_forward_incompat() {
                     session.set_suppress_upload("forward-incompat recreate");
                 }
@@ -3086,13 +3125,23 @@ pub async fn run(
             // Same policy application as the transformation arm above
             // (#1679). See that block for why it lives at the dispatch site.
             {
-                let policy_store = rocky_core::state::StateStore::open_with_policy(
+                // A bare `?` here would return with the session still
+                // alive, and dropping a live `RemoteStateSession` without
+                // finalize/abandon leaks the remote lock. Same obligation as
+                // the transformation arm above.
+                let policy_store = match rocky_core::state::StateStore::open_with_policy(
                     state_path,
                     rocky_cfg.state.on_schema_mismatch,
-                )
-                .with_context(|| {
-                    format!("failed to open state store at {}", state_path.display())
-                })?;
+                ) {
+                    Ok(store) => store,
+                    Err(e) => {
+                        session.abandon("state store open failed").await;
+                        return Err(anyhow::Error::new(e).context(format!(
+                            "failed to open state store at {}",
+                            state_path.display()
+                        )));
+                    }
+                };
                 if policy_store.was_recreated_for_forward_incompat() {
                     session.set_suppress_upload("forward-incompat recreate");
                 }
