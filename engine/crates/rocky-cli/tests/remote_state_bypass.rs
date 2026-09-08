@@ -1150,3 +1150,73 @@ async fn backfill_forward_incompat_recreate_suppresses_upload() {
         "the shared remote must still carry the newer pod's state, not a downgraded blob"
     );
 }
+
+/// A transformation-pipeline run honours `[state] on_schema_mismatch` and
+/// suppresses its upload when the policy recreated the store (#1679).
+///
+/// Two properties in one drive, because they only mean something together:
+///
+/// 1. **The run proceeds.** Before the fix the transformation arm opened with
+///    a plain `StateStore::open`, which refuses a forward-incompatible store
+///    whatever the key says — so this `drive_run` returned `Err` while
+///    replication, model-only and load all recreated as documented. The same
+///    command with `--idempotency-key` *did* recreate, because the claim
+///    opens under the policy before dispatch; that asymmetry is what this
+///    closes.
+/// 2. **The upload is suppressed.** Now that the arm can recreate, it takes
+///    on the caller obligation the other three already carry: never push a
+///    downgraded ledger over newer shared state.
+///
+/// The forward-incompat state arrives the way it does in production — a newer
+/// pod uploaded its (v+1) ledger and this older binary's session restores it
+/// on acquire. Stamping the local file alone cannot drive this: the download
+/// rebuilds the local file and erases the stamp before the arm opens it.
+#[tokio::test]
+async fn transformation_forward_incompat_recreate_proceeds_and_suppresses_upload() {
+    let _serial = remote_testing::serial_guard();
+    let harness = CrossPodHarness::new_s3_like();
+    let project = ModelProject::new("SELECT 1 AS id\n");
+    let future_version = rocky_core::state::current_schema_version() + 1;
+
+    rocky_core::state::force_schema_version(&harness.pod_a.state_path, &future_version.to_string());
+    harness
+        .upload(&harness.pod_a)
+        .await
+        .expect("newer pod's upload");
+    let puts_before = harness.faults.count(FaultOp::Put);
+
+    // Property 1. This is the assertion that was RED before the fix.
+    drive_run(&project, None, None)
+        .await
+        .expect("a recreate-policy transformation run proceeds instead of refusing");
+
+    // Property 2, ordered first among the post-conditions so a revert fails
+    // on the consequence — a clobbered remote — not on a version number.
+    assert_eq!(
+        harness.faults.count(FaultOp::Put),
+        puts_before,
+        "a forward-incompat recreated store must suppress the transformation run's \
+         terminal upload — uploading would push the downgraded blob over the newer \
+         shared state"
+    );
+
+    // Non-vacuous: the recreate really fired, so the suppression path was
+    // reachable rather than skipped for want of anything to suppress.
+    assert_eq!(
+        StateStore::peek_schema_version(&project.state_path).expect("peek recreated version"),
+        Some(rocky_core::state::current_schema_version()),
+        "the run must have recreated the store (proves the suppression path was \
+         reachable, not vacuously skipped)"
+    );
+
+    // The no-clobber end state: a fresh pod still restores the NEWER blob.
+    let _authority = harness
+        .download(&harness.pod_b)
+        .await
+        .expect("pod B start-download");
+    assert_eq!(
+        StateStore::peek_schema_version(&harness.pod_b.state_path).expect("peek pod B version"),
+        Some(future_version),
+        "the shared remote must still carry the newer pod's state, not a downgraded blob"
+    );
+}
