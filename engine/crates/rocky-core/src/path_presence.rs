@@ -131,6 +131,15 @@ pub fn classify_not_found(path: &Path) -> PathPresence {
 fn classify_ancestors(path: &Path) -> PathPresence {
     let mut ancestor = path.parent();
     while let Some(dir) = ancestor {
+        // `Path::parent("rocky.toml")` is `Some("")`, and a stat of `""` is
+        // `NotFound` — so a bare relative leaf walked straight off the end
+        // and was called absent without the working directory ever being
+        // probed. The empty parent IS the working directory; name it.
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
         match std::fs::symlink_metadata(dir) {
             Err(stat_error) if stat_error.kind() == std::io::ErrorKind::NotFound => {
                 ancestor = dir.parent();
@@ -230,9 +239,11 @@ fn searchable_or_present(dir: &Path) -> PathPresence {
 /// (`rocky init` refuses to scaffold over it) — none folds it — which is what
 /// makes `true` the safe direction.
 pub fn entry_is_present(path: &Path) -> bool {
-    // Same trailing-separator rule as `classify_not_found`: stat the entry,
-    // not what a directory-shaped spelling of it resolves to.
-    let path = path.components().as_path();
+    // No trailing-separator normalisation here, on purpose: a dangling link
+    // spelled `models/` stats as `NotFound` and falls through to
+    // `classify_not_found`, which normalises before it decides. Doing it
+    // twice would let a reviewer believe this function guards something it
+    // does not.
     match std::fs::symlink_metadata(path) {
         Ok(_) => true,
         Err(stat_error) if stat_error.kind() == std::io::ErrorKind::NotFound => {
@@ -272,6 +283,28 @@ mod classify_tests {
         assert!(
             detail.contains(&proj.display().to_string()) && detail.contains("cannot be resolved"),
             "the detail names the ancestor the operator has to fix: {detail}"
+        );
+    }
+
+    /// A bare relative leaf — `rocky.toml`, the CLI default — has `parent()`
+    /// `Some("")`. A stat of `""` is `NotFound`, so the walk used to run off
+    /// the end and call the leaf absent without probing the working directory
+    /// at all. It cannot chmod the test's own cwd, so this pins the reachable
+    /// half: the walk lands on `.`, which is searchable, and answers Absent
+    /// for a leaf that is genuinely not there — rather than tripping over the
+    /// empty parent. The mode-000 half is the same probe the absolute-path
+    /// test exercises.
+    #[test]
+    fn a_bare_relative_leaf_walks_to_the_working_directory() {
+        let leaf = std::path::Path::new("rocky-never-created-9f1c.toml");
+        assert!(
+            std::path::Path::new("").parent().is_none()
+                && leaf.parent() == Some(std::path::Path::new("")),
+            "precondition: the parent of a bare leaf is the empty path"
+        );
+        assert!(
+            is_present(leaf).is_none(),
+            "a leaf that is not in a searchable working directory is absent"
         );
     }
 

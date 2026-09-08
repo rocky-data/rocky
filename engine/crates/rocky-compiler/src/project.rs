@@ -690,14 +690,8 @@ fn load_single_rocky_model_with_db(
         }
     };
 
-    // A dangling contract link is a contract that is there and cannot be
-    // read, not an absent one (#1817). Handed on; the contract read reports it.
-    let contract_file = path.with_extension("contract.toml");
-    let contract_path = if rocky_core::path_presence::entry_is_present(&contract_file) {
-        Some(contract_file)
-    } else {
-        None
-    };
+    // The one contract probe every loader shares (#1817).
+    let contract_path = models::sibling_contract_path(path);
 
     Ok(Model {
         config,

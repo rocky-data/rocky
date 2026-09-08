@@ -338,14 +338,18 @@ fn load_project_models_partial_with(
     // silent-drop family this walk exists to close.
     let (dirs, walk_errors) = rocky_core::model_walk::walk_model_dirs(models_dir);
     let mut all = Vec::new();
-    let mut errors = Vec::new();
+    // Walk errors FIRST. A strict caller surfaces the first error, and the
+    // walk's is the one that names the right object: with `models` a
+    // dangling link, the walk says so, while the per-directory load that
+    // follows blames `models/_defaults.toml` — a leaf under the broken
+    // root, which exists exactly as much as the root does (#1817).
+    let mut errors: Vec<anyhow::Error> = walk_errors.into_iter().map(anyhow::Error::new).collect();
     for dir in dirs {
         match load_one(&dir) {
             Ok(models) => all.extend(models),
             Err(e) => errors.push(e),
         }
     }
-    errors.extend(walk_errors.into_iter().map(anyhow::Error::new));
     (all, errors)
 }
 
@@ -641,6 +645,30 @@ mod tests {
     /// that ignores the mode), the scenario did not reproduce and asserting on
     /// it would be asserting on nothing. Skipping loudly beats a green test
     /// that never exercised the path.
+    /// #1817, review round two: with `models` a dangling link the walker
+    /// reports the root honestly, but the per-directory load ran first and
+    /// blamed `models/_defaults.toml` — a leaf under the broken root, which
+    /// exists exactly as much as the root does. The FIRST error is the one a
+    /// strict caller shows, so it must be the walk's.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_models_root_is_blamed_before_anything_under_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &models).expect("symlink");
+
+        let (_, errors) = load_project_models_partial(&models, None);
+        assert!(
+            !errors.is_empty(),
+            "a dangling root is an error, not an empty project"
+        );
+        let first = format!("{:#}", errors[0]);
+        assert!(
+            first.contains("cannot be resolved") && !first.contains("_defaults.toml"),
+            "the first error names the broken root, not a leaf under it: {first}"
+        );
+    }
+
     /// #1817. `try_exists` answers `Ok(false)` for a dangling symlink — the
     /// #1336 note called that out and left it. A models dir that is a link
     /// to nowhere then reported `Absent`, the pipeline loaded no models, and

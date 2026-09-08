@@ -1019,7 +1019,11 @@ impl LanguageServer for RockyLsp {
             && let Ok(path) = root.to_file_path()
         {
             let models_path = path.join("models");
-            if models_path.exists() {
+            // `exists()` follows a symlink, so a `models` entry that is a
+            // dangling link read as "no models project" and the server sat
+            // silent over it. Anything but a proven absence is a project;
+            // the compile that follows reports the broken link (#1817).
+            if rocky_core::path_presence::entry_is_present(&models_path) {
                 *self.models_dir.write().await = Some(models_path.display().to_string());
                 info!(path = %models_path.display(), "LSP found models directory");
             }

@@ -1411,6 +1411,21 @@ pub fn load_model_pair(
     load_model_pair_with_context(sql_path, toml_path, defaults, &ModelLoadContext::default())
 }
 
+/// The sibling `<model>.contract.toml`, or `None` when there is genuinely
+/// none.
+///
+/// ONE probe for every model loader — the `.sql`+`.toml` pair, the inline
+/// frontmatter path, and the compiler's `.rocky` path — so the rule cannot
+/// drift between them. It is `entry_is_present`, not `exists()`: `exists()`
+/// follows a symlink, so a contract that is a dangling link read as "no
+/// contract" and the model compiled uncontracted with nothing said (#1817).
+/// A contract that is there and cannot be read is handed on; the compiler's
+/// read reports which link and why.
+pub fn sibling_contract_path(model_path: &Path) -> Option<std::path::PathBuf> {
+    let contract = model_path.with_extension("contract.toml");
+    crate::path_presence::entry_is_present(&contract).then_some(contract)
+}
+
 /// [`load_model_pair`] with directory-level config resolution: config-group
 /// references (`group = "<name>"`) and named-test references (`[[use_test]]`)
 /// resolve against the [`ModelLoadContext`]. Bare `load_model_pair` passes an
@@ -1456,17 +1471,7 @@ pub fn load_model_pair_with_context(
 
     let config = resolve_model_config(raw, &file_stem, defaults, ctx, declared)?;
 
-    // Check for sibling contract file. `exists()` follows a symlink, so a
-    // contract that is a dangling link read as "no contract" and the model
-    // compiled with its contract silently dropped (#1817). `entry_is_present`
-    // answers `true` for anything but a proven absence; the compiler's read
-    // then reports the honest error.
-    let contract_path = sql_path.with_extension("contract.toml");
-    let contract_path = if crate::path_presence::entry_is_present(&contract_path) {
-        Some(contract_path)
-    } else {
-        None
-    };
+    let contract_path = sibling_contract_path(sql_path);
 
     Ok(Model {
         config,
@@ -1526,13 +1531,8 @@ pub fn parse_model_inline_with_context(
 
     let config = resolve_model_config(raw, &file_stem, defaults, ctx, declared)?;
 
-    // Check for sibling contract file (inline models can have them too)
-    let contract_file = Path::new(file_path).with_extension("contract.toml");
-    let contract_path = if contract_file.exists() {
-        Some(contract_file)
-    } else {
-        None
-    };
+    // Inline models can have a sibling contract too — same probe, same rule.
+    let contract_path = sibling_contract_path(Path::new(file_path));
 
     Ok(Model {
         config,
@@ -2056,6 +2056,30 @@ mod tests {
         assert!(
             format!("{err}").contains("_defaults.toml"),
             "the refusal names the file: {err}"
+        );
+    }
+
+    /// The INLINE path — frontmatter in the `.sql`, no `.toml` — had its own
+    /// `exists()` probe that the first pass missed. Same rule, same helper now.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_contract_beside_an_inline_model_is_handed_on_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(
+            models.join("orders.sql"),
+            "---toml\nname = \"orders\"\ntarget = { catalog = \"c\", schema = \"s\", table = \"orders\" }\n---\nSELECT 1 AS id\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(dir.path().join("gone"), models.join("orders.contract.toml"))
+            .unwrap();
+
+        let loaded = load_models_from_dir(&models, None).expect("the inline model loads");
+        assert_eq!(loaded.len(), 1);
+        assert!(
+            loaded[0].contract_path.is_some(),
+            "the inline path dropped a dangling contract just like the pair path did"
         );
     }
 
