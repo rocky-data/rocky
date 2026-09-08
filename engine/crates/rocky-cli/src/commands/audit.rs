@@ -762,6 +762,49 @@ pub(crate) fn blast_radius_of(
     Some((direct, transitive))
 }
 
+/// The transitive downstream models reached by **all** of `models`, unioned and
+/// deduplicated — or `None` if any one of them is absent from the graph.
+///
+/// The queue's aggregation rule for a plan-level escalation, factored out
+/// beside [`blast_radius_of`] so there is one derivation of "how far does this
+/// reach" rather than a second one invented at the call site.
+///
+/// **Union, not `max`.** The glossary defines a blast radius as the *set* of
+/// downstream models, and [`build_blast_radius_link`] already unions across
+/// subjects. `max` throws away disjoint closures: a plan over two unrelated
+/// roots with three downstream models each reaches six, and `max` calls it
+/// three — the same number as a plan over one of them. `sum` has the opposite
+/// fault and double-counts an overlap. The deduplicated union is the only one
+/// of the three that counts each reached model once.
+///
+/// **All-or-nothing, and this is the load-bearing half.** If any named model is
+/// absent, the answer is `None` — unknown — not a partial count. A plan over a
+/// live leaf and a since-deleted model would otherwise resolve the leaf to an
+/// empty set and report a **measured zero**, which reads as "nothing
+/// downstream" about a plan half of which could not be looked up at all.
+/// Unknown and zero are different answers and only one of them is honest here.
+///
+/// **The plan's own models are NOT removed**, which is where this parts company
+/// with [`build_blast_radius_link`]'s subject removal — deliberately, so the
+/// difference is on the record rather than an oversight. That function answers
+/// "what else does this subject reach", so excluding the subject is right. A
+/// backfill's model list is a transitively closed set by construction, so
+/// removing its members would make **every** backfill measure exactly zero and
+/// re-open the ranking collapse this exists to fix. Here the question is how
+/// much the plan's change reaches, and a model rebuilt because another member
+/// changed is part of that reach.
+pub(crate) fn blast_radius_union<'a>(
+    result: &compile::CompileResult,
+    models: impl IntoIterator<Item = &'a str>,
+) -> Option<BTreeSet<String>> {
+    let mut union: BTreeSet<String> = BTreeSet::new();
+    for model in models {
+        let (_, transitive) = blast_radius_of(result, model)?;
+        union.extend(transitive);
+    }
+    Some(union)
+}
+
 /// Render the custody chain as a concise human-readable report.
 fn render_chain_text(out: &AuditForOutput) {
     let kind = serde_plain(&out.subject_kind);

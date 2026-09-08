@@ -55,7 +55,7 @@ use rocky_core::state::{PolicyDecisionRecord, StateStore};
 use serde::{Deserialize, Serialize};
 
 use crate::commands::apply::{ai_plan_is_reviewed, review_marker_path};
-use crate::commands::audit::{blast_radius_of, compile_project_with_schemas, plan_file_path};
+use crate::commands::audit::{blast_radius_union, compile_project_with_schemas, plan_file_path};
 use crate::output::{
     ApproverIdentity, ReviewOutput, ReviewQueueEntry, ReviewQueueOutput, RunPlan, print_json,
 };
@@ -855,19 +855,25 @@ fn build_queue(
     let mut entries: Vec<ReviewQueueEntry> = outstanding
         .into_iter()
         .map(|d| {
-            // A plan-level escalation (backfill / gc / restore) names its
-            // models in `models`; an ordinary row's `model` IS the graph key.
-            // `graph_keys` yields the right one, and the WIDEST radius among
-            // them ranks the plan — a plan is as risky as its riskiest model.
-            // `max()` over no resolvable key is `None`, which is the honest
-            // "unknown" this ranking already degrades on; it must never
-            // collapse to `Some(0)`, which would claim a measured zero.
-            let blast_radius = compiled.as_ref().and_then(|r| {
-                d.graph_keys()
-                    .filter_map(|m| blast_radius_of(r, m))
-                    .map(|(_, transitive)| transitive.len() as u64)
-                    .max()
-            });
+            // The keys that must RESOLVE are the recorded model set — or, on
+            // an ordinary row that has none, the single `model`, which is the
+            // graph key there. `graph_keys` is deliberately not used for this:
+            // it also yields the human label so `audit --for` can match it, and
+            // a label resolves in no graph, so requiring it to resolve would
+            // make every plan-level row unknown forever.
+            let radius_keys: Vec<&str> = if d.models.is_empty() {
+                vec![d.model.as_str()]
+            } else {
+                d.models.iter().map(String::as_str).collect()
+            };
+            // Deduplicated union, all-or-nothing: an absent member makes the
+            // whole answer unknown rather than a partial count dressed as a
+            // measurement. See `blast_radius_union` for why union and not
+            // `max`, and why the plan's own models stay in.
+            let blast_radius = compiled
+                .as_ref()
+                .and_then(|r| blast_radius_union(r, radius_keys.iter().copied()))
+                .map(|reached| reached.len() as u64);
             let classification_weight = classification_weight(d.capability);
             let staleness_seconds = (now - d.timestamp).num_seconds().max(0);
             let score = queue_score(blast_radius, classification_weight, staleness_seconds);
@@ -1020,9 +1026,11 @@ pub(crate) fn record_plan_review_escalation(
 /// comment named only the first two and was therefore false: the project failed
 /// to compile; the model is gone from the graph; the row is a pre-v28
 /// plan-level escalation, which recorded no model set and whose `model` is a
-/// label no graph resolves; or the row named models and none of them resolve.
-/// Zero is the ranking's honest floor for every one of those — it is not a
-/// measured radius of zero, which is `Some(0)`.
+/// label no graph resolves; or the row named models and **any one of them** is
+/// absent. That last case is all-or-nothing on purpose — a partly resolvable
+/// plan is unknown, not a small number. Zero is the ranking's honest floor for
+/// every one of those, and it is not a measured radius of zero, which is
+/// `Some(0)` and means the plan really does reach nothing.
 fn queue_score(
     blast_radius: Option<u64>,
     classification_weight: u32,
@@ -1918,15 +1926,14 @@ mod tests {
         );
     }
 
-    /// A backfill ranks on its WIDEST model, not its first or its last.
+    /// A backfill's radius is the union over its models, and the order the
+    /// set arrives in cannot change it.
     ///
-    /// `blast_radius_of` takes one name, so the fix has to choose. A backfill
-    /// closure is exactly the case where the choice shows: the seed `a` is the
-    /// riskiest model in the plan and the leaves are harmless, and a plan is
-    /// as risky as its riskiest member. Ordering the set differently must not
-    /// change the answer, which is what the two plans pin.
+    /// The seed `a` reaches `b`, `c` and `d`; the leaves reach nothing. The
+    /// union is the same three whichever way the list is written, which is
+    /// what a set-valued answer has to guarantee.
     #[test]
-    fn a_backfill_ranks_on_its_widest_model_whatever_the_order() {
+    fn a_backfill_ranks_on_the_union_of_its_models_whatever_the_order() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let models_dir = root.join("models");
@@ -1960,6 +1967,195 @@ mod tests {
                 e.plan_id
             );
         }
+    }
+
+    /// **Union, not `max`.** Two disjoint roots reach twice as far as one.
+    ///
+    /// `blast_radius_of` takes a single name, so an aggregation rule had to be
+    /// chosen, and `max` was the wrong one: it discards every closure but the
+    /// biggest. A plan over `a` and `x` — three downstream models each, no
+    /// overlap — reaches six models, and `max` reported three, the same number
+    /// as a plan over `a` alone. The two plans were indistinguishable in the
+    /// ranking, which is the defect #1766 exists to remove.
+    ///
+    /// Restoring `max` makes this fail. `sum` would pass here and fail
+    /// `overlapping_closures_are_counted_once` below; only the deduplicated
+    /// union passes both.
+    #[test]
+    fn two_disjoint_roots_reach_further_than_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let models_dir = root.join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        // Two unrelated trees: a -> {b, c, d} and x -> {y, z, w}.
+        for (name, sql) in [
+            ("a", "SELECT id FROM source.raw.t"),
+            ("b", "SELECT id FROM a"),
+            ("c", "SELECT id FROM b"),
+            ("d", "SELECT id FROM a"),
+            ("x", "SELECT id FROM source.raw.u"),
+            ("y", "SELECT id FROM x"),
+            ("z", "SELECT id FROM y"),
+            ("w", "SELECT id FROM x"),
+        ] {
+            std::fs::write(models_dir.join(format!("{name}.sql")), sql).unwrap();
+            std::fs::write(
+                models_dir.join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                     [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{name}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let state_path = root.join("state.redb");
+
+        // `bf_one` sorts FIRST on the plan-id tie-break, so under `max` — where
+        // both score 3 — it led the queue. Only a wider measured radius on
+        // `bf_two` can move it.
+        touch_plan_file(root, "bf_one");
+        record_plan_review_escalation(
+            &state_path,
+            "bf_one",
+            PolicyPrincipal::Agent,
+            PolicyCapability::Backfill,
+            "backfill: 1 model(s)",
+            vec!["a".to_string()],
+            "backfill plan awaits review",
+        );
+        touch_plan_file(root, "bf_two");
+        record_plan_review_escalation(
+            &state_path,
+            "bf_two",
+            PolicyPrincipal::Agent,
+            PolicyCapability::Backfill,
+            "backfill: 2 model(s)",
+            vec!["a".to_string(), "x".to_string()],
+            "backfill plan awaits review",
+        );
+
+        let out = compute_review_queue(root, &root.join("rocky.toml"), &state_path, &models_dir)
+            .expect("the queue must rank");
+        assert_eq!(out.total, 2);
+        let radius = |plan: &str| {
+            out.pending
+                .iter()
+                .find(|e| e.plan_id == plan)
+                .unwrap_or_else(|| panic!("{plan} must be in the queue"))
+                .blast_radius
+        };
+        assert_eq!(radius("bf_one"), Some(3), "a alone reaches b, c, d");
+        assert_eq!(
+            radius("bf_two"),
+            Some(6),
+            "a and x are disjoint, so the plan reaches all six — `max` said 3"
+        );
+        assert_eq!(
+            out.pending[0].plan_id, "bf_two",
+            "the wider plan leads; it does not sort first on id, so only the \
+             radius can put it there"
+        );
+    }
+
+    /// The union counts each reached model **once**, so an overlap is not
+    /// double-counted.
+    ///
+    /// This is the half that rules out `sum`. `a` reaches `b`, `c`, `d`; `b`
+    /// reaches `c`. A plan over both reaches three distinct models, not four.
+    #[test]
+    fn overlapping_closures_are_counted_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let models_dir = root.join("models");
+        write_blast_graph(&models_dir);
+        let state_path = root.join("state.redb");
+
+        touch_plan_file(root, "bf_overlap");
+        record_plan_review_escalation(
+            &state_path,
+            "bf_overlap",
+            PolicyPrincipal::Agent,
+            PolicyCapability::Backfill,
+            "backfill: 2 model(s)",
+            vec!["a".to_string(), "b".to_string()],
+            "backfill plan awaits review",
+        );
+
+        let out = compute_review_queue(root, &root.join("rocky.toml"), &state_path, &models_dir)
+            .expect("the queue must rank");
+        assert_eq!(
+            out.pending[0].blast_radius,
+            Some(3),
+            "a reaches b, c, d and b reaches c — three distinct models, not four"
+        );
+    }
+
+    /// **A partly resolvable plan is unknown, not a small number.**
+    ///
+    /// The sharpest case in the whole fix, and the one the first version got
+    /// wrong. `c` is a live leaf, so `blast_radius_of("c")` returns
+    /// `Some(empty)` — a real, measured zero. `deleted_since` is absent and
+    /// returns `None`. Under a `filter_map` + `max` the absent member was
+    /// simply dropped, leaving `Some(0)`, and the queue rendered
+    /// "0 downstream" for a plan half of which could not be looked up at all.
+    ///
+    /// A measured zero and an unknown are different answers. Only one of them
+    /// is true here, and it is not the one that reads as a measurement.
+    ///
+    /// The second half is the discriminator: the SAME leaf alone really does
+    /// measure zero, so this test cannot pass by making every leaf unknown.
+    #[test]
+    fn a_partly_resolvable_plan_is_unknown_not_a_measured_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let models_dir = root.join("models");
+        write_blast_graph(&models_dir);
+        let state_path = root.join("state.redb");
+
+        // A live leaf PLUS a model the graph no longer has.
+        touch_plan_file(root, "gc_partial");
+        record_plan_review_escalation(
+            &state_path,
+            "gc_partial",
+            PolicyPrincipal::Human,
+            PolicyCapability::Gc,
+            "gc: 2 artifact(s) across 2 model(s)",
+            vec!["c".to_string(), "deleted_since".to_string()],
+            "gc plan awaits review",
+        );
+        // The same leaf on its own.
+        touch_plan_file(root, "gc_leaf_only");
+        record_plan_review_escalation(
+            &state_path,
+            "gc_leaf_only",
+            PolicyPrincipal::Human,
+            PolicyCapability::Gc,
+            "gc: 1 artifact(s) across 1 model(s)",
+            vec!["c".to_string()],
+            "gc plan awaits review",
+        );
+
+        let out = compute_review_queue(root, &root.join("rocky.toml"), &state_path, &models_dir)
+            .expect("the queue must rank");
+        let radius = |plan: &str| {
+            out.pending
+                .iter()
+                .find(|e| e.plan_id == plan)
+                .unwrap_or_else(|| panic!("{plan} must be in the queue"))
+                .blast_radius
+        };
+        assert_eq!(
+            radius("gc_partial"),
+            None,
+            "one member of this plan cannot be resolved, so the radius is \
+             unknown — never a zero that reads as a measurement"
+        );
+        assert_eq!(
+            radius("gc_leaf_only"),
+            Some(0),
+            "the same leaf alone IS a measured zero, so unknown is not simply \
+             what every leaf now returns"
+        );
     }
 
     /// **The empty set is reachable, and it must rank as unknown.**
