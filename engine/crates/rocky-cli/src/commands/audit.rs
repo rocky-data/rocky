@@ -1454,24 +1454,32 @@ mod tests {
     }
 
     /// A product's custody chain includes a plan-level escalation that touches
-    /// its output model.
+    /// its output model — driven through `compute_audit`, not through the
+    /// accessor.
     ///
     /// `rocky audit --product <p>` scopes the ledger to the product's
     /// `output.model`. It compared that to `PolicyDecisionRecord::model`, which
     /// on a backfill / gc / restore row is a summary — so a gc plan proposing
-    /// to delete the product's own output was absent from the product's
-    /// custody chain, on the screen a governor would look at to decide.
+    /// to delete the product's own output was **absent from the product's
+    /// custody chain**, on the screen a governor reads to decide.
+    ///
+    /// An earlier version of this test called `graph_keys()` directly and
+    /// proved nothing about the filter: restoring `d.model == scope.output_model`
+    /// at the call site left it green. It now goes through `compute_audit`, so
+    /// the production plumbing is what is under test.
     #[test]
     fn a_products_custody_chain_includes_a_plan_level_row_touching_its_output_model() {
-        use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let state_path = root.join("state.redb");
 
-        let row = |models: Vec<&str>, model: &str| PolicyDecisionRecord {
+        let plan_level = |plan_id: &str, models: Vec<&str>, label: &str| PolicyDecisionRecord {
             models: models.into_iter().map(str::to_string).collect(),
-            timestamp: Utc::now(),
-            plan_id: "planGC".to_string(),
+            timestamp: Utc.with_ymd_and_hms(2026, 9, 8, 0, 0, 1).unwrap(),
+            plan_id: plan_id.to_string(),
             principal: PolicyPrincipal::Human,
             capability: PolicyCapability::Gc,
-            model: model.to_string(),
+            model: label.to_string(),
             effect: PolicyEffect::RequireReview,
             rule_id: None,
             reason: "gc plan awaits review".to_string(),
@@ -1479,24 +1487,65 @@ mod tests {
             auto_apply: None,
         };
 
-        // The gc plan would evict from `revenue_daily`, the product's output.
-        let touching = row(
-            vec!["revenue_daily", "staging_orders"],
-            "gc: 4 artifact(s) across 2 model(s)",
-        );
-        assert!(
-            touching.graph_keys().any(|m| m == "revenue_daily"),
-            "the product's output model is one of the recorded keys"
-        );
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            // An ordinary row about the output model — matched before and after.
+            store
+                .record_policy_decision(&decision(
+                    1,
+                    "plan-ordinary",
+                    "revenue_daily",
+                    PolicyEffect::Allow,
+                ))
+                .unwrap();
+            // A gc plan that WOULD DELETE the product's output model. Its
+            // `model` is a summary, so the old filter dropped it.
+            store
+                .record_policy_decision(&plan_level(
+                    "plan-gc-hits",
+                    vec!["revenue_daily", "staging_orders"],
+                    "gc: 4 artifact(s) across 2 model(s)",
+                ))
+                .unwrap();
+            // A gc plan touching only unrelated models — must STAY out.
+            store
+                .record_policy_decision(&plan_level(
+                    "plan-gc-misses",
+                    vec!["staging_orders"],
+                    "gc: 1 artifact(s) across 1 model(s)",
+                ))
+                .unwrap();
+        }
 
-        // A gc plan that touches only unrelated models must NOT join the chain.
-        let unrelated = row(
-            vec!["staging_orders"],
-            "gc: 1 artifact(s) across 1 model(s)",
+        fs::create_dir_all(root.join("products")).unwrap();
+        fs::write(
+            root.join("products/daily_revenue.toml"),
+            SPEC_FIXTURE.replace("name   = \"revenue_daily\"", "name   = \"daily_revenue\""),
+        )
+        .unwrap();
+        let scope = resolve_product_scope(root, "daily_revenue").unwrap();
+        assert_eq!(scope.output_model, "revenue_daily");
+
+        let scoped = compute_audit(&state_path, Some(scope)).unwrap();
+        let plans: Vec<&str> = scoped
+            .decisions
+            .iter()
+            .map(|d| d.plan_id.as_str())
+            .collect();
+
+        assert!(
+            plans.contains(&"plan-gc-hits"),
+            "a gc plan that would delete this product's output model belongs in \
+             its custody chain; got {plans:?}"
         );
         assert!(
-            !unrelated.graph_keys().any(|m| m == "revenue_daily"),
-            "scoping must still exclude a plan that does not touch the product"
+            plans.contains(&"plan-ordinary"),
+            "the ordinary row must still match — the fix is additive, not a swap"
+        );
+        assert!(
+            !plans.contains(&"plan-gc-misses"),
+            "scoping must still exclude a plan that does not touch the product; \
+             got {plans:?}"
         );
     }
 

@@ -3967,6 +3967,36 @@ auto_create_schemas = true
         assert_eq!(queue.pending[0].capability, PolicyCapability::Gc);
         assert_eq!(queue.excluded_non_plan_rows, 0);
 
+        // #1766: the escalation carries the models the plan would evict from,
+        // beside the summary in `model`. This is the only assertion that
+        // reaches the PRODUCTION call site — the ranking tests in `review.rs`
+        // hand `record_plan_review_escalation` a set they made up, so replacing
+        // `gc_plan_models(&plan)` with `Vec::new()` at gc.rs would leave every
+        // one of them green.
+        let decision = {
+            let store = StateStore::open_read_only(&state_path).unwrap();
+            store
+                .list_policy_decisions()
+                .unwrap()
+                .into_iter()
+                .find(|d| d.plan_id == plan_id)
+                .expect("the gc plan's escalation row")
+        };
+        assert_eq!(
+            decision.models,
+            vec!["orders".to_string()],
+            "the recorded keys are the evicted models, not the summary"
+        );
+        assert!(
+            decision.model.contains("model(s)"),
+            "and the summary is untouched: {}",
+            decision.model
+        );
+        // No models dir in this fixture, so the compile fails and the radius is
+        // honestly unknown. Asserted so the `None` here reads as the degrade it
+        // is, rather than as a silent absence of the fix.
+        assert_eq!(queue.pending[0].blast_radius, None);
+
         // 3. Approve through the exact core the MCP review_queue tool calls.
         let review = crate::commands::review::compute_review(root, &config, &plan_id, "HEAD", true)
             .await

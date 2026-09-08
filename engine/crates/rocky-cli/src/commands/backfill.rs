@@ -952,6 +952,17 @@ mod tests {
         assert_eq!(d.capability, PolicyCapability::Backfill);
         assert_eq!(d.principal, PolicyPrincipal::Agent);
         assert!(d.model.contains("2 model(s)"), "scope summary: {}", d.model);
+        // #1766: the summary above is a LABEL. These are the graph keys, and
+        // this assertion is the only thing that proves the production call site
+        // passes the real closure — every other test for this behaviour calls
+        // `record_plan_review_escalation` directly with a set it made up, so
+        // replacing `ordered.clone()` with `Vec::new()` at the call site would
+        // leave all of them green.
+        assert_eq!(
+            d.models,
+            vec!["a".to_string(), "b".to_string()],
+            "the recorded set is the resolved closure, seed first"
+        );
 
         // And the decision-driven review queue now lists the backfill.
         let queue = crate::commands::review::compute_review_queue(
@@ -967,6 +978,15 @@ mod tests {
         assert_eq!(
             queue.pending[0].approve_command,
             format!("rocky review {plan_id} --approve")
+        );
+        // And it ranks on a MEASURED radius rather than "unknown", which is the
+        // whole point of #1766. `a` reaches `b`; `b` reaches nothing; the union
+        // is one model. Blank the recorded set at the call site and this reads
+        // `None`.
+        assert_eq!(
+            queue.pending[0].blast_radius,
+            Some(1),
+            "the closure {{a, b}} reaches b and nothing further"
         );
     }
 
