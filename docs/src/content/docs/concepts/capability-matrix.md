@@ -73,8 +73,10 @@ Two limits, stated plainly:
   that. `rocky test` and `rocky ci` always compile with no source schemas, so
   every column that takes its type from a source table is `Unknown` under
   them. And an expression whose result type depends on the warehouse — `AVG`
-  over a `DECIMAL` column — stays `Unknown` either way. A `CAST` only fixes
-  the column when the value it casts already has a known type.
+  over a `DECIMAL` column — stays `Unknown` either way. Do not add a `CAST`
+  to clear an `I003`. A cast takes its type from the target, not from the
+  value, so it reports whatever you cast to whether or not the data matches.
+  It silences the message and checks nothing.
 - A bare `Decimal` in a contract matches any precision and scale. A contract
   that names the digits — `Decimal(18,2)` — must match the inferred precision
   and scale exactly.

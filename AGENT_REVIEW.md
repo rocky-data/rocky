@@ -160,6 +160,17 @@ it. That is the property to **preserve**, and it means the finding to look for i
   test-env mutation). Any new `unsafe` without a `// SAFETY:` justification is a finding.
 - **`ModelIr::clone()` is a deep O(sql + Vec sizes) copy**, not a refcount bump. Flag a clone added inside
   a per-partition / per-row hot loop; do not assume cloning the IR is free.
+- **A path probe that answers "no" must not become a claim.** `Path::exists()` (and
+  `metadata().is_ok()`) returns `false` for *absent* and for *there but unreadable* alike — a
+  permission denial, a dangling symlink, a directory where a file belongs. Ask of every such call:
+  **when this answers false, does the caller produce a default that a reader would take as fact?**
+  If it does, that is a finding. "No spec file", "snapshot intact", "no staging journal" are answers
+  a human approves from; earning them from an unreadable path is a false claim, not a missing file.
+  Use `rocky_core::path_presence::classify_not_found` to separate the two, and let `Present { .. }`
+  become an error rather than a default. Six instances of this class shipped before the helper was
+  reached for (#1708, #1710, #1787, #1789, #1792); it is the most repeated defect in the product
+  surface. A bare `.exists()` is *fine* where false only routes control flow — creating a directory,
+  picking a search path, skipping optional work. The rule is about the answer, not the call.
 
 ## Test-evidence expectations
 Rocky uses **inline `#[cfg(test)] mod tests`** (plus `engine/crates/rocky-compiler/tests/` for fixtures).

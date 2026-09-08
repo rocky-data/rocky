@@ -1658,6 +1658,64 @@ fn replication_resume_scope(
 /// resuming invocation (#1549). Fail-closed on a scopeless (pre-v23)
 /// checkpoint: it cannot name the pipeline that wrote it, so it must not
 /// authorize skipping this pipeline's tables.
+/// Refuse a resume whose checkpoint keys cannot prove *where* the data went
+/// (#1611).
+///
+/// A checkpoint key is the rendered `catalog.schema.table` text. On Snowflake
+/// an empty catalog is not an error — `format_table_ref` emits
+/// `"schema"."table"` — so when the adapter also pins no `database`, the write
+/// resolves against the session user's `DEFAULT_NAMESPACE`. Nothing in that
+/// path reaches the key:
+///
+/// ```text
+/// run A   session default = DB_A   writes  DB_A.staging.orders   key ".staging.orders"
+/// run B   session default = DB_B   resume  ─────────────────────▶ key matches, SKIPPED
+///                                           DB_B.staging.orders is never written
+/// ```
+///
+/// The resume scope compares pipeline, filter, templates, separator and the
+/// endpoint identity — and every one of them is byte-identical across that
+/// pair, deliberately so: the endpoint carries no principal, and the session
+/// default is a property of the credential rather than the config.
+///
+/// Scoped to resumes on purpose. A fresh run under a session default is
+/// unaffected; this only declines to *trust a completed key* that cannot name
+/// a database. Refusing an empty catalog outright, for every adapter and every
+/// run, is the wider option recorded on the issue and is not what this does.
+fn ensure_resume_namespace_is_pinned(
+    target: &rocky_core::config::PipelineTargetConfig,
+    target_adapter: &rocky_core::config::AdapterConfig,
+) -> Result<()> {
+    if !target_adapter
+        .adapter_type
+        .eq_ignore_ascii_case("snowflake")
+    {
+        return Ok(());
+    }
+    // A template that is blank renders blank. A template carrying a
+    // placeholder is left alone here: it may still render empty for some
+    // binding, but refusing on that would refuse every templated project on
+    // the strength of a value this function cannot see.
+    if !target.catalog_template.trim().is_empty() {
+        return Ok(());
+    }
+    if target_adapter
+        .database
+        .as_deref()
+        .is_some_and(|db| !db.trim().is_empty())
+    {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "cannot resume: this pipeline's target catalog is empty and the Snowflake adapter \
+         pins no `database`, so the write resolves against the session user's default \
+         namespace. A completed checkpoint key cannot prove which database a table was \
+         written to, and resuming under a different default would skip tables it never \
+         copied. Set `[pipeline.<name>.target] catalog_template`, or the adapter's \
+         `database`, then start a fresh run"
+    )
+}
+
 fn ensure_resume_scope(progress: &RunProgress, current: &ResumeScope) -> Result<()> {
     let Some(recorded) = &progress.scope else {
         anyhow::bail!(
@@ -3255,6 +3313,12 @@ pub async fn run(
         target_sep,
         &pattern,
     );
+    // Before any checkpoint is consulted (#1611). A key that cannot name a
+    // database is not evidence a table was copied, so the refusal belongs
+    // ahead of the lookup that would trust it.
+    if resume_run_id.is_some() || resume_latest {
+        ensure_resume_namespace_is_pinned(&pipeline.target, target_adapter)?;
+    }
     let resume_progress =
         resolve_resume_progress(&state_store, resume_run_id, resume_latest, &resume_scope)?;
     // Read the prior run's persisted check-gate verdict here, while
@@ -15172,6 +15236,68 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             "the message still names the machine, so the operator can tell the \
              endpoints apart"
         );
+    }
+
+    /// #1611: a Snowflake resume whose target database is unpinned is
+    /// refused, because its checkpoint keys cannot say which database a
+    /// completed table went to.
+    ///
+    /// The refusal is narrow by construction, and each arm below is one of
+    /// the ways it must NOT fire — a guard that refuses more than the
+    /// ambiguous case would break working projects.
+    #[test]
+    fn resume_refuses_an_unpinned_snowflake_namespace() {
+        use rocky_core::config::{AdapterConfig, PipelineTargetConfig};
+
+        let target = |catalog_template: &str| -> PipelineTargetConfig {
+            toml::from_str(&format!(
+                "adapter = \"default\"\ncatalog_template = \"{catalog_template}\"\nschema_template = \"staging\"\n"
+            ))
+            .unwrap()
+        };
+        let snowflake = |extra: &str| -> AdapterConfig {
+            toml::from_str(&format!("type = \"snowflake\"\n{extra}")).unwrap()
+        };
+
+        // The ambiguous shape: no catalog, no database. Refused.
+        let err = ensure_resume_namespace_is_pinned(&target(""), &snowflake(""))
+            .expect_err("an unpinned Snowflake namespace must refuse a resume");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("session user's default namespace"),
+            "the refusal must say WHY the key cannot be trusted: {msg}"
+        );
+        assert!(
+            msg.contains("catalog_template") && msg.contains("database"),
+            "the refusal must name both remedies: {msg}"
+        );
+
+        // Whitespace is not a catalog.
+        assert!(ensure_resume_namespace_is_pinned(&target("   "), &snowflake("")).is_err());
+
+        // Pinned either way is fine — one is enough.
+        ensure_resume_namespace_is_pinned(&target("wh"), &snowflake(""))
+            .expect("a rendered catalog pins the namespace");
+        ensure_resume_namespace_is_pinned(&target(""), &snowflake("database = \"DB_A\"\n"))
+            .expect("an adapter database pins the namespace");
+
+        // A blank adapter database is no more pinned than an absent one.
+        assert!(
+            ensure_resume_namespace_is_pinned(&target(""), &snowflake("database = \"  \"\n"))
+                .is_err()
+        );
+
+        // Not Snowflake: an empty catalog means something else on other
+        // adapters, and this guard has no opinion about them.
+        let duckdb = test_duckdb_adapter(None);
+        ensure_resume_namespace_is_pinned(&target(""), &duckdb)
+            .expect("the guard is Snowflake-only");
+
+        // A templated catalog is left alone. It may still render empty for
+        // some binding, but refusing here would refuse every templated
+        // project on the strength of a value this function cannot see.
+        ensure_resume_namespace_is_pinned(&target("{tenant}"), &snowflake(""))
+            .expect("a placeholder catalog is not a blank catalog");
     }
 
     /// A template with a **bare** variadic placeholder joins it with the
