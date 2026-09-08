@@ -1664,7 +1664,35 @@ impl Runner {
             outbox_dir: dir.join("outbox"),
         };
         Ok(match self.dispatch(record, &*driver, &brief).await {
-            Ok(_) => {
+            Ok(DriverOutcome::Elicitation { .. }) => Event::DraftingFinished {
+                error: Some("driver returned an elicitation outcome for a drafting task".into()),
+            },
+            Ok(DriverOutcome::Drafting {
+                model_sql,
+                model_sidecar,
+                expected_sql_digest,
+                expected_sidecar_digest,
+                ..
+            }) => {
+                // Custody (#1515): verify the hand-off, check the tree on
+                // disk still matches it, then perform the confined write
+                // ourselves — so Phase B merges bytes the runner wrote
+                // from an attributed hand-off, and a mid-window edit by
+                // anything else is refused with the file named rather
+                // than merged. Runs BEFORE the tamper drill seams below,
+                // so those drills keep exercising Phase A's byte-verify.
+                if let Err(err) = crate::handoff::commit_model_handoff(
+                    &self.root,
+                    spec.parsed.output_model(),
+                    crate::handoff::Handoff {
+                        model_sql: &model_sql,
+                        model_sidecar: &model_sidecar,
+                        expected_sql_digest: &expected_sql_digest,
+                        expected_sidecar_digest: &expected_sidecar_digest,
+                    },
+                ) {
+                    return Ok(Event::DraftingFinished { error: Some(err) });
+                }
                 // Crash seam for the Phase-A tamper drill: the worker is
                 // gone (group killed), the byte-verify has not run yet.
                 fault_point("post-drafting");

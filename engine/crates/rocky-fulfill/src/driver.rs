@@ -48,6 +48,14 @@ pub const OUTBOX_CANDIDATE: &str = "candidate_spec.toml";
 /// The outbox file an elicitation worker writes its questions to
 /// (a JSON array of strings). Optional.
 pub const OUTBOX_QUESTIONS: &str = "questions.json";
+/// The outbox file carrying a drafting / repair worker's hand-off of
+/// `models/<model>.sql` (#1515). Written by the worker-profile
+/// `draft_model` tool as a mirror of its own write, so both the
+/// subprocess and the replay driver produce it without the worker having
+/// to follow an instruction.
+pub const OUTBOX_MODEL_SQL: &str = "model.sql";
+/// The outbox file carrying the hand-off of `models/<model>.toml`.
+pub const OUTBOX_MODEL_SIDECAR: &str = "model.toml";
 
 /// What kind of task the worker is being dispatched on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,7 +112,11 @@ pub struct TaskBrief {
     /// The task outbox (`.rocky/fulfillment/<name>/outbox/`), cleared by
     /// the driver before dispatch. The elicitation contract: the worker
     /// writes [`OUTBOX_CANDIDATE`] (+ optionally [`OUTBOX_QUESTIONS`])
-    /// here; the RUNNER does the confined spec write.
+    /// here; the RUNNER does the confined spec write. The drafting /
+    /// repair contract is the same shape one seam over (#1515): the
+    /// worker-profile `draft_model` tool mirrors [`OUTBOX_MODEL_SQL`] and
+    /// [`OUTBOX_MODEL_SIDECAR`] here, and the runner commits the model
+    /// files ONLY when the tree on disk still matches that hand-off.
     pub outbox_dir: PathBuf,
 }
 
@@ -126,8 +138,21 @@ pub enum DriverOutcome {
     },
     /// A drafting / repair task ended with the worker's exit 0 and the
     /// group killed (cooperative-descendant scope; see the module doc).
-    /// The runner trusts NOTHING from it — its own compile/test decide.
+    /// The runner trusts NOTHING from it for correctness — its own
+    /// compile/test decide. What it does take from it is CUSTODY (#1515):
+    /// the hand-off bytes below are what the runner will write into
+    /// `models/`, after checking the tree on disk still matches them, so
+    /// Phase B merges bytes the runner wrote from an attributed hand-off
+    /// rather than whatever happened to be on disk.
     Drafting {
+        /// The worker's hand-off of `models/<model>.sql`, raw bytes.
+        model_sql: Vec<u8>,
+        /// The worker's hand-off of `models/<model>.toml`, raw bytes.
+        model_sidecar: Vec<u8>,
+        /// `sha256:<hex>` the hand-off claims for `model_sql`.
+        expected_sql_digest: String,
+        /// `sha256:<hex>` the hand-off claims for `model_sidecar`.
+        expected_sidecar_digest: String,
         /// The captured transcript.
         transcript_path: PathBuf,
     },
@@ -472,11 +497,38 @@ fn collect_outcome(
             })
         }
         // Every authoring kind produces the same outcome shape: the
-        // worker wrote SQL, and the runner re-verifies it from disk.
+        // worker's hand-off of the two model files, read from the outbox
+        // the worker-profile `draft_model` tool mirrored them into. A
+        // missing hand-off is the typed outbox error, exactly as for
+        // elicitation — a worker that never called `draft_model` (or was
+        // denied) has nothing for the runner to take custody of.
         TaskBriefKind::Drafting | TaskBriefKind::Repair | TaskBriefKind::DataRepair => {
-            Ok(DriverOutcome::Drafting { transcript_path })
+            let model_sql = read_outbox_file(brief, OUTBOX_MODEL_SQL)?;
+            let model_sidecar = read_outbox_file(brief, OUTBOX_MODEL_SIDECAR)?;
+            let expected_sql_digest = rocky_core::product::manifest::content_digest(&model_sql);
+            let expected_sidecar_digest =
+                rocky_core::product::manifest::content_digest(&model_sidecar);
+            Ok(DriverOutcome::Drafting {
+                model_sql,
+                model_sidecar,
+                expected_sql_digest,
+                expected_sidecar_digest,
+                transcript_path,
+            })
         }
     }
+}
+
+/// One required outbox file, or the typed outbox error naming it.
+fn read_outbox_file(brief: &TaskBrief, name: &str) -> Result<Vec<u8>, DriverError> {
+    let path = brief.outbox_dir.join(name);
+    std::fs::read(&path).map_err(|e| {
+        DriverError::OutboxMissing(format!(
+            "the worker did not hand off {} ({e}) — the worker-profile `draft_model` tool \
+             writes it; a round that never drafted, or was denied, has nothing to commit",
+            path.display()
+        ))
+    })
 }
 
 fn read_questions(path: &Path) -> Result<Vec<String>, DriverError> {
@@ -885,8 +937,13 @@ impl AgentDriver for ReplayDriver {
                     transcript_path,
                 })
             }
+            // The replayed `draft_model` calls ran against a real
+            // worker-profile server, which mirrored its writes into the
+            // outbox — so the hand-off is read back exactly as the
+            // subprocess driver reads it. A recorded session that never
+            // called `draft_model` has no hand-off, and says so.
             TaskBriefKind::Drafting | TaskBriefKind::Repair | TaskBriefKind::DataRepair => {
-                Ok(DriverOutcome::Drafting { transcript_path })
+                collect_outcome(brief, transcript_path)
             }
         }
     }
@@ -1044,6 +1101,16 @@ fn log_exchange(transcript: &mut std::fs::File, label: &str, response: &Option<s
 mod supervision_tests {
     use super::*;
 
+    /// Prefix a worker script with the minimum drafting hand-off (#1515):
+    /// both model files written into the outbox `brief()` derives from
+    /// `dir`. For tests whose subject is supervision, not the outbox — a
+    /// drafting task that hands nothing off is now the typed outbox error
+    /// rather than `Ok`, which those tests never meant to assert.
+    fn handoff_then(dir: &Path, cmd: &str) -> String {
+        let o = dir.join("outbox").display().to_string();
+        format!("printf 'x' > {o}/model.sql; printf 'y' > {o}/model.toml; {cmd}")
+    }
+
     fn brief(kind: TaskBriefKind, dir: &Path) -> TaskBrief {
         TaskBrief {
             kind,
@@ -1086,7 +1153,11 @@ mod supervision_tests {
     async fn orphan_grandchild_dies_with_the_group() {
         let dir = tempfile::tempdir().expect("tempdir");
         let driver = subprocess(
-            &["/bin/sh", "-c", "(sleep 300 &); echo {brief}; exit 0"],
+            &[
+                "/bin/sh",
+                "-c",
+                handoff_then(dir.path(), "(sleep 300 &); echo {brief}; exit 0").as_str(),
+            ],
             Duration::from_secs(30),
             Duration::from_secs(2),
         );
@@ -1187,7 +1258,12 @@ mod supervision_tests {
             let (outcome, stamp) = run(&driver, &brief).await;
             let (pgid, _) = stamp.expect("stamped");
             match &outcome {
-                Ok(DriverOutcome::Drafting { .. }) | Err(DriverError::Timeout { .. }) => {}
+                // A worker that finished without a hand-off is a coherent
+                // completion too (#1515) — this battery is about group
+                // supervision under the timeout race, not the outbox.
+                Ok(DriverOutcome::Drafting { .. })
+                | Err(DriverError::OutboxMissing(_))
+                | Err(DriverError::Timeout { .. }) => {}
                 other => panic!("iteration {i}: incoherent outcome {other:?}"),
             }
             assert!(!group_exists(pgid), "iteration {i}: survivors");
@@ -1247,10 +1323,13 @@ mod supervision_tests {
             std::env::set_var("ROCKY_FULFILL_BATTERY_ALLOWED", "yes");
             std::env::set_var("ROCKY_FULFILL_BATTERY_BLOCKED", "leak");
         }
-        let script = format!(
-            "printf '%s,%s' \"$ROCKY_FULFILL_BATTERY_ALLOWED\" \
-             \"$ROCKY_FULFILL_BATTERY_BLOCKED\" > {}; echo {{brief}}",
-            probe.display()
+        let script = handoff_then(
+            dir.path(),
+            &format!(
+                "printf '%s,%s' \"$ROCKY_FULFILL_BATTERY_ALLOWED\" \
+                 \"$ROCKY_FULFILL_BATTERY_BLOCKED\" > {}; echo {{brief}}",
+                probe.display()
+            ),
         );
         let driver = SubprocessDriver::new(
             vec!["/bin/sh".into(), "-c".into(), script],
@@ -1270,23 +1349,107 @@ mod supervision_tests {
     #[tokio::test]
     async fn transcript_captures_stdout_and_stderr() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let brief = brief(TaskBriefKind::Drafting, dir.path());
+        // A drafting task must hand off (#1515); this test is about the
+        // transcript, so the hand-off is the minimum that makes the
+        // outcome `Ok`.
+        let script = format!(
+            "echo {{brief}}; echo out-line; echo err-line >&2; \
+             printf 'x' > {o}/model.sql; printf 'y' > {o}/model.toml",
+            o = brief.outbox_dir.display()
+        );
         let driver = subprocess(
-            &[
-                "/bin/sh",
-                "-c",
-                "echo {brief}; echo out-line; echo err-line >&2",
-            ],
+            &["/bin/sh", "-c", &script],
             Duration::from_secs(30),
             Duration::from_secs(2),
         );
-        let brief = brief(TaskBriefKind::Drafting, dir.path());
         let (outcome, _) = run(&driver, &brief).await;
-        let Ok(DriverOutcome::Drafting { transcript_path }) = outcome else {
+        let Ok(DriverOutcome::Drafting {
+            transcript_path, ..
+        }) = outcome
+        else {
             panic!("{outcome:?}");
         };
         let transcript = std::fs::read_to_string(&transcript_path).expect("transcript");
         assert!(transcript.contains("out-line"));
         assert!(transcript.contains("err-line"));
+    }
+
+    /// The drafting outbox contract (#1515): the two model files read back
+    /// from the hand-off, digests computed over the exact bytes; a missing
+    /// hand-off is the typed outbox error, exactly as for elicitation — a
+    /// round whose worker never called `draft_model` has nothing the runner
+    /// can take custody of. Same contract for every authoring kind.
+    #[tokio::test]
+    async fn drafting_outbox_round_trips_and_missing_handoff_is_typed() {
+        for kind in [
+            TaskBriefKind::Drafting,
+            TaskBriefKind::Repair,
+            TaskBriefKind::DataRepair,
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let brief = brief(kind, dir.path());
+            let outbox = brief.outbox_dir.display().to_string();
+            let script = format!(
+                "printf 'SELECT 1 AS id\\n' > {outbox}/model.sql; \
+                 printf 'name = \"m1\"\\n' > {outbox}/model.toml; echo {{brief}}"
+            );
+            let driver = SubprocessDriver::new(
+                vec!["/bin/sh".into(), "-c".into(), script],
+                Vec::new(),
+                Duration::from_secs(30),
+                Duration::from_secs(2),
+            )
+            .expect("valid");
+            let (outcome, _) = run(&driver, &brief).await;
+            let Ok(DriverOutcome::Drafting {
+                model_sql,
+                model_sidecar,
+                expected_sql_digest,
+                expected_sidecar_digest,
+                ..
+            }) = outcome
+            else {
+                panic!("{kind:?}: {outcome:?}");
+            };
+            assert_eq!(model_sql, b"SELECT 1 AS id\n");
+            assert_eq!(model_sidecar, b"name = \"m1\"\n");
+            assert_eq!(
+                expected_sql_digest,
+                rocky_core::product::manifest::content_digest(&model_sql)
+            );
+            assert_eq!(
+                expected_sidecar_digest,
+                rocky_core::product::manifest::content_digest(&model_sidecar)
+            );
+
+            // Only the SQL handed off → the typed outbox error names the
+            // sidecar; nothing handed off → it names the SQL. Never a
+            // success with half a hand-off.
+            let half = format!("printf 'x' > {outbox}/model.sql; echo {{brief}}");
+            let driver = subprocess(
+                &["/bin/sh", "-c", &half],
+                Duration::from_secs(30),
+                Duration::from_secs(2),
+            );
+            let (outcome, _) = run(&driver, &brief).await;
+            match outcome {
+                Err(DriverError::OutboxMissing(msg)) => {
+                    assert!(msg.contains("model.toml"), "{msg}")
+                }
+                other => panic!("{kind:?}: half a hand-off must be typed: {other:?}"),
+            }
+            let none = subprocess(
+                &["/bin/sh", "-c", "echo {brief}"],
+                Duration::from_secs(30),
+                Duration::from_secs(2),
+            );
+            let (outcome, _) = run(&none, &brief).await;
+            match outcome {
+                Err(DriverError::OutboxMissing(msg)) => assert!(msg.contains("model.sql"), "{msg}"),
+                other => panic!("{kind:?}: no hand-off must be typed: {other:?}"),
+            }
+        }
     }
 
     /// The elicitation outbox contract: candidate + questions read back,
@@ -1390,7 +1553,11 @@ mod supervision_tests {
     async fn the_group_stamp_carries_the_leaders_start_time() {
         let dir = tempfile::tempdir().expect("tempdir");
         let driver = subprocess(
-            &["/bin/sh", "-c", "echo {brief}"],
+            &[
+                "/bin/sh",
+                "-c",
+                handoff_then(dir.path(), "echo {brief}").as_str(),
+            ],
             Duration::from_secs(30),
             Duration::from_secs(2),
         );
@@ -1504,8 +1671,15 @@ mod escape_scope_tests {
     const WORKER_OUTPUT: &[u8] = b"battery\n";
 
     fn run_a_trivial_task(brief: &TaskBrief) {
+        // A drafting task must hand off (#1515); these tests are about the
+        // transcript file, so the worker writes the minimum hand-off.
+        let script = format!(
+            "import pathlib\np = pathlib.Path({o:?})\n(p / 'model.sql').write_bytes(b'x')\n\
+             (p / 'model.toml').write_bytes(b'y')\nprint(\"{{brief}}\")",
+            o = brief.outbox_dir.display().to_string()
+        );
         let driver = SubprocessDriver::new(
-            vec!["python3".into(), "-c".into(), "print(\"{brief}\")".into()],
+            vec!["python3".into(), "-c".into(), script],
             vec!["PATH".into()],
             Duration::from_secs(20),
             Duration::from_millis(300),
@@ -1721,8 +1895,11 @@ mod escape_scope_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let escapee_file = dir.path().join("escapee.pid");
         let script = format!(
-            "import os, time\n\
+            "import os, time, pathlib\n\
              note = \"{{brief}}\"\n\
+             p = pathlib.Path({outbox:?})\n\
+             (p / 'model.sql').write_bytes(b'x')\n\
+             (p / 'model.toml').write_bytes(b'y')\n\
              if os.fork() == 0:\n\
              \x20   os.setsid()\n\
              \x20   if os.fork() == 0:\n\
@@ -1730,7 +1907,8 @@ mod escape_scope_tests {
              \x20       time.sleep(300)\n\
              \x20   os._exit(0)\n\
              time.sleep(0.5)\n",
-            escapee_file.display()
+            escapee_file.display(),
+            outbox = dir.path().join("outbox").display().to_string()
         );
         let driver = SubprocessDriver::new(
             vec!["python3".into(), "-c".into(), script],

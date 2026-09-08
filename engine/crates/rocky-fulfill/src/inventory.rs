@@ -159,6 +159,12 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     // one more function from a module this crate already consumes, and the
     // alternative was a second copy of a guard that is easy to get subtly wrong.
     "rocky_core::product::commit::write_new_no_follow",
+    // #1515 — the drafting hand-off: `handoff.rs` reads the model tree
+    // no-follow to compare it against the worker's hand-off, and the
+    // driver digests hand-off bytes with the same function Phase B
+    // records manifest digests with, so the two can be compared.
+    "rocky_core::product::commit::read_no_follow_bytes",
+    "rocky_core::product::manifest::content_digest",
     "rocky_core::product::spec::ParsedSpec",
     "rocky_core::product::spec::parse_spec_bytes",
     "rocky_core::product::spec::spec_digest",
