@@ -96,8 +96,21 @@ pub fn discover_contracts_from_models(
 
     for model in models {
         if let Some(ref contract_path) = model.contract_path {
-            let content = std::fs::read_to_string(contract_path)
-                .map_err(|e| format!("failed to read {}: {e}", contract_path.display()))?;
+            // The loader hands on a contract that IS there (#1817), so a
+            // `NotFound` here is a dangling link, not a missing file — say
+            // so, rather than "No such file or directory" about a path the
+            // operator can see in a listing.
+            let content = std::fs::read_to_string(contract_path).map_err(|e| {
+                let why = if e.kind() == std::io::ErrorKind::NotFound {
+                    match rocky_core::path_presence::classify_not_found(contract_path) {
+                        rocky_core::path_presence::PathPresence::Present { detail } => detail,
+                        rocky_core::path_presence::PathPresence::Absent => e.to_string(),
+                    }
+                } else {
+                    e.to_string()
+                };
+                format!("failed to read {}: {why}", contract_path.display())
+            })?;
             let contract: CompilerContract = toml::from_str(&content)
                 .map_err(|e| format!("failed to parse {}: {e}", contract_path.display()))?;
             contracts.insert(model.config.name.clone(), contract);
