@@ -858,15 +858,13 @@ fn gc_plan_models(plan: &GcPlan) -> Vec<String> {
 }
 
 fn gc_plan_scope_summary(plan: &GcPlan) -> String {
-    let models: BTreeSet<&str> = plan
-        .evictions
-        .iter()
-        .map(|e| e.model_name.as_str())
-        .collect();
+    // ONE derivation, shared with the escalation's model set. Counting the
+    // models here separately would let the label say "4 model(s)" while the
+    // recorded set carries 3, and nothing would catch the drift.
     format!(
         "gc: {} artifact(s) across {} model(s)",
         plan.evictions.len(),
-        models.len()
+        gc_plan_models(plan).len()
     )
 }
 
@@ -2676,6 +2674,55 @@ auto_create_schemas = true
                 .await,
             )
         }
+    }
+
+    /// The gc escalation's LABEL and its recorded MODEL SET are one
+    /// derivation, so the count in the text can never disagree with the names.
+    ///
+    /// `gc_plan_scope_summary` used to count a `BTreeSet` it built itself,
+    /// beside the set `gc_plan_models` builds for the ledger row. They agreed
+    /// by coincidence. This pins that they cannot drift: four evictions across
+    /// two distinct models, one of them repeated, must read "2 model(s)" and
+    /// record exactly those two names, deduplicated and sorted.
+    #[test]
+    fn the_gc_label_and_the_recorded_model_set_come_from_one_derivation() {
+        let eviction = |model: &str, hash: &str| GcPlanEviction {
+            model_name: model.to_string(),
+            run_id: "r1".to_string(),
+            blake3_hash: hash.to_string(),
+            file_path: format!("s3://b/{hash}.parquet"),
+            size_bytes: 100,
+            commit_version: 0,
+            written_at: "2026-09-07T00:00:00Z".to_string(),
+            recipe_hash: None,
+            input_hash: None,
+            input_proof_class: None,
+            env_hash: None,
+            hash_scheme: None,
+        };
+        let plan = GcPlan {
+            version: VERSION.to_string(),
+            min_age_days: 7,
+            total_bytes: 400,
+            evictions: vec![
+                eviction("orders", "aa"),
+                eviction("events", "bb"),
+                eviction("orders", "cc"),
+                eviction("orders", "dd"),
+            ],
+        };
+
+        let models = gc_plan_models(&plan);
+        assert_eq!(
+            models,
+            vec!["events".to_string(), "orders".to_string()],
+            "deduplicated and sorted — these are the graph keys the queue looks up"
+        );
+        assert_eq!(
+            gc_plan_scope_summary(&plan),
+            format!("gc: 4 artifact(s) across {} model(s)", models.len()),
+            "the label's count IS the recorded set's length, not a second count"
+        );
     }
 
     #[test]

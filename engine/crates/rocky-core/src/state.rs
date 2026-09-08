@@ -12626,6 +12626,67 @@ mod tests {
         assert_eq!(store.list_watermarks().unwrap().len(), 1, "data preserved");
     }
 
+    /// The v28 upgrade claim, exercised rather than asserted in a comment:
+    /// a v27 store is stamped v28 **in place**, every policy-decision row is
+    /// KEPT, and each one reads back with `models` empty.
+    ///
+    /// The generic `open_with_policy_recreate_upgrades_older_store_without_
+    /// recreating` above stamps version 6 and checks a watermark. It proves
+    /// migration happens; it says nothing about the ledger this bump touches.
+    /// The distinction matters because "kept" is the load-bearing half — a
+    /// bump that quietly recreated the store would discard the decision
+    /// history, and every pending review escalation with it.
+    #[test]
+    fn a_v27_store_upgrades_in_place_and_keeps_its_policy_decisions() {
+        use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        {
+            let store = StateStore::open(&path).unwrap();
+            store
+                .record_policy_decision(&PolicyDecisionRecord {
+                    models: Vec::new(),
+                    timestamp: Utc::now(),
+                    plan_id: "planPre28".to_string(),
+                    principal: PolicyPrincipal::Agent,
+                    capability: PolicyCapability::Backfill,
+                    model: "backfill: 3 model(s)".to_string(),
+                    effect: PolicyEffect::RequireReview,
+                    rule_id: None,
+                    reason: "backfill plan awaits review".to_string(),
+                    verify_after: Vec::new(),
+                    auto_apply: None,
+                })
+                .unwrap();
+        }
+        force_schema_version(&path, "27");
+
+        // The open is what performs the stamp; drop it before peeking, since
+        // redb refuses a second handle on a live file.
+        let decisions = {
+            let store = StateStore::open(&path).unwrap();
+            store.list_policy_decisions().unwrap()
+        };
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            Some(CURRENT_SCHEMA_VERSION),
+            "a v27 store is stamped forward in place"
+        );
+        assert_eq!(decisions.len(), 1, "the row survives the bump");
+        assert_eq!(decisions[0].plan_id, "planPre28");
+        assert!(
+            decisions[0].models.is_empty(),
+            "a pre-v28 row carries no model set"
+        );
+        assert_eq!(
+            decisions[0].graph_keys().collect::<Vec<_>>(),
+            vec!["backfill: 3 model(s)"],
+            "and it falls back to its label, which resolves in no graph — so it \
+             ranks with an unknown blast radius, exactly as it did before the bump"
+        );
+    }
+
     #[test]
     fn peek_schema_version_reports_on_disk_without_mutating() {
         let dir = TempDir::new().unwrap();
@@ -12734,7 +12795,13 @@ mod tests {
         // serde-additive shape. NO table change either — so this stanza moves
         // the version only; guarded by
         // `test_v25_run_record_forward_deserializes_verify_after_failed_false`.
-        const EXPECTED_VERSION: u32 = 27;
+        const EXPECTED_VERSION: u32 = 28;
+        // v28 adds `PolicyDecisionRecord::models` (#1766), the graph keys
+        // behind a plan-level review escalation's human label. The same
+        // serde-additive shape as v25-v27: NO table change — `EXPECTED_TABLES`
+        // is deliberately unchanged below — so this stanza moves the version
+        // only; guarded by
+        // `test_v27_policy_decision_forward_deserializes_models_empty`.
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",
