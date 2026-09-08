@@ -30,3 +30,8 @@ Stop once `compile` and `test` are green. You have no tool to advance
 this past drafting and must not try; the runner does its own
 verification and the governed hand-off to human review after you are
 gone.
+
+Your last `draft_model` call is your hand-off. The tool records what it
+wrote for the runner, and the runner commits the model files only if
+they still match that record when you are gone. Do not edit them by any
+other route after your final `draft_model`.

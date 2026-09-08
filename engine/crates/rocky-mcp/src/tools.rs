@@ -2232,6 +2232,71 @@ impl RockyMcpServer {
     /// never instructs `propose` (FF-WP1 fix round 2, item 5c). The approver
     /// profile is the default surface plus one action, so it shares the
     /// default text — which already ends at the human's `rocky review`.
+    /// Mirror a worker-profile `draft_model` write into the owning
+    /// product's task outbox — the drafting hand-off (#1515).
+    ///
+    /// The fulfillment runner commits `models/<model>.{sql,toml}` only when
+    /// the tree still matches what the worker handed off, so the hand-off
+    /// has to come from the worker's own write, not from whatever is on
+    /// disk when the worker exits. Doing it here, inside the tool the
+    /// worker already uses, means both the subprocess driver and the replay
+    /// driver produce it without the worker having to follow an
+    /// instruction.
+    ///
+    /// The owning product is the `products/<name>.toml` whose output model
+    /// is this stem. A stem no product owns is an ordinary worker draft
+    /// with no loop waiting on it, and nothing is written. A spec that does
+    /// not parse is skipped, not fatal — it is not this draft's problem.
+    /// Default-profile drafts are never mirrored: the loop's worker is the
+    /// only author whose hand-off the runner takes custody of.
+    fn mirror_worker_handoff(
+        &self,
+        stem: &str,
+        sql: &[u8],
+        sidecar: &[u8],
+    ) -> Result<(), Json<ToolError>> {
+        if self.profile != McpProfile::Worker {
+            return Ok(());
+        }
+        let products = self.root.join("products");
+        let Ok(entries) = std::fs::read_dir(&products) else {
+            return Ok(());
+        };
+        let owner = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+            .filter_map(|path| rocky_core::product::spec::parse_spec_file(&path).ok())
+            .find(|spec| spec.output_model() == stem)
+            .map(|spec| spec.product().name.clone());
+        let Some(product) = owner else {
+            return Ok(());
+        };
+        let outbox = self
+            .root
+            .join(".rocky")
+            .join("fulfillment")
+            .join(&product)
+            .join("outbox");
+        std::fs::create_dir_all(&outbox).map_err(|e| {
+            ToolError::internal(
+                format!("failed to create the task outbox {}: {e}", outbox.display()),
+                "Ensure the project's .rocky directory is writable.",
+            )
+        })?;
+        for (name, bytes) in [("model.sql", sql), ("model.toml", sidecar)] {
+            let path = outbox.join(name);
+            write_no_follow(&path, bytes).map_err(|e| {
+                ToolError::internal(
+                    format!("failed to hand off the draft to {}: {e}", path.display()),
+                    "The draft was written to models/ but the fulfillment runner cannot take \
+                     custody of it without the hand-off. Ensure the task outbox is writable.",
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     fn draft_model_next_steps(&self) -> &'static str {
         match self.profile {
             McpProfile::Default | McpProfile::Approver => DRAFT_NEXT_STEPS,
@@ -4330,6 +4395,12 @@ impl RockyMcpServer {
             }
             rocky_cli::commands::PolicyGate::NotConfigured
             | rocky_cli::commands::PolicyGate::Allow => {
+                // The hand-off (#1515) is written only for a draft the
+                // policy let through, and BEFORE the rollback is defused:
+                // a draft whose hand-off could not be written is rolled
+                // back like a denied one, so the loop never finds a model
+                // on disk with no custody record behind it.
+                self.mirror_worker_handoff(&paths.stem, sql.as_bytes(), sidecar_bytes.as_bytes())?;
                 rollback.defuse();
                 Ok(Json(DraftModelResult {
                     model: paths.stem.clone(),

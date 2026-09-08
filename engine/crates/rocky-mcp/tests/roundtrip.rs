@@ -2296,6 +2296,136 @@ async fn draft_check_rejects_an_unbounded_expression_before_the_write() {
     client.cancel().await.unwrap();
 }
 
+/// A product spec whose output model is `orders`, so a worker draft of
+/// `orders` is a fulfillment draft with a loop waiting on it.
+fn write_owning_product(dir: &Path) {
+    std::fs::create_dir_all(dir.join("products")).unwrap();
+    std::fs::write(
+        dir.join("products").join("orders.toml"),
+        r#"[product]
+name   = "orders"
+intent = "Orders, one row per order"
+
+[product.source]
+tables = ["main.raw.orders"]
+
+[product.output]
+model = "orders"
+grain = ["id"]
+columns = [
+  { name = "id", type = "Int64", nullable = false },
+]
+
+[product.trust]
+agent = "propose_only"
+"#,
+    )
+    .unwrap();
+}
+
+/// #1515: a worker-profile `draft_model` mirrors what it wrote into the
+/// owning product's task outbox — the hand-off the fulfillment runner takes
+/// custody of. Byte-identical to the model files, so the runner's "tree
+/// still matches the hand-off" check has something exact to compare.
+#[tokio::test]
+async fn worker_draft_model_hands_off_to_the_owning_products_outbox() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    write_target_defaults(dir.path());
+    write_owning_product(dir.path());
+    let server = RockyMcpServer::new_with_profile(
+        dir.path().join("rocky.toml"),
+        rocky_mcp::McpProfile::Worker,
+    );
+    let client = connect(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                "orders",
+                "SELECT 1 AS id",
+                "one order per row",
+            )),
+        )
+        .await
+        .expect("draft_model call");
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+
+    let outbox = dir.path().join(".rocky/fulfillment/orders/outbox");
+    let models = dir.path().join("models");
+    assert_eq!(
+        std::fs::read(outbox.join("model.sql")).expect("the SQL hand-off exists"),
+        std::fs::read(models.join("orders.sql")).unwrap(),
+        "the hand-off is byte-identical to the model SQL"
+    );
+    assert_eq!(
+        std::fs::read(outbox.join("model.toml")).expect("the sidecar hand-off exists"),
+        std::fs::read(models.join("orders.toml")).unwrap(),
+        "the hand-off is byte-identical to the sidecar"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// The two ways a draft is NOT a fulfillment hand-off: the default profile
+/// (an operator's agent, no loop waiting), and a worker draft of a model no
+/// product owns. Neither writes an outbox.
+#[tokio::test]
+async fn draft_model_hands_off_only_for_a_worker_draft_of_an_owned_model() {
+    // Default profile, product present: no hand-off.
+    {
+        let dir = TempDir::new().unwrap();
+        write_project(dir.path(), &dir.path().join("test.duckdb"));
+        write_target_defaults(dir.path());
+        write_owning_product(dir.path());
+        let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+        let client = connect(server).await;
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                    "orders",
+                    "SELECT 1 AS id",
+                    "x",
+                )),
+            )
+            .await
+            .expect("draft_model call");
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        assert!(
+            !dir.path().join(".rocky/fulfillment").exists(),
+            "a default-profile draft is not a hand-off"
+        );
+        client.cancel().await.unwrap();
+    }
+    // Worker profile, no owning product: no hand-off.
+    {
+        let dir = TempDir::new().unwrap();
+        write_project(dir.path(), &dir.path().join("test.duckdb"));
+        write_target_defaults(dir.path());
+        let server = RockyMcpServer::new_with_profile(
+            dir.path().join("rocky.toml"),
+            rocky_mcp::McpProfile::Worker,
+        );
+        let client = connect(server).await;
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                    "orders",
+                    "SELECT 1 AS id",
+                    "x",
+                )),
+            )
+            .await
+            .expect("draft_model call");
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        assert!(
+            !dir.path().join(".rocky/fulfillment").exists(),
+            "a draft of a model no product owns is not a hand-off"
+        );
+        client.cancel().await.unwrap();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // draft_metadata (FF-WP1)
 // ---------------------------------------------------------------------------
