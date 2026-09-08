@@ -27,10 +27,11 @@ pub struct RequiredColumn {
     /// Expected type, written in warehouse vocabulary (e.g. `BIGINT`,
     /// `VARCHAR`, `NUMBER(38,0)`). It is normalized to a portable Rocky type
     /// before comparison, so the same contract ports across warehouses
-    /// (DuckDB `VARCHAR` and Snowflake `STRING` both match). A type the
-    /// normalizer does not recognise is never compared: the load gate reports
-    /// the column in `ContractResult::warnings` instead, and the type check
-    /// neither passes nor fails it — presence and nullability still apply.
+    /// (DuckDB `VARCHAR` and Snowflake `STRING` both match). A type string
+    /// here that the normalizer does not recognise is reported in
+    /// `ContractResult::warnings` and not compared — it is yours to correct,
+    /// and presence and nullability still apply. An unrecognised *landed*
+    /// type is different: it refuses the load (#1721).
     #[serde(rename = "type")]
     pub data_type: String,
     #[serde(default = "default_true")]
@@ -179,10 +180,13 @@ pub fn validate_contract(
 ///   a violation is emitted only when both normalize to a *known* type and the
 ///   landed type is not assignable to (does not fit within) the expected type.
 ///   So a narrower landed type (`INT32`) satisfies a wider contract (`BIGINT`),
-///   but not the reverse. If either side normalizes to [`RockyType::Unknown`]
-///   the column cannot be compared: it is reported in `warnings`, naming the
-///   column and both raw type strings, and is neither a violation nor a
-///   silent pass (#1614).
+///   but not the reverse. When a side normalizes to [`RockyType::Unknown`] the
+///   column cannot be compared, and the two sides are handled differently
+///   (#1721): an unrecognised **landed** type is a violation, because it
+///   leaves the gate's question unanswered and an unanswered question must
+///   not promote staging; an unrecognised **declared** type is a warning
+///   naming both raw strings, because that string is the user's own file and
+///   says nothing about what landed.
 ///
 /// `protected_columns` and `allowed_type_changes` describe source-vs-target
 /// *evolution*, which a single-table load can't meaningfully evaluate (there
@@ -222,26 +226,49 @@ pub fn validate_contract_typed(
 
         // Type match — best-effort in Rocky's type vocabulary.
         //
-        // `Unknown` is decided here, before the matcher runs. Until #1614 a
-        // type string outside `warehouse_type_to_rocky`'s map — on either
-        // side — became `Unknown`, and `is_assignable` treats `Unknown` as
-        // assignable to and from anything, so the column satisfied whatever
-        // the contract declared and staging was promoted with nothing said.
-        // The same shape was closed on the compile-time gate in #1240 (I003).
-        // This gate has no info channel, so the report goes to `warnings`:
-        // it names the column and both raw type strings, and does not touch
-        // `passed`, because "could not compare" is not "does not conform".
+        // `Unknown` is decided here, before the matcher runs, and the two
+        // sides are NOT symmetric (#1721).
+        //
+        //   landed   the warehouse's own answer about what it stored
+        //   declared a string in the user's own contract file
+        //
+        // An unparseable LANDED type refuses. "Rocky could not read the
+        // warehouse's answer" is not evidence the data conforms, and
+        // treating it as a warning is what let a BigQuery `NUMERIC` column
+        // really holding (38,9) satisfy a `NUMERIC(10,2)` contract and get
+        // promoted out of staging. Until #1614 both sides became `Unknown`
+        // and `is_assignable` treats `Unknown` as assignable to and from
+        // anything; #1646 then removed the fabricated `Decimal(38,0)` that
+        // had been accidentally enforcing the right answer, leaving no
+        // comparison at all.
+        //
+        // An unparseable DECLARED type still reports. That string is the
+        // user's file, Rocky refusing to read it says nothing about the
+        // data, and the remedy is to edit the contract — so naming it is
+        // the useful response. The same shape is closed on the
+        // compile-time gate by I003 (#1240).
         let landed_ty = warehouse_type_to_rocky(&col.data_type);
         let expected_ty = warehouse_type_to_rocky(&req.data_type);
         let landed_unknown = landed_ty == RockyType::Unknown;
         let expected_unknown = expected_ty == RockyType::Unknown;
-        if landed_unknown || expected_unknown {
+        if landed_unknown {
+            violations.push(ContractViolation {
+                rule: "unverifiable_landed_type".to_string(),
+                column: req.name.clone(),
+                message: format!(
+                    "column '{}' landed as '{}', which Rocky cannot compare against the \
+                     contract's '{}'. The load is refused because an uncomparable landed \
+                     type is not evidence the column conforms. Declare the column with a \
+                     type Rocky parses, or fix the source so the warehouse reports a \
+                     precise type.",
+                    req.name, col.data_type, req.data_type
+                ),
+            });
+        } else if expected_unknown {
             warnings.push(unchecked_type_warning(
                 &req.name,
                 &col.data_type,
                 &req.data_type,
-                landed_unknown,
-                expected_unknown,
             ));
         } else if !landed_type_conforms(&landed_ty, &expected_ty) {
             violations.push(ContractViolation {
@@ -416,23 +443,17 @@ fn landed_type_conforms(landed: &RockyType, expected: &RockyType) -> bool {
 /// The warning for a required column whose type could not be compared.
 /// Names the column and both raw type strings, and says which side Rocky
 /// did not recognise, so the reader can fix the contract or extend the map.
-fn unchecked_type_warning(
-    column: &str,
-    landed_type: &str,
-    declared_type: &str,
-    landed_unknown: bool,
-    declared_unknown: bool,
-) -> String {
-    let which = match (landed_unknown, declared_unknown) {
-        (true, true) => "Rocky recognises neither type",
-        (true, false) => "Rocky does not recognise the landed type",
-        (false, true) => "Rocky does not recognise the declared type",
-        (false, false) => unreachable!("only called when at least one side is Unknown"),
-    };
+/// Report a declared type Rocky cannot parse.
+///
+/// Only the DECLARED side reaches here. An unparseable landed type is a
+/// violation, not a warning (#1721) — see the call site for why the two
+/// sides differ.
+fn unchecked_type_warning(column: &str, landed_type: &str, declared_type: &str) -> String {
     format!(
         "column '{column}' landed as '{landed_type}' and the contract declares '{declared_type}'; \
-         {which}, so the declared type was not checked. Presence and nullability were checked. \
-         The load was not refused for this."
+         Rocky does not recognise the declared type, so it was not checked. Presence and \
+         nullability were checked. The load was not refused for this, because the declared \
+         string is yours to correct and says nothing about what landed."
     )
 }
 
@@ -805,8 +826,15 @@ mod tests {
     /// A landed type outside Rocky's map cannot be compared, so it must not
     /// produce a type violation — and it must not pass silently either. Until
     /// #1614 this test pinned the fail-open: it asserted only `passed`.
+    /// A landed type Rocky cannot parse REFUSES the load (#1721).
+    ///
+    /// The gate's whole job is to decide whether what landed conforms. The
+    /// landed string is the warehouse's own answer, so failing to read it
+    /// leaves the question unanswered — and an unanswered question must not
+    /// promote staging. Asserted before the message text so a revert fails
+    /// on the consequence, not on wording.
     #[test]
-    fn test_typed_unknown_landed_type_is_reported_not_passed_silently() {
+    fn test_typed_unknown_landed_type_refuses_the_load() {
         let contract = ContractConfig {
             required_columns: vec![RequiredColumn {
                 name: "geo".into(),
@@ -817,23 +845,68 @@ mod tests {
         };
         let landed = vec![col_n("geo", "GEOMETRY", true)];
         let result = validate_contract_typed(&contract, &landed);
-        assert!(result.passed, "violations: {:?}", result.violations);
-        assert!(result.violations.is_empty());
+        assert!(
+            !result.passed,
+            "an uncomparable landed type must refuse, not pass: {result:?}"
+        );
         assert_eq!(
-            result.warnings.len(),
+            result.violations.len(),
             1,
-            "exactly one warning for the unchecked column: {:?}",
-            result.warnings
+            "violations: {:?}",
+            result.violations
         );
-        let w = &result.warnings[0];
+        let v = &result.violations[0];
+        assert_eq!(v.rule, "unverifiable_landed_type");
+        assert_eq!(v.column, "geo");
         assert!(
-            w.contains("'geo'") && w.contains("'GEOMETRY'") && w.contains("'BIGINT'"),
-            "the warning must name the column, the landed type and the declared type: {w}"
+            v.message.contains("'geo'")
+                && v.message.contains("'GEOMETRY'")
+                && v.message.contains("'BIGINT'"),
+            "the refusal must name the column and both raw type strings: {}",
+            v.message
         );
-        assert!(
-            w.contains("does not recognise the landed type"),
-            "the warning must say which side was not recognised: {w}"
-        );
+    }
+
+    /// Blast-radius control for #1721, at the GATE rather than the mapper.
+    ///
+    /// Refusing an uncomparable landed type widens what a refusal covers
+    /// from "does not fit" to "could not be read", so every type string the
+    /// normalizer does not know now blocks a load that used to promote. The
+    /// mapper-level control (`test_healthy_describe_decimals_stay_concrete`)
+    /// proves those strings parse; this one proves the GATE still passes
+    /// them, which is the property an ordinary run actually depends on.
+    ///
+    /// Strings are the ones the adapters really emit from a live `DESCRIBE`
+    /// — see that test's doc comment for the per-adapter sources.
+    #[test]
+    fn test_healthy_adapter_describe_output_still_passes_the_gate() {
+        for (landed, declared) in [
+            ("DECIMAL(10,2)", "DECIMAL(10,2)"),
+            ("decimal(10,2)", "DECIMAL(10,2)"),
+            ("NUMBER(38,0)", "NUMBER(38,0)"),
+            ("BIGINT", "BIGINT"),
+            ("INTEGER", "BIGINT"),
+            ("VARCHAR", "VARCHAR"),
+            ("STRING", "VARCHAR"),
+            ("BOOLEAN", "BOOLEAN"),
+            ("TIMESTAMP", "TIMESTAMP"),
+            ("DOUBLE", "DOUBLE"),
+        ] {
+            let contract = ContractConfig {
+                required_columns: vec![RequiredColumn {
+                    name: "c".into(),
+                    data_type: declared.into(),
+                    nullable: true,
+                }],
+                ..Default::default()
+            };
+            let result = validate_contract_typed(&contract, &[col_n("c", landed, true)]);
+            assert!(
+                result.passed,
+                "landed '{landed}' against '{declared}' must still pass: {:?}",
+                result.violations
+            );
+        }
     }
 
     /// The declared side has the same hole: a contract type string the
@@ -863,9 +936,14 @@ mod tests {
         );
     }
 
-    /// Both sides unrecognised is one unchecked column, so one warning.
+    /// When BOTH sides are unrecognised, the landed side decides: refuse.
+    ///
+    /// A broken declared string does not soften an unreadable landed one.
+    /// The column is still unverified, so it still must not promote — and
+    /// reporting only the declared problem would name the half the user can
+    /// fix while staying silent about the half that blocks the answer.
     #[test]
-    fn test_typed_both_types_unknown_reported_once() {
+    fn test_typed_both_types_unknown_refuses_on_the_landed_side() {
         let contract = ContractConfig {
             required_columns: vec![RequiredColumn {
                 name: "geo".into(),
@@ -876,16 +954,26 @@ mod tests {
         };
         let landed = vec![col_n("geo", "GEOMETRY", true)];
         let result = validate_contract_typed(&contract, &landed);
-        assert!(result.passed, "violations: {:?}", result.violations);
-        assert_eq!(result.warnings.len(), 1, "warnings: {:?}", result.warnings);
-        let w = &result.warnings[0];
+        assert!(!result.passed, "violations: {:?}", result.violations);
+        assert_eq!(
+            result.violations.len(),
+            1,
+            "violations: {:?}",
+            result.violations
+        );
+        let v = &result.violations[0];
+        assert_eq!(v.rule, "unverifiable_landed_type");
         assert!(
-            w.contains("'geo'") && w.contains("'GEOMETRY'") && w.contains("'GEOM'"),
-            "the warning must name the column and both type strings: {w}"
+            v.message.contains("'geo'")
+                && v.message.contains("'GEOMETRY'")
+                && v.message.contains("'GEOM'"),
+            "the refusal must name the column and both type strings: {}",
+            v.message
         );
         assert!(
-            w.contains("recognises neither type"),
-            "the warning must say that neither side was recognised: {w}"
+            result.warnings.is_empty(),
+            "the landed refusal replaces the warning rather than adding to it: {:?}",
+            result.warnings
         );
     }
 
@@ -947,15 +1035,27 @@ mod tests {
         }
     }
 
-    /// The bare BigQuery case (#1646). `INFORMATION_SCHEMA.COLUMNS.data_type`
-    /// reports a default-precision column as a bare `NUMERIC` — the live
-    /// sweep in `rocky-bigquery/tests/dialect_sweep_live.rs` asserts exactly
-    /// that string after an `ALTER ... SET DATA TYPE NUMERIC`. Read as
-    /// `DECIMAL(38,0)` it refused a correct load, because
-    /// `is_assignable(Decimal(38,0), Decimal(38,9))` fails on integer digits.
-    /// It is now unread, so the column is reported and the load promotes.
+    /// The bare BigQuery case (#1646), and the ACCEPTED COST of #1721.
+    ///
+    /// `INFORMATION_SCHEMA.COLUMNS.data_type` reports a default-precision
+    /// column as a bare `NUMERIC` — the live sweep in
+    /// `rocky-bigquery/tests/dialect_sweep_live.rs` asserts exactly that
+    /// string after an `ALTER ... SET DATA TYPE NUMERIC`.
+    ///
+    /// ```text
+    ///   before #1646   Decimal(38,0)  ->  38 > 29 integer digits  ->  REFUSED (wrong reason)
+    ///   after  #1646   Unknown        ->  warning                 ->  PROMOTED (no comparison)
+    ///   after  #1721   Unknown        ->  REFUSED (uncomparable)
+    /// ```
+    ///
+    /// This contract would have fitted, and it is refused anyway. That is
+    /// deliberate and is the price of the decision: the gate declines to
+    /// certify a column it could not compare, rather than guessing in
+    /// either direction. The remedy is nameable, which the fabricated
+    /// `Decimal(38,0)` never was — declare a type Rocky parses, or make the
+    /// source report a precise one.
     #[test]
-    fn test_typed_bare_numeric_is_reported_not_refused() {
+    fn test_typed_bare_numeric_refuses_even_where_the_data_would_have_fitted() {
         let contract = ContractConfig {
             required_columns: vec![RequiredColumn {
                 name: "amount".into(),
@@ -967,25 +1067,26 @@ mod tests {
         let result = validate_contract_typed(&contract, &[col_n("amount", "NUMERIC", true)]);
 
         assert!(
-            result.passed,
-            "a bare NUMERIC must not refuse a NUMERIC(38,9) contract: {:?}",
-            result.violations
+            !result.passed,
+            "an uncomparable landed type refuses even when the data would fit: {result:?}"
         );
-        assert!(result.violations.is_empty());
-        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
-        let w = &result.warnings[0];
+        let v = &result.violations[0];
+        assert_eq!(v.rule, "unverifiable_landed_type");
         assert!(
-            w.contains("'amount'") && w.contains("'NUMERIC'") && w.contains("'NUMERIC(38,9)'"),
-            "the warning must name the column and both type strings: {w}"
+            v.message.contains("'amount'")
+                && v.message.contains("'NUMERIC'")
+                && v.message.contains("'NUMERIC(38,9)'"),
+            "the refusal must name the column and both type strings: {}",
+            v.message
         );
     }
 
-    /// The other half of #1646: a contract written `NUMERIC(38,0)` used to
-    /// accept a landed bare `NUMERIC`, which on BigQuery holds nine decimal
-    /// places. It is still not refused — `passed` is computed from
-    /// violations only — but it is no longer silent.
+    /// The other half of #1646, and the defect #1721 exists to close: a
+    /// contract written `NUMERIC(38,0)` accepted a landed bare `NUMERIC`,
+    /// which on BigQuery holds nine decimal places. #1646 made it noisy;
+    /// its own comment conceded "it is still not refused". Now it is.
     #[test]
-    fn test_typed_bare_numeric_against_narrow_contract_is_reported() {
+    fn test_typed_bare_numeric_against_narrow_contract_refuses() {
         let contract = ContractConfig {
             required_columns: vec![RequiredColumn {
                 name: "amount".into(),
@@ -996,12 +1097,15 @@ mod tests {
         };
         let result = validate_contract_typed(&contract, &[col_n("amount", "NUMERIC", true)]);
 
-        assert!(result.violations.is_empty());
+        assert!(
+            !result.passed,
+            "a bare NUMERIC holding (38,9) must not satisfy NUMERIC(38,0): {result:?}"
+        );
         assert_eq!(
-            result.warnings.len(),
+            result.violations.len(),
             1,
-            "the landed bare NUMERIC must be reported, not accepted silently: {:?}",
-            result.warnings
+            "violations: {:?}",
+            result.violations
         );
     }
 
@@ -1053,11 +1157,14 @@ mod tests {
         );
     }
 
-    /// A malformed decimal on the landed side is reported too. Before #1614 it
-    /// was read as `DECIMAL(38,0)` and failed a narrower contract for a made-up
-    /// reason.
+    /// A malformed decimal on the landed side REFUSES (#1721). Before #1614
+    /// it was read as `DECIMAL(38,0)` and failed a narrower contract for a
+    /// made-up reason; #1614 stopped inventing the type and #1646 removed
+    /// the last fabricated one, which left the column promoted on no
+    /// comparison at all. Refusing is the third state: no fabricated type,
+    /// and no pass either.
     #[test]
-    fn test_typed_malformed_landed_decimal_is_reported() {
+    fn test_typed_malformed_landed_decimal_refuses() {
         let contract = ContractConfig {
             required_columns: vec![RequiredColumn {
                 name: "amount".into(),
@@ -1068,13 +1175,16 @@ mod tests {
         };
         let result =
             validate_contract_typed(&contract, &[col_n("amount", "DECIMAL(10,2,3)", true)]);
-        assert!(result.passed, "violations: {:?}", result.violations);
-        assert_eq!(result.warnings.len(), 1, "warnings: {:?}", result.warnings);
-        let w = &result.warnings[0];
-        assert!(
-            w.contains("'DECIMAL(10,2,3)'") && w.contains("does not recognise the landed type"),
-            "{w}"
+        assert!(!result.passed, "violations: {:?}", result.violations);
+        assert_eq!(
+            result.violations.len(),
+            1,
+            "violations: {:?}",
+            result.violations
         );
+        let v = &result.violations[0];
+        assert_eq!(v.rule, "unverifiable_landed_type");
+        assert!(v.message.contains("'DECIMAL(10,2,3)'"), "{}", v.message);
     }
 
     /// The matcher must answer "not a match" for `Unknown` on either side.

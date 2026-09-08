@@ -18,7 +18,7 @@
       "message": "column 'order_id' declares type Int64 in the contract, but Rocky could not work out the column's type, so it did not check the declared type",
       "span": null,
       "model": "broken_metrics",
-      "suggestion": "give `rocky compile` source schemas so `order_id`'s type resolves \u2014 `rocky discover --with-schemas` fills the cache, or use `rocky compile --with-seed`; `rocky test` and `rocky ci` always compile without them. A CAST to Int64 only helps when the value it casts already has a known type"
+      "suggestion": "give `rocky compile` source schemas so `order_id`'s type resolves \u2014 `rocky discover --with-schemas` fills the cache, or use `rocky compile --with-seed`; `rocky test` and `rocky ci` always compile without them. Do not add a CAST to silence this: a cast takes its type from the target, so it would report Int64 whatever the column actually holds"
     },
     {
       "severity": "Error",
@@ -34,7 +34,7 @@
       "message": "column 'amount' declares type Decimal in the contract, but Rocky could not work out the column's type, so it did not check the declared type",
       "span": null,
       "model": "broken_metrics",
-      "suggestion": "give `rocky compile` source schemas so `amount`'s type resolves \u2014 `rocky discover --with-schemas` fills the cache, or use `rocky compile --with-seed`; `rocky test` and `rocky ci` always compile without them. A CAST to Decimal only helps when the value it casts already has a known type"
+      "suggestion": "give `rocky compile` source schemas so `amount`'s type resolves \u2014 `rocky discover --with-schemas` fills the cache, or use `rocky compile --with-seed`; `rocky test` and `rocky ci` always compile without them. Do not add a CAST to silence this: a cast takes its type from the target, so it would report Decimal whatever the column actually holds"
     },
     {
       "severity": "Error",
@@ -50,7 +50,7 @@
       "message": "column 'order_id' declares type Int64 in the contract, but Rocky could not work out the column's type, so it did not check the declared type",
       "span": null,
       "model": "good_metrics",
-      "suggestion": "give `rocky compile` source schemas so `order_id`'s type resolves \u2014 `rocky discover --with-schemas` fills the cache, or use `rocky compile --with-seed`; `rocky test` and `rocky ci` always compile without them. A CAST to Int64 only helps when the value it casts already has a known type"
+      "suggestion": "give `rocky compile` source schemas so `order_id`'s type resolves \u2014 `rocky discover --with-schemas` fills the cache, or use `rocky compile --with-seed`; `rocky test` and `rocky ci` always compile without them. Do not add a CAST to silence this: a cast takes its type from the target, so it would report Int64 whatever the column actually holds"
     },
     {
       "severity": "Info",
@@ -58,7 +58,7 @@
       "message": "column 'customer_id' declares type Int64 in the contract, but Rocky could not work out the column's type, so it did not check the declared type",
       "span": null,
       "model": "good_metrics",
-      "suggestion": "give `rocky compile` source schemas so `customer_id`'s type resolves \u2014 `rocky discover --with-schemas` fills the cache, or use `rocky compile --with-seed`; `rocky test` and `rocky ci` always compile without them. A CAST to Int64 only helps when the value it casts already has a known type"
+      "suggestion": "give `rocky compile` source schemas so `customer_id`'s type resolves \u2014 `rocky discover --with-schemas` fills the cache, or use `rocky compile --with-seed`; `rocky test` and `rocky ci` always compile without them. Do not add a CAST to silence this: a cast takes its type from the target, so it would report Int64 whatever the column actually holds"
     },
     {
       "severity": "Info",
@@ -66,7 +66,7 @@
       "message": "column 'amount' declares type Decimal in the contract, but Rocky could not work out the column's type, so it did not check the declared type",
       "span": null,
       "model": "good_metrics",
-      "suggestion": "give `rocky compile` source schemas so `amount`'s type resolves \u2014 `rocky discover --with-schemas` fills the cache, or use `rocky compile --with-seed`; `rocky test` and `rocky ci` always compile without them. A CAST to Decimal only helps when the value it casts already has a known type"
+      "suggestion": "give `rocky compile` source schemas so `amount`'s type resolves \u2014 `rocky discover --with-schemas` fills the cache, or use `rocky compile --with-seed`; `rocky test` and `rocky ci` always compile without them. Do not add a CAST to silence this: a cast takes its type from the target, so it would report Decimal whatever the column actually holds"
     }
   ],
   "has_errors": true,
