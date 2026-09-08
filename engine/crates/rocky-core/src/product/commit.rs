@@ -1331,10 +1331,57 @@ pub fn recover_generation(project_root: &Path, parsed: &ParsedSpec) -> SpecResul
         .map(|(_, path)| path.clone())
         .expect("the manifest entry was proven present above");
 
-    let committed = manifest_final.is_file()
-        && std::fs::read(&manifest_final)
-            .map(|bytes| content_digest(&bytes) == manifest_entry.staged_sha)
-            .unwrap_or(false);
+    // Did the commit marker land? Only a READING of the final can say, and a
+    // reading has three answers, not two:
+    //
+    //   read succeeds, digest == staged_sha   committed   (roll forward)
+    //   read succeeds, digest differs         not yet     (the previous generation
+    //                                                       is still in place)
+    //   nothing is at the path                not yet     (the rename never ran)
+    //   ANY OTHER ERROR                       refuse      (#1813)
+    //
+    // The fourth row used to fold into the second: `read(..).unwrap_or(false)`
+    // turned a manifest the process could not open — EACCES, EIO — into
+    // "uncommitted", and the loop below then restored every `.ff-prev` over a
+    // generation that HAD committed and deleted the journal that would have
+    // shown it. An unreadable marker is not an absent one; the honest answer
+    // is that the commit's fate is unknown, and recovery mutates nothing on an
+    // unknown. Containment above already refused a symlink or a directory at
+    // this path, so a `NotFound` here is a bare leaf — but it is still put
+    // through the shared discriminator rather than trusted, because the
+    // window between that check and this read is exactly where a swapped-in
+    // link would sit.
+    let committed = match std::fs::read(&manifest_final) {
+        Ok(bytes) => content_digest(&bytes) == manifest_entry.staged_sha,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            match crate::path_presence::classify_not_found(&manifest_final) {
+                crate::path_presence::PathPresence::Absent => false,
+                crate::path_presence::PathPresence::Present { detail } => {
+                    return Err(SpecRejected::new(
+                        "commit-io",
+                        format!(
+                            "reading {} failed: the commit marker cannot be read — {detail}. \
+                             Recovery cannot tell whether this generation committed, so it \
+                             changes nothing. Fix the path and re-run.",
+                            manifest_final.display()
+                        ),
+                    ));
+                }
+            }
+        }
+        Err(err) => {
+            return Err(SpecRejected::new(
+                "commit-io",
+                format!(
+                    "reading {} failed: {err}. The commit marker exists but cannot be read, \
+                     so recovery cannot tell whether this generation committed and changes \
+                     nothing — a rollback here would restore every backup over a commit that \
+                     may have succeeded. Fix the permissions and re-run.",
+                    manifest_final.display()
+                ),
+            ));
+        }
+    };
 
     for (entry, final_path) in &resolved_finals {
         let staged = staged_sibling(final_path);
@@ -1376,16 +1423,48 @@ pub fn recover_generation(project_root: &Path, parsed: &ParsedSpec) -> SpecResul
                     final_path.display()
                 ),
             ));
-        } else if !entry.has_prev
-            && final_path.is_file()
-            && std::fs::read(final_path)
-                .map(|bytes| content_digest(&bytes) == entry.staged_sha)
-                .unwrap_or(false)
-        {
-            // A brand-new file that already renamed into place: uncommitted
-            // generation content with nothing underneath — remove it.
-            std::fs::remove_file(final_path)
-                .map_err(|err| io_reject("removing", final_path, &err))?;
+        } else if !entry.has_prev {
+            // A brand-new file that already renamed into place is uncommitted
+            // generation content with nothing underneath — remove it. But
+            // decide that by READING it. The same fold as the marker above
+            // (`read(..).unwrap_or(false)`) turned an unreadable final into
+            // "not ours, leave it", then removed the staged copy and deleted
+            // the journal — walking away from a file it never identified with
+            // the one record of what it was. Refusing keeps the journal, so
+            // the next run asks the same question instead of forgetting it.
+            let is_this_generations = match std::fs::read(final_path) {
+                Ok(bytes) => content_digest(&bytes) == entry.staged_sha,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    match crate::path_presence::classify_not_found(final_path) {
+                        crate::path_presence::PathPresence::Absent => false,
+                        crate::path_presence::PathPresence::Present { detail } => {
+                            return Err(SpecRejected::new(
+                                "commit-io",
+                                format!(
+                                    "reading {} failed: {detail}. Recovery cannot identify \
+                                     this file, so it leaves it and the journal in place.",
+                                    final_path.display()
+                                ),
+                            ));
+                        }
+                    }
+                }
+                Err(err) => {
+                    return Err(SpecRejected::new(
+                        "commit-io",
+                        format!(
+                            "reading {} failed: {err}. Recovery cannot identify this file, \
+                             so it leaves it and the journal in place. Fix the permissions \
+                             and re-run.",
+                            final_path.display()
+                        ),
+                    ));
+                }
+            };
+            if is_this_generations {
+                std::fs::remove_file(final_path)
+                    .map_err(|err| io_reject("removing", final_path, &err))?;
+            }
         }
         if staged.exists() {
             std::fs::remove_file(&staged).map_err(|err| io_reject("removing", &staged, &err))?;
@@ -3743,6 +3822,152 @@ mod tests {
         assert_eq!(
             std::fs::read(&target).expect("intact"),
             b"in-root file the link aims at"
+        );
+    }
+
+    /// An unreadable commit marker is not an uncommitted one (#1813).
+    ///
+    /// The condition: the manifest final is a regular file — containment
+    /// passes, `is_file()` is true — but reading it fails. The old probe
+    /// folded that read error into `committed = false`, and the loop then
+    /// renamed every `.ff-prev` over a generation that HAD committed and
+    /// deleted the journal that would have shown it.
+    ///
+    /// The fixture puts a real backup beside a real committed contract, so
+    /// the destructive outcome is observable: under the old code the
+    /// contract final ends up holding the PREVIOUS content and the journal is
+    /// gone. Under the fix, recovery refuses and touches nothing.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_commit_marker_refuses_recovery_and_restores_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: `geteuid` is an always-safe libc call with no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads through mode 000; the condition cannot be built.
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).expect("mkdir");
+        let parsed = parsed_d3();
+
+        // A committed contract with the backup recovery would restore.
+        let contract = contract_rel(&parsed);
+        let contract_final = project.join(&contract);
+        std::fs::create_dir_all(contract_final.parent().expect("parent")).expect("mkdir");
+        write_file(&contract_final, b"the committed contract");
+        let backup = prev_sibling(&contract_final);
+        write_file(&backup, b"the previous contract");
+
+        // The commit marker: present, a regular file, and unreadable.
+        let manifest_final = project.join(manifest_rel("revenue_daily"));
+        std::fs::create_dir_all(manifest_final.parent().expect("parent")).expect("mkdir");
+        write_file(&manifest_final, b"a manifest the process may not read");
+        std::fs::set_permissions(&manifest_final, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod");
+
+        let journal = write_journal(
+            &project,
+            "revenue_daily",
+            &forged_journal_payload(&[serde_json::json!({
+                "final": contract,
+                "staged_sha": content_digest(b"the committed contract"),
+                "has_prev": true,
+            })]),
+        );
+
+        let result = recover_generation(&project, &parsed);
+        // Readable again before any assertion, so a failure here cannot leave
+        // a mode-000 file for the tempdir to trip over.
+        std::fs::set_permissions(&manifest_final, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod back");
+
+        let error = result.expect_err("an unreadable commit marker must refuse recovery");
+        assert_eq!(error.code, "commit-io", "{error}");
+        assert!(
+            error
+                .message
+                .contains("cannot tell whether this generation committed"),
+            "the refusal must say the outcome is UNKNOWN, not absent: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&contract_final).expect("intact"),
+            b"the committed contract",
+            "the backup must NOT have been restored over the committed contract"
+        );
+        assert_eq!(
+            std::fs::read(&backup).expect("still there"),
+            b"the previous contract",
+            "the backup is left exactly where it was"
+        );
+        assert!(
+            journal.is_file(),
+            "the journal is kept, so the next run asks the same question"
+        );
+    }
+
+    /// The per-entry probe has the same fold, in the non-destructive
+    /// direction — and refusing is still right, because the alternative
+    /// deleted the journal.
+    ///
+    /// A brand-new final with no backup is removed by recovery only if its
+    /// digest matches the journal's. The old probe read an unreadable final as
+    /// "not ours", left it, removed the staged copy, and then deleted the
+    /// journal — walking away from a file it never identified with the one
+    /// record of what it was supposed to be. Now it refuses, and the journal
+    /// survives.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_final_with_no_backup_refuses_and_keeps_the_journal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: `geteuid` is an always-safe libc call with no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).expect("mkdir");
+        let parsed = parsed_d3();
+
+        // A final that IS this generation's — the digest matches — but which
+        // the process cannot read to find that out. No manifest: the commit
+        // never happened, so this is the roll-back path.
+        let contract = contract_rel(&parsed);
+        let contract_final = project.join(&contract);
+        std::fs::create_dir_all(contract_final.parent().expect("parent")).expect("mkdir");
+        write_file(&contract_final, b"this generation's contract");
+        std::fs::set_permissions(&contract_final, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod");
+
+        let journal = write_journal(
+            &project,
+            "revenue_daily",
+            &forged_journal_payload(&[serde_json::json!({
+                "final": contract,
+                "staged_sha": content_digest(b"this generation's contract"),
+                "has_prev": false,
+            })]),
+        );
+
+        let result = recover_generation(&project, &parsed);
+        std::fs::set_permissions(&contract_final, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod back");
+
+        let error = result.expect_err("an unreadable final must refuse, not be guessed at");
+        assert_eq!(error.code, "commit-io", "{error}");
+        assert!(
+            error.message.contains("cannot identify this file"),
+            "{error}"
+        );
+        assert!(
+            contract_final.is_file(),
+            "the file recovery could not identify is left in place"
+        );
+        assert!(
+            journal.is_file(),
+            "the journal is kept — deleting it is what the old code did, and it \
+             was the only record of what the file was supposed to be"
         );
     }
 
