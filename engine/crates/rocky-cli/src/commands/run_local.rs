@@ -757,7 +757,7 @@ pub async fn run_quality(
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
     let audit_ctx = super::run_audit::AuditContext::detect(None, None);
     let audit = super::run::audit_to_record(&audit_ctx);
-    super::run::persist_run_record(
+    let recorded = super::run::persist_run_record(
         Some(&store),
         &output,
         run_id,
@@ -768,6 +768,20 @@ pub async fn run_quality(
     );
 
     if error_failures > 0 && pipeline.checks.fail_on_error {
+        if !recorded {
+            // The gate failed AND the record did not land. The typed error
+            // below is the dispatcher's proof that the record is persisted and
+            // may ride the terminal upload; returned here it would publish a
+            // ledger that does not contain this run, and a fresh pod would
+            // read an authoritative history with the failure missing (#1816).
+            // Untyped, so the dispatcher abandons the session, and nothing
+            // claims the record exists.
+            anyhow::bail!(
+                "quality pipeline failed: {error_failures} error-severity check(s) failed \
+                 (run_id: {run_id}); the run record could not be written to the state store, \
+                 so this failure is not in the run history"
+            );
+        }
         // Typed, not `bail!`: the dispatcher still holds this run's remote-state
         // session and must finalize (upload the record persisted just above)
         // rather than abandon on what it would otherwise read as a hard exit

@@ -848,6 +848,23 @@ fn run_trigger_from_env() -> rocky_core::state::RunTrigger {
     }
 }
 
+/// Test hook (#1816): make [`persist_run_record`] fail the record write for
+/// this run id, as `StateStore::record_run` does on a full disk or a failed
+/// commit, so a test can drive the real dispatcher through the path where the
+/// gate failed AND the record did not land. One id at a time.
+#[cfg(test)]
+pub(crate) static FAIL_RECORD_WRITE_FOR_TEST: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+/// Persist the run's terminal record, best-effort: a failed write is logged
+/// and the run goes on, because history is advisory for most of its readers.
+///
+/// Returns whether the record landed (`false` when there is no store, or the
+/// write failed). A caller whose error TYPE tells the dispatcher "my record
+/// is persisted, upload it" must check this before returning that type
+/// (`run_quality`'s `QualityGateFailure`, #1816): finalizing on a record that
+/// is not there publishes a ledger without the run, and a fresh pod then
+/// reads an authoritative history with the failure missing.
 pub(crate) fn persist_run_record(
     state_store: Option<&StateStore>,
     output: &RunOutput,
@@ -860,9 +877,9 @@ pub(crate) fn persist_run_record(
     // succeed?" for `after`/`freshness` demands. `None` for a model-only run or
     // a multi-pipeline set (a backfill), which the reconciler never matches.
     pipeline: Option<&str>,
-) {
+) -> bool {
     let Some(store) = state_store else {
-        return;
+        return false;
     };
     let finished_at = Utc::now();
     let status = output.derive_run_status();
@@ -884,12 +901,31 @@ pub(crate) fn persist_run_record(
     record.submission_id = std::env::var("ROCKY_SUBMISSION_ID")
         .ok()
         .filter(|s| !s.is_empty());
-    if let Err(e) = store.record_run(&record) {
-        warn!(
-            error = %e,
-            run_id = run_id,
-            "failed to record run to state store — history/replay/cost/trace will not surface this run"
-        );
+    #[cfg(test)]
+    let written = if FAIL_RECORD_WRITE_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_deref()
+        == Some(run_id)
+    {
+        Err(rocky_core::state::StateError::from(
+            serde_json::from_str::<()>("injected record-write failure").unwrap_err(),
+        ))
+    } else {
+        store.record_run(&record)
+    };
+    #[cfg(not(test))]
+    let written = store.record_run(&record);
+    match written {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(
+                error = %e,
+                run_id = run_id,
+                "failed to record run to state store — history/replay/cost/trace will not surface this run"
+            );
+            false
+        }
     }
 }
 
@@ -14071,37 +14107,27 @@ fn post_copy_column_match(
 #[cfg(test)]
 mod tests {
 
-    /// #1816. A quality run that fails its check gate persists a `Failure`
-    /// record with `check_gate_failed` and then returns an error; the
-    /// dispatcher's quality arm treated every error as pre-terminal and
-    /// ABANDONED the remote-state session, which uploads nothing. Under an
-    /// S3 / GCS / Valkey / tiered `[state]` backend the record stayed in the
-    /// pod-local file, and a fresh pod downloading the shared state saw the
-    /// history from before the run. The transformation arm already
-    /// distinguished its typed `RunFailed` from a hard error; the quality arm
-    /// now does the same with `QualityGateFailure`.
-    ///
-    /// Two pods over one in-memory "S3": pod A runs the failing quality
-    /// pipeline through the real dispatcher; pod B downloads the remote state
-    /// into its own empty store and must find the record.
-    #[test]
-    fn a_failed_quality_gate_is_uploaded_to_remote_state_not_abandoned() {
-        use rocky_core::state::{RunStatus, StateStore};
-        use rocky_core::test_harness::CrossPodHarness;
-
-        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
-        let harness = CrossPodHarness::new_s3_like();
-        let project = tempfile::tempdir().unwrap();
-        // A quality pipeline on a table the (empty) DuckDB file does not
-        // have: the row-count query fails, the check is error-severity and
-        // not evaluated, and the gate trips with no data seeded at all.
-        let config_path = project.path().join("rocky.toml");
+    /// Shared by the two remote-state quality tests below. Pod A of `harness`
+    /// runs the REAL dispatcher on a quality pipeline whose only table does
+    /// not exist in the (empty) DuckDB file: the row-count query fails, the
+    /// check is error-severity and not evaluated, and the gate trips with
+    /// nothing seeded. The DuckDB path is absolute, so the test never moves
+    /// the process's working directory (other tests in this binary do, and
+    /// nothing serialises them). Returns what `run` returned.
+    fn run_failing_quality_on_pod_a(
+        rt: &tokio::runtime::Runtime,
+        harness: &rocky_core::test_harness::CrossPodHarness,
+        project: &std::path::Path,
+        run_id: &str,
+    ) -> anyhow::Result<super::RunTermination> {
+        let config_path = project.join("rocky.toml");
         std::fs::write(
             &config_path,
-            r#"
+            format!(
+                r#"
 [adapter]
 type = "duckdb"
-path = "probe.duckdb"
+path = "{}"
 
 [pipeline.dq]
 type = "quality"
@@ -14126,20 +14152,11 @@ on_upload_failure = "fail"
 [state.retry]
 max_retries = 0
 "#,
+                project.join("probe.duckdb").display()
+            ),
         )
         .unwrap();
-        // DuckDB resolves a relative `path` against the working directory, so
-        // pin it to the project.
-        let previous_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(project.path()).unwrap();
-        let run_id = "quality-gate-under-remote-state";
-
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("test runtime");
-        let outcome = rt.block_on(async {
+        rt.block_on(async {
             let loaded = std::sync::Arc::new(
                 rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
             );
@@ -14170,9 +14187,42 @@ max_retries = 0
                 None,
             )
             .await
-        });
-        std::env::set_current_dir(previous_cwd).unwrap();
+        })
+    }
 
+    fn remote_state_test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime")
+    }
+
+    /// #1816. A quality run that fails its check gate persists a `Failure`
+    /// record with `check_gate_failed` and then returns an error; the
+    /// dispatcher's quality arm treated every error as pre-terminal and
+    /// ABANDONED the remote-state session, which uploads nothing. Under an
+    /// S3 / GCS / Valkey / tiered `[state]` backend the record stayed in the
+    /// pod-local file, and a fresh pod downloading the shared state saw the
+    /// history from before the run. The transformation arm already
+    /// distinguished its typed `RunFailed` from a hard error; the quality arm
+    /// now does the same with `QualityGateFailure`.
+    ///
+    /// Two pods over one in-memory "S3": pod A runs the failing quality
+    /// pipeline through the real dispatcher; pod B downloads the remote state
+    /// into its own empty store and must find the record.
+    #[test]
+    fn a_failed_quality_gate_is_uploaded_to_remote_state_not_abandoned() {
+        use rocky_core::state::{RunStatus, StateStore};
+        use rocky_core::test_harness::CrossPodHarness;
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let project = tempfile::tempdir().unwrap();
+        let run_id = "quality-gate-under-remote-state";
+        let rt = remote_state_test_runtime();
+
+        let outcome = run_failing_quality_on_pod_a(&rt, &harness, project.path(), run_id);
         let err = outcome.expect_err("a failed quality gate fails the run");
         assert!(
             err.is::<super::QualityGateFailure>(),
@@ -14218,6 +14268,64 @@ max_retries = 0
         assert!(
             record.check_gate_failed,
             "and it carries the gate the run failed on"
+        );
+    }
+
+    /// #1816, round two. The typed sentinel is the dispatcher's proof that the
+    /// record is persisted and may be uploaded, so it must not come back when
+    /// the record did NOT land. `persist_run_record` is best-effort (a failed
+    /// write is logged and the run goes on), and a run whose gate failed AND
+    /// whose record write failed returned `QualityGateFailure` anyway: the
+    /// dispatcher finalized, and the upload published a ledger without the
+    /// run, so pod B read an authoritative history with the failure missing.
+    /// Now the gate failure is untyped when the record is missing, the
+    /// dispatcher abandons, nothing is uploaded, and the message says the run
+    /// is not in the history.
+    #[test]
+    fn a_failed_quality_gate_whose_record_did_not_land_is_not_uploaded_as_if_it_had() {
+        use rocky_core::state::StateStore;
+        use rocky_core::test_harness::CrossPodHarness;
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let project = tempfile::tempdir().unwrap();
+        let run_id = "quality-gate-record-write-failed";
+        let rt = remote_state_test_runtime();
+
+        *super::FAIL_RECORD_WRITE_FOR_TEST.lock().unwrap() = Some(run_id.to_string());
+        let outcome = run_failing_quality_on_pod_a(&rt, &harness, project.path(), run_id);
+        *super::FAIL_RECORD_WRITE_FOR_TEST.lock().unwrap() = None;
+
+        let err = outcome.expect_err("the gate still fails the run");
+        assert!(
+            !err.is::<super::QualityGateFailure>(),
+            "a typed gate failure claims the record is persisted, and it is not: {err:#}"
+        );
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("error-severity check(s) failed")
+                && message.contains("could not be written"),
+            "the message names the gate AND the missing record: {message}"
+        );
+
+        // Pod A has no record: the write failed.
+        let local = StateStore::open(&harness.pod_a.state_path).unwrap();
+        assert!(
+            local.get_run(run_id).unwrap().is_none(),
+            "precondition: the injected write failure held"
+        );
+
+        // Nothing was uploaded: pod B's download finds no remote object at
+        // all, rather than an authoritative ledger with the run missing.
+        let authority = rt
+            .block_on(harness.download(&harness.pod_b))
+            .expect("pod B's download itself succeeds");
+        assert!(
+            matches!(
+                authority,
+                rocky_core::state_sync::StateAuthority::FreshStart
+            ),
+            "the session must abandon, not publish a ledger without the run: {authority:?}"
         );
     }
 
