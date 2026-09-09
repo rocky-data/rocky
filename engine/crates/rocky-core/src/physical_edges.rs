@@ -116,11 +116,13 @@ pub fn fold_identifier(s: &str) -> String {
 /// not answer to a bare `FROM customers`: the name matches, the object does
 /// not (#1354).
 ///
-/// This is a question about the WAREHOUSE. `rocky test` / `rocky ci` go
-/// through `rocky_engine::executor::execute_locally`, which materializes every
-/// model as `CREATE OR REPLACE TABLE <model name>` and ignores the configured
-/// target — there a bare read of the name always reaches the model, whatever
-/// this returns. Callers must know which execution they are reasoning about.
+/// This used to be a question about the WAREHOUSE only: `rocky test` /
+/// `rocky ci` went through `rocky_engine::executor::execute_locally`, which
+/// materialized every model as `CREATE OR REPLACE TABLE <model name>` and
+/// ignored the configured target, so there a bare read of the name always
+/// reached the model whatever this returned. Since #1354 step 1 local
+/// execution materializes at the configured `schema.table` too, so both
+/// executions now answer this the same way.
 ///
 /// The comparison folds both sides through [`fold_identifier`], so a project
 /// that spells its targets in upper case (`[target] table = "CUSTOMERS"` for
