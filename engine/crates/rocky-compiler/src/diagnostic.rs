@@ -199,6 +199,24 @@ pub const W011: &str = "W011";
 /// error — the consumer compiles, it just isn't verified against that
 /// producer this run.
 pub const W012: &str = "W012";
+/// The project's `rocky.toml` is present and could not be read, so the
+/// project-level checks that depend on it did not run (#1625).
+///
+/// Same shape as [`W012`] one level up: the compile itself still succeeds —
+/// models parse and typecheck without a project config — but `[mask]` /
+/// `[classifications.allow_unmasked]` (W004), the `[freshness]` default
+/// (W005) and the warehouse schema cache all came through empty because the
+/// file could not be parsed, not because the project declares nothing.
+///
+/// Emitted by the long-running surfaces — `rocky lsp` and `rocky serve` —
+/// which stay usable on a broken config by design rather than refusing.
+/// Every one-shot entry point (`rocky lineage`, the MCP tools, `rocky plan`)
+/// refuses instead: those return an answer a caller acts on, and an answer
+/// computed from a config that never loaded is wrong rather than degraded.
+///
+/// A project with NO `rocky.toml` does not emit this. Absence is an ordinary
+/// project fact; unreadability is a failure to read.
+pub const W013: &str = "W013";
 
 /// Imported producer added a column. Surfaced (at info severity) only to
 /// consumers that read the producer via `SELECT *`, where an added column
