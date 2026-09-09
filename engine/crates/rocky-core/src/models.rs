@@ -635,12 +635,6 @@ pub struct DirDefaultsTarget {
     pub schema: Option<String>,
 }
 
-/// Validates and loads a `_defaults.toml` file. Rejects per-model fields.
-///
-/// `${VAR}` and `${VAR:-default}` placeholders are resolved before parsing,
-/// matching `rocky.toml` and per-model sidecar behavior. Lets directory-level
-/// defaults (e.g. `target.schema = "${ROCKY_SCHEMA:-public}"`) be set per
-/// orchestrator subprocess.
 /// Read a model-tree file, naming the file and — for a `NotFound` on an entry
 /// that IS there — saying what it really is.
 ///
@@ -675,6 +669,12 @@ fn read_model_text(path: &Path) -> Result<String, ModelError> {
     })
 }
 
+/// Validates and loads a `_defaults.toml` file. Rejects per-model fields.
+///
+/// `${VAR}` and `${VAR:-default}` placeholders are resolved before parsing,
+/// matching `rocky.toml` and per-model sidecar behavior. Lets directory-level
+/// defaults (e.g. `target.schema = "${ROCKY_SCHEMA:-public}"`) be set per
+/// orchestrator subprocess.
 pub fn load_dir_defaults(path: &Path) -> Result<DirDefaults, ModelError> {
     // Named, like the sidecar read (#1738): the bare `ReadFile` carries only
     // the OS error, and on a dangling link that reads "No such file or

@@ -482,7 +482,16 @@ fn has_matching_model_source(root: &Path, pattern: &glob::Pattern) -> Result<boo
     // archive SQL could run on attributes nobody could read (#1817, round
     // six). A match still wins — something loadable is there. Nothing
     // matching plus a walk error is the walk error.
-    let (dirs, walk_errors) = rocky_core::model_walk::walk_model_dirs(root);
+    //
+    // The ROOT's own walk error outranks the listing: the walk yields a
+    // dangling root as a directory to visit, and listing it fails with a
+    // bare "No such file" that would pre-empt the walk's own account of what
+    // is there — a link to nowhere, and what to do about it (#1822, round
+    // eight). A matching healthy child still wins over any DEEPER error.
+    let (dirs, mut walk_errors) = rocky_core::model_walk::walk_model_dirs(root);
+    if let Some(i) = walk_errors.iter().position(|e| walk_error_dir(e) == root) {
+        return Err(ProjectError::ModelsTree(walk_errors.remove(i)));
+    }
     for dir in dirs {
         if dir_has_matching_model_source(&dir, pattern)? {
             return Ok(true);
@@ -657,7 +666,9 @@ fn load_single_rocky_model_with_db(
     // A `.rocky` entry that is there and cannot be resolved is a walk
     // failure, not a parse failure: say so before the salsa read folds it
     // into "failed to parse" with an OS error for a reason (#1822, round
-    // seven). One stat per `.rocky` file, only on the NotFound path.
+    // seven). The stat runs on every `.rocky` load; only its NotFound arm
+    // returns early. One `metadata()` per file per compile, beside the
+    // canonicalize and read the salsa route already does for each.
     if let Err(source) = std::fs::metadata(path)
         && source.kind() == std::io::ErrorKind::NotFound
         && let rocky_core::path_presence::PathPresence::Present { detail } =
@@ -1516,6 +1527,39 @@ mod recursive_load_tests {
             text.contains("models directory") && !text.contains("model file"),
             "a directory is called a directory: {text}"
         );
+    }
+
+    /// #1822, round eight: the models ROOT itself is a link to nowhere, on the
+    /// filtered route. The walk yields the root as a directory to visit and
+    /// records an `UnresolvedEntry` for it; the pre-check's listing of that
+    /// root then failed with a bare "No such file" and pre-empted the walk's
+    /// own account. The root's walk error comes first now.
+    #[cfg(unix)]
+    #[test]
+    fn a_filtered_compile_of_a_dangling_root_keeps_the_walks_own_words() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &models).unwrap();
+
+        let mut db = crate::salsa_compile::RockyDatabase::default();
+        let glob = format!("{}/**", models.display());
+        let err = Project::load_models_matching_with_db(&models, &glob, &mut db, None)
+            .expect_err("a dangling root refuses");
+        assert!(
+            matches!(
+                err,
+                ProjectError::ModelsTree(
+                    rocky_core::model_walk::ModelWalkError::UnresolvedEntry { .. }
+                )
+            ),
+            "the walk's own error, not a listing failure: {err}"
+        );
+        let text = format!("{err}");
+        assert!(
+            text.contains("cannot be resolved") && text.contains("repair or remove it"),
+            "{text}"
+        );
+        assert!(!text.contains("No such file"), "{text}");
     }
 
     /// A project whose ONLY matching sources sit below the first level is not
