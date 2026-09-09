@@ -47,19 +47,33 @@
 //!      backup / sidecar read)                              a unix flag)
 //!   hardlink at an EXISTING leaf  refused on the opened    not checked
 //!                                 DESCRIPTOR (nlink > 1)   (see below)
-//!   parent directory swapped      NOT closed — only dirfd-relative APIs
-//!     after validation            close it, and v0 does not use them
+//!   parent directory swapped      closed for the PUBLISHING           not closed
+//!     after validation            mutations: renameat / unlinkat       (renameat /
+//!                                 against descriptors captured          unlinkat are
+//!                                 before the first write (#1500)        unix)
 //! ```
 //!
 //! The rows say what the SYSCALL does. On the commit path a symlink parked
 //! at any of these leaves before the run is additionally refused up front
 //! by [`commit_generation`]'s pre-check, before the first mutation.
 //!
+//! Directory custody, and what it is for. Path-based syscalls re-traverse
+//! every component at syscall time, so a DIRECTORY swapped for a symlink
+//! between validation and a rename/unlink redirects that operation. The
+//! sharpest form is not a redirected write — a swap between staging and
+//! publishing makes the staged SOURCE name stop resolving, so the rename
+//! fails closed — it is cleanup: removing each `.ff-prev` by path sends
+//! `remove_file` into whatever tree the replaced directory now names, and
+//! deletes a file there the project never owned. [`DirCustody`] opens every
+//! parent ONCE before the first write and issues `renameat` / `unlinkat`
+//! against those descriptors, which do not re-traverse. A paired test
+//! proves the attack works against the path-based operations and fails
+//! against the captured ones; neither half is evidence alone. Unix only —
+//! both syscalls are, and the Windows paragraph below is the whole story
+//! there.
+//!
 //! Stated residuals, accepted under the v0 same-machine threat posture.
-//! Path-based syscalls re-traverse the path at syscall time, so a
-//! DIRECTORY swapped for a symlink in the instant between validation and
-//! a rename/unlink is only fully closed by dirfd-relative APIs, which v0
-//! does not use. Every leaf the protocol WRITES is guarded at the OPEN —
+//! Every leaf the protocol WRITES is guarded at the OPEN —
 //! O_EXCL on each create (portable), `O_NOFOLLOW` on an in-place write
 //! (unix) — and so is every read whose bytes go on to LAND somewhere: the
 //! `.ff-prev` backup source, Phase B's sidecar read, the draft rollback
@@ -74,8 +88,17 @@
 //! the staged name with a symlink between the close and the rename gets that
 //! symlink renamed into place as the artifact, because `rename` acts on the
 //! name it is given and never follows it. Nothing is written through the
-//! link — but a symlink now sits where a regular file belongs. Three things
-//! are true of it afterwards, and none of them is "the commit noticed":
+//! link — but a symlink now sits where a regular file belongs. Directory
+//! custody does NOT close this one, and the distinction is easy to lose:
+//! `renameat(dirfd, "x.ff-staged", dirfd, "x")` resolves the NAME
+//! `x.ff-staged` relative to a trusted directory, so if that name has been
+//! replaced by a symlink it renames the symlink exactly as `rename` would.
+//! The descriptor protects the directory, not the leaf. Closing it needs
+//! publication from the held file descriptor — `linkat` with
+//! `AT_EMPTY_PATH` — which is Linux-only and wants `CAP_DAC_READ_SEARCH`;
+//! `libc` does not define `AT_EMPTY_PATH` on Apple targets at all. There is
+//! no portable spelling, so v0 keeps this residual. Three things are true
+//! of that symlink afterwards, and none of them is "the commit noticed":
 //! the next crash recovery refuses it, because every final it touches goes
 //! back through [`contained_target`], which rejects a symlinked leaf; the
 //! `O_NOFOLLOW` readers refuse it on unix (`read_no_follow`, behind Phase B's
@@ -83,8 +106,9 @@
 //! committed artifact — the sidecar and contract loaders included — uses a
 //! plain following read (`std::fs::read`, `read_to_string`) and resolves it
 //! to its target. Same check-then-use class as the parent directory
-//! above, closed by the same fix (a dirfd plus `renameat`, or holding the
-//! staged descriptor through publication), and v0 accepts it.
+//! above, but NOT closed by the same fix: only the second remedy there
+//! (holding the staged descriptor through publication) reaches a swapped
+//! LEAF name, and it has no portable spelling. v0 accepts it.
 //!
 //! Not every read. Recovery's own `std::fs::read` of a final and of a
 //! committed manifest are pathname-based and follow a link; both are digest
@@ -133,6 +157,7 @@
 //! behaviour is untested; every symlink and hardlink exploit test in this
 //! module is `#[cfg(unix)]`.
 
+use std::ffi::CString;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -924,6 +949,189 @@ fn sibling_with_suffix(final_path: &Path, suffix: &str) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// Directory custody: the publishing mutations act on a captured descriptor
+// ---------------------------------------------------------------------------
+
+/// Directory descriptors captured once, so the renames and removals that
+/// PUBLISH a generation cannot be redirected by swapping a directory after
+/// it was validated (#1500).
+///
+/// # What a descriptor buys
+///
+/// `std::fs::rename` and `std::fs::remove_file` re-traverse every component
+/// of the path at syscall time. Between the pre-check that validated
+/// `models/` and the rename that publishes into it, an attacker with write
+/// access to the PARENT of `models/` can replace it with a symlink, and the
+/// rename follows the replacement. A descriptor does not re-traverse: it
+/// names the inode that was there when it was opened, and a later swap of
+/// the name leaves it pointing at the original directory.
+///
+/// So every parent is opened ONCE, up front, with `O_DIRECTORY |
+/// O_NOFOLLOW | O_CLOEXEC`, and each mutation becomes `renameat` /
+/// `unlinkat` against that descriptor with a single-component name.
+///
+/// # What it does NOT buy, stated because the distinction is easy to lose
+///
+/// `renameat(dirfd, "x.ff-staged", dirfd, "x")` resolves the NAME
+/// `x.ff-staged` relative to a trusted directory. If that name has been
+/// replaced by a symlink since the file was closed, `renameat` renames the
+/// symlink into place exactly as `rename` would. The descriptor protects
+/// the directory, not the leaf.
+///
+/// Closing that residual needs publication from the held file descriptor —
+/// `linkat` with `AT_EMPTY_PATH` — which is Linux-only (and wants
+/// `CAP_DAC_READ_SEARCH`); `libc` does not define `AT_EMPTY_PATH` on Apple
+/// targets at all. There is no portable spelling, so the residual stands
+/// and the module header keeps it.
+///
+/// # Fails closed
+///
+/// A mutation whose parent was not captured is refused rather than falling
+/// back to a path-based call. A silent fallback would reintroduce the
+/// vector on precisely the paths nobody remembered to enumerate.
+#[cfg(unix)]
+pub(crate) struct DirCustody {
+    /// Parent directory → its open descriptor. Keyed by the path used to
+    /// capture it, which is how the mutation closures look it up.
+    dirs: std::collections::HashMap<PathBuf, std::fs::File>,
+}
+
+#[cfg(unix)]
+impl DirCustody {
+    /// Capture a descriptor for each distinct parent of `paths`, creating
+    /// the directory first when it does not exist.
+    ///
+    /// Creation happens here rather than at the point of use so that
+    /// capture is the LAST thing to touch a parent before the protocol
+    /// starts writing: a `create_dir_all` interleaved with the writes
+    /// would reopen the window this closes.
+    fn capture<'a>(paths: impl Iterator<Item = &'a Path>) -> std::io::Result<Self> {
+        use std::os::unix::io::AsRawFd as _;
+
+        let mut dirs: std::collections::HashMap<PathBuf, std::fs::File> =
+            std::collections::HashMap::new();
+        for path in paths {
+            let Some(parent) = path.parent() else {
+                continue;
+            };
+            if dirs.contains_key(parent) {
+                continue;
+            }
+            std::fs::create_dir_all(parent)?;
+            let file = open_dir_no_follow(parent)?;
+            // Cheap assertion that the descriptor really is a directory;
+            // `O_DIRECTORY` already guarantees it, and this catches a
+            // platform where the flag is silently ignored.
+            let _ = file.as_raw_fd();
+            dirs.insert(parent.to_path_buf(), file);
+        }
+        Ok(Self { dirs })
+    }
+
+    /// The descriptor for `path`'s parent, or an error naming the path.
+    fn parent_fd(&self, path: &Path) -> std::io::Result<(std::os::unix::io::RawFd, CString)> {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::io::AsRawFd as _;
+
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} has no parent directory", path.display()),
+            )
+        })?;
+        let name = path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} has no final component", path.display()),
+            )
+        })?;
+        let dir = self.dirs.get(parent).ok_or_else(|| {
+            // Fail closed. See the type doc.
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "no directory custody was captured for {}, so publishing {} is refused",
+                    parent.display(),
+                    path.display()
+                ),
+            )
+        })?;
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} contains an interior NUL", path.display()),
+            )
+        })?;
+        Ok((dir.as_raw_fd(), name))
+    }
+
+    /// `renameat` between two captured directories.
+    fn rename(&self, src: &Path, dst: &Path) -> std::io::Result<()> {
+        let (src_fd, src_name) = self.parent_fd(src)?;
+        let (dst_fd, dst_name) = self.parent_fd(dst)?;
+        // SAFETY: both descriptors are owned by `self` and outlive the
+        // call; both names are NUL-terminated `CString`s built above.
+        let rc = unsafe { libc::renameat(src_fd, src_name.as_ptr(), dst_fd, dst_name.as_ptr()) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    /// `unlinkat` in a captured directory.
+    fn remove(&self, path: &Path) -> std::io::Result<()> {
+        let (fd, name) = self.parent_fd(path)?;
+        // SAFETY: the descriptor is owned by `self` and outlives the call;
+        // the name is a NUL-terminated `CString` built above. Flag 0 means
+        // "unlink a non-directory", which is what every caller removes.
+        let rc = unsafe { libc::unlinkat(fd, name.as_ptr(), 0) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+/// Open a directory without following a symlink at its final component.
+#[cfg(unix)]
+fn open_dir_no_follow(dir: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)
+}
+
+/// The non-unix stand-in. `renameat` / `unlinkat` are unix, so these stay
+/// path-based and the parent-swap vector is NOT closed there — the Windows
+/// gap the module header states. It exists so the protocol has one shape
+/// rather than a second code path nobody runs.
+#[cfg(not(unix))]
+pub(crate) struct DirCustody;
+
+#[cfg(not(unix))]
+impl DirCustody {
+    fn capture<'a>(paths: impl Iterator<Item = &'a Path>) -> std::io::Result<Self> {
+        for path in paths {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        Ok(Self)
+    }
+
+    fn rename(&self, src: &Path, dst: &Path) -> std::io::Result<()> {
+        std::fs::rename(src, dst)
+    }
+
+    fn remove(&self, path: &Path) -> std::io::Result<()> {
+        std::fs::remove_file(path)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Commit: stage, journal, rename (manifest LAST), clean up
 // ---------------------------------------------------------------------------
 
@@ -931,9 +1139,14 @@ fn sibling_with_suffix(final_path: &Path, suffix: &str) -> PathBuf {
 /// code passes the real operations; a test injects a failure at the N-th
 /// rename (or at a cleanup removal) to freeze the protocol mid-flight —
 /// the same seam the answer key's `os.replace` monkeypatch exercised.
+/// Rename one path onto another. See [`CommitOps`].
+type RenameOp<'a> = Box<dyn FnMut(&Path, &Path) -> std::io::Result<()> + 'a>;
+/// Remove one path. See [`CommitOps`].
+type RemoveOp<'a> = Box<dyn FnMut(&Path) -> std::io::Result<()> + 'a>;
+
 struct CommitOps<'a> {
-    rename: &'a mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
-    remove: &'a mut dyn FnMut(&Path) -> std::io::Result<()>,
+    rename: RenameOp<'a>,
+    remove: RemoveOp<'a>,
 }
 
 fn io_reject(action: &str, path: &Path, err: &std::io::Error) -> SpecRejected {
@@ -1011,22 +1224,19 @@ pub fn commit_generation(
     parsed: &ParsedSpec,
     lowering: &Lowering,
 ) -> SpecResult<()> {
-    commit_generation_with_ops(
-        project_root,
-        parsed,
-        lowering,
-        &mut CommitOps {
-            rename: &mut |src, dst| std::fs::rename(src, dst),
-            remove: &mut |p| std::fs::remove_file(p),
-        },
-    )
+    commit_generation_with_ops(project_root, parsed, lowering, None)
 }
 
+/// `ops` is `None` on every production path, which is what makes the
+/// captured directory custody below the ONE implementation of the publishing
+/// mutations: `commit_generation` and `run_phase_b` both reach it that way,
+/// so neither can quietly keep the path-based calls. `Some` belongs to the
+/// crash drills, which interpose to freeze the protocol mid-flight.
 fn commit_generation_with_ops(
     project_root: &Path,
     parsed: &ParsedSpec,
     lowering: &Lowering,
-    ops: &mut CommitOps<'_>,
+    ops: Option<CommitOps<'_>>,
 ) -> SpecResult<()> {
     let product_name = &parsed.product().name;
     recover_generation(project_root, parsed)?;
@@ -1054,14 +1264,36 @@ fn commit_generation_with_ops(
             .chain(std::iter::once(journal_relpath.as_str())),
     )?;
 
+    // Take custody of every directory this generation will publish into,
+    // BEFORE the first write (#1500). From here the renames and removals act
+    // on descriptors, so a directory swapped after the pre-check above
+    // cannot be reached. The set is exactly what the protocol writes:
+    // each artifact's final, the manifest, and the journal — their
+    // `.ff-staged` / `.ff-prev` siblings live in the same directories.
+    let published: Vec<PathBuf> = contents
+        .iter()
+        .map(|(relpath, _)| project_root.join(relpath))
+        .chain(std::iter::once(journal_path(project_root, product_name)))
+        .collect();
+    let custody = DirCustody::capture(published.iter().map(PathBuf::as_path)).map_err(|err| {
+        SpecRejected::new(
+            "commit-io",
+            format!("taking directory custody for the commit failed: {err}"),
+        )
+    })?;
+    let mut ops = ops.unwrap_or_else(|| CommitOps {
+        rename: Box::new(|src: &Path, dst: &Path| custody.rename(src, dst)),
+        remove: Box::new(|path: &Path| custody.remove(path)),
+    });
+
     // 1. Stage every file (same dir, fixed suffix) and back up finals.
     let mut entries: Vec<StagingEntry> = Vec::with_capacity(contents.len());
     for (relpath, bytes) in &contents {
+        // The parent already exists: `DirCustody::capture` created it, which
+        // is deliberate — a `create_dir_all` interleaved with the writes
+        // would re-resolve a path the custody above was taken to stop
+        // re-resolving.
         let final_path = project_root.join(relpath);
-        if let Some(parent) = final_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| io_reject("creating directory", parent, &err))?;
-        }
         let staged = staged_sibling(&final_path);
         // O_EXCL (via `write_new_no_follow`): a link swapped in at the
         // staged leaf after the pre-check is refused, never followed.
@@ -1089,10 +1321,7 @@ fn commit_generation_with_ops(
         manifest: manifest_relpath,
     };
     let journal = journal_path(project_root, product_name);
-    if let Some(parent) = journal.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| io_reject("creating directory", parent, &err))?;
-    }
+    // Its directory is under custody too, created there.
     let journal_tmp = sibling_with_suffix(&journal, STAGED_SUFFIX);
     let journal_bytes =
         serde_json::to_vec_pretty(&record).expect("the staging journal serializes to JSON");
@@ -1101,6 +1330,9 @@ fn commit_generation_with_ops(
     (ops.rename)(&journal_tmp, &journal).map_err(|err| io_reject("renaming", &journal, &err))?;
 
     // 3. Rename staged → final: artifacts first, the manifest LAST.
+    // `staged_sibling` keeps the file in its final's directory, so these
+    // renames land inside a captured parent; a name outside one is refused
+    // rather than silently falling back to a path-based rename (#1500).
     for entry in &entries {
         let final_path = project_root.join(&entry.final_path);
         (ops.rename)(&staged_sibling(&final_path), &final_path)
@@ -1557,22 +1789,14 @@ pub fn run_phase_b(
     spec_path: &str,
     parsed: &ParsedSpec,
 ) -> SpecResult<Lowering> {
-    run_phase_b_with_ops(
-        project_root,
-        spec_path,
-        parsed,
-        &mut CommitOps {
-            rename: &mut |src, dst| std::fs::rename(src, dst),
-            remove: &mut |p| std::fs::remove_file(p),
-        },
-    )
+    run_phase_b_with_ops(project_root, spec_path, parsed, None)
 }
 
 fn run_phase_b_with_ops(
     project_root: &Path,
     spec_path: &str,
     parsed: &ParsedSpec,
-    ops: &mut CommitOps<'_>,
+    ops: Option<CommitOps<'_>>,
 ) -> SpecResult<Lowering> {
     recover_generation(project_root, parsed)?;
     let Some(committed) = committed_manifest(project_root, &parsed.product().name)? else {
@@ -1959,6 +2183,151 @@ mod tests {
         project
     }
 
+    /// #1500, the harness half: a directory swapped mid-protocol really can
+    /// redirect a PATHNAME-based mutation, and the primitive is deletion.
+    ///
+    /// Where the redirect bites is not the renames. A swap between staging
+    /// and publishing makes the staged SOURCE name stop resolving, so a
+    /// path-based rename fails closed rather than writing somewhere else —
+    /// worth stating, because it is the intuitive attack and it does not
+    /// work. Cleanup is the one that does: step 4 removes each `.ff-prev`
+    /// backup by path, so a `models/` replaced by a symlink after the
+    /// publish sends `remove_file` into whatever tree the link names, and
+    /// deletes a file there that the project never owned.
+    ///
+    /// This test asserts the attack WORKS against the path-based
+    /// operations. Its sibling asserts it fails against the captured
+    /// descriptors. Neither is evidence alone: a single green test could be
+    /// green because the attack never fired.
+    #[cfg(unix)]
+    #[test]
+    fn a_swapped_directory_redirects_a_pathname_based_cleanup() {
+        let (tmp, project, parsed, lowering) = swap_fixture();
+        let (attacker, decoys) = decoy_dir(tmp.path(), &parsed);
+        let models = project.join("models");
+
+        let swapped = std::cell::Cell::new(false);
+        let remove = |path: &Path| {
+            if !swapped.get() {
+                swapped.set(true);
+                std::fs::remove_dir_all(&models).expect("rm models");
+                std::os::unix::fs::symlink(&attacker, &models).expect("plant");
+            }
+            std::fs::remove_file(path)
+        };
+        let _ = commit_generation_with_ops(
+            &project,
+            &parsed,
+            &lowering,
+            Some(CommitOps {
+                rename: Box::new(|src: &Path, dst: &Path| std::fs::rename(src, dst)),
+                remove: Box::new(remove),
+            }),
+        );
+
+        assert!(
+            decoys.iter().any(|d| !d.exists()),
+            "the harness must actually be able to redirect a path-based removal; \
+             if every decoy survives here, the sibling test proves nothing"
+        );
+    }
+
+    /// #1500, the fix half: the same swap, against the captured descriptors.
+    ///
+    /// Reverting [`DirCustody::remove`] to `std::fs::remove_file` fails this
+    /// and leaves its sibling green — which is what makes the pair evidence.
+    #[cfg(unix)]
+    #[test]
+    fn captured_directories_survive_a_swap_that_defeats_pathnames() {
+        let (tmp, project, parsed, lowering) = swap_fixture();
+        let (attacker, decoys) = decoy_dir(tmp.path(), &parsed);
+        let models = project.join("models");
+
+        let custody = DirCustody::capture(
+            published_paths(&project, &parsed)
+                .iter()
+                .map(PathBuf::as_path),
+        )
+        .expect("custody");
+        let swapped = std::cell::Cell::new(false);
+        let remove = |path: &Path| {
+            if !swapped.get() {
+                swapped.set(true);
+                std::fs::remove_dir_all(&models).expect("rm models");
+                std::os::unix::fs::symlink(&attacker, &models).expect("plant");
+            }
+            custody.remove(path)
+        };
+        let _ = commit_generation_with_ops(
+            &project,
+            &parsed,
+            &lowering,
+            Some(CommitOps {
+                rename: Box::new(|src: &Path, dst: &Path| custody.rename(src, dst)),
+                remove: Box::new(remove),
+            }),
+        );
+
+        let deleted: Vec<_> = decoys.iter().filter(|d| !d.exists()).collect();
+        assert!(
+            deleted.is_empty(),
+            "a directory swapped after custody was taken must not have its removals \
+             redirected; these files outside the project were deleted: {deleted:?}"
+        );
+    }
+
+    /// A project that has already committed once, so a second commit takes
+    /// `.ff-prev` backups and therefore reaches the cleanup removals the
+    /// swap tests interpose on.
+    #[cfg(unix)]
+    fn swap_fixture() -> (tempfile::TempDir, PathBuf, ParsedSpec, Lowering) {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let project = seeded_project(tmp.path());
+        write_file(&project.join(SPEC_PATH), SPEC_FIXTURE);
+        let parsed = parsed_d3();
+        let lowering = lower_phase_a(&parsed, SPEC_PATH).expect("phase A lowers");
+        commit_generation(&project, &parsed, &lowering).expect("first commit");
+        (tmp, project, parsed, lowering)
+    }
+
+    /// A directory outside the project holding a file named after EVERY
+    /// backup the cleanup may remove — so a redirected removal deletes one
+    /// of them, and a contained one cannot see any.
+    ///
+    /// One decoy per leaf rather than per the leaf that happens to be
+    /// removed first: pinning the order would make this test fail for a
+    /// reason that has nothing to do with containment the day the artifact
+    /// set changes.
+    #[cfg(unix)]
+    fn decoy_dir(root: &Path, parsed: &ParsedSpec) -> (PathBuf, Vec<PathBuf>) {
+        let attacker = root.join("attacker");
+        std::fs::create_dir_all(&attacker).expect("mkdir");
+        let mut decoys = Vec::new();
+        for rel in [sql_rel(parsed), sidecar_rel(parsed), contract_rel(parsed)] {
+            let leaf = Path::new(&rel)
+                .file_name()
+                .expect("leaf")
+                .to_string_lossy()
+                .into_owned();
+            let decoy = attacker.join(format!("{leaf}{PREV_SUFFIX}"));
+            std::fs::write(&decoy, b"a file the project never owned").expect("decoy");
+            decoys.push(decoy);
+        }
+        (attacker, decoys)
+    }
+
+    /// Every path a generation publishes into, mirroring what
+    /// `commit_generation_with_ops` captures.
+    #[cfg(unix)]
+    fn published_paths(project: &Path, parsed: &ParsedSpec) -> Vec<PathBuf> {
+        vec![
+            project.join(sql_rel(parsed)),
+            project.join(sidecar_rel(parsed)),
+            project.join(manifest_rel(&parsed.product().name)),
+            journal_path(project, &parsed.product().name),
+        ]
+    }
+
     /// Fail the N-th rename with an injected error, mirroring the answer
     /// key's `os.replace` bomb. Phase B commits 3 renames: the journal
     /// swap (1), the sidecar rename (2), the manifest rename (3 — the
@@ -1969,7 +2338,7 @@ mod tests {
         fail_on_call: usize,
     ) -> SpecRejected {
         let mut calls = 0usize;
-        let mut rename = |src: &Path, dst: &Path| {
+        let rename = |src: &Path, dst: &Path| {
             calls += 1;
             if calls == fail_on_call {
                 return Err(std::io::Error::other(
@@ -1978,15 +2347,15 @@ mod tests {
             }
             std::fs::rename(src, dst)
         };
-        let mut remove = |p: &Path| std::fs::remove_file(p);
+        let remove = |p: &Path| std::fs::remove_file(p);
         let error = run_phase_b_with_ops(
             project,
             SPEC_PATH,
             parsed,
-            &mut CommitOps {
-                rename: &mut rename,
-                remove: &mut remove,
-            },
+            Some(CommitOps {
+                rename: Box::new(rename),
+                remove: Box::new(remove),
+            }),
         )
         .expect_err("the injected crash must surface");
         assert!(
@@ -2636,8 +3005,8 @@ mod tests {
         let parsed = parsed_d3();
         let project = project_with_phase_a_and_draft(dir.path(), &parsed);
 
-        let mut rename = |src: &Path, dst: &Path| std::fs::rename(src, dst);
-        let mut remove = |p: &Path| -> std::io::Result<()> {
+        let rename = |src: &Path, dst: &Path| std::fs::rename(src, dst);
+        let remove = |p: &Path| -> std::io::Result<()> {
             if p.to_string_lossy().ends_with(PREV_SUFFIX) {
                 return Err(std::io::Error::other("injected crash during cleanup"));
             }
@@ -2647,10 +3016,10 @@ mod tests {
             &project,
             SPEC_PATH,
             &parsed,
-            &mut CommitOps {
-                rename: &mut rename,
-                remove: &mut remove,
-            },
+            Some(CommitOps {
+                rename: Box::new(rename),
+                remove: Box::new(remove),
+            }),
         )
         .expect_err("the injected cleanup crash must surface");
         assert!(error.message.contains("injected crash"), "{error}");
@@ -4400,7 +4769,7 @@ mod tests {
         // (3). Fail at 3: the brand-new contract has already renamed into
         // place; the manifest (the marker) has not.
         let mut calls = 0usize;
-        let mut rename = |src: &Path, dst: &Path| {
+        let rename = |src: &Path, dst: &Path| {
             calls += 1;
             if calls == 3 {
                 return Err(std::io::Error::other(
@@ -4409,15 +4778,15 @@ mod tests {
             }
             std::fs::rename(src, dst)
         };
-        let mut remove = |p: &Path| std::fs::remove_file(p);
+        let remove = |p: &Path| std::fs::remove_file(p);
         commit_generation_with_ops(
             &project,
             &parsed,
             &lowering,
-            &mut CommitOps {
-                rename: &mut rename,
-                remove: &mut remove,
-            },
+            Some(CommitOps {
+                rename: Box::new(rename),
+                remove: Box::new(remove),
+            }),
         )
         .expect_err("the injected crash must surface");
 
@@ -4489,22 +4858,22 @@ mod tests {
         let parsed = crate::product::spec::parse_spec_file(Path::new(&spec_file))
             .expect("the child reads the spec file the parent wrote");
         let marker = PathBuf::from(marker);
-        let mut rename = |src: &Path, dst: &Path| {
+        let rename = |src: &Path, dst: &Path| {
             if dst.file_name().is_some_and(|n| n == MANIFEST_FILENAME) {
                 std::fs::write(&marker, b"mid-protocol").expect("marker");
                 std::thread::sleep(std::time::Duration::from_secs(300));
             }
             std::fs::rename(src, dst)
         };
-        let mut remove = |p: &Path| std::fs::remove_file(p);
+        let remove = |p: &Path| std::fs::remove_file(p);
         let _ = run_phase_b_with_ops(
             Path::new(&project),
             SPEC_PATH,
             &parsed,
-            &mut CommitOps {
-                rename: &mut rename,
-                remove: &mut remove,
-            },
+            Some(CommitOps {
+                rename: Box::new(rename),
+                remove: Box::new(remove),
+            }),
         );
     }
 
