@@ -3768,6 +3768,10 @@ adapter = "db"
     /// so the sweep returned `Ok(0)` and the tombstone stayed forever. The
     /// unit test in `spool.rs` could not see it: it calls `sweep_tombstones`
     /// directly with the right path, proving the callee and not the caller.
+    // Unix-only: the fixture is a dangling SYMLINK, and
+    // `std::os::unix::fs::symlink` does not exist on Windows — where
+    // `cargo check --all-targets` compiles this test and fails on it.
+    #[cfg(unix)]
     #[test]
     fn a_dangling_spool_symlink_is_carried_on_the_report_not_just_the_log() {
         let (state_path, dir, opts) = temp_env();
