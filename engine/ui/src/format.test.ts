@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   NOT_RECORDED,
-  elideMiddle,
+  clipHead,
+  clipMiddle,
   formatDuration,
   formatInstant,
   orNotRecorded,
-  shortId,
 } from "./format";
 
 describe("orNotRecorded", () => {
@@ -47,41 +47,65 @@ describe("formatInstant", () => {
   });
 });
 
-describe("shortId", () => {
-  it("keeps short ids whole and marks a cut with an ellipsis", () => {
-    expect(shortId("run-1")).toBe("run-1");
-    expect(shortId("a".repeat(64))).toBe(`${"a".repeat(12)}…`);
+describe("clipHead", () => {
+  it("keeps short ids whole and says when it cut", () => {
+    expect(clipHead("run-1")).toEqual({ clipped: false, text: "run-1" });
+    expect(clipHead("a".repeat(64))).toEqual({ clipped: true, head: "a".repeat(12), tail: "" });
   });
 
-  it("does not mark an id that was not cut", () => {
+  it("does not claim a cut it did not make", () => {
     // Exactly at the limit: twelve characters are shown, nothing was dropped,
-    // so an ellipsis would claim a truncation that did not happen.
-    expect(shortId("a".repeat(12))).toBe("a".repeat(12));
-    expect(shortId("a".repeat(13))).toBe(`${"a".repeat(12)}…`);
+    // so a marker would claim a truncation that did not happen.
+    expect(clipHead("a".repeat(12))).toEqual({ clipped: false, text: "a".repeat(12) });
+    expect(clipHead("a".repeat(13)).clipped).toBe(true);
+  });
+
+  /// `String.prototype.slice` counts UTF-16 code units, and a cut at the
+  /// twelfth unit of `aaaaaaaaaaa😀z` lands between the emoji's two
+  /// surrogates, leaving a lone `\ud83d` on screen (#1815). The cut is made
+  /// between characters a reader sees.
+  it("never splits a surrogate pair", () => {
+    const cut = clipHead("aaaaaaaaaaa😀z");
+    expect(cut).toEqual({ clipped: true, head: "aaaaaaaaaaa😀", tail: "" });
+    expect(/[\ud800-\udbff]$/.test(cut.clipped ? cut.head : "")).toBe(false);
+  });
+
+  /// The marker is a flag, not a character, so a value that contains "…"
+  /// is not mistaken for one that was cut.
+  it("reports a literal ellipsis as text that was not cut", () => {
+    expect(clipHead("abcdefghij…")).toEqual({ clipped: false, text: "abcdefghij…" });
   });
 });
 
-describe("elideMiddle", () => {
+describe("clipMiddle", () => {
   it("keeps both ends of a compound identifier", () => {
-    // #1756: `shortId` renders every key for one product identically, because
-    // they all begin `product:<name>@`. The tail is what distinguishes them.
+    // #1756: a leading slice renders every key for one product identically,
+    // because they all begin `product:<name>@`. The tail is what
+    // distinguishes them.
     const key = "product:revenue_daily@sha256:5b1bf5c@21";
-    expect(elideMiddle(key)).toBe("product:re…1bf5c@21");
-    expect(elideMiddle(key)).toContain("@21");
+    expect(clipMiddle(key)).toEqual({ clipped: true, head: "product:re", tail: "1bf5c@21" });
   });
 
-  it("distinguishes two keys that shortId renders identically", () => {
-    const a = "product:revenue_daily@sha256:5b1bf5c@21";
-    const b = "product:revenue_daily@sha256:5b1bf5c@22";
-    expect(shortId(a)).toBe(shortId(b));
-    expect(elideMiddle(a)).not.toBe(elideMiddle(b));
+  it("distinguishes two keys whose heads are the same", () => {
+    const a = clipMiddle("product:revenue_daily@sha256:5b1bf5c@21");
+    const b = clipMiddle("product:revenue_daily@sha256:5b1bf5c@22");
+    expect(clipHead("product:revenue_daily@sha256:5b1bf5c@21")).toEqual(
+      clipHead("product:revenue_daily@sha256:5b1bf5c@22"),
+    );
+    expect(a).not.toEqual(b);
   });
 
-  it("returns a value unchanged rather than rendering it longer", () => {
-    // head + tail + the ellipsis is 19 characters, so anything at or under
-    // that gains nothing from eliding.
-    expect(elideMiddle("a".repeat(19))).toBe("a".repeat(19));
-    expect(elideMiddle("a".repeat(20)).length).toBeLessThan(20);
-    expect(elideMiddle("short")).toBe("short");
+  it("returns a value uncut rather than rendering it longer", () => {
+    // head + tail + the marker is 19 characters, so anything at or under
+    // that gains nothing from cutting.
+    expect(clipMiddle("a".repeat(19))).toEqual({ clipped: false, text: "a".repeat(19) });
+    const cut = clipMiddle("a".repeat(20));
+    expect(cut.clipped).toBe(true);
+    expect(clipMiddle("short")).toEqual({ clipped: false, text: "short" });
+  });
+
+  it("never splits a surrogate pair at either end", () => {
+    const cut = clipMiddle("aaaaaaaaa😀bbbbbbbbbb");
+    expect(cut).toEqual({ clipped: true, head: "aaaaaaaaa😀", tail: "bbbbbbbb" });
   });
 });

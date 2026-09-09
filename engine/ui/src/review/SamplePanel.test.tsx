@@ -36,6 +36,26 @@ describe("SamplePanel", () => {
     expect(load).toHaveBeenCalledWith("orders");
   });
 
+  /// Consent is given for one model. D8 made sampling a per-request consent;
+  /// a panel that kept `asked` across a model change turned one press into
+  /// consent for whatever model came next, and ran that query with no click
+  /// (#1815).
+  it("withdraws consent when the model under it changes", async () => {
+    const load = vi.fn(async () => SAMPLE);
+    const view = render(<SamplePanel model="orders" load={load} />);
+    fireEvent.click(screen.getByRole("button", { name: `Show ${SAMPLE_LIMIT} rows` }));
+    await waitFor(() => expect(load).toHaveBeenCalledTimes(1));
+
+    view.rerender(<SamplePanel model="customers" load={load} />);
+
+    // The button is back, nothing ran for the new model, and the panel says
+    // which model a press would now read.
+    expect(screen.getByRole("button", { name: `Show ${SAMPLE_LIMIT} rows` })).toBeTruthy();
+    expect(screen.getByText("customers")).toBeTruthy();
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(load).not.toHaveBeenCalledWith("customers");
+  });
+
   it("renders the rows, a null as null, and the SQL that ran", async () => {
     const load = vi.fn(async () => SAMPLE);
     render(<SamplePanel model="orders" load={load} />);

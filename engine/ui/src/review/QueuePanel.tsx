@@ -2,7 +2,8 @@ import type { ReviewQueueEntry, ReviewQueueOutput } from "@rocky-types/review_qu
 import { apiGet } from "../api";
 import { useResource } from "../estate/useResource";
 import { ResourceState } from "./ResourceState";
-import { formatInstant, shortId } from "../format";
+import { Clip } from "../components";
+import { formatInstant } from "../format";
 import { navigateTo } from "../router";
 import { reviewPath } from "./paths";
 
@@ -33,7 +34,7 @@ function QueueRow({ entry, now }: { entry: ReviewQueueEntry; now?: number }) {
           }}
           className="font-mono text-sm text-sky-700 underline-offset-2 hover:underline dark:text-sky-400"
         >
-          <span title={entry.plan_id}>{shortId(entry.plan_id)}</span>
+          <Clip value={entry.plan_id} />
         </a>
         <span className="text-[11px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
           {entry.capability} · {entry.principal}
@@ -45,6 +46,17 @@ function QueueRow({ entry, now }: { entry: ReviewQueueEntry; now?: number }) {
           <dt className="text-zinc-500 dark:text-zinc-400">model</dt>
           <dd className="font-mono break-all">{entry.model}</dd>
         </div>
+        {!(entry.models.length === 1 && entry.models[0] === entry.model) && (
+          // On a plan-level row `model` is a label — "backfill: 3 model(s)" —
+          // and the names are in `models`. Shown only when they differ; on an
+          // ordinary row the set is the label and the cell would repeat it.
+          <div>
+            <dt className="text-zinc-500 dark:text-zinc-400">models</dt>
+            <dd className="font-mono break-all">
+              {entry.models.length === 0 ? "not recorded" : entry.models.join(", ")}
+            </dd>
+          </div>
+        )}
         <div>
           <dt className="text-zinc-500 dark:text-zinc-400">blast radius</dt>
           <dd>{entry.blast_radius ?? "not computed"}</dd>

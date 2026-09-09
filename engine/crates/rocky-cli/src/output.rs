@@ -7650,8 +7650,17 @@ pub struct ReviewQueueEntry {
     /// The capability that was evaluated (its `schema_change.*` refinement is
     /// the change class the ranking weighs).
     pub capability: rocky_core::config::PolicyCapability,
-    /// The model the escalation is about.
+    /// The model the escalation is about. On a plan-level escalation
+    /// (`backfill` / `gc` / `restore`) this is a human label — `"backfill: 3
+    /// model(s)"` — and not a model name; the names are in `models`.
     pub model: String,
+    /// The graph keys this entry stands for: the model set the ledger row
+    /// recorded, or the single `model` on an ordinary evaluation row. It is
+    /// the set `blast_radius` was computed over. **Empty means unknown** — a
+    /// plan-level row written before the engine kept its set — and never "no
+    /// models". A consumer that needs a model name takes it from here; `model`
+    /// is display text and is not to be parsed.
+    pub models: Vec<String>,
     /// Index of the winning `[[policy.rules]]` entry, or `null` when the
     /// escalation came from the default posture.
     #[serde(skip_serializing_if = "Option::is_none")]

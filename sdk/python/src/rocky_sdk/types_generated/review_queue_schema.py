@@ -160,7 +160,11 @@ class ReviewQueueEntry(BaseModel):
     """
     model: str
     """
-    The model the escalation is about.
+    The model the escalation is about. On a plan-level escalation (`backfill` / `gc` / `restore`) this is a human label — `"backfill: 3 model(s)"` — and not a model name; the names are in `models`.
+    """
+    models: list[str]
+    """
+    The graph keys this entry stands for: the model set the ledger row recorded, or the single `model` on an ordinary evaluation row. It is the set `blast_radius` was computed over. **Empty means unknown** — a plan-level row written before the engine kept its set — and never "no models". A consumer that needs a model name takes it from here; `model` is display text and is not to be parsed.
     """
     plan_id: str
     """

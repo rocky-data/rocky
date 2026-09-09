@@ -793,10 +793,17 @@ pub(crate) fn blast_radius_of(
 /// re-open the ranking collapse this exists to fix. Here the question is how
 /// much the plan's change reaches, and a model rebuilt because another member
 /// changed is part of that reach.
+///
+/// **No subjects, no answer.** An empty set of names unions to an empty set,
+/// which would report as a measured zero for a row that named nothing — the
+/// same partial-count-as-measurement the all-or-nothing rule refuses. A row
+/// that resolves to no keys (a pre-v28 plan-level escalation) is unknown.
 pub(crate) fn blast_radius_union<'a>(
     result: &compile::CompileResult,
     models: impl IntoIterator<Item = &'a str>,
 ) -> Option<BTreeSet<String>> {
+    let mut models = models.into_iter().peekable();
+    models.peek()?;
     let mut union: BTreeSet<String> = BTreeSet::new();
     for model in models {
         let (_, transitive) = blast_radius_of(result, model)?;

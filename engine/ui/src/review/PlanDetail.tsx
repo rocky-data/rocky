@@ -4,9 +4,9 @@ import type { BreakingFinding, ReviewOutput } from "@rocky-types/review";
 import type { ReviewQueueEntry, ReviewQueueOutput } from "@rocky-types/review_queue";
 import type { ReviewStatusOutput } from "@rocky-types/review_status";
 import { apiGet } from "../api";
-import { StatusCard } from "../components";
+import { Clip, StatusCard } from "../components";
 import { type Resource, useResource } from "../estate/useResource";
-import { formatInstant, shortId } from "../format";
+import { formatInstant } from "../format";
 import { CustodyLink } from "../governor/links";
 import { ResourceState } from "./ResourceState";
 import { SamplePanel } from "./SamplePanel";
@@ -25,15 +25,32 @@ export const defaultPlanLoaders: PlanLoaders = {
   product: (name) => apiGet<ProductStatusOutput>(`products/${encodeURIComponent(name)}`),
 };
 
-/**
- * What the samples route will accept as a model name — the same shape as
- * `rocky_sql::validation::validate_identifier` (`^[a-zA-Z0-9_]+$`).
- */
-const MODEL_NAME = /^[a-zA-Z0-9_]+$/;
-
 /** A `product:<name>` identity reduced to the name the products route takes. */
 export function productNameFromId(productId: string): string {
   return productId.startsWith("product:") ? productId.slice("product:".length) : productId;
+}
+
+/**
+ * What the queue says about one plan. Three answers, because the queue is a
+ * resource and a resource has three ways to stand: it named the plan, it was
+ * read and did not name it, or it could not be read. Only the middle one is
+ * "not in the queue". The last is unknown, and unknown is never shown as
+ * absent: a queue refused with `engine_busy` says nothing about whether the
+ * plan is in it, and a screen that said "no longer in the queue" beside that
+ * refusal was asserting what it could not know (#1815).
+ */
+export type QueueLookup =
+  | { kind: "unknown"; queue: Resource<ReviewQueueOutput> }
+  | { kind: "absent" }
+  | { kind: "present"; entry: ReviewQueueEntry };
+
+export function lookupQueueEntry(
+  queue: Resource<ReviewQueueOutput>,
+  planId: string,
+): QueueLookup {
+  if (queue.kind !== "ready") return { kind: "unknown", queue };
+  const entry = queue.value.pending.find((row) => row.plan_id === planId);
+  return entry === undefined ? { kind: "absent" } : { kind: "present", entry };
 }
 
 /** One breaking finding as a sentence, from the tagged union the engine emits. */
@@ -142,7 +159,11 @@ function SpecDrift({
       <StatusCard
         label="the spec it was planned against"
         value="unchanged"
-        sub={`Still ${shortId(planned)}.`}
+        sub={
+          <>
+            Still <Clip value={planned} />.
+          </>
+        }
       />
     );
   }
@@ -151,37 +172,32 @@ function SpecDrift({
       label="the spec it was planned against"
       value="the spec moved"
       tone="risk"
-      sub={`Planned against ${shortId(planned)}; the product is now ${shortId(
-        current,
-      )}. Applying this plan would be refused, because apply checks the digest.`}
+      sub={
+        <>
+          Planned against <Clip value={planned} />; the product is now <Clip value={current} />.
+          Applying this plan would be refused, because apply checks the digest.
+        </>
+      }
     />
   );
 }
 
-function Escalation({
-  entry,
-  queue,
-  planId,
-}: {
-  entry: ReviewQueueEntry | null;
-  queue: Resource<ReviewQueueOutput>;
-  planId: string;
-}) {
+function Escalation({ lookup, planId }: { lookup: QueueLookup; planId: string }) {
   // "The queue does not name this plan" and "the queue could not be read" are
   // different facts, and only the first is safe to state. Collapsing them told
   // a reader that an escalation had been resolved when the server had in fact
   // refused the request.
-  if (queue.kind !== "ready") {
+  if (lookup.kind === "unknown") {
     return (
       <section aria-label="Why it needs a human" className="space-y-2">
         <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
           Why it needs a human
         </h3>
-        <ResourceState resource={queue} loadingLine="reading the review queue…" />
+        <ResourceState resource={lookup.queue} loadingLine="reading the review queue…" />
       </section>
     );
   }
-  if (entry === null) {
+  if (lookup.kind === "absent") {
     return (
       <StatusCard
         label="why it needs a human"
@@ -190,6 +206,7 @@ function Escalation({
       />
     );
   }
+  const { entry } = lookup;
   return (
     <section aria-label="Why it needs a human" className="space-y-2">
       <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
@@ -249,6 +266,67 @@ function HowToApprove({ status, entry }: { status: ReviewStatusOutput; entry: Re
 }
 
 /**
+ * Why there is no sample panel, said only as far as the payloads support.
+ *
+ * Absent is not empty. A missing panel reads as "this plan touches no data";
+ * this says instead which fact is missing, and it is a different fact each
+ * time: the queue named several models, or none; the product could not be
+ * read; the queue could not be read. Only when the queue was READ and does
+ * not name the plan, and no product names a model, does the screen say the
+ * plan has left the queue — that is the one case it knows (#1815).
+ */
+function SampleFallback({
+  lookup,
+  productId,
+  product,
+}: {
+  lookup: QueueLookup;
+  productId: string | null;
+  product: Resource<ProductStatusOutput>;
+}) {
+  const pending = (resource: Resource<unknown>, loadingLine: string) => (
+    <section aria-label="Sample rows" className="space-y-2">
+      <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Sample rows</h3>
+      <p className="text-xs text-zinc-600 dark:text-zinc-300">
+        Which model to sample is not known yet.
+      </p>
+      <ResourceState resource={resource} loadingLine={loadingLine} />
+    </section>
+  );
+  if (lookup.kind === "unknown") {
+    return pending(lookup.queue, "reading the review queue…");
+  }
+  if (productId !== null && product.kind !== "ready") {
+    return pending(product, "reading the product…");
+  }
+  if (lookup.kind === "present") {
+    const { entry } = lookup;
+    return (
+      <StatusCard
+        label="sample rows"
+        value="no single model to sample"
+        sub={
+          entry.models.length === 0
+            ? `The queue recorded no model set for this ${entry.capability} plan ("${entry.model}"): it was escalated before the engine kept one. Sample the models it touches from the estate screen instead.`
+            : `This ${entry.capability} plan touches ${entry.models.length} models: ${entry.models.join(", ")}. Sample each from the estate screen instead.`
+        }
+      />
+    );
+  }
+  return (
+    <StatusCard
+      label="sample rows"
+      value="no single model to sample"
+      sub={
+        productId !== null
+          ? "The plan is no longer in the review queue and its product names no output model, so there is nothing to read rows from."
+          : "Neither the review queue nor a product names a model for this plan, so there is nothing to read rows from. A plan that is not product-bound and no longer in the queue has no model on this screen."
+      }
+    />
+  );
+}
+
+/**
  * One plan, read-only: what it is, what it would break, why policy stopped it,
  * whether the spec moved under it, a sample of the data, and the command that
  * would approve it.
@@ -284,43 +362,37 @@ export function PlanDetail({
     return (
       <section aria-label="The plan" className="space-y-3">
         <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-          Plan <span title={planId}>{shortId(planId)}</span>
+          Plan <Clip value={planId} />
         </h2>
         <ResourceState resource={status} loadingLine="reading the plan…" />
       </section>
     );
   }
 
-  const entry =
-    queue.kind === "ready"
-      ? (queue.value.pending.find((row) => row.plan_id === planId) ?? null)
-      : null;
-  // Which model to sample. The queue entry names it, but the queue is not a
-  // durable source: an approval marker resolves the escalation, so the entry
-  // disappears the moment the plan is signed off — and that is exactly when
-  // the table it built starts existing. Reading the queue alone meant the
-  // panel could never show real rows for a product's first plan: before the
-  // approval there is no table, and after it there is no entry.
+  const lookup = lookupQueueEntry(queue, planId);
+  const entry = lookup.kind === "present" ? lookup.entry : null;
+  // Which model to sample. The queue entry's `models` is the set the engine
+  // recorded for the escalation — the real names, kept apart from `model`,
+  // which is display text ("backfill: 3 model(s)") and is never parsed here.
+  // A regex on it once decided a label was a name, and `backfill_3_models`
+  // would have sampled a real model of that name (#1815). The panel takes the
+  // set only when it names exactly one model.
   //
-  // The product's own status carries `output_model`, and this screen already
+  // The queue is not a durable source: an approval marker resolves the
+  // escalation, so the entry disappears the moment the plan is signed off —
+  // and that is exactly when the table it built starts existing. The
+  // product's own status carries `output_model`, and this screen already
   // reads it for the spec-drift card, so the fallback costs no request.
-  //
-  // The queue entry's `model` is not always a model name. A backfill escalation
-  // puts a display sentence there — "backfill: 3 model(s)" — and feeding that to
-  // the samples route earns a 400 `invalid_model_name` on every click. So take
-  // the field only when it could be a name. The server stays the authority
-  // (`rocky_sql::validation::validate_identifier`, `^[a-zA-Z0-9_]+$`); this only
-  // withholds an offer the server would refuse, so a drift here declines to ask
-  // rather than asking wrongly.
-  const named = entry?.model !== undefined && MODEL_NAME.test(entry.model) ? entry.model : null;
-  const model =
-    named ?? (product.kind === "ready" ? (product.value.output_model ?? null) : null);
+  const fromQueue = entry !== null && entry.models.length === 1 ? entry.models[0] : null;
+  const fromProduct =
+    product.kind === "ready" ? (product.value.output_model ?? null) : null;
+  const model = fromQueue ?? fromProduct;
 
   return (
     <div className="space-y-4">
       <section aria-label="The plan" className="space-y-2">
         <h2 className="font-mono text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-          <span title={planId}>{shortId(planId)}</span>
+          <Clip value={planId} />
         </h2>
         <div className="grid gap-2 sm:grid-cols-3">
           <StatusCard label="kind" value={status.value.kind} />
@@ -347,7 +419,7 @@ export function PlanDetail({
         </section>
       )}
 
-      <Escalation entry={entry} queue={queue} planId={planId} />
+      <Escalation lookup={lookup} planId={planId} />
 
       {productId !== null &&
         (product.kind === "ready" ? (
@@ -364,23 +436,7 @@ export function PlanDetail({
       {model !== null ? (
         <SamplePanel model={model} />
       ) : (
-        // Absent is not empty. A missing panel reads as "this plan touches no
-        // data"; say instead that the screen could not work out which model to
-        // sample, which is a different thing and has a different fix.
-        //
-        // Say only what the payload supports. Backfill is not the only
-        // capability whose `model` field holds a sentence — gc and restore
-        // write one too — so quote the sentence and name the capability the
-        // engine gave, rather than describing a backfill the plan may not be.
-        <StatusCard
-          label="sample rows"
-          value="no single model to sample"
-          sub={
-            entry !== null
-              ? `The queue describes this ${entry.capability} plan as "${entry.model}", which is not a model name this panel can read rows from. Sample the models it touches from the estate screen instead.`
-              : "Neither the review queue nor the product names a model for this plan, so there is nothing to read rows from. A plan that is not product-bound and no longer in the queue has no model on this screen."
-          }
-        />
+        <SampleFallback lookup={lookup} productId={productId} product={product} />
       )}
 
       <HowToApprove status={status.value} entry={entry} />

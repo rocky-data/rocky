@@ -855,24 +855,18 @@ fn build_queue(
     let mut entries: Vec<ReviewQueueEntry> = outstanding
         .into_iter()
         .map(|d| {
-            // The keys that must RESOLVE are the recorded model set — or, on
-            // an ordinary row that has none, the single `model`, which is the
-            // graph key there. `graph_keys` is deliberately not used for this:
-            // it also yields the human label so `audit --for` can match it, and
-            // a label resolves in no graph, so requiring it to resolve would
-            // make every plan-level row unknown forever.
-            let radius_keys: Vec<&str> = if d.models.is_empty() {
-                vec![d.model.as_str()]
-            } else {
-                d.models.iter().map(String::as_str).collect()
-            };
+            // One derivation serves both the ranking and the entry's `models`,
+            // so what a consumer is told the row stands for is exactly what
+            // the blast radius was computed over.
+            let models = queue_graph_keys(d);
             // Deduplicated union, all-or-nothing: an absent member makes the
             // whole answer unknown rather than a partial count dressed as a
-            // measurement. See `blast_radius_union` for why union and not
-            // `max`, and why the plan's own models stay in.
+            // measurement, and no members at all is unknown too. See
+            // `blast_radius_union` for why union and not `max`, and why the
+            // plan's own models stay in.
             let blast_radius = compiled
                 .as_ref()
-                .and_then(|r| blast_radius_union(r, radius_keys.iter().copied()))
+                .and_then(|r| blast_radius_union(r, models.iter().map(String::as_str)))
                 .map(|reached| reached.len() as u64);
             let classification_weight = classification_weight(d.capability);
             let staleness_seconds = (now - d.timestamp).num_seconds().max(0);
@@ -884,6 +878,7 @@ fn build_queue(
                 principal: d.principal,
                 capability: d.capability,
                 model: d.model.clone(),
+                models,
                 rule_id: d.rule_id,
                 reason: d.reason.clone(),
                 blast_radius,
@@ -959,6 +954,35 @@ pub(crate) fn select_outstanding<'a>(
         })
         .collect();
     (outstanding, excluded_non_plan)
+}
+
+/// The graph keys a queue row stands for — what the ranking resolves and what
+/// the entry reports as `models`, from one derivation so the two cannot drift.
+///
+/// The recorded set when there is one. Otherwise `model`, when it could be a
+/// graph key at all: a model name is admitted by
+/// `rocky_sql::validation::validate_identifier`, and a value that rule
+/// refuses can be in no graph. That is the case of a plan-level row written
+/// before the engine kept its set (pre-v28): its `model` is a label —
+/// `"backfill: 3 model(s)"` — and handing a label over as if it were a name
+/// is how the UI came to parse it (#1815). So the answer there is *no keys* —
+/// unknown — not the label dressed as a key.
+///
+/// The capability is NOT the discriminator, and was tried: the apply-time
+/// gate records one ordinary row per touched model with the plan's own
+/// capability (`gc` over `orders`), and those rows carry a real name in
+/// `model` and no set. Only the name's shape tells the two apart, and every
+/// label the engine has ever written (`backfill: …`, `gc: …`, `restore: …`)
+/// fails it. `graph_keys` is deliberately not used here: it also yields the
+/// label, on purpose, so `audit --for` can match it.
+fn queue_graph_keys(d: &PolicyDecisionRecord) -> Vec<String> {
+    if !d.models.is_empty() {
+        d.models.clone()
+    } else if rocky_sql::validation::validate_identifier(&d.model).is_ok() {
+        vec![d.model.clone()]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Record the "this plan awaits review" escalation for an unconditionally
@@ -1081,6 +1105,16 @@ fn render_queue_text(out: &ReviewQueueOutput) {
             e.score,
         );
         println!("     {}", e.reason);
+        // The label above is display text; on a plan-level row the names are
+        // in `models`, and the JSON carries them, so the text does too.
+        if e.models.as_slice() != std::slice::from_ref(&e.model) {
+            let listed = if e.models.is_empty() {
+                "unknown (the row was recorded before the engine kept the set)".to_string()
+            } else {
+                e.models.join(", ")
+            };
+            println!("     models: {listed}");
+        }
         println!("     approve: {}", e.approve_command);
     }
 }
@@ -2210,6 +2244,141 @@ mod tests {
                 e.plan_id
             );
         }
+        // And the entry says which it is. The pre-v28 row's `model` is a label
+        // that resolves nowhere, and the entry does not hand it over as if it
+        // were a name: `models` is empty, which is the documented "unknown".
+        let by_plan = |plan: &str| {
+            out.pending
+                .iter()
+                .find(|e| e.plan_id == plan)
+                .unwrap_or_else(|| panic!("{plan} must be listed"))
+        };
+        assert!(
+            by_plan("p_empty").models.is_empty(),
+            "a pre-v28 plan-level row reports no keys, never its label as one"
+        );
+        assert_eq!(by_plan("p_empty").model, "backfill: 2 model(s)");
+        assert_eq!(by_plan("p_gone").models, vec!["deleted_since".to_string()]);
+    }
+
+    /// The entry's `models` is the set the ranking resolved, from the same
+    /// derivation, so a consumer that wants a model NAME reads it from there
+    /// and never parses the label. Three shapes, one rule each:
+    ///
+    /// - an ordinary evaluation row: `models` is the one graph key, which is
+    ///   `model` itself;
+    /// - a plan-level row with its set: `models` is that set, and `model`
+    ///   stays the label;
+    /// - a plan-level row without one (covered above): `models` is empty.
+    ///
+    /// The UI used a `^[a-zA-Z0-9_]+$` regex on `model` to decide whether it
+    /// could sample it, which accepted `"backfill_3_models"` as a name and
+    /// would have sampled a real model of that name (#1815). Restoring the
+    /// label as the ordinary row's key, dropping the set from a plan-level
+    /// row, or deciding by capability instead of by the name's shape, makes
+    /// this fail.
+    #[test]
+    fn the_entry_reports_the_graph_keys_the_ranking_resolved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let models_dir = root.join("models");
+        write_blast_graph(&models_dir);
+        let state_path = root.join("state.redb");
+
+        // An ordinary evaluation row: `model` is the graph key, the set empty.
+        touch_plan_file(root, "ordinary");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .record_policy_decision(&qd(
+                    1,
+                    "ordinary",
+                    "a",
+                    PolicyEffect::RequireReview,
+                    PolicyCapability::SchemaChangeBreaking,
+                ))
+                .unwrap();
+        }
+        // The apply-time gate's row for a gc plan: the plan's capability, a
+        // real model name, no set. A capability-based rule called this
+        // plan-level and threw the name away; the name is the key.
+        touch_plan_file(root, "gc_applied");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .record_policy_decision(&qd(
+                    2,
+                    "gc_applied",
+                    "b",
+                    PolicyEffect::RequireReview,
+                    PolicyCapability::Gc,
+                ))
+                .unwrap();
+        }
+        // A plan-level row with its set; its `model` is a label that would
+        // pass the identifier regex the UI used to trust.
+        touch_plan_file(root, "bf");
+        record_plan_review_escalation(
+            &state_path,
+            "bf",
+            PolicyPrincipal::Agent,
+            PolicyCapability::Backfill,
+            "backfill_2_models",
+            vec!["b".to_string(), "d".to_string()],
+            "backfill plan awaits review",
+        );
+
+        let out = compute_review_queue(root, &root.join("rocky.toml"), &state_path, &models_dir)
+            .expect("the queue must rank");
+        let by_plan = |plan: &str| {
+            out.pending
+                .iter()
+                .find(|e| e.plan_id == plan)
+                .unwrap_or_else(|| panic!("{plan} must be listed"))
+        };
+        let ordinary = by_plan("ordinary");
+        assert_eq!(ordinary.model, "a");
+        assert_eq!(ordinary.models, vec!["a".to_string()]);
+        assert_eq!(ordinary.blast_radius, Some(3), "ranked on `a`, the one key");
+
+        let gc_applied = by_plan("gc_applied");
+        assert_eq!(gc_applied.models, vec!["b".to_string()]);
+        assert_eq!(
+            gc_applied.blast_radius,
+            Some(1),
+            "a gc row over a real name ranks on it"
+        );
+
+        let bf = by_plan("bf");
+        assert_eq!(bf.model, "backfill_2_models", "the label is untouched");
+        assert_eq!(bf.models, vec!["b".to_string(), "d".to_string()]);
+        // `b` reaches `c`; `d` is a leaf. Ranked on the label it would be
+        // unknown (`None`), since no graph has a model called that.
+        assert_eq!(
+            bf.blast_radius,
+            Some(1),
+            "ranked on the set, not on the label"
+        );
+    }
+
+    /// `blast_radius_union` over no names is `None`, not `Some(∅)`: an empty
+    /// union would report as a measured zero for a row that named nothing.
+    /// The queue reaches this through a pre-v28 plan-level row, and the test
+    /// above pins the queue's answer; this one pins the function's, so the
+    /// guard cannot quietly move to one caller.
+    #[test]
+    fn a_union_over_no_subjects_is_unknown_not_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models_dir = tmp.path().join("models");
+        write_blast_graph(&models_dir);
+        let compiled = compile_project_with_schemas(Default::default(), &models_dir)
+            .expect("the blast graph compiles");
+        assert_eq!(blast_radius_union(&compiled, std::iter::empty()), None);
+        assert_eq!(
+            blast_radius_union(&compiled, ["c"]).map(|s| s.len()),
+            Some(0),
+            "a live leaf alone really is a measured zero — the discriminator"
+        );
     }
 
     /// A present-but-unloadable `rocky.toml` refuses the queue, and the error
