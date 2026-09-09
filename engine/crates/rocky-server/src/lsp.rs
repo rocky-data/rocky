@@ -4461,6 +4461,91 @@ pub async fn run_lsp() {
 
 #[cfg(test)]
 mod tests {
+    /// #1817 / #1822 round four: a startup compile that fails must reach the
+    /// EDITOR, not only the server log. Driven at the protocol level — a real
+    /// `LspService`, a real `initialize` + `initialized` exchange — because
+    /// tower-lsp drops every client notification sent before the service is
+    /// initialized, so calling `recompile` on a bare struct would observe
+    /// nothing whether or not the message is sent. The fixture is the dangling
+    /// `models` link the rest of the branch closes; before this change the
+    /// editor received no notification at all for it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_startup_compile_reaches_the_editor_as_an_error_message() {
+        use futures::StreamExt as _;
+        use tower::Service as _;
+        use tower::ServiceExt as _;
+        use tower_lsp::jsonrpc::Request;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("gone"), root.join("models")).unwrap();
+
+        let (mut service, mut socket) = LspService::new(|client| RockyLsp {
+            client,
+            compile_result: Arc::new(RwLock::new(None)),
+            models_dir: Arc::new(RwLock::new(None)),
+            documents: Arc::new(RwLock::new(HashMap::new())),
+            recompile_pending: Arc::new(AtomicBool::new(false)),
+            init_done: Arc::new(AtomicBool::new(false)),
+            init_notify: Arc::new(Notify::new()),
+            semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
+            schema_cache_throttle: SchemaCacheThrottle::new(),
+            salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
+            salsa_sources: Arc::new(RwLock::new(HashMap::new())),
+        });
+
+        let root_uri = Url::from_directory_path(&root).unwrap();
+        let initialize = Request::build("initialize")
+            .id(1)
+            .params(serde_json::json!({ "capabilities": {}, "rootUri": root_uri }))
+            .finish();
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(initialize)
+            .await
+            .expect("initialize answers");
+        // `initialized` awaits the startup compile, so by the time it returns
+        // whatever the failure arm sent is already queued on the socket.
+        let initialized = Request::build("initialized")
+            .params(serde_json::json!({}))
+            .finish();
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(initialized)
+            .await
+            .expect("initialized is a notification");
+
+        let shown = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while let Some(outgoing) = socket.next().await {
+                if outgoing.method() == "window/showMessage" {
+                    return Some(outgoing);
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
+        .expect("the editor must be told the startup compile failed; it was told nothing");
+        let params = shown.params().cloned().expect("showMessage carries params");
+        assert_eq!(
+            params["type"],
+            serde_json::json!(1),
+            "MessageType::ERROR, not a log-level info: {params}"
+        );
+        let message = params["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("compiling the project's models failed"),
+            "the message says what failed: {message}"
+        );
+    }
+
     use super::*;
     use indexmap::IndexMap;
     use rocky_compiler::semantic::{

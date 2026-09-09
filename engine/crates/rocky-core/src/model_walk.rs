@@ -65,6 +65,19 @@ pub enum ModelWalkError {
 /// The root is always yielded first, even when absent — per-directory loaders
 /// treat an absent directory as empty, and several callers rely on that
 /// (`rocky docs` on a project with no models, for one).
+/// Would an entry with this name have been a directory this walk enters?
+///
+/// Only consulted for an entry whose type cannot be read — a dangling link.
+/// A model file, a contract, a `README.md` all carry an extension; a models
+/// subdirectory (`staging`, `marts`, `.hidden`) does not. The convention is
+/// the tree's own, and it is what keeps a dangling non-model file from
+/// failing a compile it never took part in.
+fn looks_like_a_directory_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| !name.trim_start_matches('.').contains('.'))
+}
+
 pub fn walk_model_dirs(root: &Path) -> (Vec<PathBuf>, Vec<ModelWalkError>) {
     let mut dirs = Vec::new();
     let mut errors = Vec::new();
@@ -125,7 +138,18 @@ pub fn walk_model_dirs(root: &Path) -> (Vec<PathBuf>, Vec<ModelWalkError>) {
                 Ok(entry) => match std::fs::metadata(entry.path()) {
                     Ok(metadata) if metadata.is_dir() => subdirs.push(entry.path()),
                     Ok(_) => {}
-                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    // A dangling link's target type is unknowable, so the
+                    // question is what it WOULD have been. `staging -> gone`
+                    // is a directory this walk would have entered — report
+                    // it. `README.md -> gone` is an unrelated file: the
+                    // loaders promise that a non-matching file cannot fail a
+                    // compile, and a dangling one is no exception. Model
+                    // files that dangle (`x.sql`, `x.toml`, a contract) are
+                    // caught by the loaders' own presence probes, not here.
+                    Err(source)
+                        if source.kind() == std::io::ErrorKind::NotFound
+                            && looks_like_a_directory_name(&entry.path()) =>
+                    {
                         match crate::path_presence::classify_not_found(&entry.path()) {
                             crate::path_presence::PathPresence::Absent => {}
                             crate::path_presence::PathPresence::Present { detail } => {
@@ -139,6 +163,7 @@ pub fn walk_model_dirs(root: &Path) -> (Vec<PathBuf>, Vec<ModelWalkError>) {
                             }
                         }
                     }
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
                     Err(source) => errors.push(ModelWalkError::ReadDir {
                         dir: entry.path(),
                         source,
@@ -277,6 +302,25 @@ mod tests {
         assert!(
             text.contains("staging") && text.contains("cannot be resolved"),
             "the error names the broken child: {text}"
+        );
+    }
+
+    /// The other side of the rule above (#1822, round four): a dangling link
+    /// with a file's name is an unrelated file, and an unrelated file cannot
+    /// fail a compile. `README.md -> gone` beside a healthy tree is not an
+    /// error; `staging -> gone` still is.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_non_model_file_does_not_fail_the_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("models");
+        mk(&root, "a");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), root.join("README.md")).unwrap();
+        let (dirs, errors) = walk_model_dirs(&root);
+        assert_eq!(dirs, vec![root.clone(), root.join("a")]);
+        assert!(
+            errors.is_empty(),
+            "a dangling README is nobody's business: {errors:?}"
         );
     }
 

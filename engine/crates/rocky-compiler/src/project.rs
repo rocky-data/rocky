@@ -157,6 +157,16 @@ pub enum ProjectError {
     RockyLower { path: String, reason: String },
 }
 
+/// The directory a walk error is about, whichever variant it is.
+fn walk_error_dir(e: &rocky_core::model_walk::ModelWalkError) -> &Path {
+    use rocky_core::model_walk::ModelWalkError;
+    match e {
+        ModelWalkError::ReadDir { dir, .. }
+        | ModelWalkError::DirEntry { dir, .. }
+        | ModelWalkError::DepthCeiling { dir, .. } => dir,
+    }
+}
+
 impl Project {
     /// Load a project from a models directory.
     ///
@@ -253,8 +263,19 @@ impl Project {
         // strict consumer: the first walk error fails the load, because an
         // unreadable subtree silently missing from a compile is the
         // silent-drop family this closes.
-        let (dirs, walk_errors) = rocky_core::model_walk::walk_model_dirs(models_dir);
-        if let Some(walk_error) = walk_errors.into_iter().next() {
+        let (dirs, mut walk_errors) = rocky_core::model_walk::walk_model_dirs(models_dir);
+        // The ROOT's walk error outranks everything: with `models` itself a
+        // dangling link there is nothing to load and the root is the right
+        // thing to name. A DEEPER walk error is reported only after the
+        // models that did load were parsed — a parse error in a root model
+        // is the one the operator can act on, and it must not be hidden
+        // behind a subdirectory that could not be entered (#1822). Same
+        // precedence as the CLI loader's `load_project_models_partial_with`.
+        let root_error = walk_errors
+            .iter()
+            .position(|e| walk_error_dir(e) == models_dir)
+            .map(|i| walk_errors.remove(i));
+        if let Some(walk_error) = root_error {
             return Err(models::ModelError::from(std::io::Error::other(walk_error)).into());
         }
 
@@ -289,6 +310,11 @@ impl Project {
             });
         }
 
+        // Deeper walk errors, now that every model that could load has
+        // been parsed and any parse error has had its turn.
+        if let Some(walk_error) = walk_errors.into_iter().next() {
+            return Err(models::ModelError::from(std::io::Error::other(walk_error)).into());
+        }
         Ok(models)
     }
 
@@ -1215,6 +1241,75 @@ mod recursive_load_tests {
                 "name = \"{name}\"\n[target]\ncatalog = \"w\"\nschema = \"s\"\ntable = \"{name}\"\n"
             ),
         );
+    }
+
+    /// #1822, round four: the COMPILER's loader returned on the first walk
+    /// error before parsing a single model, so a dangling subdirectory
+    /// outranked a parse error in the root — and the LSP, which compiles
+    /// through this path, showed the wrong problem. Same precedence as the
+    /// CLI loader now: the root's walk error first, then the models, then
+    /// deeper walk errors.
+    #[cfg(unix)]
+    #[test]
+    fn compile_path_reports_a_root_parse_error_before_a_deeper_walk_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        write(
+            &models.join("broken.sql"),
+            "---toml\nname = \n---\nSELECT 1 AS id\n",
+        );
+        std::os::unix::fs::symlink(tmp.path().join("gone"), models.join("staging")).unwrap();
+
+        let err = Project::load_models(&models, None).expect_err("a broken model is an error");
+        let text = format!("{err}");
+        assert!(
+            text.contains("broken.sql") || text.contains("frontmatter"),
+            "the actionable root error is the one reported: {text}"
+        );
+        assert!(
+            !text.contains("staging"),
+            "the deeper walk error must not hide the parse error: {text}"
+        );
+
+        // With the root model fixed, the dangling subdirectory is what is
+        // left, and it is still reported — deferred, not dropped.
+        write(&models.join("broken.sql"), "SELECT 1 AS id\n");
+        write(
+            &models.join("broken.toml"),
+            "name = \"broken\"\n[target]\ncatalog = \"w\"\nschema = \"s\"\ntable = \"broken\"\n",
+        );
+        let err = Project::load_models(&models, None).expect_err("the dangling subdir remains");
+        assert!(format!("{err}").contains("staging"), "{err}");
+    }
+
+    /// And the root's OWN walk error still comes first, ahead of anything a
+    /// per-directory load would say about a leaf under it.
+    #[cfg(unix)]
+    #[test]
+    fn compile_path_blames_a_dangling_root_before_anything_under_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &models).unwrap();
+        let err = Project::load_models(&models, None).expect_err("a dangling root is an error");
+        let text = format!("{err}");
+        assert!(
+            text.contains("cannot be resolved") && !text.contains("_defaults.toml"),
+            "{text}"
+        );
+    }
+
+    /// A dangling link with a FILE's name is an unrelated file and cannot
+    /// fail a compile it took no part in (#1822, round four).
+    #[cfg(unix)]
+    #[test]
+    fn compile_path_ignores_a_dangling_non_model_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        write_model(&models, "top");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), models.join("README.md")).unwrap();
+        let loaded =
+            Project::load_models(&models, None).expect("a dangling README is nobody's business");
+        assert_eq!(loaded.len(), 1);
     }
 
     /// The compile path sees the same tree every other scanner sees (#1262):

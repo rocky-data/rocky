@@ -328,10 +328,13 @@ mod classify_tests {
             let home = std::env::current_dir().unwrap();
             std::env::set_current_dir(dir.path()).unwrap();
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
-            // Looking up `.` INSIDE the working directory needs search
-            // permission on it, so this stat failing IS the condition; under
-            // root it succeeds and the child reports a skip.
-            let reproduced = std::fs::symlink_metadata(".").is_err();
+            // The gate is the PRODUCTION probe, not a look-alike: `stat(".")`
+            // needs no search permission on Linux (nothing leads to it), so
+            // gating on it skipped the whole test on the CI runner. `./.`
+            // puts the working directory in the path prefix, which is what
+            // `searchable_or_present` relies on; it fails without search
+            // permission on every Unix, and succeeds under root — a skip.
+            let reproduced = std::fs::symlink_metadata("./.").is_err();
             let verdict = super::classify_ancestors(std::path::Path::new("rocky.toml"));
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).ok();
             std::env::set_current_dir(home).ok();
