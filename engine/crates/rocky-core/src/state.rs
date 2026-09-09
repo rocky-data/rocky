@@ -12719,8 +12719,9 @@ mod tests {
     }
 
     /// The v28 upgrade claim, exercised rather than asserted in a comment:
-    /// a v27 store is stamped v28 **in place**, every policy-decision row is
-    /// KEPT, and each one reads back with `models` empty.
+    /// a v27 store is stamped forward **in place** (to v28 then, to the
+    /// current version now), every policy-decision row is KEPT, and each one
+    /// reads back with `models` empty.
     ///
     /// The generic `open_with_policy_recreate_upgrades_older_store_without_
     /// recreating` above stamps version 6 and checks a watermark. It proves
@@ -12895,6 +12896,10 @@ mod tests {
         // is deliberately unchanged below — so this stanza moves the version
         // only; guarded by
         // `test_v27_policy_decision_forward_deserializes_models_empty`.
+        // v29 adds `PolicyDecisionRecord::keys_recorded` (#1815), whether
+        // that set was the producer's word. Same serde-additive shape: NO
+        // table change, the version moves only; guarded by
+        // `test_v28_policy_decision_forward_deserializes_keys_recorded_false`.
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",
