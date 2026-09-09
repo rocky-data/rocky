@@ -116,7 +116,20 @@ jobs:
                       /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force || true
           sudo fallocate -l 4G /mnt/swapfile && sudo chmod 600 /mnt/swapfile && sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile || true
-      - run: sudo apt-get update && sudo apt-get install -y cmake
+      # `apt-get update` exits non-zero when ANY configured source serves a
+      # bad index, including the third-party ones the GitHub runner image
+      # ships (Google Chrome, Microsoft). On 2026-09-09 Chrome's repo served
+      # a stale `Packages.gz` and every engine job died here before
+      # compiling a line. Neither cmake nor the cross toolchain comes from
+      # those repos, so they are removed first — and cmake is usually
+      # preinstalled, so the whole block is skipped.
+      - name: Install cmake
+        run: |
+          command -v cmake >/dev/null 2>&1 && exit 0
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
+          sudo apt-get update
+          sudo apt-get install -y cmake
       - name: Install cargo-tarpaulin
         # Pinned + --locked for the same reason as cargo-audit above.
         run: cargo install cargo-tarpaulin --version 0.31.2 --locked
@@ -176,7 +189,20 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           sudo fallocate -l 4G /mnt/swapfile && sudo chmod 600 /mnt/swapfile && sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile || true
-      - run: sudo apt-get update && sudo apt-get install -y cmake
+      # `apt-get update` exits non-zero when ANY configured source serves a
+      # bad index, including the third-party ones the GitHub runner image
+      # ships (Google Chrome, Microsoft). On 2026-09-09 Chrome's repo served
+      # a stale `Packages.gz` and every engine job died here before
+      # compiling a line. Neither cmake nor the cross toolchain comes from
+      # those repos, so they are removed first — and cmake is usually
+      # preinstalled, so the whole block is skipped.
+      - name: Install cmake
+        run: |
+          command -v cmake >/dev/null 2>&1 && exit 0
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
+          sudo apt-get update
+          sudo apt-get install -y cmake
       - name: Build rocky binary
         working-directory: engine
         run: cargo build --release
