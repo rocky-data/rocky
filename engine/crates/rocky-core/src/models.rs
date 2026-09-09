@@ -641,15 +641,46 @@ pub struct DirDefaultsTarget {
 /// matching `rocky.toml` and per-model sidecar behavior. Lets directory-level
 /// defaults (e.g. `target.schema = "${ROCKY_SCHEMA:-public}"`) be set per
 /// orchestrator subprocess.
+/// Read a model-tree file, naming the file and — for a `NotFound` on an entry
+/// that IS there — saying what it really is.
+///
+/// Every reader in this module reaches a file through a presence probe that
+/// answers `true` for anything but a proven absence, so a `NotFound` at the
+/// read is never "the file is missing": it is a link to nowhere, and the OS
+/// error "No such file or directory" is exactly the sentence that made the
+/// old probes call it absent (#1738, #1817). The shared discriminator names
+/// the link and its target; the guidance says what to do about it. Every
+/// other read failure keeps the OS error, which already says which file.
+fn read_model_text(path: &Path) -> Result<String, ModelError> {
+    std::fs::read_to_string(path).map_err(|source| {
+        let source = if source.kind() == std::io::ErrorKind::NotFound {
+            match crate::path_presence::classify_not_found(path) {
+                crate::path_presence::PathPresence::Present { detail } => std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "{detail}. A models tree with a link to nowhere is refused whatever \
+                         the link is called, because its name cannot say what it pointed at; \
+                         repair or remove it"
+                    ),
+                ),
+                crate::path_presence::PathPresence::Absent => source,
+            }
+        } else {
+            source
+        };
+        ModelError::ReadPath {
+            path: path.display().to_string(),
+            source,
+        }
+    })
+}
+
 pub fn load_dir_defaults(path: &Path) -> Result<DirDefaults, ModelError> {
     // Named, like the sidecar read (#1738): the bare `ReadFile` carries only
     // the OS error, and on a dangling link that reads "No such file or
     // directory" with nothing saying WHICH file — the words that made the
     // caller call it absent in the first place.
-    let raw_content = std::fs::read_to_string(path).map_err(|source| ModelError::ReadPath {
-        path: path.display().to_string(),
-        source,
-    })?;
+    let raw_content = read_model_text(path)?;
     let content =
         substitute_env_vars(&raw_content).map_err(|source| ModelError::EnvSubstitution {
             path: path.display().to_string(),
@@ -1437,10 +1468,7 @@ pub fn load_model_pair_with_context(
     ctx: &ModelLoadContext,
 ) -> Result<Model, ModelError> {
     let sql = {
-        let s = std::fs::read_to_string(sql_path).map_err(|source| ModelError::ReadPath {
-            path: sql_path.display().to_string(),
-            source,
-        })?;
+        let s = read_model_text(sql_path)?;
         let trimmed = s.trim();
         if trimmed.len() == s.len() {
             s // no trimming needed, reuse allocation
@@ -1448,10 +1476,7 @@ pub fn load_model_pair_with_context(
             trimmed.to_string()
         }
     };
-    let raw_toml = std::fs::read_to_string(toml_path).map_err(|source| ModelError::ReadPath {
-        path: toml_path.display().to_string(),
-        source,
-    })?;
+    let raw_toml = read_model_text(toml_path)?;
     let declared = extract_declared_fields(&raw_toml);
     let toml_content =
         substitute_env_vars(&raw_toml).map_err(|source| ModelError::EnvSubstitution {
@@ -1624,7 +1649,7 @@ pub fn load_models_from_dir_filtered(
             if crate::path_presence::entry_is_present(&toml_path) {
                 load_model_pair_with_context(path, &toml_path, defaults.as_ref(), &ctx)
             } else {
-                let content = std::fs::read_to_string(path)?;
+                let content = read_model_text(path)?;
                 parse_model_inline_with_context(
                     &content,
                     &path.display().to_string(),

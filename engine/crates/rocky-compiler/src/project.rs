@@ -498,12 +498,27 @@ fn dir_has_matching_model_source(
     dir: &Path,
     pattern: &glob::Pattern,
 ) -> Result<bool, ProjectError> {
-    if !dir.exists() {
+    // A directory the walk yielded is there; a dangling one it yielded is
+    // reported by the walk itself. Only a proven absence is "nothing here".
+    if !rocky_core::path_presence::entry_is_present(dir) {
         return Ok(false);
     }
-    let entries = std::fs::read_dir(dir).map_err(models::ModelError::from)?;
+    // A directory this pre-check cannot LIST is a walk failure, and is typed
+    // as one — not as "failed to read model file", which is what the bare
+    // `ModelError::from` said about a directory (#1822, round seven).
+    let entries = std::fs::read_dir(dir).map_err(|source| {
+        ProjectError::ModelsTree(rocky_core::model_walk::ModelWalkError::ReadDir {
+            dir: dir.to_path_buf(),
+            source,
+        })
+    })?;
     for entry in entries {
-        let entry = entry.map_err(models::ModelError::from)?;
+        let entry = entry.map_err(|source| {
+            ProjectError::ModelsTree(rocky_core::model_walk::ModelWalkError::DirEntry {
+                dir: dir.to_path_buf(),
+                source,
+            })
+        })?;
         let path = entry.path();
         if matches!(
             path.extension().and_then(|extension| extension.to_str()),
@@ -639,6 +654,22 @@ fn load_single_rocky_model_with_db(
         .unwrap_or("unknown")
         .to_string();
 
+    // A `.rocky` entry that is there and cannot be resolved is a walk
+    // failure, not a parse failure: say so before the salsa read folds it
+    // into "failed to parse" with an OS error for a reason (#1822, round
+    // seven). One stat per `.rocky` file, only on the NotFound path.
+    if let Err(source) = std::fs::metadata(path)
+        && source.kind() == std::io::ErrorKind::NotFound
+        && let rocky_core::path_presence::PathPresence::Present { detail } =
+            rocky_core::path_presence::classify_not_found(path)
+    {
+        return Err(ProjectError::ModelsTree(
+            rocky_core::model_walk::ModelWalkError::UnresolvedEntry {
+                path: path.to_path_buf(),
+                detail,
+            },
+        ));
+    }
     // Tracked-query route: read_source loads the file via the salsa
     // dedup map; file_typecheck parses + lowers (or returns the cached
     // result if neither input nor AST has changed).
@@ -1402,6 +1433,89 @@ mod recursive_load_tests {
             "the walk error, never `NoModels`: {err}"
         );
         assert!(format!("{err}").contains("gold"), "{err}");
+    }
+
+    /// #1822, round seven: a dangling MODEL file — `orders.sql -> gone` —
+    /// reached the loader's read before the walk's stored error, and rendered
+    /// as "failed to read model file: No such file or directory". The read
+    /// now says what the entry is and what to do, whichever error variant
+    /// carries it.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_model_file_says_what_it_is_and_what_to_do() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("gone"), models.join("orders.sql")).unwrap();
+        write(
+            &models.join("orders.toml"),
+            "name = \"orders\"\n[target]\ncatalog = \"w\"\nschema = \"s\"\ntable = \"orders\"\n",
+        );
+
+        let mut db = crate::salsa_compile::RockyDatabase::default();
+        let glob = format!("{}/**", models.display());
+        let err = Project::load_models_matching_with_db(&models, &glob, &mut db, None)
+            .expect_err("a dangling model file refuses");
+        let text = format!("{err}");
+        assert!(
+            text.contains("orders.sql")
+                && text.contains("cannot be resolved")
+                && text.contains("repair or remove it"),
+            "the refusal names the link and says what to do, not 'No such file': {text}"
+        );
+        assert!(!text.contains("No such file"), "{text}");
+    }
+
+    /// The `.rocky` route: the salsa read folded a dangling entry into "failed
+    /// to parse … No such file". It is a walk failure and is typed as one.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_rocky_model_is_a_walk_failure_not_a_parse_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("gone"), models.join("orders.rocky")).unwrap();
+
+        let mut db = crate::salsa_compile::RockyDatabase::default();
+        let glob = format!("{}/**", models.display());
+        let err = Project::load_models_matching_with_db(&models, &glob, &mut db, None)
+            .expect_err("a dangling .rocky refuses");
+        assert!(matches!(err, ProjectError::ModelsTree(_)), "{err}");
+        assert!(format!("{err}").contains("repair or remove it"), "{err}");
+    }
+
+    /// An unreadable directory that sorts BEFORE a healthy match: the pre-check
+    /// listed it and its `?` returned "failed to read model file" about a
+    /// directory. It is a walk failure, typed and worded as one. Skips under
+    /// root, which can list a mode-000 directory.
+    #[cfg(unix)]
+    #[test]
+    fn an_unlistable_directory_before_a_healthy_match_is_a_walk_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        write_model(&models.join("z"), "orders");
+        let locked = models.join("a");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let reproduced = std::fs::read_dir(&locked).is_err();
+        let mut db = crate::salsa_compile::RockyDatabase::default();
+        let glob = format!("{}/**", models.display());
+        let result = Project::load_models_matching_with_db(&models, &glob, &mut db, None);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
+        if !reproduced {
+            eprintln!("skipping: this process can list a mode-000 directory");
+            return;
+        }
+        let err = result.expect_err("an unlistable directory refuses");
+        assert!(matches!(err, ProjectError::ModelsTree(_)), "{err}");
+        let text = format!("{err}");
+        assert!(
+            text.contains("models directory") && !text.contains("model file"),
+            "a directory is called a directory: {text}"
+        );
     }
 
     /// A project whose ONLY matching sources sit below the first level is not
