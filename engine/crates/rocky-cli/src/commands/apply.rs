@@ -3275,7 +3275,22 @@ pub(crate) fn resolve_touched_apply_targets(
             m.config.target.catalog, m.config.target.schema, m.config.target.table
         )
         .to_lowercase();
-        fqn_to_name.insert(fqn, m.config.name.clone());
+        // Two models declaring one physical table is the compiler's E036,
+        // which the maintenance loader (partial, not the compiler) never
+        // sees. Keeping one owner silently let the policy plane evaluate
+        // whichever name sorted last and the ledger record only that one —
+        // a denied co-owner vanished (#1815, review round six). A destructive
+        // apply against a table with two owners refuses.
+        if let Some(other) = fqn_to_name.insert(fqn.clone(), m.config.name.clone())
+            && other != m.config.name
+        {
+            return Err(anyhow::anyhow!(
+                "refusing to gate this apply: models '{other}' and '{}' both declare the target \
+                 table '{fqn}' (compiler E036). A maintenance apply against a table with two \
+                 owners cannot say whose policy governs it; fix the duplicate target first",
+                m.config.name
+            ));
+        }
     }
 
     let mut touched = BTreeMap::new();
@@ -5259,6 +5274,108 @@ mod tests {
                 && msg.contains("name of model 'corp.prod.orders'"),
             "the refusal names both readings: {msg}"
         );
+    }
+
+    /// Two models declaring the same physical table (the compiler's E036,
+    /// invisible to the maintenance loader) used to collapse to whichever
+    /// name sorted last: the policy plane evaluated that one, the ledger
+    /// recorded that one, and a co-owner a rule denied simply vanished
+    /// (#1815, review round six). A destructive apply refuses instead.
+    #[test]
+    fn a_table_with_two_owners_refuses_the_maintenance_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let config_path = root.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"p.duckdb\"\n\n\
+             [pipeline.silver]\ntype = \"transformation\"\n\n\
+             [pipeline.silver.target]\nadapter = \"default\"\n",
+        )
+        .unwrap();
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        for name in ["pii_orders", "zzz_public"] {
+            std::fs::write(models.join(format!("{name}.sql")), "SELECT 1 AS id\n").unwrap();
+            std::fs::write(
+                models.join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\n[target]\ncatalog = \"corp\"\nschema = \"prod\"\ntable = \"orders\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+        let err =
+            resolve_touched_apply_targets(&cfg, &config_path, ["corp.prod.orders".to_string()])
+                .expect_err("two owners of one table must refuse, not pick one");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("'pii_orders'") && msg.contains("'zzz_public'") && msg.contains("E036"),
+            "the refusal names both owners: {msg}"
+        );
+    }
+
+    /// The PRODUCTION maintenance gate, end to end: a table its model targets
+    /// records that model's key; a table no model targets is gated under its
+    /// own string and records none. This reaches `gate_maintenance_apply`
+    /// itself — the sibling test below hands `Resolved` to the evaluator by
+    /// hand and so could not tell whether production does (#1815, review
+    /// round six). Passing `CompiledModels` in `gate_maintenance_apply`
+    /// makes the last assertion fail.
+    #[tokio::test]
+    async fn the_maintenance_gate_records_a_key_for_a_model_and_none_for_a_stranger()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config_path = write_config(dir.path(), "")?;
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models)?;
+        std::fs::write(models.join("orders.sql"), "SELECT 1 AS id\n")?;
+        std::fs::write(
+            models.join("orders.toml"),
+            "name = \"orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"corp\"\nschema = \"prod\"\ntable = \"orders\"\n",
+        )?;
+        let cfg = rocky_core::config::load_rocky_config(&config_path)?;
+        let targets = resolve_touched_apply_targets(
+            &cfg,
+            &config_path,
+            ["corp.prod.orders".to_string(), "x.y.z".to_string()],
+        )?;
+        let plan = PersistedPlan {
+            plan_id: "plan_gate".to_string(),
+            kind: PlanKind::Compact,
+            created_at: chrono::Utc::now(),
+            format_version: 2,
+            principal: None,
+            payload: serde_json::json!({}),
+        };
+        let state = dir.path().join("state.redb");
+        // The default agent posture escalates; the verdict is not the point.
+        let _ = gate_maintenance_apply(
+            dir.path(),
+            &plan,
+            "plan_gate",
+            &cfg,
+            &config_path,
+            &state,
+            PolicyPrincipal::Agent,
+            &targets,
+        )
+        .await;
+
+        let rows = StateStore::open(&state)?.list_policy_decisions()?;
+        let row = |model: &str| {
+            rows.iter()
+                .find(|r| r.plan_id == "plan_gate" && r.model == model)
+                .unwrap_or_else(|| panic!("a row for {model}"))
+        };
+        assert_eq!(row("orders").models, vec!["orders".to_string()]);
+        assert!(
+            row("x.y.z").models.is_empty(),
+            "a stranger is no model's key"
+        );
+        Ok(())
     }
 
     /// Without the ambiguity, a table resolves to the model that targets it
