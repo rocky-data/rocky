@@ -451,8 +451,15 @@ export function PlanDetail({
   // reads it for the spec-drift card, so the fallback costs no request.
   const targets = previewTargetsOf(entries);
   const fromQueue = targets.length === 1 ? targets[0] : null;
+  // The product's output model stands in only once the plan has LEFT the
+  // queue (approved, its table now real). While the plan is in the queue the
+  // engine has already said which model, if any, the samples route would
+  // read, and a null there is an answer — a product fallback beside it
+  // offered a read the route refuses (#1815, review round three).
   const fromProduct =
-    product.kind === "ready" ? (product.value.output_model ?? null) : null;
+    lookup.kind === "absent" && product.kind === "ready"
+      ? (product.value.output_model ?? null)
+      : null;
   const model = fromQueue ?? fromProduct;
 
   return (

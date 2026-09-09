@@ -290,6 +290,40 @@ describe("PlanDetail", () => {
     ).toBeTruthy();
   });
 
+  /// A product-bound plan still in the queue whose row the engine marked
+  /// unreadable (`preview_model: null` — a time-interval model, say) must not
+  /// fall back to the product's output model: that offers the very read the
+  /// route refuses. The product stands in only once the plan has left the
+  /// queue (#1815, review round three).
+  it("does not fall back to the product's model while the queue says none is readable", async () => {
+    const unreadable: ReviewQueueOutput = {
+      ...QUEUE,
+      pending: [{ ...QUEUE.pending[0], models: ["revenue_daily"], preview_model: null }],
+    };
+
+    render(
+      <PlanDetail
+        planId={PLAN}
+        loaders={loaders({
+          status: vi.fn(async () => ({
+            ...STATUS,
+            product_id: "product:revenue_daily",
+            spec_digest: "sha256:1111",
+          })),
+          queue: vi.fn(async () => unreadable),
+        })}
+      />,
+    );
+
+    await screen.findByText("no single model to sample");
+    // The product read did happen (the spec-drift card needs it)…
+    await screen.findByText("unchanged");
+    // …and still no offer.
+    expect(screen.queryByRole("button", { name: /Show \d+ rows/ })).toBeNull();
+    expect(screen.getByText(/The samples route would read none of the models this plan names/))
+      .toBeTruthy();
+  });
+
   /// The apply-time gate records one decision per touched model, and the
   /// queue keeps one row per (plan, model): a plan over two models under two
   /// rules pends twice. Keeping only the first row showed one reason and one

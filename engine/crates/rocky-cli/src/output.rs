@@ -7668,13 +7668,20 @@ pub struct ReviewQueueEntry {
     /// rows — `preview_model` is.
     pub models: Vec<String>,
     /// The one model of this entry that `GET /api/v1/models/{name}/rows`
-    /// would read, decided by that route's own admission rules (a valid
-    /// name, in the compiled project, not time-interval, no compile errors,
-    /// a single SELECT), or `null`: the entry names no model or several, or
-    /// the route would refuse the one it names — a dotted name, a model a
-    /// restore plan recorded that is gone from the current project, a model
-    /// that no longer compiles. A consumer offers a sample from this and from
-    /// nothing else.
+    /// would admit, decided by that route's own rules — its front door (the
+    /// strict config, the adapter registry, one resolvable pipeline with no
+    /// name given) and its admission of the model (a valid name, in the
+    /// compiled project, not time-interval, no compile errors, a single
+    /// SELECT) — or `null`: the entry names no model or several, the route's
+    /// front door is shut for this project, or the route would refuse the
+    /// one model it names (a dotted name, a model a restore plan recorded
+    /// that is gone from the current project, a model that no longer
+    /// compiles). A consumer offers a sample from this and from nothing else.
+    ///
+    /// What this cannot promise is the request itself: the adapter's
+    /// reachability and credentials at query time, the masking of classified
+    /// columns, the route's concurrency and time limits. Those refusals
+    /// arrive as the route's own envelope and render as themselves.
     pub preview_model: Option<String>,
     /// Index of the winning `[[policy.rules]]` entry, or `null` when the
     /// escalation came from the default posture.

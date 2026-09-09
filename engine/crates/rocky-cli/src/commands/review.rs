@@ -852,6 +852,18 @@ fn build_queue(
     // unchanged. Only the config leg above refuses, and it already ran.
     let compiled = compile_project_with_schemas(source_schemas, models_dir).ok();
 
+    // Whether the samples route would get past its own front door for this
+    // project: the strict config loader, the adapter registry, and pipeline
+    // resolution with no `pipeline` parameter (the UI sends none). The queue
+    // itself tolerates an unset credential and an absent config on purpose;
+    // the route does not, and a queue that offered a read there would be
+    // advertising an answer the route cannot give (#1815, review round
+    // three). Decided once; it is the project's, not a row's.
+    let route_front_door_open = rocky_core::config::load_rocky_config(config_path)
+        .ok()
+        .filter(|cfg| crate::registry::AdapterRegistry::from_config(cfg).is_ok())
+        .is_some_and(|cfg| crate::registry::resolve_pipeline(&cfg, None).is_ok());
+
     let mut entries: Vec<ReviewQueueEntry> = outstanding
         .into_iter()
         .map(|d| {
@@ -864,7 +876,7 @@ fn build_queue(
             // any consumer's reading of a name. `models` ranks and audits;
             // only this licenses an offer to read (#1815).
             let preview_model = match (models.as_slice(), compiled.as_ref()) {
-                ([only], Some(result)) => {
+                ([only], Some(result)) if route_front_door_open => {
                     crate::commands::preview_rows::admit_model(result, models_dir, only)
                         .ok()
                         .map(|_| only.clone())
@@ -940,7 +952,18 @@ pub(crate) fn select_outstanding<'a>(
     plan_exists: impl Fn(&str) -> bool,
 ) -> (Vec<&'a PolicyDecisionRecord>, u64) {
     let mut latest: BTreeMap<(&str, &str), &PolicyDecisionRecord> = BTreeMap::new();
-    for d in decisions {
+    // A `deny` row is left out of the latest-row pick, so it neither queues
+    // nor supersedes. It cannot supersede: the fail-closed path records a
+    // `deny` when the ledger snapshot could not be read — an operational
+    // refusal, not a policy decision about the plan — and the row cannot say
+    // which kind it is. Letting it supersede hid an escalation the policy
+    // still required until someone retried the mutation (#1815, review round
+    // three). A superseded-by-deny escalation stays approvable, which is what
+    // it was before; approval then meets the deny at apply, loudly.
+    for d in decisions
+        .into_iter()
+        .filter(|d| d.effect != PolicyEffect::Deny)
+    {
         latest
             .entry((d.plan_id.as_str(), d.model.as_str()))
             .and_modify(|cur| {
@@ -953,12 +976,11 @@ pub(crate) fn select_outstanding<'a>(
     let mut excluded_non_plan: u64 = 0;
     let outstanding = latest
         .into_values()
-        // The LATEST decision per key decides, whatever its effect. A
-        // `require_review` that a later `allow` or `deny` for the same
-        // (plan, model) superseded is history: approving it is moot under
-        // the `allow` and cannot make apply succeed under the `deny`.
-        // Filtering to `require_review` BEFORE picking the latest kept such
-        // rows approvable (#1815, review round two).
+        // The LATEST of `require_review` and `allow` per key decides. A
+        // `require_review` that a later `allow` for the same (plan, model)
+        // superseded is history: policy loosened, the plan re-ran, approving
+        // it is moot. Filtering to `require_review` BEFORE picking the
+        // latest kept such rows approvable (#1815, review round two).
         .filter(|d| d.effect == PolicyEffect::RequireReview)
         .filter(|d| !is_reviewed(&d.plan_id))
         .filter(|d| {
@@ -1491,14 +1513,16 @@ mod tests {
         assert_eq!(d.capability, PolicyCapability::SchemaChangeBreaking);
     }
 
-    /// The latest decision per (plan, model) decides. A `require_review`
-    /// followed by an `allow` (policy loosened, plan re-run) is moot; one
-    /// followed by a `deny` cannot be made to succeed by approval. Both used
-    /// to stay in the queue, because the effect filter ran before the
-    /// latest-row pick. The reverse orders still queue: the newest row is the
-    /// escalation.
+    /// The latest of `require_review` and `allow` per (plan, model) decides.
+    /// A `require_review` followed by an `allow` (policy loosened, plan
+    /// re-run) is moot and used to stay in the queue, because the effect
+    /// filter ran before the latest-row pick. A later `deny` does NOT
+    /// supersede: a deny may be the fail-closed refusal of an unreadable
+    /// ledger, which says nothing about the plan, and the row cannot tell
+    /// the two apart — so the escalation stays, as it always did. The
+    /// reverse orders queue: the newest row is the escalation.
     #[test]
-    fn a_later_allow_or_deny_supersedes_an_older_require_review() {
+    fn a_later_allow_supersedes_an_older_require_review_but_a_deny_does_not() {
         let decisions = vec![
             qd(
                 1,
@@ -1551,8 +1575,8 @@ mod tests {
         plans.sort_unstable();
         assert_eq!(
             plans,
-            vec!["planC", "planD"],
-            "superseded escalations are history; new ones queue"
+            vec!["planB", "planC", "planD"],
+            "an allow supersedes; a deny does not; new escalations queue"
         );
     }
 
@@ -2372,6 +2396,7 @@ mod tests {
         let root = tmp.path();
         let models_dir = root.join("models");
         write_blast_graph(&models_dir);
+        let config_path = write_single_pipeline_config(root);
         let state_path = root.join("state.redb");
 
         // An ordinary evaluation row: `model` is the graph key, the set empty.
@@ -2457,7 +2482,7 @@ mod tests {
             "backfill plan awaits review",
         );
 
-        let out = compute_review_queue(root, &root.join("rocky.toml"), &state_path, &models_dir)
+        let out = compute_review_queue(root, &config_path, &state_path, &models_dir)
             .expect("the queue must rank");
         let by_plan = |plan: &str| {
             out.pending
@@ -2525,6 +2550,7 @@ mod tests {
         let root = tmp.path();
         let models_dir = root.join("models");
         write_blast_graph(&models_dir);
+        let config_path = write_single_pipeline_config(root);
         // A model whose SQL does not parse: in the project, with an error.
         std::fs::write(models_dir.join("shaky.sql"), "SELECT FROM WHERE").unwrap();
         std::fs::write(
@@ -2561,7 +2587,7 @@ mod tests {
                 .unwrap();
         }
 
-        let out = compute_review_queue(root, &root.join("rocky.toml"), &state_path, &models_dir)
+        let out = compute_review_queue(root, &config_path, &state_path, &models_dir)
             .expect("a model that fails to parse degrades the ranking, it does not refuse");
         let by_plan = |plan: &str| out.pending.iter().find(|e| e.plan_id == plan).unwrap();
         assert_eq!(by_plan("restore_gone").models, vec!["gone".to_string()]);
@@ -2575,6 +2601,88 @@ mod tests {
             None,
             "the route refuses compile errors"
         );
+    }
+
+    /// The samples route has a front door the queue must not promise past:
+    /// the strict config loader, the adapter registry, and pipeline
+    /// resolution with no name. With two pipelines the UI (which sends no
+    /// `pipeline`) would get `pipeline_error` on every click; with no config
+    /// at all, `config_error`. The queue still ranks — its own tolerance is
+    /// deliberate and pinned elsewhere — but offers no read. Dropping the
+    /// front-door check makes this fail.
+    #[test]
+    fn the_entry_offers_no_read_where_the_routes_front_door_is_shut() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let models_dir = root.join("models");
+        write_blast_graph(&models_dir);
+        let state_path = root.join("state.redb");
+        touch_plan_file(root, "ordinary");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .record_policy_decision(&qd(
+                    1,
+                    "ordinary",
+                    "a",
+                    PolicyEffect::RequireReview,
+                    PolicyCapability::Apply,
+                ))
+                .unwrap();
+        }
+
+        // No config at all: the queue ranks, the route would refuse.
+        let out = compute_review_queue(root, &root.join("rocky.toml"), &state_path, &models_dir)
+            .expect("the queue ranks without a config");
+        assert_eq!(
+            out.pending[0].models,
+            vec!["a".to_string()],
+            "still a graph key"
+        );
+        assert_eq!(
+            out.pending[0].preview_model, None,
+            "no config, no front door"
+        );
+
+        // Two pipelines: the route cannot pick one without a name.
+        let config_path = root.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.p.target.governance]\nauto_create_schemas = true\n\n\
+             [pipeline.q]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.q.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        let out = compute_review_queue(root, &config_path, &state_path, &models_dir)
+            .expect("the queue ranks with two pipelines");
+        assert_eq!(
+            out.pending[0].preview_model, None,
+            "two pipelines, no name: shut"
+        );
+
+        // One pipeline: open, and `a` is readable.
+        write_single_pipeline_config(root);
+        let out = compute_review_queue(root, &config_path, &state_path, &models_dir)
+            .expect("the queue ranks with one pipeline");
+        assert_eq!(out.pending[0].preview_model.as_deref(), Some("a"));
+    }
+
+    /// A config the samples route's front door accepts: the strict loader,
+    /// the adapter registry, and pipeline resolution with no name. The queue
+    /// tolerates more than the route does, so a queue that offers a read
+    /// without this would be advertising an answer the route cannot give.
+    fn write_single_pipeline_config(root: &Path) -> std::path::PathBuf {
+        let config_path = root.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.p.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        config_path
     }
 
     /// `blast_radius_union` over no names is `None`, not `Some(∅)`: an empty
