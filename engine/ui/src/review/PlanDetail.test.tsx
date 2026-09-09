@@ -183,8 +183,7 @@ describe("PlanDetail", () => {
 
     await screen.findByText("no single model to sample");
     expect(screen.queryByRole("button", { name: /Show \d+ rows/ })).toBeNull();
-    expect(screen.getByText(/This backfill plan touches 3 models: orders, customers, payments/))
-      .toBeTruthy();
+    expect(screen.getByText(/This plan touches 3 models: orders, customers, payments/)).toBeTruthy();
   });
 
   /// The screen used a `^[a-zA-Z0-9_]+$` regex on the label to decide whether
@@ -220,9 +219,10 @@ describe("PlanDetail", () => {
     expect(screen.queryByRole("region", { name: "Sample rows" })).toBeNull();
   });
 
-  /// A plan-level row from before the engine kept its set has an empty
-  /// `models`. That is "unknown", never "the label is the model".
-  it("says a plan-level row recorded no model set rather than parsing its label", async () => {
+  /// A row whose `models` is empty names no compiled model: a plan-level row
+  /// from before the engine kept its set, a replication target, a removed
+  /// model. That is "unknown", never "the label is the model".
+  it("says the queue names no compiled model rather than parsing the label", async () => {
     const unrecorded: ReviewQueueOutput = {
       ...QUEUE,
       pending: [
@@ -248,7 +248,59 @@ describe("PlanDetail", () => {
 
     await screen.findByText("no single model to sample");
     expect(screen.queryByRole("button", { name: /Show \d+ rows/ })).toBeNull();
-    expect(screen.getByText(/recorded no model set for this gc plan \("gc"\)/)).toBeTruthy();
+    expect(screen.getByText(/names no compiled model for this plan \(gc "gc"\)/)).toBeTruthy();
+  });
+
+  /// The apply-time gate records one decision per touched model, and the
+  /// queue keeps one row per (plan, model): a plan over two models under two
+  /// rules pends twice. Keeping only the first row showed one reason and one
+  /// model beside a command that clears both (#1815).
+  it("shows every escalation of one plan, and one command that clears them all", async () => {
+    const twice: ReviewQueueOutput = {
+      ...QUEUE,
+      total: 2,
+      pending: [
+        {
+          ...QUEUE.pending[0],
+          decision_ref: "2026-09-06T09:00:00Z|aaa|orders",
+          model: "orders",
+          models: ["orders"],
+          rule_id: 2,
+          reason: "orders carries a classified column",
+        },
+        {
+          ...QUEUE.pending[0],
+          decision_ref: "2026-09-06T09:00:00Z|aaa|customers",
+          model: "customers",
+          models: ["customers"],
+          rule_id: 5,
+          reason: "customers is a governed product input",
+        },
+      ],
+    };
+
+    render(
+      <PlanDetail
+        planId={PLAN}
+        loaders={loaders({
+          status: vi.fn(async () => ({ ...STATUS, product_id: undefined })),
+          queue: vi.fn(async () => twice),
+        })}
+      />,
+    );
+
+    await screen.findByText("orders carries a classified column");
+    expect(screen.getByText("customers is a governed product input")).toBeTruthy();
+    expect(screen.getByText("#2")).toBeTruthy();
+    expect(screen.getByText("#5")).toBeTruthy();
+    expect(screen.getByText(/2 escalations name this plan/)).toBeTruthy();
+    // Two models is not one to sample; both are named.
+    expect(screen.getByText("no single model to sample")).toBeTruthy();
+    expect(screen.getByText(/touches 2 models: orders, customers/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Show \d+ rows/ })).toBeNull();
+    // One command, and it says what it clears.
+    expect(screen.getAllByText(`rocky review ${PLAN} --approve`)).toHaveLength(1);
+    expect(screen.getByText(/clears every one of the 2 escalations/)).toBeTruthy();
   });
 
   /// Backfill is not the only capability whose queue `model` holds a sentence:
@@ -279,7 +331,10 @@ describe("PlanDetail", () => {
     );
 
     await screen.findByText("no single model to sample");
-    expect(screen.getByText(/This restore plan/)).toBeTruthy();
+    expect(screen.getByText(/This plan touches 2 models: orders, customers/)).toBeTruthy();
+    // The capability is shown where the engine put it — on the escalation —
+    // and the sample card does not guess one.
+    expect(screen.getByText("restore")).toBeTruthy();
     expect(screen.queryByText(/backfill/)).toBeNull();
   });
 

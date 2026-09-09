@@ -2057,6 +2057,11 @@ pub(crate) fn evaluate_apply_policy_core(
     let mut worst: Option<PolicyGate> = None;
     for (model, capability) in touched {
         let owned;
+        // Whether the subject is a model of the compiled project. The same
+        // field carries a replication target's table name and, on plan-level
+        // rows, a label; only a compiled model is a graph key, and only the
+        // producer knows that for certain, so it records it (#1815).
+        let compiled_model = attrs_map.contains_key(model);
         let attrs = match attrs_map.get(model) {
             Some(a) => a,
             None => {
@@ -2102,7 +2107,11 @@ pub(crate) fn evaluate_apply_policy_core(
         }
 
         record(&PolicyDecisionRecord {
-            models: Vec::new(),
+            models: if compiled_model {
+                vec![model.clone()]
+            } else {
+                Vec::new()
+            },
             timestamp: now,
             plan_id: plan_id.to_string(),
             principal,

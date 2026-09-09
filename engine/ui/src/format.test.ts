@@ -70,6 +70,35 @@ describe("clipHead", () => {
     expect(/[\ud800-\udbff]$/.test(cut.clipped ? cut.head : "")).toBe(false);
   });
 
+  /// Where the runtime segments graphemes, a combining mark stays with its
+  /// base: `é` written as `e` + U+0301 is one character to the reader.
+  it("keeps a combining mark with its base where the runtime can see it", () => {
+    expect(typeof Intl.Segmenter).toBe("function");
+    const cut = clipHead(`${"a".repeat(11)}e\u0301z`);
+    expect(cut).toEqual({ clipped: true, head: `${"a".repeat(11)}e\u0301`, tail: "" });
+  });
+
+  /// Without `Intl.Segmenter` the units are code points. That still keeps
+  /// every surrogate pair whole — the one guarantee the fallback makes.
+  it("still keeps surrogate pairs whole without Intl.Segmenter", () => {
+    const segmenter = Intl.Segmenter;
+    Object.defineProperty(Intl, "Segmenter", { value: undefined, configurable: true });
+    try {
+      expect(clipHead("aaaaaaaaaaa😀z")).toEqual({
+        clipped: true,
+        head: "aaaaaaaaaaa😀",
+        tail: "",
+      });
+      expect(clipMiddle("aaaaaaaaa😀bbbbbbbbbb")).toEqual({
+        clipped: true,
+        head: "aaaaaaaaa😀",
+        tail: "bbbbbbbb",
+      });
+    } finally {
+      Object.defineProperty(Intl, "Segmenter", { value: segmenter, configurable: true });
+    }
+  });
+
   /// The marker is a flag, not a character, so a value that contains "…"
   /// is not mistaken for one that was cut.
   it("reports a literal ellipsis as text that was not cut", () => {

@@ -57,11 +57,13 @@ export type Clipped =
   | { clipped: true; head: string; tail: string };
 
 /**
- * The characters a reader sees, so a cut never lands inside one. `String`
- * indexes UTF-16 code units, and slicing at one splits a surrogate pair: a
- * slice can end in a lone high surrogate. Grapheme segmentation is used where
- * the runtime has it; code points are the fallback, which still keeps every
- * pair whole.
+ * The units a cut may fall between. `String` indexes UTF-16 code units, and
+ * slicing at one splits a surrogate pair: a slice can end in a lone high
+ * surrogate. Where the runtime has `Intl.Segmenter` the units are grapheme
+ * clusters — what a reader sees, an `é` written as `e` plus a combining
+ * accent included. Without it they are code points, which keeps every
+ * surrogate pair whole but can still part a combining mark from its base;
+ * that is the guarantee the fallback makes, and the only one.
  */
 function characters(value: string): string[] {
   if (typeof Intl !== "undefined" && typeof Intl.Segmenter === "function") {

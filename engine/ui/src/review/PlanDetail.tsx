@@ -38,19 +38,30 @@ export function productNameFromId(productId: string): string {
  * absent: a queue refused with `engine_busy` says nothing about whether the
  * plan is in it, and a screen that said "no longer in the queue" beside that
  * refusal was asserting what it could not know (#1815).
+ *
+ * A present plan carries EVERY row that names it. The apply-time gate records
+ * one decision per touched model and the queue keeps one row per (plan,
+ * model), so a plan over two models under two rules pends twice, with two
+ * reasons. Keeping the first row showed one reason beside a command that
+ * clears both (#1815).
  */
 export type QueueLookup =
   | { kind: "unknown"; queue: Resource<ReviewQueueOutput> }
   | { kind: "absent" }
-  | { kind: "present"; entry: ReviewQueueEntry };
+  | { kind: "present"; entries: ReviewQueueEntry[] };
 
 export function lookupQueueEntry(
   queue: Resource<ReviewQueueOutput>,
   planId: string,
 ): QueueLookup {
   if (queue.kind !== "ready") return { kind: "unknown", queue };
-  const entry = queue.value.pending.find((row) => row.plan_id === planId);
-  return entry === undefined ? { kind: "absent" } : { kind: "present", entry };
+  const entries = queue.value.pending.filter((row) => row.plan_id === planId);
+  return entries.length === 0 ? { kind: "absent" } : { kind: "present", entries };
+}
+
+/** The distinct compiled models a plan's rows name, in the queue's order. */
+export function modelsNamedBy(entries: ReviewQueueEntry[]): string[] {
+  return Array.from(new Set(entries.flatMap((entry) => entry.models)));
 }
 
 /** One breaking finding as a sentence, from the tagged union the engine emits. */
@@ -206,31 +217,49 @@ function Escalation({ lookup, planId }: { lookup: QueueLookup; planId: string })
       />
     );
   }
-  const { entry } = lookup;
+  const { entries } = lookup;
   return (
-    <section aria-label="Why it needs a human" className="space-y-2">
+    <section aria-label="Why it needs a human" className="space-y-3">
       <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
         Why it needs a human
       </h3>
-      <p className="text-sm text-zinc-800 dark:text-zinc-200">{entry.reason}</p>
-      <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-zinc-600 sm:grid-cols-4 dark:text-zinc-300">
-        <div>
-          <dt className="text-zinc-500 dark:text-zinc-400">capability</dt>
-          <dd>{entry.capability}</dd>
+      {entries.length > 1 && (
+        <p className="text-xs text-zinc-600 dark:text-zinc-300">
+          {entries.length} escalations name this plan, one per model policy stopped. Approving
+          the plan clears all of them.
+        </p>
+      )}
+      {entries.map((entry) => (
+        <div key={entry.decision_ref} className="space-y-2">
+          <p className="text-sm text-zinc-800 dark:text-zinc-200">{entry.reason}</p>
+          <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-zinc-600 sm:grid-cols-5 dark:text-zinc-300">
+            <div>
+              <dt className="text-zinc-500 dark:text-zinc-400">model</dt>
+              <dd className="font-mono break-all">{entry.model}</dd>
+            </div>
+            <div>
+              <dt className="text-zinc-500 dark:text-zinc-400">capability</dt>
+              <dd>{entry.capability}</dd>
+            </div>
+            <div>
+              <dt className="text-zinc-500 dark:text-zinc-400">principal</dt>
+              <dd>{entry.principal}</dd>
+            </div>
+            <div>
+              <dt className="text-zinc-500 dark:text-zinc-400">rule</dt>
+              <dd>
+                {entry.rule_id === undefined || entry.rule_id === null
+                  ? "the default effect"
+                  : `#${entry.rule_id}`}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-zinc-500 dark:text-zinc-400">blast radius</dt>
+              <dd>{entry.blast_radius ?? "not computed"}</dd>
+            </div>
+          </dl>
         </div>
-        <div>
-          <dt className="text-zinc-500 dark:text-zinc-400">principal</dt>
-          <dd>{entry.principal}</dd>
-        </div>
-        <div>
-          <dt className="text-zinc-500 dark:text-zinc-400">rule</dt>
-          <dd>{entry.rule_id === undefined || entry.rule_id === null ? "the default effect" : `#${entry.rule_id}`}</dd>
-        </div>
-        <div>
-          <dt className="text-zinc-500 dark:text-zinc-400">blast radius</dt>
-          <dd>{entry.blast_radius ?? "not computed"}</dd>
-        </div>
-      </dl>
+      ))}
       <p className="text-xs text-zinc-600 dark:text-zinc-300">
         Every decision recorded about this plan: <CustodyLink subject={planId} />
       </p>
@@ -238,7 +267,13 @@ function Escalation({ lookup, planId }: { lookup: QueueLookup; planId: string })
   );
 }
 
-function HowToApprove({ status, entry }: { status: ReviewStatusOutput; entry: ReviewQueueEntry | null }) {
+function HowToApprove({
+  status,
+  entries,
+}: {
+  status: ReviewStatusOutput;
+  entries: ReviewQueueEntry[];
+}) {
   if (status.reviewed) {
     return (
       <StatusCard
@@ -250,13 +285,15 @@ function HowToApprove({ status, entry }: { status: ReviewStatusOutput; entry: Re
       />
     );
   }
-  const command = entry?.approve_command ?? `rocky review ${status.plan_id} --approve`;
+  // Every row of one plan carries the same command: approval is per plan.
+  const command = entries[0]?.approve_command ?? `rocky review ${status.plan_id} --approve`;
   return (
     <section aria-label="How to approve" className="space-y-2">
       <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">How to approve</h3>
       <p className="text-xs text-zinc-600 dark:text-zinc-300">
         Approving happens in a terminal, on purpose: the marker records a git identity, and this
         page holds a read-only token. Copy the command.
+        {entries.length > 1 ? ` It clears every one of the ${entries.length} escalations above.` : ""}
       </p>
       <pre className="overflow-x-auto rounded bg-zinc-50 p-2 font-mono text-xs dark:bg-zinc-800">
         {command}
@@ -300,15 +337,21 @@ function SampleFallback({
     return pending(product, "reading the product…");
   }
   if (lookup.kind === "present") {
-    const { entry } = lookup;
+    const { entries } = lookup;
+    const named = modelsNamedBy(entries);
+    const subjects = entries.map((entry) => `${entry.capability} "${entry.model}"`).join(", ");
     return (
       <StatusCard
         label="sample rows"
         value="no single model to sample"
         sub={
-          entry.models.length === 0
-            ? `The queue recorded no model set for this ${entry.capability} plan ("${entry.model}"): it was escalated before the engine kept one. Sample the models it touches from the estate screen instead.`
-            : `This ${entry.capability} plan touches ${entry.models.length} models: ${entry.models.join(", ")}. Sample each from the estate screen instead.`
+          named.length === 0
+            ? // The engine could not vouch for a compiled model behind the
+              // row: its subject is not one (a replication target, a label),
+              // the model is gone, or the compile could not name it. The
+              // screen does not guess which.
+              `The queue names no compiled model for this plan (${subjects}), so there is nothing to read rows from. Sample from the estate screen instead.`
+            : `This plan touches ${named.length} models: ${named.join(", ")}. Sample each from the estate screen instead.`
         }
       />
     );
@@ -370,20 +413,22 @@ export function PlanDetail({
   }
 
   const lookup = lookupQueueEntry(queue, planId);
-  const entry = lookup.kind === "present" ? lookup.entry : null;
-  // Which model to sample. The queue entry's `models` is the set the engine
-  // recorded for the escalation — the real names, kept apart from `model`,
-  // which is display text ("backfill: 3 model(s)") and is never parsed here.
-  // A regex on it once decided a label was a name, and `backfill_3_models`
-  // would have sampled a real model of that name (#1815). The panel takes the
-  // set only when it names exactly one model.
+  const entries = lookup.kind === "present" ? lookup.entries : [];
+  // Which model to sample. Each row's `models` is the set of compiled models
+  // the engine vouches for — the real names, kept apart from `model`, which
+  // is display text ("backfill: 3 model(s)", a replication target's table
+  // name) and is never parsed here. A regex on it once decided a label was a
+  // name, and `backfill_3_models` would have sampled a real model of that
+  // name (#1815). The panel takes the plan's rows together, and only when
+  // they name exactly one model.
   //
   // The queue is not a durable source: an approval marker resolves the
   // escalation, so the entry disappears the moment the plan is signed off —
   // and that is exactly when the table it built starts existing. The
   // product's own status carries `output_model`, and this screen already
   // reads it for the spec-drift card, so the fallback costs no request.
-  const fromQueue = entry !== null && entry.models.length === 1 ? entry.models[0] : null;
+  const named = modelsNamedBy(entries);
+  const fromQueue = named.length === 1 ? named[0] : null;
   const fromProduct =
     product.kind === "ready" ? (product.value.output_model ?? null) : null;
   const model = fromQueue ?? fromProduct;
@@ -439,7 +484,7 @@ export function PlanDetail({
         <SampleFallback lookup={lookup} productId={productId} product={product} />
       )}
 
-      <HowToApprove status={status.value} entry={entry} />
+      <HowToApprove status={status.value} entries={entries} />
     </div>
   );
 }

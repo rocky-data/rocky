@@ -85,7 +85,7 @@ export interface ReviewQueueEntry {
    */
   model: string;
   /**
-   * The graph keys this entry stands for: the model set the ledger row recorded, or the single `model` on an ordinary evaluation row. It is the set `blast_radius` was computed over. **Empty means unknown** — a plan-level row written before the engine kept its set — and never "no models". A consumer that needs a model name takes it from here; `model` is display text and is not to be parsed.
+   * The graph keys this entry stands for — names of compiled models, and only those: the set the ledger row recorded, or its bare `model` when the compiled graph has a model of that name. It is the set `blast_radius` was computed over. **Empty means unknown**, never "no models": a subject that is not a compiled model (a replication target is gated by table name; a plan-level row's `model` is a label), a model since removed, a failed compile, or a row from before its producer recorded the set. A consumer that needs a model name takes it from here; `model` is display text and is not to be parsed.
    */
   models: string[];
   /**

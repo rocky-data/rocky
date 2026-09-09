@@ -53,7 +53,7 @@ function QueueRow({ entry, now }: { entry: ReviewQueueEntry; now?: number }) {
           <div>
             <dt className="text-zinc-500 dark:text-zinc-400">models</dt>
             <dd className="font-mono break-all">
-              {entry.models.length === 0 ? "not recorded" : entry.models.join(", ")}
+              {entry.models.length === 0 ? "none the graph can name" : entry.models.join(", ")}
             </dd>
           </div>
         )}

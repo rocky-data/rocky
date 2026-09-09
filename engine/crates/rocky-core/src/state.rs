@@ -6097,18 +6097,22 @@ pub struct PolicyDecisionRecord {
     pub capability: crate::config::PolicyCapability,
     /// The model the decision was about — the concrete scope that matched.
     pub model: String,
-    /// The graph keys this decision covers, when [`Self::model`] cannot be one.
+    /// The graph keys this decision covers, as the producer knew them.
     ///
-    /// Empty on an ordinary evaluation row, where `model` **is** the graph key
-    /// and this field would only repeat it. Non-empty on a **plan-level**
-    /// escalation (`backfill` / `gc` / `restore`), where `model` is a
-    /// human-readable summary — `"backfill: 3 model(s)"` — that no graph lookup
-    /// can resolve. Those rows record the real model names here so a consumer
-    /// can compute a blast radius or match `rocky audit --for <model>` without
-    /// parsing the label.
+    /// Non-empty on a **plan-level** escalation (`backfill` / `gc` /
+    /// `restore`), where `model` is a human-readable summary — `"backfill: 3
+    /// model(s)"` — that no graph lookup can resolve, so the real names go
+    /// here. Also the single name on an apply-time evaluation row whose
+    /// subject is a model of the compiled project (#1815) — the gate is the
+    /// one place that knows, because the same `model` field carries a
+    /// replication target's table name, which is gated by name and is not a
+    /// model. Empty when the producer could not name a graph key, or on a row
+    /// written before it recorded one.
     ///
     /// Read through [`Self::graph_keys`], never directly: an empty vec means
-    /// "fall back to `model`", not "this decision covers no model".
+    /// "fall back to `model`", not "this decision covers no model". The
+    /// review queue, which must not hand a non-model over as a name, resolves
+    /// an empty set against the compiled graph instead.
     #[serde(default)]
     pub models: Vec<String>,
     /// The resolved verdict.
