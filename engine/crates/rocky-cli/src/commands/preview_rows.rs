@@ -24,6 +24,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
@@ -33,6 +34,7 @@ use rocky_compiler::diagnostic::Severity;
 use rocky_core::config::PipelineConfig;
 use rocky_core::masking::inline_mask_expr;
 use rocky_core::models::StrategyConfig;
+use rocky_core::traits::WarehouseAdapter;
 use rocky_ir::MaskStrategy;
 
 use crate::output::{PreviewRowsOutput, print_json};
@@ -66,6 +68,8 @@ pub async fn run_preview_rows(
         pipeline_name,
         models_dir,
         sql_file,
+        // The CLI holds no admission permit: it is one process, one sample.
+        None,
     )
     .await
     {
@@ -89,13 +93,51 @@ pub async fn run_preview_rows(
     }
 }
 
-/// Compute one preview: resolve the model, gate remote execution, mask what
-/// must be masked, and run the query. Prints nothing.
+/// What the blocking stage of a preview decides, handed to the warehouse
+/// stage: the adapter to run against, the exact SQL to run, and the pipeline
+/// the model was resolved on (its type shapes one error message).
+struct PreparedPreview {
+    adapter: Arc<dyn WarehouseAdapter>,
+    adapter_name: String,
+    adapter_type: String,
+    pipeline: PipelineConfig,
+    final_sql: String,
+}
+
+/// Test hook: hold the blocking stage of every preview of the named config
+/// for this long, so a test can watch a caller's deadline fire during a
+/// compile that outlives it (#1816). Keyed by config path so tests that share
+/// the process do not hold each other; one entry, so one test at a time.
+#[cfg(test)]
+pub(crate) static PREPARE_HOLD_FOR_TEST: std::sync::Mutex<
+    Option<(std::path::PathBuf, std::time::Duration)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn hold_for_test(config_path: &Path) {
+    let hold = PREPARE_HOLD_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some((held_path, delay)) = hold
+        && held_path == config_path
+    {
+        std::thread::sleep(delay);
+    }
+}
+
+/// The blocking stage of a preview: load the config, gate remote execution,
+/// compile, admit the model, decide the masking, build the SQL and construct
+/// the adapter. Every step is synchronous — the compiler has no `await` in
+/// it — so [`compute_preview_rows`] runs this on Tokio's blocking pool rather
+/// than inline in the async task (#1816). Inline, a caller's deadline could
+/// not fire until the compile returned: a Tokio timeout is checked between
+/// polls, and a poll that is inside a synchronous compile does not return.
 ///
-/// Shared by `rocky preview rows` and `GET /api/v1/models/{name}/rows`, so the
-/// two cannot answer differently: same gate, same masking refusal, same SQL.
+/// The blocking task owns its inputs (it can outlive a caller that stopped
+/// waiting); this borrows them from it.
 #[allow(clippy::too_many_arguments)]
-pub async fn compute_preview_rows(
+fn prepare_preview(
     config_path: &Path,
     model: &str,
     cte: Option<&str>,
@@ -104,8 +146,9 @@ pub async fn compute_preview_rows(
     pipeline_name: Option<&str>,
     models_dir: &Path,
     sql_file: Option<&Path>,
-) -> std::result::Result<PreviewRowsOutput, PreviewFailure> {
-    let start = Instant::now();
+) -> std::result::Result<PreparedPreview, PreviewFailure> {
+    #[cfg(test)]
+    hold_for_test(config_path);
 
     // `--sql-file` (ad-hoc selection preview) and `--cte` are mutually
     // exclusive: ad-hoc runs the file's SQL, not a model CTE.
@@ -268,11 +311,95 @@ pub async fn compute_preview_rows(
         })?
     };
 
-    // Build the adapter and execute (after the gate + compile, so warehouse
-    // credential construction only happens once the run is authorized).
+    // Build the adapter (after the gate + compile, so warehouse credential
+    // construction only happens once the run is authorized). Executing against
+    // it is the caller's, async, stage.
     let adapter = registry
         .warehouse_adapter(&adapter_name)
         .map_err(|e| fail("adapter_error", &format!("{e}"), None))?;
+
+    Ok(PreparedPreview {
+        adapter,
+        adapter_name,
+        adapter_type,
+        pipeline: pipeline.clone(),
+        final_sql,
+    })
+}
+
+/// Compute one preview: resolve the model, gate remote execution, mask what
+/// must be masked, and run the query. Prints nothing.
+///
+/// Shared by `rocky preview rows` and `GET /api/v1/models/{name}/rows`, so the
+/// two cannot answer differently: same gate, same masking refusal, same SQL.
+///
+/// Two stages. The blocking one ([`prepare_preview`]: config, gate, compile,
+/// masking, SQL, adapter) runs on Tokio's blocking pool, so a caller that
+/// wraps this future in a deadline sees the deadline fire during a compile
+/// that outlives it, rather than only once the compile returns (#1816). The
+/// warehouse one (`ping`, `execute_query`) is async and is dropped with the
+/// future. A compile the caller stopped waiting for cannot be cancelled; it
+/// finishes on the blocking pool on its own.
+///
+/// `permit` is whatever admission the caller holds for the sample — the
+/// route's one-at-a-time permit; the CLI passes `None`. It travels into the
+/// blocking stage and back out, so a caller that stops waiting releases it
+/// when the compile actually returns, not when it stops waiting: the next
+/// sample must not compile beside the one still running.
+#[allow(clippy::too_many_arguments)]
+pub async fn compute_preview_rows(
+    config_path: &Path,
+    model: &str,
+    cte: Option<&str>,
+    limit: u32,
+    allow_warehouse: bool,
+    pipeline_name: Option<&str>,
+    models_dir: &Path,
+    sql_file: Option<&Path>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> std::result::Result<PreviewRowsOutput, PreviewFailure> {
+    let start = Instant::now();
+
+    let blocking = {
+        let config_path = config_path.to_path_buf();
+        let model = model.to_string();
+        let cte = cte.map(str::to_string);
+        let pipeline_name = pipeline_name.map(str::to_string);
+        let models_dir = models_dir.to_path_buf();
+        let sql_file = sql_file.map(Path::to_path_buf);
+        tokio::task::spawn_blocking(move || {
+            let prepared = prepare_preview(
+                &config_path,
+                &model,
+                cte.as_deref(),
+                limit,
+                allow_warehouse,
+                pipeline_name.as_deref(),
+                &models_dir,
+                sql_file.as_deref(),
+            );
+            // The permit leaves with the result: dropped when this task's
+            // output is, which for a caller that stopped waiting is when the
+            // compile returns.
+            (prepared, permit)
+        })
+    };
+    let (prepared, permit) = blocking.await.map_err(|e| {
+        fail(
+            "internal_error",
+            &format!("preview preparation did not complete: {e}"),
+            None,
+        )
+    })?;
+    let _held = permit;
+    let PreparedPreview {
+        adapter,
+        adapter_name,
+        adapter_type,
+        pipeline,
+        final_sql,
+    } = prepared?;
+
     adapter.ping().await.map_err(|e| {
         fail(
             "connection_error",
@@ -289,7 +416,7 @@ pub async fn compute_preview_rows(
                 "missing_catalog" => format!(
                     "the target catalog doesn't exist (`rocky run` won't create one) — check that the `catalog` in your config matches an existing database; for DuckDB that's the file name, e.g. `playground` for `playground.duckdb`. ({msg})"
                 ),
-                "upstream_not_materialized" => upstream_not_materialized_message(pipeline, &msg),
+                "upstream_not_materialized" => upstream_not_materialized_message(&pipeline, &msg),
                 _ => format!("query failed: {msg}"),
             };
             return Err(fail(kind, &human, None));

@@ -137,6 +137,11 @@ jobs:
       - name: Install cross-compilation toolchain
         if: matrix.cross
         run: |
+          # See the note in engine-ci.yml: a third-party source with a bad
+          # index fails `apt-get update` for everyone, and the cross
+          # toolchain does not come from one.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
