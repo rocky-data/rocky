@@ -22,6 +22,7 @@
       "description": "The compile's diagnostics, counted. All zero before the first compile.",
       "properties": {
         "has_errors": {
+          "description": "`true` when the compile reported an error-severity diagnostic — and also when the last compile produced no result at all (`compile_error` on the project), with `total` and `warnings` at zero: \"did not compile\" is never \"no errors\" (#1823).",
           "type": "boolean"
         },
         "total": {
@@ -107,6 +108,13 @@
       },
       "type": "array"
     },
+    "compile_error": {
+      "description": "Why the last compile produced no result, when it did not: the models could not be read, a model failed to load, the compile task panicked. While this stands `models_compiled` is absent and `diagnostics.has_errors` is `true`, whatever an earlier compile found: a project whose models cannot be compiled is not a clean project, and counts from a compile that no longer describes it are not shown beside its failure (#1823). Absent when the last compile produced a result, and before the first compile finishes.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "config_error": {
       "description": "Why the config could not be loaded, when it could not. The lists below are then empty.",
       "type": [
@@ -141,7 +149,7 @@
       "description": "The newest run in the state store the server resolved; `null` when none was recorded."
     },
     "models_compiled": {
-      "description": "Models in the in-memory compile result; `null` before the first compile finishes.",
+      "description": "Models in the in-memory compile result. Absent (not `null`) before the first compile finishes and while `compile_error` stands; absent with no `compile_error` is the pending state, which the browser UI shows as pending rather than as zero diagnostics.",
       "format": "uint64",
       "minimum": 0.0,
       "type": [
