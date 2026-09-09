@@ -43,6 +43,18 @@ pub enum ModelWalkError {
          models below it were not loaded"
     )]
     DepthCeiling { dir: PathBuf, limit: usize },
+    /// An entry of the tree that is there and cannot be resolved — a symlink
+    /// to nowhere. Its kind is unknowable (a subtree of models, or a README:
+    /// its NAME cannot say), so this variant names neither "directory" nor
+    /// "file"; the earlier shape of this error did, and the review read the
+    /// contradiction. A models tree with a link to nowhere is refused
+    /// whatever the link is called (#1817).
+    #[error(
+        "entry '{path}' of the models tree cannot be resolved: {detail}. A models tree with \
+         a link to nowhere is refused whatever the link is called, because its name cannot \
+         say what it pointed at; repair or remove it"
+    )]
+    UnresolvedEntry { path: PathBuf, detail: String },
 }
 
 /// Every directory of the models tree under `root`, pre-order.
@@ -76,9 +88,28 @@ pub fn walk_model_dirs(root: &Path) -> (Vec<PathBuf>, Vec<ModelWalkError>) {
         dirs.push(dir.clone());
 
         // Only descend when there is something to descend into, so an absent
-        // root stays a non-error rather than failing `read_dir`.
-        if !dir.is_dir() {
-            continue;
+        // root stays a non-error rather than failing `read_dir`. `is_dir()`
+        // folded every metadata failure into "nothing to descend into", so a
+        // root (or a subdirectory) that is a dangling link was skipped with
+        // nothing said — the silent drop this walk exists to close (#1817).
+        // Only a PROVEN absence is a non-error now; a link to nowhere and an
+        // unstatable entry are reported, and `read_dir` says why.
+        match std::fs::metadata(&dir) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => continue,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                match crate::path_presence::classify_not_found(&dir) {
+                    crate::path_presence::PathPresence::Absent => continue,
+                    crate::path_presence::PathPresence::Present { detail } => {
+                        errors.push(ModelWalkError::UnresolvedEntry { path: dir, detail });
+                        continue;
+                    }
+                }
+            }
+            Err(source) => {
+                errors.push(ModelWalkError::ReadDir { dir, source });
+                continue;
+            }
         }
 
         let entries = match std::fs::read_dir(&dir) {
@@ -95,8 +126,44 @@ pub fn walk_model_dirs(root: &Path) -> (Vec<PathBuf>, Vec<ModelWalkError>) {
             // silent drop this walk exists to close, reintroduced one level
             // down.
             match entry {
-                Ok(entry) if entry.path().is_dir() => subdirs.push(entry.path()),
-                Ok(_) => {}
+                // `is_dir()` folded every metadata failure into "not a
+                // directory", so a subdirectory that is a dangling link was
+                // never pushed and never reported (#1817). Follow the link —
+                // a live `staging -> shared` must keep loading — but refuse
+                // to lose one that does not resolve.
+                Ok(entry) => match std::fs::metadata(entry.path()) {
+                    Ok(metadata) if metadata.is_dir() => subdirs.push(entry.path()),
+                    Ok(_) => {}
+                    // A dangling link's target type is unknowable, and its
+                    // NAME cannot say what it was: `v1.2` and `staging.old`
+                    // are directories, `LICENSE` and `.gitkeep` are files, and
+                    // a rule that reads a dot as "file" gets both wrong (this
+                    // walk tried one; the review showed it dropping a dotted
+                    // directory in silence and refusing a scaffold's
+                    // `.gitkeep`). So EVERY link to nowhere in a models tree
+                    // is reported, whatever it is called. The cost is that a
+                    // dangling `README.md` fails a compile it took no part in;
+                    // the message names the entry and says the fix is to
+                    // repair or remove it. That is the class rule — anything
+                    // but a proven absence is present, and present-but-
+                    // unreadable is refused — applied without exception,
+                    // because the exception could not be made honestly.
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                        match crate::path_presence::classify_not_found(&entry.path()) {
+                            crate::path_presence::PathPresence::Absent => {}
+                            crate::path_presence::PathPresence::Present { detail } => {
+                                errors.push(ModelWalkError::UnresolvedEntry {
+                                    path: entry.path(),
+                                    detail,
+                                });
+                            }
+                        }
+                    }
+                    Err(source) => errors.push(ModelWalkError::ReadDir {
+                        dir: entry.path(),
+                        source,
+                    }),
+                },
                 Err(source) => errors.push(ModelWalkError::DirEntry {
                     dir: dir.clone(),
                     source,
@@ -191,6 +258,70 @@ mod tests {
         let (dirs, errors) = walk_model_dirs(&root);
         assert_eq!(dirs, vec![root]);
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// #1817. A root that is a dangling symlink is not an absent root: an
+    /// entry is there, and `is_dir()` folded the broken link into "nothing to
+    /// descend into" with no error. It is yielded AND reported.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_root_is_reported_not_silently_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("models");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &root).unwrap();
+        let (dirs, errors) = walk_model_dirs(&root);
+        assert_eq!(dirs, vec![root.clone()]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            format!("{}", errors[0]).contains("cannot be resolved"),
+            "the error names the broken link: {}",
+            errors[0]
+        );
+    }
+
+    /// A SUBDIRECTORY that is a dangling link. The stack-pop check only sees
+    /// what the listing pushed, and `is_dir()` never pushed this — so the
+    /// round-two fix reported a dangling root and still walked past a
+    /// dangling child in silence.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_subdirectory_is_reported_not_silently_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("models");
+        mk(&root, "a");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), root.join("staging")).unwrap();
+        let (dirs, errors) = walk_model_dirs(&root);
+        assert_eq!(dirs, vec![root.clone(), root.join("a")]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let text = format!("{}", errors[0]);
+        assert!(
+            text.contains("staging") && text.contains("cannot be resolved"),
+            "the error names the broken child: {text}"
+        );
+    }
+
+    /// Every link to nowhere is reported, whatever it is called (#1822,
+    /// round five). A dotted DIRECTORY (`v1.2`), an extensionless FILE
+    /// (`.gitkeep`, part of the documented scaffold) and a plain file
+    /// (`README.md`) all dangle the same way, and a name rule got two of the
+    /// three wrong — so there is no name rule.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_is_reported_whatever_its_name() {
+        for name in ["v1.2", "staging.old", ".gitkeep", "LICENSE", "README.md"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("models");
+            mk(&root, "a");
+            std::os::unix::fs::symlink(tmp.path().join("gone"), root.join(name)).unwrap();
+            let (dirs, errors) = walk_model_dirs(&root);
+            assert_eq!(dirs, vec![root.clone(), root.join("a")], "{name}");
+            assert_eq!(errors.len(), 1, "{name}: {errors:?}");
+            let text = format!("{}", errors[0]);
+            assert!(
+                text.contains(name) && text.contains("repair or remove it"),
+                "{name}: the error names the link and says what to do: {text}"
+            );
+        }
     }
 
     /// Hidden directories were never excluded and stay walked — an exclusion

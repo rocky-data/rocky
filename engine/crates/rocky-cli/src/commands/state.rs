@@ -533,6 +533,43 @@ mod retention_sweep_config_tests {
         );
     }
 
+    /// #1817: the #1729 case one directory up. `rocky.toml` itself is fine —
+    /// it is the project directory that is a symlink to nowhere. The config
+    /// read reports `NotFound`, the LEAF discriminator agreed (a leaf under a
+    /// broken parent stats exactly like a path nobody created), the loader
+    /// returned `FileNotFound`, and the sweep ran on the defaults: irreversible
+    /// deletion, exit 0, from a config that was never absent. The ancestor
+    /// walk turns that into the same refusal the leaf case gets.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_ancestor_above_the_config_refuses_the_sweep_and_deletes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &proj).unwrap();
+        let config = proj.join("rocky.toml");
+        assert!(
+            std::fs::symlink_metadata(&config).is_err(),
+            "precondition: the leaf-only probe reports the config absent"
+        );
+
+        let state_path = tmp.path().join("state.redb");
+        store_with_aged_runs(&state_path, 105);
+
+        let err = state_retention_sweep(&config, &state_path, false, false)
+            .expect_err("a config under a dangling ancestor is not an absent config");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(&proj.display().to_string())
+                && rendered.contains("cannot be resolved"),
+            "the refusal must name the ancestor the operator has to fix, got: {rendered}"
+        );
+        assert_eq!(
+            run_count(&state_path),
+            105,
+            "a refused sweep deletes nothing; on the defaults it would have dropped 5"
+        );
+    }
+
     /// The control that proves the assertion above is about the refusal and
     /// not about an inert sweep: with the SAME store and the SAME `rocky.toml`
     /// resolving, the sweep runs and the defaults delete.

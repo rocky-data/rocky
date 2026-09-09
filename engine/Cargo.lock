@@ -4395,6 +4395,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "futures",
  "indexmap",
  "notify",
  "rocky-ai",

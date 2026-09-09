@@ -635,6 +635,40 @@ pub struct DirDefaultsTarget {
     pub schema: Option<String>,
 }
 
+/// Read a model-tree file, naming the file and — for a `NotFound` on an entry
+/// that IS there — saying what it really is.
+///
+/// Every reader in this module reaches a file through a presence probe that
+/// answers `true` for anything but a proven absence, so a `NotFound` at the
+/// read is never "the file is missing": it is a link to nowhere, and the OS
+/// error "No such file or directory" is exactly the sentence that made the
+/// old probes call it absent (#1738, #1817). The shared discriminator names
+/// the link and its target; the guidance says what to do about it. Every
+/// other read failure keeps the OS error, which already says which file.
+fn read_model_text(path: &Path) -> Result<String, ModelError> {
+    std::fs::read_to_string(path).map_err(|source| {
+        let source = if source.kind() == std::io::ErrorKind::NotFound {
+            match crate::path_presence::classify_not_found(path) {
+                crate::path_presence::PathPresence::Present { detail } => std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "{detail}. A models tree with a link to nowhere is refused whatever \
+                         the link is called, because its name cannot say what it pointed at; \
+                         repair or remove it"
+                    ),
+                ),
+                crate::path_presence::PathPresence::Absent => source,
+            }
+        } else {
+            source
+        };
+        ModelError::ReadPath {
+            path: path.display().to_string(),
+            source,
+        }
+    })
+}
+
 /// Validates and loads a `_defaults.toml` file. Rejects per-model fields.
 ///
 /// `${VAR}` and `${VAR:-default}` placeholders are resolved before parsing,
@@ -642,7 +676,11 @@ pub struct DirDefaultsTarget {
 /// defaults (e.g. `target.schema = "${ROCKY_SCHEMA:-public}"`) be set per
 /// orchestrator subprocess.
 pub fn load_dir_defaults(path: &Path) -> Result<DirDefaults, ModelError> {
-    let raw_content = std::fs::read_to_string(path)?;
+    // Named, like the sidecar read (#1738): the bare `ReadFile` carries only
+    // the OS error, and on a dangling link that reads "No such file or
+    // directory" with nothing saying WHICH file — the words that made the
+    // caller call it absent in the first place.
+    let raw_content = read_model_text(path)?;
     let content =
         substitute_env_vars(&raw_content).map_err(|source| ModelError::EnvSubstitution {
             path: path.display().to_string(),
@@ -1404,6 +1442,21 @@ pub fn load_model_pair(
     load_model_pair_with_context(sql_path, toml_path, defaults, &ModelLoadContext::default())
 }
 
+/// The sibling `<model>.contract.toml`, or `None` when there is genuinely
+/// none.
+///
+/// ONE probe for every model loader — the `.sql`+`.toml` pair, the inline
+/// frontmatter path, and the compiler's `.rocky` path — so the rule cannot
+/// drift between them. It is `entry_is_present`, not `exists()`: `exists()`
+/// follows a symlink, so a contract that is a dangling link read as "no
+/// contract" and the model compiled uncontracted with nothing said (#1817).
+/// A contract that is there and cannot be read is handed on; the compiler's
+/// read reports which link and why.
+pub fn sibling_contract_path(model_path: &Path) -> Option<std::path::PathBuf> {
+    let contract = model_path.with_extension("contract.toml");
+    crate::path_presence::entry_is_present(&contract).then_some(contract)
+}
+
 /// [`load_model_pair`] with directory-level config resolution: config-group
 /// references (`group = "<name>"`) and named-test references (`[[use_test]]`)
 /// resolve against the [`ModelLoadContext`]. Bare `load_model_pair` passes an
@@ -1415,10 +1468,7 @@ pub fn load_model_pair_with_context(
     ctx: &ModelLoadContext,
 ) -> Result<Model, ModelError> {
     let sql = {
-        let s = std::fs::read_to_string(sql_path).map_err(|source| ModelError::ReadPath {
-            path: sql_path.display().to_string(),
-            source,
-        })?;
+        let s = read_model_text(sql_path)?;
         let trimmed = s.trim();
         if trimmed.len() == s.len() {
             s // no trimming needed, reuse allocation
@@ -1426,10 +1476,7 @@ pub fn load_model_pair_with_context(
             trimmed.to_string()
         }
     };
-    let raw_toml = std::fs::read_to_string(toml_path).map_err(|source| ModelError::ReadPath {
-        path: toml_path.display().to_string(),
-        source,
-    })?;
+    let raw_toml = read_model_text(toml_path)?;
     let declared = extract_declared_fields(&raw_toml);
     let toml_content =
         substitute_env_vars(&raw_toml).map_err(|source| ModelError::EnvSubstitution {
@@ -1449,13 +1496,7 @@ pub fn load_model_pair_with_context(
 
     let config = resolve_model_config(raw, &file_stem, defaults, ctx, declared)?;
 
-    // Check for sibling contract file
-    let contract_path = sql_path.with_extension("contract.toml");
-    let contract_path = if contract_path.exists() {
-        Some(contract_path)
-    } else {
-        None
-    };
+    let contract_path = sibling_contract_path(sql_path);
 
     Ok(Model {
         config,
@@ -1515,13 +1556,8 @@ pub fn parse_model_inline_with_context(
 
     let config = resolve_model_config(raw, &file_stem, defaults, ctx, declared)?;
 
-    // Check for sibling contract file (inline models can have them too)
-    let contract_file = Path::new(file_path).with_extension("contract.toml");
-    let contract_path = if contract_file.exists() {
-        Some(contract_file)
-    } else {
-        None
-    };
+    // Inline models can have a sibling contract too — same probe, same rule.
+    let contract_path = sibling_contract_path(Path::new(file_path));
 
     Ok(Model {
         config,
@@ -1560,13 +1596,22 @@ pub fn load_models_from_dir_filtered(
     include: impl Fn(&Path) -> bool,
     project_freshness: Option<&crate::config::ProjectFreshnessConfig>,
 ) -> Result<Vec<Model>, ModelError> {
-    if !dir.exists() {
+    // Absent is empty; anything else is read, and `read_dir` says why it
+    // cannot be. `exists()` followed a symlink, so a models directory that is
+    // a dangling link answered "no models" and the project compiled empty
+    // (#1817).
+    if !crate::path_presence::entry_is_present(dir) {
         return Ok(Vec::new());
     }
 
     // Load optional directory defaults and config groups (once, upfront)
+    // `_defaults.toml` carries the strategy the whole directory falls back to.
+    // `exists()` read a dangling link as "no defaults", the strategy resolved
+    // to its own default, and every model in the directory silently changed
+    // materialization (#1817). Present-or-refuse: `load_dir_defaults` reports
+    // the honest read error.
     let defaults_path = dir.join("_defaults.toml");
-    let defaults = if defaults_path.exists() {
+    let defaults = if crate::path_presence::entry_is_present(&defaults_path) {
         Some(load_dir_defaults(&defaults_path)?)
     } else {
         None
@@ -1604,7 +1649,7 @@ pub fn load_models_from_dir_filtered(
             if crate::path_presence::entry_is_present(&toml_path) {
                 load_model_pair_with_context(path, &toml_path, defaults.as_ref(), &ctx)
             } else {
-                let content = std::fs::read_to_string(path)?;
+                let content = read_model_text(path)?;
                 parse_model_inline_with_context(
                     &content,
                     &path.display().to_string(),
@@ -1641,7 +1686,11 @@ pub fn load_unit_tests_from_dir(
     dir: &Path,
 ) -> Result<std::collections::HashMap<String, Vec<UnitTestDef>>, ModelError> {
     let mut out = std::collections::HashMap::new();
-    if !dir.exists() {
+    // Absent is empty; anything else is read, and `read_dir` says why it
+    // cannot be. `exists()` followed a symlink, so a models directory that is
+    // a dangling link answered "no models" and the project compiled empty
+    // (#1817).
+    if !crate::path_presence::entry_is_present(dir) {
         return Ok(out);
     }
     for entry in std::fs::read_dir(dir)? {
@@ -1714,7 +1763,11 @@ pub fn load_column_docs_from_dir(
 ) -> Result<std::collections::HashMap<String, std::collections::HashMap<String, String>>, ModelError>
 {
     let mut out = std::collections::HashMap::new();
-    if !dir.exists() {
+    // Absent is empty; anything else is read, and `read_dir` says why it
+    // cannot be. `exists()` followed a symlink, so a models directory that is
+    // a dangling link answered "no models" and the project compiled empty
+    // (#1817).
+    if !crate::path_presence::entry_is_present(dir) {
         return Ok(out);
     }
     for entry in std::fs::read_dir(dir)? {
@@ -1816,7 +1869,11 @@ pub fn load_surrogate_keys_from_dir_filtered(
     include: impl Fn(&Path) -> bool,
 ) -> Result<std::collections::HashMap<String, Vec<SurrogateKeySpec>>, ModelError> {
     let mut out = std::collections::HashMap::new();
-    if !dir.exists() {
+    // Absent is empty; anything else is read, and `read_dir` says why it
+    // cannot be. `exists()` followed a symlink, so a models directory that is
+    // a dangling link answered "no models" and the project compiled empty
+    // (#1817).
+    if !crate::path_presence::entry_is_present(dir) {
         return Ok(out);
     }
     for entry in std::fs::read_dir(dir)? {
@@ -1997,6 +2054,108 @@ mod tests {
     /// materialization strategy, possibly writing to a different table, and
     /// nothing said so. A bigger blast radius than #1729's `serve` case,
     /// because it changes what SQL is generated and where it lands.
+    /// #1817. `_defaults.toml` is a dangling symlink. `exists()` followed it
+    /// into nothing, the loader supplied no defaults, and the strategy fell
+    /// through to `FullRefresh` for every model in the directory — a
+    /// materialization change with nothing said about it.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_defaults_file_refuses_instead_of_dropping_the_directory_strategy() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("orders.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            models.join("orders.toml"),
+            "name = \"orders\"\ntarget = { catalog = \"c\", schema = \"s\", table = \"orders\" }\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(dir.path().join("gone"), models.join("_defaults.toml")).unwrap();
+        assert!(
+            !models.join("_defaults.toml").exists(),
+            "precondition: the probe this replaces reports the defaults absent"
+        );
+
+        let err = load_models_from_dir(&models, None)
+            .expect_err("a defaults file that is there and unreadable must refuse");
+        assert!(
+            format!("{err}").contains("_defaults.toml"),
+            "the refusal names the file: {err}"
+        );
+    }
+
+    /// The INLINE path — frontmatter in the `.sql`, no `.toml` — had its own
+    /// `exists()` probe that the first pass missed. Same rule, same helper now.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_contract_beside_an_inline_model_is_handed_on_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(
+            models.join("orders.sql"),
+            "---toml\nname = \"orders\"\ntarget = { catalog = \"c\", schema = \"s\", table = \"orders\" }\n---\nSELECT 1 AS id\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(dir.path().join("gone"), models.join("orders.contract.toml"))
+            .unwrap();
+
+        let loaded = load_models_from_dir(&models, None).expect("the inline model loads");
+        assert_eq!(loaded.len(), 1);
+        assert!(
+            loaded[0].contract_path.is_some(),
+            "the inline path dropped a dangling contract just like the pair path did"
+        );
+    }
+
+    /// #1817. A contract that is a dangling symlink read as "no contract", and
+    /// the model compiled with its contract dropped. The loader must hand the
+    /// path on so the compiler's read reports it.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_contract_is_handed_on_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("orders.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            models.join("orders.toml"),
+            "name = \"orders\"\ntarget = { catalog = \"c\", schema = \"s\", table = \"orders\" }\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(dir.path().join("gone"), models.join("orders.contract.toml"))
+            .unwrap();
+
+        let loaded = load_models_from_dir(&models, None).expect("the model itself loads");
+        assert_eq!(loaded.len(), 1);
+        assert!(
+            loaded[0].contract_path.is_some(),
+            "a contract entry that is there must reach the compiler, which reads it and \
+             reports the dangling link — dropping it here compiled the model uncontracted"
+        );
+    }
+
+    /// #1817. The models directory itself is a dangling symlink. `exists()`
+    /// answered false, the loader returned an empty set, and the project
+    /// looked model-free: a DAG with no nodes, reported as success.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_models_dir_errors_instead_of_loading_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::os::unix::fs::symlink(dir.path().join("gone"), &models).unwrap();
+
+        load_models_from_dir(&models, None)
+            .expect_err("a models dir that is there and cannot be read is not an empty one");
+        // The control: a directory nobody created is still empty, not an error.
+        let absent = dir.path().join("never-created");
+        assert!(
+            load_models_from_dir(&absent, None)
+                .expect("absent is empty")
+                .is_empty()
+        );
+    }
+
     #[test]
     fn a_dangling_model_sidecar_refuses_instead_of_compiling_against_defaults() {
         let dir = tempfile::tempdir().unwrap();

@@ -6957,6 +6957,15 @@ async fn draft_contract_deny_with_a_failed_remove_says_the_draft_is_still_on_dis
 /// while the refusal claimed a clean rollback. The no-follow restore fails
 /// instead: nothing lands outside, the failure rides the envelope, and the
 /// message says a symlink is what is on disk.
+///
+/// The planted target is a REAL file holding valid contract TOML. It used to
+/// be a path with nothing at it, which made the swapped-in link dangling —
+/// and since #1817 a dangling contract is refused by the compile step, one
+/// stage before the policy ever runs, so the deny-then-rollback path this
+/// test exists to pin was never reached. A live target keeps the compile
+/// green (the read follows the link) and lets the deny fire; the pin becomes
+/// "the outside file's content is untouched", which is the same invariant
+/// stated against a file that exists.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn draft_contract_deny_never_restores_through_a_leaf_swapped_for_a_symlink() {
@@ -6975,6 +6984,9 @@ async fn draft_contract_deny_never_restores_through_a_leaf_swapped_for_a_symlink
     .unwrap();
     let outside = TempDir::new().unwrap();
     let leak = outside.path().join("leak.toml");
+    const OUTSIDE_CONTRACT: &str =
+        "[[columns]]\nname = \"outside_marker\"\ntype = \"String\"\nnullable = true\n";
+    std::fs::write(&leak, OUTSIDE_CONTRACT).unwrap();
 
     let spec = "[[columns]]\nname = \"status\"\ntype = \"String\"\nnullable = true\n";
     let args = object(serde_json::json!({ "model": "orders", "spec": spec }));
@@ -6993,12 +7005,13 @@ async fn draft_contract_deny_never_restores_through_a_leaf_swapped_for_a_symlink
     .await
     .expect("the swap arms for every user");
 
-    // THE PIN: the prior contract did not land outside the project.
-    assert!(
-        !leak.exists(),
-        "the rollback wrote the prior contract through the link to {}: {:?}",
-        leak.display(),
-        std::fs::read_to_string(&leak)
+    // THE PIN: the prior contract did not land outside the project — the
+    // outside file still holds exactly what was planted there.
+    assert_eq!(
+        std::fs::read_to_string(&leak).expect("the outside file is still there"),
+        OUTSIDE_CONTRACT,
+        "the rollback wrote the prior contract through the link to {}",
+        leak.display()
     );
     assert_eq!(result.is_error, Some(true), "the deny is an error");
     let err = result.structured_content.expect("envelope");

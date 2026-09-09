@@ -141,6 +141,13 @@ pub enum ProjectError {
     #[error("no models found in {path}")]
     NoModels { path: String },
 
+    /// The models tree could not be fully walked. Its own variant, so a walk
+    /// failure is never rendered as "failed to read model file" about an
+    /// entry nobody knows to be a file — and never as `NoModels`, which the
+    /// policy plane reads as a PROVEN empty set (#1817).
+    #[error("models tree: {0}")]
+    ModelsTree(#[from] rocky_core::model_walk::ModelWalkError),
+
     #[error("invalid models glob '{pattern}': {reason}")]
     InvalidModelsGlob { pattern: String, reason: String },
 
@@ -155,6 +162,17 @@ pub enum ProjectError {
 
     #[error("failed to lower .rocky file '{path}': {reason}")]
     RockyLower { path: String, reason: String },
+}
+
+/// The directory a walk error is about, whichever variant it is.
+fn walk_error_dir(e: &rocky_core::model_walk::ModelWalkError) -> &Path {
+    use rocky_core::model_walk::ModelWalkError;
+    match e {
+        ModelWalkError::ReadDir { dir, .. }
+        | ModelWalkError::DirEntry { dir, .. }
+        | ModelWalkError::DepthCeiling { dir, .. } => dir,
+        ModelWalkError::UnresolvedEntry { path, .. } => path,
+    }
 }
 
 impl Project {
@@ -253,9 +271,20 @@ impl Project {
         // strict consumer: the first walk error fails the load, because an
         // unreadable subtree silently missing from a compile is the
         // silent-drop family this closes.
-        let (dirs, walk_errors) = rocky_core::model_walk::walk_model_dirs(models_dir);
-        if let Some(walk_error) = walk_errors.into_iter().next() {
-            return Err(models::ModelError::from(std::io::Error::other(walk_error)).into());
+        let (dirs, mut walk_errors) = rocky_core::model_walk::walk_model_dirs(models_dir);
+        // The ROOT's walk error outranks everything: with `models` itself a
+        // dangling link there is nothing to load and the root is the right
+        // thing to name. A DEEPER walk error is reported only after the
+        // models that did load were parsed — a parse error in a root model
+        // is the one the operator can act on, and it must not be hidden
+        // behind a subdirectory that could not be entered (#1822). Same
+        // precedence as the CLI loader's `load_project_models_partial_with`.
+        let root_error = walk_errors
+            .iter()
+            .position(|e| walk_error_dir(e) == models_dir)
+            .map(|i| walk_errors.remove(i));
+        if let Some(walk_error) = root_error {
+            return Err(ProjectError::ModelsTree(walk_error));
         }
 
         let mut models = Vec::new();
@@ -283,12 +312,20 @@ impl Project {
             }
         }
 
+        // Deeper walk errors, now that every model that could load has
+        // been parsed and any parse error has had its turn — and BEFORE the
+        // no-models answer below: a tree whose only entry is an unreadable
+        // subtree has not been shown to hold no models, it has been shown to
+        // be unreadable (#1822, round five).
+        if let Some(walk_error) = walk_errors.into_iter().next() {
+            return Err(ProjectError::ModelsTree(walk_error));
+        }
+
         if models.is_empty() {
             return Err(ProjectError::NoModels {
                 path: models_dir.display().to_string(),
             });
         }
-
         Ok(models)
     }
 
@@ -433,14 +470,35 @@ fn model_path_matches(pattern: &glob::Pattern, path: &Path) -> bool {
 fn has_matching_model_source(root: &Path, pattern: &glob::Pattern) -> Result<bool, ProjectError> {
     // Walks the same tree the loader walks (#1262): a project whose only
     // matching sources sit below the first level must not be reported as
-    // having no models. Walk errors are ignored HERE on purpose — this is a
-    // pre-check answering "is there anything at all"; the loader immediately
-    // behind it surfaces the same errors strictly.
-    let (dirs, _) = rocky_core::model_walk::walk_model_dirs(root);
+    // having no models.
+    //
+    // Walk errors used to be ignored here "on purpose", on the reasoning that
+    // the strict loader behind this pre-check would surface them. It never
+    // got the chance: when nothing matched, the caller answered `NoModels`
+    // from THIS function's `false` and returned before the loader ran — so
+    // a tree whose only matching subtree was `gold -> gone` compiled as
+    // "no models", and the policy plane reads `NoModels` as a PROVEN empty
+    // set: a `deny` scoped to that layer stopped matching, and compact or
+    // archive SQL could run on attributes nobody could read (#1817, round
+    // six). A match still wins — something loadable is there. Nothing
+    // matching plus a walk error is the walk error.
+    //
+    // The ROOT's own walk error outranks the listing: the walk yields a
+    // dangling root as a directory to visit, and listing it fails with a
+    // bare "No such file" that would pre-empt the walk's own account of what
+    // is there — a link to nowhere, and what to do about it (#1822, round
+    // eight). A matching healthy child still wins over any DEEPER error.
+    let (dirs, mut walk_errors) = rocky_core::model_walk::walk_model_dirs(root);
+    if let Some(i) = walk_errors.iter().position(|e| walk_error_dir(e) == root) {
+        return Err(ProjectError::ModelsTree(walk_errors.remove(i)));
+    }
     for dir in dirs {
         if dir_has_matching_model_source(&dir, pattern)? {
             return Ok(true);
         }
+    }
+    if let Some(walk_error) = walk_errors.into_iter().next() {
+        return Err(ProjectError::ModelsTree(walk_error));
     }
     Ok(false)
 }
@@ -449,12 +507,27 @@ fn dir_has_matching_model_source(
     dir: &Path,
     pattern: &glob::Pattern,
 ) -> Result<bool, ProjectError> {
-    if !dir.exists() {
+    // A directory the walk yielded is there; a dangling one it yielded is
+    // reported by the walk itself. Only a proven absence is "nothing here".
+    if !rocky_core::path_presence::entry_is_present(dir) {
         return Ok(false);
     }
-    let entries = std::fs::read_dir(dir).map_err(models::ModelError::from)?;
+    // A directory this pre-check cannot LIST is a walk failure, and is typed
+    // as one — not as "failed to read model file", which is what the bare
+    // `ModelError::from` said about a directory (#1822, round seven).
+    let entries = std::fs::read_dir(dir).map_err(|source| {
+        ProjectError::ModelsTree(rocky_core::model_walk::ModelWalkError::ReadDir {
+            dir: dir.to_path_buf(),
+            source,
+        })
+    })?;
     for entry in entries {
-        let entry = entry.map_err(models::ModelError::from)?;
+        let entry = entry.map_err(|source| {
+            ProjectError::ModelsTree(rocky_core::model_walk::ModelWalkError::DirEntry {
+                dir: dir.to_path_buf(),
+                source,
+            })
+        })?;
         let path = entry.path();
         if matches!(
             path.extension().and_then(|extension| extension.to_str()),
@@ -517,12 +590,16 @@ fn load_rocky_models_with_db_filtered(
     include: &impl Fn(&Path) -> bool,
     project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
 ) -> Result<Vec<Model>, ProjectError> {
-    if !dir.exists() {
+    // Same rule as `rocky_core::models`: absent is empty, anything else is
+    // read and refuses with the honest error. `exists()` followed a symlink,
+    // so a dangling models dir compiled empty and a dangling `_defaults.toml`
+    // silently dropped the directory's strategy (#1817).
+    if !rocky_core::path_presence::entry_is_present(dir) {
         return Ok(Vec::new());
     }
 
     let defaults_path = dir.join("_defaults.toml");
-    let defaults = if defaults_path.exists() {
+    let defaults = if rocky_core::path_presence::entry_is_present(&defaults_path) {
         Some(models::load_dir_defaults(&defaults_path)?)
     } else {
         None
@@ -586,6 +663,24 @@ fn load_single_rocky_model_with_db(
         .unwrap_or("unknown")
         .to_string();
 
+    // A `.rocky` entry that is there and cannot be resolved is a walk
+    // failure, not a parse failure: say so before the salsa read folds it
+    // into "failed to parse" with an OS error for a reason (#1822, round
+    // seven). The stat runs on every `.rocky` load; only its NotFound arm
+    // returns early. One `metadata()` per file per compile, beside the
+    // canonicalize and read the salsa route already does for each.
+    if let Err(source) = std::fs::metadata(path)
+        && source.kind() == std::io::ErrorKind::NotFound
+        && let rocky_core::path_presence::PathPresence::Present { detail } =
+            rocky_core::path_presence::classify_not_found(path)
+    {
+        return Err(ProjectError::ModelsTree(
+            rocky_core::model_walk::ModelWalkError::UnresolvedEntry {
+                path: path.to_path_buf(),
+                detail,
+            },
+        ));
+    }
     // Tracked-query route: read_source loads the file via the salsa
     // dedup map; file_typecheck parses + lowers (or returns the cached
     // result if neither input nor AST has changed).
@@ -686,12 +781,8 @@ fn load_single_rocky_model_with_db(
         }
     };
 
-    let contract_file = path.with_extension("contract.toml");
-    let contract_path = if contract_file.exists() {
-        Some(contract_file)
-    } else {
-        None
-    };
+    // The one contract probe every loader shares (#1817).
+    let contract_path = models::sibling_contract_path(path);
 
     Ok(Model {
         config,
@@ -1217,6 +1308,102 @@ mod recursive_load_tests {
         );
     }
 
+    /// #1822, round four: the COMPILER's loader returned on the first walk
+    /// error before parsing a single model, so a dangling subdirectory
+    /// outranked a parse error in the root — and the LSP, which compiles
+    /// through this path, showed the wrong problem. Same precedence as the
+    /// CLI loader now: the root's walk error first, then the models, then
+    /// deeper walk errors.
+    #[cfg(unix)]
+    #[test]
+    fn compile_path_reports_a_root_parse_error_before_a_deeper_walk_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        write(
+            &models.join("broken.sql"),
+            "---toml\nname = \n---\nSELECT 1 AS id\n",
+        );
+        std::os::unix::fs::symlink(tmp.path().join("gone"), models.join("staging")).unwrap();
+
+        let err = Project::load_models(&models, None).expect_err("a broken model is an error");
+        let text = format!("{err}");
+        assert!(
+            text.contains("broken.sql") || text.contains("frontmatter"),
+            "the actionable root error is the one reported: {text}"
+        );
+        assert!(
+            !text.contains("staging"),
+            "the deeper walk error must not hide the parse error: {text}"
+        );
+
+        // With the root model fixed, the dangling subdirectory is what is
+        // left, and it is still reported — deferred, not dropped.
+        write(&models.join("broken.sql"), "SELECT 1 AS id\n");
+        write(
+            &models.join("broken.toml"),
+            "name = \"broken\"\n[target]\ncatalog = \"w\"\nschema = \"s\"\ntable = \"broken\"\n",
+        );
+        let err = Project::load_models(&models, None).expect_err("the dangling subdir remains");
+        assert!(format!("{err}").contains("staging"), "{err}");
+    }
+
+    /// And the root's OWN walk error still comes first, ahead of anything a
+    /// per-directory load would say about a leaf under it.
+    #[cfg(unix)]
+    #[test]
+    fn compile_path_blames_a_dangling_root_before_anything_under_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &models).unwrap();
+        let err = Project::load_models(&models, None).expect_err("a dangling root is an error");
+        let text = format!("{err}");
+        assert!(
+            text.contains("cannot be resolved") && !text.contains("_defaults.toml"),
+            "{text}"
+        );
+    }
+
+    /// A link to nowhere in the models tree refuses the compile whatever it
+    /// is called (#1822, round five): a name cannot say whether it pointed at
+    /// a subtree of models or at a README, so the tree is refused with a
+    /// message that names the link and says to repair or remove it.
+    #[cfg(unix)]
+    #[test]
+    fn compile_path_refuses_a_dangling_link_whatever_its_name() {
+        for name in ["README.md", "v1.2", ".gitkeep"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let models = tmp.path().join("models");
+            write_model(&models, "top");
+            std::os::unix::fs::symlink(tmp.path().join("gone"), models.join(name)).unwrap();
+            let err = Project::load_models(&models, None)
+                .expect_err("a link to nowhere refuses the tree");
+            let text = format!("{err}");
+            assert!(
+                text.contains(name) && text.contains("repair or remove"),
+                "{name}: {text}"
+            );
+        }
+    }
+
+    /// A tree whose ONLY entry is a dangling subdirectory is unreadable, not
+    /// empty: the deferred walk error must outrank `NoModels` (#1822, round
+    /// five). Reverting the whole ordering change makes this fail too, which
+    /// the dangling-root test alone did not.
+    #[cfg(unix)]
+    #[test]
+    fn compile_path_reports_a_dangling_subdir_ahead_of_no_models() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("gone"), models.join("staging")).unwrap();
+        let err = Project::load_models(&models, None).expect_err("unreadable, not empty");
+        let text = format!("{err}");
+        assert!(
+            text.contains("staging") && !text.contains("no models"),
+            "the unreadable subtree is named, not a false 'no models': {text}"
+        );
+    }
+
     /// The compile path sees the same tree every other scanner sees (#1262):
     /// a model two levels down loads, where it used to be silently absent —
     /// which is what made `rocky list models` show a model `run` would then
@@ -1232,6 +1419,147 @@ mod recursive_load_tests {
         let mut names: Vec<&str> = loaded.iter().map(|m| m.config.name.as_str()).collect();
         names.sort_unstable();
         assert_eq!(names, ["lvl2", "top"]);
+    }
+
+    /// #1817, round six. The glob pre-check discarded walk errors and the
+    /// caller answered `NoModels` from its `false` before the strict loader
+    /// ever ran. `NoModels` is read by the policy plane as a PROVEN empty
+    /// set — a `deny` scoped to `layer = "gold"` stops matching — so a tree
+    /// whose only matching subtree was `gold -> gone` could authorise a
+    /// compact or archive on attributes nobody could read.
+    #[cfg(unix)]
+    #[test]
+    fn a_filtered_compile_reports_a_dangling_subtree_instead_of_no_models() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("gone"), models.join("gold")).unwrap();
+
+        let mut db = crate::salsa_compile::RockyDatabase::default();
+        let glob = format!("{}/**", models.display());
+        let err = Project::load_models_matching_with_db(&models, &glob, &mut db, None)
+            .expect_err("an unreadable subtree is not an empty one");
+        assert!(
+            matches!(err, ProjectError::ModelsTree(_)),
+            "the walk error, never `NoModels`: {err}"
+        );
+        assert!(format!("{err}").contains("gold"), "{err}");
+    }
+
+    /// #1822, round seven: a dangling MODEL file — `orders.sql -> gone` —
+    /// reached the loader's read before the walk's stored error, and rendered
+    /// as "failed to read model file: No such file or directory". The read
+    /// now says what the entry is and what to do, whichever error variant
+    /// carries it.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_model_file_says_what_it_is_and_what_to_do() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("gone"), models.join("orders.sql")).unwrap();
+        write(
+            &models.join("orders.toml"),
+            "name = \"orders\"\n[target]\ncatalog = \"w\"\nschema = \"s\"\ntable = \"orders\"\n",
+        );
+
+        let mut db = crate::salsa_compile::RockyDatabase::default();
+        let glob = format!("{}/**", models.display());
+        let err = Project::load_models_matching_with_db(&models, &glob, &mut db, None)
+            .expect_err("a dangling model file refuses");
+        let text = format!("{err}");
+        assert!(
+            text.contains("orders.sql")
+                && text.contains("cannot be resolved")
+                && text.contains("repair or remove it"),
+            "the refusal names the link and says what to do, not 'No such file': {text}"
+        );
+        assert!(!text.contains("No such file"), "{text}");
+    }
+
+    /// The `.rocky` route: the salsa read folded a dangling entry into "failed
+    /// to parse … No such file". It is a walk failure and is typed as one.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_rocky_model_is_a_walk_failure_not_a_parse_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("gone"), models.join("orders.rocky")).unwrap();
+
+        let mut db = crate::salsa_compile::RockyDatabase::default();
+        let glob = format!("{}/**", models.display());
+        let err = Project::load_models_matching_with_db(&models, &glob, &mut db, None)
+            .expect_err("a dangling .rocky refuses");
+        assert!(matches!(err, ProjectError::ModelsTree(_)), "{err}");
+        assert!(format!("{err}").contains("repair or remove it"), "{err}");
+    }
+
+    /// An unreadable directory that sorts BEFORE a healthy match: the pre-check
+    /// listed it and its `?` returned "failed to read model file" about a
+    /// directory. It is a walk failure, typed and worded as one. Skips under
+    /// root, which can list a mode-000 directory.
+    #[cfg(unix)]
+    #[test]
+    fn an_unlistable_directory_before_a_healthy_match_is_a_walk_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        write_model(&models.join("z"), "orders");
+        let locked = models.join("a");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let reproduced = std::fs::read_dir(&locked).is_err();
+        let mut db = crate::salsa_compile::RockyDatabase::default();
+        let glob = format!("{}/**", models.display());
+        let result = Project::load_models_matching_with_db(&models, &glob, &mut db, None);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
+        if !reproduced {
+            eprintln!("skipping: this process can list a mode-000 directory");
+            return;
+        }
+        let err = result.expect_err("an unlistable directory refuses");
+        assert!(matches!(err, ProjectError::ModelsTree(_)), "{err}");
+        let text = format!("{err}");
+        assert!(
+            text.contains("models directory") && !text.contains("model file"),
+            "a directory is called a directory: {text}"
+        );
+    }
+
+    /// #1822, round eight: the models ROOT itself is a link to nowhere, on the
+    /// filtered route. The walk yields the root as a directory to visit and
+    /// records an `UnresolvedEntry` for it; the pre-check's listing of that
+    /// root then failed with a bare "No such file" and pre-empted the walk's
+    /// own account. The root's walk error comes first now.
+    #[cfg(unix)]
+    #[test]
+    fn a_filtered_compile_of_a_dangling_root_keeps_the_walks_own_words() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &models).unwrap();
+
+        let mut db = crate::salsa_compile::RockyDatabase::default();
+        let glob = format!("{}/**", models.display());
+        let err = Project::load_models_matching_with_db(&models, &glob, &mut db, None)
+            .expect_err("a dangling root refuses");
+        assert!(
+            matches!(
+                err,
+                ProjectError::ModelsTree(
+                    rocky_core::model_walk::ModelWalkError::UnresolvedEntry { .. }
+                )
+            ),
+            "the walk's own error, not a listing failure: {err}"
+        );
+        let text = format!("{err}");
+        assert!(
+            text.contains("cannot be resolved") && text.contains("repair or remove it"),
+            "{text}"
+        );
+        assert!(!text.contains("No such file"), "{text}");
     }
 
     /// A project whose ONLY matching sources sit below the first level is not

@@ -468,6 +468,19 @@ impl RockyLsp {
             }
             Err(e) => {
                 info!(error = %e, "LSP compilation failed");
+                // The log line above is the only place this failure went.
+                // The editor was left with NOTHING: no diagnostic (none was
+                // built), no message. A models directory that is a dangling
+                // link, a `_defaults.toml` that cannot be read, a contract
+                // that cannot be resolved — each produced a silent, empty
+                // editor (#1817). Tell the client, so the silence is not
+                // mistaken for a clean project.
+                self.client
+                    .show_message(
+                        tower_lsp::lsp_types::MessageType::ERROR,
+                        format!("Rocky: compiling the project's models failed: {e}"),
+                    )
+                    .await;
                 // `ProjectError::RockyParse` aborts the compile pipeline
                 // before any `Diagnostic` is built, so the LSP would
                 // otherwise leave the editor with no feedback at all.
@@ -1019,7 +1032,15 @@ impl LanguageServer for RockyLsp {
             && let Ok(path) = root.to_file_path()
         {
             let models_path = path.join("models");
-            if models_path.exists() {
+            // `exists()` follows a symlink, so a `models` entry that is a
+            // dangling link read as "no models project" and the server sat
+            // silent over it. Anything but a proven absence is a project.
+            // The compile that follows then FAILS on the broken link, and
+            // that failure reaches the editor as an error message from the
+            // `recompile` failure arm — before this change it only reached
+            // the server log, so admitting the project here would have
+            // moved the silence rather than removed it (#1817).
+            if rocky_core::path_presence::entry_is_present(&models_path) {
                 *self.models_dir.write().await = Some(models_path.display().to_string());
                 info!(path = %models_path.display(), "LSP found models directory");
             }
@@ -4440,6 +4461,90 @@ pub async fn run_lsp() {
 
 #[cfg(test)]
 mod tests {
+    /// #1817 / #1822 round four: a startup compile that fails must reach the
+    /// EDITOR, not only the server log. Driven at the protocol level — a real
+    /// `LspService`, a real `initialize` + `initialized` exchange — so what is
+    /// observed is what an editor receives, on the path an editor drives,
+    /// rather than a method call on a bare struct. The fixture is the dangling
+    /// `models` link the rest of the branch closes; before this change the
+    /// editor received no notification at all for it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_startup_compile_reaches_the_editor_as_an_error_message() {
+        use futures::StreamExt as _;
+        use tower::Service as _;
+        use tower::ServiceExt as _;
+        use tower_lsp::jsonrpc::Request;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("gone"), root.join("models")).unwrap();
+
+        let (mut service, mut socket) = LspService::new(|client| RockyLsp {
+            client,
+            compile_result: Arc::new(RwLock::new(None)),
+            models_dir: Arc::new(RwLock::new(None)),
+            documents: Arc::new(RwLock::new(HashMap::new())),
+            recompile_pending: Arc::new(AtomicBool::new(false)),
+            init_done: Arc::new(AtomicBool::new(false)),
+            init_notify: Arc::new(Notify::new()),
+            semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
+            schema_cache_throttle: SchemaCacheThrottle::new(),
+            salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
+            salsa_sources: Arc::new(RwLock::new(HashMap::new())),
+        });
+
+        let root_uri = Url::from_directory_path(&root).unwrap();
+        let initialize = Request::build("initialize")
+            .id(1)
+            .params(serde_json::json!({ "capabilities": {}, "rootUri": root_uri }))
+            .finish();
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(initialize)
+            .await
+            .expect("initialize answers");
+        // `initialized` awaits the startup compile, so by the time it returns
+        // whatever the failure arm sent is already queued on the socket.
+        let initialized = Request::build("initialized")
+            .params(serde_json::json!({}))
+            .finish();
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(initialized)
+            .await
+            .expect("initialized is a notification");
+
+        let shown = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while let Some(outgoing) = socket.next().await {
+                if outgoing.method() == "window/showMessage" {
+                    return Some(outgoing);
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
+        .expect("the editor must be told the startup compile failed; it was told nothing");
+        let params = shown.params().cloned().expect("showMessage carries params");
+        assert_eq!(
+            params["type"],
+            serde_json::json!(1),
+            "MessageType::ERROR, not a log-level info: {params}"
+        );
+        let message = params["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("compiling the project's models failed"),
+            "the message says what failed: {message}"
+        );
+    }
+
     use super::*;
     use indexmap::IndexMap;
     use rocky_compiler::semantic::{

@@ -43,6 +43,8 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+# The LSP protocol test reads the client socket as a stream.
+futures = { workspace = true }
 tempfile = "3"
 
 [lints]
