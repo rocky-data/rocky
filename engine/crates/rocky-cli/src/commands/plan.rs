@@ -1294,7 +1294,34 @@ pub fn compute_embedded_capabilities(
     // config identity. Every path below stamps `fingerprint_version` so a NEW
     // plan whose fingerprint could not be produced is distinguishable from a
     // genuinely-legacy plan at apply time (finding #7).
-    let loaded_cfg = rocky_core::config::load_rocky_config(config_path).ok();
+    // A gate that cannot read its input has not passed (#1702).
+    //
+    // This used to be `.ok()`. #1680 established that the degrade is
+    // fail-OPEN, not fail-closed as an earlier comment claimed: an empty
+    // schema map types both sides' leaves as `Unknown`, so a real
+    // `BIGINT -> VARCHAR` source change produces no finding, the model is
+    // ABSENT from `changed`, and `EmbeddedCapabilities::touched` gates an
+    // absent model under the bare `Apply` capability instead of
+    // `SchemaChangeBreaking`. A `schema_change.breaking` deny rule therefore
+    // did not fire on a model whose type really did change.
+    //
+    // `load_optional_project_config` keeps the one degrade that is a fact
+    // about the project rather than a failure to read it: NO config file is
+    // `Ok(None)`, and the capability computation proceeds without one
+    // exactly as before. Every other `ConfigError` — unparseable, unreadable,
+    // a dangling symlink — propagates, so the plan refuses instead of
+    // embedding a capability set computed from types it could not resolve.
+    let loaded_cfg =
+        rocky_core::config::load_optional_project_config(Some(config_path)).map_err(|e| {
+            anyhow::anyhow!(
+                "cannot compute this plan's embedded capabilities: failed to load config \
+                 from {}: {e}. The capability set decides what a governed apply is allowed \
+                 to do, and computing it without the project's source-schema cache silently \
+                 weakens it — a breaking type change would be gated as a plain apply. Fix \
+                 the config, then re-plan",
+                config_path.display()
+            )
+        })?;
     let config_identity = loaded_cfg
         .as_ref()
         .map(crate::commands::apply::config_policy_identity);
@@ -1346,21 +1373,18 @@ pub fn compute_embedded_capabilities(
     // `rocky.toml` (the `.ok()` above), a cold cache, a disabled cache, an
     // unreadable state store.
     //
-    // This used to claim the degrade "only ever fails *closed* (more models look
-    // breaking), never open." That is FALSE and #1680 corrected it. An empty map
-    // types both sides' leaves as `Unknown`, so a real `BIGINT -> VARCHAR` change
-    // on a source column produces `Unknown` vs `Unknown` — no finding at all. The
-    // model is then ABSENT from `changed`, and `EmbeddedCapabilities::touched`
-    // maps an absent model to the bare `PolicyCapability::Apply`, not
-    // `SchemaChangeBreaking` (see `plan_store.rs`). A `schema_change.breaking`
-    // deny rule therefore does not fire on a model whose type really did change.
-    // That is fail-OPEN, in the one direction the comment promised was safe.
+    // The remaining degrades here are NOT the unloadable-config one — that
+    // refuses above now (#1702). What is left is a cold cache, a disabled
+    // cache, an unreadable state store, or a project with no config file at
+    // all. Those are facts about the project rather than a gate that could
+    // not read its input, and they degrade to empty types as before.
     //
-    // Left as-is on purpose in #1680, which fixed only the comment. Refusing here
-    // changes what a governed `rocky plan` does on a config that never loaded,
-    // and the same question is open for the `rocky branch promote` gate
-    // (`branch.rs`) and `plan.rs`'s `--semantic` leg. #1667 deferred those three
-    // together and they should move together.
+    // The distinction matters because the degrade IS fail-open, as #1680
+    // established: an empty map types both sides' leaves as `Unknown`, so a
+    // real `BIGINT -> VARCHAR` source change produces no finding, the model
+    // is absent from `changed`, and `touched` gates it under the bare
+    // `Apply` capability. That is why the config case now refuses rather
+    // than joining them.
     let source_schemas = match (state_path, loaded_cfg.as_ref()) {
         (Some(sp), Some(cfg)) => {
             let schema_cfg = cfg.cache.schemas.clone().with_ttl_override(None);
@@ -2088,14 +2112,36 @@ fn compute_semantic_verdict(
     }
 
     // Seed both compiles from the current warehouse schema cache so the IR
-    // carries real leaf types. Degrade to an empty map on config / cache
-    // failure rather than blocking the preview.
-    let source_schemas = match rocky_core::config::load_rocky_config(config_path) {
-        Ok(cfg) => {
+    // carries real leaf types.
+    //
+    // `--semantic` is a PREVIEW, not an apply-authorization gate, so its way
+    // of not passing is to omit the verdict rather than to refuse the
+    // command (#1702). That distinction is the whole reason this arm differs
+    // from `compute_embedded_capabilities` above, which refuses.
+    //
+    // What it must not do is what it did before: degrade to empty types and
+    // emit a verdict anyway. Every leaf then types as `Unknown`, so a real
+    // breaking change produces no finding and the preview reads GREEN — a
+    // verdict computed from types it could not resolve, presented exactly
+    // like one that was. Omitting says "no verdict", which is true.
+    //
+    // An absent config file is not that case: there is nothing to fail to
+    // read, and the preview proceeds on empty types as before.
+    let source_schemas = match rocky_core::config::load_optional_project_config(Some(config_path)) {
+        Ok(Some(cfg)) => {
             let schema_cfg = cfg.cache.schemas.with_ttl_override(None);
             crate::source_schemas::load_cached_source_schemas(&schema_cfg, state_path)
         }
-        Err(_) => std::collections::HashMap::new(),
+        Ok(None) => std::collections::HashMap::new(),
+        Err(e) => {
+            tracing::debug!(
+                config = %config_path.display(),
+                error = %e,
+                "plan --semantic: config failed to load — verdict omitted rather than \
+                 computed from unresolved types"
+            );
+            return None;
+        }
     };
 
     let head_compile = {
@@ -2396,6 +2442,9 @@ pub(crate) async fn build_promote_plan_inner(
     )?;
 
     // Breaking-change gate — runs before the plan is written.
+    // `?` on purpose (#1702): a gate that could not read the project refuses
+    // the promote. A SKIP still returns `Ok(None)` and still lets the
+    // promote proceed — that shape is unchanged.
     let breaking_findings = run_breaking_change_gate_for_plan(
         config_path,
         models_dir,
@@ -2404,7 +2453,7 @@ pub(crate) async fn build_promote_plan_inner(
         &actor,
         &record,
         &branch_state_hash,
-    );
+    )?;
 
     if let Some(findings) = &breaking_findings {
         let breaking: Vec<_> = findings.iter().filter(|f| f.is_breaking()).collect();
