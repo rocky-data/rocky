@@ -40,6 +40,20 @@ pub struct ServerState {
     pub contracts_dir: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
     pub compile_result: RwLock<Option<CompileResult>>,
+    /// Why the LAST compile produced no result, when it did not (#1823).
+    ///
+    /// `recompile` runs in the background and used to log a failed compile
+    /// and carry on; `compile_result` then held either nothing or an earlier
+    /// compile's result, and every reader of "no result" — `GET
+    /// /api/v1/project`, the SPA — presented a project whose models cannot
+    /// be read as clean: no diagnostics, `has_errors: false`. This is the
+    /// third state beside "compiled clean" and "compiled with errors":
+    /// "the compile did not complete", with its reason. Set by every
+    /// failing exit of `recompile` (a compile error, a panicked compile
+    /// task); cleared by a compile that produces a result. A stale
+    /// `compile_result` may sit beside it, for the LSP's sake; a status
+    /// reader must not project that result's counts while this stands.
+    pub compile_failure: RwLock<Option<String>>,
     /// Latest DAG execution status, exposed at `GET /api/v1/dag/status`.
     pub dag_status: DagStatusStore,
     /// App-level single-mutating-job guard for the HTTP job model. A second
@@ -216,6 +230,7 @@ impl ServerState {
             webhook,
             ui,
             compile_result: RwLock::new(None),
+            compile_failure: RwLock::new(None),
             dag_status: DagStatusStore::new(),
             mutation_permit: crate::jobs::MutationPermit::new(),
             jobs: crate::jobs::JobRegistry::new(),
@@ -327,6 +342,8 @@ impl ServerState {
                 Ok(r) => r,
                 Err(join_err) => {
                     warn!(error = %join_err, "compile task join failed");
+                    *self.compile_failure.write().await =
+                        Some(format!("the compile task did not complete: {join_err}"));
                     return config_unreadable;
                 }
             };
@@ -357,6 +374,7 @@ impl ServerState {
                 let diag_count = result.diagnostics.len();
                 let has_errors = result.has_errors;
                 *self.compile_result.write().await = Some(result);
+                *self.compile_failure.write().await = None;
                 info!(
                     models = model_count,
                     diagnostics = diag_count,
@@ -365,7 +383,13 @@ impl ServerState {
                 );
             }
             Err(e) => {
+                // Logged, as before — and RECORDED (#1823), so a reader of
+                // the state can tell "the compile failed" from "nothing to
+                // report". The warning alone left `GET /api/v1/project` and
+                // the SPA describing a project whose models cannot be read as
+                // clean.
                 warn!(error = %e, "compilation failed");
+                *self.compile_failure.write().await = Some(e.to_string());
             }
         }
 
@@ -515,6 +539,51 @@ mod tests {
             0,
             "allow_unmasked must suppress W004 in the server compile path"
         );
+    }
+
+    /// #1823. A compile that FAILS — here the `models` entry is a dangling
+    /// symlink, which the walker refuses since #1817 — was logged and
+    /// dropped: `compile_result` stayed `None`, and every reader of `None`
+    /// took it for "nothing to report". The failure is recorded now, with
+    /// its reason, and a compile that produces a result clears it.
+    #[tokio::test]
+    async fn a_failed_compile_is_recorded_and_a_later_success_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::os::unix::fs::symlink(dir.path().join("gone"), &models_dir).unwrap();
+        let state = ServerState::new(models_dir.clone(), None, None);
+
+        state.recompile().await;
+        let failure = state
+            .compile_failure
+            .read()
+            .await
+            .clone()
+            .expect("a compile that produced no result is recorded, not just logged");
+        assert!(
+            failure.contains("models"),
+            "the reason names what could not be read: {failure}"
+        );
+        assert!(
+            state.compile_result.read().await.is_none(),
+            "precondition: there is no result to read"
+        );
+
+        // Repair the project: the link becomes a directory with one model.
+        std::fs::remove_file(&models_dir).unwrap();
+        std::fs::create_dir(&models_dir).unwrap();
+        std::fs::write(models_dir.join("users.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("users.toml"),
+            "name = \"users\"\n\n[target]\ncatalog = \"demo\"\nschema = \"main\"\ntable = \"users\"\n",
+        )
+        .unwrap();
+        state.recompile().await;
+        assert!(
+            state.compile_failure.read().await.is_none(),
+            "a compile that produced a result clears the recorded failure"
+        );
+        assert!(state.compile_result.read().await.is_some());
     }
 
     /// The case #1625 is about, on the `serve` side.

@@ -10381,8 +10381,18 @@ pub struct ProjectOutput {
     pub pipelines: Vec<ProjectPipelineOutput>,
     /// Every `[adapter.<name>]`, in config order.
     pub adapters: Vec<ProjectAdapterOutput>,
+    /// Why the last compile produced no result, when it did not: the models
+    /// could not be read, a model failed to load, the compile task panicked.
+    /// While this stands `models_compiled` is `null` and
+    /// `diagnostics.has_errors` is `true`, whatever an earlier compile found:
+    /// a project whose models cannot be compiled is not a clean project, and
+    /// counts from a compile that no longer describes it are not shown
+    /// beside its failure (#1823). Absent when the last compile produced a
+    /// result, and before the first compile finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compile_error: Option<String>,
     /// Models in the in-memory compile result; `null` before the first
-    /// compile finishes.
+    /// compile finishes, and while `compile_error` stands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models_compiled: Option<u64>,
     /// The compile's diagnostics, counted.
@@ -10414,6 +10424,10 @@ pub struct ProjectAdapterOutput {
 pub struct ProjectDiagnosticsOutput {
     pub total: u64,
     pub warnings: u64,
+    /// `true` when the compile reported an error-severity diagnostic — and
+    /// also when the last compile produced no result at all
+    /// (`compile_error` on the project), with `total` and `warnings` at
+    /// zero: "did not compile" is never "no errors" (#1823).
     pub has_errors: bool,
 }
 

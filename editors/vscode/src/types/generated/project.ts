@@ -16,6 +16,10 @@ export interface ProjectOutput {
    */
   adapters: ProjectAdapterOutput[];
   /**
+   * Why the last compile produced no result, when it did not: the models could not be read, a model failed to load, the compile task panicked. While this stands `models_compiled` is `null` and `diagnostics.has_errors` is `true`, whatever an earlier compile found: a project whose models cannot be compiled is not a clean project, and counts from a compile that no longer describes it are not shown beside its failure (#1823). Absent when the last compile produced a result, and before the first compile finishes.
+   */
+  compile_error?: string | null;
+  /**
    * Why the config could not be loaded, when it could not. The lists below are then empty.
    */
   config_error?: string | null;
@@ -32,7 +36,7 @@ export interface ProjectOutput {
    */
   last_run?: ProjectRunOutput | null;
   /**
-   * Models in the in-memory compile result; `null` before the first compile finishes.
+   * Models in the in-memory compile result; `null` before the first compile finishes, and while `compile_error` stands.
    */
   models_compiled?: number | null;
   /**
@@ -60,6 +64,9 @@ export interface ProjectAdapterOutput {
  * The compile's diagnostics, counted. All zero before the first compile.
  */
 export interface ProjectDiagnosticsOutput {
+  /**
+   * `true` when the compile reported an error-severity diagnostic — and also when the last compile produced no result at all (`compile_error` on the project), with `total` and `warnings` at zero: "did not compile" is never "no errors" (#1823).
+   */
   has_errors: boolean;
   total: number;
   warnings: number;

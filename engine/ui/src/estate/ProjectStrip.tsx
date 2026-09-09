@@ -12,6 +12,13 @@ export function ProjectStrip({ project, now }: { project: ProjectOutput; now?: n
     : project.diagnostics.warnings > 0
       ? "warn"
       : "ok";
+  // A compile that produced no result is its own state, with its reason:
+  // the counts would describe a compile that no longer exists (#1823).
+  const compileSub = project.compile_error
+    ? `compile failed: ${project.compile_error}`
+    : `${project.diagnostics.total} diagnostics, ${project.diagnostics.warnings} warnings${
+        project.diagnostics.has_errors ? ", errors" : ""
+      }`;
   const list = (items: { name: string; kind: string }[]) =>
     items.length === 0 ? "none" : items.map((item) => `${item.name} (${item.kind})`).join(", ");
 
@@ -38,9 +45,7 @@ export function ProjectStrip({ project, now }: { project: ProjectOutput; now?: n
           label="models compiled"
           value={orNotRecorded(project.models_compiled)}
           tone={diagnosticsTone}
-          sub={`${project.diagnostics.total} diagnostics, ${project.diagnostics.warnings} warnings${
-            project.diagnostics.has_errors ? ", errors" : ""
-          }`}
+          sub={compileSub}
         />
       </div>
       <StatusCard

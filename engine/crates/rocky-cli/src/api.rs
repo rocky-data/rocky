@@ -875,6 +875,13 @@ async fn health() -> PrettyJson<HealthOutput> {
 /// bound), the counts from the in-memory compile result, and `last_run`
 /// from the state store the server resolved, namespace included. Bounded by
 /// construction: no model names, one run. Reads only.
+///
+/// A compile that produced no result is its own state (#1823):
+/// `compile_error` carries the reason, `models_compiled` is `null`, and
+/// `diagnostics.has_errors` is `true`. Before this, a background compile
+/// that failed was logged and the route read the absent result as a clean
+/// project — no diagnostics, `has_errors: false` — which is what the SPA
+/// then showed for a project whose models could not be read at all.
 async fn project(
     State(state): State<Arc<ServerState>>,
 ) -> Result<PrettyJson<ProjectOutput>, ApiError> {
@@ -913,7 +920,21 @@ async fn project(
         }
     };
 
-    let (models_compiled, diagnostics) = {
+    let compile_error = state.compile_failure.read().await.clone();
+    let (models_compiled, diagnostics) = if compile_error.is_some() {
+        // The last compile produced no result. Whatever `compile_result`
+        // holds is from an earlier compile, kept for the LSP; its counts do
+        // not describe this project any more and are not shown beside the
+        // failure. `has_errors` is true: this is not a clean project.
+        (
+            None,
+            crate::output::ProjectDiagnosticsOutput {
+                total: 0,
+                warnings: 0,
+                has_errors: true,
+            },
+        )
+    } else {
         let lock = state.compile_result.read().await;
         match lock.as_ref() {
             Some(result) => (
@@ -969,6 +990,7 @@ async fn project(
         config_error,
         pipelines,
         adapters,
+        compile_error,
         models_compiled,
         diagnostics,
         last_run,
@@ -4524,6 +4546,90 @@ mod tests {
         assert_eq!(project["name"], "broken");
         assert!(project["config_error"].is_string(), "{project}");
         assert_eq!(project["pipelines"], serde_json::json!([]));
+    }
+
+    /// #1823. The background compile failed — the project's `models` entry
+    /// is a dangling symlink, which the walker refuses since #1817 — and the
+    /// route read the absent result as a clean project: `diagnostics: []`,
+    /// `has_errors: false`. Now the failure is its own state on the wire,
+    /// with the reason, and it clears when a later compile produces a result.
+    #[tokio::test]
+    async fn the_project_route_reports_a_failed_compile_rather_than_a_clean_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("broken-models");
+        std::fs::create_dir_all(&root).unwrap();
+        let config = root.join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter]\ntype = \"duckdb\"\npath = \"probe.duckdb\"\n\n\
+             [pipeline.main]\ntype = \"transformation\"\nmodels = \"models/**\"\n",
+        )
+        .unwrap();
+        let models = root.join("models");
+        std::os::unix::fs::symlink(root.join("gone"), &models).unwrap();
+        let state_path = root.join("state.redb");
+        let state = pinned_server(models.clone(), Some(config), &state_path);
+        let base = spawn_router(Arc::clone(&state)).await;
+
+        // The initial compile runs in the background; wait for it to fail.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let project = loop {
+            let project: serde_json::Value = reqwest::get(format!("{base}/api/v1/project"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if project.get("compile_error").is_some() {
+                break project;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the failed compile never reached the route: {project}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        let reason = project["compile_error"].as_str().expect("a string reason");
+        assert!(
+            reason.contains("models"),
+            "the reason names what could not be read: {reason}"
+        );
+        assert_eq!(
+            project["diagnostics"]["has_errors"],
+            serde_json::json!(true),
+            "a project that did not compile is not clean: {project}"
+        );
+        assert!(
+            project.get("models_compiled").is_none(),
+            "no count from a compile that produced no result: {project}"
+        );
+        assert_eq!(project["diagnostics"]["total"], 0, "{project}");
+
+        // Repair the project and recompile: the state clears.
+        std::fs::remove_file(&models).unwrap();
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(models.join("users.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models.join("users.toml"),
+            "name = \"users\"\n\n[target]\ncatalog = \"probe\"\nschema = \"main\"\ntable = \"users\"\n",
+        )
+        .unwrap();
+        state.recompile().await;
+        let project: serde_json::Value = reqwest::get(format!("{base}/api/v1/project"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            project.get("compile_error").is_none(),
+            "a compile that produced a result clears the failure: {project}"
+        );
+        assert_eq!(project["models_compiled"], 1, "{project}");
+        assert_eq!(
+            project["diagnostics"]["has_errors"],
+            serde_json::json!(false)
+        );
     }
 
     /// The server-rendered dashboard is retired: `/dashboard` is no route in
