@@ -742,8 +742,16 @@ pub(crate) fn run_approval_gate(
 
 /// Run the breaking-change gate for a plan step, updating `audit`.
 ///
-/// Returns the same `Option<Vec<BreakingFinding>>` as the internal
-/// `evaluate_breaking_change_gate` — `None` when the gate was skipped.
+/// Mirrors the internal `evaluate_breaking_change_gate`:
+///
+/// - `Ok(Some(findings))` — the gate ran; the caller filters on
+///   [`BreakingFinding::is_breaking`];
+/// - `Ok(None)` — the gate was SKIPPED (no models directory, or either side
+///   failed to compile), with a `BreakingChangesGateSkipped` audit event
+///   carrying the reason. The caller lets the promote proceed;
+/// - `Err(_)` — the gate could not read the project at all (#1702). That is
+///   NOT a skip: skipping would let the promote through past a gate that
+///   examined nothing.
 pub(crate) fn run_breaking_change_gate_for_plan(
     config_path: &Path,
     models_dir: &Path,
@@ -752,7 +760,7 @@ pub(crate) fn run_breaking_change_gate_for_plan(
     actor: &ApproverIdentity,
     record: &BranchRecord,
     branch_state_hash: &str,
-) -> Option<Vec<rocky_core::breaking_change::BreakingFinding>> {
+) -> anyhow::Result<Option<Vec<rocky_core::breaking_change::BreakingFinding>>> {
     evaluate_breaking_change_gate(
         config_path,
         models_dir,
@@ -1419,7 +1427,7 @@ fn evaluate_breaking_change_gate(
     actor: &ApproverIdentity,
     record: &BranchRecord,
     branch_state_hash: &str,
-) -> Option<Vec<BreakingFinding>> {
+) -> anyhow::Result<Option<Vec<BreakingFinding>>> {
     use rocky_compiler::compile::{self, CompilerConfig};
 
     let push_skip = |audit: &mut Vec<AuditEvent>, reason: String| {
@@ -1442,22 +1450,41 @@ fn evaluate_breaking_change_gate(
                 models_dir.display()
             ),
         );
-        return None;
+        return Ok(None);
     }
 
     // Seed both compiles with the cached source schemas so the resulting
-    // IR uses real types rather than `Unknown`. Mirrors `compute_ci_diff`'s
-    // policy: degrade to an empty map on config / cache failure rather than
-    // blocking the promote on a configuration issue.
-    let source_schemas = match rocky_core::config::load_rocky_config(config_path) {
-        Ok(cfg) => {
+    // IR uses real types rather than `Unknown`.
+    //
+    // An unloadable config REFUSES the promote (#1702). It cannot skip: the
+    // caller reads a skipped gate as `if let Some(findings)`, so `None`
+    // lets the promote through — and the old degrade produced the same
+    // outcome more quietly, by typing every leaf `Unknown` so that no
+    // breaking change could be found. Either way a promote proceeded past a
+    // gate that never read the project. A gate that cannot read its input
+    // has not passed.
+    //
+    // An absent config file is not that case, and still degrades: there is
+    // nothing to fail to read.
+    let source_schemas = match rocky_core::config::load_optional_project_config(Some(config_path)) {
+        Ok(Some(cfg)) => {
             let schema_cfg = cfg.cache.schemas.with_ttl_override(None);
             // The state path is independent of the source-schemas cache for
             // the gate's purposes; use the workspace default.
             let state_path = std::path::PathBuf::from(".rocky/state.redb");
             crate::source_schemas::load_cached_source_schemas(&schema_cfg, &state_path)
         }
-        Err(_) => std::collections::HashMap::new(),
+        Ok(None) => std::collections::HashMap::new(),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "cannot evaluate the breaking-change gate: failed to load config from {}: \
+                 {e}. Promoting past a gate that could not read the project would allow a \
+                 breaking change through unexamined — every source column would type as \
+                 `Unknown`, so nothing could be found breaking. Fix the config, then \
+                 re-run the promote",
+                config_path.display()
+            ));
+        }
     };
 
     let head_compile = {
@@ -1471,7 +1498,7 @@ fn evaluate_breaking_change_gate(
             Ok(r) => r,
             Err(e) => {
                 push_skip(audit, format!("HEAD compile failed — gate skipped: {e}"));
-                return None;
+                return Ok(None);
             }
         }
     };
@@ -1481,13 +1508,13 @@ fn evaluate_breaking_change_gate(
             Ok(r) => r,
             Err(reason) => {
                 push_skip(audit, format!("{reason} — gate skipped"));
-                return None;
+                return Ok(None);
             }
         };
 
     let base_ir = compile_result_to_project_ir(&base_compile);
     let head_ir = compile_result_to_project_ir(&head_compile);
-    Some(breaking_change::diff_project_ir(&base_ir, &head_ir))
+    Ok(Some(breaking_change::diff_project_ir(&base_ir, &head_ir)))
 }
 
 /// Project a [`rocky_compiler::compile::CompileResult`] into a
@@ -2467,7 +2494,9 @@ mod tests {
 
         std::env::set_current_dir(saved_cwd).unwrap();
 
-        let findings = findings.expect("gate must run when both refs compile");
+        let findings = findings
+            .expect("the gate must not refuse: the config loads")
+            .expect("gate must run when both refs compile");
         let breaking: Vec<&BreakingFinding> = findings.iter().filter(|f| f.is_breaking()).collect();
         assert!(
             !breaking.is_empty(),
@@ -2546,11 +2575,69 @@ mod tests {
 
         std::env::set_current_dir(saved_cwd).unwrap();
 
-        let findings = findings.expect("gate must run when both refs compile");
+        let findings = findings
+            .expect("the gate must not refuse: the config loads")
+            .expect("gate must run when both refs compile");
         let breaking_count = findings.iter().filter(|f| f.is_breaking()).count();
         assert_eq!(
             breaking_count, 0,
             "a SQL-body-only change must produce zero breaking findings, got {findings:?}"
+        );
+    }
+
+    /// An UNLOADABLE config refuses the gate rather than skipping it
+    /// (#1702).
+    ///
+    /// The distinction this pins is the whole point: a missing models
+    /// directory SKIPS (the test below), and a skip lets the promote
+    /// proceed — the caller reads the gate as `if let Some(findings)`. So
+    /// if an unreadable config also skipped, a promote would pass a gate
+    /// that examined nothing. Worse, the behaviour before this change was
+    /// quieter than a skip: the config error degraded to an empty schema
+    /// map, every source column typed as `Unknown`, no finding could be
+    /// breaking, and the gate reported a clean pass it had not earned.
+    ///
+    /// Asserted on the ERROR, not on a message: the promote must not
+    /// proceed. The audit must stay empty, because this is not a skip and
+    /// recording it as one would be the same lie in the ledger.
+    #[test]
+    fn gate_refuses_rather_than_skips_when_the_config_cannot_be_read() {
+        let _cwd_guard = cwd_lock();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        // Present and unparseable — NOT absent. Absence is an ordinary
+        // project fact and still degrades; this is a config that exists and
+        // cannot be read.
+        let broken = "[adapters.duckdb\ntype = \"duckdb\"\n";
+        let models_dir = init_git_repo_with_models(dir, broken, &[("widgets", "SELECT 1 AS id")]);
+
+        let config_path = dir.join("rocky.toml");
+        let mut audit: Vec<AuditEvent> = Vec::new();
+        let record = sample_record("fix-price");
+
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+        let result = evaluate_breaking_change_gate(
+            &config_path,
+            &models_dir,
+            "main",
+            &mut audit,
+            &dummy_actor(),
+            &record,
+            "branch-state-hash",
+        );
+        std::env::set_current_dir(saved_cwd).unwrap();
+
+        let err = result.expect_err("an unreadable config must refuse the promote, not skip it");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("failed to load config"),
+            "the refusal names the cause: {msg}"
+        );
+        assert!(
+            audit.is_empty(),
+            "a refusal is not a skip — recording BreakingChangesGateSkipped would claim the \
+             gate ran and was bypassed for a known reason: {audit:?}"
         );
     }
 
@@ -2602,7 +2689,9 @@ mod tests {
         std::env::set_current_dir(saved_cwd).unwrap();
 
         assert!(
-            findings.is_none(),
+            findings
+                .expect("the gate must not refuse: the config loads")
+                .is_none(),
             "gate must return None when the base ref has no models"
         );
         assert_eq!(audit.len(), 1, "exactly one skip event must be recorded");
@@ -2641,7 +2730,11 @@ mod tests {
             "branch-state-hash",
         );
 
-        assert!(findings.is_none());
+        assert!(
+            findings
+                .expect("a missing models dir SKIPS the gate; it does not refuse")
+                .is_none()
+        );
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].kind, AuditEventKind::BreakingChangesGateSkipped);
     }
