@@ -214,7 +214,7 @@ pub struct RunFailed {
 /// writes and then failed its check gate: at least one error-severity check
 /// failed, or could not be evaluated, while `[pipeline.<name>.checks]
 /// fail_on_error` was on. Exit 1, as the untyped `bail!` it replaces was; the
-/// message is unchanged.
+/// message is the one it printed, plus the run id.
 ///
 /// The TYPE exists for the same reason [`RunFailed`] does (#1816): the
 /// quality arm of the dispatcher still holds the run's remote-state session
@@ -861,10 +861,13 @@ pub(crate) static FAIL_RECORD_WRITE_FOR_TEST: std::sync::Mutex<Option<String>> =
 ///
 /// Returns whether the record landed (`false` when there is no store, or the
 /// write failed). A caller whose error TYPE tells the dispatcher "my record
-/// is persisted, upload it" must check this before returning that type
-/// (`run_quality`'s `QualityGateFailure`, #1816): finalizing on a record that
-/// is not there publishes a ledger without the run, and a fresh pod then
-/// reads an authoritative history with the failure missing.
+/// is persisted, upload it" should check this before returning that type:
+/// finalizing on a record that is not there publishes a ledger without the
+/// run, and a fresh pod then reads an authoritative history with the failure
+/// missing. `run_quality` checks it before its `QualityGateFailure` (#1816);
+/// the transformation, snapshot and load arms do not yet, and their typed
+/// sentinels carry the same exposure (#1836). Nothing forces the check — a
+/// `bool` can be dropped — which is the shape #1836 is about.
 pub(crate) fn persist_run_record(
     state_store: Option<&StateStore>,
     output: &RunOutput,
@@ -14121,13 +14124,15 @@ mod tests {
         run_id: &str,
     ) -> anyhow::Result<super::RunTermination> {
         let config_path = project.join("rocky.toml");
+        // A TOML literal string (single quotes), so a path with backslashes
+        // is not read as escape sequences.
         std::fs::write(
             &config_path,
             format!(
                 r#"
 [adapter]
 type = "duckdb"
-path = "{}"
+path = '{}'
 
 [pipeline.dq]
 type = "quality"
