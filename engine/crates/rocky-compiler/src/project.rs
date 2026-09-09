@@ -141,6 +141,13 @@ pub enum ProjectError {
     #[error("no models found in {path}")]
     NoModels { path: String },
 
+    /// The models tree could not be fully walked. Its own variant, so a walk
+    /// failure is never rendered as "failed to read model file" about an
+    /// entry nobody knows to be a file — and never as `NoModels`, which the
+    /// policy plane reads as a PROVEN empty set (#1817).
+    #[error("models tree: {0}")]
+    ModelsTree(#[from] rocky_core::model_walk::ModelWalkError),
+
     #[error("invalid models glob '{pattern}': {reason}")]
     InvalidModelsGlob { pattern: String, reason: String },
 
@@ -164,6 +171,7 @@ fn walk_error_dir(e: &rocky_core::model_walk::ModelWalkError) -> &Path {
         ModelWalkError::ReadDir { dir, .. }
         | ModelWalkError::DirEntry { dir, .. }
         | ModelWalkError::DepthCeiling { dir, .. } => dir,
+        ModelWalkError::UnresolvedEntry { path, .. } => path,
     }
 }
 
@@ -276,7 +284,7 @@ impl Project {
             .position(|e| walk_error_dir(e) == models_dir)
             .map(|i| walk_errors.remove(i));
         if let Some(walk_error) = root_error {
-            return Err(models::ModelError::from(std::io::Error::other(walk_error)).into());
+            return Err(ProjectError::ModelsTree(walk_error));
         }
 
         let mut models = Vec::new();
@@ -310,7 +318,7 @@ impl Project {
         // subtree has not been shown to hold no models, it has been shown to
         // be unreadable (#1822, round five).
         if let Some(walk_error) = walk_errors.into_iter().next() {
-            return Err(models::ModelError::from(std::io::Error::other(walk_error)).into());
+            return Err(ProjectError::ModelsTree(walk_error));
         }
 
         if models.is_empty() {
@@ -462,14 +470,26 @@ fn model_path_matches(pattern: &glob::Pattern, path: &Path) -> bool {
 fn has_matching_model_source(root: &Path, pattern: &glob::Pattern) -> Result<bool, ProjectError> {
     // Walks the same tree the loader walks (#1262): a project whose only
     // matching sources sit below the first level must not be reported as
-    // having no models. Walk errors are ignored HERE on purpose — this is a
-    // pre-check answering "is there anything at all"; the loader immediately
-    // behind it surfaces the same errors strictly.
-    let (dirs, _) = rocky_core::model_walk::walk_model_dirs(root);
+    // having no models.
+    //
+    // Walk errors used to be ignored here "on purpose", on the reasoning that
+    // the strict loader behind this pre-check would surface them. It never
+    // got the chance: when nothing matched, the caller answered `NoModels`
+    // from THIS function's `false` and returned before the loader ran — so
+    // a tree whose only matching subtree was `gold -> gone` compiled as
+    // "no models", and the policy plane reads `NoModels` as a PROVEN empty
+    // set: a `deny` scoped to that layer stopped matching, and compact or
+    // archive SQL could run on attributes nobody could read (#1817, round
+    // six). A match still wins — something loadable is there. Nothing
+    // matching plus a walk error is the walk error.
+    let (dirs, walk_errors) = rocky_core::model_walk::walk_model_dirs(root);
     for dir in dirs {
         if dir_has_matching_model_source(&dir, pattern)? {
             return Ok(true);
         }
+    }
+    if let Some(walk_error) = walk_errors.into_iter().next() {
+        return Err(ProjectError::ModelsTree(walk_error));
     }
     Ok(false)
 }
@@ -1357,6 +1377,31 @@ mod recursive_load_tests {
         let mut names: Vec<&str> = loaded.iter().map(|m| m.config.name.as_str()).collect();
         names.sort_unstable();
         assert_eq!(names, ["lvl2", "top"]);
+    }
+
+    /// #1817, round six. The glob pre-check discarded walk errors and the
+    /// caller answered `NoModels` from its `false` before the strict loader
+    /// ever ran. `NoModels` is read by the policy plane as a PROVEN empty
+    /// set — a `deny` scoped to `layer = "gold"` stops matching — so a tree
+    /// whose only matching subtree was `gold -> gone` could authorise a
+    /// compact or archive on attributes nobody could read.
+    #[cfg(unix)]
+    #[test]
+    fn a_filtered_compile_reports_a_dangling_subtree_instead_of_no_models() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("gone"), models.join("gold")).unwrap();
+
+        let mut db = crate::salsa_compile::RockyDatabase::default();
+        let glob = format!("{}/**", models.display());
+        let err = Project::load_models_matching_with_db(&models, &glob, &mut db, None)
+            .expect_err("an unreadable subtree is not an empty one");
+        assert!(
+            matches!(err, ProjectError::ModelsTree(_)),
+            "the walk error, never `NoModels`: {err}"
+        );
+        assert!(format!("{err}").contains("gold"), "{err}");
     }
 
     /// A project whose ONLY matching sources sit below the first level is not

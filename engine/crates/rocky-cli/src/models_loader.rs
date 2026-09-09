@@ -369,6 +369,7 @@ fn walk_error_dir(e: &rocky_core::model_walk::ModelWalkError) -> &Path {
         ModelWalkError::ReadDir { dir, .. }
         | ModelWalkError::DirEntry { dir, .. }
         | ModelWalkError::DepthCeiling { dir, .. } => dir,
+        ModelWalkError::UnresolvedEntry { path, .. } => path,
     }
 }
 

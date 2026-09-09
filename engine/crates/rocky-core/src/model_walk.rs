@@ -43,6 +43,18 @@ pub enum ModelWalkError {
          models below it were not loaded"
     )]
     DepthCeiling { dir: PathBuf, limit: usize },
+    /// An entry of the tree that is there and cannot be resolved — a symlink
+    /// to nowhere. Its kind is unknowable (a subtree of models, or a README:
+    /// its NAME cannot say), so this variant names neither "directory" nor
+    /// "file"; the earlier shape of this error did, and the review read the
+    /// contradiction. A models tree with a link to nowhere is refused
+    /// whatever the link is called (#1817).
+    #[error(
+        "entry '{path}' of the models tree cannot be resolved: {detail}. A models tree with \
+         a link to nowhere is refused whatever the link is called, because its name cannot \
+         say what it pointed at; repair or remove it"
+    )]
+    UnresolvedEntry { path: PathBuf, detail: String },
 }
 
 /// Every directory of the models tree under `root`, pre-order.
@@ -89,10 +101,7 @@ pub fn walk_model_dirs(root: &Path) -> (Vec<PathBuf>, Vec<ModelWalkError>) {
                 match crate::path_presence::classify_not_found(&dir) {
                     crate::path_presence::PathPresence::Absent => continue,
                     crate::path_presence::PathPresence::Present { detail } => {
-                        errors.push(ModelWalkError::ReadDir {
-                            dir,
-                            source: std::io::Error::new(std::io::ErrorKind::NotFound, detail),
-                        });
+                        errors.push(ModelWalkError::UnresolvedEntry { path: dir, detail });
                         continue;
                     }
                 }
@@ -143,17 +152,9 @@ pub fn walk_model_dirs(root: &Path) -> (Vec<PathBuf>, Vec<ModelWalkError>) {
                         match crate::path_presence::classify_not_found(&entry.path()) {
                             crate::path_presence::PathPresence::Absent => {}
                             crate::path_presence::PathPresence::Present { detail } => {
-                                errors.push(ModelWalkError::ReadDir {
-                                    dir: entry.path(),
-                                    source: std::io::Error::new(
-                                        std::io::ErrorKind::NotFound,
-                                        format!(
-                                            "{detail}. A models tree with a link to nowhere \
-                                             is refused whatever the link is called, because \
-                                             its name cannot say what it pointed at; repair \
-                                             or remove it"
-                                        ),
-                                    ),
+                                errors.push(ModelWalkError::UnresolvedEntry {
+                                    path: entry.path(),
+                                    detail,
                                 });
                             }
                         }
