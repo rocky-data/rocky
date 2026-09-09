@@ -579,7 +579,7 @@
       "properties": {
         "anomaly_threshold_pct": {
           "default": 50.0,
-          "description": "Row count anomaly detection threshold (percentage deviation from baseline). Default: 50.0 (50% deviation triggers anomaly).\n\n`0` disables detection. It used to do the opposite — the comparison is `deviation_pct > threshold_pct`, so `0` flagged every table whose count moved at all, and an operator following this sentence to turn detection off turned it maximally on. A negative value disables it too.",
+          "description": "Row count anomaly detection threshold (percentage deviation from baseline). Default: 50.0 (50% deviation triggers anomaly).\n\n`0` disables detection. It used to do the opposite — the comparison is `deviation_pct > threshold_pct`, so `0` flagged every table whose count moved at all, and an operator following this sentence to turn detection off turned it maximally on. A negative value disables it too.\n\nMust be a finite number. TOML accepts `nan` and `inf`, and a NaN threshold disabled detection silently: every comparison with NaN is false, so nothing was flagged and every count was called \"within normal range\" (#1816). A non-finite value is refused when the config loads; `0` is the way to turn detection off, and it says so in the result.",
           "format": "double",
           "type": "number"
         },

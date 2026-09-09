@@ -6492,13 +6492,35 @@ pub struct AnomalyResult {
 /// Detects row count anomalies by comparing against historical baseline.
 ///
 /// An anomaly is flagged when the current count deviates from the moving average
-/// by more than `threshold_pct` (e.g., 50.0 = 50% deviation).
+/// by more than `threshold_pct` (e.g., 50.0 = 50% deviation). `threshold_pct <= 0`
+/// disables detection and says so in `reason`.
+///
+/// A threshold that is not a finite number (`NaN`, `±inf`) cannot be compared
+/// against, and used to fall through both branches to "within normal range"
+/// with detection silently off (#1816). Config loading now refuses such a
+/// value, so this is reached only by a caller that bypassed it; it fails
+/// closed — `is_anomaly: true`, with a `reason` that names the threshold —
+/// because the one outcome it must not have is a quiet "normal".
 pub fn detect_anomaly(
     table_key: &str,
     current_count: u64,
     history: &[CheckSnapshot],
     threshold_pct: f64,
 ) -> AnomalyResult {
+    if !threshold_pct.is_finite() {
+        return AnomalyResult {
+            table: table_key.to_string(),
+            current_count,
+            baseline_avg: current_count as f64,
+            deviation_pct: 0.0,
+            is_anomaly: true,
+            reason: format!(
+                "anomaly_threshold_pct is {threshold_pct}, not a finite number: the threshold \
+                 cannot be evaluated, so this count is flagged rather than called normal"
+            ),
+        };
+    }
+
     if history.is_empty() {
         return AnomalyResult {
             table: table_key.to_string(),
@@ -7366,6 +7388,59 @@ mod tests {
         assert!(detect_anomaly("tbl", 105, &history, 1.0).is_anomaly);
         // 5% move against a 10% threshold: not one.
         assert!(!detect_anomaly("tbl", 105, &history, 10.0).is_anomaly);
+    }
+
+    /// #1816. `NaN` failed both `threshold_pct > 0.0` and `threshold_pct <= 0.0`,
+    /// so a 400% spike came back `is_anomaly: false`, "within normal range":
+    /// detection off, and the result described as measured. `+inf` reached
+    /// the same place through the other branch — no deviation exceeds it.
+    /// Neither may be called normal. The threshold is refused at config load;
+    /// here, for a caller that bypassed it, the result fails closed.
+    #[test]
+    fn a_non_finite_threshold_is_never_called_normal() {
+        let history = vec![
+            CheckSnapshot {
+                timestamp: Utc::now(),
+                row_count: 100,
+            },
+            CheckSnapshot {
+                timestamp: Utc::now(),
+                row_count: 100,
+            },
+        ];
+        for threshold in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            // A 400% spike, unmissable at any real threshold.
+            let spike = detect_anomaly("tbl", 500, &history, threshold);
+            assert!(spike.is_anomaly, "{threshold}: {}", spike.reason);
+            assert!(
+                !spike.reason.contains("within normal range"),
+                "{threshold}: {}",
+                spike.reason
+            );
+            assert!(
+                spike.reason.contains("not a finite number"),
+                "{threshold}: the reason names the misconfiguration: {}",
+                spike.reason
+            );
+            // An unchanged count is flagged too: the flag is about the
+            // threshold, not the data, so it cannot be mistaken for a
+            // measurement that cleared.
+            let flat = detect_anomaly("tbl", 100, &history, threshold);
+            assert!(flat.is_anomaly, "{threshold}: {}", flat.reason);
+            // And a first run, which has no baseline to compare against,
+            // still refuses to report a threshold it cannot evaluate.
+            let first = detect_anomaly("tbl", 100, &[], threshold);
+            assert!(first.is_anomaly, "{threshold}: {}", first.reason);
+        }
+        // The discriminator: the same spike at the default threshold is an
+        // ordinary anomaly with a measured reason, and the flat count is not
+        // one at all.
+        assert!(
+            detect_anomaly("tbl", 500, &history, 50.0)
+                .reason
+                .contains("spiked")
+        );
+        assert!(!detect_anomaly("tbl", 100, &history, 50.0).is_anomaly);
     }
 
     #[test]
