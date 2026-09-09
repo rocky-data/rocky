@@ -173,8 +173,8 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: "The Rocky scheduler cannot read its webhook spool; pending webhook demands are not being consumed and new deliveries are refused."
-          description: "rocky.scheduler.ticks with outcome=spool_unreadable has been continuously non-zero for 5 minutes — something is at .rocky/pending-demands that cannot be read (a dangling symlink, a permissions change). Webhook demands accepted before this cannot be consumed, and a new delivery is refused (HTTP 500 from the webhook endpoint) until the spool is repaired — it is NOT spooled. Scheduled (cron, after, freshness) work may still be running. Repair the spool path; the next tick consumes what was pending, and any delivery refused meanwhile has to be retried by its sender."
+          summary: "The Rocky scheduler cannot read its webhook spool; pending webhook demands are not being consumed and new deliveries may fail."
+          description: "rocky.scheduler.ticks with outcome=spool_unreadable has been continuously non-zero for 5 minutes — something is at .rocky/pending-demands that cannot be read (a dangling symlink, a permissions change). Webhook demands accepted before this are not being consumed, and a delivery made meanwhile may be answered HTTP 500 by the webhook endpoint: that answer means its persistence is UNCERTAIN, not that nothing was written, so a sender must retry it with the same X-Rocky-Delivery id (a body-keyed retry can run the demand twice). Scheduled (cron, after, freshness) work may still be running. Repair the spool path; eligible pending demands resume on the next tick (a paused pipeline's stay pending until it is resumed)."
         data:
           - refId: A
             relativeTimeRange:
