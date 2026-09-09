@@ -159,11 +159,13 @@ groups:
                     type: gt
                     params: [0]
 
-      # The webhook spool cannot be read: every tick reconciles its configured
-      # schedules but consumes no webhook demand, and says so with its own
-      # outcome (#1812). A separate rule from tick-errors on purpose: cron /
-      # after / freshness work may still be running, so the message must not
-      # claim the loop is doing nothing. Same window and `for` as tick-errors.
+      # The webhook spool scan keeps failing: a tick whose scan fails reconciles
+      # its configured schedules but consumes no webhook demand, and says so
+      # with its own outcome (#1812). A rate over a window, so ticks whose scan
+      # succeeds can sit between the failing ones. A separate rule from
+      # tick-errors on purpose: cron / after / freshness work may still be
+      # running, so the message must not claim the loop is doing nothing. Same
+      # window and `for` as tick-errors.
       - uid: rocky-scheduler-spool-unreadable
         title: Rocky scheduler cannot read its webhook spool
         condition: C
