@@ -65,19 +65,6 @@ pub enum ModelWalkError {
 /// The root is always yielded first, even when absent — per-directory loaders
 /// treat an absent directory as empty, and several callers rely on that
 /// (`rocky docs` on a project with no models, for one).
-/// Would an entry with this name have been a directory this walk enters?
-///
-/// Only consulted for an entry whose type cannot be read — a dangling link.
-/// A model file, a contract, a `README.md` all carry an extension; a models
-/// subdirectory (`staging`, `marts`, `.hidden`) does not. The convention is
-/// the tree's own, and it is what keeps a dangling non-model file from
-/// failing a compile it never took part in.
-fn looks_like_a_directory_name(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| !name.trim_start_matches('.').contains('.'))
-}
-
 pub fn walk_model_dirs(root: &Path) -> (Vec<PathBuf>, Vec<ModelWalkError>) {
     let mut dirs = Vec::new();
     let mut errors = Vec::new();
@@ -138,18 +125,21 @@ pub fn walk_model_dirs(root: &Path) -> (Vec<PathBuf>, Vec<ModelWalkError>) {
                 Ok(entry) => match std::fs::metadata(entry.path()) {
                     Ok(metadata) if metadata.is_dir() => subdirs.push(entry.path()),
                     Ok(_) => {}
-                    // A dangling link's target type is unknowable, so the
-                    // question is what it WOULD have been. `staging -> gone`
-                    // is a directory this walk would have entered — report
-                    // it. `README.md -> gone` is an unrelated file: the
-                    // loaders promise that a non-matching file cannot fail a
-                    // compile, and a dangling one is no exception. Model
-                    // files that dangle (`x.sql`, `x.toml`, a contract) are
-                    // caught by the loaders' own presence probes, not here.
-                    Err(source)
-                        if source.kind() == std::io::ErrorKind::NotFound
-                            && looks_like_a_directory_name(&entry.path()) =>
-                    {
+                    // A dangling link's target type is unknowable, and its
+                    // NAME cannot say what it was: `v1.2` and `staging.old`
+                    // are directories, `LICENSE` and `.gitkeep` are files, and
+                    // a rule that reads a dot as "file" gets both wrong (this
+                    // walk tried one; the review showed it dropping a dotted
+                    // directory in silence and refusing a scaffold's
+                    // `.gitkeep`). So EVERY link to nowhere in a models tree
+                    // is reported, whatever it is called. The cost is that a
+                    // dangling `README.md` fails a compile it took no part in;
+                    // the message names the entry and says the fix is to
+                    // repair or remove it. That is the class rule — anything
+                    // but a proven absence is present, and present-but-
+                    // unreadable is refused — applied without exception,
+                    // because the exception could not be made honestly.
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
                         match crate::path_presence::classify_not_found(&entry.path()) {
                             crate::path_presence::PathPresence::Absent => {}
                             crate::path_presence::PathPresence::Present { detail } => {
@@ -157,13 +147,17 @@ pub fn walk_model_dirs(root: &Path) -> (Vec<PathBuf>, Vec<ModelWalkError>) {
                                     dir: entry.path(),
                                     source: std::io::Error::new(
                                         std::io::ErrorKind::NotFound,
-                                        detail,
+                                        format!(
+                                            "{detail}. A models tree with a link to nowhere \
+                                             is refused whatever the link is called, because \
+                                             its name cannot say what it pointed at; repair \
+                                             or remove it"
+                                        ),
                                     ),
                                 });
                             }
                         }
                     }
-                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
                     Err(source) => errors.push(ModelWalkError::ReadDir {
                         dir: entry.path(),
                         source,
@@ -305,23 +299,28 @@ mod tests {
         );
     }
 
-    /// The other side of the rule above (#1822, round four): a dangling link
-    /// with a file's name is an unrelated file, and an unrelated file cannot
-    /// fail a compile. `README.md -> gone` beside a healthy tree is not an
-    /// error; `staging -> gone` still is.
+    /// Every link to nowhere is reported, whatever it is called (#1822,
+    /// round five). A dotted DIRECTORY (`v1.2`), an extensionless FILE
+    /// (`.gitkeep`, part of the documented scaffold) and a plain file
+    /// (`README.md`) all dangle the same way, and a name rule got two of the
+    /// three wrong — so there is no name rule.
     #[cfg(unix)]
     #[test]
-    fn a_dangling_non_model_file_does_not_fail_the_walk() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("models");
-        mk(&root, "a");
-        std::os::unix::fs::symlink(tmp.path().join("gone"), root.join("README.md")).unwrap();
-        let (dirs, errors) = walk_model_dirs(&root);
-        assert_eq!(dirs, vec![root.clone(), root.join("a")]);
-        assert!(
-            errors.is_empty(),
-            "a dangling README is nobody's business: {errors:?}"
-        );
+    fn a_dangling_link_is_reported_whatever_its_name() {
+        for name in ["v1.2", "staging.old", ".gitkeep", "LICENSE", "README.md"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("models");
+            mk(&root, "a");
+            std::os::unix::fs::symlink(tmp.path().join("gone"), root.join(name)).unwrap();
+            let (dirs, errors) = walk_model_dirs(&root);
+            assert_eq!(dirs, vec![root.clone(), root.join("a")], "{name}");
+            assert_eq!(errors.len(), 1, "{name}: {errors:?}");
+            let text = format!("{}", errors[0]);
+            assert!(
+                text.contains(name) && text.contains("repair or remove it"),
+                "{name}: the error names the link and says what to do: {text}"
+            );
+        }
     }
 
     /// Hidden directories were never excluded and stay walked — an exclusion

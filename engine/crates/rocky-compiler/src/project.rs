@@ -304,16 +304,19 @@ impl Project {
             }
         }
 
+        // Deeper walk errors, now that every model that could load has
+        // been parsed and any parse error has had its turn — and BEFORE the
+        // no-models answer below: a tree whose only entry is an unreadable
+        // subtree has not been shown to hold no models, it has been shown to
+        // be unreadable (#1822, round five).
+        if let Some(walk_error) = walk_errors.into_iter().next() {
+            return Err(models::ModelError::from(std::io::Error::other(walk_error)).into());
+        }
+
         if models.is_empty() {
             return Err(ProjectError::NoModels {
                 path: models_dir.display().to_string(),
             });
-        }
-
-        // Deeper walk errors, now that every model that could load has
-        // been parsed and any parse error has had its turn.
-        if let Some(walk_error) = walk_errors.into_iter().next() {
-            return Err(models::ModelError::from(std::io::Error::other(walk_error)).into());
         }
         Ok(models)
     }
@@ -1298,18 +1301,45 @@ mod recursive_load_tests {
         );
     }
 
-    /// A dangling link with a FILE's name is an unrelated file and cannot
-    /// fail a compile it took no part in (#1822, round four).
+    /// A link to nowhere in the models tree refuses the compile whatever it
+    /// is called (#1822, round five): a name cannot say whether it pointed at
+    /// a subtree of models or at a README, so the tree is refused with a
+    /// message that names the link and says to repair or remove it.
     #[cfg(unix)]
     #[test]
-    fn compile_path_ignores_a_dangling_non_model_file() {
+    fn compile_path_refuses_a_dangling_link_whatever_its_name() {
+        for name in ["README.md", "v1.2", ".gitkeep"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let models = tmp.path().join("models");
+            write_model(&models, "top");
+            std::os::unix::fs::symlink(tmp.path().join("gone"), models.join(name)).unwrap();
+            let err = Project::load_models(&models, None)
+                .expect_err("a link to nowhere refuses the tree");
+            let text = format!("{err}");
+            assert!(
+                text.contains(name) && text.contains("repair or remove"),
+                "{name}: {text}"
+            );
+        }
+    }
+
+    /// A tree whose ONLY entry is a dangling subdirectory is unreadable, not
+    /// empty: the deferred walk error must outrank `NoModels` (#1822, round
+    /// five). Reverting the whole ordering change makes this fail too, which
+    /// the dangling-root test alone did not.
+    #[cfg(unix)]
+    #[test]
+    fn compile_path_reports_a_dangling_subdir_ahead_of_no_models() {
         let tmp = tempfile::tempdir().unwrap();
         let models = tmp.path().join("models");
-        write_model(&models, "top");
-        std::os::unix::fs::symlink(tmp.path().join("gone"), models.join("README.md")).unwrap();
-        let loaded =
-            Project::load_models(&models, None).expect("a dangling README is nobody's business");
-        assert_eq!(loaded.len(), 1);
+        std::fs::create_dir_all(&models).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("gone"), models.join("staging")).unwrap();
+        let err = Project::load_models(&models, None).expect_err("unreadable, not empty");
+        let text = format!("{err}");
+        assert!(
+            text.contains("staging") && !text.contains("no models"),
+            "the unreadable subtree is named, not a false 'no models': {text}"
+        );
     }
 
     /// The compile path sees the same tree every other scanner sees (#1262):

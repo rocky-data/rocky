@@ -4463,10 +4463,9 @@ pub async fn run_lsp() {
 mod tests {
     /// #1817 / #1822 round four: a startup compile that fails must reach the
     /// EDITOR, not only the server log. Driven at the protocol level — a real
-    /// `LspService`, a real `initialize` + `initialized` exchange — because
-    /// tower-lsp drops every client notification sent before the service is
-    /// initialized, so calling `recompile` on a bare struct would observe
-    /// nothing whether or not the message is sent. The fixture is the dangling
+    /// `LspService`, a real `initialize` + `initialized` exchange — so what is
+    /// observed is what an editor receives, on the path an editor drives,
+    /// rather than a method call on a bare struct. The fixture is the dangling
     /// `models` link the rest of the branch closes; before this change the
     /// editor received no notification at all for it.
     #[cfg(unix)]
