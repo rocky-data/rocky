@@ -250,6 +250,149 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    /// Every `*Output` type in `output.rs` that derives `JsonSchema`, paired
+    /// with the line it is declared on (for the failure message).
+    ///
+    /// The scan is deliberately over `output.rs` only. A new CLI output goes
+    /// there, so a type this misses is a type nobody added — and a type it
+    /// wrongly picks up is answered by the containment rule below rather than
+    /// by an allowlist.
+    fn json_schema_output_types() -> Vec<String> {
+        let source = include_str!("../output.rs");
+        let lines: Vec<&str> = source.lines().collect();
+        let mut found = Vec::new();
+
+        for (i, line) in lines.iter().enumerate() {
+            let Some(rest) = line
+                .strip_prefix("pub struct ")
+                .or_else(|| line.strip_prefix("pub enum "))
+            else {
+                continue;
+            };
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.ends_with("Output") {
+                continue;
+            }
+
+            // Walk back over the declaration's attributes and doc comments to
+            // find its `#[derive(...)]`, which may be wrapped across lines.
+            let mut attrs = String::new();
+            let mut j = i;
+            while j > 0 {
+                j -= 1;
+                let prev = lines[j];
+                let is_attached = prev.starts_with("#[")
+                    || prev.starts_with("///")
+                    || prev.starts_with("    ")
+                    || prev.starts_with(")]")
+                    || prev.trim().is_empty();
+                if !is_attached {
+                    break;
+                }
+                attrs.push_str(prev);
+                attrs.push('\n');
+            }
+            if attrs.contains("JsonSchema") {
+                found.push(name);
+            }
+        }
+
+        found.sort();
+        found.dedup();
+        found
+    }
+
+    /// Every name the registered schemas account for: each schema's own
+    /// `title`, plus every type it inlines under `definitions` / `$defs`.
+    fn names_the_registered_schemas_account_for() -> HashSet<String> {
+        let mut names = HashSet::new();
+        for (_, schema) in schemas() {
+            let Some(obj) = schema.as_object() else {
+                continue;
+            };
+            if let Some(title) = obj.get("title").and_then(|t| t.as_str()) {
+                names.insert(title.to_string());
+            }
+            for key in ["definitions", "$defs"] {
+                if let Some(defs) = obj.get(key).and_then(|d| d.as_object()) {
+                    names.extend(defs.keys().cloned());
+                }
+            }
+        }
+        names
+    }
+
+    /// The roster gate (#1760). A `JsonSchema`-deriving `*Output` type must
+    /// either be registered in [`schemas()`] or be inlined into some
+    /// registered schema. A type that is neither is a **serialization root
+    /// with no exported schema** — an `--output json` surface with no Pydantic
+    /// model and no TypeScript interface.
+    ///
+    /// # Why `codegen-drift` cannot see this
+    ///
+    /// That workflow runs `just codegen` and compares the committed bindings
+    /// against what it produces. Both sides are derived from [`schemas()`], so
+    /// a type missing from the roster is missing from both and the check is
+    /// green. Absence reads as agreement. This test is the independent half:
+    /// it asks the SOURCE what types exist, and the generated schemas what
+    /// they account for.
+    ///
+    /// # Why containment rather than counting derives
+    ///
+    /// Most `*Output` types are nested — schemars inlines them into their
+    /// parent's `definitions` and they need no standalone entry. Counting
+    /// derives and comparing against the roster length needs an allowlist of
+    /// every nested type, and an allowlist drifts. Asking the generated
+    /// schemas what they already inline needs none: on the tree that added
+    /// this test, 145 candidates resolved with **zero** exceptions.
+    ///
+    /// The rule is also fully discriminating. Un-registering any one of the
+    /// 93 registered roots makes this test fail — including the six that
+    /// reached `main` unregistered and were found by reading the roster by
+    /// eye: `SnapshotOutput` and `DocsOutput` (#1699), and the four
+    /// `List*Output` types (#1760).
+    #[test]
+    fn every_output_type_is_registered_or_inlined() {
+        let accounted = names_the_registered_schemas_account_for();
+        let missing: Vec<String> = json_schema_output_types()
+            .into_iter()
+            .filter(|name| !accounted.contains(name))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "these `output.rs` types derive JsonSchema, are registered in no \
+             schema, and are inlined into none — so they are CLI outputs with \
+             no exported schema and no generated bindings: {missing:?}\n\
+             Register each in `schemas()` and run `just codegen`. If one is \
+             genuinely not a CLI output, it should not derive JsonSchema."
+        );
+    }
+
+    /// The scan must actually find types. A parser change that silently
+    /// matched nothing would make the gate above pass on an empty set — the
+    /// exact "absence reads as agreement" failure it exists to close.
+    #[test]
+    fn the_output_type_scan_finds_the_types_it_claims_to() {
+        let found = json_schema_output_types();
+        assert!(
+            found.len() > 100,
+            "the output.rs scan found only {} types, which means the parser \
+             broke rather than the file shrinking: {found:?}",
+            found.len()
+        );
+        for expected in ["RunOutput", "PlanOutput", "SnapshotOutput", "DocsOutput"] {
+            assert!(
+                found.iter().any(|n| n == expected),
+                "the scan missed {expected}, so it is not reading declarations \
+                 the way the gate assumes"
+            );
+        }
+    }
+
     /// Every entry in `schemas()` must produce a valid Draft-07 JSON Schema
     /// with at least a top-level `type`, `$ref`, or `oneOf`. Catches the
     /// failure mode where a struct's `JsonSchema` derive misbehaves.
