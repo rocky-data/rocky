@@ -3622,6 +3622,7 @@ mod tests {
             .expect("run recorded");
         store
             .record_policy_decision(&PolicyDecisionRecord {
+                keys_recorded: false,
                 models: Vec::new(),
                 timestamp: now - chrono::Duration::minutes(30),
                 plan_id: "freeze:global".to_string(),
@@ -3937,6 +3938,7 @@ mod tests {
         StateStore::open(&state_path)
             .unwrap()
             .record_policy_decision(&PolicyDecisionRecord {
+                keys_recorded: false,
                 models: Vec::new(),
                 timestamp: chrono::Utc::now() - chrono::Duration::minutes(5),
                 plan_id: "plan-revenue-daily".to_string(),
