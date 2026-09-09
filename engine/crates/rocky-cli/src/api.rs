@@ -1182,30 +1182,38 @@ async fn compile_status(
 
 /// `POST /api/v1/compile` — recompile in place.
 ///
-/// Reports `status: "recompiled"` when the project config loaded or is
-/// absent, and `status: "recompiled_degraded"` with `config_error` when a
-/// `rocky.toml` is present and could not be read.
+/// Reports `status: "recompiled"` when the compile produced a result and the
+/// project config loaded or is absent; `status: "recompiled_degraded"` with
+/// `config_error` when a `rocky.toml` is present and could not be read; and
+/// `status: "compile_failed"` with `compile_error` when the compile produced
+/// no result at all (#1823) — with `config_error` beside it when both hold.
 ///
 /// It used to answer `"recompiled"` unconditionally, so an SDK caller could
 /// not distinguish a project that declares no masks and no freshness from
 /// one whose config failed to parse — the compile silently ran with empty
-/// project inputs and the route still said success (#1625). `serve` still
-/// compiles rather than refusing (a resident server must not go dark
-/// mid-edit), but it no longer calls that outcome the same thing.
+/// project inputs and the route still said success (#1625). And it still
+/// said `"recompiled"` when the compile itself failed: `recompile` returns
+/// only the config's reason, and a failed compile was logged and dropped,
+/// so the caller that asked for a compile was told it had one (#1823).
+/// `serve` still compiles rather than refusing (a resident server must not
+/// go dark mid-edit), but it no longer calls either outcome the same thing.
 async fn trigger_compile(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    match state.recompile().await {
-        None => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "status": "recompiled" })),
-        ),
-        Some(config_error) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "status": "recompiled_degraded",
-                "config_error": config_error,
-            })),
-        ),
+    let config_error = state.recompile().await;
+    let compile_error = state.compile_failure.read().await.clone();
+    let mut body = serde_json::Map::new();
+    let status = match (&compile_error, &config_error) {
+        (Some(_), _) => "compile_failed",
+        (None, Some(_)) => "recompiled_degraded",
+        (None, None) => "recompiled",
+    };
+    body.insert("status".into(), serde_json::Value::String(status.into()));
+    if let Some(reason) = compile_error {
+        body.insert("compile_error".into(), serde_json::Value::String(reason));
     }
+    if let Some(reason) = config_error {
+        body.insert("config_error".into(), serde_json::Value::String(reason));
+    }
+    (StatusCode::OK, Json(serde_json::Value::Object(body)))
 }
 
 /// `GET /api/v1/dag` — canonical [`DagOutput`].
@@ -4562,7 +4570,8 @@ mod tests {
         std::fs::write(
             &config,
             "[adapter]\ntype = \"duckdb\"\npath = \"probe.duckdb\"\n\n\
-             [pipeline.main]\ntype = \"transformation\"\nmodels = \"models/**\"\n",
+             [pipeline.main]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.main.target]\nadapter = \"default\"\n",
         )
         .unwrap();
         let models = root.join("models");
@@ -4589,6 +4598,10 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         };
+        assert!(
+            project.get("config_error").is_none(),
+            "precondition: the config loads, so the only failure is the compile's: {project}"
+        );
         let reason = project["compile_error"].as_str().expect("a string reason");
         assert!(
             reason.contains("models"),
@@ -4605,7 +4618,26 @@ mod tests {
         );
         assert_eq!(project["diagnostics"]["total"], 0, "{project}");
 
-        // Repair the project and recompile: the state clears.
+        // Asking for a compile says the compile failed, not "recompiled".
+        let client = reqwest::Client::new();
+        let triggered: serde_json::Value = client
+            .post(format!("{base}/api/v1/compile"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(triggered["status"], "compile_failed", "{triggered}");
+        assert!(
+            triggered["compile_error"]
+                .as_str()
+                .is_some_and(|r| r.contains("models")),
+            "{triggered}"
+        );
+        assert!(triggered.get("config_error").is_none(), "{triggered}");
+
+        // Repair the project and recompile through the route: the state clears.
         std::fs::remove_file(&models).unwrap();
         std::fs::create_dir(&models).unwrap();
         std::fs::write(models.join("users.sql"), "SELECT 1 AS id").unwrap();
@@ -4614,7 +4646,16 @@ mod tests {
             "name = \"users\"\n\n[target]\ncatalog = \"probe\"\nschema = \"main\"\ntable = \"users\"\n",
         )
         .unwrap();
-        state.recompile().await;
+        let triggered: serde_json::Value = client
+            .post(format!("{base}/api/v1/compile"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(triggered["status"], "recompiled", "{triggered}");
+        assert!(triggered.get("compile_error").is_none(), "{triggered}");
         let project: serde_json::Value = reqwest::get(format!("{base}/api/v1/project"))
             .await
             .unwrap()
