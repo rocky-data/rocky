@@ -853,7 +853,11 @@ async fn execute_run_plan(
         Some(rocky_core::shadow::ShadowConfig {
             suffix: shadow_suffix,
             schema_override: run_plan.shadow_schema.clone(),
-            cleanup_after: false,
+            // Disposable, matching `rocky run --shadow` (#1273): a plain
+            // shadow object exists to be compared and then go away, and
+            // that is what makes the ownership refusal sound. The branch
+            // arm above stays persistent on purpose.
+            cleanup_after: true,
         })
     } else {
         None

@@ -8181,11 +8181,51 @@ fn apply_shadow_rewrite(
                     model.config.name
                 );
             }
-            rocky_core::models::StrategyConfig::FullRefresh
-            | rocky_core::models::StrategyConfig::Incremental { .. }
+            // The incremental family cannot produce a comparable shadow
+            // (#1273). These strategies build on what the target ALREADY
+            // holds, and a shadow target holds nothing:
+            //
+            //   first run   the CTAS *is* the load, so the shadow gets one
+            //               delta while production holds full history — the
+            //               comparison reports a near-total row-count loss
+            //               that says nothing about the change under review;
+            //   self-read   `WHERE ts > (SELECT MAX(ts) FROM main.events)`
+            //               is deliberately NOT redirected (pointing it at
+            //               the empty shadow would change what the model
+            //               computes), so the shadow gets rows strictly
+            //               newer than production's maximum — normally zero;
+            //   repeat run  with nothing dropped between runs, the second
+            //               run appends to the first run's leftover and the
+            //               row count drifts further every time.
+            //
+            // Producing an incomparable number is worse than refusing, so
+            // these join the two strategies above rather than running.
+            // Seeding the shadow from production first would make the
+            // comparison meaningful, but that is a full copy per model and
+            // a cost decision nobody has taken.
+            rocky_core::models::StrategyConfig::Incremental { .. }
             | rocky_core::models::StrategyConfig::Merge { .. }
             | rocky_core::models::StrategyConfig::DeleteInsert { .. }
-            | rocky_core::models::StrategyConfig::Microbatch { .. }
+            | rocky_core::models::StrategyConfig::Microbatch { .. } => {
+                anyhow::bail!(
+                    "shadow/branch execution is not supported for model '{}': its \
+                     '{}' strategy builds on rows the target already holds, and a shadow \
+                     target starts empty — so the shadow would be compared against a \
+                     production table it was never built the same way as. Give the model \
+                     `full_refresh` to shadow it, or exclude it from this run with --model",
+                    model.config.name,
+                    match &model.config.strategy {
+                        rocky_core::models::StrategyConfig::Incremental { .. } => "incremental",
+                        rocky_core::models::StrategyConfig::Merge { .. } => "merge",
+                        rocky_core::models::StrategyConfig::DeleteInsert { .. } => "delete_insert",
+                        _ => "microbatch",
+                    }
+                );
+            }
+            // What survives is exactly the set that REPLACES its target
+            // rather than adding to it, so a shadow build is a complete,
+            // comparable output and the object is disposable.
+            rocky_core::models::StrategyConfig::FullRefresh
             | rocky_core::models::StrategyConfig::View
             | rocky_core::models::StrategyConfig::MaterializedView
             | rocky_core::models::StrategyConfig::DynamicTable { .. } => {}
@@ -9540,6 +9580,10 @@ pub(crate) async fn execute_models(
         )?;
     }
 
+    // Shadow objects this run derived, in selection order. Empty on every
+    // non-shadow run, so the ownership preflight and the cleanup below are
+    // both no-ops there (#1273).
+    let mut shadow_objects: Vec<crate::commands::shadow_lifecycle::ShadowObject> = Vec::new();
     if let Some(config) = shadow_config {
         apply_shadow_rewrite(
             &mut compile_result,
@@ -9549,6 +9593,48 @@ pub(crate) async fn execute_models(
             warehouse.dialect(),
             resilience.contain_failures,
         )?;
+        // `apply_shadow_rewrite` rewrote each selected model's target in
+        // place, so the models now carry their shadow names. Collect them
+        // BEFORE anything executes: the ownership check and the cleanup are
+        // the same list, and deriving it twice is how the two would drift.
+        for model in &compile_result.project.models {
+            let selected = model_name_filter.is_none_or(|f| f == model.config.name)
+                && model_set.is_none_or(|set| set.contains(&model.config.name));
+            if !selected {
+                continue;
+            }
+            shadow_objects.push(crate::commands::shadow_lifecycle::ShadowObject {
+                model: model.config.name.clone(),
+                target: rocky_ir::TargetRef {
+                    catalog: model.config.target.catalog.clone(),
+                    schema: model.config.target.schema.clone(),
+                    table: model.config.target.table.clone(),
+                },
+            });
+        }
+        // Refuse before any write — but ONLY in the disposable mode.
+        //
+        // `cleanup_after` is exactly the axis this turns on, because it is
+        // what makes "the name should be free" a true invariant: a run that
+        // drops what it made leaves nothing, so an object sitting there is
+        // either not Rocky's or debris from a run that did not finish, and
+        // replacing it silently is the defect #1273 reported.
+        //
+        // With `cleanup_after` off — a named `--branch`, or any caller that
+        // asks for objects outliving the run — the previous run's objects
+        // are SUPPOSED to still be there, and the next run is supposed to
+        // replace them. Refusing would break the feature outright. Rocky
+        // cannot tell its own leftover from a stranger's without a
+        // persisted owner record, so it does not guess: the persistent mode
+        // keeps no per-object ownership check, and #1273 stays open for it.
+        if config.cleanup_after {
+            crate::commands::shadow_lifecycle::refuse_occupied_shadow_targets(
+                warehouse,
+                warehouse.dialect(),
+                &shadow_objects,
+            )
+            .await?;
+        }
         output.shadow = true;
     } else {
         augment_physical_read_edges(
@@ -10809,6 +10895,36 @@ pub(crate) async fn execute_models(
                 entries = reuse_index_entries.len(),
                 "recorded auditable-reuse input-match spine"
             );
+        }
+    }
+
+    // `cleanup_after` finally has a consumer (#1273). It has always been
+    // documented as "whether to drop shadow tables after comparison
+    // completes" and defaulted to `true`, while nothing read it and every
+    // construction hard-coded `false` — so shadow objects accumulated, and
+    // the next run wrote over its own leftover.
+    //
+    // Dropped only on the success path, on purpose: a run that failed is
+    // evidence, and destroying it to save the operator one statement is the
+    // wrong trade. The next run refuses on those leftovers rather than
+    // replacing them, and prints the drop — so the failure mode is a
+    // refusal with a remedy, never a silent overwrite.
+    //
+    // A named `--branch` sets `cleanup_after = false`: its objects are the
+    // point of the branch, not debris.
+    if let Some(config) = shadow_config
+        && config.cleanup_after
+        && !shadow_objects.is_empty()
+    {
+        let warnings = crate::commands::shadow_lifecycle::drop_owned_shadow_objects(
+            warehouse,
+            warehouse.dialect(),
+            &shadow_objects,
+        )
+        .await;
+        for warning in warnings {
+            warn!("{warning}");
+            output.scheduling_warnings.push(warning);
         }
     }
 
