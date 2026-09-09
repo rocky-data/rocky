@@ -87,6 +87,15 @@ pub struct ServerState {
     /// cleared it, or the reverse. One at a time, and each returns its own
     /// [`RecompileOutcome`] rather than re-reading the shared fields.
     compile_gate: tokio::sync::Mutex<()>,
+    /// Test hook: the first `recompile` on THIS state that finds it set
+    /// signals `reached` and then waits on `hold` before publishing, so a
+    /// test can have a second recompile queue behind the gate and observe
+    /// the shared pair while a compile has finished but not yet published
+    /// (#1823, round two). Taken on first use, so one invocation holds; per
+    /// state, so no other test's compile can be caught by it.
+    #[cfg(test)]
+    pub(crate) publish_hold:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     /// Latest DAG execution status, exposed at `GET /api/v1/dag/status`.
     pub dag_status: DagStatusStore,
     /// App-level single-mutating-job guard for the HTTP job model. A second
@@ -265,6 +274,8 @@ impl ServerState {
             compile_result: RwLock::new(None),
             compile_failure: RwLock::new(None),
             compile_gate: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            publish_hold: std::sync::Mutex::new(None),
             dag_status: DagStatusStore::new(),
             mutation_permit: crate::jobs::MutationPermit::new(),
             jobs: crate::jobs::JobRegistry::new(),
@@ -389,6 +400,19 @@ impl ServerState {
                     };
                 }
             };
+
+        #[cfg(test)]
+        {
+            let hold = self
+                .publish_hold
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some((reached, hold)) = hold {
+                reached.notify_one();
+                hold.notified().await;
+            }
+        }
 
         match compile_result {
             Ok(mut result) => {
@@ -663,6 +687,102 @@ mod tests {
         assert!(
             state.compile_result.read().await.is_none(),
             "a failed compile does not leave the previous compile's result in place"
+        );
+    }
+
+    /// #1823, round two. Two recompiles in flight at once used to publish
+    /// each other's outcome: B's success could clear A's failure before A
+    /// recorded it, or A's failure could land after B's success and describe
+    /// a project B had just compiled. Recompiles are serialised on
+    /// `compile_gate` now, and each returns its own outcome.
+    ///
+    /// The hook holds A after its compile finished and before it publishes;
+    /// B, asked for while A is held, must queue behind the gate rather than
+    /// run beside it. While A is held the shared pair is untouched, A's
+    /// outcome is A's, B's is B's, and the state that stands at the end is
+    /// the outcome of the LAST compile asked for. Without the gate B runs
+    /// beside A, publishes first, and A's stale failure lands on top of it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overlapping_recompiles_are_serialised_and_each_reports_its_own_outcome() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::os::unix::fs::symlink(dir.path().join("gone"), &models_dir).unwrap();
+        let state = ServerState::new(models_dir.clone(), None, None);
+
+        // The constructor spawns a background compile of its own. Let it
+        // finish and record its failure before arming the hold, so the hold
+        // catches A and not that compile.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while state.compile_failure.read().await.is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the constructor's compile never finished"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // A: the broken project. Held after its compile, before publication.
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let hold = Arc::new(tokio::sync::Notify::new());
+        *state.publish_hold.lock().unwrap() = Some((Arc::clone(&reached), Arc::clone(&hold)));
+        let a = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { state.recompile().await })
+        };
+        tokio::time::timeout(Duration::from_secs(20), reached.notified())
+            .await
+            .expect("A reaches the publish point");
+
+        // Repair the project under A, and ask for B. B must wait for A.
+        std::fs::remove_file(&models_dir).unwrap();
+        std::fs::create_dir(&models_dir).unwrap();
+        std::fs::write(models_dir.join("users.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("users.toml"),
+            "name = \"users\"\n\n[target]\ncatalog = \"demo\"\nschema = \"main\"\ntable = \"users\"\n",
+        )
+        .unwrap();
+        let b = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { state.recompile().await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // While A is held, nothing has changed since A started: the pair is
+        // still the constructor's failure, and B's success is not there,
+        // because B has not run. Read the pair the way the project route
+        // does: failure guard held across the result.
+        {
+            let failure = state.compile_failure.read().await;
+            let result = state.compile_result.read().await;
+            assert!(
+                failure.is_some() && result.is_none(),
+                "B ran beside A instead of queueing behind it: its success is already published"
+            );
+        }
+
+        // Release A. A publishes its failure; B then compiles the repaired
+        // project and publishes its success.
+        hold.notify_one();
+        let a = tokio::time::timeout(Duration::from_secs(20), a)
+            .await
+            .expect("A finishes")
+            .unwrap();
+        let b = tokio::time::timeout(Duration::from_secs(20), b)
+            .await
+            .expect("B finishes")
+            .unwrap();
+        assert!(a.compile_error.is_some(), "A's outcome is A's: {a:?}");
+        assert!(b.compile_error.is_none(), "B's outcome is B's: {b:?}");
+
+        // The last compile asked for was B's, and B's is what stands.
+        let failure = state.compile_failure.read().await;
+        let result = state.compile_result.read().await;
+        assert!(
+            failure.is_none() && result.is_some(),
+            "the state that stands is the last compile's, not a stale failure landing on it"
         );
     }
 

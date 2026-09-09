@@ -10383,7 +10383,7 @@ pub struct ProjectOutput {
     pub adapters: Vec<ProjectAdapterOutput>,
     /// Why the last compile produced no result, when it did not: the models
     /// could not be read, a model failed to load, the compile task panicked.
-    /// While this stands `models_compiled` is `null` and
+    /// While this stands `models_compiled` is absent and
     /// `diagnostics.has_errors` is `true`, whatever an earlier compile found:
     /// a project whose models cannot be compiled is not a clean project, and
     /// counts from a compile that no longer describes it are not shown

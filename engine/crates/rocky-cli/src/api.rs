@@ -926,10 +926,9 @@ async fn project(
     let failure_guard = state.compile_failure.read().await;
     let compile_error = failure_guard.clone();
     let (models_compiled, diagnostics) = if compile_error.is_some() {
-        // The last compile produced no result. Whatever `compile_result`
-        // holds is from an earlier compile, kept for the LSP; its counts do
-        // not describe this project any more and are not shown beside the
-        // failure. `has_errors` is true: this is not a clean project.
+        // The last compile produced no result, and `publish_failure` dropped
+        // the previous one with it, so there are no counts to show. Zero
+        // counts, and `has_errors` true: this is not a clean project.
         (
             None,
             crate::output::ProjectDiagnosticsOutput {
