@@ -175,65 +175,11 @@ pub async fn compute_preview_rows(
     let result = compile::compile(&compiler_cfg)
         .map_err(|e| fail("compile_error", &format!("compile failed: {e}"), None))?;
 
-    let Some(m) = result
-        .project
-        .models
-        .iter()
-        .find(|m| m.config.name == model)
-    else {
-        return Err(fail(
-            "model_not_found",
-            &format!("model '{model}' not found in pipeline"),
-            None,
-        ));
-    };
-
-    // Guards.
-    if matches!(m.config.strategy, StrategyConfig::TimeInterval { .. }) {
-        return Err(fail(
-            "unsupported_model_kind",
-            &format!(
-                "model '{model}' is a time-interval model; preview rows can't resolve partition placeholders"
-            ),
-            None,
-        ));
-    }
-    let model_has_errors = m.sql.trim().is_empty()
-        || result
-            .diagnostics
-            .iter()
-            .any(|d| d.model == model && d.severity == Severity::Error);
-    if model_has_errors {
-        return Err(fail(
-            "compile_error",
-            &format!("model '{model}' has compile errors; fix them before previewing"),
-            None,
-        ));
-    }
-
-    // Expand Rocky macros (model.sql may contain unexpanded macro calls).
-    let macros_dir = models_dir.join("../macros");
-    let macro_defs = if macros_dir.is_dir() {
-        rocky_core::macros::load_macros_from_dir(&macros_dir)
-            .map_err(|e| fail("compile_error", &format!("macro load failed: {e}"), None))?
-    } else {
-        Vec::new()
-    };
-    let expanded = rocky_core::macros::expand_macros(&m.sql, &macro_defs).map_err(|e| {
-        fail(
-            "compile_error",
-            &format!("macro expansion failed: {e}"),
-            None,
-        )
-    })?;
-
-    if !rocky_sql::parser::is_single_select(&expanded) {
-        return Err(fail(
-            "unsupported_model_kind",
-            &format!("model '{model}' did not compile to a single SELECT statement"),
-            None,
-        ));
-    }
+    let Admitted {
+        model: m,
+        expanded,
+        macro_defs,
+    } = admit_model(&result, models_dir, model)?;
 
     // Resolve which output columns must be masked (workspace-default env).
     let masks = rocky_cfg.resolve_mask_for_env(None);
@@ -554,6 +500,103 @@ impl PreviewFailure {
 
 /// Build a [`PreviewFailure`]. Prints nothing: the caller decides how to
 /// render it.
+/// A model the preview route has admitted, with what the route needs next.
+pub(crate) struct Admitted<'a> {
+    pub(crate) model: &'a rocky_core::models::Model,
+    /// The model's SQL with Rocky macros expanded.
+    pub(crate) expanded: String,
+    /// The macro set, kept for an ad-hoc selection that references macros.
+    pub(crate) macro_defs: Vec<rocky_core::macros::MacroDef>,
+}
+
+/// The route's admission rules for a model, in one place: a valid name, a
+/// model of the compiled project, not time-interval, free of compile errors,
+/// and a single SELECT once macros are expanded. Every refusal is the same
+/// envelope the route returns.
+///
+/// One derivation, on purpose. The review queue asks this before it offers a
+/// sample (`ReviewQueueEntry::preview_model`), so what the queue says the
+/// route would read is exactly what the route reads. A consumer that decided
+/// from a name alone got it wrong both ways — a dotted model name the route
+/// refuses, a target that is no model (#1815).
+pub(crate) fn admit_model<'a>(
+    result: &'a compile::CompileResult,
+    models_dir: &Path,
+    model: &str,
+) -> std::result::Result<Admitted<'a>, PreviewFailure> {
+    rocky_sql::validation::validate_identifier(model).map_err(|_| {
+        fail(
+            "invalid_model_name",
+            &format!("invalid model name '{model}'"),
+            None,
+        )
+    })?;
+    let Some(m) = result
+        .project
+        .models
+        .iter()
+        .find(|m| m.config.name == model)
+    else {
+        return Err(fail(
+            "model_not_found",
+            &format!("model '{model}' not found in pipeline"),
+            None,
+        ));
+    };
+
+    // Guards.
+    if matches!(m.config.strategy, StrategyConfig::TimeInterval { .. }) {
+        return Err(fail(
+            "unsupported_model_kind",
+            &format!(
+                "model '{model}' is a time-interval model; preview rows can't resolve partition placeholders"
+            ),
+            None,
+        ));
+    }
+    let model_has_errors = m.sql.trim().is_empty()
+        || result
+            .diagnostics
+            .iter()
+            .any(|d| d.model == model && d.severity == Severity::Error);
+    if model_has_errors {
+        return Err(fail(
+            "compile_error",
+            &format!("model '{model}' has compile errors; fix them before previewing"),
+            None,
+        ));
+    }
+
+    // Expand Rocky macros (model.sql may contain unexpanded macro calls).
+    let macros_dir = models_dir.join("../macros");
+    let macro_defs = if macros_dir.is_dir() {
+        rocky_core::macros::load_macros_from_dir(&macros_dir)
+            .map_err(|e| fail("compile_error", &format!("macro load failed: {e}"), None))?
+    } else {
+        Vec::new()
+    };
+    let expanded = rocky_core::macros::expand_macros(&m.sql, &macro_defs).map_err(|e| {
+        fail(
+            "compile_error",
+            &format!("macro expansion failed: {e}"),
+            None,
+        )
+    })?;
+
+    if !rocky_sql::parser::is_single_select(&expanded) {
+        return Err(fail(
+            "unsupported_model_kind",
+            &format!("model '{model}' did not compile to a single SELECT statement"),
+            None,
+        ));
+    }
+    Ok(Admitted {
+        model: m,
+        expanded,
+        macro_defs,
+    })
+}
+
 fn fail(kind: &str, message: &str, extra: Option<serde_json::Value>) -> PreviewFailure {
     PreviewFailure {
         kind: kind.to_string(),

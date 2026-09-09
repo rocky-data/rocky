@@ -64,6 +64,26 @@ export function modelsNamedBy(entries: ReviewQueueEntry[]): string[] {
   return Array.from(new Set(entries.flatMap((entry) => entry.models)));
 }
 
+/**
+ * The distinct models the samples route would read for a plan's rows. The
+ * engine decides this per row under the route's own admission rules
+ * (`preview_model`); a graph key in `models` is for ranking and audit and is
+ * not a licence to read — a dotted name, a model a restore plan recorded
+ * that is gone from the project, a model that no longer compiles are all
+ * keys the route refuses (#1815).
+ */
+export function previewTargetsOf(entries: ReviewQueueEntry[]): string[] {
+  return Array.from(
+    new Set(
+      entries.flatMap((entry) =>
+        entry.preview_model === null || entry.preview_model === undefined
+          ? []
+          : [entry.preview_model],
+      ),
+    ),
+  );
+}
+
 /** One breaking finding as a sentence, from the tagged union the engine emits. */
 export function describeFinding(finding: BreakingFinding): string {
   const change = finding.change as Record<string, unknown>;
@@ -340,21 +360,22 @@ function SampleFallback({
     const { entries } = lookup;
     const named = modelsNamedBy(entries);
     const subjects = entries.map((entry) => `${entry.capability} "${entry.model}"`).join(", ");
-    return (
-      <StatusCard
-        label="sample rows"
-        value="no single model to sample"
-        sub={
-          named.length === 0
-            ? // The engine could not vouch for a compiled model behind the
-              // row: its subject is not one (a replication target, a label),
-              // the model is gone, or the compile could not name it. The
-              // screen does not guess which.
-              `The queue names no compiled model for this plan (${subjects}), so there is nothing to read rows from. Sample from the estate screen instead.`
-            : `This plan touches ${named.length} models: ${named.join(", ")}. Sample each from the estate screen instead.`
-        }
-      />
-    );
+    let sub: string;
+    if (named.length === 0) {
+      // The engine could not vouch for a compiled model behind the row: its
+      // subject is not one (a replication target, a label), the model is
+      // gone, or the compile could not name it. The screen does not guess
+      // which.
+      sub = `The queue names no compiled model for this plan (${subjects}), so there is nothing to read rows from. Sample from the estate screen instead.`;
+    } else if (named.length > 1) {
+      sub = `This plan touches ${named.length} models: ${named.join(", ")}. Sample each from the estate screen instead.`;
+    } else {
+      // One model named, and no preview target offered for it: the samples
+      // route would refuse it. The engine applied the route's own rules;
+      // the screen repeats them rather than guessing which one bit.
+      sub = `The samples route would read none of the models this plan names (${named.join(", ")}): it reads one model at a time, in the current project, with no compile errors and not time-interval. Sample from the estate screen instead.`;
+    }
+    return <StatusCard label="sample rows" value="no single model to sample" sub={sub} />;
   }
   return (
     <StatusCard
@@ -420,15 +441,16 @@ export function PlanDetail({
   // name) and is never parsed here. A regex on it once decided a label was a
   // name, and `backfill_3_models` would have sampled a real model of that
   // name (#1815). The panel takes the plan's rows together, and only when
-  // they name exactly one model.
+  // the engine says the samples route would read exactly one model for them
+  // (`preview_model`, decided under that route's own admission rules).
   //
   // The queue is not a durable source: an approval marker resolves the
   // escalation, so the entry disappears the moment the plan is signed off —
   // and that is exactly when the table it built starts existing. The
   // product's own status carries `output_model`, and this screen already
   // reads it for the spec-drift card, so the fallback costs no request.
-  const named = modelsNamedBy(entries);
-  const fromQueue = named.length === 1 ? named[0] : null;
+  const targets = previewTargetsOf(entries);
+  const fromQueue = targets.length === 1 ? targets[0] : null;
   const fromProduct =
     product.kind === "ready" ? (product.value.output_model ?? null) : null;
   const model = fromQueue ?? fromProduct;

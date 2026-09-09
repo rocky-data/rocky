@@ -1772,6 +1772,7 @@ fn evaluate_apply_policy_with_policy_matching_dual(
                     principal,
                     touched,
                     attrs,
+                    GateSubjects::CompiledModels,
                     &prior_decisions,
                     marker_freezes,
                     snapshot_unreadable,
@@ -1798,6 +1799,7 @@ fn evaluate_apply_policy_with_policy_matching_dual(
         principal,
         touched,
         eval_attrs,
+        GateSubjects::CompiledModels,
         &prior_decisions,
         marker_freezes,
         snapshot_unreadable,
@@ -1951,6 +1953,7 @@ pub(crate) fn evaluate_apply_policy_with_store(
     models_glob: Option<&str>,
     ledger: &StateStore,
     marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
+    subjects: GateSubjects,
 ) -> PolicyGate {
     // Finding 1: takes the SAME `[policy]` snapshot `run` already holds (its L1212
     // `rocky_cfg`), not a reload — the in-run replication gate must evaluate the
@@ -1973,6 +1976,7 @@ pub(crate) fn evaluate_apply_policy_with_store(
         principal,
         touched,
         &attrs_map,
+        subjects,
         &prior_decisions,
         marker_freezes,
         snapshot_unreadable,
@@ -2027,6 +2031,22 @@ pub(crate) fn resolve_policy_and_attrs(
     Ok((policy.clone(), attrs))
 }
 
+/// What the keys of a gate's `touched` map name. The map holds strings; only
+/// the caller knows whether they are the compiled project's models or a
+/// replication's target tables, and the row the gate records must not call a
+/// target a model. A target that happens to share a compiled model's name
+/// still matches that model's policy attributes (the plane's standing rule),
+/// but it is not that model, and a consumer that read the row's `models` as
+/// a licence to sample would read the wrong thing (#1815).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GateSubjects {
+    /// Keys are models of the compiled project (apply, promote, gc, restore,
+    /// the MCP propose gate).
+    CompiledModels,
+    /// Keys are replication target table names, gated under bare `apply`.
+    ReplicationTargets,
+}
+
 /// The per-model evaluation loop shared by [`evaluate_apply_policy`] and
 /// [`evaluate_apply_policy_with_store`]. The snapshot and the record sink are
 /// supplied by the caller so the two variants differ only in how they reach the
@@ -2038,6 +2058,7 @@ pub(crate) fn evaluate_apply_policy_core(
     principal: PolicyPrincipal,
     touched: &BTreeMap<String, PolicyCapability>,
     attrs_map: &BTreeMap<String, ModelAttributes>,
+    subjects: GateSubjects,
     prior_decisions: &[PolicyDecisionRecord],
     // The projected durable freeze-marker set, hoisted at the async command
     // entry. OR-ed with the ledger freeze projection inside
@@ -2060,8 +2081,13 @@ pub(crate) fn evaluate_apply_policy_core(
         // Whether the subject is a model of the compiled project. The same
         // field carries a replication target's table name and, on plan-level
         // rows, a label; only a compiled model is a graph key, and only the
-        // producer knows that for certain, so it records it (#1815).
-        let compiled_model = attrs_map.contains_key(model);
+        // producer knows that for certain, so it records it (#1815). Being
+        // in the attribute map is not enough: a target named like a model
+        // is in it too, which is why the caller says what its keys are.
+        let compiled_model = match subjects {
+            GateSubjects::CompiledModels => attrs_map.contains_key(model),
+            GateSubjects::ReplicationTargets => false,
+        };
         let attrs = match attrs_map.get(model) {
             Some(a) => a,
             None => {
@@ -2911,6 +2937,7 @@ impl GovernedRunContext<'_> {
             models_glob.as_deref(),
             ledger,
             marker_freezes,
+            GateSubjects::ReplicationTargets,
         );
         apply_policy_gate(self.root, self.plan_id, gate)?;
 
@@ -7937,6 +7964,59 @@ auto_create_schemas = true
             .expect("a v1 replication-only (no-model) plan must NOT be refused (#1)");
         super::preflight_snapshot(Some(&v2), "p", false)
             .expect("a v2 replication-only (no-model) plan must NOT be refused (#1)");
+        Ok(())
+    }
+
+    /// A replication target that shares a compiled model's NAME is still a
+    /// target. The gate matches it against that model's policy attributes
+    /// (the plane's standing rule, unchanged here), but the row it records
+    /// must not name the model as a graph key: the review queue would offer
+    /// to sample it, and the unrelated compiled model is what would be read
+    /// (#1815, review round two). Restoring `attrs_map.contains_key` as the
+    /// whole test, without the caller's word, makes this fail.
+    #[test]
+    fn a_replication_target_named_like_a_model_records_no_model_key() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // No rules: the default agent posture is `require_review`.
+        let config = write_config(dir.path(), "")?;
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models)?;
+        std::fs::write(models.join("orders.sql"), "SELECT id FROM source.raw.t")?;
+        std::fs::write(
+            models.join("orders.toml"),
+            "name = \"orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"orders\"\n",
+        )?;
+        let state = dir.path().join("state.redb");
+        let ledger = StateStore::open(&state)?;
+        let ctx = super::GovernedRunContext {
+            principal: PolicyPrincipal::Agent,
+            plan_id: "plan_x",
+            root: dir.path(),
+            config_path: &config,
+            expected_ir_fingerprint: None,
+            expected_config_identity: None,
+            require_fingerprint: false,
+            reviewed_source_schemas: None,
+            expects_models: true,
+            replication_verify_after: Mutex::new(BTreeSet::new()),
+        };
+        let loaded_cfg = rocky_core::config::load_rocky_config(&config)?;
+        let targets: BTreeSet<String> = ["orders".to_string()].into_iter().collect();
+        // The verdict is the plane's business; this test is about the row.
+        let _ = ctx.gate_replication_targets(&targets, &ledger, &loaded_cfg, &[]);
+
+        let rows = ledger.list_policy_decisions()?;
+        let row = rows
+            .iter()
+            .find(|r| r.plan_id == "plan_x" && r.model == "orders")
+            .expect("the target's decision row");
+        assert_eq!(row.effect, rocky_core::config::PolicyEffect::RequireReview);
+        assert!(
+            row.models.is_empty(),
+            "a target is not a model, even one named like a model: {:?}",
+            row.models
+        );
         Ok(())
     }
 

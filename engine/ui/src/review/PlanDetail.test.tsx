@@ -53,6 +53,7 @@ const QUEUE: ReviewQueueOutput = {
       capability: "schema_change.breaking",
       model: "orders",
       models: ["orders"],
+      preview_model: "orders",
       rule_id: 2,
       reason: "a breaking schema change needs a human",
       blast_radius: 7,
@@ -166,6 +167,7 @@ describe("PlanDetail", () => {
           capability: "backfill",
           model: "backfill: 3 model(s)",
           models: ["orders", "customers", "payments"],
+          preview_model: null,
           blast_radius: undefined,
         },
       ],
@@ -199,6 +201,7 @@ describe("PlanDetail", () => {
           capability: "backfill",
           model: "backfill_3_models",
           models: ["orders", "customers", "payments"],
+          preview_model: null,
           blast_radius: undefined,
         },
       ],
@@ -231,6 +234,7 @@ describe("PlanDetail", () => {
           capability: "gc",
           model: "gc",
           models: [],
+          preview_model: null,
           blast_radius: undefined,
         },
       ],
@@ -249,6 +253,41 @@ describe("PlanDetail", () => {
     await screen.findByText("no single model to sample");
     expect(screen.queryByRole("button", { name: /Show \d+ rows/ })).toBeNull();
     expect(screen.getByText(/names no compiled model for this plan \(gc "gc"\)/)).toBeTruthy();
+  });
+
+  /// A graph key is not a licence to read. The engine says per row what the
+  /// samples route would read (`preview_model`); a dotted model name, a
+  /// model a restore recorded that is gone, a model with compile errors are
+  /// keys the route refuses, and the screen must not offer them (#1815,
+  /// review round two). Offering from `models` makes this fail.
+  it("offers no sample for a model the samples route would refuse", async () => {
+    const refused: ReviewQueueOutput = {
+      ...QUEUE,
+      pending: [
+        {
+          ...QUEUE.pending[0],
+          model: "v2.fct_orders",
+          models: ["v2.fct_orders"],
+          preview_model: null,
+        },
+      ],
+    };
+
+    render(
+      <PlanDetail
+        planId={PLAN}
+        loaders={loaders({
+          status: vi.fn(async () => ({ ...STATUS, product_id: undefined })),
+          queue: vi.fn(async () => refused),
+        })}
+      />,
+    );
+
+    await screen.findByText("no single model to sample");
+    expect(screen.queryByRole("button", { name: /Show \d+ rows/ })).toBeNull();
+    expect(
+      screen.getByText(/The samples route would read none of the models this plan names \(v2\.fct_orders\)/),
+    ).toBeTruthy();
   });
 
   /// The apply-time gate records one decision per touched model, and the
@@ -273,6 +312,7 @@ describe("PlanDetail", () => {
           decision_ref: "2026-09-06T09:00:00Z|aaa|customers",
           model: "customers",
           models: ["customers"],
+          preview_model: "customers",
           rule_id: 5,
           reason: "customers is a governed product input",
         },
@@ -315,6 +355,7 @@ describe("PlanDetail", () => {
           capability: "restore",
           model: "restore: 1 tombstoned model",
           models: ["orders", "customers"],
+          preview_model: null,
           blast_radius: undefined,
         },
       ],
@@ -389,6 +430,7 @@ describe("PlanDetail", () => {
           plan_id: PLAN_B,
           model: "customers",
           models: ["customers"],
+          preview_model: "customers",
           approve_command: `rocky review ${PLAN_B} --approve`,
         },
       ],

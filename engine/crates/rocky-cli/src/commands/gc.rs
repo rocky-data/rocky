@@ -1580,6 +1580,7 @@ async fn gc_seam_regate(
         principal,
         touched,
         &attrs_map,
+        crate::commands::apply::GateSubjects::CompiledModels,
         prior_decisions,
         &fresh_markers,
         false,

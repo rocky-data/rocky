@@ -21,6 +21,7 @@ const QUEUE: ReviewQueueOutput = {
       capability: "schema_change.breaking",
       model: "orders",
       models: ["orders"],
+      preview_model: "orders",
       rule_id: 2,
       reason: "a breaking schema change needs a human",
       blast_radius: 7,
@@ -37,6 +38,7 @@ const QUEUE: ReviewQueueOutput = {
       capability: "schema_change.additive",
       model: "customers",
       models: ["customers"],
+      preview_model: "customers",
       rule_id: null,
       reason: "the default effect asks for review",
       blast_radius: null,
@@ -84,6 +86,7 @@ describe("QueuePanel", () => {
           capability: "backfill" as const,
           model: "backfill: 3 model(s)",
           models: ["orders", "customers", "payments"],
+          preview_model: null,
         },
       ],
     }));

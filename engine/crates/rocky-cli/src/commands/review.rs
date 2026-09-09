@@ -859,6 +859,18 @@ fn build_queue(
             // so what a consumer is told the row stands for is exactly what
             // the blast radius was computed over.
             let models = queue_graph_keys(d, compiled.as_ref());
+            // What the samples route would read for this row, decided by the
+            // route's own admission (`preview_rows::admit_model`) and not by
+            // any consumer's reading of a name. `models` ranks and audits;
+            // only this licenses an offer to read (#1815).
+            let preview_model = match (models.as_slice(), compiled.as_ref()) {
+                ([only], Some(result)) => {
+                    crate::commands::preview_rows::admit_model(result, models_dir, only)
+                        .ok()
+                        .map(|_| only.clone())
+                }
+                _ => None,
+            };
             // Deduplicated union, all-or-nothing: an absent member makes the
             // whole answer unknown rather than a partial count dressed as a
             // measurement, and no members at all is unknown too. See
@@ -879,6 +891,7 @@ fn build_queue(
                 capability: d.capability,
                 model: d.model.clone(),
                 models,
+                preview_model,
                 rule_id: d.rule_id,
                 reason: d.reason.clone(),
                 blast_radius,
@@ -927,10 +940,7 @@ pub(crate) fn select_outstanding<'a>(
     plan_exists: impl Fn(&str) -> bool,
 ) -> (Vec<&'a PolicyDecisionRecord>, u64) {
     let mut latest: BTreeMap<(&str, &str), &PolicyDecisionRecord> = BTreeMap::new();
-    for d in decisions
-        .into_iter()
-        .filter(|d| d.effect == PolicyEffect::RequireReview)
-    {
+    for d in decisions {
         latest
             .entry((d.plan_id.as_str(), d.model.as_str()))
             .and_modify(|cur| {
@@ -943,6 +953,13 @@ pub(crate) fn select_outstanding<'a>(
     let mut excluded_non_plan: u64 = 0;
     let outstanding = latest
         .into_values()
+        // The LATEST decision per key decides, whatever its effect. A
+        // `require_review` that a later `allow` or `deny` for the same
+        // (plan, model) superseded is history: approving it is moot under
+        // the `allow` and cannot make apply succeed under the `deny`.
+        // Filtering to `require_review` BEFORE picking the latest kept such
+        // rows approvable (#1815, review round two).
+        .filter(|d| d.effect == PolicyEffect::RequireReview)
         .filter(|d| !is_reviewed(&d.plan_id))
         .filter(|d| {
             if plan_exists(&d.plan_id) {
@@ -1472,6 +1489,71 @@ mod tests {
         assert_eq!(d.model, "x");
         // The newest of the two planA/x rows wins (the breaking one at secs=9).
         assert_eq!(d.capability, PolicyCapability::SchemaChangeBreaking);
+    }
+
+    /// The latest decision per (plan, model) decides. A `require_review`
+    /// followed by an `allow` (policy loosened, plan re-run) is moot; one
+    /// followed by a `deny` cannot be made to succeed by approval. Both used
+    /// to stay in the queue, because the effect filter ran before the
+    /// latest-row pick. The reverse orders still queue: the newest row is the
+    /// escalation.
+    #[test]
+    fn a_later_allow_or_deny_supersedes_an_older_require_review() {
+        let decisions = vec![
+            qd(
+                1,
+                "planA",
+                "x",
+                PolicyEffect::RequireReview,
+                PolicyCapability::Apply,
+            ),
+            qd(
+                5,
+                "planA",
+                "x",
+                PolicyEffect::Allow,
+                PolicyCapability::Apply,
+            ),
+            qd(
+                1,
+                "planB",
+                "y",
+                PolicyEffect::RequireReview,
+                PolicyCapability::Apply,
+            ),
+            qd(5, "planB", "y", PolicyEffect::Deny, PolicyCapability::Apply),
+            qd(
+                1,
+                "planC",
+                "z",
+                PolicyEffect::Allow,
+                PolicyCapability::Apply,
+            ),
+            qd(
+                5,
+                "planC",
+                "z",
+                PolicyEffect::RequireReview,
+                PolicyCapability::Apply,
+            ),
+            qd(1, "planD", "w", PolicyEffect::Deny, PolicyCapability::Apply),
+            qd(
+                5,
+                "planD",
+                "w",
+                PolicyEffect::RequireReview,
+                PolicyCapability::Apply,
+            ),
+        ];
+        let (out, excluded) = select_outstanding(&decisions, |_| false, |_| true);
+        assert_eq!(excluded, 0);
+        let mut plans: Vec<&str> = out.iter().map(|d| d.plan_id.as_str()).collect();
+        plans.sort_unstable();
+        assert_eq!(
+            plans,
+            vec!["planC", "planD"],
+            "superseded escalations are history; new ones queue"
+        );
     }
 
     /// FIX: decision-only custody rows (`draft:*`, `autoapply:*`, …) whose
@@ -2421,6 +2503,77 @@ mod tests {
             bf.blast_radius,
             Some(1),
             "ranked on the set, not on the label"
+        );
+
+        // A graph key is not a licence to read: the samples route refuses a
+        // dotted name, so the queue offers none — while `a` is readable, a
+        // target is not a model, and two models are not one to read.
+        assert_eq!(ordinary.preview_model.as_deref(), Some("a"));
+        assert_eq!(dotted.preview_model, None);
+        assert_eq!(replication.preview_model, None);
+        assert_eq!(bf.preview_model, None);
+    }
+
+    /// `preview_model` follows the samples route's own admission, not the
+    /// graph's: a model a restore plan recorded that is gone from the current
+    /// project, and a model that no longer compiles, are graph keys the route
+    /// would refuse, so no offer is made. Deciding from `models` alone makes
+    /// this fail.
+    #[test]
+    fn the_entry_offers_a_read_only_where_the_samples_route_would_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let models_dir = root.join("models");
+        write_blast_graph(&models_dir);
+        // A model whose SQL does not parse: in the project, with an error.
+        std::fs::write(models_dir.join("shaky.sql"), "SELECT FROM WHERE").unwrap();
+        std::fs::write(
+            models_dir.join("shaky.toml"),
+            "name = \"shaky\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"shaky\"\n",
+        )
+        .unwrap();
+        let state_path = root.join("state.redb");
+
+        // A restore plan's recorded set names a tombstoned model the current
+        // project no longer has.
+        touch_plan_file(root, "restore_gone");
+        record_plan_review_escalation(
+            &state_path,
+            "restore_gone",
+            PolicyPrincipal::Human,
+            PolicyCapability::Restore,
+            "restore: gone (abc123…)",
+            vec!["gone".to_string()],
+            "restore plan awaits review",
+        );
+        touch_plan_file(root, "shaky_plan");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .record_policy_decision(&qd(
+                    1,
+                    "shaky_plan",
+                    "shaky",
+                    PolicyEffect::RequireReview,
+                    PolicyCapability::Apply,
+                ))
+                .unwrap();
+        }
+
+        let out = compute_review_queue(root, &root.join("rocky.toml"), &state_path, &models_dir)
+            .expect("a model that fails to parse degrades the ranking, it does not refuse");
+        let by_plan = |plan: &str| out.pending.iter().find(|e| e.plan_id == plan).unwrap();
+        assert_eq!(by_plan("restore_gone").models, vec!["gone".to_string()]);
+        assert_eq!(
+            by_plan("restore_gone").preview_model,
+            None,
+            "not in the current project"
+        );
+        assert_eq!(
+            by_plan("shaky_plan").preview_model,
+            None,
+            "the route refuses compile errors"
         );
     }
 
