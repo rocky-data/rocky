@@ -62,9 +62,38 @@ values = ["pending", "shipped"]
     )
 }
 
-/// One row that violates both assertions: a NULL `name` and a `status`
-/// outside the accepted list. The row count check passes (one row).
-fn seed(dir: &Path, extra: &str) {
+/// A schema-wide quality target (`table` omitted) on `schema`, with the row
+/// count check only, so the seeded row passes everything the pipeline runs.
+/// `extra` appends the per-case knob to `[checks]`.
+fn schema_wide_config(schema: &str, extra: &str) -> String {
+    format!(
+        r#"
+[adapter]
+type = "duckdb"
+path = "fixture.duckdb"
+
+[pipeline.dq]
+type = "quality"
+
+[pipeline.dq.target]
+adapter = "default"
+
+[[pipeline.dq.tables]]
+catalog = "fixture"
+schema = "{schema}"
+
+[pipeline.dq.checks]
+enabled = true
+row_count = true
+{extra}
+"#
+    )
+}
+
+/// One row in `main.orders` that violates both assertions of [`config`]: a
+/// NULL `name` and a `status` outside the accepted list. The row count check
+/// passes (one row).
+fn seed_db(dir: &Path) {
     let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
     conn.execute_batch(
         "CREATE TABLE main.orders AS
@@ -72,12 +101,32 @@ fn seed(dir: &Path, extra: &str) {
     )
     .expect("seed table");
     drop(conn);
+}
+
+fn seed(dir: &Path, extra: &str) {
+    seed_db(dir);
     fs::write(dir.join("rocky.toml"), config(extra)).expect("write config");
 }
 
 fn rocky(dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_rocky"))
         .args(["--output", "json"])
+        .arg("--config")
+        .arg(dir.join("rocky.toml"))
+        .arg("--state-path")
+        .arg(dir.join("state.redb"))
+        .args(args)
+        .current_dir(dir)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("spawn rocky")
+}
+
+/// [`rocky`] with `--output table`: the human summary. Explicit, because a
+/// run whose stdout is not a terminal defaults to JSON.
+fn rocky_text(dir: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_rocky"))
+        .args(["--output", "table"])
         .arg("--config")
         .arg(dir.join("rocky.toml"))
         .arg("--state-path")
@@ -201,4 +250,138 @@ fn fail_on_error_off_leaves_the_run_green_and_the_counts_honest() {
         "the gate is not tripped, and an untripped gate is omitted: {out}"
     );
     assert_eq!(out["tables_failed"], 0, "{out}");
+}
+
+/// #1811. A schema-wide target whose schema lists as EMPTY reported a clean
+/// run. #1786 closed the case where listing the schema errors; a renamed or
+/// never-created schema is not an error to `information_schema`, it is zero
+/// rows, and the check loop iterated nothing, emitted nothing, and the run
+/// said `Success`, exit 0, having checked no table at all. Through the real
+/// binary and the real expansion against a real missing schema, as the issue
+/// asks: the helper-level test could not see this path.
+#[test]
+fn a_schema_wide_target_that_lists_no_tables_is_not_a_clean_run() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    seed_db(dir);
+    fs::write(dir.join("rocky.toml"), schema_wide_config("ghost", "")).expect("write config");
+
+    let run = rocky(dir, &["run"]);
+    assert_eq!(
+        run.status.code(),
+        Some(1),
+        "a run that checked nothing is not green; stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let out = json(&run);
+    assert_eq!(out["status"], "Failure", "JSON status: {out}");
+    assert_eq!(out["check_gate_failed"], serde_json::json!(true), "{out}");
+    assert_eq!(
+        out["tables_failed"], 0,
+        "no table failed; none was found: {out}"
+    );
+    let results = out["check_results"].as_array().expect("check_results");
+    assert_eq!(results.len(), 1, "one entry, for the target itself: {out}");
+    assert_eq!(
+        results[0]["asset_key"],
+        serde_json::json!(["fixture", "ghost"]),
+        "keyed by the schema, since no table is known: {out}"
+    );
+    let check = &results[0]["checks"][0];
+    assert_eq!(check["name"], "schema_expansion", "{out}");
+    assert_eq!(check["passed"], false, "{out}");
+    assert_eq!(check["severity"], "error", "{out}");
+    let reason = check["not_evaluated"]
+        .as_str()
+        .expect("not_evaluated reason");
+    assert!(
+        reason.contains("listed no tables") && reason.contains("fixture.ghost"),
+        "the reason says what happened and names the schema: {reason}"
+    );
+}
+
+/// The gate off: the empty expansion is still reported as a check the engine
+/// could not evaluate, but `fail_on_error = false` leaves the run green.
+#[test]
+fn an_empty_schema_expansion_is_reported_even_when_the_gate_is_off() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    seed_db(dir);
+    fs::write(
+        dir.join("rocky.toml"),
+        schema_wide_config("ghost", "fail_on_error = false"),
+    )
+    .expect("write config");
+
+    let run = rocky(dir, &["run"]);
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let out = json(&run);
+    assert_eq!(out["status"], "Success", "{out}");
+    assert!(out.get("check_gate_failed").is_none(), "{out}");
+    assert_eq!(
+        failed_checks(&out),
+        vec!["schema_expansion".to_string()],
+        "the unevaluated target is still in the payload: {out}"
+    );
+}
+
+/// The discriminator: the same schema-wide target on a schema that HAS a
+/// table checks that table and is green. The fix keys on an empty listing,
+/// not on schema-wide targets as such.
+#[test]
+fn a_schema_wide_target_with_a_table_still_checks_it_and_passes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    seed_db(dir);
+    fs::write(dir.join("rocky.toml"), schema_wide_config("main", "")).expect("write config");
+
+    let run = rocky(dir, &["run"]);
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let out = json(&run);
+    assert_eq!(out["status"], "Success", "{out}");
+    let results = out["check_results"].as_array().expect("check_results");
+    assert_eq!(results.len(), 1, "the one table the schema lists: {out}");
+    assert_eq!(
+        results[0]["asset_key"],
+        serde_json::json!(["fixture", "main", "orders"]),
+        "{out}"
+    );
+    assert!(failed_checks(&out).is_empty(), "{out}");
+    assert_eq!(results[0]["checks"][0]["name"], "row_count", "{out}");
+    assert_eq!(results[0]["checks"][0]["passed"], true, "{out}");
+}
+
+/// The human summary counts tables actually checked, not `check_results`
+/// entries: with the schema-level entry for an empty expansion it said
+/// "across 1 table(s)" for a run that found none (round-one review nit).
+#[test]
+fn the_text_summary_counts_zero_tables_for_an_empty_expansion() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    seed_db(dir);
+    fs::write(dir.join("rocky.toml"), schema_wide_config("ghost", "")).expect("write config");
+
+    let run = rocky_text(dir, &["run"]);
+    assert_eq!(run.status.code(), Some(1));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        text.contains("across 0 table(s)")
+            && text.contains("1 schema target(s) could not be expanded"),
+        "the summary says nothing was checked and why: {text}"
+    );
 }
