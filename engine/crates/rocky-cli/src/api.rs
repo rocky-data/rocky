@@ -1508,11 +1508,6 @@ fn is_plan_id(candidate: &str) -> bool {
 /// wait beats a refusal the caller would only retry into.
 const REVIEW_DIFF_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// How long a warehouse sample may run before the route gives up. The query
-/// itself may keep running: cancelling one is adapter-specific and is not in
-/// this package, which the guide says plainly.
-const SAMPLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// Largest `limit` the samples route accepts. The CLI takes any `u32`; a
 /// browser-reachable route does not, because the rows cross the wire and sit
 /// in a page.
@@ -1647,9 +1642,14 @@ async fn review_diff(
 ///   local DuckDB adapter needs none, exactly as the CLI needs no
 ///   `--allow-warehouse` there.
 /// * **A row cap.** `limit` is `1..=500`; anything else is `400`.
-/// * **A timeout.** The warehouse call is bounded by [`SAMPLE_TIMEOUT`], and
-///   only one sample runs at a time — a second is refused at once rather than
-///   queued behind a call that may take the whole 30 seconds.
+/// * **A timeout.** The whole call is bounded by the state's sample timeout
+///   ([`rocky_server::state::DEFAULT_SAMPLE_TIMEOUT`], 30 seconds), the
+///   compile included: the blocking stage of the sample runs on the blocking
+///   pool, so the deadline is observed while it runs (#1816). Only one sample
+///   runs at a time — a second is refused at once rather than queued behind
+///   a call that may take the whole 30 seconds — and the permit rides with
+///   the blocking stage, so a compile the route stopped waiting for keeps the
+///   lane until it returns.
 ///
 /// The response carries `Cache-Control: no-store`: the body is warehouse rows,
 /// and `GET` is the one method a browser, a proxy or a service worker caches
@@ -1696,24 +1696,25 @@ async fn model_rows(
         .retry_after(5));
     };
 
-    let models_dir = state.models_dir.clone();
-    let cte = query.cte.clone();
-    let pipeline = query.pipeline.clone();
-    let sample = tokio::time::timeout(SAMPLE_TIMEOUT, async move {
-        let _held = permit;
+    let timeout = state.sample_timeout();
+    let sample = tokio::time::timeout(
+        timeout,
         crate::commands::compute_preview_rows(
             &config,
             &name,
-            cte.as_deref(),
+            query.cte.as_deref(),
             limit,
             consented,
-            pipeline.as_deref(),
-            &models_dir,
+            query.pipeline.as_deref(),
+            &state.models_dir,
             // Ad-hoc SQL is never reachable over HTTP.
             None,
-        )
-        .await
-    })
+            // The permit goes with the sample, into its blocking stage: a
+            // compile that outlives the deadline keeps the lane until it
+            // returns (#1816).
+            Some(permit),
+        ),
+    )
     .await;
 
     match sample {
@@ -1728,10 +1729,7 @@ async fn model_rows(
         Err(_) => Err(ApiError::new(
             StatusCode::GATEWAY_TIMEOUT,
             "sample_timeout",
-            format!(
-                "the sample did not finish within {} seconds",
-                SAMPLE_TIMEOUT.as_secs()
-            ),
+            format!("the sample did not finish within {timeout:?}"),
             Some("the warehouse may still be running the query; narrow the model or lower `limit`"),
         )),
     }
@@ -1761,6 +1759,9 @@ fn sample_failure_to_api_error(failure: crate::commands::PreviewFailure) -> ApiE
         | "unmaskable_column" => StatusCode::UNPROCESSABLE_ENTITY,
         "upstream_not_materialized" | "missing_catalog" => StatusCode::CONFLICT,
         "config_error" | "pipeline_error" => StatusCode::SERVICE_UNAVAILABLE,
+        // The blocking stage of the sample did not complete (a panic on the
+        // blocking pool): this server's fault, not the adapter's.
+        "internal_error" => StatusCode::INTERNAL_SERVER_ERROR,
         // An adapter that would not connect, or would not answer, failed
         // upstream of this server.
         _ => StatusCode::BAD_GATEWAY,
@@ -3314,6 +3315,72 @@ mod tests {
             } else {
                 assert_eq!(resp.status(), 403, "consent header {value:?} was accepted");
             }
+        }
+    }
+
+    /// #1816. The sample deadline could not fire during the compile. Config
+    /// loading and the compiler run inside `compute_preview_rows` are
+    /// synchronous, and a Tokio timeout is checked only between polls, so a
+    /// compile that took a minute held the request, a runtime worker and the
+    /// sample permit for the minute, and `504 sample_timeout` was never sent
+    /// at 30 seconds. The blocking stage now runs on the blocking pool, where
+    /// the deadline can be observed; the permit rides with it, so a compile
+    /// the route stopped waiting for still keeps a second sample out until it
+    /// returns.
+    ///
+    /// A test hook holds the blocking stage for longer than the deadline. The
+    /// clock is the discriminator: on the pre-fix shape the answer arrives
+    /// after the whole hold, not after the deadline.
+    #[tokio::test]
+    async fn the_sample_deadline_fires_during_a_slow_compile_and_the_permit_outlives_it() {
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) = remote_adapter_project(dir.path());
+        let hold = Duration::from_millis(1500);
+        *crate::commands::PREPARE_HOLD_FOR_TEST.lock().unwrap() = Some((config.clone(), hold));
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        state.set_sample_timeout(Duration::from_millis(100));
+        let base = spawn_router(Arc::clone(&state)).await;
+        let client = reqwest::Client::new();
+
+        let started = Instant::now();
+        let resp = client
+            .get(format!("{base}/api/v1/models/orders/rows"))
+            .header("x-rocky-allow-warehouse", "true")
+            .send()
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(resp.status(), 504, "answered after {elapsed:?}");
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "sample_timeout");
+        assert!(
+            elapsed < hold,
+            "the deadline waited for the compile: answered after {elapsed:?}, \
+             and the compile holds for {hold:?}"
+        );
+
+        // The compile the route stopped waiting for still holds the permit,
+        // so a second sample is refused rather than compiled beside it...
+        let second = client
+            .get(format!("{base}/api/v1/models/orders/rows"))
+            .header("x-rocky-allow-warehouse", "true")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second.status(), 503);
+        let err: ErrorEnvelope = second.json().await.unwrap();
+        assert_eq!(err.code, "engine_busy");
+
+        // ...and releases it when the compile returns, not never.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.warehouse_samples.available_permits() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the permit never came back after the orphaned compile"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 

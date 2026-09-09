@@ -514,6 +514,10 @@ fn config_error_diagnostic(
         ConfigError::StateFreezeMarkerWritesUnsupportedBackend { .. } => {
             ("V046", Some("state.freeze_marker_writes".into()))
         }
+        ConfigError::ChecksAnomalyThresholdNotFinite { pipeline, .. } => (
+            "V046",
+            Some(format!("pipeline.{pipeline}.checks.anomaly_threshold_pct")),
+        ),
         _ => ("V046", None),
     };
 

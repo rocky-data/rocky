@@ -341,6 +341,17 @@ pub enum ConfigError {
          Disable the flag or switch the [state] backend."
     )]
     StateFreezeMarkerWritesUnsupportedBackend { backend: String },
+
+    /// `[pipeline.<name>.checks] anomaly_threshold_pct` is `nan` or
+    /// infinite. Detection compares a deviation against the threshold, and
+    /// every comparison with NaN is false, so a NaN threshold flagged nothing
+    /// and called every row count normal (#1816). `0` disables detection and
+    /// says so; a value that cannot be compared is refused instead.
+    #[error(
+        "pipeline '{pipeline}': checks.anomaly_threshold_pct must be a finite number, got {value}; \
+         set it to 0 to disable anomaly detection"
+    )]
+    ChecksAnomalyThresholdNotFinite { pipeline: String, value: String },
 }
 
 /// Concurrency strategy for table processing.
@@ -1216,6 +1227,13 @@ pub struct ChecksConfig {
     /// `deviation_pct > threshold_pct`, so `0` flagged every table whose count
     /// moved at all, and an operator following this sentence to turn detection
     /// off turned it maximally on. A negative value disables it too.
+    ///
+    /// Must be a finite number. TOML accepts `nan` and `inf`, and a NaN
+    /// threshold disabled detection silently: every comparison with NaN is
+    /// false, so nothing was flagged and every count was called "within
+    /// normal range" (#1816). `validate_checks` refuses a non-finite value
+    /// when the config loads; `0` is the way to turn detection off, and it
+    /// says so in the result.
     #[serde(default = "default_anomaly_threshold_pct")]
     pub anomaly_threshold_pct: f64,
     /// When `true` (default), the quality run exits non-zero if any
@@ -3406,6 +3424,27 @@ pub fn validate_freeze_marker_writes(config: &RockyConfig) -> Vec<ConfigError> {
         errors.push(ConfigError::StateFreezeMarkerWritesUnsupportedBackend {
             backend: config.state.backend.to_string(),
         });
+    }
+    errors
+}
+
+/// Every pipeline's `checks.anomaly_threshold_pct` must be a finite number
+/// (#1816). TOML parses `nan`, `inf` and `-inf` into an `f64` without
+/// complaint, and `detect_anomaly` cannot compare against any of them: NaN
+/// fails both `> 0` and `<= 0`, so it fell through to "within normal range"
+/// with detection silently off; `inf` is never exceeded. Rejected here, at
+/// load, so the run never starts with detection off by accident. Zero and
+/// negative values are the documented off switch and stay accepted.
+pub fn validate_checks(config: &RockyConfig) -> Vec<ConfigError> {
+    let mut errors = Vec::new();
+    for (name, pipeline) in &config.pipelines {
+        let threshold = pipeline.checks().anomaly_threshold_pct;
+        if !threshold.is_finite() {
+            errors.push(ConfigError::ChecksAnomalyThresholdNotFinite {
+                pipeline: name.clone(),
+                value: threshold.to_string(),
+            });
+        }
     }
     errors
 }
@@ -6682,6 +6721,7 @@ const CONFIG_VALIDATORS: &[ConfigValidator] = &[
     validate_fivetran_resilience,
     validate_policy,
     validate_freeze_marker_writes,
+    validate_checks,
 ];
 
 /// The fail-fast validation chain shared by [`load_rocky_config`] and
@@ -8336,6 +8376,93 @@ autonomy_budget = { failures = 2, window = "banana" }
             ),
             "got {errors:?}"
         );
+    }
+
+    // --- [pipeline.*.checks] anomaly_threshold_pct validation (#1816) ---
+
+    /// A quality pipeline whose `anomaly_threshold_pct` is `threshold`, as the
+    /// TOML text the operator would write.
+    fn quality_with_threshold(threshold: &str) -> RockyConfig {
+        parse(&format!(
+            "[adapter.db]\ntype = \"duckdb\"\n\n\
+             [pipeline.dq]\ntype = \"quality\"\n\n\
+             [pipeline.dq.target]\nadapter = \"db\"\n\n\
+             [[pipeline.dq.tables]]\ncatalog = \"main\"\nschema = \"raw\"\ntable = \"orders\"\n\n\
+             [pipeline.dq.checks]\nanomaly_threshold_pct = {threshold}\n"
+        ))
+    }
+
+    /// `nan` and the infinities parse as valid TOML floats and are refused at
+    /// load, naming the pipeline and the value, because a NaN threshold turned
+    /// anomaly detection off without saying so.
+    #[test]
+    fn a_non_finite_anomaly_threshold_is_rejected_at_load() {
+        for threshold in ["nan", "+nan", "-nan", "inf", "+inf", "-inf"] {
+            let cfg = quality_with_threshold(threshold);
+            // The precondition the test rests on: TOML did accept it.
+            assert!(
+                !cfg.pipelines["dq"]
+                    .checks()
+                    .anomaly_threshold_pct
+                    .is_finite(),
+                "{threshold} parsed as a finite number"
+            );
+            let errors = validate_checks(&cfg);
+            assert!(
+                matches!(
+                    errors.as_slice(),
+                    [ConfigError::ChecksAnomalyThresholdNotFinite { pipeline, .. }] if pipeline == "dq"
+                ),
+                "{threshold}: got {errors:?}"
+            );
+            // The load-time chain and the diagnostic chain both carry it.
+            assert!(
+                matches!(
+                    validate_loaded_config(&cfg),
+                    Err(ConfigError::ChecksAnomalyThresholdNotFinite { .. })
+                ),
+                "{threshold}: the load-time chain let it through"
+            );
+            assert!(
+                collect_loaded_config_errors(&cfg)
+                    .iter()
+                    .any(|e| matches!(e, ConfigError::ChecksAnomalyThresholdNotFinite { .. })),
+                "{threshold}: `rocky validate` would not report it"
+            );
+            let message = errors[0].to_string();
+            assert!(
+                message.contains("anomaly_threshold_pct") && message.contains("set it to 0"),
+                "the message names the field and the off switch: {message}"
+            );
+        }
+    }
+
+    /// The other side: the documented off switch (`0`, a negative value), the
+    /// default, and an ordinary threshold all load. A `[checks]` table that
+    /// does not name the threshold carries the default and loads too.
+    #[test]
+    fn finite_anomaly_thresholds_including_the_off_switch_still_load() {
+        for threshold in ["0", "0.0", "-1", "50.0", "1e3"] {
+            let cfg = quality_with_threshold(threshold);
+            assert!(
+                validate_checks(&cfg).is_empty(),
+                "{threshold} was refused: {:?}",
+                validate_checks(&cfg)
+            );
+            assert!(validate_loaded_config(&cfg).is_ok(), "{threshold}");
+        }
+        let defaulted = parse(
+            "[adapter.db]\ntype = \"duckdb\"\n\n\
+             [pipeline.dq]\ntype = \"quality\"\n\n\
+             [pipeline.dq.target]\nadapter = \"db\"\n\n\
+             [[pipeline.dq.tables]]\ncatalog = \"main\"\nschema = \"raw\"\ntable = \"orders\"\n\n\
+             [pipeline.dq.checks]\nrow_count = true\n",
+        );
+        assert_eq!(
+            defaulted.pipelines["dq"].checks().anomaly_threshold_pct,
+            default_anomaly_threshold_pct()
+        );
+        assert!(validate_checks(&defaulted).is_empty());
     }
 
     // --- [state] freeze_marker_writes validation ---

@@ -473,16 +473,29 @@ fn checks_for_unexpandable_target(
     });
 }
 
-/// Brings a quality run's `tables_failed` and `status` into agreement with the
-/// verdict its checks produced, before anything is emitted or persisted.
+/// Brings a quality run's `check_gate_failed` and `status` into agreement
+/// with the verdict its checks produced, before anything is emitted or
+/// persisted.
 ///
-/// `RunOutput::derive_run_status` keys only on
-/// `tables_copied`/`tables_failed`/`interrupted` and IGNORES `check_results`,
-/// and nothing else in `run_quality` touches `tables_failed`. So a quality run
-/// with FAILING error-severity checks derived `Success`, and the schedule
-/// reconciler would treat a failed quality gate as a satisfied
+/// `RunOutput::derive_run_status` keys on
+/// `tables_copied`/`tables_failed`/`check_gate_failed`/`interrupted` and
+/// IGNORES `check_results`, and nothing else in `run_quality` sets the gate.
+/// So a quality run with FAILING error-severity checks derived `Success`, and
+/// the schedule reconciler would treat a failed quality gate as a satisfied
 /// `after`/`freshness` demand. This maps the SAME condition the exit code uses
-/// (`error_failures > 0 && fail_on_error`) onto `tables_failed`.
+/// (`error_failures > 0 && fail_on_error`) onto `check_gate_failed`, the field
+/// built to carry it.
+///
+/// Onto the gate, not onto `tables_failed` (#1816). The first version of this
+/// wrote the failed-CHECK count into `tables_failed`, whose contract is a
+/// count of tables and models that "never counts checks": one table with three
+/// failing checks reported `tables_failed: 3`, `check_gate_failed: false`, and
+/// a `dagster-rocky` consumer that compares `tables_failed` with the itemised
+/// `errors` read three unattributable failed tables. `status` came out right
+/// by accident, through the count. Now the count stays what it is (a quality
+/// run copies nothing and fails no table) and the gate says why the run
+/// failed, which is what `RunRecord::check_gate_failed` persists and what the
+/// resume gate inherits.
 ///
 /// It also stamps `status`, which `run_quality` never derived at all — the
 /// field kept the `RunStatus::Success` that `RunOutput::new` defaults it to,
@@ -495,11 +508,11 @@ fn checks_for_unexpandable_target(
 /// re-derive status from counts themselves", and `rocky-sdk` and
 /// `dagster-rocky` are those consumers. `#1604` governs HOW the payload is
 /// printed (through `print_json`, so `COMPACT_JSON` is honoured), not when it
-/// is built, so nothing there depended on the stale value.
+/// is built, so nothing there depended on the stale value. The end-to-end test
+/// in `rocky/tests/quality_check_gate.rs` reads the emitted payload through
+/// the real binary, so moving this call below the emit fails it.
 fn finalize_quality_status(output: &mut RunOutput, error_failures: usize, fail_on_error: bool) {
-    if error_failures > 0 && fail_on_error {
-        output.tables_failed = error_failures;
-    }
+    output.check_gate_failed = error_failures > 0 && fail_on_error;
     output.status = output.derive_run_status();
 }
 
@@ -2613,7 +2626,11 @@ auto_create_schemas = true
 
         super::finalize_quality_status(&mut output, error_failures, true);
 
-        assert_eq!(output.tables_failed, 1);
+        assert!(output.check_gate_failed, "the gate is the carrier (#1816)");
+        assert_eq!(
+            output.tables_failed, 0,
+            "a failed check is not a failed table"
+        );
         assert!(
             matches!(output.status, RunStatus::Failure),
             "the emitted payload agrees with the exit code: {:?}",
@@ -2622,6 +2639,104 @@ auto_create_schemas = true
         assert!(
             matches!(output.derive_run_status(), RunStatus::Failure),
             "and with what the persisted record derives"
+        );
+    }
+
+    /// #1816. The #1788 fix carried the failed gate in the wrong field: it
+    /// wrote the failed-CHECK count into `tables_failed`, whose contract says
+    /// it "never counts checks", and left `check_gate_failed` false. The test
+    /// above used one table with one check, so the two numbers coincided at
+    /// 1 and the wrong carrier passed. Three failing checks on one table pull
+    /// them apart.
+    #[test]
+    fn a_failed_quality_gate_rides_check_gate_failed_not_the_table_count() {
+        use crate::output::{RunOutput, TableCheckOutput};
+        use rocky_core::checks::{CheckDetails, CheckResult};
+        use rocky_core::state::RunStatus;
+        use rocky_core::tests::TestSeverity;
+
+        let failing = |name: &str, severity: TestSeverity| CheckResult {
+            name: name.to_string(),
+            passed: false,
+            severity,
+            not_evaluated: None,
+            details: CheckDetails::RowCount {
+                source_count: 0,
+                target_count: 0,
+            },
+        };
+        let one_table_three_checks = |severity: TestSeverity| {
+            let mut output = RunOutput::new(String::new(), 0, 1);
+            output.check_results.push(TableCheckOutput {
+                asset_key: vec!["cat".into(), "raw".into(), "orders".into()],
+                checks: vec![
+                    failing("not_null:id", severity),
+                    failing("unique:id", severity),
+                    failing("row_count", severity),
+                ],
+            });
+            output
+        };
+
+        // Three error-severity failures on one table, gate on.
+        let mut output = one_table_three_checks(TestSeverity::Error);
+        let (error_failures, _) = super::count_failures_by_severity(&output);
+        assert_eq!(error_failures, 3, "precondition: three failed checks");
+        super::finalize_quality_status(&mut output, error_failures, true);
+        assert!(output.check_gate_failed, "the gate carries the verdict");
+        assert_eq!(
+            output.tables_failed, 0,
+            "three failed checks on one table are not three failed tables, \
+             and not one either: a quality run fails no table"
+        );
+        assert!(
+            matches!(output.status, RunStatus::Failure),
+            "{:?}",
+            output.status
+        );
+        // The persisted record carries the same gate forward.
+        let now = chrono::Utc::now();
+        let record = output.to_run_record(
+            "run",
+            now,
+            now,
+            "cfg".to_string(),
+            rocky_core::state::RunTrigger::Manual,
+            output.derive_run_status(),
+            crate::output::RunRecordAudit::test_sentinels(),
+        );
+        assert!(record.check_gate_failed, "the record inherits the gate");
+        assert!(
+            matches!(record.status, RunStatus::Failure),
+            "{:?}",
+            record.status
+        );
+
+        // The same failures with the gate off: no gate, no failure.
+        let mut output = one_table_three_checks(TestSeverity::Error);
+        super::finalize_quality_status(&mut output, 3, false);
+        assert!(
+            !output.check_gate_failed,
+            "fail_on_error = false never trips the gate"
+        );
+        assert_eq!(output.tables_failed, 0);
+        assert!(
+            matches!(output.status, RunStatus::Success),
+            "{:?}",
+            output.status
+        );
+
+        // Warning-severity failures never reach the error bucket, so the gate
+        // stays down with fail_on_error on.
+        let mut output = one_table_three_checks(TestSeverity::Warning);
+        let (error_failures, warning_failures) = super::count_failures_by_severity(&output);
+        assert_eq!((error_failures, warning_failures), (0, 3));
+        super::finalize_quality_status(&mut output, error_failures, true);
+        assert!(!output.check_gate_failed, "warnings do not gate");
+        assert!(
+            matches!(output.status, RunStatus::Success),
+            "{:?}",
+            output.status
         );
     }
 

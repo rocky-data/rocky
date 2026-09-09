@@ -29,11 +29,24 @@ impl Drop for Server {
 
 /// One HTTP/1.0 GET: the status line, the headers, and the body.
 fn http_get(port: u16, path: &str) -> (String, String, String) {
+    http_get_with(port, path, &[])
+}
+
+/// [`http_get`] with extra request headers, each `(name, value)`.
+fn http_get_with(port: u16, path: &str, headers: &[(&str, &str)]) -> (String, String, String) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(60)))
         .expect("read timeout");
-    write!(stream, "GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").expect("request");
+    let extra: String = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
+    write!(
+        stream,
+        "GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n{extra}\r\n"
+    )
+    .expect("request");
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).expect("response");
     let text = String::from_utf8(raw).expect("utf-8 response");
@@ -189,9 +202,19 @@ fn real_server_answers_the_real_cli_sample_bytes() {
     );
 
     // A DuckDB project is local, so no consent header is needed — and passing
-    // one changes nothing.
-    let (with_consent, _, _) = http_get(port, "/api/v1/models/customer_orders/rows?limit=3");
+    // one changes nothing. (The header is really sent: an earlier version of
+    // this check repeated the headerless call, #1816.)
+    let (with_consent, _, consent_body) = http_get_with(
+        port,
+        "/api/v1/models/customer_orders/rows?limit=3",
+        &[("X-Rocky-Allow-Warehouse", "true")],
+    );
     assert!(with_consent.contains("200"), "{with_consent}");
+    assert_eq!(
+        without_duration(&consent_body),
+        without_duration(&body),
+        "consent on a local project changed the answer"
+    );
 
     // The row cap is the route's, not the CLI's: the CLI takes any u32.
     let (capped, _, capped_body) = http_get(port, "/api/v1/models/customer_orders/rows?limit=501");
