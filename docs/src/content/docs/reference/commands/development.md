@@ -219,10 +219,11 @@ rocky serve [flags]
 
 ### Security defaults
 
-`rocky serve` binds **`127.0.0.1` (loopback) by default**. Every endpoint except `/api/v1/health` requires a Bearer token. Two operating modes:
+`rocky serve` binds **`127.0.0.1` (loopback) by default**. Whether a request needs a Bearer token depends on one thing: whether a token is configured.
 
-- **Loopback only (default)** — bind stays on `127.0.0.1`. Authentication is still on, so external processes (LSP, dashboards) need the token, but a misconfigured network won't expose model SQL to the LAN.
-- **Non-loopback bind** — `--host 0.0.0.0` (or any non-loopback address) **requires `--token <secret>`** (or the `ROCKY_SERVE_TOKEN` env var); `rocky serve` refuses to start otherwise.
+- **No token configured (the loopback default)** — every request is accepted without authentication. Any process on the machine can read model SQL, run history and the governor ledger, and can call the mutating routes. This is the development posture. It is refused on a non-loopback bind, so a misconfigured network cannot expose the server this way.
+- **A token configured** — `--token <secret>`, or the `ROCKY_SERVE_TOKEN` env var. Every request must carry `Authorization: Bearer <secret>`, with two exceptions: `GET /api/v1/health` never needs one, and `POST /api/v1/hooks/trigger/{pipeline}` (exactly one path segment after the prefix) checks an `X-Rocky-Signature` HMAC instead of the token — see the webhook edge below.
+- **Non-loopback bind** — `--host 0.0.0.0` (or any non-loopback address) **requires a token**; `rocky serve` refuses to start otherwise. `--ui` requires a token on any bind.
 
 A token is full-scope by default: it reaches every route. `--token-scope read-only` narrows it. A read-only token authenticates the same way, then gets `403` on any request that is not `GET`, `HEAD`, or `OPTIONS`. Give that token to a browser UI, so a leaked token cannot start a run:
 
@@ -248,7 +249,7 @@ CORS is empty-by-default. Browser apps must declare every allowed origin via `--
 | `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. |
 | `--host <HOST>` | `String` | `127.0.0.1` | Bind host. Non-loopback (`0.0.0.0`, etc.) requires `--token`. |
 | `--port <PORT>` | `u16` | `8080` | Port to listen on. |
-| `--token <SECRET>` | `String` | | Bearer token required by every API request except `/api/v1/health`. Falls back to `ROCKY_SERVE_TOKEN` env var when omitted. **Required when `--host` is non-loopback.** |
+| `--token <SECRET>` | `String` | | Bearer token. When set, every request must carry it, except `GET /api/v1/health` and the HMAC-checked webhook route. When unset, requests on a loopback bind are accepted without authentication. Falls back to `ROCKY_SERVE_TOKEN` env var when omitted. **Required when `--host` is non-loopback, and with `--ui`.** |
 | `--token-scope <SCOPE>` | `full` \| `read-only` | `full` | What `--token` may do. `read-only` allows `GET`, `HEAD`, and `OPTIONS` only; anything else gets `403 forbidden_read_only_token`. Falls back to `ROCKY_SERVE_TOKEN_SCOPE`. Setting a scope without a token is an error. |
 | `--allowed-origin <ORIGIN>` | `String` (repeatable) | `[]` | Add an origin to the CORS allowlist. Repeat for multiple origins (e.g. `--allowed-origin http://localhost:5173 --allowed-origin https://dashboard.example.com`). |
 | `--ui` | `bool` | `false` | Serve the browser UI at `/ui/`. Release binaries carry it; from source, build with `--features ui`. Requires `--token` with `--token-scope read-only`, and `ROCKY_WEBHOOK_SECRET` with `--scheduler`. Prints the address to open, token included. |
