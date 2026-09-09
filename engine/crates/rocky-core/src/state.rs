@@ -9775,7 +9775,11 @@ mod tests {
         assert_ne!(recorded, progress_scope("p1"));
         assert_eq!(
             recorded.to_string(),
-            "pipeline 'p1', no filter, target unrecorded"
+            // Both halves read "unrecorded": a pre-release blob carries
+            // neither the structured target nor the source (#1583). Saying
+            // so is the point — it is what makes the mismatch below legible
+            // rather than a silent inequality.
+            "pipeline 'p1', no filter, target unrecorded, source unrecorded"
         );
 
         assert!(
