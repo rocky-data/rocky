@@ -16,6 +16,12 @@ use rocky_core::dag_status::DagStatusStore;
 use crate::auth::ServeToken;
 use crate::schema_cache_throttle::SchemaCacheThrottle;
 
+/// How long `GET /api/v1/models/{name}/rows` waits for a sample before
+/// answering `504 sample_timeout`, unless [`ServerState::set_sample_timeout`]
+/// changed it. The query itself may keep running past it: cancelling one is
+/// adapter-specific and is not in this package, which the guide says plainly.
+pub const DEFAULT_SAMPLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Shared server state holding the latest compilation result.
 pub struct ServerState {
     pub models_dir: PathBuf,
@@ -107,9 +113,35 @@ pub struct ServerState {
     /// with `Retry-After`, because queueing behind a possible 30 seconds is
     /// worse for it than a fast refusal.
     pub warehouse_samples: Arc<tokio::sync::Semaphore>,
+    /// The sample deadline, in milliseconds: [`DEFAULT_SAMPLE_TIMEOUT`]
+    /// unless [`ServerState::set_sample_timeout`] changed it. An atomic
+    /// rather than a constructor argument because the state is handed out as
+    /// an `Arc` (and cloned into the initial compile) before a test can reach
+    /// it (#1816).
+    sample_timeout_ms: std::sync::atomic::AtomicU64,
+}
+
+/// A duration as whole milliseconds, saturating rather than truncating.
+fn millis(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 impl ServerState {
+    /// How long the samples route waits before answering `504 sample_timeout`.
+    pub fn sample_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.sample_timeout_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Change the sample deadline for every later request. Tests shorten it
+    /// to watch the deadline fire; nothing in the server itself calls this.
+    pub fn set_sample_timeout(&self, timeout: std::time::Duration) {
+        self.sample_timeout_ms
+            .store(millis(timeout), std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Create new server state and perform initial compilation.
     ///
     /// Defaults to the LSP-style configuration (no token, empty CORS
@@ -193,6 +225,7 @@ impl ServerState {
             store_access: Arc::new(tokio::sync::Semaphore::new(1)),
             review_diffs: Arc::new(tokio::sync::Semaphore::new(1)),
             warehouse_samples: Arc::new(tokio::sync::Semaphore::new(1)),
+            sample_timeout_ms: std::sync::atomic::AtomicU64::new(millis(DEFAULT_SAMPLE_TIMEOUT)),
         });
 
         // Initial compile
