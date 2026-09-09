@@ -14272,7 +14272,11 @@ mod tests {
         first.retention = Some(rocky_core::retention::RetentionPolicy { duration_days: 90 });
         first.governance_tags = one_entry("owner", "analytics");
 
+        // The second model needs a leg BEFORE its set_tags too, or the
+        // expected sequence is identical whether the tags leg runs inside the
+        // per-model loop or in a second pass over every model.
         let mut second = ungoverned_model("customers");
+        second.classification = one_entry("region", "pii");
         second.governance_tags = one_entry("owner", "crm");
 
         let snapshot = super::GovernanceSnapshot {
@@ -14294,11 +14298,14 @@ mod tests {
                 "apply_masking_policy",
                 "apply_retention_policy",
                 "set_tags",
-                // "customers" — only `[governance.tags]`, so only that leg.
+                // "customers" — no retention, so that leg is skipped, and its
+                // calls follow orders' rather than grouping by method.
+                "apply_column_tags",
+                "apply_masking_policy",
                 "set_tags",
             ],
-            "the reconcile order, and the per-model skipping, must match the \
-             order the doc comment on reconcile_model_governance states"
+            "the reconcile must finish one model before starting the next, and \
+             skip the legs a model does not configure"
         );
     }
 
