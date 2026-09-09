@@ -1231,9 +1231,9 @@ pub struct ChecksConfig {
     /// Must be a finite number. TOML accepts `nan` and `inf`, and a NaN
     /// threshold disabled detection silently: every comparison with NaN is
     /// false, so nothing was flagged and every count was called "within
-    /// normal range" (#1816). `validate_checks` refuses a non-finite value
-    /// when the config loads; `0` is the way to turn detection off, and it
-    /// says so in the result.
+    /// normal range" (#1816). A non-finite value is refused when the config
+    /// loads; `0` is the way to turn detection off, and it says so in the
+    /// result.
     #[serde(default = "default_anomaly_threshold_pct")]
     pub anomaly_threshold_pct: f64,
     /// When `true` (default), the quality run exits non-zero if any
