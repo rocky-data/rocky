@@ -2047,18 +2047,17 @@ pub(crate) fn resolve_policy_and_attrs(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GateSubjects<'a> {
     /// Every key is a model of the compiled project (run/apply, backfill, gc,
-    /// restore, the MCP propose gate) — or, for maintenance, was resolved to
-    /// one by a resolver that resolves every key matching a model's name, so
-    /// a verbatim key is never also a model name.
+    /// restore, the MCP propose gate).
     CompiledModels,
     /// Keys are replication target table names, gated under bare `apply`.
     ReplicationTargets,
     /// Only the keys in this set were resolved to compiled models; any other
     /// key is a target string the caller kept verbatim because it could not
-    /// be mapped (promote: an FQN the current project no longer targets).
-    /// A verbatim FQN can equal a dotted model's name — `corp.prod.orders`
-    /// is a legal model name — and the attribute map would then hold it, so
-    /// membership there is not enough (#1815, review round four).
+    /// be mapped (promote: an FQN the current project no longer targets;
+    /// maintenance: a table no model targets). A verbatim FQN can equal a
+    /// dotted model's name — `corp.prod.orders` is a legal model name — and
+    /// the attribute map would then hold it, so membership there is not
+    /// enough (#1815, review rounds four and five).
     Resolved(&'a BTreeSet<String>),
 }
 
@@ -3200,11 +3199,25 @@ fn compile_target_to_name(
 /// Compact plans always carry a concrete `target_table`; the archive
 /// targetless (`None`, `DELETE FROM *`) case is refused by the caller before
 /// this is reached, so every identifier here is a concrete string.
+///
+/// **Which reading wins, and when neither may.** A target string is looked
+/// up as a physical FQN first — the plan's SQL mutates exactly that table, so
+/// the model whose target it is, is the model touched — and as a logical
+/// name second (`--model X`). A string that is BOTH the target table of one
+/// model and the name of another is refused: the plan cannot say which it
+/// meant, a dotted model name can spell an FQN, and this apply is
+/// destructive. The names-first order that stood before resolved a catalog
+/// FQN to the wrong model whenever a model happened to be named like it
+/// (#1815, review round five).
+///
+/// The returned [`TouchedTargets`] says which keys were resolved to a model,
+/// so the gate records a graph key for those alone; a verbatim key is a
+/// policy subject, not a model.
 pub(crate) fn resolve_touched_apply_targets(
     config: &rocky_core::config::RockyConfig,
     config_path: &Path,
     targets: impl IntoIterator<Item = String>,
-) -> Result<BTreeMap<String, PolicyCapability>> {
+) -> Result<TouchedTargets> {
     // Fail CLOSED. This map is a POLICY input for `rocky compact` / `rocky
     // archive` — both destructive. Degrading an unconfinable models glob to
     // "no models" would leave every target unresolved, and this function's own
@@ -3266,17 +3279,45 @@ pub(crate) fn resolve_touched_apply_targets(
     }
 
     let mut touched = BTreeMap::new();
+    let mut resolved = BTreeSet::new();
     for target in targets {
-        let name = if names.contains(&target) {
-            target
-        } else if let Some(name) = fqn_to_name.get(&target.to_lowercase()) {
-            name.clone()
-        } else {
-            target
+        let by_fqn = fqn_to_name.get(&target.to_lowercase()).cloned();
+        let by_name = names.contains(&target).then(|| target.clone());
+        let name = match (by_fqn, by_name) {
+            // A model that targets a table spelled like its own name: one
+            // model either way.
+            (Some(fqn_owner), Some(named)) if fqn_owner == named => fqn_owner,
+            (Some(fqn_owner), Some(named)) => {
+                return Err(anyhow::anyhow!(
+                    "refusing to gate this apply: maintenance target '{target}' is both the \
+                     target table of model '{fqn_owner}' and the name of model '{named}'. \
+                     The plan cannot say which it means and this apply is destructive; \
+                     rename one of them, or re-plan with the form that names only one"
+                ));
+            }
+            (Some(fqn_owner), None) => fqn_owner,
+            (None, Some(named)) => named,
+            (None, None) => {
+                // Neither a known table nor a known name: kept verbatim so a
+                // blanket rule still gates it, but it is no model's key.
+                touched.insert(target, PolicyCapability::Apply);
+                continue;
+            }
         };
+        resolved.insert(name.clone());
         touched.insert(name, PolicyCapability::Apply);
     }
-    Ok(touched)
+    Ok(TouchedTargets { touched, resolved })
+}
+
+/// A maintenance plan's policy subjects, and which of them the resolver
+/// could vouch for as compiled models. See [`resolve_touched_apply_targets`].
+#[derive(Debug, Default)]
+pub(crate) struct TouchedTargets {
+    /// Every subject, keyed for the policy plane (`Apply`).
+    pub(crate) touched: BTreeMap<String, PolicyCapability>,
+    /// The subjects that are models of the compiled project.
+    pub(crate) resolved: BTreeSet<String>,
 }
 
 /// Gate a maintenance apply (`compact` / `archive`) under
@@ -3302,8 +3343,9 @@ pub(crate) async fn gate_maintenance_apply(
     config_path: &Path,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
-    touched: &BTreeMap<String, PolicyCapability>,
+    targets: &TouchedTargets,
 ) -> Result<()> {
+    let touched = &targets.touched;
     let models_dir = resolve_confined_config_models_dir(config_path, Some(config))?;
     let models_glob = resolve_config_models_glob(config_path, Some(config));
     // Pull the authoritative remote freeze/budget ledger before the gate reads
@@ -3322,9 +3364,9 @@ pub(crate) async fn gate_maintenance_apply(
         models_glob.as_deref(),
         state_path,
         &marker_freezes,
-        // Every key the maintenance resolver leaves is either a model it
-        // resolved or a string no model is named — see `GateSubjects`.
-        GateSubjects::CompiledModels,
+        // The resolver says which subjects are models; a verbatim table is
+        // gated but records no model's key.
+        GateSubjects::Resolved(&targets.resolved),
     );
     apply_policy_gate(root, plan_id, gate)
 }
@@ -5095,7 +5137,10 @@ mod tests {
             principal: None,
             payload: serde_json::json!({}),
         };
-        let touched = BTreeMap::from([("orders".to_string(), PolicyCapability::Apply)]);
+        let touched = TouchedTargets {
+            touched: BTreeMap::from([("orders".to_string(), PolicyCapability::Apply)]),
+            resolved: BTreeSet::from(["orders".to_string()]),
+        };
 
         let error = gate_maintenance_apply(
             &project,
@@ -5158,10 +5203,116 @@ mod tests {
                 .expect("a confinable models glob must resolve targets, not refuse");
 
         assert!(
-            touched.contains_key("payments"),
+            touched.touched.contains_key("payments"),
             "the physical FQN must map to the logical model name so an \
              attribute-scoped policy rule still fires; got {touched:?}"
         );
+        assert!(
+            touched.resolved.contains("payments"),
+            "and it is a model: {touched:?}"
+        );
+    }
+
+    /// The names-first order resolved a catalog FQN to the WRONG model when
+    /// another model happened to be named like it: `rocky compact --catalog
+    /// corp` discovers `corp.prod.orders` — model B's table — and a model A
+    /// named `corp.prod.orders` (a legal dotted name) won the lookup, so the
+    /// gate evaluated A, recorded A's key, and the review screen offered A's
+    /// rows beside a plan that compacts B's table (#1815, review round five).
+    /// The plan cannot say which it meant; a destructive apply refuses.
+    #[test]
+    fn an_ambiguous_maintenance_target_refuses_rather_than_picking_a_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let config_path = root.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"p.duckdb\"\n\n\
+             [pipeline.silver]\ntype = \"transformation\"\n\n\
+             [pipeline.silver.target]\nadapter = \"default\"\n",
+        )
+        .unwrap();
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        // Model A: NAMED corp.prod.orders, targeting somewhere else.
+        std::fs::write(models.join("corp.prod.orders.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            models.join("corp.prod.orders.toml"),
+            "name = \"corp.prod.orders\"\n[target]\ncatalog = \"warehouse\"\nschema = \"gold\"\ntable = \"shadow_orders\"\n",
+        )
+        .unwrap();
+        // Model B: named orders, TARGETING corp.prod.orders.
+        std::fs::write(models.join("orders.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            models.join("orders.toml"),
+            "name = \"orders\"\n[target]\ncatalog = \"corp\"\nschema = \"prod\"\ntable = \"orders\"\n",
+        )
+        .unwrap();
+
+        let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+        let err =
+            resolve_touched_apply_targets(&cfg, &config_path, ["corp.prod.orders".to_string()])
+                .expect_err("a string that is one model's table and another's name must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("target table of model 'orders'")
+                && msg.contains("name of model 'corp.prod.orders'"),
+            "the refusal names both readings: {msg}"
+        );
+    }
+
+    /// Without the ambiguity, a table resolves to the model that targets it
+    /// (the FQN reading first), and a table no model targets is gated under
+    /// its own string but records no model's key — the gate is told which
+    /// keys the resolver vouched for. Passing `CompiledModels` for
+    /// maintenance makes the last assertion fail.
+    #[test]
+    fn a_maintenance_table_resolves_to_its_model_and_a_stranger_records_no_key()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config_path = write_config(dir.path(), "")?;
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models)?;
+        std::fs::write(models.join("orders.sql"), "SELECT 1 AS id\n")?;
+        std::fs::write(
+            models.join("orders.toml"),
+            "name = \"orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"corp\"\nschema = \"prod\"\ntable = \"orders\"\n",
+        )?;
+        let cfg = rocky_core::config::load_rocky_config(&config_path)?;
+        let targets = resolve_touched_apply_targets(
+            &cfg,
+            &config_path,
+            ["corp.prod.orders".to_string(), "x.y.z".to_string()],
+        )?;
+        assert!(targets.touched.contains_key("orders"), "{targets:?}");
+        assert!(targets.touched.contains_key("x.y.z"), "{targets:?}");
+        assert!(targets.resolved.contains("orders") && !targets.resolved.contains("x.y.z"));
+
+        let state = dir.path().join("state.redb");
+        let _gate = super::evaluate_apply_policy_with_policy_matching(
+            cfg.policy.as_ref(),
+            "plan_m",
+            PolicyPrincipal::Agent,
+            &targets.touched,
+            &models,
+            None,
+            &state,
+            &[],
+            super::GateSubjects::Resolved(&targets.resolved),
+        );
+        let rows = StateStore::open(&state)?.list_policy_decisions()?;
+        let row = |model: &str| {
+            rows.iter()
+                .find(|r| r.plan_id == "plan_m" && r.model == model)
+                .unwrap_or_else(|| panic!("a row for {model}"))
+        };
+        assert_eq!(row("orders").models, vec!["orders".to_string()]);
+        assert!(
+            row("x.y.z").models.is_empty(),
+            "a stranger is no model's key"
+        );
+        Ok(())
     }
 
     /// A models glob that cannot be confined to the project root REFUSES the
