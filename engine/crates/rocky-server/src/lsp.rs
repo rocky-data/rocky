@@ -364,6 +364,10 @@ pub struct RockyLsp {
     /// session per `models_dir` rather than per keystroke. See
     /// `schema_cache_throttle.rs`.
     schema_cache_throttle: SchemaCacheThrottle,
+    /// Whether a W013 squiggle is currently published on `rocky.toml`
+    /// (#1625). See [`RockyLsp::publish_project_config_diagnostic`] for why
+    /// the state is tracked rather than republished on every compile.
+    config_diagnostic_published: Arc<AtomicBool>,
     /// Salsa database for incremental DSL parsing — backs `didOpen` /
     /// `didChange` so a parsed `RockyFile` is memoized across keystrokes
     /// and only re-runs when the buffer text actually changes.
@@ -400,6 +404,17 @@ impl RockyLsp {
         notified.await;
     }
 
+    /// Where this project's `rocky.toml` lives, given its models directory.
+    ///
+    /// One derivation, because two of them would be a bug that is invisible
+    /// until it matters: [`Self::project_compiler_inputs`] decides whether
+    /// the config is unreadable, and [`Self::publish_project_config_diagnostic`]
+    /// decides which file to squiggle. If those ever disagreed the warning
+    /// would land on a file that is fine, or on nothing at all.
+    fn project_config_path(models_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        models_dir.parent().map(|root| root.join("rocky.toml"))
+    }
+
     /// The project-level compiler inputs, read from `rocky.toml`.
     ///
     /// One derivation for both compile paths — the initial
@@ -410,23 +425,41 @@ impl RockyLsp {
     /// keystroke.
     ///
     /// Project root = `models_dir.parent()`, the same assumption the
-    /// schema-cache loader makes. A missing or unreadable `rocky.toml`
-    /// falls back to empty defaults, which is the "no project config"
-    /// behaviour rather than an error: an editor must keep type-checking a
-    /// models directory that has no project around it.
+    /// schema-cache loader makes. A *missing* `rocky.toml` falls back to
+    /// empty defaults, which is the "no project config" behaviour rather
+    /// than an error: an editor must keep type-checking a models directory
+    /// that has no project around it.
+    ///
+    /// The fourth element separates the other case: a `rocky.toml` that is
+    /// present and unparseable (#1625). It used to be swallowed by `.ok()`, so
+    /// W004 / W005 simply went quiet and the editor looked like a project
+    /// that declares no masks and no freshness — indistinguishable from one
+    /// that genuinely declares none. The LSP still compiles (staying usable
+    /// on a broken config is the point of an editor surface), but the
+    /// silence is now reported as W013 rather than being invisible.
     fn project_compiler_inputs(
         models_dir: &std::path::Path,
     ) -> (
         std::collections::BTreeMap<String, rocky_core::config::MaskEntry>,
         Vec<String>,
         rocky_core::config::ProjectFreshnessConfig,
+        Option<String>,
     ) {
-        models_dir
-            .parent()
-            .map(|root| root.join("rocky.toml"))
-            .and_then(|toml_path| rocky_core::config::load_rocky_config(&toml_path).ok())
-            .map(|c| (c.mask, c.classifications.allow_unmasked, c.freshness))
-            .unwrap_or_default()
+        let Some(toml_path) = Self::project_config_path(models_dir) else {
+            return (Default::default(), Vec::new(), Default::default(), None);
+        };
+        match rocky_core::config::load_optional_project_config(Some(&toml_path)) {
+            // A project with no `rocky.toml` declares nothing, and that is
+            // an ordinary fact rather than a failure to read.
+            Ok(None) => (Default::default(), Vec::new(), Default::default(), None),
+            Ok(Some(c)) => (c.mask, c.classifications.allow_unmasked, c.freshness, None),
+            Err(e) => (
+                Default::default(),
+                Vec::new(),
+                Default::default(),
+                Some(format!("{} could not be read: {e}", toml_path.display())),
+            ),
+        }
     }
 
     async fn recompile(&self) {
@@ -449,7 +482,15 @@ impl RockyLsp {
         // Load `rocky.toml` so the W004 classification-tag check + W005
         // freshness coverage check fire in the LSP, and so a model with no
         // `[freshness]` block of its own carries the project's.
-        let (mask, allow_unmasked, project_freshness) = Self::project_compiler_inputs(&dir_path);
+        let (mask, allow_unmasked, project_freshness, config_unreadable) =
+            Self::project_compiler_inputs(&dir_path);
+        Self::publish_project_config_diagnostic(
+            &self.client,
+            &self.config_diagnostic_published,
+            &dir_path,
+            config_unreadable.as_deref(),
+        )
+        .await;
 
         let config = CompilerConfig {
             models_dir: dir_path.clone(),
@@ -596,6 +637,69 @@ impl RockyLsp {
             };
             self.client.publish_diagnostics(uri, vec![diag], None).await;
         }
+    }
+
+    /// Publish (or clear) the W013 squiggle on `rocky.toml` itself (#1625).
+    ///
+    /// The project config is not a model, so a compiler `Diagnostic` cannot
+    /// carry it: [`Self::publish_diagnostics`] resolves every diagnostic to
+    /// a model file and `continue`s past anything it cannot place, so a
+    /// project-scoped one would be silently dropped — which is the exact
+    /// failure this fixes. It goes straight to the file it is about.
+    ///
+    /// Called on every compile, but it only WRITES when the answer changed:
+    /// it publishes once when the config goes bad and clears once when it is
+    /// fixed. A squiggle that outlived the fix would be its own lie, so the
+    /// clear is not optional — but it happens once, not on every keystroke.
+    ///
+    /// `published` carries that state, and tracking it is not an
+    /// optimisation. `Client::publish_diagnostics` sends into tower-lsp's
+    /// outgoing channel, and the `initialized` handler awaits the startup
+    /// compile — so against a client that has not begun draining the socket
+    /// yet, a message written on every compile deadlocks the handshake. The
+    /// protocol-level test below is exactly that client. Writing only on a
+    /// transition means the ordinary path puts nothing on the wire at all.
+    ///
+    /// An associated fn rather than a method because the debounced
+    /// `did_change` recompile runs in a spawned task that holds clones, not
+    /// `&self`.
+    async fn publish_project_config_diagnostic(
+        client: &Client,
+        published: &AtomicBool,
+        models_dir: &std::path::Path,
+        reason: Option<&str>,
+    ) {
+        // Nothing to say and nothing outstanding: stay off the wire.
+        if reason.is_none() && !published.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(toml_path) = Self::project_config_path(models_dir) else {
+            return;
+        };
+        let Ok(uri) = Url::from_file_path(&toml_path) else {
+            return;
+        };
+        let diags = match reason {
+            None => Vec::new(),
+            Some(reason) => vec![Diagnostic {
+                range: Range::default(),
+                severity: Some(DiagnosticSeverity::WARNING),
+                code: Some(NumberOrString::String(
+                    rocky_compiler::diagnostic::W013.to_string(),
+                )),
+                source: Some("rocky".to_string()),
+                message: format!(
+                    "{reason}\n\nThe models still type-check, but every project-level check \
+                     is silent because this file could not be parsed: masking (W004), the \
+                     project [freshness] default (W005), and the cached warehouse schemas all \
+                     came through empty \u{2014} indistinguishable from a project that declares \
+                     none of them."
+                ),
+                ..Default::default()
+            }],
+        };
+        published.store(reason.is_some(), Ordering::SeqCst);
+        client.publish_diagnostics(uri, diags, None).await;
     }
 
     /// Read `rocky.toml` from the project root and return its URI + raw
@@ -1271,6 +1375,7 @@ impl LanguageServer for RockyLsp {
             // doesn't re-emit the info log that `recompile()` already
             // emitted for the same project.
             let schema_cache_throttle = self.schema_cache_throttle.clone();
+            let config_diagnostic_published = self.config_diagnostic_published.clone();
 
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -1292,8 +1397,15 @@ impl LanguageServer for RockyLsp {
                 // `[freshness]` block after the first edit, so a model's
                 // inherited freshness vanished from the IDE's view of the
                 // project the moment the user typed.
-                let (mask, allow_unmasked, project_freshness) =
+                let (mask, allow_unmasked, project_freshness, config_unreadable) =
                     Self::project_compiler_inputs(&dir_path);
+                Self::publish_project_config_diagnostic(
+                    &client,
+                    &config_diagnostic_published,
+                    &dir_path,
+                    config_unreadable.as_deref(),
+                )
+                .await;
                 let config = CompilerConfig {
                     models_dir: dir_path,
                     contracts_dir: None,
@@ -4452,6 +4564,7 @@ pub async fn run_lsp() {
         init_notify: Arc::new(Notify::new()),
         semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
         schema_cache_throttle: SchemaCacheThrottle::new(),
+        config_diagnostic_published: Arc::new(AtomicBool::new(false)),
         salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
         salsa_sources: Arc::new(RwLock::new(HashMap::new())),
     });
@@ -4491,6 +4604,7 @@ mod tests {
             init_notify: Arc::new(Notify::new()),
             semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
             schema_cache_throttle: SchemaCacheThrottle::new(),
+            config_diagnostic_published: Arc::new(AtomicBool::new(false)),
             salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
             salsa_sources: Arc::new(RwLock::new(HashMap::new())),
         });
@@ -4574,16 +4688,118 @@ mod tests {
         let models = root.join("models");
         std::fs::create_dir_all(&models).unwrap();
 
-        let (_mask, allow_unmasked, freshness) = RockyLsp::project_compiler_inputs(&models);
+        let (_mask, allow_unmasked, freshness, unreadable) =
+            RockyLsp::project_compiler_inputs(&models);
         assert_eq!(freshness.expected_lag_seconds, Some(900));
         assert_eq!(freshness.time_column.as_deref(), Some("updated_at"));
         assert_eq!(allow_unmasked, vec!["public".to_string()]);
+        assert!(
+            unreadable.is_none(),
+            "a config that parsed is not unreadable"
+        );
 
         // No project around the models directory is not an error.
         let bare = tempfile::tempdir().unwrap();
-        let (_m, a, f) = RockyLsp::project_compiler_inputs(bare.path());
+        let (_m, a, f, u) = RockyLsp::project_compiler_inputs(bare.path());
         assert!(a.is_empty());
         assert_eq!(f.expected_lag_seconds, None);
+        assert!(
+            u.is_none(),
+            "an ABSENT rocky.toml is a fact about the project, not a read failure; \
+             emitting W013 here would squiggle every bare models directory"
+        );
+    }
+
+    /// The wire, not the value.
+    ///
+    /// `project_compiler_inputs` returning a reason is useless unless somebody
+    /// publishes it, and the two call sites are inside `recompile` and inside
+    /// the debounced `did_change` task — one behind a live LSP client, the
+    /// other behind a 300 ms sleep in a spawned task. Neither is reachable
+    /// from a unit test, so deleting both publish calls would leave every
+    /// other test in this file green while the editor went back to silence:
+    /// exactly the "coded but not wired" shape this fix is about.
+    ///
+    /// So the source is the assertion. Every call to `project_compiler_inputs`
+    /// must be followed by a `publish_project_config_diagnostic` call — the
+    /// counts must match, and neither may be zero.
+    ///
+    /// What this does NOT prove, stated so nobody leans on it further than it
+    /// reaches: it counts text. It cannot tell that the reason passed to the
+    /// publisher is the one that call site computed, only that a publish
+    /// happens for every derivation. The value half is covered by
+    /// [`an_unparseable_project_config_reports_a_reason_instead_of_going_quiet`];
+    /// the end-to-end pairing is covered by neither and would need a live LSP
+    /// client.
+    #[test]
+    fn every_project_config_read_publishes_its_verdict() {
+        let source = include_str!("lsp.rs");
+        // Strip comments and the test module, so prose naming either symbol
+        // (this doc comment included) cannot inflate a count.
+        let code_end = source
+            .find("\nmod tests {")
+            .or_else(|| source.find("\n    mod tests {"))
+            .unwrap_or(source.len());
+        let code: String = source[..code_end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//!") && !l.trim_start().starts_with("///"))
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let reads = code.matches("Self::project_compiler_inputs(").count();
+        let publishes = code
+            .matches("Self::publish_project_config_diagnostic(")
+            .count();
+
+        assert!(
+            reads > 0,
+            "the project config must still be read somewhere; if this hits zero the \
+             search string is stale, not the code"
+        );
+        assert_eq!(
+            reads, publishes,
+            "every read of the project config must publish its verdict. {reads} call(s) \
+             to project_compiler_inputs but {publishes} call(s) to \
+             publish_project_config_diagnostic — a read without a publish is a config \
+             error that vanishes, which is the defect #1625 fixes"
+        );
+    }
+
+    /// The case #1625 is about: `rocky.toml` is present and unparseable.
+    ///
+    /// Before, `.ok()` collapsed this into the same empty defaults as "no
+    /// project", so the editor silently stopped running W004 and W005 and
+    /// looked like a project that declares neither. The reason now comes
+    /// back so the LSP can squiggle the file, and the compiler inputs stay
+    /// empty so the editor keeps type-checking.
+    #[test]
+    fn an_unparseable_project_config_reports_a_reason_instead_of_going_quiet() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("rocky.toml"),
+            "[adapter.wh]\ntype = \"duckdb\"\nthis is not toml at all",
+        )
+        .unwrap();
+        let models = root.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+
+        let (mask, allow_unmasked, freshness, unreadable) =
+            RockyLsp::project_compiler_inputs(&models);
+
+        let reason = unreadable.expect(
+            "a present-but-unparseable rocky.toml must report WHY it is silent; \
+             returning None would be indistinguishable from a project with no config",
+        );
+        assert!(
+            reason.contains("rocky.toml"),
+            "the reason must name the file the user has to fix, got: {reason}"
+        );
+
+        // Still compiles. The editor does not go blank on a broken config.
+        assert!(mask.is_empty());
+        assert!(allow_unmasked.is_empty());
+        assert_eq!(freshness.expected_lag_seconds, None);
     }
 
     fn make_graph() -> SemanticGraph {

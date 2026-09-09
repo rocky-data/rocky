@@ -3820,7 +3820,15 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 Some(rocky_core::shadow::ShadowConfig {
                     suffix: shadow_suffix,
                     schema_override: shadow_schema,
-                    cleanup_after: false,
+                    // A one-off `--shadow` object is disposable: it exists to
+                    // be compared against production and then go away
+                    // (#1273). This honours the documented default that
+                    // nothing read before — the `false` here is what made
+                    // shadow objects accumulate and let the next run write
+                    // over its own leftover. The `--branch` arm above keeps
+                    // `false` deliberately: a named branch's objects are the
+                    // point of the branch.
+                    cleanup_after: true,
                 })
             } else {
                 None

@@ -74,6 +74,7 @@ pub mod schedule_status;
 pub mod scheduler;
 mod seed;
 mod serve;
+mod shadow_lifecycle;
 mod shell;
 mod skip_gate;
 mod snapshot;

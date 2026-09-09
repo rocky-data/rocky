@@ -1158,12 +1158,32 @@ async fn compile_status(
     Ok(PrettyJson(output))
 }
 
+/// `POST /api/v1/compile` — recompile in place.
+///
+/// Reports `status: "recompiled"` when the project config loaded or is
+/// absent, and `status: "recompiled_degraded"` with `config_error` when a
+/// `rocky.toml` is present and could not be read.
+///
+/// It used to answer `"recompiled"` unconditionally, so an SDK caller could
+/// not distinguish a project that declares no masks and no freshness from
+/// one whose config failed to parse — the compile silently ran with empty
+/// project inputs and the route still said success (#1625). `serve` still
+/// compiles rather than refusing (a resident server must not go dark
+/// mid-edit), but it no longer calls that outcome the same thing.
 async fn trigger_compile(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    state.recompile().await;
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "status": "recompiled" })),
-    )
+    match state.recompile().await {
+        None => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "recompiled" })),
+        ),
+        Some(config_error) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "recompiled_degraded",
+                "config_error": config_error,
+            })),
+        ),
+    }
 }
 
 /// `GET /api/v1/dag` — canonical [`DagOutput`].
