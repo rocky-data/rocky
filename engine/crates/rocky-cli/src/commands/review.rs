@@ -1014,11 +1014,18 @@ pub(crate) fn select_outstanding<'a>(
 /// a compile that failed, or a row from before its producer recorded the set.
 /// `graph_keys` is deliberately not used here: it also yields the label, on
 /// purpose, so `audit --for` can match it.
+///
+/// **The producer's word stands.** A row whose producer recorded its set
+/// (`keys_recorded`) is taken as written, an empty set included: the gate
+/// wrote "no compiled model" for a replication target, and resolving its
+/// bare name against the graph anyway turned a target called `orders` into
+/// the compiled model `orders` and offered its rows (#1815, review round
+/// seven). Only a row that never said — pre-v29 — is resolved by the graph.
 fn queue_graph_keys(
     d: &PolicyDecisionRecord,
     compiled: Option<&rocky_compiler::compile::CompileResult>,
 ) -> Vec<String> {
-    if !d.models.is_empty() {
+    if !d.models.is_empty() || d.keys_recorded {
         return d.models.clone();
     }
     let in_graph = compiled.is_some_and(|r| r.semantic_graph.model_schema(&d.model).is_some());
@@ -1061,6 +1068,8 @@ pub(crate) fn record_plan_review_escalation(
     reason: &str,
 ) {
     let record = PolicyDecisionRecord {
+        // The plan-level writer names its set on purpose.
+        keys_recorded: true,
         models,
         timestamp: Utc::now(),
         plan_id: plan_id.to_string(),
@@ -1415,6 +1424,7 @@ mod tests {
         cap: PolicyCapability,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            keys_recorded: false,
             models: Vec::new(),
             timestamp: Utc.with_ymd_and_hms(2026, 7, 7, 0, 0, secs).unwrap(),
             plan_id: plan_id.to_string(),
@@ -2776,6 +2786,87 @@ mod tests {
         assert_eq!(entry("a").blast_radius, Some(3));
         assert!(entry("raw_orders").models.is_empty());
         assert_eq!(entry("raw_orders").blast_radius, None);
+    }
+
+    /// **The queue must not undo the gate's word.** A replication target
+    /// called `orders`, gated beside a compiled model also called `orders`:
+    /// the gate records `keys_recorded` with an empty set — "this is no
+    /// model" — and the queue used to resolve the bare name against the graph
+    /// anyway, hand over the compiled model as the key, and offer its rows
+    /// (#1815, review round seven). Dropping the `keys_recorded` check makes
+    /// this fail.
+    #[test]
+    fn the_queue_keeps_a_gates_no_model_word_even_when_a_model_shares_the_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let models_dir = root.join("models");
+        write_blast_graph(&models_dir);
+        // A compiled model that happens to share the target's name.
+        std::fs::write(models_dir.join("orders.sql"), "SELECT id FROM a").unwrap();
+        std::fs::write(
+            models_dir.join("orders.toml"),
+            "name = \"orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"orders\"\n",
+        )
+        .unwrap();
+        let state_path = root.join("state.redb");
+        let config_path = root.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.p.target.governance]\nauto_create_schemas = true\n\n\
+             [policy]\nversion = 1\ndefault_agent_effect = \"require_review\"\n",
+        )
+        .unwrap();
+        touch_plan_file(root, "repl");
+        let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+        {
+            // The real replication gate path, through the held-store evaluator.
+            let ledger = StateStore::open(&state_path).unwrap();
+            let touched: BTreeMap<String, PolicyCapability> =
+                [("orders".to_string(), PolicyCapability::Apply)]
+                    .into_iter()
+                    .collect();
+            let _ = crate::commands::apply::evaluate_apply_policy_with_store(
+                cfg.policy.as_ref(),
+                "repl",
+                PolicyPrincipal::Agent,
+                &touched,
+                &models_dir,
+                None,
+                &ledger,
+                &[],
+                crate::commands::apply::GateSubjects::ReplicationTargets,
+            );
+            let rows = ledger.list_policy_decisions().unwrap();
+            let row = rows
+                .iter()
+                .find(|r| r.plan_id == "repl")
+                .expect("the target's row");
+            assert!(
+                row.keys_recorded && row.models.is_empty(),
+                "the gate's word: no model"
+            );
+        }
+
+        let out = compute_review_queue(root, &config_path, &state_path, &models_dir)
+            .expect("the queue must rank");
+        let entry = out
+            .pending
+            .iter()
+            .find(|e| e.plan_id == "repl")
+            .expect("listed");
+        assert!(
+            entry.models.is_empty(),
+            "the queue keeps the gate's word: {:?}",
+            entry.models
+        );
+        assert_eq!(
+            entry.preview_model, None,
+            "and offers no read of the same-named model"
+        );
+        assert_eq!(entry.blast_radius, None);
     }
 
     /// When the compile fails, a bare `model` cannot be checked against any

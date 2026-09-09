@@ -4443,6 +4443,7 @@ auto_create_schemas = true
         // A ledger-only freeze row for THIS principal → deny. This is the
         // marker-blind bypass the review caught: no marker exists at all.
         let freeze = rocky_core::state::PolicyDecisionRecord {
+            keys_recorded: false,
             models: Vec::new(),
             timestamp: Utc::now(),
             plan_id: "freeze:unit".to_string(),
@@ -4569,6 +4570,7 @@ auto_create_schemas = true
                         let store = StateStore::open(&self.path).unwrap();
                         store
                             .record_policy_decision(&rocky_core::state::PolicyDecisionRecord {
+                                keys_recorded: false,
                                 models: Vec::new(),
                                 timestamp: Utc::now(),
                                 plan_id: "freeze:mid-seam".to_string(),

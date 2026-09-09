@@ -818,7 +818,25 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   unchanged, so it behaves exactly as it does today. It does not reach the
 ///   blob anyway — the version check runs at OPEN and `[state]
 ///   on_schema_mismatch` engages there.
-const CURRENT_SCHEMA_VERSION: u32 = 28;
+///
+/// - **v29** — records whether a policy decision's model set was the
+///   producer's word: a new serde-additive
+///   [`PolicyDecisionRecord::keys_recorded`] flag. Not a table change; no blob
+///   walk. A v28 blob forward-deserializes with it `false`, guarded by
+///   `test_v28_policy_decision_forward_deserializes_keys_recorded_false`.
+///
+///   **What it fixes (#1815).** v28's `models` could not tell "the gate said
+///   this subject is no model" (an empty set it wrote on purpose) from "the
+///   row predates the set" (an empty set by default). A consumer that
+///   resolved the bare `model` against the compiled graph for the second
+///   case did it for the first too, and a replication target named like a
+///   compiled model was offered for sampling as that model.
+///
+///   **On upgrade.** A v28 store is stamped v29 in place and every record is
+///   kept, reading back with the flag `false` — "unknown", the only honest
+///   reading of a row that never said. **On rollback.** One extra key,
+///   ignored; the version check at OPEN engages `[state] on_schema_mismatch`.
+const CURRENT_SCHEMA_VERSION: u32 = 29;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -6115,6 +6133,22 @@ pub struct PolicyDecisionRecord {
     /// an empty set against the compiled graph instead.
     #[serde(default)]
     pub models: Vec<String>,
+    /// Whether the producer decided [`Self::models`] on purpose.
+    ///
+    /// `true` means the set is the producer's word — including an EMPTY set,
+    /// which then says "this subject is no compiled model": a replication
+    /// target gated by table name, a maintenance table no model owns, a
+    /// promote target the current project no longer maps. `false` means the
+    /// row was written before producers recorded the set (pre-v29), where an
+    /// empty set says only "unknown" and a consumer may still resolve the
+    /// bare `model` against the compiled graph.
+    ///
+    /// Without this bit the two were the same bytes, and the review queue
+    /// undid a gate's "not a model" by re-resolving the name — a replication
+    /// target called `orders` became the compiled model `orders`, and its
+    /// rows were offered for sampling (#1815, review round seven).
+    #[serde(default)]
+    pub keys_recorded: bool,
     /// The resolved verdict.
     pub effect: crate::config::PolicyEffect,
     /// Index of the winning `[[policy.rules]]` entry, or `None` for the
@@ -11717,6 +11751,7 @@ mod tests {
         let (store, _dir) = temp_store();
         // Two decisions with distinct timestamps → forward scan is oldest-first.
         let earlier = PolicyDecisionRecord {
+            keys_recorded: false,
             models: Vec::new(),
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-07-07T10:00:00Z")
                 .unwrap()
@@ -11732,6 +11767,7 @@ mod tests {
             auto_apply: None,
         };
         let later = PolicyDecisionRecord {
+            keys_recorded: false,
             models: Vec::new(),
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-07-07T11:00:00Z")
                 .unwrap()
@@ -11771,6 +11807,7 @@ mod tests {
 
         // A full record serialized with `models` stripped — a v27 blob.
         let record = PolicyDecisionRecord {
+            keys_recorded: false,
             models: vec!["dim_customer".to_string()],
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-09-07T10:00:00Z")
                 .unwrap()
@@ -11807,6 +11844,46 @@ mod tests {
         );
     }
 
+    /// A v28 policy decision — one whose blob has no `keys_recorded` key —
+    /// must forward-deserialize with the flag `false`: a row that never said
+    /// whether its set was deliberate is "unknown", and a consumer may still
+    /// resolve its bare `model`. Guards the v29 bump.
+    #[test]
+    fn test_v28_policy_decision_forward_deserializes_keys_recorded_false() {
+        use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+
+        let record = PolicyDecisionRecord {
+            keys_recorded: true,
+            models: Vec::new(),
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-09-09T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            plan_id: "plan_v28".to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::Apply,
+            model: "orders".to_string(),
+            effect: PolicyEffect::RequireReview,
+            rule_id: None,
+            reason: "replication target awaits review".to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+        };
+        let mut value = serde_json::to_value(&record).expect("serialize record");
+        value
+            .as_object_mut()
+            .expect("record is an object")
+            .remove("keys_recorded");
+        let blob = serde_json::to_vec(&value).expect("reserialize without field");
+
+        let read: PolicyDecisionRecord = serde_json::from_slice(&blob)
+            .expect("v28 PolicyDecisionRecord must forward-deserialize");
+        assert_eq!(read.plan_id, "plan_v28");
+        assert!(
+            !read.keys_recorded,
+            "a v28 blob never said whether its set was deliberate: unknown, not vouched"
+        );
+    }
+
     /// `graph_keys` yields the model set when there is one and the single
     /// `model` when there is not — and NEVER yields nothing.
     ///
@@ -11820,6 +11897,7 @@ mod tests {
         use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
 
         let base = PolicyDecisionRecord {
+            keys_recorded: false,
             models: Vec::new(),
             timestamp: Utc::now(),
             plan_id: "p".to_string(),
@@ -11846,6 +11924,7 @@ mod tests {
         // keeps the audit screen's `subject={entry.model}` custody link
         // working, which an exclusive matcher would have broken.
         let with_models = PolicyDecisionRecord {
+            keys_recorded: false,
             models: vec!["dim_customer".to_string(), "fct_orders".to_string()],
             ..base.clone()
         };
@@ -11856,6 +11935,7 @@ mod tests {
 
         // An ordinary row: `model` is the graph key and there is no set.
         let ordinary = PolicyDecisionRecord {
+            keys_recorded: false,
             models: Vec::new(),
             model: "fct_orders".to_string(),
             ..base
@@ -11872,6 +11952,7 @@ mod tests {
 
         // A full v17 record serialized with `auto_apply` stripped.
         let record = PolicyDecisionRecord {
+            keys_recorded: false,
             models: Vec::new(),
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-07-07T10:00:00Z")
                 .unwrap()
@@ -12657,6 +12738,7 @@ mod tests {
             let store = StateStore::open(&path).unwrap();
             store
                 .record_policy_decision(&PolicyDecisionRecord {
+                    keys_recorded: false,
                     models: Vec::new(),
                     timestamp: Utc::now(),
                     plan_id: "planPre28".to_string(),
@@ -12806,7 +12888,7 @@ mod tests {
         // serde-additive shape. NO table change either — so this stanza moves
         // the version only; guarded by
         // `test_v25_run_record_forward_deserializes_verify_after_failed_false`.
-        const EXPECTED_VERSION: u32 = 28;
+        const EXPECTED_VERSION: u32 = 29;
         // v28 adds `PolicyDecisionRecord::models` (#1766), the graph keys
         // behind a plan-level review escalation's human label. The same
         // serde-additive shape as v25-v27: NO table change — `EXPECTED_TABLES`

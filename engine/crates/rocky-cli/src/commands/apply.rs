@@ -2150,6 +2150,9 @@ pub(crate) fn evaluate_apply_policy_core(
         }
 
         record(&PolicyDecisionRecord {
+            // The gate decided this set on purpose: an empty one says "no
+            // compiled model here", and the queue must not re-resolve it.
+            keys_recorded: true,
             models: if compiled_model {
                 vec![model.clone()]
             } else {
@@ -3238,10 +3241,11 @@ pub(crate) fn resolve_touched_apply_targets(
     )?;
     let models_dir = Some(models_dir);
     let models_glob = resolve_config_models_glob(config_path, Some(config));
-    // Physical FQN (lowercased) → logical model name, plus the set of known
-    // logical names, from the project's model sidecars. Best-effort: a load
-    // failure just leaves the maps empty and every target falls through as-is.
-    let mut fqn_to_name: BTreeMap<String, String> = BTreeMap::new();
+    // Physical FQN (lowercased) → the logical models that declare it, plus
+    // the set of known logical names, from the project's model sidecars.
+    // Best-effort: a load failure just leaves the maps empty and every target
+    // falls through as-is.
+    let mut fqn_owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut names: BTreeSet<String> = BTreeSet::new();
     // Partial, NOT `load_project_models`: this map is a policy input, so losing
     // it wholesale because one unrelated subdirectory is malformed is a
@@ -3270,33 +3274,54 @@ pub(crate) fn resolve_touched_apply_targets(
     }
     for m in &models {
         names.insert(m.config.name.clone());
+        // An ephemeral model is inlined as a CTE and materializes nothing:
+        // its `[target]` is a phantom the compiler excludes from ownership
+        // too (`project.rs`). Indexing it here let a scratch model's policy
+        // govern a real table it never owned (#1815, review round seven).
+        if matches!(
+            m.config.strategy,
+            rocky_core::models::StrategyConfig::Ephemeral
+        ) {
+            continue;
+        }
         let fqn = format!(
             "{}.{}.{}",
             m.config.target.catalog, m.config.target.schema, m.config.target.table
         )
         .to_lowercase();
-        // Two models declaring one physical table is the compiler's E036,
-        // which the maintenance loader (partial, not the compiler) never
-        // sees. Keeping one owner silently let the policy plane evaluate
-        // whichever name sorted last and the ledger record only that one —
-        // a denied co-owner vanished (#1815, review round six). A destructive
-        // apply against a table with two owners refuses.
-        if let Some(other) = fqn_to_name.insert(fqn.clone(), m.config.name.clone())
-            && other != m.config.name
-        {
-            return Err(anyhow::anyhow!(
-                "refusing to gate this apply: models '{other}' and '{}' both declare the target \
-                 table '{fqn}' (compiler E036). A maintenance apply against a table with two \
-                 owners cannot say whose policy governs it; fix the duplicate target first",
-                m.config.name
-            ));
+        let owners = fqn_owners.entry(fqn).or_default();
+        if !owners.contains(&m.config.name) {
+            owners.push(m.config.name.clone());
         }
     }
 
     let mut touched = BTreeMap::new();
     let mut resolved = BTreeSet::new();
     for target in targets {
-        let by_fqn = fqn_to_name.get(&target.to_lowercase()).cloned();
+        let by_fqn = match fqn_owners.get(&target.to_lowercase()).map(Vec::as_slice) {
+            None | Some([]) => None,
+            Some([owner]) => Some(owner.clone()),
+            // Two models declaring one physical table is the compiler's E036,
+            // which the maintenance loader (partial, not the compiler) never
+            // sees. Keeping one owner silently let the policy plane evaluate
+            // whichever name sorted last and the ledger record only that one —
+            // a denied co-owner vanished (#1815, review round six). Refused
+            // only when the plan actually names that table (round seven): a
+            // duplicate elsewhere in the project is the compiler's to report.
+            Some(owners) => {
+                return Err(anyhow::anyhow!(
+                    "refusing to gate this apply: maintenance target '{target}' is declared \
+                     by models {} (compiler E036). A destructive apply against a table with \
+                     two owners cannot say whose policy governs it; fix the duplicate target \
+                     first",
+                    owners
+                        .iter()
+                        .map(|o| format!("'{o}'"))
+                        .collect::<Vec<_>>()
+                        .join(" and ")
+                ));
+            }
+        };
         let by_name = names.contains(&target).then(|| target.clone());
         let name = match (by_fqn, by_name) {
             // A model that targets a table spelled like its own name: one
@@ -3574,6 +3599,7 @@ fn run_verify_after(
     // Best-effort custody entry — the gate below is the safety boundary; the
     // ledger is the trail.
     let record = PolicyDecisionRecord {
+        keys_recorded: false,
         models: Vec::new(),
         timestamp: chrono::Utc::now(),
         plan_id: plan_id.to_string(),
@@ -5314,6 +5340,63 @@ mod tests {
             msg.contains("'pii_orders'") && msg.contains("'zzz_public'") && msg.contains("E036"),
             "the refusal names both owners: {msg}"
         );
+
+        // A plan that never names the duplicated table is not refused for it:
+        // the duplicate elsewhere is the compiler's to report.
+        let targets = resolve_touched_apply_targets(&cfg, &config_path, ["x.y.z".to_string()])
+            .expect("an untouched duplicate is not this plan's problem");
+        assert!(targets.touched.contains_key("x.y.z"));
+    }
+
+    /// An ephemeral model is inlined and materializes nothing; its `[target]`
+    /// is a phantom the compiler excludes from ownership. Indexed as an owner
+    /// here, a scratch model's `allow` rule governed a real table it never
+    /// owned, and beside the real owner it raised a false two-owner refusal
+    /// (#1815, review round seven). Indexing it again makes this fail.
+    #[test]
+    fn an_ephemeral_model_owns_no_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let config_path = root.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"p.duckdb\"\n\n\
+             [pipeline.silver]\ntype = \"transformation\"\n\n\
+             [pipeline.silver.target]\nadapter = \"default\"\n",
+        )
+        .unwrap();
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("scratch.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            models.join("scratch.toml"),
+            "name = \"scratch\"\n[strategy]\ntype = \"ephemeral\"\n[target]\ncatalog = \"corp\"\nschema = \"prod\"\ntable = \"orders\"\n",
+        )
+        .unwrap();
+        let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+
+        // Alone: the table is nobody's, so the target stays verbatim and is
+        // no model's key.
+        let alone =
+            resolve_touched_apply_targets(&cfg, &config_path, ["corp.prod.orders".to_string()])
+                .expect("a phantom target resolves to no owner");
+        assert!(alone.touched.contains_key("corp.prod.orders"), "{alone:?}");
+        assert!(alone.resolved.is_empty(), "{alone:?}");
+
+        // Beside a real owner: that owner, and no two-owner refusal.
+        std::fs::write(models.join("orders.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            models.join("orders.toml"),
+            "name = \"orders\"\n[target]\ncatalog = \"corp\"\nschema = \"prod\"\ntable = \"orders\"\n",
+        )
+        .unwrap();
+        let owned =
+            resolve_touched_apply_targets(&cfg, &config_path, ["corp.prod.orders".to_string()])
+                .expect("one real owner beside a phantom is one owner");
+        assert!(
+            owned.touched.contains_key("orders") && owned.resolved.contains("orders"),
+            "{owned:?}"
+        );
     }
 
     /// The PRODUCTION maintenance gate, end to end: a table its model targets
@@ -5321,8 +5404,15 @@ mod tests {
     /// own string and records none. This reaches `gate_maintenance_apply`
     /// itself — the sibling test below hands `Resolved` to the evaluator by
     /// hand and so could not tell whether production does (#1815, review
-    /// round six). Passing `CompiledModels` in `gate_maintenance_apply`
-    /// makes the last assertion fail.
+    /// round six).
+    ///
+    /// The stranger is made to spell a model's NAME between resolution and
+    /// the gate: the resolver and the gate's attribute compile read the model
+    /// tree separately, so a model named `x.y.z` added in between is in the
+    /// attribute map but not in the resolved set (round seven). That is the
+    /// case where `Resolved` and `CompiledModels` differ, and passing
+    /// `CompiledModels` in `gate_maintenance_apply` makes the last assertion
+    /// fail.
     #[tokio::test]
     async fn the_maintenance_gate_records_a_key_for_a_model_and_none_for_a_stranger()
     -> anyhow::Result<()> {
@@ -5341,6 +5431,14 @@ mod tests {
             &cfg,
             &config_path,
             ["corp.prod.orders".to_string(), "x.y.z".to_string()],
+        )?;
+        // Between resolution and the gate, a model NAMED like the stranger
+        // appears (targeting elsewhere): the attribute map will hold it.
+        std::fs::write(models.join("x.y.z.sql"), "SELECT 1 AS id\n")?;
+        std::fs::write(
+            models.join("x.y.z.toml"),
+            "name = \"x.y.z\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"xyz\"\n",
         )?;
         let plan = PersistedPlan {
             plan_id: "plan_gate".to_string(),
@@ -6266,6 +6364,7 @@ auto_create_schemas = true
         let store = StateStore::open(state_path)?;
         let now = chrono::Utc::now();
         store.record_policy_decision(&PolicyDecisionRecord {
+            keys_recorded: false,
             models: Vec::new(),
             timestamp: now,
             plan_id: format!(
