@@ -159,6 +159,51 @@ groups:
                     type: gt
                     params: [0]
 
+      # The webhook spool cannot be read: every tick reconciles its configured
+      # schedules but consumes no webhook demand, and says so with its own
+      # outcome (#1812). A separate rule from tick-errors on purpose: cron /
+      # after / freshness work may still be running, so the message must not
+      # claim the loop is doing nothing. Same window and `for` as tick-errors.
+      - uid: rocky-scheduler-spool-unreadable
+        title: Rocky scheduler cannot read its webhook spool
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: critical
+        annotations:
+          summary: "The Rocky scheduler cannot read its webhook spool; webhook demands are not being consumed."
+          description: "rocky.scheduler.ticks with outcome=spool_unreadable has been continuously non-zero for 5 minutes — something is at .rocky/pending-demands that cannot be read (a dangling symlink, a permissions change), so every webhook delivery since is spooled but never run. Scheduled (cron, after, freshness) work may still be running. Repair the spool path; the next tick consumes what is pending."
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              refId: A
+              editorMode: code
+              expr: sum(rate(rocky_scheduler_ticks{outcome="spool_unreadable"}[2m]))
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - type: query
+                  evaluator:
+                    type: gt
+                    params: [0]
+
       # A scheduled pipeline has failed 3 or more times in a row. gt [2] on an
       # integer gauge is "3 or more".
       - uid: rocky-scheduler-consecutive-failures

@@ -406,24 +406,16 @@ fn build_tick_output(
             reason = reason.as_str(),
             "webhook spool unreadable this tick"
         );
-        skipped.push(SkippedDemandOutput {
-            pipeline: None,
-            source: Some("webhook".to_string()),
-            reason: rocky_observe::span_attrs::SPOOL_UNREADABLE_LABEL.to_string(),
-            resume_at: None,
-            missed: None,
-        });
     }
-
-    // The store was held by another `rocky` process. When it could not be opened
-    // at all, no per-demand skip exists yet, so synthesize a pipeline-less
-    // `state_busy` entry; a mid-tick reopen contention already pushed a
-    // pipeline-scoped `state_busy` skip, so don't duplicate it.
-    if report.state_busy && !skipped.iter().any(|s| s.reason == "state_busy") {
+    // The skips the tick synthesises for a whole source or the whole pass —
+    // the unreadable spool, the store held by another `rocky` process before
+    // any pipeline was evaluated — from the ONE derivation the scheduler's
+    // span, log and metrics use, so this list and those counts agree (#1812).
+    for synth in crate::commands::scheduler::synthesized_skips(report) {
         skipped.push(SkippedDemandOutput {
             pipeline: None,
-            source: None,
-            reason: "state_busy".to_string(),
+            source: synth.source.map(str::to_string),
+            reason: synth.reason.to_string(),
             resume_at: None,
             missed: None,
         });

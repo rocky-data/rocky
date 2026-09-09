@@ -169,11 +169,12 @@ pub const SPOOL_UNREADABLE_LABEL: &str = "spool_unreadable";
 
 /// Recognised values for [`SCHEDULER_OUTCOME`].
 ///
-/// `spool_unreadable` is a tick that reconciled its cron schedules but could
-/// not read the webhook spool, so no webhook demand was consumed. It is not
+/// `spool_unreadable` is a tick that reconciled its configured schedules
+/// (cron, after, freshness) but could not read the webhook spool, so no
+/// webhook demand was consumed. It is not
 /// `completed`: a scheduler that cannot read its spool was indistinguishable
 /// from a healthy idle one in the metrics an alert reads (#1812). The counts
-/// still describe the cron half of such a tick.
+/// still describe the schedules that ran.
 pub const SCHEDULER_OUTCOMES: &[&str] = &[
     "completed",
     "config_error",
