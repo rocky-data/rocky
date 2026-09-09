@@ -122,6 +122,22 @@ fn rocky(dir: &Path, args: &[&str]) -> Output {
         .expect("spawn rocky")
 }
 
+/// [`rocky`] with `--output table`: the human summary. Explicit, because a
+/// run whose stdout is not a terminal defaults to JSON.
+fn rocky_text(dir: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_rocky"))
+        .args(["--output", "table"])
+        .arg("--config")
+        .arg(dir.join("rocky.toml"))
+        .arg("--state-path")
+        .arg(dir.join("state.redb"))
+        .args(args)
+        .current_dir(dir)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("spawn rocky")
+}
+
 fn json(out: &Output) -> serde_json::Value {
     serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
         panic!(
@@ -344,4 +360,28 @@ fn a_schema_wide_target_with_a_table_still_checks_it_and_passes() {
     assert!(failed_checks(&out).is_empty(), "{out}");
     assert_eq!(results[0]["checks"][0]["name"], "row_count", "{out}");
     assert_eq!(results[0]["checks"][0]["passed"], true, "{out}");
+}
+
+/// The human summary counts tables actually checked, not `check_results`
+/// entries: with the schema-level entry for an empty expansion it said
+/// "across 1 table(s)" for a run that found none (round-one review nit).
+#[test]
+fn the_text_summary_counts_zero_tables_for_an_empty_expansion() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    seed_db(dir);
+    fs::write(dir.join("rocky.toml"), schema_wide_config("ghost", "")).expect("write config");
+
+    let run = rocky_text(dir, &["run"]);
+    assert_eq!(run.status.code(), Some(1));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        text.contains("across 0 table(s)")
+            && text.contains("1 schema target(s) could not be expanded"),
+        "the summary says nothing was checked and why: {text}"
+    );
 }
