@@ -10391,8 +10391,10 @@ pub struct ProjectOutput {
     /// result, and before the first compile finishes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compile_error: Option<String>,
-    /// Models in the in-memory compile result; `null` before the first
-    /// compile finishes, and while `compile_error` stands.
+    /// Models in the in-memory compile result. Absent (not `null`) before
+    /// the first compile finishes and while `compile_error` stands; absent
+    /// with no `compile_error` is the pending state, which the browser UI
+    /// shows as pending rather than as zero diagnostics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models_compiled: Option<u64>,
     /// The compile's diagnostics, counted.

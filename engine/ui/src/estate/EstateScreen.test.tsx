@@ -244,6 +244,24 @@ describe("ProjectStrip", () => {
     expect(screen.queryByText("0 diagnostics, 0 warnings, errors")).toBeNull();
   });
 
+  it("shows the state before the first compile as pending, not as zero diagnostics", async () => {
+    render(
+      <EstateScreen
+        loaders={loaders({
+          project: async () => ({
+            ...project,
+            models_compiled: undefined,
+            diagnostics: { total: 0, warnings: 0, has_errors: false },
+          }),
+        })}
+        refreshMs={0}
+        now={NOW}
+      />,
+    );
+    expect(await screen.findByText("compile pending")).toBeInTheDocument();
+    expect(screen.queryByText("0 diagnostics, 0 warnings")).toBeNull();
+  });
+
   it("says when no run was recorded", async () => {
     render(
       <EstateScreen

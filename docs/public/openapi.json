@@ -15075,7 +15075,7 @@
             "description": "The newest run in the state store the server resolved; `null` when none was recorded."
           },
           "models_compiled": {
-            "description": "Models in the in-memory compile result; `null` before the first compile finishes, and while `compile_error` stands.",
+            "description": "Models in the in-memory compile result. Absent (not `null`) before the first compile finishes and while `compile_error` stands; absent with no `compile_error` is the pending state, which the browser UI shows as pending rather than as zero diagnostics.",
             "format": "uint64",
             "minimum": 0.0,
             "type": [

@@ -101,7 +101,7 @@ class ProjectOutput(BaseModel):
     """
     models_compiled: conint(ge=0) | None = None
     """
-    Models in the in-memory compile result; `null` before the first compile finishes, and while `compile_error` stands.
+    Models in the in-memory compile result. Absent (not `null`) before the first compile finishes and while `compile_error` stands; absent with no `compile_error` is the pending state, which the browser UI shows as pending rather than as zero diagnostics.
     """
     name: str
     """

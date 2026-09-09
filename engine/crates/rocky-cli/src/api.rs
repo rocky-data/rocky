@@ -920,7 +920,11 @@ async fn project(
         }
     };
 
-    let compile_error = state.compile_failure.read().await.clone();
+    // The failure guard is held across the result read, in the writers'
+    // order (failure, then result), so this route sees the pair a single
+    // recompile published — never an earlier failure beside a newer result.
+    let failure_guard = state.compile_failure.read().await;
+    let compile_error = failure_guard.clone();
     let (models_compiled, diagnostics) = if compile_error.is_some() {
         // The last compile produced no result. Whatever `compile_result`
         // holds is from an earlier compile, kept for the LSP; its counts do
@@ -959,6 +963,7 @@ async fn project(
             ),
         }
     };
+    drop(failure_guard);
 
     let state_path = state_path_for(&state);
     let last_run =
@@ -1198,8 +1203,14 @@ async fn compile_status(
 /// `serve` still compiles rather than refusing (a resident server must not
 /// go dark mid-edit), but it no longer calls either outcome the same thing.
 async fn trigger_compile(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    let config_error = state.recompile().await;
-    let compile_error = state.compile_failure.read().await.clone();
+    // This invocation's own outcome, not a re-read of the shared fields: a
+    // concurrent recompile (the watcher, another request) could otherwise
+    // publish its result between this compile and the read, and the caller
+    // would be told the other compile's outcome.
+    let rocky_server::state::RecompileOutcome {
+        config_error,
+        compile_error,
+    } = state.recompile().await;
     let mut body = serde_json::Map::new();
     let status = match (&compile_error, &config_error) {
         (Some(_), _) => "compile_failed",
@@ -4671,6 +4682,44 @@ mod tests {
             project["diagnostics"]["has_errors"],
             serde_json::json!(false)
         );
+        let listed: serde_json::Value = reqwest::get(format!("{base}/api/v1/models"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listed["models"][0]["name"], "users", "{listed}");
+
+        // Break it again. The failure is recorded and the previous result is
+        // dropped with it: the model routes answer "not ready" rather than
+        // serve the users model as current.
+        std::fs::remove_dir_all(&models).unwrap();
+        std::os::unix::fs::symlink(root.join("gone"), &models).unwrap();
+        let triggered: serde_json::Value = client
+            .post(format!("{base}/api/v1/compile"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(triggered["status"], "compile_failed", "{triggered}");
+        let resp = reqwest::get(format!("{base}/api/v1/models")).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            503,
+            "the previous compile's models are not served as current"
+        );
+        let err: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(err.code, "engine_not_ready");
+        let project: serde_json::Value = reqwest::get(format!("{base}/api/v1/project"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(project["compile_error"].is_string(), "{project}");
+        assert!(project.get("models_compiled").is_none(), "{project}");
     }
 
     /// The server-rendered dashboard is retired: `/dashboard` is no route in
