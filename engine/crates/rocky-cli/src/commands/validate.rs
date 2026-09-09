@@ -1751,6 +1751,55 @@ freeze_marker_writes = true
         );
     }
 
+    /// #1816. `anomaly_threshold_pct = nan` is refused by the shared chain;
+    /// `rocky validate` must report it as an error AND point at the key, not
+    /// fall into the field-less wildcard arm of `config_error_diagnostic`.
+    #[test]
+    fn a_non_finite_anomaly_threshold_is_rejected_v046_at_its_key() {
+        let (out, loadable) = validate_and_load(
+            r#"
+[adapter.db]
+type = "duckdb"
+[pipeline.dq]
+type = "quality"
+[pipeline.dq.target]
+adapter = "db"
+[[pipeline.dq.tables]]
+catalog = "main"
+schema = "raw"
+table = "orders"
+[pipeline.dq.checks]
+anomaly_threshold_pct = nan
+"#,
+        );
+
+        assert!(
+            !out.valid,
+            "a config no run can load must not validate: {:?}",
+            out.messages
+        );
+        let v046: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V046" && m.severity == "error")
+            .collect();
+        assert_eq!(v046.len(), 1, "expected one V046: {:?}", out.messages);
+        assert_eq!(
+            v046[0].field.as_deref(),
+            Some("pipeline.dq.checks.anomaly_threshold_pct"),
+            "the diagnostic must point at the offending key",
+        );
+        assert!(
+            v046[0].message.contains("finite") && v046[0].message.contains("set it to 0"),
+            "the message names the rule and the off switch: {}",
+            v046[0].message
+        );
+        assert!(
+            !loadable,
+            "the config validate rejects must be one load_rocky_config already rejected"
+        );
+    }
+
     /// A config carrying both an adapter-kind issue and a later-chain issue
     /// surfaces both. The kind diagnostic keeps its V032 code and is emitted
     /// exactly once — the chain now includes the kind validator, so a

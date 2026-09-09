@@ -210,6 +210,28 @@ pub struct RunFailed {
     pub run_id: String,
 }
 
+/// Sentinel error signalling that a quality run completed its terminal state
+/// writes and then failed its check gate: at least one error-severity check
+/// failed, or could not be evaluated, while `[pipeline.<name>.checks]
+/// fail_on_error` was on. Exit 1, as the untyped `bail!` it replaces was; the
+/// message is unchanged.
+///
+/// The TYPE exists for the same reason [`RunFailed`] does (#1816): the
+/// quality arm of the dispatcher still holds the run's remote-state session
+/// when this comes back, and it must FINALIZE — the `Failure` record with
+/// `check_gate_failed` is already persisted and must ride the terminal
+/// upload — rather than abandon, which uploads nothing. Abandoning on a bare
+/// `anyhow` error stranded the record in the pod-local file: every other pod,
+/// and the scheduler on it, kept reading the previous history. Not
+/// [`CheckGateFailure`], whose exit-2 partial-success contract belongs to a
+/// replication run that moved data first; a quality run moves none.
+#[derive(Debug, thiserror::Error)]
+#[error("quality pipeline failed: {count} error-severity check(s) failed (run_id: {run_id})")]
+pub struct QualityGateFailure {
+    pub count: usize,
+    pub run_id: String,
+}
+
 /// Sentinel error signalling that a replication run moved its data and then
 /// failed its declared check gate (#1598): at least one error-severity check
 /// failed, or could not be evaluated, while
@@ -3072,9 +3094,26 @@ pub async fn run(
                     return Ok(());
                 }
                 Err(e) => {
-                    session
-                        .abandon("quality exited before terminal state writes")
-                        .await;
+                    // A typed gate failure means `run_quality` completed its
+                    // terminal state writes — the `Failure` record carrying
+                    // `check_gate_failed` is persisted — so the session must
+                    // FINALIZE, exactly as the transformation arm does for
+                    // `RunFailed`: the record rides the terminal upload.
+                    // Abandoning here (the previous shape) uploaded nothing,
+                    // so under a remote `[state]` backend every other pod
+                    // kept reading the history from before the failed run
+                    // (#1816). Every other error is a pre-terminal hard exit:
+                    // abandon, never upload.
+                    if e.is::<QualityGateFailure>() {
+                        session.finalize().await.context(
+                            "the run's recorded check-gate failure could not be persisted to \
+                             the remote [state] backend",
+                        )?;
+                    } else {
+                        session
+                            .abandon("quality exited before terminal state writes")
+                            .await;
+                    }
                     return Err(e);
                 }
             }
@@ -14031,6 +14070,156 @@ fn post_copy_column_match(
 
 #[cfg(test)]
 mod tests {
+
+    /// #1816. A quality run that fails its check gate persists a `Failure`
+    /// record with `check_gate_failed` and then returns an error; the
+    /// dispatcher's quality arm treated every error as pre-terminal and
+    /// ABANDONED the remote-state session, which uploads nothing. Under an
+    /// S3 / GCS / Valkey / tiered `[state]` backend the record stayed in the
+    /// pod-local file, and a fresh pod downloading the shared state saw the
+    /// history from before the run. The transformation arm already
+    /// distinguished its typed `RunFailed` from a hard error; the quality arm
+    /// now does the same with `QualityGateFailure`.
+    ///
+    /// Two pods over one in-memory "S3": pod A runs the failing quality
+    /// pipeline through the real dispatcher; pod B downloads the remote state
+    /// into its own empty store and must find the record.
+    #[test]
+    fn a_failed_quality_gate_is_uploaded_to_remote_state_not_abandoned() {
+        use rocky_core::state::{RunStatus, StateStore};
+        use rocky_core::test_harness::CrossPodHarness;
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let project = tempfile::tempdir().unwrap();
+        // A quality pipeline on a table the (empty) DuckDB file does not
+        // have: the row-count query fails, the check is error-severity and
+        // not evaluated, and the gate trips with no data seeded at all.
+        let config_path = project.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[adapter]
+type = "duckdb"
+path = "probe.duckdb"
+
+[pipeline.dq]
+type = "quality"
+
+[pipeline.dq.target]
+adapter = "default"
+
+[[pipeline.dq.tables]]
+catalog = "probe"
+schema = "main"
+table = "missing"
+
+[pipeline.dq.checks]
+enabled = true
+row_count = true
+
+[state]
+backend = "s3"
+s3_bucket = "test"
+on_upload_failure = "fail"
+
+[state.retry]
+max_retries = 0
+"#,
+        )
+        .unwrap();
+        // DuckDB resolves a relative `path` against the working directory, so
+        // pin it to the project.
+        let previous_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(project.path()).unwrap();
+        let run_id = "quality-gate-under-remote-state";
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let outcome = rt.block_on(async {
+            let loaded = std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+            );
+            super::run(
+                &config_path,
+                loaded,
+                None,
+                None,
+                &harness.pod_a.state_path,
+                None,
+                true,
+                None,
+                false,
+                None,
+                false,
+                None,
+                &PartitionRunOptions::default(),
+                None,
+                None,
+                None,
+                None,
+                &DeferOptions::default(),
+                &SkipRunOptions::default(),
+                &rocky_core::run_vars::RunVars::new(),
+                Some(run_id),
+                None,
+                false,
+                None,
+            )
+            .await
+        });
+        std::env::set_current_dir(previous_cwd).unwrap();
+
+        let err = outcome.expect_err("a failed quality gate fails the run");
+        assert!(
+            err.is::<super::QualityGateFailure>(),
+            "the gate failure is typed so the dispatcher can tell it from a hard exit: {err:#}"
+        );
+
+        // Pod A's own file has the record (it always did).
+        {
+            let local = StateStore::open(&harness.pod_a.state_path).unwrap();
+            let record = local
+                .get_run(run_id)
+                .unwrap()
+                .expect("the failed run is persisted locally");
+            assert!(
+                matches!(record.status, RunStatus::Failure),
+                "{:?}",
+                record.status
+            );
+            assert!(record.check_gate_failed);
+        }
+
+        // Pod B, a fresh process elsewhere, downloads the shared state and
+        // must see the same record: the session FINALIZED after the gate.
+        let authority = rt
+            .block_on(harness.download(&harness.pod_b))
+            .expect("pod B downloads the shared state");
+        assert!(
+            matches!(
+                authority,
+                rocky_core::state_sync::StateAuthority::Authoritative
+            ),
+            "pod B found a remote object to download: {authority:?}"
+        );
+        let remote = harness.open_store(&harness.pod_b);
+        let record = remote.get_run(run_id).unwrap().expect(
+            "the failed quality run rode the terminal upload; abandoning stranded it locally",
+        );
+        assert!(
+            matches!(record.status, RunStatus::Failure),
+            "the remote record is the failure: {:?}",
+            record.status
+        );
+        assert!(
+            record.check_gate_failed,
+            "and it carries the gate the run failed on"
+        );
+    }
 
     /// Every partition-status write in `run_one_partition` must cover the WHOLE
     /// batch, not just its leading key.

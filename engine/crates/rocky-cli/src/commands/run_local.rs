@@ -768,7 +768,15 @@ pub async fn run_quality(
     );
 
     if error_failures > 0 && pipeline.checks.fail_on_error {
-        anyhow::bail!("quality pipeline failed: {error_failures} error-severity check(s) failed");
+        // Typed, not `bail!`: the dispatcher still holds this run's remote-state
+        // session and must finalize (upload the record persisted just above)
+        // rather than abandon on what it would otherwise read as a hard exit
+        // (#1816).
+        return Err(super::run::QualityGateFailure {
+            count: error_failures,
+            run_id: run_id.to_string(),
+        }
+        .into());
     }
 
     Ok(())

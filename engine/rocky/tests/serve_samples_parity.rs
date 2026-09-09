@@ -224,3 +224,89 @@ fn real_server_answers_the_real_cli_sample_bytes() {
     let (missing, _, missing_body) = http_get(port, "/api/v1/models/not_a_model/rows");
     assert!(missing.contains("404"), "{missing}: {missing_body}");
 }
+
+/// The consent header really travels through the real server (#1816): on a
+/// remote adapter the headerless request is refused `403 warehouse_gated`
+/// before anything is compiled, and the same request with
+/// `X-Rocky-Allow-Warehouse: true` gets past the gate — to `422
+/// compile_error`, since the project has no models to compile, which is the
+/// proof the header was read. The DuckDB check above cannot show this: a
+/// local project needs no consent, so the header changes nothing there by
+/// design.
+#[test]
+fn consent_header_reaches_the_gate_on_a_remote_adapter() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("remote");
+    std::fs::create_dir_all(root.join("models")).expect("models dir");
+    let config = root.join("rocky.toml");
+    std::fs::write(
+        &config,
+        "[adapter]\ntype = \"databricks\"\nhost = \"example.invalid\"\n\
+         http_path = \"/sql/1.0/warehouses/x\"\ntoken = \"unused\"\n\n\
+         [pipeline.main]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+         [pipeline.main.target.governance]\nauto_create_schemas = true\n",
+    )
+    .expect("write config");
+    let state = dir.path().join("state.redb");
+
+    let port = TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port();
+    let server = Server(
+        rocky()
+            .current_dir(&root)
+            .args([
+                "--config",
+                config.to_str().unwrap(),
+                "--state-path",
+                state.to_str().unwrap(),
+                "serve",
+                "--models",
+                root.join("models").to_str().unwrap(),
+                "--port",
+                &port.to_string(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn rocky serve"),
+    );
+    let _keep_alive = &server;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            let (status, _, _) = http_get(port, "/api/v1/health");
+            if status.contains("200") {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rocky serve did not come up on {port}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let (refused, _, refused_body) = http_get(port, "/api/v1/models/orders/rows");
+    assert!(refused.contains("403"), "{refused}: {refused_body}");
+    assert!(
+        refused_body.contains("warehouse_gated"),
+        "the headerless request is refused at the gate: {refused_body}"
+    );
+
+    let (consented, _, consented_body) = http_get_with(
+        port,
+        "/api/v1/models/orders/rows",
+        &[("X-Rocky-Allow-Warehouse", "true")],
+    );
+    assert!(
+        !consented.contains("403"),
+        "the header was not read: {consented}: {consented_body}"
+    );
+    assert!(
+        consented.contains("422") && consented_body.contains("compile_error"),
+        "past the gate the project itself answers: {consented}: {consented_body}"
+    );
+}
