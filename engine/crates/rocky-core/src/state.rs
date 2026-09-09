@@ -2801,6 +2801,63 @@ pub struct ResumeScope {
     /// resume refuses it as a scope mismatch.
     #[serde(default)]
     pub target: Option<ResumeTarget>,
+    /// Where the run READ from: the discovery adapter behind the alias, the
+    /// source catalog, and the shape of the schema pattern that maps source
+    /// schema names onto target names (#1583).
+    ///
+    /// The scope used to record nothing about the source, so pointing
+    /// `source.discovery.adapter` at another adapter moved no field in it. A
+    /// resume then matched its checkpoint by TARGET key, skipped every table
+    /// it had never copied from the new source, and exited 0.
+    ///
+    /// `None` on a checkpoint written before this field existed. A current
+    /// scope always records `Some`, so such a checkpoint never equals one and
+    /// a resume refuses it as a scope mismatch — the same fail-closed
+    /// treatment [`ResumeScope::target`] gets.
+    #[serde(default)]
+    pub source: Option<ResumeSource>,
+}
+
+/// Where a replication run read from, for the resume scope (#1583).
+///
+/// # Why the pattern's SHAPE and not the pattern
+///
+/// Discovery parses every source schema name with this pattern, and the
+/// values it extracts render the target names a run checkpoints by. So two
+/// runs whose patterns differ can map different source tables onto the same
+/// target key — which is exactly the silent skip. What matters is the shape
+/// that does the mapping: the prefix that selects which schemas are seen at
+/// all, the separator that splits them, and the ordered components that name
+/// the captured values.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResumeSource {
+    /// The discovery adapter name (a config alias), when the pipeline
+    /// declares discovery. `None` is not "unrecorded" — it is a pipeline
+    /// with no `[source.discovery]` block, which is itself a difference
+    /// worth refusing a resume over.
+    #[serde(default)]
+    pub discovery_adapter: Option<String>,
+    /// The data location behind that alias. An alias can be re-pointed
+    /// without renaming it, so the alias alone does not identify a source —
+    /// the same argument [`ResumeTarget::endpoint`] answers on the write
+    /// side.
+    #[serde(default)]
+    pub endpoint: Option<crate::config::EndpointIdentity>,
+    /// `[source] catalog`, verbatim.
+    #[serde(default)]
+    pub catalog: Option<String>,
+    /// The schema pattern's prefix — which source schemas discovery sees.
+    pub pattern_prefix: String,
+    /// The schema pattern's own separator, which splits every source schema
+    /// name. Distinct from [`ResumeTarget::separator_role`], which is the
+    /// TARGET separator and may be overridden by `[target] separator`.
+    pub pattern_separator: String,
+    /// The ordered components, each rendered to a stable tag
+    /// (`fixed:`, `var:`, `varlen:`, `term:`). A rendering rather than the
+    /// component enum so the recorded blob does not move when that enum
+    /// gains a variant or a field.
+    #[serde(default)]
+    pub pattern_components: Vec<String>,
 }
 
 /// Where a replication run routed its writes: the target adapter alias, the
@@ -2909,8 +2966,36 @@ impl std::fmt::Display for ResumeScope {
             None => write!(f, ", no filter")?,
         }
         match &self.target {
-            Some(target) => write!(f, ", target {target}"),
-            None => write!(f, ", target unrecorded"),
+            Some(target) => write!(f, ", target {target}")?,
+            None => write!(f, ", target unrecorded")?,
+        }
+        match &self.source {
+            Some(source) => write!(f, ", source {source}"),
+            None => write!(f, ", source unrecorded"),
+        }
+    }
+}
+
+impl std::fmt::Display for ResumeSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.discovery_adapter {
+            Some(adapter) => write!(f, "{adapter}")?,
+            None => write!(f, "<no discovery>")?,
+        }
+        match &self.catalog {
+            Some(catalog) => write!(f, ":{catalog}")?,
+            None => write!(f, ":<no catalog>")?,
+        }
+        write!(
+            f,
+            " pattern({}{}[{}])",
+            self.pattern_prefix,
+            self.pattern_separator,
+            self.pattern_components.join(",")
+        )?;
+        match &self.endpoint {
+            Some(endpoint) => write!(f, " endpoint({endpoint})"),
+            None => write!(f, " endpoint unrecorded"),
         }
     }
 }
@@ -9530,6 +9615,7 @@ mod tests {
         ResumeScope {
             pipeline: pipeline.to_string(),
             filter: None,
+            source: None,
             target: Some(ResumeTarget {
                 adapter: "default".to_string(),
                 catalog_template: "wh".to_string(),
