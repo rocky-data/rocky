@@ -700,8 +700,14 @@ mod tests {
     /// B, asked for while A is held, must queue behind the gate rather than
     /// run beside it. While A is held the shared pair is untouched, A's
     /// outcome is A's, B's is B's, and the state that stands at the end is
-    /// the outcome of the LAST compile asked for. Without the gate B runs
-    /// beside A, publishes first, and A's stale failure lands on top of it.
+    /// the outcome of the LAST compile asked for.
+    ///
+    /// The deterministic proof is the gate itself: while A is held, the gate
+    /// is locked, so `try_lock` fails; with the gate gone it succeeds. The
+    /// pair check while A is held is a second observation, not a proof: a
+    /// B that ran beside A would usually have published within the wait,
+    /// but a slow B could still be compiling. Without the gate the ordinary
+    /// schedule is B publishing first and A's stale failure landing on top.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn overlapping_recompiles_are_serialised_and_each_reports_its_own_outcome() {
         use std::time::Duration;
@@ -750,9 +756,17 @@ mod tests {
         };
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        // While A is held, nothing has changed since A started: the pair is
-        // still the constructor's failure, and B's success is not there,
-        // because B has not run. Read the pair the way the project route
+        // The proof that B is queued behind A and not running beside it: A
+        // holds the gate for the whole of its compile, including this hold,
+        // so nobody else can take it. Deterministic, whatever B's timing.
+        assert!(
+            state.compile_gate.try_lock().is_err(),
+            "the gate is not held while A compiles, so B can run beside it"
+        );
+
+        // A second observation, timing-dependent: nothing has changed since
+        // A started. The pair is still the constructor's failure, and B's
+        // success is not there. Read the pair the way the project route
         // does: failure guard held across the result.
         {
             let failure = state.compile_failure.read().await;

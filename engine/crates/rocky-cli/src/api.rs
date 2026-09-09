@@ -877,7 +877,7 @@ async fn health() -> PrettyJson<HealthOutput> {
 /// construction: no model names, one run. Reads only.
 ///
 /// A compile that produced no result is its own state (#1823):
-/// `compile_error` carries the reason, `models_compiled` is `null`, and
+/// `compile_error` carries the reason, `models_compiled` is absent, and
 /// `diagnostics.has_errors` is `true`. Before this, a background compile
 /// that failed was logged and the route read the absent result as a clean
 /// project — no diagnostics, `has_errors: false` — which is what the SPA
