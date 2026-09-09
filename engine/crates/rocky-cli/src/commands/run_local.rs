@@ -442,9 +442,11 @@ fn quality_row_count_check(
 /// failing check the engine could not evaluate.
 ///
 /// A `[[pipeline.x.tables]]` entry with no `table` names a whole schema, and
-/// Rocky enumerates it with `list_tables_sql`. When that SQL cannot be built or
-/// cannot be run, no table is known — so every check for that target is
-/// unevaluated.
+/// Rocky enumerates it with `list_tables_sql`. When that SQL cannot be built,
+/// cannot be run, or runs and lists nothing (#1811), no table is known — so
+/// every check for that target is unevaluated. The empty listing is the
+/// shape a renamed or never-created schema produces: `information_schema`
+/// answers it with zero rows, not an error.
 ///
 /// Both arms used to `continue` after a `warn!`, emitting NO `CheckResult` at
 /// all. Nothing reached either severity bucket, `error_failures` stayed 0, and
@@ -590,11 +592,44 @@ pub async fn run_quality(
                     }
                 };
                 match warehouse_adapter.execute_query(&list_sql).await {
-                    Ok(result) => result
-                        .rows
-                        .into_iter()
-                        .filter_map(|r| r.first().and_then(|v| v.as_str().map(String::from)))
-                        .collect(),
+                    Ok(result) => {
+                        let listed: Vec<String> = result
+                            .rows
+                            .into_iter()
+                            .filter_map(|r| r.first().and_then(|v| v.as_str().map(String::from)))
+                            .collect();
+                        // A listing that succeeds with ZERO rows is the door
+                        // #1786 left open (#1811). A schema that was renamed
+                        // or never created is not an error to
+                        // `information_schema`; it is an empty answer. The
+                        // loop below then iterated nothing and emitted
+                        // nothing, so a run that had checked no table at all
+                        // reported `Success` and exited 0 — a scheduled
+                        // quality pipeline pointed at a renamed schema stayed
+                        // green forever. An empty expansion is a target the
+                        // engine could not evaluate, recorded the same way as
+                        // one it could not list, so "nothing matched" cannot
+                        // read as "everything passed".
+                        if listed.is_empty() {
+                            warn!(
+                                catalog = table_ref.catalog.as_str(),
+                                schema = table_ref.schema.as_str(),
+                                "the schema listed no tables — nothing was checked"
+                            );
+                            checks_for_unexpandable_target(
+                                &mut output,
+                                table_ref,
+                                &list_sql,
+                                format!(
+                                    "the schema listed no tables, so nothing was checked: \
+                                     `{}.{}` may be missing, renamed, or empty",
+                                    table_ref.catalog, table_ref.schema
+                                ),
+                            );
+                            continue;
+                        }
+                        listed
+                    }
                     Err(e) => {
                         warn!(
                             catalog = table_ref.catalog.as_str(),
