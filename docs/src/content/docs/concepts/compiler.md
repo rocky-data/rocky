@@ -260,6 +260,7 @@ span, and sometimes a suggested fix.
 | `W010` | Contract defines a column not in model output (not required) |
 | `W011` | Contract exists for a model not found in the project |
 | `W012` | An `[imports.<name>]` snapshot could not be loaded; `E030`/`E033` checks skipped |
+| `W013` | `rocky.toml` is present but could not be read, so every project-level check is silent (`rocky lsp` and `rocky serve` only; one-shot commands refuse instead) |
 | `W030` | Imported producer added a column, surfaced only to consumers reading it via `SELECT *` |
 | `W031` | Imported producer widened the type of a column this project reads (cross-team contract) |
 | `I001` | Model dependency inferred from SQL |
