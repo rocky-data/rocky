@@ -205,33 +205,68 @@ impl ServerState {
     }
 
     /// Recompile the project and update the stored result.
-    pub async fn recompile(&self) {
+    ///
+    /// Returns the reason the project config could not be READ, when that is
+    /// what happened. `None` covers both "it loaded" and "there is none" —
+    /// a project with no `rocky.toml` is an ordinary project, not a failure.
+    ///
+    /// `serve` keeps compiling on an unreadable config, which is a contract
+    /// rather than an accident (#1625): a resident server watching a
+    /// directory should not go dark because someone is mid-edit in
+    /// `rocky.toml`. What it must not do is what it did — carry on silently,
+    /// so a caller cannot tell "this project declares no masks" from "the
+    /// file that declares them could not be parsed". The reason now rides
+    /// out on a W013 diagnostic and on this return value.
+    pub async fn recompile(&self) -> Option<String> {
         info!(models_dir = %self.models_dir.display(), "compiling project");
+
+        // ONE read of `rocky.toml` for the whole recompile. It used to be
+        // loaded twice — here and again inside the schema-cache loader —
+        // and each copy decided independently what a broken config meant.
+        // That per-caller decision is the defect #1625 is about, so there
+        // is now one snapshot and one decision.
+        let project_config =
+            rocky_core::config::load_optional_project_config(self.config_path.as_deref());
+
+        let config_unreadable = match &project_config {
+            // `Ok(None)` is "no rocky.toml", which is an ordinary fact
+            // about the project rather than a failure to read one.
+            Ok(_) => None,
+            Err(e) => {
+                let path = self
+                    .config_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "rocky.toml".to_string());
+                warn!(error = %e, config = %path, "rocky.toml could not be read");
+                Some(format!("{path} could not be read: {e}"))
+            }
+        };
+        let project_config = project_config.ok().flatten();
 
         // Load cached source schemas so the server's hover/inlay-hint
         // surfaces typecheck against real warehouse types when the cache
         // is warm. Degrades to empty on cold cache, missing state.redb,
         // or `[cache.schemas] enabled = false`. See
         // `rocky-cli::source_schemas` for the CLI equivalent.
-        let source_schemas = self.load_cached_source_schemas().await;
+        let schema_cache_config = project_config
+            .as_ref()
+            .map(|c| c.cache.schemas.clone())
+            .unwrap_or_default();
+        let source_schemas = self.load_cached_source_schemas(schema_cache_config).await;
 
-        // Load `[mask]` + `[classifications.allow_unmasked]` (W004) and the
-        // `[freshness]` default bit (W005) from rocky.toml, mirroring the
-        // CLI compile path. Without a config_path (or on a parse error) both
-        // come through empty and the checks stay silent — matching standalone
-        // `rocky compile --models models/`.
-        let (mask, allow_unmasked, project_freshness) = match &self.config_path {
-            Some(path) => match rocky_core::config::load_rocky_config(path) {
-                Ok(cfg) => (
-                    cfg.mask.clone(),
-                    cfg.classifications.allow_unmasked.clone(),
-                    cfg.freshness.clone(),
-                ),
-                Err(e) => {
-                    debug!(error = %e, "rocky.toml load failed; W004/W005 will be silent");
-                    (Default::default(), Vec::new(), Default::default())
-                }
-            },
+        // `[mask]` + `[classifications.allow_unmasked]` (W004) and the
+        // `[freshness]` default bit (W005), mirroring the CLI compile path.
+        // With no rocky.toml these come through empty and the checks stay
+        // silent — matching standalone `rocky compile --models models/`.
+        // With an UNREADABLE one they also come through empty, but that is
+        // now reported rather than assumed equivalent.
+        let (mask, allow_unmasked, project_freshness) = match &project_config {
+            Some(cfg) => (
+                cfg.mask.clone(),
+                cfg.classifications.allow_unmasked.clone(),
+                cfg.freshness.clone(),
+            ),
             None => (Default::default(), Vec::new(), Default::default()),
         };
 
@@ -259,12 +294,32 @@ impl ServerState {
                 Ok(r) => r,
                 Err(join_err) => {
                     warn!(error = %join_err, "compile task join failed");
-                    return;
+                    return config_unreadable;
                 }
             };
 
         match compile_result {
-            Ok(result) => {
+            Ok(mut result) => {
+                // The compiler never saw the config, so it cannot raise
+                // this itself. Attach W013 to the stored result so every
+                // reader of `compile_result` — the diagnostics counts on
+                // `GET /api/v1/meta`, the browser UI — sees that the
+                // project-level checks were silent because the file could
+                // not be parsed, not because the project declares nothing.
+                if let Some(ref reason) = config_unreadable {
+                    result
+                        .diagnostics
+                        .push(rocky_compiler::diagnostic::Diagnostic::warning(
+                            rocky_compiler::diagnostic::W013,
+                            "rocky.toml",
+                            format!(
+                                "{reason}. The models still compile, but the project-level \
+                                 checks are silent: masking (W004), the project [freshness] \
+                                 default (W005), and the cached warehouse schemas all came \
+                                 through empty."
+                            ),
+                        ));
+                }
                 let model_count = result.project.model_count();
                 let diag_count = result.diagnostics.len();
                 let has_errors = result.has_errors;
@@ -280,6 +335,8 @@ impl ServerState {
                 warn!(error = %e, "compilation failed");
             }
         }
+
+        config_unreadable
     }
 
     /// Load the schema-cache-backed `source_schemas` map for this
@@ -288,19 +345,17 @@ impl ServerState {
     /// server observes exactly the same file that `rocky run` writes to
     /// (unified default — `<models>/.rocky-state.redb` — with the legacy
     /// CWD fallback for existing projects).
+    ///
+    /// `schema_cache_config` comes from the caller's single `rocky.toml`
+    /// snapshot rather than a second read of the file. This used to load the
+    /// config again and `unwrap_or_default()` the error, making it the second
+    /// place in one function that independently decided a broken config meant
+    /// "defaults" (#1625). Absent a config it still falls back to the
+    /// defaults (enabled + 24h TTL), so zero-config projects mirror the CLI.
     async fn load_cached_source_schemas(
         &self,
+        schema_cache_config: rocky_core::config::SchemaCacheConfig,
     ) -> HashMap<String, Vec<rocky_compiler::types::TypedColumn>> {
-        // Config lookup: fall back to defaults (enabled + 24h TTL) when
-        // no rocky.toml is wired in, so LSP/server behaviour mirrors the
-        // CLI for zero-config projects.
-        let schema_cache_config = match &self.config_path {
-            Some(path) => rocky_core::config::load_rocky_config(path)
-                .map(|c| c.cache.schemas)
-                .unwrap_or_default(),
-            None => rocky_core::config::SchemaCacheConfig::default(),
-        };
-
         if !schema_cache_config.enabled {
             return HashMap::new();
         }
@@ -426,6 +481,86 @@ mod tests {
             w004_count(result),
             0,
             "allow_unmasked must suppress W004 in the server compile path"
+        );
+    }
+
+    /// The case #1625 is about, on the `serve` side.
+    ///
+    /// A `rocky.toml` that is present and unparseable used to be swallowed
+    /// by `debug!` + defaults. The compile then ran with an empty `[mask]`,
+    /// an empty `allow_unmasked` and no project `[freshness]`, and every
+    /// reader — `POST /api/v1/compile`, the diagnostics counts, the UI —
+    /// was told the same thing as a project that genuinely declares none of
+    /// those. `serve` still compiles (a resident server must not go dark
+    /// mid-edit), but it now says WHY the project-level checks are silent.
+    #[tokio::test]
+    async fn an_unreadable_config_is_reported_rather_than_treated_as_absent() {
+        // Valid enough to exist, invalid as TOML.
+        let (_dir, models_dir, config_path) = pii_project("[classifications\nnot = toml\n");
+        let state = ServerState::new(models_dir, None, Some(config_path.clone()));
+
+        let reason = state.recompile().await.expect(
+            "a present-but-unparseable rocky.toml must be reported; returning None would \
+             make POST /api/v1/compile answer plain success after degrading",
+        );
+        assert!(
+            reason.contains(&config_path.display().to_string()),
+            "the reason must name the file to fix, got: {reason}"
+        );
+
+        let guard = state.compile_result.read().await;
+        let result = guard.as_ref().expect("compile result");
+
+        // The contract: still usable. Serve does not refuse.
+        assert!(
+            result.project.model_count() > 0,
+            "serve must keep compiling the models on a broken config"
+        );
+
+        // And the silence is visible to every reader of `compile_result`.
+        let w013: Vec<&str> = result
+            .diagnostics
+            .iter()
+            .filter(|d| &*d.code == "W013")
+            .map(|d| &*d.message)
+            .collect();
+        assert_eq!(
+            w013.len(),
+            1,
+            "exactly one W013 must reach the stored result; without it the compile \
+             is indistinguishable from a project that declares nothing"
+        );
+    }
+
+    /// The other half, and the reason W013 cannot simply fire whenever the
+    /// project inputs are empty: a project with NO `rocky.toml` is an
+    /// ordinary project. Squiggling it would make the warning noise.
+    #[tokio::test]
+    async fn a_project_with_no_config_is_not_reported_as_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let mut sql = std::fs::File::create(models_dir.join("users.sql")).unwrap();
+        write!(sql, "SELECT 1 AS id").unwrap();
+        let mut sidecar = std::fs::File::create(models_dir.join("users.toml")).unwrap();
+        write!(
+            sidecar,
+            "name = \"users\"\n\n[target]\ncatalog = \"demo\"\nschema = \"main\"\ntable = \"users\"\n"
+        )
+        .unwrap();
+
+        // No `rocky.toml` written at this path.
+        let state = ServerState::new(models_dir, None, Some(dir.path().join("rocky.toml")));
+        assert!(
+            state.recompile().await.is_none(),
+            "an ABSENT rocky.toml is a fact about the project, not a failure to read one"
+        );
+
+        let guard = state.compile_result.read().await;
+        let result = guard.as_ref().expect("compile result");
+        assert!(
+            !result.diagnostics.iter().any(|d| &*d.code == "W013"),
+            "W013 must not fire on a project that simply has no config"
         );
     }
 
