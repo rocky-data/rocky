@@ -707,6 +707,52 @@ freshness = true
         assert_eq!(clean.counts.skipped, 0);
     }
 
+    /// The whole-pass `state_busy` — the store held by another process before
+    /// any pipeline was evaluated — reaches the JSON as one pipeline-less skip
+    /// and counts as one, from the derivation the scheduler's span, log and
+    /// metrics share; a pipeline-scoped `state_busy` the reconciler already
+    /// recorded is not doubled (#1812, review round two).
+    #[test]
+    fn a_held_store_reaches_the_json_as_one_pipeline_less_skip() {
+        let busy = TickReport {
+            state_busy: true,
+            ..TickReport::default()
+        };
+        let out = build_tick_output(&busy, ts("2026-05-02T03:05:00Z"), false, 0);
+        let entries: Vec<_> = out
+            .skipped
+            .iter()
+            .filter(|s| s.reason == "state_busy")
+            .collect();
+        assert_eq!(entries.len(), 1, "one whole-pass entry: {:?}", out.skipped);
+        assert!(entries[0].pipeline.is_none() && entries[0].source.is_none());
+        assert_eq!(out.counts.skipped, 1, "and it counts as a skip");
+
+        let already_recorded = TickReport {
+            state_busy: true,
+            skipped: vec![rocky_core::schedule::SkippedDemand {
+                pipeline: "raw".to_string(),
+                source: None,
+                reason: TickSkipReason::StateBusy,
+            }],
+            ..TickReport::default()
+        };
+        let out = build_tick_output(&already_recorded, ts("2026-05-02T03:05:00Z"), false, 0);
+        let entries: Vec<_> = out
+            .skipped
+            .iter()
+            .filter(|s| s.reason == "state_busy")
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the pipeline-scoped one, not doubled: {:?}",
+            out.skipped
+        );
+        assert_eq!(entries[0].pipeline.as_deref(), Some("raw"));
+        assert_eq!(out.counts.skipped, 1);
+    }
+
     /// Build a report + output pair whose only executed run FAILED, so the
     /// exit-2 arm is live. Used to prove the precedence, not just the arm.
     fn unhealthy_pair(spool_unreadable: Option<&str>) -> (TickReport, TickOutput) {

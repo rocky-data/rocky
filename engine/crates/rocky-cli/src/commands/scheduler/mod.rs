@@ -1313,6 +1313,58 @@ cron = "* * * * *"
         assert_eq!(busy.value, 1.0, "one synthesised skip for the whole pass");
     }
 
+    /// The whole-pass `state_busy` on the closed span: a store held by another
+    /// process before any pipeline was evaluated is one skip there too, from
+    /// the derivation the JSON and the metrics share. Restoring the old count
+    /// formula (per-demand skips plus the spool alone) leaves the spool span
+    /// test green and this one red (#1812, review round two).
+    #[tokio::test]
+    async fn a_busy_store_closes_a_span_with_one_skip() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let (dir, config_path) = temp_project(CRON_EVERY_MINUTE);
+        let state = test_state(dir.path());
+        let capture = SpanCapture::default();
+        let spawner = Arc::new(CapturingSpawner::new(0));
+        let shutdown = Drain::new();
+        let clock = FakeClock::new(at(2026, 5, 2, 3, 0));
+        let state_path = dir.path().join(".rocky-state.redb");
+        let held = rocky_core::state::StateStore::open(&state_path).unwrap();
+
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        run_one_tick(
+            &state,
+            &config_path,
+            &state_path,
+            &dir.path().join(".rocky"),
+            clock.as_ref(),
+            &shutdown,
+            spawner.as_ref(),
+            &SchedulerMetrics::disabled(),
+        )
+        .await;
+        drop(_guard);
+        drop(held);
+
+        let spans = capture.spans_named("scheduler.tick");
+        assert_eq!(spans.len(), 1, "one tick ⇒ one span");
+        let fields = &spans[0];
+        assert_eq!(
+            fields
+                .get(span_attrs::SCHEDULER_STATE_BUSY)
+                .map(String::as_str),
+            Some("true"),
+        );
+        assert_eq!(
+            fields
+                .get(span_attrs::SCHEDULER_SKIPPED)
+                .map(String::as_str),
+            Some("1"),
+            "the synthesised whole-pass skip is counted on the span: {fields:?}"
+        );
+    }
+
     /// The one derivation, case by case: what each whole-source or
     /// whole-pass state synthesises, and that a pipeline-scoped `state_busy`
     /// already recorded is not doubled.
