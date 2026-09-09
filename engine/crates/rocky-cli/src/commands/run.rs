@@ -14272,6 +14272,141 @@ fn post_copy_column_match(
 #[cfg(test)]
 mod tests {
 
+    // ---------------------------------------------------------------------
+    // Governance seams, observed through a recording adapter (#1609)
+    //
+    // These four sites take `&dyn GovernanceAdapter`, so a recorder drops in
+    // without changing any signature. Every "the adapter was not called"
+    // assertion below is paired with one where the same wiring DOES record,
+    // because on its own an empty log cannot tell "no call was issued" from
+    // "the recorder was never reached".
+    // ---------------------------------------------------------------------
+
+    /// One snapshot entry with nothing governed. Callers switch on the fields
+    /// they are testing so each test states only what it depends on.
+    fn ungoverned_model(name: &str) -> super::GovernedModelGovernance {
+        super::GovernedModelGovernance {
+            name: name.to_string(),
+            target_catalog: "analytics".to_string(),
+            target_schema: "marts".to_string(),
+            target_table: name.to_string(),
+            strategy: rocky_core::models::StrategyConfig::FullRefresh,
+            classification: std::collections::BTreeMap::new(),
+            retention: None,
+            governance_tags: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn one_entry(key: &str, value: &str) -> std::collections::BTreeMap<String, String> {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(key.to_string(), value.to_string());
+        m
+    }
+
+    /// `reconcile_model_governance`'s doc comment claims a fixed order —
+    /// `apply_column_tags` → `apply_masking_policy` → `apply_retention_policy`
+    /// → `set_tags`, **per model, in compiled model order**.
+    ///
+    /// `replication_reconcile_uses_snapshot` pins that sequence for a single
+    /// model. The per-model half of the claim — that a second model's calls
+    /// follow the first's rather than grouping by method — had nothing
+    /// checking it.
+    #[tokio::test]
+    async fn a_reconcile_interleaves_its_calls_per_model_in_compiled_order() {
+        let mut first = ungoverned_model("orders");
+        first.classification = one_entry("email", "pii");
+        first.retention = Some(rocky_core::retention::RetentionPolicy { duration_days: 90 });
+        first.governance_tags = one_entry("owner", "analytics");
+
+        // The second model needs a leg BEFORE its set_tags too, or the
+        // expected sequence is identical whether the tags leg runs inside the
+        // per-model loop or in a second pass over every model.
+        let mut second = ungoverned_model("customers");
+        second.classification = one_entry("region", "pii");
+        second.governance_tags = one_entry("owner", "crm");
+
+        let snapshot = super::GovernanceSnapshot {
+            models: vec![first, second],
+        };
+        let mut tag_to_strategy = std::collections::BTreeMap::new();
+        tag_to_strategy.insert("pii".to_string(), rocky_ir::MaskStrategy::Hash);
+
+        let log = rocky_core::traits::GovernanceLog::default();
+        let governance = rocky_core::traits::RecordingGovernanceAdapter::new(log.clone());
+
+        super::reconcile_model_governance(&snapshot, &governance, &tag_to_strategy).await;
+
+        assert_eq!(
+            log.methods(),
+            vec![
+                // "orders" — every leg configured, in the documented order.
+                "apply_column_tags",
+                "apply_masking_policy",
+                "apply_retention_policy",
+                "set_tags",
+                // "customers" — no retention, so that leg is skipped, and its
+                // calls follow orders' rather than grouping by method.
+                "apply_column_tags",
+                "apply_masking_policy",
+                "set_tags",
+            ],
+            "the reconcile must finish one model before starting the next, and \
+             skip the legs a model does not configure"
+        );
+    }
+
+    /// The negative control the positive test above licenses: a snapshot with
+    /// nothing governed reaches the adapter and issues no call at all.
+    #[tokio::test]
+    async fn a_reconcile_of_ungoverned_models_issues_no_adapter_call() {
+        let snapshot = super::GovernanceSnapshot {
+            models: vec![ungoverned_model("orders"), ungoverned_model("customers")],
+        };
+
+        let log = rocky_core::traits::GovernanceLog::default();
+        let governance = rocky_core::traits::RecordingGovernanceAdapter::new(log.clone());
+
+        super::reconcile_model_governance(
+            &snapshot,
+            &governance,
+            &std::collections::BTreeMap::new(),
+        )
+        .await;
+
+        assert!(
+            log.is_empty(),
+            "models with no classification, retention or tags must not reach \
+             the warehouse at all, but recorded {:?}",
+            log.methods()
+        );
+    }
+
+    /// A classification with no matching `[mask]` entry tags the column but
+    /// applies no policy — the masking leg is skipped, not called with an
+    /// empty policy.
+    #[tokio::test]
+    async fn an_unmapped_classification_tags_the_column_without_a_masking_call() {
+        let mut model = ungoverned_model("orders");
+        model.classification = one_entry("email", "pii");
+
+        let snapshot = super::GovernanceSnapshot {
+            models: vec![model],
+        };
+
+        let log = rocky_core::traits::GovernanceLog::default();
+        let governance = rocky_core::traits::RecordingGovernanceAdapter::new(log.clone());
+
+        super::reconcile_model_governance(
+            &snapshot,
+            &governance,
+            // "pii" is unmapped: no strategy resolves for the column.
+            &std::collections::BTreeMap::new(),
+        )
+        .await;
+
+        assert_eq!(log.methods(), vec!["apply_column_tags"]);
+    }
+
     /// Shared by the two remote-state quality tests below. Pod A of `harness`
     /// runs the REAL dispatcher on a quality pipeline whose only table does
     /// not exist in the (empty) DuckDB file: the row-count query fails, the

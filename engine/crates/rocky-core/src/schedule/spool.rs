@@ -1175,6 +1175,10 @@ mod tests {
         assert_eq!(scan.to_string(), corrupt.to_string());
     }
 
+    // Unix-only: the fixture is a dangling SYMLINK, and
+    // `std::os::unix::fs::symlink` does not exist on Windows — where
+    // `cargo check --all-targets` compiles this test and fails on it.
+    #[cfg(unix)]
     #[test]
     fn a_dangling_spool_symlink_refuses_instead_of_reading_as_empty() {
         let dir = tempfile::tempdir().unwrap();

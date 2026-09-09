@@ -469,6 +469,10 @@ mod tests {
     ///
     /// The second assertion is the one that matters: refusing is only half of
     /// it if the target got created on the way.
+    // Unix-only: the fixture is a dangling SYMLINK, and
+    // `std::os::unix::fs::symlink` does not exist on Windows — where
+    // `cargo check --all-targets` compiles this test and fails on it.
+    #[cfg(unix)]
     #[test]
     fn init_refuses_a_dangling_rocky_toml_and_does_not_write_through_it() {
         let tmp = tempfile::tempdir().unwrap();
