@@ -9612,17 +9612,29 @@ pub(crate) async fn execute_models(
                 },
             });
         }
-        // Refuse before any write: a shadow object is disposable and
-        // belongs to the run that made it, so anything already sitting at
-        // one of these names is either not Rocky's or debris from a run
-        // that did not finish. Replacing it silently is the defect #1273
-        // reported and reproduced.
-        crate::commands::shadow_lifecycle::refuse_occupied_shadow_targets(
-            warehouse,
-            warehouse.dialect(),
-            &shadow_objects,
-        )
-        .await?;
+        // Refuse before any write — but ONLY in the disposable mode.
+        //
+        // `cleanup_after` is exactly the axis this turns on, because it is
+        // what makes "the name should be free" a true invariant: a run that
+        // drops what it made leaves nothing, so an object sitting there is
+        // either not Rocky's or debris from a run that did not finish, and
+        // replacing it silently is the defect #1273 reported.
+        //
+        // With `cleanup_after` off — a named `--branch`, or any caller that
+        // asks for objects outliving the run — the previous run's objects
+        // are SUPPOSED to still be there, and the next run is supposed to
+        // replace them. Refusing would break the feature outright. Rocky
+        // cannot tell its own leftover from a stranger's without a
+        // persisted owner record, so it does not guess: the persistent mode
+        // keeps no per-object ownership check, and #1273 stays open for it.
+        if config.cleanup_after {
+            crate::commands::shadow_lifecycle::refuse_occupied_shadow_targets(
+                warehouse,
+                warehouse.dialect(),
+                &shadow_objects,
+            )
+            .await?;
+        }
         output.shadow = true;
     } else {
         augment_physical_read_edges(

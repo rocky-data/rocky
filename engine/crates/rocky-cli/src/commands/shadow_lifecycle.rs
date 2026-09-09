@@ -217,6 +217,35 @@ mod tests {
         );
     }
 
+    /// The refusal is scoped to the DISPOSABLE mode, and the caller is what
+    /// scopes it (`run.rs` calls this only when `cleanup_after` is set).
+    ///
+    /// This test pins the reason, because the scoping is a decision and not
+    /// an oversight: with `cleanup_after` off, the previous run's objects
+    /// are supposed to still be there and the next run is supposed to
+    /// replace them, so an unconditional refusal would make a named
+    /// `--branch` refuse its own workspace on every re-run. Rocky cannot
+    /// tell its own leftover from a stranger's without a persisted owner
+    /// record, so the persistent mode keeps no per-object check and #1273
+    /// stays open for it.
+    ///
+    /// What this function must NOT do is decide that for itself — a future
+    /// caller that forgets the gate should get a refusal, not a silent pass.
+    #[tokio::test]
+    async fn the_check_itself_is_unconditional_and_the_caller_scopes_it() {
+        let wh = duckdb();
+        let dialect = wh.dialect();
+        wh.execute_statement("CREATE TABLE main.orders_rocky_shadow AS SELECT 1 AS id")
+            .await
+            .expect("seed");
+        assert!(
+            refuse_occupied_shadow_targets(&wh, dialect, &[object("orders_rocky_shadow")])
+                .await
+                .is_err(),
+            "the primitive always refuses an occupied target; only the call site is conditional"
+        );
+    }
+
     /// Cleanup removes what the run created, and is idempotent — a second
     /// drop of an absent object is not an error, so a crash between the
     /// drop and the record cannot wedge the next run.
