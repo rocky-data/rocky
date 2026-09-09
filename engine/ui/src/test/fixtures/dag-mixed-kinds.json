@@ -1,0 +1,156 @@
+{
+  "version": "1.73.0",
+  "schema_version": "1",
+  "command": "dag",
+  "nodes": [
+    {
+      "id": "seed:country_codes",
+      "kind": "seed",
+      "label": "country_codes",
+      "target": {
+        "catalog": "",
+        "schema": "",
+        "table": "country_codes"
+      }
+    },
+    {
+      "id": "snapshot:customer_history",
+      "kind": "snapshot",
+      "label": "customer_history",
+      "pipeline": "customer_history"
+    },
+    {
+      "id": "source:ecommerce",
+      "kind": "source",
+      "label": "ecommerce (source)",
+      "pipeline": "ecommerce"
+    },
+    {
+      "id": "load:ecommerce",
+      "kind": "load",
+      "label": "ecommerce (load)",
+      "pipeline": "ecommerce",
+      "depends_on": [
+        "source:ecommerce"
+      ]
+    },
+    {
+      "id": "quality:nightly_dq",
+      "kind": "quality",
+      "label": "nightly_dq",
+      "pipeline": "nightly_dq"
+    },
+    {
+      "id": "transformation:customer_orders",
+      "kind": "transformation",
+      "label": "customer_orders",
+      "pipeline": "playground",
+      "target": {
+        "catalog": "playground",
+        "schema": "main",
+        "table": "customer_orders"
+      },
+      "strategy": {
+        "type": "full_refresh"
+      },
+      "depends_on": [
+        "transformation:raw_orders"
+      ]
+    },
+    {
+      "id": "transformation:raw_orders",
+      "kind": "transformation",
+      "label": "raw_orders",
+      "pipeline": "playground",
+      "target": {
+        "catalog": "playground",
+        "schema": "main",
+        "table": "raw_orders"
+      },
+      "strategy": {
+        "type": "full_refresh"
+      }
+    },
+    {
+      "id": "transformation:revenue_summary",
+      "kind": "transformation",
+      "label": "revenue_summary",
+      "pipeline": "playground",
+      "target": {
+        "catalog": "playground",
+        "schema": "main",
+        "table": "revenue_summary"
+      },
+      "strategy": {
+        "type": "full_refresh"
+      },
+      "depends_on": [
+        "transformation:customer_orders"
+      ]
+    },
+    {
+      "id": "test:revenue_summary::not_null_customer_id",
+      "kind": "test",
+      "label": "revenue_summary::not_null_customer_id",
+      "pipeline": "playground",
+      "depends_on": [
+        "transformation:revenue_summary"
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "from": "source:ecommerce",
+      "to": "load:ecommerce",
+      "edge_type": "data"
+    },
+    {
+      "from": "transformation:raw_orders",
+      "to": "transformation:customer_orders",
+      "edge_type": "data"
+    },
+    {
+      "from": "transformation:customer_orders",
+      "to": "transformation:revenue_summary",
+      "edge_type": "data"
+    },
+    {
+      "from": "transformation:revenue_summary",
+      "to": "test:revenue_summary::not_null_customer_id",
+      "edge_type": "check"
+    }
+  ],
+  "execution_layers": [
+    [
+      "quality:nightly_dq",
+      "seed:country_codes",
+      "snapshot:customer_history",
+      "source:ecommerce",
+      "transformation:raw_orders"
+    ],
+    [
+      "load:ecommerce",
+      "transformation:customer_orders"
+    ],
+    [
+      "transformation:revenue_summary"
+    ],
+    [
+      "test:revenue_summary::not_null_customer_id"
+    ]
+  ],
+  "summary": {
+    "total_nodes": 9,
+    "total_edges": 4,
+    "execution_layers": 4,
+    "counts_by_kind": {
+      "load": 1,
+      "quality": 1,
+      "seed": 1,
+      "snapshot": 1,
+      "source": 1,
+      "test": 1,
+      "transformation": 3
+    }
+  }
+}

@@ -8,6 +8,7 @@
 
 import type { Edge, Node } from "@xyflow/react";
 import type { DagNodeOutput, DagOutput } from "@rocky-types/dag";
+import { nodeRoute } from "./nodeRoute";
 
 export interface ModelNodeData extends Record<string, unknown> {
   label: string;
@@ -55,20 +56,33 @@ export function layeredFlow(dag: DagOutput): Flow {
   const placed = new Set<string>();
   const nodes: ModelFlowNode[] = [];
 
-  const toNode = (node: DagNodeOutput, column: number, row: number, rows: number): ModelFlowNode => ({
-    id: node.id,
-    type: "model",
-    position: position(column, row, rows),
-    draggable: false,
-    data: {
-      label: node.label,
-      kind: node.kind,
-      strategy: strategyOf(node),
-      target: targetOf(node),
-      pipeline: node.pipeline ?? null,
-      layer: column,
-    },
-  });
+  const toNode = (node: DagNodeOutput, column: number, row: number, rows: number): ModelFlowNode => {
+    // Only a node the detail route can serve is reachable by keyboard. React
+    // Flow honours these per node: `tabIndex`, `onKeyDown` and `role` are all
+    // gated on `focusable`, and the global flags apply only where a node
+    // leaves them undefined. So the rest leave the tab order entirely.
+    const openable = nodeRoute(node).state === "servable";
+    return {
+      id: node.id,
+      type: "model",
+      position: position(column, row, rows),
+      draggable: false,
+      focusable: openable,
+      selectable: openable,
+      // A node that opens a pane is a button. One that does not is marked
+      // as such for assistive technology, and takes no role of its own.
+      ariaRole: openable ? "button" : undefined,
+      domAttributes: openable ? undefined : { "aria-disabled": true },
+      data: {
+        label: node.label,
+        kind: node.kind,
+        strategy: strategyOf(node),
+        target: targetOf(node),
+        pipeline: node.pipeline ?? null,
+        layer: column,
+      },
+    };
+  };
 
   dag.execution_layers.forEach((layer, column) => {
     const ids = layer.filter((id) => byId.has(id) && !placed.has(id));

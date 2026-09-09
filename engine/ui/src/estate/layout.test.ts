@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { DagOutput } from "@rocky-types/dag";
 import dagFixture from "@rocky-fixtures/dag.json";
+import mixedDag from "../test/fixtures/dag-mixed-kinds.json";
 import { NODE_HEIGHT, NODE_WIDTH, layeredFlow } from "./layout";
 
 function dag(overrides: Partial<DagOutput>): DagOutput {
@@ -89,6 +90,52 @@ describe("layeredFlow", () => {
     const bare = flow.nodes.find((n) => n.id === "bare")?.data;
     expect(bare?.strategy).toBeNull();
     expect(bare?.target).toBeNull();
+  });
+
+  it("makes only a servable node focusable and selectable", () => {
+    const flow = layeredFlow(
+      dag({
+        nodes: [
+          { id: "transformation:orders", label: "orders", kind: "transformation" },
+          { id: "source:ecommerce", label: "ecommerce (source)", kind: "source" },
+        ] as DagOutput["nodes"],
+        execution_layers: [["transformation:orders", "source:ecommerce"]],
+      }),
+    );
+    const model = flow.nodes.find((n) => n.id === "transformation:orders");
+    expect(model?.focusable).toBe(true);
+    expect(model?.selectable).toBe(true);
+    expect(model?.ariaRole).toBe("button");
+    expect(model?.domAttributes).toBeUndefined();
+
+    const source = flow.nodes.find((n) => n.id === "source:ecommerce");
+    expect(source?.focusable).toBe(false);
+    expect(source?.selectable).toBe(false);
+    expect(source?.ariaRole).toBeUndefined();
+    expect(source?.domAttributes).toEqual({ "aria-disabled": true });
+  });
+
+  it("takes every kind but transformation out of the captured DAG's tab order", () => {
+    const flow = layeredFlow(mixedDag as unknown as DagOutput);
+    const focusable = flow.nodes.filter((n) => n.focusable);
+    expect(focusable.map((n) => n.id)).toEqual([
+      "transformation:raw_orders",
+      "transformation:customer_orders",
+      "transformation:revenue_summary",
+    ]);
+    // Seven kinds in the fixture; six of them take no tab stop at all.
+    expect(flow.nodes.filter((n) => !n.focusable)).toHaveLength(6);
+    expect(flow.nodes.filter((n) => !n.focusable).every((n) => n.selectable === false)).toBe(true);
+  });
+
+  it("refuses a tab stop to a kind it cannot classify", () => {
+    const flow = layeredFlow(
+      dag({
+        nodes: [{ id: "x:a", label: "a", kind: "materialized_view" }] as DagOutput["nodes"],
+        execution_layers: [["x:a"]],
+      }),
+    );
+    expect(flow.nodes[0]?.focusable).toBe(false);
   });
 
   it("lays out the playground's captured DAG: one node per model, one edge per dependency", () => {

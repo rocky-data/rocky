@@ -1,6 +1,7 @@
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import type { ModelFlowNode } from "./layout";
 import { NODE_WIDTH } from "./layout";
+import { nodeRoute } from "./nodeRoute";
 
 /** Accent by resource kind, the VS Code Inspector's idiom in the SPA's palette. */
 function kindClass(kind: string): string {
@@ -40,11 +41,13 @@ export function kindGlyph(kind: string): string {
 /** A rounded card: a kind glyph and the model name. Every value is text. */
 export function ModelNode({ data, selected }: NodeProps<ModelFlowNode>) {
   const title = [data.target, data.strategy].filter((s) => s !== null).join(" · ");
+  // Only a node the detail route can serve invites a click.
+  const openable = nodeRoute(data).state === "servable";
   return (
     <div
       className={`flex items-center gap-2 rounded-md border border-l-4 bg-white px-2.5 py-2 text-xs shadow-xs dark:bg-zinc-900 ${kindClass(data.kind)} ${
-        selected ? "border-sky-500" : "border-zinc-200 dark:border-zinc-700"
-      }`}
+        openable ? "cursor-pointer" : "cursor-default"
+      } ${selected ? "border-sky-500" : "border-zinc-200 dark:border-zinc-700"}`}
       style={{ width: NODE_WIDTH }}
       title={title}
     >
