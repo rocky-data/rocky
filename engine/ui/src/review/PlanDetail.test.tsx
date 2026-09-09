@@ -127,9 +127,13 @@ describe("PlanDetail", () => {
     // Two cards say "signed off" once a marker exists — the review status and
     // the approval. Either is enough to know the queue has released the plan.
     await screen.findAllByText("signed off");
-    const panel = await screen.findByRole("region", { name: "Sample rows" });
+    // The offer is the button, and it exists only once the model is known.
+    // Waiting for it also waits out the fallback's "not known yet" section,
+    // which shares the region's name and is what a slower product read
+    // shows first.
+    await screen.findByRole("button", { name: /Show \d+ rows/ });
+    const panel = screen.getByRole("region", { name: "Sample rows" });
     expect(panel.textContent).toContain("revenue_daily");
-    expect(screen.getByRole("button", { name: /Show \d+ rows/ })).toBeTruthy();
   });
 
   /// Absent is not empty. A missing panel would read as "this plan touches no
