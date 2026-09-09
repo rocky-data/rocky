@@ -442,9 +442,11 @@ fn quality_row_count_check(
 /// failing check the engine could not evaluate.
 ///
 /// A `[[pipeline.x.tables]]` entry with no `table` names a whole schema, and
-/// Rocky enumerates it with `list_tables_sql`. When that SQL cannot be built or
-/// cannot be run, no table is known — so every check for that target is
-/// unevaluated.
+/// Rocky enumerates it with `list_tables_sql`. When that SQL cannot be built,
+/// cannot be run, or runs and lists nothing (#1811), no table is known — so
+/// every check for that target is unevaluated. The empty listing is the
+/// shape a renamed or never-created schema produces: `information_schema`
+/// answers it with zero rows, not an error.
 ///
 /// Both arms used to `continue` after a `warn!`, emitting NO `CheckResult` at
 /// all. Nothing reached either severity bucket, `error_failures` stayed 0, and
@@ -563,6 +565,12 @@ pub async fn run_quality(
 
     let row_count_severity = pipeline.checks.row_count.severity();
 
+    // For the text summary: `check_results` holds one entry per TABLE checked
+    // plus one per schema-wide target that could not be expanded, so its
+    // length is not a table count (#1811 round one). Counted here instead.
+    let mut tables_checked = 0usize;
+    let mut targets_unexpanded = 0usize;
+
     if !pipeline.checks.enabled {
         warn!("quality pipeline checks are disabled — nothing to do");
     } else {
@@ -586,15 +594,63 @@ pub async fn run_quality(
                             "",
                             format!("could not build the list-tables SQL: {e}"),
                         );
+                        targets_unexpanded += 1;
                         continue;
                     }
                 };
                 match warehouse_adapter.execute_query(&list_sql).await {
-                    Ok(result) => result
-                        .rows
-                        .into_iter()
-                        .filter_map(|r| r.first().and_then(|v| v.as_str().map(String::from)))
-                        .collect(),
+                    Ok(result) => {
+                        let row_count = result.rows.len();
+                        let listed: Vec<String> = result
+                            .rows
+                            .into_iter()
+                            .filter_map(|r| r.first().and_then(|v| v.as_str().map(String::from)))
+                            .collect();
+                        // A row whose first cell is not a string is dropped
+                        // by the collect above; say so rather than silently
+                        // checking fewer tables than the schema listed.
+                        if listed.len() < row_count {
+                            warn!(
+                                catalog = table_ref.catalog.as_str(),
+                                schema = table_ref.schema.as_str(),
+                                listed = row_count,
+                                usable = listed.len(),
+                                "some listed rows carried no table name and were skipped"
+                            );
+                        }
+                        // A listing that succeeds with ZERO rows is the door
+                        // #1786 left open (#1811). A schema that was renamed
+                        // or never created is not an error to
+                        // `information_schema`; it is an empty answer. The
+                        // loop below then iterated nothing and emitted
+                        // nothing, so a run that had checked no table at all
+                        // reported `Success` and exited 0 — a scheduled
+                        // quality pipeline pointed at a renamed schema stayed
+                        // green forever. An empty expansion is a target the
+                        // engine could not evaluate, recorded the same way as
+                        // one it could not list, so "nothing matched" cannot
+                        // read as "everything passed".
+                        if listed.is_empty() {
+                            warn!(
+                                catalog = table_ref.catalog.as_str(),
+                                schema = table_ref.schema.as_str(),
+                                "the schema listed no tables — nothing was checked"
+                            );
+                            checks_for_unexpandable_target(
+                                &mut output,
+                                table_ref,
+                                &list_sql,
+                                format!(
+                                    "the schema listed no tables, so nothing was checked: \
+                                     `{}.{}` may be missing, renamed, or empty",
+                                    table_ref.catalog, table_ref.schema
+                                ),
+                            );
+                            targets_unexpanded += 1;
+                            continue;
+                        }
+                        listed
+                    }
                     Err(e) => {
                         warn!(
                             catalog = table_ref.catalog.as_str(),
@@ -608,12 +664,14 @@ pub async fn run_quality(
                             &list_sql,
                             format!("could not list the tables in this schema: {e}"),
                         );
+                        targets_unexpanded += 1;
                         continue;
                     }
                 }
             };
 
             for table_name in &tables_to_check {
+                tables_checked += 1;
                 let full_table = dialect
                     .format_table_ref(&table_ref.catalog, &table_ref.schema, table_name)
                     .unwrap_or_else(|_| {
@@ -740,9 +798,13 @@ pub async fn run_quality(
                 output.quarantine.len()
             )
         };
+        let unexpanded_summary = if targets_unexpanded == 0 {
+            String::new()
+        } else {
+            format!(", {targets_unexpanded} schema target(s) could not be expanded")
+        };
         crate::status_line!(
-            "quality pipeline complete: {total_checks} check(s) across {} table(s), {error_failures} error / {warning_failures} warning failed{quarantine_summary}, in {}ms",
-            output.check_results.len(),
+            "quality pipeline complete: {total_checks} check(s) across {tables_checked} table(s){unexpanded_summary}, {error_failures} error / {warning_failures} warning failed{quarantine_summary}, in {}ms",
             output.duration_ms
         );
     }
