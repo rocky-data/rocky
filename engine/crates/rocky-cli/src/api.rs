@@ -4571,6 +4571,7 @@ mod tests {
     /// route read the absent result as a clean project: `diagnostics: []`,
     /// `has_errors: false`. Now the failure is its own state on the wire,
     /// with the reason, and it clears when a later compile produces a result.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_project_route_reports_a_failed_compile_rather_than_a_clean_project() {
         let dir = tempfile::tempdir().unwrap();

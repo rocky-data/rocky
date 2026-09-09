@@ -634,6 +634,7 @@ mod tests {
     /// dropped: `compile_result` stayed `None`, and every reader of `None`
     /// took it for "nothing to report". The failure is recorded now, with
     /// its reason, and a compile that produces a result clears it.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_failed_compile_is_recorded_and_a_later_success_clears_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -708,6 +709,7 @@ mod tests {
     /// B that ran beside A would usually have published within the wait,
     /// but a slow B could still be compiling. Without the gate the ordinary
     /// schedule is B publishing first and A's stale failure landing on top.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn overlapping_recompiles_are_serialised_and_each_reports_its_own_outcome() {
         use std::time::Duration;
