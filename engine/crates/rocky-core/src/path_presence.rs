@@ -521,6 +521,10 @@ mod present_tests {
         assert!(entry_is_present(&proj.join("orders.toml")));
     }
 
+    // Unix-only: the fixture is a dangling SYMLINK, and
+    // `std::os::unix::fs::symlink` does not exist on Windows — where
+    // `cargo check --all-targets` compiles this test and fails on it.
+    #[cfg(unix)]
     #[test]
     fn a_dangling_symlink_is_present_where_exists_says_otherwise() {
         let dir = tempfile::tempdir().unwrap();
