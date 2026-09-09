@@ -409,7 +409,7 @@ fn build_tick_output(
         skipped.push(SkippedDemandOutput {
             pipeline: None,
             source: Some("webhook".to_string()),
-            reason: "spool_unreadable".to_string(),
+            reason: rocky_observe::span_attrs::SPOOL_UNREADABLE_LABEL.to_string(),
             resume_at: None,
             missed: None,
         });

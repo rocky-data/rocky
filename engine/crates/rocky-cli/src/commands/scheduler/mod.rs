@@ -355,6 +355,12 @@ enum TickOutcome {
     PermitHeld,
     LockSkipped,
     Fault,
+    /// The tick reconciled its cron schedules but could not read the webhook
+    /// spool, so no webhook demand was consumed. Reported as its own outcome
+    /// rather than `Completed`: in the metrics — the surface an alert reads —
+    /// a scheduler that cannot read its spool was identical to a healthy idle
+    /// one, and only the trace span carried a boolean (#1812).
+    SpoolUnreadable,
 }
 
 impl TickOutcome {
@@ -365,6 +371,7 @@ impl TickOutcome {
             TickOutcome::PermitHeld => "permit_held",
             TickOutcome::LockSkipped => "lock_skipped",
             TickOutcome::Fault => "fault",
+            TickOutcome::SpoolUnreadable => span_attrs::SPOOL_UNREADABLE_LABEL,
         }
     }
 }
@@ -387,7 +394,11 @@ fn tick_counts(report: &TickReport) -> TickCounts {
             .iter()
             .filter(|e| e.outcome != rocky_core::schedule::TerminalOutcome::Success)
             .count(),
-        skipped: report.skipped.len(),
+        // An unreadable spool is one more skip — the whole webhook source,
+        // not one demand — and `rocky tick --output json` already lists it
+        // as one. Counting it here keeps the span's `skipped`, the log's,
+        // and the sum of the metric's `reason` series equal to the JSON's.
+        skipped: report.skipped.len() + usize::from(report.spool_unreadable.is_some()),
     }
 }
 
@@ -410,7 +421,14 @@ fn record_tick(report: &TickReport, metrics: &SchedulerMetrics) {
         record_outcome(TickOutcome::LockSkipped, metrics);
         return;
     }
-    record_outcome(TickOutcome::Completed, metrics);
+    // Not `Completed` when the spool could not be read: the tick counter is
+    // what an alert reads, and `completed` there said the loop was healthy.
+    let outcome = if report.spool_unreadable.is_some() {
+        TickOutcome::SpoolUnreadable
+    } else {
+        TickOutcome::Completed
+    };
+    record_outcome(outcome, metrics);
     let counts = tick_counts(report);
     let span = tracing::Span::current();
     span.record(span_attrs::SCHEDULER_DUE, counts.due);
@@ -448,6 +466,7 @@ fn log_tick(report: &TickReport) {
         lock_overridden = report.lock_overridden,
         state_busy = report.state_busy,
         drained = report.drained,
+        spool_unreadable = report.spool_unreadable.is_some(),
         "scheduler: tick complete",
     );
 }
@@ -471,6 +490,13 @@ fn record_metrics(report: &TickReport, now: DateTime<Utc>, metrics: &SchedulerMe
     // the span's `rocky.scheduler.skipped`.
     for skip in &report.skipped {
         metrics.record_skip(skip_reason_label(&skip.reason));
+    }
+    // The skip the tick synthesises for an unreadable spool — the same entry
+    // the JSON carries. Without it `rocky.scheduler.skipped` never said the
+    // spool was unreadable, and the `.ticks` counter above said `completed`
+    // (#1812).
+    if report.spool_unreadable.is_some() {
+        metrics.record_skip(span_attrs::SPOOL_UNREADABLE_LABEL);
     }
 
     // Per executed demand: its execution lag, and its outcome folded into the
@@ -758,6 +784,7 @@ cron = "* * * * *"
             TickOutcome::PermitHeld,
             TickOutcome::LockSkipped,
             TickOutcome::Fault,
+            TickOutcome::SpoolUnreadable,
         ] {
             // Exhaustiveness guard: a new variant fails to compile here.
             match outcome {
@@ -765,7 +792,8 @@ cron = "* * * * *"
                 | TickOutcome::ConfigError
                 | TickOutcome::PermitHeld
                 | TickOutcome::LockSkipped
-                | TickOutcome::Fault => {}
+                | TickOutcome::Fault
+                | TickOutcome::SpoolUnreadable => {}
             }
             assert!(
                 span_attrs::SCHEDULER_OUTCOMES.contains(&outcome.as_str()),
@@ -981,7 +1009,20 @@ cron = "* * * * *"
         spawner: Arc<dyn Spawner>,
         ticks: usize,
     ) -> Vec<MetricPoint> {
+        drive_ticks_with_metrics_prepared(config, spawner, ticks, |_| {}).await
+    }
+
+    /// [`drive_ticks_with_metrics`] with a hook that runs against the project
+    /// directory before the first tick — to plant a state the reconciler must
+    /// find already there.
+    async fn drive_ticks_with_metrics_prepared(
+        config: &str,
+        spawner: Arc<dyn Spawner>,
+        ticks: usize,
+        prepare: impl FnOnce(&Path),
+    ) -> Vec<MetricPoint> {
         let (dir, config_path) = temp_project(config);
+        prepare(dir.path());
         let state = test_state(dir.path());
         let harness = MetricsHarness::new();
         let metrics = harness.metrics();
@@ -1095,6 +1136,58 @@ cron = "* * * * *"
         assert_eq!(
             failure_gauges[0].value, 0.0,
             "a success ⇒ zero-length failure streak",
+        );
+    }
+
+    /// A tick whose webhook spool cannot be read counts under its own
+    /// `outcome` and emits a `spool_unreadable` skip — in the METRICS, which
+    /// is what an alert reads. #1752 carried the refusal onto the JSON and the
+    /// span; the `.ticks` counter still said `completed` and no skip was ever
+    /// emitted, so a scheduler that could not read its spool looked exactly
+    /// like a healthy idle one (#1812). The assertions are on the exported
+    /// points: a report-level check passed without the wiring, which is how
+    /// this shipped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_spool_counts_under_its_own_outcome_and_reason() {
+        let spawner: Arc<dyn Spawner> = Arc::new(CapturingSpawner::new(0));
+        let points = drive_ticks_with_metrics_prepared(CRON_EVERY_MINUTE, spawner, 2, |root| {
+            // A dangling symlink where the spool directory should be: present
+            // and unreadable, which #1710 made the scan refuse.
+            let rocky_dir = root.join(".rocky");
+            std::fs::create_dir_all(&rocky_dir).unwrap();
+            std::os::unix::fs::symlink("nowhere", rocky_dir.join("pending-demands")).unwrap();
+        })
+        .await;
+
+        let ticks: Vec<&MetricPoint> = points
+            .iter()
+            .filter(|p| p.name == "rocky.scheduler.ticks")
+            .collect();
+        assert!(
+            ticks
+                .iter()
+                .all(|p| p.attr("outcome") == Some(span_attrs::SPOOL_UNREADABLE_LABEL)),
+            "no tick may count as completed while the spool is unreadable: {ticks:?}"
+        );
+        assert_eq!(
+            ticks.iter().map(|p| p.value).sum::<f64>(),
+            2.0,
+            "both passes ticked, both under the unreadable-spool outcome"
+        );
+        let skips: Vec<&MetricPoint> = points
+            .iter()
+            .filter(|p| p.name == "rocky.scheduler.skipped")
+            .collect();
+        let spool = skips
+            .iter()
+            .find(|p| p.attr("reason") == Some(span_attrs::SPOOL_UNREADABLE_LABEL))
+            .expect("a `spool_unreadable` skip series, the entry the JSON already carries");
+        assert_eq!(spool.value, 2.0, "one synthesised skip per tick");
+        // The cron half still ran: the firing pass executed its occurrence.
+        assert_eq!(
+            metric(&points, "rocky.scheduler.executed").unwrap().value,
+            1.0,
         );
     }
 
