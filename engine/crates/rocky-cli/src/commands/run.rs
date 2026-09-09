@@ -1652,6 +1652,7 @@ fn require_resume_progress(
 /// [`SchemaPattern::parse`]: rocky_core::schema::SchemaPattern::parse
 /// [`ResumeSeparator::Unused`]: rocky_core::state::ResumeSeparator::Unused
 /// [`ResumeShadow::Schema`]: rocky_core::state::ResumeShadow::Schema
+#[allow(clippy::too_many_arguments)]
 fn replication_resume_scope(
     pipeline_name: &str,
     target: &rocky_core::config::PipelineTargetConfig,
@@ -1660,6 +1661,8 @@ fn replication_resume_scope(
     shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
     separator: &str,
     pattern: &rocky_core::schema::SchemaPattern,
+    source: &rocky_core::config::PipelineSourceConfig,
+    discovery_adapter: Option<&rocky_core::config::AdapterConfig>,
 ) -> ResumeScope {
     use rocky_core::state::{ResumeSeparator, ResumeShadow, ResumeTarget};
 
@@ -1692,9 +1695,40 @@ fn replication_resume_scope(
     } else {
         ResumeSeparator::Unused
     };
+    // The source half (#1583). The scope recorded nothing about where the
+    // run READ from, so re-pointing `source.discovery.adapter` moved no
+    // field: a resume matched its checkpoint by TARGET key, skipped every
+    // table it had never copied from the new source, and exited 0.
+    //
+    // The pattern goes in as a SHAPE rather than as itself. Discovery parses
+    // each source schema name with it and the captured values render the
+    // target names the checkpoint is keyed by, so two patterns that differ
+    // can map different source tables onto one key. Prefix, separator and
+    // the ordered components are what does that mapping.
+    let resume_source = rocky_core::state::ResumeSource {
+        discovery_adapter: source.discovery.as_ref().map(|d| d.adapter.clone()),
+        endpoint: discovery_adapter.map(rocky_core::config::AdapterConfig::endpoint_identity),
+        catalog: source.catalog.clone(),
+        pattern_prefix: pattern.prefix.clone(),
+        pattern_separator: pattern.separator.clone(),
+        pattern_components: pattern
+            .components
+            .iter()
+            .map(|component| {
+                use rocky_core::schema::PatternComponent as C;
+                match component {
+                    C::Fixed(value) => format!("fixed:{value}"),
+                    C::Variable { name } => format!("var:{name}"),
+                    C::VariableLength { name } => format!("varlen:{name}"),
+                    C::Terminal { name } => format!("term:{name}"),
+                }
+            })
+            .collect(),
+    };
     ResumeScope {
         pipeline: pipeline_name.to_string(),
         filter: filter.map(str::to_string),
+        source: Some(resume_source),
         target: Some(ResumeTarget {
             adapter: target.adapter.clone(),
             catalog_template: target.catalog_template.clone(),
@@ -3502,6 +3536,16 @@ pub async fn run(
         .separator
         .as_deref()
         .unwrap_or(&pattern.separator);
+    // Resolved from the same adapter map the target came from, so the
+    // recorded endpoint is the one discovery will actually read (#1583).
+    // A missing entry is not an error here: the discovery call below raises
+    // it with the context this function does not have, and a scope that
+    // records `None` still differs from one that records an endpoint.
+    let discovery_adapter_config = pipeline
+        .source
+        .discovery
+        .as_ref()
+        .and_then(|disc| rocky_cfg.adapters.get(&disc.adapter));
     let resume_scope = replication_resume_scope(
         pipeline_name,
         &pipeline.target,
@@ -3510,6 +3554,8 @@ pub async fn run(
         shadow_config,
         target_sep,
         &pattern,
+        &pipeline.source,
+        discovery_adapter_config,
     );
     // Before any checkpoint is consulted (#1611). A key that cannot name a
     // database is not evidence a table was copied, so the refusal belongs
@@ -14584,6 +14630,7 @@ max_retries = 0
 
         ResumeScope {
             pipeline: pipeline.to_string(),
+            source: None,
             filter: None,
             target: Some(ResumeTarget {
                 adapter: "default".to_string(),
@@ -14644,6 +14691,198 @@ max_retries = 0
         resume_scope_with_pattern(pipeline, target, adapter, &test_schema_pattern())
     }
 
+    /// #1583 step 2, the issue's own reproduction: point
+    /// `source.discovery.adapter` at another adapter and the scope must
+    /// move.
+    ///
+    /// It did not. The scope recorded pipeline, filter and the whole TARGET
+    /// block and nothing about the source, so this edit left every field
+    /// identical. `completed_keys` then matched the checkpoint's `Success`
+    /// entries by target key, skipped every table never copied from the new
+    /// source, and the run exited 0.
+    #[test]
+    fn re_pointing_the_discovery_adapter_changes_the_resume_scope() {
+        let target: rocky_core::config::PipelineTargetConfig = toml::from_str(
+            r#"
+adapter = "default"
+catalog_template = "wh"
+schema_template = "staging"
+"#,
+        )
+        .unwrap();
+        let adapter = test_duckdb_adapter(None);
+        let pattern = test_schema_pattern();
+
+        let mut moved = test_source_config();
+        moved.discovery.as_mut().expect("discovery").adapter = "other".to_string();
+
+        let before = replication_resume_scope(
+            "p1",
+            &target,
+            &adapter,
+            None,
+            None,
+            "__",
+            &pattern,
+            &test_source_config(),
+            None,
+        );
+        let after = replication_resume_scope(
+            "p1", &target, &adapter, None, None, "__", &pattern, &moved, None,
+        );
+        assert_ne!(
+            before, after,
+            "a different discovery adapter is a different source; resuming across it \
+             skips tables that were never copied"
+        );
+    }
+
+    /// The endpoint half: the alias can stay put while the data location
+    /// behind it moves. Recording only the alias would let a re-pointed
+    /// adapter resume a checkpoint written against a different database —
+    /// the same argument `ResumeTarget::endpoint` answers on the write side.
+    #[test]
+    fn re_pointing_the_adapter_behind_the_alias_changes_the_resume_scope() {
+        let target: rocky_core::config::PipelineTargetConfig = toml::from_str(
+            r#"
+adapter = "default"
+catalog_template = "wh"
+schema_template = "staging"
+"#,
+        )
+        .unwrap();
+        let target_adapter = test_duckdb_adapter(None);
+        let pattern = test_schema_pattern();
+        let source = test_source_config();
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let one = test_duckdb_adapter(Some(&dir.path().join("one.duckdb")));
+        let two = test_duckdb_adapter(Some(&dir.path().join("two.duckdb")));
+
+        let scope = |discovery: &rocky_core::config::AdapterConfig| {
+            replication_resume_scope(
+                "p1",
+                &target,
+                &target_adapter,
+                None,
+                None,
+                "__",
+                &pattern,
+                &source,
+                Some(discovery),
+            )
+        };
+        assert_ne!(
+            scope(&one),
+            scope(&two),
+            "the same alias over a different database is a different source"
+        );
+    }
+
+    /// The pattern's SHAPE, which is the other half of the issue: discovery
+    /// parses source schema names with it and the captured values render the
+    /// target names the checkpoint is keyed by, so two patterns can map
+    /// different source tables onto one key.
+    ///
+    /// `prefix` and `components` were not in the scope at all. Only the
+    /// separator was, and only through the TARGET's `separator_role` — which
+    /// is a different value whenever `[target] separator` overrides it.
+    #[test]
+    fn a_different_source_pattern_changes_the_resume_scope() {
+        let target: rocky_core::config::PipelineTargetConfig = toml::from_str(
+            r#"
+adapter = "default"
+catalog_template = "wh"
+schema_template = "staging"
+"#,
+        )
+        .unwrap();
+        let adapter = test_duckdb_adapter(None);
+        let source = test_source_config();
+        let base = test_schema_pattern();
+
+        let scope = |pattern: &rocky_core::schema::SchemaPattern| {
+            replication_resume_scope(
+                "p1", &target, &adapter, None, None, "__", pattern, &source, None,
+            )
+        };
+
+        let mut other_prefix = base.clone();
+        other_prefix.prefix = format!("{}_v2", base.prefix);
+        assert_ne!(
+            scope(&base),
+            scope(&other_prefix),
+            "the prefix selects WHICH source schemas discovery sees"
+        );
+
+        let mut other_components = base.clone();
+        other_components
+            .components
+            .push(rocky_core::schema::PatternComponent::Variable {
+                name: "region".to_string(),
+            });
+        assert_ne!(
+            scope(&base),
+            scope(&other_components),
+            "the components name the captured values that render target names"
+        );
+    }
+
+    /// The counterpart, so the refusal is not simply "always". An unrelated
+    /// edit must leave the source half alone: two scopes built from the same
+    /// source and pattern are equal, whatever else the test varies.
+    #[test]
+    fn an_unchanged_source_leaves_the_source_scope_equal() {
+        let target: rocky_core::config::PipelineTargetConfig = toml::from_str(
+            r#"
+adapter = "default"
+catalog_template = "wh"
+schema_template = "staging"
+"#,
+        )
+        .unwrap();
+        let adapter = test_duckdb_adapter(None);
+        let pattern = test_schema_pattern();
+        let build = || {
+            replication_resume_scope(
+                "p1",
+                &target,
+                &adapter,
+                None,
+                None,
+                "__",
+                &pattern,
+                &test_source_config(),
+                None,
+            )
+        };
+        assert_eq!(
+            build().source,
+            build().source,
+            "the source half must be a function of the config, not of anything \
+             incidental to the call"
+        );
+    }
+
+    /// A `[source]` block for the resume-scope tests: one discovery adapter,
+    /// one catalog. Tests that vary the SOURCE half build their own.
+    fn test_source_config() -> rocky_core::config::PipelineSourceConfig {
+        rocky_core::config::PipelineSourceConfig {
+            adapter: "default".to_string(),
+            catalog: Some("src".to_string()),
+            schema_pattern: rocky_core::config::SchemaPatternConfig {
+                prefix: "src".to_string(),
+                separator: "__".to_string(),
+                components: vec!["tenant".to_string(), "source".to_string()],
+            },
+            discovery: Some(rocky_core::config::DiscoveryConfig {
+                adapter: "default".to_string(),
+                report_new_sources: false,
+                on_collision: rocky_core::config::OnCollision::Off,
+            }),
+        }
+    }
+
     /// The same scope, for a case that varies the source pattern instead of
     /// the target block.
     fn resume_scope_with_pattern(
@@ -14660,6 +14899,8 @@ max_retries = 0
             None,
             target.separator.as_deref().unwrap_or("__"),
             pattern,
+            &test_source_config(),
+            None,
         )
     }
 
@@ -14767,6 +15008,8 @@ token = "dapi-SECRET"
             Some(&branch_shadow),
             "__",
             &test_schema_pattern(),
+            &test_source_config(),
+            None,
         );
         assert_eq!(
             serde_json::to_value(&scope).unwrap(),
@@ -14792,6 +15035,20 @@ token = "dapi-SECRET"
                     },
                     "shadow": { "schema": "branch__feature" },
                 },
+                // The source half (#1583). It was absent, which is the
+                // whole defect: re-pointing `source.discovery.adapter`
+                // moved no field in this blob. `endpoint` is null only
+                // because this call passes no discovery adapter config;
+                // the run resolves one from the same adapter map the
+                // target came from.
+                "source": {
+                    "discovery_adapter": "default",
+                    "endpoint": null,
+                    "catalog": "src",
+                    "pattern_prefix": "src__",
+                    "pattern_separator": "__",
+                    "pattern_components": ["var:tenant", "varlen:regions", "term:source"],
+                },
             })
         );
         assert_eq!(
@@ -14800,7 +15057,9 @@ token = "dapi-SECRET"
                 "pipeline 'p1', filter 'client=acme', target default:wh.<overridden> \
                  separator(__) endpoint(databricks host=https://adb-1.azuredatabricks.net \
                  host_route_digest={DATABRICKS_ROUTE_DIGEST} \
-                 http_path=/sql/1.0/warehouses/abc) shadow(schema=branch__feature)"
+                 http_path=/sql/1.0/warehouses/abc) shadow(schema=branch__feature), \
+                 source default:src pattern(src____[var:tenant,varlen:regions,term:source]) \
+                 endpoint unrecorded"
             )
         );
 
@@ -14842,6 +15101,8 @@ token = "dapi-SECRET"
             Some(&branch_shadow),
             "--",
             &test_schema_pattern(),
+            &test_source_config(),
+            None,
         );
         assert_eq!(
             serde_json::to_value(&overridden).unwrap()["target"]["separator_role"],
@@ -14866,6 +15127,8 @@ token = "dapi-SECRET"
             Some(&suffix_shadow),
             "__",
             &test_schema_pattern(),
+            &test_source_config(),
+            None,
         );
         assert_eq!(
             serde_json::to_value(&shadowed).unwrap()["target"]["shadow"],
@@ -14944,6 +15207,8 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             Some(&real_shadow),
             "__",
             &test_schema_pattern(),
+            &test_source_config(),
+            None,
         );
         assert_eq!(
             serde_json::to_value(&genuine).unwrap()["target"]["separator_role"],
@@ -15632,6 +15897,8 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             Some(&real_shadow),
             "__",
             &test_schema_pattern(),
+            &test_source_config(),
+            None,
         );
         assert_eq!(forged.to_string(), genuine.to_string());
 
@@ -15678,10 +15945,18 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let scope_a = resume_scope_for_test("p1", &target, &gateway("a"));
         let scope_b = resume_scope_for_test("p1", &target, &gateway("b"));
         for rendered in [scope_a.to_string(), scope_b.to_string()] {
+            // The PATH is what must not leak, so the check names the path
+            // rather than the word "tenant". A bare substring test for that
+            // word also matched the schema pattern's component names, which
+            // the source half now renders (#1583) — it would have failed
+            // here for a reason that has nothing to do with a gateway route.
             assert!(
-                rendered.contains("host=https://gw.example.com:8443")
-                    && !rendered.contains("tenant"),
-                "the rendered scope must keep the path out of the message: {rendered}"
+                rendered.contains("host=https://gw.example.com:8443"),
+                "the rendered scope must still name the host: {rendered}"
+            );
+            assert!(
+                !rendered.contains("/tenant/"),
+                "the rendered scope must keep the gateway path out of the message: {rendered}"
             );
         }
         assert_ne!(scope_a, scope_b, "two gateway paths are two endpoints");
@@ -16064,6 +16339,8 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                 Some(&branch),
                 target.separator.as_deref().unwrap_or(&pattern.separator),
                 &pattern,
+                &test_source_config(),
+                None,
             )
         };
         // A source schema whose `regions` binds TWO values, so a separator
@@ -16206,6 +16483,8 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                 shadow,
                 target.separator.as_deref().unwrap_or(&pattern.separator),
                 &pattern,
+                &test_source_config(),
+                None,
             )
         };
         // A source schema whose `regions` binds TWO values, so a template
@@ -16370,6 +16649,8 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                 Some(&branch),
                 target.separator.as_deref().unwrap_or(&pattern.separator),
                 pattern,
+                &test_source_config(),
+                None,
             )
         };
         let written = scope(&source_pattern("__"));
@@ -17057,6 +17338,14 @@ auto_create_schemas = true
                     None,
                     target.separator.as_deref().unwrap_or(&pattern.separator),
                     &pattern,
+                    // The pipeline's own source, resolved the way the run
+                    // path resolves it (#1583).
+                    &replication.source,
+                    replication
+                        .source
+                        .discovery
+                        .as_ref()
+                        .and_then(|disc| loaded.config.adapters.get(&disc.adapter)),
                 );
                 let store = StateStore::open(&state_path).unwrap();
                 store
@@ -17145,6 +17434,16 @@ auto_create_schemas = true
                 Some(&branch),
                 target.separator.as_deref().unwrap_or(&pattern.separator),
                 &pattern,
+                // The pipeline's own source, resolved the way the run path
+                // resolves it (#1583): a fixture here would seed a scope the
+                // run never builds, and the lookup would miss for a reason
+                // that has nothing to do with what the test is about.
+                &replication.source,
+                replication
+                    .source
+                    .discovery
+                    .as_ref()
+                    .and_then(|disc| loaded.config.adapters.get(&disc.adapter)),
             );
             assert_eq!(
                 scope.target.as_ref().unwrap().schema_template,
@@ -17299,6 +17598,16 @@ auto_create_schemas = true
                 None,
                 target.separator.as_deref().unwrap_or(&pattern.separator),
                 &pattern,
+                // The pipeline's own source, resolved the way the run path
+                // resolves it (#1583): a fixture here would seed a scope the
+                // run never builds, and the lookup would miss for a reason
+                // that has nothing to do with what the test is about.
+                &replication.source,
+                replication
+                    .source
+                    .discovery
+                    .as_ref()
+                    .and_then(|disc| loaded.config.adapters.get(&disc.adapter)),
             );
             let store = StateStore::open(&state_path).unwrap();
             store
