@@ -505,6 +505,7 @@ async fn run_apply_run_plan(
         models_glob.as_deref(),
         state_path,
         &marker_freezes,
+        GateSubjects::CompiledModels,
     );
     apply_policy_gate(root, plan_id, gate)?;
 
@@ -1578,6 +1579,7 @@ pub fn evaluate_apply_policy_with_policy(
         None,
         state_path,
         marker_freezes,
+        GateSubjects::CompiledModels,
     )
 }
 
@@ -1591,6 +1593,7 @@ pub(crate) fn evaluate_apply_policy_with_policy_matching(
     models_glob: Option<&str>,
     state_path: &Path,
     marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
+    subjects: GateSubjects<'_>,
 ) -> PolicyGate {
     evaluate_apply_policy_with_policy_matching_dual(
         policy,
@@ -1602,6 +1605,7 @@ pub(crate) fn evaluate_apply_policy_with_policy_matching(
         state_path,
         marker_freezes,
         None,
+        subjects,
     )
 }
 
@@ -1674,6 +1678,7 @@ pub fn evaluate_apply_policy_with_extra_classifications(
         state_path,
         marker_freezes,
         Some(prior_classifications),
+        GateSubjects::CompiledModels,
     )
 }
 
@@ -1703,6 +1708,7 @@ fn evaluate_apply_policy_with_policy_matching_dual(
     state_path: &Path,
     marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
     prior_classifications: Option<&BTreeMap<String, Vec<String>>>,
+    subjects: GateSubjects<'_>,
 ) -> PolicyGate {
     let (policy, attrs_map) =
         match resolve_policy_and_attrs(policy, touched, models_dir, models_glob) {
@@ -1772,7 +1778,7 @@ fn evaluate_apply_policy_with_policy_matching_dual(
                     principal,
                     touched,
                     attrs,
-                    GateSubjects::CompiledModels,
+                    subjects,
                     &prior_decisions,
                     marker_freezes,
                     snapshot_unreadable,
@@ -1799,7 +1805,7 @@ fn evaluate_apply_policy_with_policy_matching_dual(
         principal,
         touched,
         eval_attrs,
-        GateSubjects::CompiledModels,
+        subjects,
         &prior_decisions,
         marker_freezes,
         snapshot_unreadable,
@@ -1953,7 +1959,7 @@ pub(crate) fn evaluate_apply_policy_with_store(
     models_glob: Option<&str>,
     ledger: &StateStore,
     marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
-    subjects: GateSubjects,
+    subjects: GateSubjects<'_>,
 ) -> PolicyGate {
     // Finding 1: takes the SAME `[policy]` snapshot `run` already holds (its L1212
     // `rocky_cfg`), not a reload — the in-run replication gate must evaluate the
@@ -2039,12 +2045,21 @@ pub(crate) fn resolve_policy_and_attrs(
 /// but it is not that model, and a consumer that read the row's `models` as
 /// a licence to sample would read the wrong thing (#1815).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum GateSubjects {
-    /// Keys are models of the compiled project (apply, promote, gc, restore,
-    /// the MCP propose gate).
+pub(crate) enum GateSubjects<'a> {
+    /// Every key is a model of the compiled project (run/apply, backfill, gc,
+    /// restore, the MCP propose gate) — or, for maintenance, was resolved to
+    /// one by a resolver that resolves every key matching a model's name, so
+    /// a verbatim key is never also a model name.
     CompiledModels,
     /// Keys are replication target table names, gated under bare `apply`.
     ReplicationTargets,
+    /// Only the keys in this set were resolved to compiled models; any other
+    /// key is a target string the caller kept verbatim because it could not
+    /// be mapped (promote: an FQN the current project no longer targets).
+    /// A verbatim FQN can equal a dotted model's name — `corp.prod.orders`
+    /// is a legal model name — and the attribute map would then hold it, so
+    /// membership there is not enough (#1815, review round four).
+    Resolved(&'a BTreeSet<String>),
 }
 
 /// The per-model evaluation loop shared by [`evaluate_apply_policy`] and
@@ -2058,7 +2073,7 @@ pub(crate) fn evaluate_apply_policy_core(
     principal: PolicyPrincipal,
     touched: &BTreeMap<String, PolicyCapability>,
     attrs_map: &BTreeMap<String, ModelAttributes>,
-    subjects: GateSubjects,
+    subjects: GateSubjects<'_>,
     prior_decisions: &[PolicyDecisionRecord],
     // The projected durable freeze-marker set, hoisted at the async command
     // entry. OR-ed with the ledger freeze projection inside
@@ -2087,6 +2102,9 @@ pub(crate) fn evaluate_apply_policy_core(
         let compiled_model = match subjects {
             GateSubjects::CompiledModels => attrs_map.contains_key(model),
             GateSubjects::ReplicationTargets => false,
+            GateSubjects::Resolved(resolved) => {
+                resolved.contains(model) && attrs_map.contains_key(model)
+            }
         };
         let attrs = match attrs_map.get(model) {
             Some(a) => a,
@@ -2312,7 +2330,7 @@ fn touched_models_for_promote(
     promote: &PromotePlan,
     models_dir: &Path,
     models_glob: Option<&str>,
-) -> BTreeMap<String, PolicyCapability> {
+) -> (BTreeMap<String, PolicyCapability>, BTreeSet<String>) {
     // The full executable target set: every SQL target plus every target a
     // finding named (a finding target may, in principle, not appear in
     // `targets` — union both so nothing escapes).
@@ -2324,18 +2342,29 @@ fn touched_models_for_promote(
         }
     }
     if target_fqns.is_empty() {
-        return BTreeMap::new();
+        return (BTreeMap::new(), BTreeSet::new());
     }
     let target_to_name = compile_target_to_name(models_dir, models_glob);
-    target_fqns
+    // The keys this function RESOLVED to a model, as distinct from the FQNs
+    // it kept verbatim. A verbatim FQN can spell a dotted model's name, and
+    // the gate must not record it as that model's key (#1815, round four).
+    let mut resolved = BTreeSet::new();
+    let touched = target_fqns
         .into_iter()
         .map(|fqn| {
             // Map FQN → logical name so a name-scoped rule matches; fail-closed
             // to the FQN when unmappable rather than dropping the target.
-            let name = target_to_name.get(&fqn).cloned().unwrap_or(fqn);
+            let name = match target_to_name.get(&fqn) {
+                Some(name) => {
+                    resolved.insert(name.clone());
+                    name.clone()
+                }
+                None => fqn,
+            };
             (name, PolicyCapability::Promote)
         })
-        .collect()
+        .collect();
+    (touched, resolved)
 }
 
 /// Canonical, process-stable fingerprint of the **compiled-IR projection** that
@@ -3015,7 +3044,7 @@ pub(crate) fn gate_promote_plan(
     );
     let promote_models_dir = resolve_confined_config_models_dir(config_path, Some(&loaded.config))?;
     let promote_models_glob = resolve_config_models_glob(config_path, Some(&loaded.config));
-    let touched = touched_models_for_promote(
+    let (touched, resolved) = touched_models_for_promote(
         promote_plan,
         &promote_models_dir,
         promote_models_glob.as_deref(),
@@ -3038,6 +3067,7 @@ pub(crate) fn gate_promote_plan(
         promote_models_glob.as_deref(),
         state_path,
         &marker_freezes,
+        GateSubjects::Resolved(&resolved),
     );
     apply_policy_gate(root, plan_id, gate)?;
     Ok(loaded)
@@ -3292,6 +3322,9 @@ pub(crate) async fn gate_maintenance_apply(
         models_glob.as_deref(),
         state_path,
         &marker_freezes,
+        // Every key the maintenance resolver leaves is either a model it
+        // resolved or a string no model is named — see `GateSubjects`.
+        GateSubjects::CompiledModels,
     );
     apply_policy_gate(root, plan_id, gate)
 }
@@ -3622,6 +3655,7 @@ async fn run_apply_ai_authored_plan(
         models_glob.as_deref(),
         state_path,
         &marker_freezes,
+        GateSubjects::CompiledModels,
     );
     // #1459: human review is a FLOOR for an AI-authored plan, not a
     // policy-dependent extra. This used to run only under
@@ -7299,7 +7333,8 @@ effect = "allow"
         };
         // Empty models_dir → nothing compiles; the fail-closed path must still
         // gate the plan's SQL target.
-        let touched = super::touched_models_for_promote(&promote, Path::new("/nonexistent"), None);
+        let (touched, _) =
+            super::touched_models_for_promote(&promote, Path::new("/nonexistent"), None);
         assert_eq!(
             touched.get("cat.prod.orders"),
             Some(&PolicyCapability::Promote),
@@ -7335,7 +7370,8 @@ effect = "allow"
         };
         // No compilable project → target_to_name is empty → the fail-closed
         // path keeps the changed target under its own name.
-        let touched = super::touched_models_for_promote(&promote, Path::new("/nonexistent"), None);
+        let (touched, _) =
+            super::touched_models_for_promote(&promote, Path::new("/nonexistent"), None);
         assert_eq!(
             touched.get("cat.prod.orders"),
             Some(&PolicyCapability::Promote),
@@ -7361,7 +7397,9 @@ effect = "allow"
             created_at: chrono::Utc::now(),
         };
         assert!(
-            super::touched_models_for_promote(&promote, Path::new("/nonexistent"), None).is_empty()
+            super::touched_models_for_promote(&promote, Path::new("/nonexistent"), None)
+                .0
+                .is_empty()
         );
     }
 
@@ -7409,7 +7447,7 @@ effect = "allow"
             plan_audit: vec![],
             created_at: chrono::Utc::now(),
         };
-        let touched = super::touched_models_for_promote(&promote, &models_dir, None);
+        let (touched, _) = super::touched_models_for_promote(&promote, &models_dir, None);
         // Both targets — mapped to their logical names — are gated, even though
         // only `orders` produced a finding.
         assert_eq!(touched.get("orders"), Some(&PolicyCapability::Promote));
@@ -7447,7 +7485,7 @@ effect = "allow"
             plan_audit: vec![],
             created_at: chrono::Utc::now(),
         };
-        let touched = super::touched_models_for_promote(&promote, &models_dir, None);
+        let (touched, resolved) = super::touched_models_for_promote(&promote, &models_dir, None);
         assert!(
             touched.contains_key("orders"),
             "the FQN must map to the logical name 'orders': {touched:?}"
@@ -7456,6 +7494,90 @@ effect = "allow"
             !touched.contains_key("c.s.orders"),
             "the FQN must not remain when it is mappable: {touched:?}"
         );
+        assert!(
+            resolved.contains("orders"),
+            "and the resolver says so: {resolved:?}"
+        );
+    }
+
+    /// A promote target the current project no longer maps is kept verbatim
+    /// (fail-closed, D5) — and a verbatim FQN can spell a dotted model's
+    /// NAME. `corp.prod.orders` is a legal model name, so the attribute map
+    /// holds it and the gate's string test would call the target that model,
+    /// record its key, and let the review screen sample an unrelated model
+    /// beside a promote that overwrites a different table (#1815, review
+    /// round four). The resolver says which keys it resolved; the gate
+    /// records a key for those alone. Passing `CompiledModels` here instead
+    /// of `Resolved` makes this fail.
+    #[test]
+    fn promote_records_no_model_key_for_a_verbatim_target_that_spells_a_model_name()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(dir.path(), "")?;
+        let models_dir = dir.path().join("models");
+        write_min_model(&models_dir, "orders"); // FQN c.s.orders
+        write_min_model(&models_dir, "corp.prod.orders"); // a dotted NAME
+        let state = dir.path().join("state.redb");
+
+        let promote = crate::output::PromotePlan {
+            branch_name: "fix".to_string(),
+            base_ref: "main".to_string(),
+            head_ref: "abc".to_string(),
+            branch_state_hash: "h".to_string(),
+            approvals_used: vec![],
+            approvals_rejected: vec![],
+            breaking_changes: None,
+            allow_breaking: false,
+            targets: vec![
+                // Mappable: the model `orders` targets it.
+                crate::output::PromoteTargetPlan {
+                    target: "c.s.orders".to_string(),
+                    source: "c.b.orders".to_string(),
+                    statement: "CREATE OR REPLACE ...".to_string(),
+                },
+                // Unmappable: no model targets this FQN any more, but a model
+                // is NAMED this.
+                crate::output::PromoteTargetPlan {
+                    target: "corp.prod.orders".to_string(),
+                    source: "corp.branch.orders".to_string(),
+                    statement: "CREATE OR REPLACE ...".to_string(),
+                },
+            ],
+            plan_audit: vec![],
+            created_at: chrono::Utc::now(),
+        };
+        let (touched, resolved) = super::touched_models_for_promote(&promote, &models_dir, None);
+        assert!(touched.contains_key("orders") && touched.contains_key("corp.prod.orders"));
+        assert!(resolved.contains("orders") && !resolved.contains("corp.prod.orders"));
+
+        let loaded = rocky_core::config::load_rocky_config(&config)?;
+        let _gate = super::evaluate_apply_policy_with_policy_matching(
+            loaded.policy.as_ref(),
+            "plan_p",
+            PolicyPrincipal::Agent,
+            &touched,
+            &models_dir,
+            None,
+            &state,
+            &[],
+            super::GateSubjects::Resolved(&resolved),
+        );
+        let rows = StateStore::open(&state)?.list_policy_decisions()?;
+        let row = |model: &str| {
+            rows.iter()
+                .find(|r| r.plan_id == "plan_p" && r.model == model)
+                .unwrap_or_else(|| panic!("a row for {model}"))
+        };
+        assert_eq!(
+            row("orders").models,
+            vec!["orders".to_string()],
+            "resolved: its key"
+        );
+        assert!(
+            row("corp.prod.orders").models.is_empty(),
+            "verbatim: no key, whatever a model happens to be named"
+        );
+        Ok(())
     }
 
     /// `resolve_config_models_dir` reads the transformation pipeline's `models`
