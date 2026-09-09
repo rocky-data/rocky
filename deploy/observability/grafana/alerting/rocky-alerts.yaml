@@ -159,6 +159,53 @@ groups:
                     type: gt
                     params: [0]
 
+      # The webhook spool scan keeps failing: a tick whose scan fails reconciles
+      # its configured schedules but consumes no webhook demand, and says so
+      # with its own outcome (#1812). A rate over a window, so ticks whose scan
+      # succeeds can sit between the failing ones. A separate rule from
+      # tick-errors on purpose: cron / after / freshness work may still be
+      # running, so the message must not claim the loop is doing nothing. Same
+      # window and `for` as tick-errors.
+      - uid: rocky-scheduler-spool-unreadable
+        title: Rocky scheduler cannot read its webhook spool
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: critical
+        annotations:
+          summary: "The Rocky scheduler has repeatedly failed to read its webhook spool; spooled webhook demands may be going unconsumed and new deliveries may fail."
+          description: "rocky.scheduler.ticks with outcome=spool_unreadable has been non-zero over every 2-minute window for 5 minutes: the scheduler's scan of .rocky/pending-demands keeps failing. Usually something is at that path that cannot be read (a dangling symlink, a permissions change); a scan can also fail for a reason unrelated to the path (descriptor exhaustion), so read the error the scheduler log names. A tick whose scan fails consumes no spooled demand; a tick in between whose scan succeeds may. A delivery made while scans are failing may be answered HTTP 500 by the webhook endpoint: that answer means its persistence is UNCERTAIN, not that nothing was written. If the original request carried a non-empty, valid X-Rocky-Delivery, retry with that exact id (deduplicated for 24 hours); a request without one, or with an empty or invalid value, is at-least-once and a retry can run the demand twice. Scheduled (cron, after, freshness) work may still be running. Fix the cause the log names; webhook consumption resumes on a later tick, and any one spooled demand can still be deferred by the reconciler's own gates."
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              refId: A
+              editorMode: code
+              expr: sum(rate(rocky_scheduler_ticks{outcome="spool_unreadable"}[2m]))
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - type: query
+                  evaluator:
+                    type: gt
+                    params: [0]
+
       # A scheduled pipeline has failed 3 or more times in a row. gt [2] on an
       # integer gauge is "3 or more".
       - uid: rocky-scheduler-consecutive-failures
