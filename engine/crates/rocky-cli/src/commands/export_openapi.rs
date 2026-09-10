@@ -1285,12 +1285,28 @@ fn route_table() -> Vec<Route> {
             query_params: &[],
             header_params: &[],
             request_body: None,
-            responses: &[Resp {
-                status: "200",
-                description: "The running server's posture. Never fails: every value was \
-                     resolved at startup.",
-                body: Body::Component("SettingsOutput"),
-            }],
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The running server's posture.",
+                    body: Body::Component("SettingsOutput"),
+                },
+                Resp {
+                    status: "503",
+                    description: "The one `rocky.toml` read this route needs is already in \
+                         flight, or did not finish inside its deadline. Every other value \
+                         was resolved at startup; only `state_backend` and \
+                         `concurrency_control` need the file. Retry.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                Resp {
+                    status: "500",
+                    description: "That config read panicked. Distinct from \
+                         `config_status: unreadable`, which means the file WAS read and \
+                         would not parse.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+            ],
             auth_exempt: false,
         },
         Route {
