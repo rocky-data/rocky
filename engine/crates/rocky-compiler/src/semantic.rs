@@ -746,6 +746,49 @@ mod tests {
         );
     }
 
+    /// #1892's consequence here, stated as a test rather than left implicit.
+    ///
+    /// Removing the invented CTE edge removes the thing `reader_depends_on_it`
+    /// above consults, so a `SELECT *` over a CTE named after a model stops
+    /// taking that model's columns. It falls through to `source_schemas`,
+    /// which is the same fall-through an external table of that name gets.
+    ///
+    /// This is a behaviour change, and it replaces a WRONG answer rather than
+    /// a right one: the CTE's own columns are what the query returns, and the
+    /// model's columns were never that. Resolving the star to the CTE body is
+    /// the further fix, and it needs `lineage.rs` to carry those columns —
+    /// #1867's half of the work.
+    #[test]
+    fn a_star_over_a_cte_no_longer_takes_the_shadowed_models_columns() {
+        let models = vec![
+            make_model("orders", "SELECT id, model_only_col FROM source.raw.o"),
+            make_model(
+                "zreader",
+                "WITH orders AS (SELECT 1 AS cte_only_col) SELECT * FROM orders",
+            ),
+        ];
+
+        let project = Project::from_models(models).unwrap();
+        let reader_deps = project
+            .dag_nodes
+            .iter()
+            .find(|n| n.name == "zreader")
+            .map(|n| n.depends_on.clone())
+            .unwrap_or_default();
+        assert!(
+            reader_deps.is_empty(),
+            "the CTE shadows the model, so no edge is derived: {reader_deps:?}"
+        );
+
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let reader = graph.model_schema("zreader").unwrap();
+        let names: Vec<&str> = reader.columns.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            !names.contains(&"model_only_col"),
+            "the shadowed model's columns are not what the query returns: {names:?}"
+        );
+    }
+
     /// The expansion must not depend on which model the topological walk
     /// reaches first.
     ///
