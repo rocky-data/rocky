@@ -57,6 +57,27 @@ pub enum PipesCheckSeverity {
     Error,
 }
 
+/// Carry the check's CONFIGURED severity onto the Pipes wire (#1784).
+///
+/// Every check used to be reported as `ERROR`, so `severity = "warning"` — a
+/// check the operator deliberately marked advisory — degraded asset health in
+/// Dagster and could page an `ASSET_HEALTH_DEGRADED` alert. The streaming path
+/// already honours the setting (`dagster_check_severity` in
+/// `dagster_rocky/component.py`); this is the same question answered on the
+/// other execution path, so the two agree.
+///
+/// Written as an exhaustive `match` rather than a catch-all, deliberately. A
+/// third variant on either enum is then a compile error at this one place
+/// instead of being folded silently into whichever arm the wildcard picked.
+impl From<rocky_core::tests::TestSeverity> for PipesCheckSeverity {
+    fn from(severity: rocky_core::tests::TestSeverity) -> Self {
+        match severity {
+            rocky_core::tests::TestSeverity::Error => PipesCheckSeverity::Error,
+            rocky_core::tests::TestSeverity::Warning => PipesCheckSeverity::Warn,
+        }
+    }
+}
+
 /// Active Dagster Pipes emitter — wraps a file handle (or other
 /// channel) and writes one JSON-line message per call.
 ///
