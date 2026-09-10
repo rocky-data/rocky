@@ -83,6 +83,7 @@ _COMMAND_SCHEMA: dict[str, str] = {
     "plan": "plan.schema.json",
     "state": "state.schema.json",
     "state-clear-schema-cache": "state_clear_schema_cache.schema.json",
+    "state-schedule-spool": "schedule_spool.schema.json",
     "compile": "compile.schema.json",
     "test": "test.schema.json",
     "ci": "ci.schema.json",
