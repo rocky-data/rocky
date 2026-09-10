@@ -239,7 +239,9 @@ async fn resume_refuses_indeterminate_remote_state() {
     let store = rocky_core::state::StateStore::open(&project.state_path).unwrap();
     // Scope is irrelevant here: the authority gate refuses before the
     // checkpoint's scope is ever inspected.
-    store.init_run_progress("stale-run", 1, None).unwrap();
+    store
+        .init_run_progress("stale-run", &["wh.raw.orders".to_string()], None)
+        .unwrap();
     drop(store);
 
     harness.faults.arm(FaultOp::Head, FaultMode::FailAll);

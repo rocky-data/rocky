@@ -25,7 +25,7 @@ const CHECK_HISTORY: TableDefinition<&str, &[u8]> = TableDefinition::new("check_
 const RUN_HISTORY: TableDefinition<&str, &[u8]> = TableDefinition::new("run_history");
 const QUALITY_HISTORY: TableDefinition<&str, &[u8]> = TableDefinition::new("quality_history");
 const DAG_SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("dag_snapshots");
-/// Per-run progress *header* (run_id / started_at / total_tables).
+/// Per-run progress *header* (run_id / started_at / the planned table set).
 ///
 /// Key: `run_id`. Value: serialized [`RunProgress`] whose `tables` vector is
 /// left empty by the current write path — the per-table entries live in
@@ -448,7 +448,7 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   table's progress is an O(1) blind insert under a per-entry key
 ///   instead of a read-modify-write of one growing blob. The legacy
 ///   [`RUN_PROGRESS`] table is retained as the per-run header (run_id /
-///   started_at / total_tables); reads stitch the header together with
+///   started_at / the planned table set); reads stitch the header together with
 ///   the per-entry rows. Pure additive schema change: v7 databases
 ///   auto-create the empty table on next open and stamp themselves as v8.
 ///   A v7-recorded run with entries still in the header blob continues to
@@ -836,7 +836,33 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   kept, reading back with the flag `false` — "unknown", the only honest
 ///   reading of a row that never said. **On rollback.** One extra key,
 ///   ignored; the version check at OPEN engages `[state] on_schema_mismatch`.
-const CURRENT_SCHEMA_VERSION: u32 = 29;
+///
+/// - **v30** — records WHICH tables a run planned to copy, not only how many:
+///   a new serde-additive [`RunProgress::planned_tables`] set. Not a table
+///   change — the redb table set is unchanged (`EXPECTED_TABLES` is
+///   untouched); no blob walk. A v29 blob (which lacks the field) forward-
+///   deserializes with it `None`, guarded by
+///   `test_v29_run_progress_forward_deserializes_planned_tables_none`.
+///
+///   **What it fixes (#1674).** The resume gate decided "every planned table
+///   copied" by counting `Success` entries against `total_tables`. A count
+///   stands in for the planned SET only while every recorded key comes from
+///   that plan, and nothing enforced that — the checkpoint had no way to say
+///   what the plan was. A checkpoint holding `Success(a)` and `Success(x)`
+///   against a plan of `{a, b}` had the right count and the wrong set, so a
+///   resume that still owed `b` was refused. The set makes completeness a
+///   comparison the checkpoint can prove.
+///
+///   **On upgrade.** A v29 store is stamped v30 in place and every existing
+///   checkpoint is kept, reading back with the set `None` — "this run never
+///   said" — and a resume of one falls back to the count, which is exactly
+///   what shipped before. Unlike the scopeless case (#1549), absence here is
+///   NOT refused: a scopeless checkpoint cannot prove which pipeline it
+///   belongs to, while a planless one is only as good as today's binary.
+///
+///   **On rollback.** One extra key, ignored by serde; the version check runs
+///   at OPEN and `[state] on_schema_mismatch` engages there.
+const CURRENT_SCHEMA_VERSION: u32 = 30;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -3036,6 +3062,14 @@ pub struct RunProgress {
     /// `None` so a scopeless record's bytes stay identical to pre-v23.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<ResumeScope>,
+    /// The table keys this invocation planned to copy, in plan order (#1674).
+    /// `None` only on checkpoints recorded before schema v30 (and on test
+    /// fixtures that simulate them) — a resume of one of those falls back to
+    /// comparing counts, which is what shipped before this field existed.
+    /// Omitted from the blob when `None` so a planless record's bytes stay
+    /// identical to pre-v30.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_tables: Option<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3531,7 +3565,12 @@ impl StateStore {
     // Checkpoint / resume
     // -----------------------------------------------------------------------
 
-    /// Initialize run progress with total table count.
+    /// Initialize run progress from the table keys this run plans to copy.
+    ///
+    /// The plan is recorded as a SET, not only a count (#1674): `total_tables`
+    /// is derived from `planned_tables` here, so the two cannot disagree and a
+    /// resume can ask "is every planned table present and `Success`?" rather
+    /// than trusting that every recorded key came from the plan.
     ///
     /// `scope` stamps the checkpoint with the pipeline identity that wrote it
     /// (#1549); every production caller passes `Some`. `None` reproduces the
@@ -3540,15 +3579,16 @@ impl StateStore {
     pub fn init_run_progress(
         &self,
         run_id: &str,
-        total_tables: usize,
+        planned_tables: &[String],
         scope: Option<&ResumeScope>,
     ) -> Result<(), StateError> {
         let progress = RunProgress {
             run_id: run_id.to_string(),
             started_at: chrono::Utc::now(),
-            total_tables,
+            total_tables: planned_tables.len(),
             tables: Vec::new(),
             scope: scope.cloned(),
+            planned_tables: Some(planned_tables.to_vec()),
         };
         let bytes = serde_json::to_vec(&progress)?;
         let txn = self.db.begin_write()?;
@@ -7013,6 +7053,12 @@ mod tests {
 
     use super::*;
 
+    /// `n` synthetic planned table keys, for storage-level tests that care
+    /// about the header's count rather than the identities in it.
+    fn planned_keys(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("cat.schema.t{i}")).collect()
+    }
+
     // ---- `[cache.schemas] replicate` table sets (#1620) ----
 
     /// The default posture returns the pre-existing list, IDENTICALLY. This is
@@ -9524,7 +9570,9 @@ mod tests {
     #[test]
     fn test_init_and_get_run_progress() {
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-001", 50, None).unwrap();
+        store
+            .init_run_progress("run-001", &planned_keys(50), None)
+            .unwrap();
 
         let progress = store.get_run_progress("run-001").unwrap().unwrap();
         assert_eq!(progress.run_id, "run-001");
@@ -9542,7 +9590,9 @@ mod tests {
     #[test]
     fn test_record_table_progress() {
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-001", 3, None).unwrap();
+        store
+            .init_run_progress("run-001", &planned_keys(3), None)
+            .unwrap();
 
         let p1 = TableProgress {
             index: 0,
@@ -9592,10 +9642,14 @@ mod tests {
         let (store, _dir) = temp_store();
 
         // Create two runs with a small time gap to ensure ordering
-        store.init_run_progress("run-001", 10, None).unwrap();
+        store
+            .init_run_progress("run-001", &planned_keys(10), None)
+            .unwrap();
         // Force a slightly later timestamp for the second run
         std::thread::sleep(std::time::Duration::from_millis(10));
-        store.init_run_progress("run-002", 20, None).unwrap();
+        store
+            .init_run_progress("run-002", &planned_keys(20), None)
+            .unwrap();
 
         let latest = store.get_latest_run_progress().unwrap().unwrap();
         assert_eq!(latest.run_id, "run-002");
@@ -9639,11 +9693,17 @@ mod tests {
         let p1 = progress_scope("p1");
         let p2 = progress_scope("p2");
 
-        store.init_run_progress("run-p1-old", 1, Some(&p1)).unwrap();
+        store
+            .init_run_progress("run-p1-old", &planned_keys(1), Some(&p1))
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        store.init_run_progress("run-p1-new", 2, Some(&p1)).unwrap();
+        store
+            .init_run_progress("run-p1-new", &planned_keys(2), Some(&p1))
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        store.init_run_progress("run-p2", 3, Some(&p2)).unwrap();
+        store
+            .init_run_progress("run-p2", &planned_keys(3), Some(&p2))
+            .unwrap();
 
         // p2's newer checkpoint must not shadow p1's own latest.
         let latest = store
@@ -9680,12 +9740,16 @@ mod tests {
         let (store, _dir) = temp_store();
         let p1 = progress_scope("p1");
 
-        store.init_run_progress("run-p1", 1, Some(&p1)).unwrap();
+        store
+            .init_run_progress("run-p1", &planned_keys(1), Some(&p1))
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
         // A pre-v23 checkpoint carries no scope. It cannot be attributed to
         // any pipeline, so it cannot be ruled out — it stays a candidate and
         // the caller decides (the CLI refuses it, fail-closed).
-        store.init_run_progress("run-legacy", 1, None).unwrap();
+        store
+            .init_run_progress("run-legacy", &planned_keys(1), None)
+            .unwrap();
 
         let latest = store
             .get_latest_run_progress_for_scope(&p1)
@@ -9699,12 +9763,72 @@ mod tests {
     fn test_get_latest_run_progress_for_scope_empty_when_nothing_matches() {
         let (store, _dir) = temp_store();
         store
-            .init_run_progress("run-p2", 1, Some(&progress_scope("p2")))
+            .init_run_progress("run-p2", &planned_keys(1), Some(&progress_scope("p2")))
             .unwrap();
         let latest = store
             .get_latest_run_progress_for_scope(&progress_scope("p1"))
             .unwrap();
         assert!(latest.is_none());
+    }
+
+    /// A v29 `RunProgress` blob (no `planned_tables` key) must forward-
+    /// deserialize with the set `None`, and a planless record must serialize
+    /// without the key — byte-identical to the pre-v30 shape. See the v30
+    /// stanza on `CURRENT_SCHEMA_VERSION`.
+    ///
+    /// The absent set is NOT refused, unlike the absent scope above: a
+    /// scopeless checkpoint cannot prove which pipeline it belongs to, while a
+    /// planless one is only as good as the binary that wrote it, and the
+    /// resume gate falls back to the count it already used.
+    #[test]
+    fn test_v29_run_progress_forward_deserializes_planned_tables_none() {
+        let blob = serde_json::json!({
+            "run_id": "run-v29",
+            "started_at": "2026-09-01T00:00:00Z",
+            "total_tables": 2,
+            "tables": [],
+        });
+        let progress: RunProgress =
+            serde_json::from_value(blob).expect("pre-v30 RunProgress must forward-deserialize");
+        assert!(
+            progress.planned_tables.is_none(),
+            "pre-v30 record names no planned set"
+        );
+        assert_eq!(progress.total_tables, 2, "its count is still readable");
+
+        let bytes = serde_json::to_string(&progress).unwrap();
+        assert!(
+            !bytes.contains("planned_tables"),
+            "a planless record must not grow the key: {bytes}"
+        );
+
+        let planned = RunProgress {
+            planned_tables: Some(vec!["cat.schema.a".to_string(), "cat.schema.b".to_string()]),
+            ..progress
+        };
+        let round_trip: RunProgress =
+            serde_json::from_str(&serde_json::to_string(&planned).unwrap()).unwrap();
+        assert_eq!(
+            round_trip.planned_tables.as_deref(),
+            Some(["cat.schema.a".to_string(), "cat.schema.b".to_string()].as_slice()),
+            "the set round-trips in plan order"
+        );
+    }
+
+    /// `init_run_progress` derives the count from the set, so the two cannot
+    /// disagree on a checkpoint this build writes (#1674).
+    #[test]
+    fn test_init_run_progress_records_the_plan_as_a_set() {
+        let (store, _dir) = temp_store();
+        let planned = vec![
+            "cat.schema.orders".to_string(),
+            "cat.schema.items".to_string(),
+        ];
+        store.init_run_progress("run-001", &planned, None).unwrap();
+
+        let progress = store.get_run_progress("run-001").unwrap().unwrap();
+        assert_eq!(progress.planned_tables.as_deref(), Some(planned.as_slice()));
+        assert_eq!(progress.total_tables, planned.len());
     }
 
     /// A v22 `RunProgress` blob (no `scope` key) must forward-deserialize
@@ -9978,7 +10102,9 @@ mod tests {
     #[test]
     fn test_resume_filters_completed() {
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-001", 5, None).unwrap();
+        store
+            .init_run_progress("run-001", &planned_keys(5), None)
+            .unwrap();
 
         // Simulate: 3 succeeded, 1 failed, 1 never reached
         for (i, (key, status)) in [
@@ -10047,7 +10173,9 @@ mod tests {
         // Each recorded table is a single per-entry row; the header blob's
         // `tables` vector is NOT grown. Reads stitch the two together.
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-001", 3, None).unwrap();
+        store
+            .init_run_progress("run-001", &planned_keys(3), None)
+            .unwrap();
 
         // Header still has no inline entries.
         {
@@ -10096,7 +10224,9 @@ mod tests {
         // Insert out of index order; read must sort by execution index, not
         // by the lexical entry key.
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-001", 3, None).unwrap();
+        store
+            .init_run_progress("run-001", &planned_keys(3), None)
+            .unwrap();
         store
             .record_table_progress(
                 "run-001",
@@ -10130,7 +10260,9 @@ mod tests {
         // Re-recording the same table (interrupted -> final) overwrites the
         // one row rather than appending a duplicate.
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-001", 1, None).unwrap();
+        store
+            .init_run_progress("run-001", &planned_keys(1), None)
+            .unwrap();
         store
             .record_table_progress(
                 "run-001",
@@ -10154,8 +10286,12 @@ mod tests {
         // "run-1" and "run-12" share a "run-1" lexical prefix but the trailing
         // "|" separator keeps their entries isolated.
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-1", 1, None).unwrap();
-        store.init_run_progress("run-12", 1, None).unwrap();
+        store
+            .init_run_progress("run-1", &planned_keys(1), None)
+            .unwrap();
+        store
+            .init_run_progress("run-12", &planned_keys(1), None)
+            .unwrap();
         store
             .record_table_progress(
                 "run-1",
@@ -10183,9 +10319,13 @@ mod tests {
         // --resume-latest reads `.tables` off the latest run; the latest header
         // must come back with its per-entry rows stitched in.
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-001", 2, None).unwrap();
+        store
+            .init_run_progress("run-001", &planned_keys(2), None)
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        store.init_run_progress("run-002", 2, None).unwrap();
+        store
+            .init_run_progress("run-002", &planned_keys(2), None)
+            .unwrap();
 
         store
             .record_table_progress(
@@ -10221,6 +10361,7 @@ mod tests {
                 progress_entry(1, "cat.sch.y", TableStatus::Failed),
             ],
             scope: None,
+            planned_tables: None,
         };
         let bytes = serde_json::to_vec(&legacy).unwrap();
         {
@@ -11615,7 +11756,9 @@ mod tests {
             ("recent", chrono::Duration::days(1)),
         ] {
             store.record_run(&run_at(run_id, now - age)).unwrap();
-            store.init_run_progress(run_id, 2, Some(&scope)).unwrap();
+            store
+                .init_run_progress(run_id, &planned_keys(2), Some(&scope))
+                .unwrap();
             for (index, key) in ["cat.sch.a", "cat.sch.b"].iter().enumerate() {
                 store
                     .record_table_progress(
@@ -11625,7 +11768,9 @@ mod tests {
                     .unwrap();
             }
         }
-        store.init_run_progress("crashed", 1, Some(&scope)).unwrap();
+        store
+            .init_run_progress("crashed", &planned_keys(1), Some(&scope))
+            .unwrap();
         store
             .record_table_progress(
                 "crashed",
@@ -13054,7 +13199,7 @@ mod tests {
         // serde-additive shape. NO table change either — so this stanza moves
         // the version only; guarded by
         // `test_v25_run_record_forward_deserializes_verify_after_failed_false`.
-        const EXPECTED_VERSION: u32 = 29;
+        const EXPECTED_VERSION: u32 = 30;
         // v28 adds `PolicyDecisionRecord::models` (#1766), the graph keys
         // behind a plan-level review escalation's human label. The same
         // serde-additive shape as v25-v27: NO table change — `EXPECTED_TABLES`
@@ -13065,6 +13210,10 @@ mod tests {
         // that set was the producer's word. Same serde-additive shape: NO
         // table change, the version moves only; guarded by
         // `test_v28_policy_decision_forward_deserializes_keys_recorded_false`.
+        // v30 adds `RunProgress::planned_tables` (#1674), the table keys a run
+        // planned to copy. Same serde-additive shape: NO table change, the
+        // version moves only; guarded by
+        // `test_v29_run_progress_forward_deserializes_planned_tables_none`.
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",
