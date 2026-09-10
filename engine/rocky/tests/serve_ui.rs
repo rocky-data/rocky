@@ -276,7 +276,11 @@ fn only_a_transformation_node_is_servable_and_only_under_its_label() {
         // enum, so a string it does not name will not deserialize.
         let kind: NodeKind = serde_json::from_value(node["kind"].clone())
             .unwrap_or_else(|e| panic!("unclassified node kind {}: {e}", node["kind"]));
-        kinds_seen.insert(node["kind"].as_str().expect("a kind string").to_string());
+        kinds_seen.insert((
+            node["kind"].as_str().expect("a kind string").to_string(),
+            id.to_string(),
+            label.to_string(),
+        ));
 
         let (label_status, _, label_body) = http_get(
             port,
@@ -312,25 +316,30 @@ fn only_a_transformation_node_is_servable_and_only_under_its_label() {
         vec!["customer_orders", "raw_orders", "revenue_summary"],
         "the playground's three models, each under its bare label"
     );
-    // Without several kinds the loop above proves only one branch. The set is
-    // read from the fixture the SPA's own tests run against, not written out
-    // here, so the two cannot drift apart: a live server that stops emitting a
-    // kind the fixture carries, or starts emitting one it does not, fails here
-    // rather than leaving the SPA asserting against a stale capture.
+    // Without several kinds the loop above proves only one branch, and the set
+    // is read from the fixture the SPA's own tests run against rather than
+    // written out here, so the two cannot drift apart unnoticed.
+    //
+    // Every node is compared by kind, id AND label, not by kind alone. A kind
+    // set would still match after a node was added, removed or renamed, which
+    // is most of what a stale capture looks like. What is deliberately NOT
+    // compared is the rest of the payload — edges, targets, the engine version
+    // string — because that is release churn, not drift the SPA can see. What
+    // the SPA reads from this fixture is exactly these three fields.
     assert_eq!(
         kinds_seen,
-        kinds_in_ui_fixture(),
+        nodes_in_ui_fixture(),
         "the live DAG and engine/ui/src/test/fixtures/dag-mixed-kinds.json \
-         disagree about which node kinds exist; recapture the fixture (its \
-         README says how) or fix the project this test builds"
+         disagree about their nodes (kind, id, label); recapture the fixture \
+         (its README says how) or fix the project this test builds"
     );
 }
 
-/// The node kinds in the capture the SPA's tests read.
+/// Every node in the capture the SPA's tests read, as (kind, id, label).
 ///
 /// The fixture is recorded by hand from a real `rocky serve` — no script
 /// regenerates it — so nothing but this comparison keeps it honest.
-fn kinds_in_ui_fixture() -> std::collections::BTreeSet<String> {
+fn nodes_in_ui_fixture() -> std::collections::BTreeSet<(String, String, String)> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../ui/src/test/fixtures/dag-mixed-kinds.json");
     let raw =
@@ -341,10 +350,13 @@ fn kinds_in_ui_fixture() -> std::collections::BTreeSet<String> {
         .expect("the fixture has nodes")
         .iter()
         .map(|n| {
-            n["kind"]
-                .as_str()
-                .expect("every fixture node has a kind")
-                .to_string()
+            let field = |name: &str| {
+                n[name]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("every fixture node has a {name}"))
+                    .to_string()
+            };
+            (field("kind"), field("id"), field("label"))
         })
         .collect()
 }
