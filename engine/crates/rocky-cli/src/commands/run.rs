@@ -7636,7 +7636,7 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
                 &asset_key,
                 &check_name,
                 passed,
-                crate::pipes::PipesCheckSeverity::Error,
+                check.severity.into(),
                 &check_value,
             );
         }
@@ -18620,6 +18620,69 @@ auto_create_schemas = true
 
         // Verify metrics
         assert_eq!(throttle.rate_limits_total(), 2);
+    }
+
+    /// A check the operator marked advisory reaches the Pipes wire as `WARN`
+    /// (#1784). The emitter used to pass `PipesCheckSeverity::Error` as a
+    /// literal for every check, so `severity = "warning"` degraded asset
+    /// health in Dagster and could page an `ASSET_HEALTH_DEGRADED` alert.
+    ///
+    /// Both severities are asserted from one run. Asserting only the `WARN`
+    /// case would pass against an emitter that hard-coded `WARN` instead,
+    /// which is the same defect facing the other way.
+    #[test]
+    fn a_configured_check_severity_reaches_the_pipes_wire() {
+        use crate::output::{RunOutput, TableCheckOutput};
+        use crate::pipes::PipesEmitter;
+        use rocky_core::tests::TestSeverity;
+        use std::io::Read;
+        use std::sync::Mutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipes_check_severity.txt");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let emitter = PipesEmitter {
+            channel: Mutex::new(Box::new(file)),
+        };
+
+        let mut advisory = rocky_core::checks::check_row_count(10, 7);
+        advisory.severity = TestSeverity::Warning;
+        let gating = rocky_core::checks::check_row_count(10, 7);
+        assert_eq!(gating.severity, TestSeverity::Error);
+
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        output.check_results = vec![TableCheckOutput {
+            asset_key: vec!["acme".into(), "raw_orders".into()],
+            checks: vec![advisory, gating],
+        }];
+
+        emit_pipes_events(&emitter, &output);
+
+        let mut content = String::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        let lines: Vec<serde_json::Value> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        assert_eq!(lines.len(), 2, "one message per check: {content}");
+        assert_eq!(lines[0]["method"], "report_asset_check");
+        assert_eq!(
+            lines[0]["params"]["severity"], "WARN",
+            "an advisory check must not report as ERROR: {content}"
+        );
+        assert_eq!(
+            lines[1]["params"]["severity"], "ERROR",
+            "an error-severity check must still report as ERROR: {content}"
+        );
     }
 
     #[test]
