@@ -557,7 +557,15 @@ struct TableTask {
     /// the resulting `MaterializationOutput` so the persisted
     /// `ModelExecution` records a tenant for `rocky cost --by tenant`.
     tenant: Option<String>,
-    check_column_match: bool,
+    /// The configured severity when the column-match check is on, `None` when
+    /// it is off (#1666).
+    ///
+    /// A bool here meant the severity had nowhere to travel, so
+    /// `check_column_match` hard-coded `Error` and a pipeline's
+    /// `severity = "warning"` parsed and was discarded. Carrying the severity
+    /// in place of the flag makes "off" and "on, at this severity" one value
+    /// that cannot disagree with itself.
+    column_match: Option<rocky_core::tests::TestSeverity>,
     check_row_count: bool,
     check_freshness: bool,
     /// Column names to exclude from column_match check (metadata columns added by Rocky).
@@ -4446,7 +4454,11 @@ pub async fn run(
                         .get("tenant")
                         .and_then(|v| v.as_str())
                         .map(str::to_string),
-                    check_column_match: pipeline.checks.column_match.enabled(),
+                    column_match: pipeline
+                        .checks
+                        .column_match
+                        .enabled()
+                        .then(|| pipeline.checks.column_match.severity()),
                     check_row_count: pipeline.checks.row_count.enabled(),
                     check_freshness: pipeline.checks.freshness.is_some(),
                     column_match_exclude: pipeline
@@ -6757,7 +6769,7 @@ async fn run_batched_checks(
                 .map(|(s, _)| s.full_name());
 
             if let Some(src_key) = src_ref {
-                let check = match (source_map.get(src_key), target_map.get(target_key)) {
+                let mut check = match (source_map.get(src_key), target_map.get(target_key)) {
                     (Some(&src_count), Some(&tgt_count)) => {
                         checks::check_row_count(src_count, tgt_count)
                     }
@@ -6791,6 +6803,12 @@ async fn run_batched_checks(
                         checks::row_count_not_evaluated(reason)
                     }
                 };
+                // The configured severity, not the constructor's default
+                // (#1666). `check_row_count` hard-codes `Error`, so
+                // `severity = "warning"` on a replication pipeline parsed and
+                // was discarded — the operator's own escape hatch did nothing.
+                // Same shape the freshness check already uses below.
+                check.severity = pipeline.checks.row_count.severity();
                 let entry =
                     pending_checks
                         .entry(target_key.clone())
@@ -11090,8 +11108,45 @@ where
     // poisoned key resolves to `None`, so `compute_consumer_baseline` records no
     // column baseline for that read and the gate builds. Mirrors the
     // case-folding-collision guard in `compute_consumer_baseline`.
+    let models: Vec<(&str, &rocky_core::models::TargetConfig)> = models.into_iter().collect();
+
     let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut poisoned: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // A bare read is ambiguous when two models write a table of that NAME in
+    // different schemas, even though neither claims the other's key (#1632).
+    //
+    //     orders  [target] cat.s1.orders   claims the bare key "orders"
+    //     other   [target] cat.s2.orders   claims "other" only
+    //
+    // Both write a physical `orders`. Which one a bare `FROM orders` reads
+    // depends on the connection's search path, which Rocky does not observe —
+    // so the key-collision guard below never fires and the consumer is bound
+    // to `cat.s1.orders`'s column hashes. If `cat.s2.orders` changes while
+    // `cat.s1.orders` does not, the consumer SKIPs on stale input.
+    //
+    // Poison on the folded TABLE component rather than on the claimed key,
+    // which is what makes this case visible at all. Same rule the
+    // case-collision poisoning already uses, applied one component down.
+    //
+    // Ephemeral models are NOT excluded, though they materialize nothing. This
+    // pass sees names and targets, not strategies, and the direction of the
+    // error decides it: over-poisoning costs a rebuild, under-poisoning costs
+    // a SKIP on stale data. Fail closed.
+    let mut targets_by_table: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for (_, t) in &models {
+        targets_by_table
+            .entry(rocky_core::physical_edges::fold_identifier(&t.table))
+            .or_default()
+            .insert(format!("{}.{}.{}", t.catalog, t.schema, t.table).to_lowercase());
+    }
+    for (table, targets) in &targets_by_table {
+        if targets.len() > 1 {
+            poisoned.insert(table.clone());
+        }
+    }
+
     for (name, t) in models {
         let target_full = format!("{}.{}.{}", t.catalog, t.schema, t.table);
         // The bare-NAME key RESOLVES only when the model's configured target
@@ -13548,18 +13603,21 @@ async fn process_table(
     // detection, the pre-drop decision and merge-column resolution all have to
     // keep reading the pre-copy state.
     let mut probe_rate_limited = false;
-    let column_match_check = if task.check_column_match {
+    let column_match_check = if let Some(column_match_severity) = task.column_match {
         let (source_probe, target_probe) = tokio::join!(
             probe_columns_after_copy(warehouse, &source_table),
             probe_columns_after_copy(warehouse, &target_table),
         );
-        let (check, rate_limited) = post_copy_column_match(
+        let (mut check, rate_limited) = post_copy_column_match(
             &source_table,
             &target_table,
             source_probe,
             target_probe,
             &task.column_match_exclude,
         );
+        // The configured severity, not `check_column_match`'s hard-coded
+        // `Error` (#1666).
+        check.severity = column_match_severity;
         probe_rate_limited = rate_limited;
         Some(check)
     } else {
@@ -16903,7 +16961,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             target_table_name: name.into(),
             asset_key_prefix: vec!["test".into()],
             tenant: None,
-            check_column_match: false,
+            column_match: None,
             check_row_count: false,
             check_freshness: false,
             column_match_exclude: vec![],
@@ -20356,7 +20414,7 @@ merge_keys = ["id"]
             target_table_name: "orders_rocky_shadow".into(),
             asset_key_prefix: vec!["test".into()],
             tenant: None,
-            check_column_match: false,
+            column_match: None,
             check_row_count: false,
             check_freshness: false,
             column_match_exclude: vec![],
@@ -20417,7 +20475,7 @@ merge_keys = ["id"]
             target_table_name: "orders_rocky_shadow".into(),
             asset_key_prefix: vec!["test".into()],
             tenant: None,
-            check_column_match: false,
+            column_match: None,
             check_row_count: false,
             check_freshness: false,
             column_match_exclude: vec![],
@@ -20538,7 +20596,7 @@ timestamp_column = "ts"
             target_table_name: "events".into(),
             asset_key_prefix: vec!["test".into()],
             tenant: None,
-            check_column_match: false,
+            column_match: None,
             check_row_count: false,
             check_freshness: false,
             column_match_exclude: vec![],
@@ -21272,7 +21330,7 @@ timestamp_column = "ts"
             target_table_name: "events".into(),
             asset_key_prefix: vec!["test".into()],
             tenant: None,
-            check_column_match: false,
+            column_match: None,
             check_row_count: false,
             check_freshness: false,
             column_match_exclude: vec![],
@@ -21352,7 +21410,7 @@ timestamp_column = "ts"
             target_table_name: "events".into(),
             asset_key_prefix: vec!["test".into()],
             tenant: None,
-            check_column_match: true,
+            column_match: Some(rocky_core::tests::TestSeverity::Error),
             check_row_count: false,
             check_freshness: false,
             column_match_exclude,
@@ -21431,6 +21489,70 @@ timestamp_column = "ts"
             check.passed && missing.is_empty() && extra.is_empty(),
             "the copy created the target from the source, so the column sets \
              match by construction; got missing={missing:?} extra={extra:?}"
+        );
+    }
+
+    /// #1666, the severity half. A pipeline that marks `column_match`
+    /// advisory gets an advisory check.
+    ///
+    /// `check_column_match` hard-codes `TestSeverity::Error`, and the task
+    /// used to carry a bare bool, so `severity = "warning"` had nowhere to
+    /// travel: it parsed, validated, and was discarded. The operator's own
+    /// documented escape hatch did nothing on the replication path.
+    ///
+    /// Both severities are asserted from the same helper. Asserting only the
+    /// warning case would pass against code that hard-coded `Warning`
+    /// instead, which is the same defect facing the other way.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn column_match_carries_the_configured_severity() {
+        use rocky_core::state::StateStore;
+        use rocky_core::tests::TestSeverity;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        async fn severity_of(configured: TestSeverity) -> TestSeverity {
+            let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+            adapter
+                .execute_statement("CREATE SCHEMA IF NOT EXISTS src")
+                .await
+                .unwrap();
+            adapter
+                .execute_statement("CREATE SCHEMA IF NOT EXISTS tgt")
+                .await
+                .unwrap();
+            adapter
+                .execute_statement("CREATE TABLE src.events AS SELECT 1 AS id")
+                .await
+                .unwrap();
+
+            let dir = tempfile::tempdir().unwrap();
+            let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+            let pipeline = parse_pipeline(r#"strategy = "full_refresh""#);
+            let mut task = column_match_task(vec![], vec![]);
+            task.column_match = Some(configured);
+
+            let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+                .await
+                .expect("the first run must copy the table");
+            let TableOutcome::Materialized(result) = outcome else {
+                panic!("table should be materialized");
+            };
+            result
+                .column_match_check
+                .expect("the task enables column_match")
+                .severity
+        }
+
+        assert_eq!(
+            severity_of(TestSeverity::Warning).await,
+            TestSeverity::Warning,
+            "an advisory column_match must not report as an error"
+        );
+        assert_eq!(
+            severity_of(TestSeverity::Error).await,
+            TestSeverity::Error,
+            "an error-severity column_match must still report as an error"
         );
     }
 
@@ -22149,7 +22271,7 @@ timestamp_column = "ts"
             target_table_name: "events".into(),
             asset_key_prefix: vec!["test".into()],
             tenant: None,
-            check_column_match: false,
+            column_match: None,
             check_row_count: false,
             check_freshness: false,
             column_match_exclude: vec![],
@@ -29741,6 +29863,66 @@ auto_create_schemas = true
         assert_eq!(
             map.get("cat2.marts.orders"),
             Some(&"cat2.marts.orders".to_string())
+        );
+    }
+
+    /// #1632: two models write a table of the same NAME in different schemas,
+    /// and only one of them claims the bare key. The key must still be
+    /// poisoned.
+    ///
+    /// ```text
+    /// orders  [target] cat.s1.orders   name == table, so it claims "orders"
+    /// other   [target] cat.s2.orders   name != table, claims nothing
+    /// ```
+    ///
+    /// Both write a physical `orders`. Which one a bare `FROM orders` reads
+    /// depends on the connection's search path, which Rocky does not observe.
+    /// Before this, the two never claimed the same key so the collision guard
+    /// never fired, and a consumer was bound to `cat.s1.orders`'s hashes — so
+    /// a change to `cat.s2.orders` alone let it SKIP on stale input.
+    #[test]
+    fn reuse_bare_key_is_poisoned_when_a_sibling_writes_the_same_table_name() {
+        let claimant = target_cfg("cat", "s1", "orders");
+        let sibling = target_cfg("cat", "s2", "orders");
+        let map = build_reuse_target_by_model([("orders", &claimant), ("other", &sibling)]);
+
+        assert!(
+            !map.contains_key("orders"),
+            "a bare `FROM orders` is ambiguous between cat.s1.orders and \
+             cat.s2.orders, so the key must resolve to nothing: {map:?}"
+        );
+        // The unambiguous 3-part identities are untouched — poisoning is
+        // scoped to the bare namespace, not to the models themselves.
+        assert_eq!(
+            map.get("cat.s1.orders"),
+            Some(&"cat.s1.orders".to_string()),
+            "{map:?}"
+        );
+        assert_eq!(
+            map.get("cat.s2.orders"),
+            Some(&"cat.s2.orders".to_string()),
+            "{map:?}"
+        );
+    }
+
+    /// The poison is scoped: a model whose target table name is unique still
+    /// resolves its bare key. Without this, the fix above could be implemented
+    /// by poisoning every bare key and every test here would still pass.
+    #[test]
+    fn reuse_bare_key_still_resolves_when_the_table_name_is_unique() {
+        let orders = target_cfg("cat", "s1", "orders");
+        let customers = target_cfg("cat", "s2", "customers");
+        let map = build_reuse_target_by_model([("orders", &orders), ("customers", &customers)]);
+
+        assert_eq!(
+            map.get("orders"),
+            Some(&"cat.s1.orders".to_string()),
+            "no sibling writes `orders`, so the bare read is unambiguous: {map:?}"
+        );
+        assert_eq!(
+            map.get("customers"),
+            Some(&"cat.s2.customers".to_string()),
+            "{map:?}"
         );
     }
 
