@@ -47,7 +47,7 @@ No secret is in the response. The token appears as its name and scope. The webho
 
 That field is reported even when the scheduler is off. It tells you what will happen when you turn the scheduler on, which is the point.
 
-Two fields have a different freshness from the rest. `state_backend` and `concurrency_control` come from `rocky.toml`, and are read once on the **first request to this route**, then fixed for the life of the process. They are not read at startup on purpose: `rocky serve` binds its listener before anything reads that file, and reading it eagerly would let a `rocky.toml` on a stalled mount stop the server binding at all.
+Two fields have a different freshness from the rest. `state_backend` and `concurrency_control` come from `rocky.toml`, and are read once on the **first request to this route**, then fixed for the life of the process. They are not read at startup on purpose: nothing on the path to binding the listener reads a file, and reading `rocky.toml` eagerly would put one there — letting a `rocky.toml` on a stalled mount stop the server binding at all. That read runs one at a time under a 5 second deadline, so a stuck file cannot starve the server either; a caller that finds it busy or slow gets `503 engine_busy` and can retry.
 
 So a config edited after that first request is not reflected here, while the scheduler — which re-reads the file every tick — acts on the new one. They are `null` when there was no readable config, and `config_status` says which:
 
