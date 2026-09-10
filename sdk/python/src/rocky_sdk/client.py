@@ -85,6 +85,7 @@ from rocky_sdk.types import (
     RetentionStatusOutput,
     ReviewStatusOutput,
     RunResult,
+    ScheduleSpoolOutput,
     StateResult,
     TestResult,
     ValidateMigrationResult,
@@ -1345,6 +1346,24 @@ class RockyClient:
     def state(self) -> StateResult:
         """Run ``rocky state`` and return the parsed watermarks/checkpoints."""
         return _parse_rocky_json(self.run_cli(["state"]), StateResult, command="state")
+
+    def schedule_spool(self) -> ScheduleSpoolOutput:
+        """Run ``rocky state schedule spool``: webhook demands not yet consumed.
+
+        ``GET /api/v1/schedule`` reports *claims*, which exist only once a tick
+        has picked a demand up. A webhook that was accepted and has not run yet
+        appears in no claim and no run history, so this is the only view of that
+        queue.
+
+        Reads only; takes no arguments. A spool directory that is present but
+        unreadable raises rather than returning an empty queue — "nothing is
+        queued" and "we cannot tell" are different answers.
+        """
+        return _parse_rocky_json(
+            self.run_cli(["state", "schedule", "spool"]),
+            ScheduleSpoolOutput,
+            command="state-schedule-spool",
+        )
 
     # ------------------------------------------------------------------ #
     # Branch approval / promote                                          #

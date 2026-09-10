@@ -24,7 +24,8 @@ use chrono::{TimeZone, Utc};
 use rocky_cli::commands::{
     CostGroupBy, compute_branch_list, compute_branch_show, compute_compliance, compute_cost,
     compute_estimate, compute_policy_check, compute_policy_show, compute_policy_test,
-    compute_replay_check, compute_trace, history_run_output, run_branch_create,
+    compute_replay_check, compute_schedule_spool, compute_trace, history_run_output,
+    run_branch_create,
 };
 use rocky_core::config::{PolicyCapability, PolicyPrincipal};
 use rocky_core::state::{
@@ -859,5 +860,117 @@ fn history_run_text_prints_the_run_table_then_the_audit_table() {
     assert!(
         rest.contains("  run-under-t  version=0.0.0-test  idempotency_key=-\n"),
         "the detail line carries the version:\n{rest}"
+    );
+}
+
+/// `rocky state schedule spool --output json` prints exactly what
+/// `compute_schedule_spool` returns, so `GET /api/v1/schedule/spool` and the
+/// CLI cannot drift.
+#[test]
+fn schedule_spool_prints_what_compute_schedule_spool_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("rocky.toml");
+    std::fs::write(&config, "").unwrap();
+
+    // Two demands and one file that will not parse: the document has to carry
+    // a pending list, a skipped list and the counts at once, or this pins less
+    // than it looks like it does.
+    for (token, at) in [
+        ("delivery-2", "2026-09-10T11:00:00Z"),
+        ("delivery-1", "2026-09-10T10:00:00Z"),
+    ] {
+        rocky_core::schedule::spool::accept(
+            &dir.path().join(".rocky"),
+            "orders",
+            rocky_core::schedule::spool::WebhookKind::Id,
+            token,
+            "deadbeef",
+            chrono::DateTime::parse_from_rfc3339(at)
+                .unwrap()
+                .with_timezone(&Utc),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        dir.path().join(".rocky/pending-demands/notjson"),
+        b"{ not json",
+    )
+    .unwrap();
+
+    let seam = compute_schedule_spool(&config).unwrap();
+    assert_eq!(seam.counts.pending, 2, "both demands are queued");
+    assert_eq!(
+        seam.counts.skipped, 1,
+        "the bad file is reported, not hidden"
+    );
+
+    // Pass the same absolute `--config` the seam was given: the binary's
+    // default is the RELATIVE `rocky.toml`, whose parent is empty, so the
+    // spool resolves to `./.rocky` and the two documents would differ on
+    // `spool_path` alone. Parity is a claim about equal inputs.
+    let stdout = rocky_stdout(
+        dir.path(),
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "--output",
+            "json",
+            "state",
+            "schedule",
+            "spool",
+        ],
+    );
+    assert_eq!(stdout, reference_bytes!(seam));
+}
+
+/// The text path names the spool it read and says how many demands are queued.
+/// A wrong-project read must not look like an empty queue.
+#[test]
+fn schedule_spool_text_names_the_spool_and_its_demands() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("rocky.toml");
+    std::fs::write(&config, "").unwrap();
+    rocky_core::schedule::spool::accept(
+        &dir.path().join(".rocky"),
+        "orders",
+        rocky_core::schedule::spool::WebhookKind::Id,
+        "delivery-1",
+        "deadbeef",
+        Utc.with_ymd_and_hms(2026, 9, 10, 10, 0, 0).unwrap(),
+    )
+    .unwrap();
+
+    let stdout = rocky_stdout(
+        dir.path(),
+        &["--output", "table", "state", "schedule", "spool"],
+    );
+    assert!(
+        stdout.contains("pending-demands"),
+        "the text names the spool read:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("orders"),
+        "the text names the queued pipeline:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("delivery-1"),
+        "the text names the demand uid or token:\n{stdout}"
+    );
+}
+
+/// An empty queue says so rather than printing nothing at all — silence reads
+/// as a broken command.
+#[test]
+fn schedule_spool_text_says_the_queue_is_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("rocky.toml"), "").unwrap();
+
+    let stdout = rocky_stdout(
+        dir.path(),
+        &["--output", "table", "state", "schedule", "spool"],
+    );
+    assert!(
+        stdout.contains("no demands pending"),
+        "an empty spool states it:\n{stdout}"
     );
 }

@@ -1230,6 +1230,42 @@ fn route_table() -> Vec<Route> {
         },
         Route {
             method: "get",
+            path: "/api/v1/schedule/spool",
+            operation_id: "getScheduleSpool",
+            tag: "schedule",
+            summary: "Queued webhook demands",
+            description: "The webhook demands accepted by the ingress and not yet consumed by \
+                 a tick. `GET /api/v1/schedule` reports claims, which exist only once a tick \
+                 has picked a demand up — so a demand queued here appears nowhere there. Read \
+                 this when a webhook was delivered and its pipeline never ran. Consumed \
+                 demands are excluded: `.done` tombstones are the 24h idempotency window for \
+                 `kind = id`, not outstanding work. An entry that cannot be read is reported \
+                 in `skipped` rather than dropped, and `counts.corrupt` reports files a \
+                 previous tick quarantined. `token` is caller-supplied text for `kind = id` \
+                 and must be rendered as inert text.",
+            path_params: &[],
+            query_params: &[],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The queued demands. An absent spool answers 200 with an \
+                         empty `pending` — no webhook has ever been accepted here.",
+                    body: Body::Component("ScheduleSpoolOutput"),
+                },
+                Resp {
+                    status: "500",
+                    description: "The spool directory is present but could not be read. \
+                         Never conflated with an empty queue.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                ENGINE_BUSY_OR_NOT_READY,
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
             path: "/api/v1/policy",
             operation_id: "getPolicy",
             tag: "policy",
