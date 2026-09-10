@@ -5955,7 +5955,14 @@ mod tests {
                 secret: "BEARER_SECRET_ABC".to_string(),
                 scope: TokenScope::ReadOnly,
             }),
-            vec!["https://example.test".to_string()],
+            // One origin CORS can install and one it cannot. The invalid one is
+            // what makes `allowed_origins` load-bearing: with a valid-only list
+            // the raw and the enforced list are identical, so no assertion on
+            // this fixture could tell a correct projection from a raw one.
+            vec![
+                "https://example.test".to_string(),
+                "https://in\nvalid.test".to_string(),
+            ],
             None,
             Some(rocky_server::webhook_ingress::WebhookIngress {
                 secret: Some("WEBHOOK_SECRET_DEF".to_string()),
@@ -6004,9 +6011,17 @@ mod tests {
             &state,
             crate::commands::serve::config_posture(state.config_path.as_deref()),
         );
-        // The fixture's origin is valid, so it survives -- proving the filter
-        // does not simply empty the field.
+        // The fixture configures one installable origin and one that is not.
+        // The valid one survives (so the filter does not simply empty the
+        // field) and the invalid one is absent (so the route is not echoing
+        // what was typed).
         assert_eq!(output.allowed_origins, ["https://example.test"]);
+        assert_eq!(
+            enforced_cors_origins(&state.allowed_origins).len(),
+            state.allowed_origins.len() - 1,
+            "the fixture must hold exactly one origin CORS cannot install, or \
+             the raw and enforced lists are identical and this proves nothing"
+        );
     }
 
     /// **The containment contract, across every safe route.**
