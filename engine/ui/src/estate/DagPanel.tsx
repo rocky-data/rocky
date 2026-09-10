@@ -57,26 +57,50 @@ function floorFor(fitted: number): number {
 }
 
 /**
- * Re-fit the graph when the canvas changes width.
+ * Re-fit the graph, and report the zoom the fit settled on.
  *
- * `fitView` runs once, at mount. Opening the detail pane takes the canvas from
- * the full width down to `1fr` beside a 360px column — measured, 990px to
- * 620px at a 1024px viewport — and the graph kept its old zoom, so the last
- * node simply left the canvas. Rotating a phone does the same thing.
+ * Two things make a fit necessary, and both were once missed:
  *
- * Width only: the height is fixed, and re-fitting on every height change would
- * fight a scroll. A refit does discard a manual pan or zoom, which is the
- * right trade when the alternative is a graph that is partly off-screen.
+ * - **The canvas changes width.** `fitView` otherwise runs once, at mount.
+ *   Opening the detail pane takes the canvas from 990px to 620px at a 1024px
+ *   viewport and the graph kept its old zoom, so the last node left the
+ *   canvas. Rotating a phone does the same.
+ * - **The graph itself changes.** `Refresh` replaces `dag` without remounting
+ *   this panel, so a shallow graph can become a deep one at an unchanged
+ *   width. Nothing refitted, and the floor stayed where the shallow graph put
+ *   it — which brought the zoom snap back by another route.
+ *
+ * Every fit reports its zoom, because the interaction floor follows it. The
+ * nodes carry their own dimensions (`layout.ts`), so a fit straight after a
+ * graph change does not have to wait to measure anything.
+ *
+ * Width only, not height: the height is fixed, and re-fitting on every height
+ * change would fight a scroll. A refit discards a manual pan or zoom, which is
+ * the right trade when the alternative is a graph partly off-screen.
  */
-function RefitOnResize({
+function RefitOnChange({
   canvas,
+  graph,
   onFitted,
 }: {
   canvas: RefObject<HTMLDivElement | null>;
+  /** Changes when the graph does, so a replaced DAG refits. */
+  graph: string;
   onFitted: (zoom: number) => void;
 }) {
   const { fitView, getZoom } = useReactFlow();
   const lastWidth = useRef(0);
+
+  const refit = useCallback(() => {
+    void fitView(FIT).then(() => onFitted(getZoom()));
+  }, [fitView, getZoom, onFitted]);
+
+  // On mount and on every graph change. `onInit` is not used for this: it
+  // gates viewport initialisation and is not guaranteed to follow the initial
+  // fit, so a floor taken from it could come from an unfitted viewport.
+  useEffect(() => {
+    refit();
+  }, [graph, refit]);
 
   useEffect(() => {
     // This panel's own canvas, passed by ref. A `document.querySelector` here
@@ -90,13 +114,31 @@ function RefitOnResize({
       lastWidth.current = width;
       // `fitView` changes the inner transform, not the observed box, so this
       // cannot feed itself.
-      void fitView(FIT).then(() => onFitted(getZoom()));
+      refit();
     });
     observer.observe(pane);
     return () => observer.disconnect();
-  }, [canvas, fitView, getZoom, onFitted]);
+  }, [canvas, refit]);
 
   return null;
+}
+
+/**
+ * The stock controls, with the fit button reporting what it did.
+ *
+ * `onFitView` runs after the control's own `fitView`, so the zoom is settled
+ * by then. Without this the button could fit below the floor and leave the
+ * floor behind, which is the snap coming back by a third route.
+ */
+function FittingControls({ onFitted }: { onFitted: (zoom: number) => void }) {
+  const { getZoom } = useReactFlow();
+  return (
+    <Controls
+      showInteractive={false}
+      fitViewOptions={FIT}
+      onFitView={() => onFitted(getZoom())}
+    />
+  );
 }
 
 /**
@@ -111,6 +153,8 @@ export function DagPanel({ dag, onSelect }: { dag: DagOutput; onSelect: (name: s
   const [minZoom, setMinZoom] = useState(MIN_ZOOM);
   const onFitted = useCallback((zoom: number) => setMinZoom(floorFor(zoom)), []);
   const flow = useMemo(() => layeredFlow(dag), [dag]);
+  // The identity of the graph, so a Refresh that replaces it refits.
+  const graph = useMemo(() => flow.nodes.map((n) => n.id).join("\u0000"), [flow]);
   const dataById = useMemo(
     () => new Map(flow.nodes.map((node) => [node.id, node.data])),
     [flow],
@@ -173,17 +217,16 @@ export function DagPanel({ dag, onSelect }: { dag: DagOutput; onSelect: (name: s
             // follows it down so the first gesture after a fit does not snap.
             fitViewOptions={FIT}
             minZoom={minZoom}
-            onInit={(flow) => onFitted(flow.getZoom())}
             nodesDraggable={false}
             nodesConnectable={false}
             proOptions={{ hideAttribution: true }}
             colorMode="system"
             onNodeClick={(_, node) => open(node.data)}
           >
-            <RefitOnResize canvas={canvasRef} onFitted={onFitted} />
+            <RefitOnChange canvas={canvasRef} graph={graph} onFitted={onFitted} />
             <Background />
             <MiniMap pannable zoomable />
-            <Controls showInteractive={false} fitViewOptions={FIT} />
+            <FittingControls onFitted={onFitted} />
           </ReactFlow>
         </ReactFlowProvider>
       </div>
