@@ -177,6 +177,13 @@ describe("ProductsScreen", () => {
     expect(copy).toContain("rocky fulfill");
     expect(copy).toMatch(/No rocky product subcommand creates one/);
 
+    // And the fulfill route needs saying WITH its prerequisite. Verified
+    // live: on a default project `rocky fulfill demo` ends "blocked: ... no
+    // [fulfill.driver] is configured in rocky.toml", so naming the command
+    // alone would send a reader at something that does nothing.
+    expect(copy).toContain("[fulfill.driver]");
+    expect(copy).toMatch(/does nothing without one/);
+
     // And it must not invent a scaffold verb.
     expect(copy).not.toMatch(/rocky product (init|new|create|scaffold|add)/);
   });
