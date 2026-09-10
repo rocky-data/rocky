@@ -7851,6 +7851,155 @@ pub struct PolicyFreezeEntry {
     pub reason: String,
 }
 
+/// JSON output for `rocky policy show`, and the body of `GET /api/v1/policy`:
+/// the policy plane as configured and as it stands.
+///
+/// The rules carry their position in `[[policy.rules]]` as `id`, the only
+/// identity a rule has today and the number `rocky policy check` reports as
+/// `matched_rule`.
+///
+/// `freezes` is every freeze in force **that this reader could see**, from the
+/// decision ledger and the durable freeze markers, and `freeze_sources` says
+/// what it saw. That qualifier is load-bearing and is not a hedge:
+///
+/// - `not_consulted` on both means no `[policy]` block, so the enforcement
+///   gate answers before it reads a freeze source and nothing is in force.
+/// - `local_mirror` on the ledger means a remote `[state]` backend, where the
+///   authority is remote and this read-only producer will not download it.
+///   A freeze recorded by another pod can be absent from `freezes` while an
+///   apply, which downloads first, still denies. Only when the ledger reads
+///   `read` or `absent` is the list exhaustive.
+///
+/// A source that exists but cannot be read is an error, never an empty list:
+/// an empty list would say "nothing is frozen" for a plane whose freezes could
+/// not be read at all.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyRulesOutput {
+    pub version: String,
+    /// Always `"policy_show"`.
+    pub command: String,
+    /// Whether `rocky.toml` carries a `[policy]` block. `false` is the default
+    /// posture: no rules, `default_agent_effect` as the engine defaults it.
+    pub configured: bool,
+    pub policy_version: u32,
+    /// The effect an agent gets when no rule matches.
+    pub default_agent_effect: rocky_core::config::PolicyEffect,
+    /// The rules in file order.
+    pub rules: Vec<PolicyRuleEntry>,
+    /// The freezes in force that this reader could see, ledger entries first,
+    /// then markers. Read `freeze_sources` before treating it as exhaustive:
+    /// a `local_mirror` ledger read may be missing another pod's freeze.
+    pub freezes: Vec<PolicyFreezeInForce>,
+    pub freeze_sources: PolicyFreezeSources,
+}
+
+/// One `[[policy.rules]]` entry.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyRuleEntry {
+    /// Zero-based position in `[[policy.rules]]`; the `matched_rule` that
+    /// `rocky policy check` reports.
+    pub id: usize,
+    pub principal: rocky_core::config::PolicyPrincipal,
+    pub capability: rocky_core::config::PolicyCapability,
+    pub effect: rocky_core::config::PolicyEffect,
+    pub scope: PolicyRuleScopeOutput,
+    /// Post-apply verification: the named checks that must pass after a
+    /// mutation this rule governs. A failing or absent named check halts the
+    /// apply. Two rules that differ only here govern differently, so the
+    /// document carries it; without it a reader cannot tell them apart.
+    ///
+    /// A rule's `conditions` is deliberately NOT carried. The engine parses it
+    /// and never evaluates it, its shape is unbounded, and `${VAR}` in a config
+    /// string is resolved before parsing — so an authored condition can hold a
+    /// resolved secret that no key-based redaction could find. It decides
+    /// nothing, so nothing is lost by leaving it out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verify_after: Vec<String>,
+    /// The rolling failure ceiling that degrades this rule's effect.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub autonomy_budget: Option<PolicyAutonomyBudgetOutput>,
+}
+
+/// What a rule matches. Every field is as authored; an empty list or `None`
+/// means the field does not narrow the rule.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyRuleScopeOutput {
+    pub any: bool,
+    pub models: Vec<String>,
+    pub tags: BTreeMap<String, String>,
+    pub classifications: Vec<String>,
+    pub exclude_classifications: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contracted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+    /// The blast-radius ceiling: the rule matches only a model with at most
+    /// this many downstreams.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_downstreams: Option<u64>,
+}
+
+/// A rule's autonomy budget: `failures` within `window` degrade its effect.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyAutonomyBudgetOutput {
+    pub failures: u64,
+    pub window: String,
+}
+
+/// One freeze in force.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyFreezeInForce {
+    /// `"ledger"` (a `rocky policy freeze` decision) or `"marker"` (a durable
+    /// freeze marker in the remote object tier).
+    pub source: String,
+    /// The frozen principal. Absent ONLY on a marker whose body could not be
+    /// read: the loader widens such a marker to scope `any` and to both
+    /// principals so it fails closed. It is not a marker that deliberately
+    /// froze both, and a reader must not present it as one — the `reason` says
+    /// the body was unreadable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal: Option<rocky_core::config::PolicyPrincipal>,
+    /// The scope selector as given to `rocky policy freeze`; `any` is every model.
+    pub scope: String,
+    pub reason: String,
+    /// When the freeze was recorded, when the source recorded it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<DateTime<Utc>>,
+    /// The ledger decision's plan id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    /// The marker's id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freeze_id: Option<String>,
+}
+
+/// Which freeze sources the report read.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyFreezeSources {
+    /// How the decision ledger was read.
+    ///
+    /// - `"read"` — a local backend, read in full.
+    /// - `"absent"` — a local backend with no state store yet. Proven absent,
+    ///   not assumed: a path that exists but cannot be read is an error.
+    /// - `"local_mirror"` — a remote `[state]` backend. What was read is the
+    ///   local mirror, which may be stale or empty; the remote authority was
+    ///   NOT downloaded, because this is a read-only route and the download
+    ///   replaces the local ledger. A freeze recorded by another pod can be
+    ///   missing here while an apply, which does download first, still denies.
+    /// - `"not_consulted"` — no `[policy]` block, so nothing is in force and
+    ///   the enforcement gate reads no ledger either.
+    pub ledger: String,
+    /// How the durable freeze markers were read.
+    ///
+    /// - `"read"` — the `[state]` backend has a durable object tier, read in
+    ///   full. Reads are NOT gated on `freeze_marker_writes`: that flag gates
+    ///   writes only, and an existing marker stays enforced after it is turned
+    ///   off, so a reader that honoured it would hide a live freeze.
+    /// - `"not_configured"` — the backend keeps no durable object tier.
+    /// - `"not_consulted"` — no `[policy]` block, as above.
+    pub markers: String,
+}
+
 /// JSON output for `rocky audit` — the agent-policy decision ledger.
 ///
 /// Lists every policy decision recorded at a mutating enforcement seam
