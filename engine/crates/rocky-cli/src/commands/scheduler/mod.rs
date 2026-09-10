@@ -1451,58 +1451,79 @@ cron = "* * * * *"
         );
     }
 
-    /// The loop fires a due cron demand once per tick after the first-sight
-    /// anchor, with no drift: N iterations ⇒ exactly N−1 fires (the first tick
-    /// only anchors), each an occurrence of the every-minute schedule.
+    /// A due cron demand fires once per tick after the first-sight anchor,
+    /// with no drift: N ticks ⇒ exactly N−1 fires (the first only anchors),
+    /// each an occurrence of the every-minute schedule.
+    ///
+    /// Driven through `run_one_tick` directly rather than through
+    /// `run_scheduler`, and this is the point of the test rather than an
+    /// implementation detail (#1890). The loop version synchronised on
+    /// `FakeClock::wait_for_park` and asserted the run count between ticks, so
+    /// a tick that ran and SKIPPED — a held tick lock, a busy state store, an
+    /// unreadable spool: every one of them non-fatal by design — read as a
+    /// missed fire and flaked the test. The clock was never the problem; it is
+    /// injected, and `scheduler/mod.rs` reads no wall clock at all.
+    ///
+    /// So the tick outcomes are collected and asserted too. A skip now names
+    /// itself instead of arriving as an off-by-one count, and the drift
+    /// property is proved where it actually lives — in the tick and its cursor,
+    /// not in the loop that calls it. `run_scheduler`'s own shape stays covered
+    /// by the tests below that still spawn it.
     #[tokio::test]
     async fn fires_due_cron_each_tick_without_drift() {
         let (dir, config_path) = temp_project(CRON_EVERY_MINUTE);
         let state = test_state(dir.path());
-        let clock = FakeClock::new(at(2026, 5, 2, 3, 0));
         let capture = Arc::new(CapturingSpawner::new(0));
-        let shutdown = Drain::new();
-        // These tests drive the loop directly, not through the server, so there is
-        // no startup barrier — hand it a pre-signalled readiness latch.
-        let ready = Drain::new();
-        ready.signal();
-
-        let clock_dyn: Arc<dyn Clock> = clock.clone();
         let spawner: Arc<dyn Spawner> = capture.clone();
-        let task = tokio::spawn(run_scheduler(
-            Arc::clone(&state),
-            config_path,
-            SchedulerConfig {
-                poll_interval: Duration::from_secs(60),
-                drain_timeout: Duration::from_secs(60),
-            },
-            clock_dyn,
-            shutdown.clone(),
-            ready.clone(),
-            spawner,
-            SchedulerMetrics::disabled(),
-        ));
+        let harness = MetricsHarness::new();
+        let metrics = harness.metrics();
+        let shutdown = Drain::new();
+        let clock = FakeClock::new(at(2026, 5, 2, 3, 0));
+        let state_path = dir.path().join(".rocky-state.redb");
+        let rocky_dir = dir.path().join(".rocky");
 
-        // Iteration 1 (now = 03:00): first sight ⇒ anchor, no fire.
-        clock.wait_for_park(1).await;
-        assert_eq!(capture.run_count(), 0, "first sight must not fire");
-
-        // Nine more ticks, one minute apart ⇒ nine fires, one per occurrence.
-        for i in 1..=9u64 {
-            clock.advance(60);
-            clock.wait_for_park(i + 1).await;
-            assert_eq!(
-                capture.run_count(),
-                i as usize,
-                "tick {i} fires exactly one occurrence (no drift, no double)",
-            );
+        // Tick 1 at 03:00 is first sight ⇒ anchor only. Nine more, one minute
+        // apart, are nine occurrences of `* * * * *`.
+        let mut counts = Vec::new();
+        for i in 0..10 {
+            if i > 0 {
+                clock.advance(60);
+            }
+            run_one_tick(
+                &state,
+                &config_path,
+                &state_path,
+                &rocky_dir,
+                clock.as_ref(),
+                &shutdown,
+                spawner.as_ref(),
+                &metrics,
+            )
+            .await;
+            counts.push(capture.run_count());
         }
 
-        shutdown.signal();
-        tokio::time::timeout(Duration::from_secs(5), task)
-            .await
-            .expect("loop exits promptly on shutdown")
-            .unwrap();
+        let points = harness.collect();
+        let outcomes: Vec<(Option<&str>, f64)> = points
+            .iter()
+            .filter(|p| p.name == "rocky.scheduler.ticks")
+            .map(|p| (p.attr("outcome"), p.value))
+            .collect();
 
+        // The cumulative count after each tick. Anything but this is either a
+        // skipped tick or a double fire, and `outcomes` says which.
+        assert_eq!(
+            counts,
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+            "one fire per tick after the anchor; tick outcomes were {outcomes:?}",
+        );
+        assert_eq!(
+            outcomes,
+            vec![(Some("completed"), 10.0)],
+            "every tick completed — a non-fatal skip carries its own outcome \
+             label, so ruling it out here is what keeps a skipped tick from \
+             reading as a missed fire",
+        );
         assert_eq!(capture.runs_for("raw").len(), 9);
     }
 
