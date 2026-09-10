@@ -196,6 +196,25 @@ pub fn history_runs_output_filtered(
     })
 }
 
+/// One run by id, as `rocky history --run <id>` prints it: a
+/// [`HistoryOutput`] whose `runs` holds exactly that run. The same envelope
+/// as the list, so a consumer reads one shape whether it asked for fifty
+/// runs or one. A run the store does not hold is an error naming the id,
+/// never an empty list.
+pub fn history_run_output(state_path: &Path, run_id: &str, audit: bool) -> Result<HistoryOutput> {
+    let store = StateStore::open_read_only(state_path)?;
+    let run = store
+        .get_run(run_id)?
+        .ok_or_else(|| anyhow::anyhow!("no run with id '{run_id}' in the state store"))?;
+    let runs = vec![record_to_history(&run, audit)];
+    Ok(HistoryOutput {
+        version: VERSION.to_string(),
+        command: "history".to_string(),
+        count: runs.len(),
+        runs,
+    })
+}
+
 /// Build the model-scoped run-history output from the state store (the
 /// `rocky history --model <name>` path), augmenting with [`RollingStats`]
 /// when `rolling_stats` is set. Pure compute — no printing.
@@ -330,8 +349,25 @@ pub fn run_history(
     rolling_stats: bool,
     window: usize,
     recipe: Option<&str>,
+    run: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
+    if let Some(run_id) = run {
+        let output = history_run_output(state_path, run_id, audit)?;
+        if output_json {
+            print_json(&output)?;
+        } else {
+            print_runs_table(&output);
+            if audit {
+                let store = StateStore::open_read_only(state_path)?;
+                let record = store.get_run(run_id)?.ok_or_else(|| {
+                    anyhow::anyhow!("no run with id '{run_id}' in the state store")
+                })?;
+                print_audit_table(std::slice::from_ref(&record));
+            }
+        }
+        return Ok(());
+    }
     if let Some(recipe_hash) = recipe {
         let output = recipe_history_output(state_path, recipe_hash, since)?;
         if output_json {
@@ -395,23 +431,7 @@ pub fn run_history(
         if output_json {
             print_json(&output)?;
         } else {
-            println!(
-                "{:<12} {:<24} {:<10} {:<8} {:<10}",
-                "RUN ID", "STARTED", "STATUS", "MODELS", "TRIGGER"
-            );
-            println!("{}", "-".repeat(66));
-
-            for run in &output.runs {
-                println!(
-                    "{:<12} {:<24} {:<10} {:<8} {:<10}",
-                    &run.run_id[..run.run_id.len().min(11)],
-                    run.started_at.format("%Y-%m-%d %H:%M:%S"),
-                    run.status,
-                    run.models_executed,
-                    run.trigger,
-                );
-            }
-            println!("\nTotal runs: {}", output.runs.len());
+            print_runs_table(&output);
 
             if audit {
                 // Re-read the raw records for the governance table — the typed
@@ -440,6 +460,27 @@ pub fn run_history(
 /// Column widths are intentionally modest — `git_commit` is printed
 /// short (8 chars) and `hostname` truncated to 16, so the table stays
 /// usable in a 160-column terminal.
+/// The run summary table `rocky history` prints, one row per run.
+fn print_runs_table(output: &HistoryOutput) {
+    println!(
+        "{:<12} {:<24} {:<10} {:<8} {:<10}",
+        "RUN ID", "STARTED", "STATUS", "MODELS", "TRIGGER"
+    );
+    println!("{}", "-".repeat(66));
+
+    for run in &output.runs {
+        println!(
+            "{:<12} {:<24} {:<10} {:<8} {:<10}",
+            &run.run_id[..run.run_id.len().min(11)],
+            run.started_at.format("%Y-%m-%d %H:%M:%S"),
+            run.status,
+            run.models_executed,
+            run.trigger,
+        );
+    }
+    println!("\nTotal runs: {}", output.runs.len());
+}
+
 fn print_audit_table(runs: &[RunRecord]) {
     if runs.is_empty() {
         return;
@@ -944,5 +985,37 @@ mod tests {
         let dz = stats.duration_ms.latest_z_score.expect("z should be Some");
         assert!((dz - z).abs() < 1e-9);
         assert!((stats.health_score - expected_health).abs() < 1e-9);
+    }
+
+    /// `rocky history --run <id>` is `history_run_output` plus one
+    /// `print_json`: the list envelope holding exactly that run, `--audit`
+    /// honoured the same way as the list.
+    #[test]
+    fn history_run_output_serves_exactly_one_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        {
+            let store = StateStore::open(&path).unwrap();
+            let mut other = sample_record();
+            other.run_id = "run-other".to_string();
+            store.record_run(&other).unwrap();
+            store.record_run(&sample_record()).unwrap();
+        }
+
+        let out = history_run_output(&path, "run-abc-001", false).unwrap();
+        assert_eq!(out.command, "history");
+        assert_eq!(out.count, 1);
+        assert_eq!(out.runs.len(), 1);
+        assert_eq!(out.runs[0].run_id, "run-abc-001");
+        assert!(
+            out.runs[0].hostname.is_none(),
+            "audit fields stay absent without --audit"
+        );
+
+        let audited = history_run_output(&path, "run-abc-001", true).unwrap();
+        assert_eq!(audited.runs[0].hostname.as_deref(), Some("dev-laptop"));
+
+        let err = history_run_output(&path, "run-none", false).unwrap_err();
+        assert!(err.to_string().contains("run-none"), "{err}");
     }
 }
