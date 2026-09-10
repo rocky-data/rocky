@@ -3220,6 +3220,73 @@ fn compile_target_to_name(
 /// The returned [`TouchedTargets`] says which keys were resolved to a model,
 /// so the gate records a graph key for those alone; a verbatim key is a
 /// policy subject, not a model.
+/// Is `s` a three-part `catalog.schema.table` name?
+///
+/// SQL identifiers are `^[a-zA-Z0-9_]+$` (`rocky-sql/validation.rs`), so a dot
+/// only ever separates parts and splitting is exact rather than a heuristic.
+pub(crate) fn is_three_part_fqn(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() == 3 && parts.iter().all(|p| !p.is_empty())
+}
+
+/// Every non-ephemeral model this project declares, as `name -> target FQN`.
+///
+/// The maintenance WRITERS (`rocky compact`, `rocky archive`) use this to
+/// record a fully-qualified table on the plan instead of whatever string the
+/// operator typed (#1829). It reuses [`resolve_touched_apply_targets`]'s own
+/// loader, confinement and ephemeral skip on purpose: a writer that derived
+/// the mapping differently from the gate that later reads it would put the
+/// two back out of step, which is the defect being closed.
+///
+/// Fails CLOSED for the same reason the gate does: a models glob that cannot
+/// be confined to the project root means we cannot say what a name refers to,
+/// and guessing is what produced the conflation.
+pub(crate) fn model_target_fqns(
+    config: &rocky_core::config::RockyConfig,
+    config_path: &Path,
+) -> Result<BTreeMap<String, String>> {
+    let models_dir = resolve_confined_config_models_dir(config_path, Some(config)).context(
+        "refusing to plan this maintenance operation: the project's models glob could not be          confined to the project root, so a bare name cannot be resolved to a table",
+    )?;
+    let models_glob = resolve_config_models_glob(config_path, Some(config));
+    let (models, load_errors) = match models_glob.as_deref() {
+        Some(glob) => crate::models_loader::load_project_models_matching_partial(
+            &models_dir,
+            glob,
+            Some(&config.freshness),
+        ),
+        None => {
+            crate::models_loader::load_project_models_partial(&models_dir, Some(&config.freshness))
+        }
+    };
+    for e in &load_errors {
+        tracing::warn!(
+            error = %format!("{e:#}"),
+            "some models could not be loaded; a bare maintenance target naming one of them will not resolve"
+        );
+    }
+    let mut by_name = BTreeMap::new();
+    for m in &models {
+        // An ephemeral model is inlined as a CTE and materializes nothing, so
+        // it has no table to compact or archive. Same exclusion the gate
+        // makes (#1815, review round seven).
+        if matches!(
+            m.config.strategy,
+            rocky_core::models::StrategyConfig::Ephemeral
+        ) {
+            continue;
+        }
+        by_name.insert(
+            m.config.name.clone(),
+            format!(
+                "{}.{}.{}",
+                m.config.target.catalog, m.config.target.schema, m.config.target.table
+            ),
+        );
+    }
+    Ok(by_name)
+}
+
 pub(crate) fn resolve_touched_apply_targets(
     config: &rocky_core::config::RockyConfig,
     config_path: &Path,

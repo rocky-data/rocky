@@ -65,6 +65,39 @@ fn persist_archive_plan(
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Resolve `--model <name>` to the model's fully-qualified target table.
+///
+/// `None` in, `None` out — that is the project-wide archive, which names no
+/// table and is unaffected. A name already written `catalog.schema.table` is
+/// kept as-is, so an operator who names a table directly still can.
+///
+/// Anything else must be a model this project declares. An unknown name is
+/// REFUSED rather than passed through: `DELETE FROM <name>` against whatever
+/// the warehouse's search path resolves is not a plan anyone reviewed.
+fn resolve_archive_model_target(config_path: &Path, model: Option<&str>) -> Result<Option<String>> {
+    let Some(name) = model else {
+        return Ok(None);
+    };
+    if crate::commands::apply::is_three_part_fqn(name) {
+        return Ok(Some(name.to_string()));
+    }
+    let config = rocky_core::config::load_rocky_config(config_path).with_context(|| {
+        format!(
+            "refusing to plan an archive of '{name}': the config could not be loaded, so the \
+             model's target table cannot be resolved"
+        )
+    })?;
+    let by_name = crate::commands::apply::model_target_fqns(&config, config_path)?;
+    match by_name.get(name) {
+        Some(fqn) => Ok(Some(fqn.clone())),
+        None => anyhow::bail!(
+            "refusing to plan an archive of '{name}': no model by that name is declared in \
+             this project. `--model` takes a model name, or a fully qualified table \
+             (catalog.schema.table) to name one directly"
+        ),
+    }
+}
+
 /// Execute `rocky archive`.
 ///
 /// After generating the plan, persists it to `.rocky/plans/<plan_id>.json`
@@ -81,6 +114,18 @@ pub fn run_archive(
 ) -> Result<()> {
     // Parse the older_than duration (e.g., "90d", "6m", "1y")
     let days = parse_duration_days(older_than)?;
+    // `--model` names a MODEL (that is what the flag is documented as), so
+    // resolve it to that model's target table and record THAT on the plan
+    // (#1829). Before this the operator's string was recorded verbatim, and
+    // the apply gate had to re-derive what it meant from the string alone —
+    // the same string `rocky compact` uses to mean a physical table. One
+    // resolver, two commands, opposite intents, no way to tell them apart.
+    //
+    // It also fixes the SQL: `DELETE FROM orders` depended on the warehouse's
+    // search path resolving to the same table the model declares. Now the
+    // statement names the table the model itself points at.
+    let model = resolve_archive_model_target(config_path, model)?;
+    let model = model.as_deref();
     // Resolve the configured target dialect (config-only, no credentials) so
     // the gated generator fails fast off Databricks at plan time instead of
     // printing DELETE/VACUUM SQL the warehouse rejects at apply time.
@@ -747,6 +792,104 @@ pub(crate) async fn run_archive_apply_alias_in_with(
 
 #[cfg(test)]
 mod tests {
+    /// #1829(1), the archive half. `--model` is documented as a MODEL name,
+    /// while `rocky compact`'s positional argument is documented as a TABLE —
+    /// and both used to record the operator's string verbatim onto the plan,
+    /// where ONE resolver had to re-derive which of the two it was looking at.
+    ///
+    /// A model name now resolves to that model's own target table before the
+    /// plan is written, so the gate reads a fact instead of guessing. It also
+    /// fixes the SQL: `DELETE FROM orders` depended on the warehouse's search
+    /// path landing on the same table the model declares.
+    mod model_target_resolution {
+        use std::path::Path;
+
+        /// A model whose NAME and TARGET TABLE differ — the only fixture where
+        /// resolving and not resolving give different answers.
+        fn write_project(dir: &Path) -> std::path::PathBuf {
+            let models = dir.join("models");
+            std::fs::create_dir_all(&models).unwrap();
+            std::fs::write(models.join("orders.sql"), "SELECT 1 AS id\n").unwrap();
+            std::fs::write(
+                models.join("orders.toml"),
+                "name = \"orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"wh\"\nschema = \"marts\"\ntable = \"orders_v2\"\n",
+            )
+            .unwrap();
+            let toml = r#"
+[adapter]
+type = "databricks"
+host = "https://example.cloud.databricks.com"
+http_path = "/sql/1.0/warehouses/abc"
+token = "pat-xxx"
+
+[pipeline.p]
+type = "transformation"
+models = "models/**"
+
+[pipeline.p.target]
+adapter = "default"
+"#;
+            let path = dir.join("rocky.toml");
+            std::fs::write(&path, toml).unwrap();
+            path
+        }
+
+        #[test]
+        fn a_model_name_becomes_the_models_own_table() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = write_project(dir.path());
+
+            let resolved = super::super::resolve_archive_model_target(&config, Some("orders"))
+                .expect("a declared model resolves");
+            assert_eq!(
+                resolved.as_deref(),
+                Some("wh.marts.orders_v2"),
+                "the plan must name the table the MODEL declares, not the string typed"
+            );
+        }
+
+        /// The negative control, and the reason this is not just a rename: an
+        /// unknown name is REFUSED rather than passed through. Passing it
+        /// through would emit `DELETE FROM <name>` against whatever the
+        /// warehouse's search path resolves — a destructive statement nobody
+        /// reviewed.
+        #[test]
+        fn an_unknown_model_name_is_refused_not_passed_through() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = write_project(dir.path());
+
+            let err = super::super::resolve_archive_model_target(&config, Some("ghost"))
+                .expect_err("an undeclared model must refuse");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("no model by that name"),
+                "the refusal says what is wrong: {msg}"
+            );
+        }
+
+        /// Two shapes that must NOT change. A fully qualified name is kept
+        /// verbatim so an operator can still name a table directly, and the
+        /// project-wide archive (no `--model`) names no table at all.
+        #[test]
+        fn a_fully_qualified_name_and_the_project_wide_archive_are_unchanged() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = write_project(dir.path());
+
+            assert_eq!(
+                super::super::resolve_archive_model_target(&config, Some("wh.raw.events"))
+                    .unwrap()
+                    .as_deref(),
+                Some("wh.raw.events"),
+            );
+            assert_eq!(
+                super::super::resolve_archive_model_target(&config, None).unwrap(),
+                None,
+                "the project-wide archive names no table and must not start"
+            );
+        }
+    }
+
     use super::*;
 
     /// Policy-gate parity coverage for `archive apply` (PR-1). Archive is the
