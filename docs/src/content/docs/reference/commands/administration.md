@@ -993,6 +993,7 @@ rocky state clear-schema-cache [--dry-run] # flush the DESCRIBE cache
 rocky state retention sweep [--dry-run]    # trim the history tables
 rocky state schedule pause <pipeline>      # hold a pipeline's schedule
 rocky state schedule resume <pipeline>     # release the hold
+rocky state schedule spool                 # list queued webhook demands
 ```
 
 ### Subcommands
@@ -1003,6 +1004,7 @@ rocky state schedule resume <pipeline>     # release the hold
 | `clear-schema-cache` | Flush the `DESCRIBE TABLE` schema cache. See [`rocky state clear-schema-cache`](#rocky-state-clear-schema-cache). |
 | `retention sweep` | Delete history rows that fall outside `[state.retention]`. See [`rocky state retention sweep`](#rocky-state-retention-sweep). |
 | `schedule pause` / `schedule resume` | Hold or release one pipeline's schedule at runtime. See [`rocky state schedule`](#rocky-state-schedule). |
+| `schedule spool` | List webhook demands accepted but not yet run. See [`rocky state schedule`](#rocky-state-schedule). |
 
 ### State-path resolution
 
@@ -1105,18 +1107,19 @@ The sweep only trims history. Two guardrails bound it:
 
 ## `rocky state schedule`
 
-Hold or release one pipeline's schedule at runtime. A hold is durable: it lives in the state store, not in `rocky.toml`.
+Hold or release one pipeline's schedule at runtime, or list the webhook demands waiting to run. A hold is durable: it lives in the state store, not in `rocky.toml`.
 
 ```bash
 rocky state schedule pause <pipeline>
 rocky state schedule resume <pipeline>
+rocky state schedule spool
 ```
 
 ### Arguments
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `pipeline` | `string` | **(required)** | The pipeline whose schedule to pause or resume. |
+| `pipeline` | `string` | **(required for `pause` and `resume`)** | The pipeline whose schedule to pause or resume. `spool` takes no argument -- it lists every queued demand. |
 
 ### Flags
 
@@ -1146,9 +1149,47 @@ A pause reaches a running scheduler immediately. Editing `[schedule] enabled` in
 
 `resume` re-enables autonomous runs, so it is deliberately human-only. Agents get the `pause_schedule` MCP tool and no matching resume.
 
+### Queued webhook demands (`spool`)
+
+`rocky state schedule spool` lists the webhook demands the ingress accepted and no tick has consumed yet. Read it when a webhook was delivered and its pipeline never ran.
+
+`rocky state schedule status` and `GET /api/v1/schedule` cannot answer that question. They report *claims*, and a claim exists only once a tick has picked a demand up, so a demand still sitting in the queue appears in neither.
+
+```
+   POST /api/v1/hooks/trigger/<pipeline>
+                │
+                ▼  accepted, written to .rocky/pending-demands
+   ┌──────────────────────────┐
+   │  the spool  ────────────────▶  rocky state schedule spool
+   └────────────┬─────────────┘        (this command: what is WAITING)
+                │ a tick claims it
+                ▼
+   ┌──────────────────────────┐
+   │  a claim  ──────────────────▶  GET /api/v1/schedule
+   └──────────────────────────┘        (what is IN FLIGHT)
+```
+
+Consumed demands are excluded: a `.done` tombstone is the 24-hour duplicate-suppression window for `kind = id`, not outstanding work.
+
+An entry the command cannot read is reported under `skipped` with a reason, never dropped -- it is still a demand blocking the queue. `counts.corrupt` reports files a previous tick quarantined.
+
+A spool directory that is **present but unreadable is an error**, not an empty list. "Nothing is queued" and "we cannot tell" must never look the same: that conflation once let every wrapper see a healthy tick while webhook demand was silently not firing. A spool that is simply absent is fine and reports an empty queue -- no webhook has ever been accepted for that project.
+
+`token` is the duplicate-suppression key. For `kind = id` it is caller-supplied text, taken verbatim from the delivery header and never interpreted by Rocky, so anything rendering it must treat it as inert text. It is listed because it is what you match against your provider's own delivery log.
+
+```bash
+rocky state schedule spool --output table
+```
+
+```
+Webhook spool: /srv/analytics/.rocky/pending-demands
+
+  4f1c...  orders  id  token 8a72-delivery  received 2026-09-10T10:00:00+00:00
+```
+
 ### Related Commands
 
-- [`rocky serve`](/reference/commands/development/#rocky-serve) -- the resident process a hold controls
+- [`rocky serve`](/reference/commands/development/#rocky-serve) -- the resident process a hold controls, and the webhook ingress that fills the spool
 - [`rocky mcp`](/reference/commands/ai/#rocky-mcp) -- the agent-facing `pause_schedule` tool
 
 ---

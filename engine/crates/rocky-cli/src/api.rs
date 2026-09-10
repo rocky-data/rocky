@@ -110,7 +110,8 @@ use crate::output::{
     ColumnLineageOutput, CompileOutput, DagExecutionOutput, DagLayersOutput, DagNodeResultOutput,
     DagNodeStatusOutput, DagOutput, DagStatusOutput, ErrorEnvelope, HealthOutput, HistoryOutput,
     JobKind, JobState, JobStatus, LineageOutput, MetaOutput, MetricsOutput, ModelColumnOutput,
-    ModelDetailOutput, ModelHistoryOutput, ModelListEntry, ModelListOutput, ScheduleStatusOutput,
+    ModelDetailOutput, ModelHistoryOutput, ModelListEntry, ModelListOutput, ScheduleSpoolOutput,
+    ScheduleStatusOutput,
     TypedColumnOutput, cap_model_sql,
 };
 
@@ -184,6 +185,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/jobs/apply", post(submit_apply))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/schedule", get(schedule_status))
+        .route("/api/v1/schedule/spool", get(schedule_spool))
         .route("/api/v1/policy", get(policy_show))
         .route("/api/v1/products", get(list_products))
         .route("/api/v1/products/{name}", get(get_product))
@@ -2114,6 +2116,54 @@ async fn schedule_status(
     })
     .await?
     .map_err(|e| map_schedule_err(e, running_job_id))?;
+    Ok(PrettyJson(output))
+}
+
+/// `GET /api/v1/schedule/spool`: the webhook demands accepted but not yet
+/// consumed — the same bytes as `rocky state schedule spool --output json`.
+///
+/// [`schedule_status`] reports claims, which exist only once a tick has picked
+/// a demand up, so a queued demand appears nowhere in `GET /api/v1/schedule`.
+/// This is the other half.
+///
+/// Fail-closed: a spool directory that is present but unreadable is a `500`,
+/// never an empty list. An absent spool is `200` with nothing pending — no
+/// webhook has ever been accepted for this project.
+///
+/// Takes no state-store permit. The spool is plain files under `.rocky`, so
+/// this read never touches redb and cannot be blocked by a running job; the
+/// filesystem work runs on a blocking thread.
+async fn schedule_spool(
+    State(state): State<Arc<ServerState>>,
+) -> Result<PrettyJson<ScheduleSpoolOutput>, ApiError> {
+    let Some(config_path) = state.config_path.clone() else {
+        return Err(ApiError::engine_not_ready());
+    };
+
+    let output = tokio::task::spawn_blocking(move || {
+        crate::commands::compute_schedule_spool(&config_path)
+    })
+    .await
+    .map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("the spool read panicked: {e}"),
+            None,
+        )
+    })?
+    .map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "spool_unreadable",
+            e.to_string(),
+            Some(
+                "inspect the spool directory's permissions — queued webhook \
+                 demands cannot be counted while it is unreadable",
+            ),
+        )
+    })?;
+
     Ok(PrettyJson(output))
 }
 

@@ -1,0 +1,141 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "SpoolCounts": {
+      "description": "Roll-up counts over a spool listing.",
+      "properties": {
+        "corrupt": {
+          "description": "Files already quarantined as corrupt by a previous tick. These are not in `pending` or `skipped` — the queue has set them aside — but a non-zero count means demands were accepted and never ran.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "pending": {
+          "description": "Outstanding demands reported in `pending`.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "skipped": {
+          "description": "Entries in `skipped`.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "corrupt",
+        "pending",
+        "skipped"
+      ],
+      "type": "object"
+    },
+    "SpoolPendingEntry": {
+      "description": "One demand accepted by the webhook ingress and not yet consumed.",
+      "properties": {
+        "body_hash": {
+          "description": "blake3 hex of the raw request body.",
+          "type": "string"
+        },
+        "demand_uid": {
+          "description": "The uid minted at acceptance. This is the claim-key discriminator and the join key to a claim in [`ScheduleStatusOutput`] once a tick picks the demand up.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "`id` or `body` — which dedup discipline the demand was accepted under.",
+          "type": "string"
+        },
+        "pipeline": {
+          "description": "The target pipeline. Validated against the config before acceptance, so this always names a pipeline that existed when the demand arrived.",
+          "type": "string"
+        },
+        "received_at": {
+          "description": "When the ingress accepted the demand.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "token": {
+          "description": "The raw dedup token.\n\nFor `kind = id` this is **caller-supplied text**, taken verbatim from the delivery header and never interpreted by the engine; for `kind = body` it is a copy of `body_hash`. Present because it is the dedup key an operator needs when a webhook appears stuck.\n\nBecause a caller controls it, a consumer must render it as inert text. The browser UI does: React escapes by default and no production component uses `dangerouslySetInnerHTML` (`engine/ui/src/components.tsx`), with the pattern in `SamplePanel.test.tsx` pinning a hostile string as text and never as an element.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "body_hash",
+        "demand_uid",
+        "kind",
+        "pipeline",
+        "received_at",
+        "token"
+      ],
+      "type": "object"
+    },
+    "SpoolSkippedEntry": {
+      "description": "A spool entry this listing could not report, and why.",
+      "properties": {
+        "detail": {
+          "description": "The underlying detail, for an operator deciding what to do with the file.",
+          "type": "string"
+        },
+        "file": {
+          "description": "The file name within the spool directory. Only the name, not the full path, which `spool_path` already carries.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why it was skipped: `unreadable` (the file could not be read), `malformed` (its JSON did not parse), or `bad_timestamp` (its `received_at` is not a valid RFC3339 instant).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "detail",
+        "file",
+        "reason"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky state schedule spool`, mirrored by `GET /api/v1/schedule/spool`.\n\nThe webhook spool is the queue of demands accepted by the ingress but not yet consumed by a tick. [`ScheduleStatusOutput`] is blind to it: that snapshot reports *claims*, which exist only once a tick has picked a demand up, so a demand sitting here appears nowhere in `GET /api/v1/schedule`. This output is the missing half — what has been accepted and is still waiting.\n\n**Pending only.** Consumed demands are excluded: `.done` tombstones are the 24h idempotency window for `kind = id`, not outstanding work. Already quarantined files are excluded from `pending` too and counted in `counts.corrupt`.\n\n**Fail-closed on an unreadable spool.** A spool directory that is present but cannot be read is an error, never an empty list. That distinction is the whole bug class behind #1710/#1752/#1731: a present-but-unreadable spool that read as empty let every wrapper see a healthy tick while the webhook demand source was silently not firing. An *absent* spool is different and is fine — it means no webhook has ever been accepted here.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "counts": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/SpoolCounts"
+        }
+      ],
+      "description": "Roll-up counts over this listing."
+    },
+    "pending": {
+      "description": "Outstanding demands, oldest first, tie-broken by `demand_uid` so the order is total. Empty when nothing is queued.\n\nThis is arrival order, which is **not** the order a tick consumes them in: a spool file is named for the blake3 of its `(pipeline, kind, token)` dedup tuple, so the tick's sorted-by-filename walk is deterministic but unrelated to time. Arrival order is what an operator triaging a stuck queue needs.",
+      "items": {
+        "$ref": "#/definitions/SpoolPendingEntry"
+      },
+      "type": "array"
+    },
+    "skipped": {
+      "description": "Entries that could not be reported, with the reason for each. Never silently dropped — a demand this command cannot read is still a demand blocking the queue, and staying quiet about it is the #1731 failure one level up.",
+      "items": {
+        "$ref": "#/definitions/SpoolSkippedEntry"
+      },
+      "type": "array"
+    },
+    "spool_path": {
+      "description": "The spool directory this listing was read from (`<project>/.rocky/pending-demands`).\n\nSurfaced for the same reason [`ScheduleHoldOutput`] names its state file: a `serve --scheduler` rooted at a different project has a different spool, and reading the wrong one must not look like an empty queue.",
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "counts",
+    "pending",
+    "skipped",
+    "spool_path",
+    "version"
+  ],
+  "title": "ScheduleSpoolOutput",
+  "type": "object"
+}

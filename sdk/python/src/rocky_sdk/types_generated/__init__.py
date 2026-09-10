@@ -341,8 +341,12 @@ _LAZY: dict[str, tuple[str, str]] = {
     "SchedulePipelineStatus": ("schedule_status_schema", "SchedulePipelineStatus"),
     "ScheduleStatusCounts": ("schedule_status_schema", "ScheduleStatusCounts"),
     "ScheduleHoldOutput": ("state_schedule_hold_schema", "ScheduleHoldOutput"),
+    "ScheduleSpoolOutput": ("schedule_spool_schema", "ScheduleSpoolOutput"),
     "ScheduleStatusOutput": ("schedule_status_schema", "ScheduleStatusOutput"),
     "ScheduleThrottleStatus": ("schedule_status_schema", "ScheduleThrottleStatus"),
+    "SpoolCounts": ("schedule_spool_schema", "SpoolCounts"),
+    "SpoolPendingEntry": ("schedule_spool_schema", "SpoolPendingEntry"),
+    "SpoolSkippedEntry": ("schedule_spool_schema", "SpoolSkippedEntry"),
     "ScorecardGroup": ("audit_scorecard_schema", "ScorecardGroup"),
     "ScorecardUnavailableMetric": ("audit_scorecard_schema", "ScorecardUnavailableMetric"),
     "SeedOutput": ("seed_schema", "SeedOutput"),
@@ -789,6 +793,12 @@ if TYPE_CHECKING:
         ReviewQueueEntry,
         ReviewQueueOutput,
     )
+    from .schedule_spool_schema import (
+        ScheduleSpoolOutput,
+        SpoolCounts,
+        SpoolPendingEntry,
+        SpoolSkippedEntry,
+    )
     from .schedule_status_schema import (
         ScheduleClaimStatus,
         ScheduleLockStatus,
@@ -1102,8 +1112,12 @@ __all__ = [
     "SchedulePipelineStatus",
     "ScheduleStatusCounts",
     "ScheduleHoldOutput",
+    "ScheduleSpoolOutput",
     "ScheduleStatusOutput",
     "ScheduleThrottleStatus",
+    "SpoolCounts",
+    "SpoolPendingEntry",
+    "SpoolSkippedEntry",
     "ScorecardGroup",
     "ScorecardUnavailableMetric",
     "PolicyCheckOutput",
