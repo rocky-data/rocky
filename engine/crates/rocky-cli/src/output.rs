@@ -8113,27 +8113,59 @@ pub struct PolicyFreezeInForce {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PolicyFreezeSources {
     /// How the decision ledger was read.
-    ///
-    /// - `"read"` — a local backend, read in full.
-    /// - `"absent"` — a local backend with no state store yet. Proven absent,
-    ///   not assumed: a path that exists but cannot be read is an error.
-    /// - `"local_mirror"` — a remote `[state]` backend. What was read is the
-    ///   local mirror, which may be stale or empty; the remote authority was
-    ///   NOT downloaded, because this is a read-only route and the download
-    ///   replaces the local ledger. A freeze recorded by another pod can be
-    ///   missing here while an apply, which does download first, still denies.
-    /// - `"not_consulted"` — no `[policy]` block, so nothing is in force and
-    ///   the enforcement gate reads no ledger either.
-    pub ledger: String,
+    pub ledger: PolicyLedgerSource,
     /// How the durable freeze markers were read.
-    ///
-    /// - `"read"` — the `[state]` backend has a durable object tier, read in
-    ///   full. Reads are NOT gated on `freeze_marker_writes`: that flag gates
-    ///   writes only, and an existing marker stays enforced after it is turned
-    ///   off, so a reader that honoured it would hide a live freeze.
-    /// - `"not_configured"` — the backend keeps no durable object tier.
-    /// - `"not_consulted"` — no `[policy]` block, as above.
-    pub markers: String,
+    pub markers: PolicyMarkerSource,
+}
+
+/// How the decision ledger was read for a policy report.
+///
+/// An enum rather than a string because a consumer BRANCHES on it: the text
+/// renderer prints the incomplete-freeze-list warning on `LocalMirror` alone.
+/// As a bare string the producer and that branch were joined by nothing —
+/// renaming the written value compiled fine and silently retired the warning,
+/// with the tests on both ends still green (#1909).
+///
+/// The wire form is unchanged: the same four snake_case strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyLedgerSource {
+    /// A local backend, read in full.
+    Read,
+    /// A local backend with no state store yet. Proven absent, not assumed: a
+    /// path that exists but cannot be read is an error.
+    Absent,
+    /// A remote `[state]` backend. What was read is the local mirror, which
+    /// may be stale or empty; the remote authority was NOT downloaded, because
+    /// this is a read-only route and the download replaces the local ledger. A
+    /// freeze recorded by another pod can be missing here while an apply,
+    /// which does download first, still denies.
+    LocalMirror,
+    /// No `[policy]` block, so nothing is in force and the enforcement gate
+    /// reads no ledger either.
+    NotConsulted,
+}
+
+/// How the durable freeze markers were read for a policy report.
+///
+/// A separate enum from [`PolicyLedgerSource`], not a shared one: the two
+/// answer different questions and only two of their values coincide. A shared
+/// enum would let a match on the ledger claim to handle `NotConfigured`, which
+/// a ledger read cannot produce.
+///
+/// The wire form is unchanged: the same three snake_case strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyMarkerSource {
+    /// The `[state]` backend has a durable object tier, read in full. Reads
+    /// are NOT gated on `freeze_marker_writes`: that flag gates writes only,
+    /// and an existing marker stays enforced after it is turned off, so a
+    /// reader that honoured it would hide a live freeze.
+    Read,
+    /// The backend keeps no durable object tier.
+    NotConfigured,
+    /// No `[policy]` block, as above.
+    NotConsulted,
 }
 
 /// JSON output for `rocky audit` — the agent-policy decision ledger.
@@ -11027,6 +11059,57 @@ pub struct JobStatus {
     /// shape is the `run` / `plan` / `apply` schema selected by
     /// [`kind`](Self::kind).
     pub result: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod policy_freeze_source_tests {
+    //! #1909. The two source fields became enums so a consumer that BRANCHES
+    //! on them cannot be silently detached from the producer. The claim that
+    //! bought is "the wire form does not move" — and nothing else pins it.
+    //!
+    //! These are the exact strings the fields carried as `String`, and they
+    //! are what the exported schema, the generated Pydantic models and the
+    //! generated TypeScript all enumerate. A renamed variant, an added one, or
+    //! a lost `#[serde(rename_all = "snake_case")]` changes the bytes on
+    //! `GET /api/v1/policy` for every existing client.
+    use super::*;
+
+    fn wire<T: Serialize>(value: &T) -> String {
+        serde_json::to_value(value)
+            .expect("serializes")
+            .as_str()
+            .expect("a unit variant is a JSON string")
+            .to_string()
+    }
+
+    #[test]
+    fn every_ledger_source_keeps_the_string_it_had() {
+        assert_eq!(wire(&PolicyLedgerSource::Read), "read");
+        assert_eq!(wire(&PolicyLedgerSource::Absent), "absent");
+        assert_eq!(wire(&PolicyLedgerSource::LocalMirror), "local_mirror");
+        assert_eq!(wire(&PolicyLedgerSource::NotConsulted), "not_consulted");
+    }
+
+    #[test]
+    fn every_marker_source_keeps_the_string_it_had() {
+        assert_eq!(wire(&PolicyMarkerSource::Read), "read");
+        assert_eq!(wire(&PolicyMarkerSource::NotConfigured), "not_configured");
+        assert_eq!(wire(&PolicyMarkerSource::NotConsulted), "not_consulted");
+    }
+
+    /// The whole struct, so a field rename is caught too — the enums pin the
+    /// values, this pins the keys they sit under.
+    #[test]
+    fn the_freeze_sources_object_is_byte_identical_to_the_string_version() {
+        let sources = PolicyFreezeSources {
+            ledger: PolicyLedgerSource::LocalMirror,
+            markers: PolicyMarkerSource::NotConfigured,
+        };
+        assert_eq!(
+            serde_json::to_string(&sources).expect("serializes"),
+            r#"{"ledger":"local_mirror","markers":"not_configured"}"#,
+        );
+    }
 }
 
 #[cfg(test)]

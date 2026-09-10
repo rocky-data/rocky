@@ -137,23 +137,60 @@ class PolicyEffect19(StrEnum):
     deny = "deny"
 
 
-class PolicyFreezeSources(BaseModel):
+class PolicyLedgerSource1(StrEnum):
     """
-    Which freeze sources the report read.
+    A local backend, read in full.
     """
 
-    ledger: str
-    """
-    How the decision ledger was read.
+    read = "read"
 
-    - `"read"` — a local backend, read in full. - `"absent"` — a local backend with no state store yet. Proven absent, not assumed: a path that exists but cannot be read is an error. - `"local_mirror"` — a remote `[state]` backend. What was read is the local mirror, which may be stale or empty; the remote authority was NOT downloaded, because this is a read-only route and the download replaces the local ledger. A freeze recorded by another pod can be missing here while an apply, which does download first, still denies. - `"not_consulted"` — no `[policy]` block, so nothing is in force and the enforcement gate reads no ledger either.
-    """
-    markers: str
-    """
-    How the durable freeze markers were read.
 
-    - `"read"` — the `[state]` backend has a durable object tier, read in full. Reads are NOT gated on `freeze_marker_writes`: that flag gates writes only, and an existing marker stays enforced after it is turned off, so a reader that honoured it would hide a live freeze. - `"not_configured"` — the backend keeps no durable object tier. - `"not_consulted"` — no `[policy]` block, as above.
+class PolicyLedgerSource2(StrEnum):
     """
+    A local backend with no state store yet. Proven absent, not assumed: a path that exists but cannot be read is an error.
+    """
+
+    absent = "absent"
+
+
+class PolicyLedgerSource3(StrEnum):
+    """
+    A remote `[state]` backend. What was read is the local mirror, which may be stale or empty; the remote authority was NOT downloaded, because this is a read-only route and the download replaces the local ledger. A freeze recorded by another pod can be missing here while an apply, which does download first, still denies.
+    """
+
+    local_mirror = "local_mirror"
+
+
+class PolicyLedgerSource4(StrEnum):
+    """
+    No `[policy]` block, so nothing is in force and the enforcement gate reads no ledger either.
+    """
+
+    not_consulted = "not_consulted"
+
+
+class PolicyMarkerSource1(StrEnum):
+    """
+    The `[state]` backend has a durable object tier, read in full. Reads are NOT gated on `freeze_marker_writes`: that flag gates writes only, and an existing marker stays enforced after it is turned off, so a reader that honoured it would hide a live freeze.
+    """
+
+    read = "read"
+
+
+class PolicyMarkerSource2(StrEnum):
+    """
+    The backend keeps no durable object tier.
+    """
+
+    not_configured = "not_configured"
+
+
+class PolicyMarkerSource3(StrEnum):
+    """
+    No `[policy]` block, as above.
+    """
+
+    not_consulted = "not_consulted"
 
 
 class PolicyPrincipal11(StrEnum):
@@ -219,6 +256,26 @@ class PolicyFreezeInForce(BaseModel):
     source: str
     """
     `"ledger"` (a `rocky policy freeze` decision) or `"marker"` (a durable freeze marker in the remote object tier).
+    """
+
+
+class PolicyFreezeSources(BaseModel):
+    """
+    Which freeze sources the report read.
+    """
+
+    ledger: (
+        PolicyLedgerSource1
+        | PolicyLedgerSource2
+        | PolicyLedgerSource3
+        | PolicyLedgerSource4
+    )
+    """
+    How the decision ledger was read.
+    """
+    markers: PolicyMarkerSource1 | PolicyMarkerSource2 | PolicyMarkerSource3
+    """
+    How the durable freeze markers were read.
     """
 
 

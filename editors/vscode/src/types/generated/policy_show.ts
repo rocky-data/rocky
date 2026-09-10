@@ -12,6 +12,22 @@
  */
 export type PolicyEffect = "allow" | "require_review" | "deny";
 /**
+ * How the decision ledger was read for a policy report.
+ *
+ * An enum rather than a string because a consumer BRANCHES on it: the text renderer prints the incomplete-freeze-list warning on `LocalMirror` alone. As a bare string the producer and that branch were joined by nothing — renaming the written value compiled fine and silently retired the warning, with the tests on both ends still green (#1909).
+ *
+ * The wire form is unchanged: the same four snake_case strings.
+ */
+export type PolicyLedgerSource = "read" | "absent" | "local_mirror" | "not_consulted";
+/**
+ * How the durable freeze markers were read for a policy report.
+ *
+ * A separate enum from [`PolicyLedgerSource`], not a shared one: the two answer different questions and only two of their values coincide. A shared enum would let a match on the ledger claim to handle `NotConfigured`, which a ledger read cannot produce.
+ *
+ * The wire form is unchanged: the same three snake_case strings.
+ */
+export type PolicyMarkerSource = "read" | "not_configured" | "not_consulted";
+/**
  * Who is attempting an action.
  *
  * `agent` is a non-human caller (an AI harness authoring, applying, or remediating). `human` is a person. In v0 the principal is supplied explicitly (`rocky policy check --principal …`); auto-detection is a later phase.
@@ -79,16 +95,12 @@ export interface PolicyRulesOutput {
 export interface PolicyFreezeSources {
   /**
    * How the decision ledger was read.
-   *
-   * - `"read"` — a local backend, read in full. - `"absent"` — a local backend with no state store yet. Proven absent, not assumed: a path that exists but cannot be read is an error. - `"local_mirror"` — a remote `[state]` backend. What was read is the local mirror, which may be stale or empty; the remote authority was NOT downloaded, because this is a read-only route and the download replaces the local ledger. A freeze recorded by another pod can be missing here while an apply, which does download first, still denies. - `"not_consulted"` — no `[policy]` block, so nothing is in force and the enforcement gate reads no ledger either.
    */
-  ledger: string;
+  ledger: PolicyLedgerSource;
   /**
    * How the durable freeze markers were read.
-   *
-   * - `"read"` — the `[state]` backend has a durable object tier, read in full. Reads are NOT gated on `freeze_marker_writes`: that flag gates writes only, and an existing marker stays enforced after it is turned off, so a reader that honoured it would hide a live freeze. - `"not_configured"` — the backend keeps no durable object tier. - `"not_consulted"` — no `[policy]` block, as above.
    */
-  markers: string;
+  markers: PolicyMarkerSource;
   [k: string]: unknown;
 }
 /**
