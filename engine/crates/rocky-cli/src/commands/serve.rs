@@ -936,6 +936,51 @@ mod tests {
         );
     }
 
+    /// **The producer-to-consumer wire for the settings snapshot.** The route
+    /// tests build a `SettingsSnapshot` by hand, so none of them would notice
+    /// if `build_serve_state` ignored its `host` argument or hard-coded a
+    /// posture — the fields would be written by tests and never by the CLI.
+    ///
+    /// A settings route that names a host the server is not bound to is worse
+    /// than no route: an operator reads `bind_host` to decide whether the
+    /// server is exposed. So this crosses the real function and asserts on the
+    /// snapshot the handler actually projects.
+    #[tokio::test]
+    async fn the_flags_reach_the_settings_snapshot() {
+        let models = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../rocky-compiler/tests/fixtures/simple_project/models");
+
+        for (host, scheduler) in [("127.0.0.1", false), ("0.0.0.0", false)] {
+            let state = build_serve_state(
+                &models,
+                false,
+                None,
+                None,
+                host,
+                Some("s3cret".to_string()),
+                None,
+                Vec::new(),
+                false,
+                // Passed WITHOUT `--ui`, so the guard never exists and the
+                // reported list must stay empty.
+                vec!["example.test".to_string()],
+                scheduler,
+                None,
+            )
+            .expect("a well-formed serve builds a state");
+
+            assert_eq!(
+                state.settings.bind_host, host,
+                "the snapshot must report the host the listener binds"
+            );
+            assert_eq!(state.settings.scheduler, scheduler);
+            assert!(
+                state.ui.is_none(),
+                "no --ui, so there is no host guard to report"
+            );
+        }
+    }
+
     /// **The producer-to-consumer wire.** Everything else here tests one half:
     /// the router tests build a `ServeToken::read_only` by hand, and the
     /// pairing tests call the private helper with an already-parsed
