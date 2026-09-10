@@ -2,11 +2,13 @@
 //! what their producer seam returns.
 //!
 //! The seams (`compute_trace`, `compute_cost`, `compute_compliance`) exist so
-//! a server route can serve the same document the CLI prints. That is only
-//! true while `run_*` is "call the seam, print it". These tests spawn the
-//! real binary and compare its stdout against the seam's own serialisation,
-//! so a `run_*` that stops going through its seam, or serialises differently,
-//! fails here rather than drifting silently.
+//! a server route can serve the same document the CLI prints. These tests
+//! spawn the real binary and compare its stdout against the seam's own
+//! serialisation, byte for byte. What they pin is the equality: a `run_*`
+//! that serialises differently, or a seam whose document drifts from what
+//! the CLI prints, fails here. They cannot see whether `run_*` calls the
+//! seam or reproduces its bytes another way; only the bytes are the
+//! contract a route needs.
 
 use std::path::Path;
 use std::process::Command;

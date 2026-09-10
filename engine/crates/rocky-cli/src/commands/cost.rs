@@ -14,9 +14,10 @@
 //! live `rocky run` path reports `None` for BQ today.
 //!
 //! Adapter type is resolved by loading `rocky.toml` at the configured
-//! path. If the config can't be read the command still succeeds and
-//! emits `adapter_type: None` / `cost_usd: None`; durations and byte
-//! counts are still useful on their own.
+//! path. If the config is absent the command still succeeds and emits
+//! `adapter_type: None` / `cost_usd: None`; durations and byte counts
+//! are still useful on their own. A config that is there but does not
+//! load is an error: a wrong price is worse than no price.
 //!
 //! Re-execution with pinned inputs is a follow-up; this command is
 //! inspection-only.
