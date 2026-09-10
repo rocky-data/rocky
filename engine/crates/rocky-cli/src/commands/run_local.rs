@@ -327,7 +327,7 @@ pub async fn run_transformation(
     let audit_ctx =
         super::run_audit::AuditContext::detect(idempotency_key.map(str::to_string), None);
     let audit = super::run::audit_to_record(&audit_ctx);
-    super::run::persist_run_record(
+    let custody = super::run::RecordCustody::from_persisted(super::run::persist_run_record(
         state_store.as_ref(),
         &output,
         run_id,
@@ -335,7 +335,7 @@ pub async fn run_transformation(
         config_hash,
         &audit,
         pipeline_name,
-    );
+    ));
 
     // Stamp the terminal status onto the emitted payload so a JSON
     // consumer reads it directly instead of re-deriving from counts. A
@@ -382,7 +382,7 @@ pub async fn run_transformation(
     // `PartialFailure` (some models built). The JSON `RunOutput` was
     // already emitted above, so a consumer keying on `status` / `errors`
     // sees the failure; this just propagates the non-zero exit code.
-    super::run::run_status_exit_result(&output, run_id)
+    super::run::run_status_exit_result(&output, run_id, custody)
 }
 
 /// Builds the quality pipeline's `row_count` check from the count query's
