@@ -146,32 +146,37 @@ pub fn run_branch_delete(state_path: &Path, name: &str, json: bool) -> Result<()
 }
 
 /// `rocky branch list` — list every branch in the state store.
-pub fn run_branch_list(state_path: &Path, json: bool) -> Result<()> {
+pub fn compute_branch_list(state_path: &Path) -> Result<BranchListOutput> {
     let store = StateStore::open_read_only(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
     let records = store.list_branches()?;
+    let entries: Vec<BranchEntry> = records.iter().map(to_entry).collect();
+    let total = entries.len();
+    Ok(BranchListOutput {
+        version: VERSION.to_string(),
+        command: "branch list".to_string(),
+        branches: entries,
+        total,
+    })
+}
+
+/// `rocky branch list`: [`compute_branch_list`], rendered as JSON or text.
+pub fn run_branch_list(state_path: &Path, json: bool) -> Result<()> {
+    let output = compute_branch_list(state_path)?;
 
     if json {
-        let entries: Vec<BranchEntry> = records.iter().map(to_entry).collect();
-        let total = entries.len();
-        let output = BranchListOutput {
-            version: VERSION.to_string(),
-            command: "branch list".to_string(),
-            branches: entries,
-            total,
-        };
         println!("{}", serde_json::to_string_pretty(&output)?);
-    } else if records.is_empty() {
+    } else if output.branches.is_empty() {
         println!("no branches");
     } else {
-        println!("branches ({}):", records.len());
-        for b in &records {
+        println!("branches ({}):", output.total);
+        for b in &output.branches {
             print!("  {}  schema_prefix={}", b.name, b.schema_prefix);
             if let Some(desc) = &b.description {
                 print!("  ({desc})");
             }
-            println!("  by {} at {}", b.created_by, b.created_at.to_rfc3339());
+            println!("  by {} at {}", b.created_by, b.created_at);
         }
     }
     Ok(())
@@ -1546,7 +1551,7 @@ fn compile_result_to_project_ir(result: &rocky_compiler::compile::CompileResult)
 }
 
 /// `rocky branch show <name>` — inspect a single branch.
-pub fn run_branch_show(state_path: &Path, name: &str, json: bool) -> Result<()> {
+pub fn compute_branch_show(state_path: &Path, name: &str) -> Result<BranchOutput> {
     let store = StateStore::open_read_only(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
@@ -1554,19 +1559,27 @@ pub fn run_branch_show(state_path: &Path, name: &str, json: bool) -> Result<()> 
         .get_branch(name)?
         .with_context(|| format!("branch '{name}' not found"))?;
 
+    Ok(BranchOutput {
+        version: VERSION.to_string(),
+        command: "branch show".to_string(),
+        branch: to_entry(&record),
+    })
+}
+
+/// `rocky branch show <name>`: [`compute_branch_show`], rendered as JSON
+/// or text.
+pub fn run_branch_show(state_path: &Path, name: &str, json: bool) -> Result<()> {
+    let output = compute_branch_show(state_path, name)?;
+
     if json {
-        let output = BranchOutput {
-            version: VERSION.to_string(),
-            command: "branch show".to_string(),
-            branch: to_entry(&record),
-        };
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        println!("branch: {}", record.name);
-        println!("schema_prefix: {}", record.schema_prefix);
-        println!("created_by: {}", record.created_by);
-        println!("created_at: {}", record.created_at.to_rfc3339());
-        if let Some(desc) = &record.description {
+        let b = &output.branch;
+        println!("branch: {}", b.name);
+        println!("schema_prefix: {}", b.schema_prefix);
+        println!("created_by: {}", b.created_by);
+        println!("created_at: {}", b.created_at);
+        if let Some(desc) = &b.description {
             println!("description: {desc}");
         }
     }
@@ -4406,6 +4419,34 @@ adapter = "default"
                 .expect("filter must succeed");
         assert_eq!(planned.len(), 1, "filter must keep only the matching model");
         assert_eq!(planned[0].prod.table, "fct_orders");
+    }
+
+    /// `run_branch_list` and `run_branch_show --output json` are their seams
+    /// plus one `println!` each; this pins the producers both callers share.
+    #[test]
+    fn compute_branch_list_and_show_serve_the_store() {
+        let tmp = TempDir::new().unwrap();
+        let state_path = tmp.path().join("state.redb");
+        run_branch_create(&state_path, "fix-price", Some("a description"), true).unwrap();
+
+        let list = compute_branch_list(&state_path).unwrap();
+        assert_eq!(list.command, "branch list");
+        assert_eq!(list.total, 1);
+        assert_eq!(list.branches.len(), 1);
+        assert_eq!(list.branches[0].name, "fix-price");
+        assert_eq!(
+            list.branches[0].description.as_deref(),
+            Some("a description")
+        );
+
+        let show = compute_branch_show(&state_path, "fix-price").unwrap();
+        assert_eq!(show.command, "branch show");
+        assert_eq!(show.branch.name, "fix-price");
+        assert_eq!(show.branch.schema_prefix, list.branches[0].schema_prefix);
+        assert_eq!(show.branch.created_at, list.branches[0].created_at);
+
+        let err = compute_branch_show(&state_path, "nope").unwrap_err();
+        assert!(err.to_string().contains("branch 'nope' not found"), "{err}");
     }
 }
 

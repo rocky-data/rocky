@@ -109,8 +109,9 @@ pub use backfill::run_backfill;
 #[cfg(feature = "duckdb")]
 pub use bench::run_bench;
 pub use branch::{
-    run_branch_approve, run_branch_compare, run_branch_create, run_branch_delete, run_branch_list,
-    run_branch_promote, run_branch_promote_from_plan, run_branch_show,
+    compute_branch_list, compute_branch_show, run_branch_approve, run_branch_compare,
+    run_branch_create, run_branch_delete, run_branch_list, run_branch_promote,
+    run_branch_promote_from_plan, run_branch_show,
 };
 pub use brief::{BriefSince, compute_brief, run_brief};
 pub use catalog::{
@@ -130,15 +131,15 @@ pub use discover::discover;
 pub use docs::run_docs;
 pub use doctor::doctor;
 pub use emit_sql::run_emit_sql;
-pub use estimate::run_estimate;
+pub use estimate::{EstimateReport, compute_estimate, run_estimate};
 pub use export_openapi::export_openapi;
 pub use export_schemas::{export_schemas, schemas_hash};
 pub use fmt::run_fmt;
 pub use fulfill_api::propose_governed_run_plan;
 pub use gc::{run_gc_derivable, run_gc_plan};
 pub use history::{
-    history_runs_output, history_runs_output_filtered, model_history_output, recipe_history_output,
-    run_history,
+    history_run_output, history_runs_output, history_runs_output_filtered, model_history_output,
+    recipe_history_output, run_history,
 };
 pub use hooks::{run_hooks_list, run_hooks_test};
 pub use import_dbt::run_import_dbt;
@@ -160,7 +161,9 @@ pub use plan::{
     plan_promote, populate_governance_actions,
 };
 pub use playground::{run_playground, run_playground_with_template};
-pub use policy::{run_policy_check, run_policy_freeze, run_policy_test};
+pub use policy::{
+    compute_policy_check, compute_policy_test, run_policy_check, run_policy_freeze, run_policy_test,
+};
 pub use preview::{
     PreviewDiffAlgorithmSelector, run_preview_cost, run_preview_create, run_preview_diff,
 };
@@ -174,7 +177,10 @@ pub use product::{
 pub use profile::run_profile;
 pub use profile_storage::run_profile_storage;
 pub use publish_ir::run_publish_ir;
-pub use replay::{run_replay, run_replay_check, run_replay_execute, run_replay_execute_warehouse};
+pub use replay::{
+    compute_replay_check, run_replay, run_replay_check, run_replay_execute,
+    run_replay_execute_warehouse,
+};
 pub use restore::run_restore_plan;
 pub use retention_status::run_retention_status;
 pub use review::{
