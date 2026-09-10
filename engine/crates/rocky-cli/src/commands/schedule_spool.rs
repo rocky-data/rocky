@@ -7,11 +7,15 @@
 //! has no claim, so it appears nowhere in `GET /api/v1/schedule`. This is the
 //! other half of that picture.
 //!
-//! The config is **not** loaded here. All this read needs is the project root,
-//! and a pending demand records the pipeline that was validated when it was
-//! accepted — which the config may since have renamed or removed. Reporting
-//! the stored value is honest about what will be attempted; re-validating it
-//! against today's config would answer a different question.
+//! The document is **config-independent**: this producer never parses
+//! `rocky.toml`, and uses `config_path` only to locate the project root. (The
+//! CLI front end separately attempts a load for every command, in
+//! `resolve_state_namespace`, and swallows the error — so a project whose
+//! config does not parse still gets a spool listing.) A pending demand records
+//! the pipeline that was validated when it was accepted, which the config may
+//! since have renamed or removed. Reporting the stored value is honest about
+//! what will be attempted; re-validating it against today's config would
+//! answer a different question.
 
 use std::path::Path;
 
@@ -48,6 +52,20 @@ pub fn compute_schedule_spool(
 ) -> Result<ScheduleSpoolOutput, ScheduleSpoolError> {
     let rocky_dir = crate::commands::scheduler::rocky_dir_for_config(config_path);
     let spool_path = spool::spool_dir(&rocky_dir);
+
+    // Report an ABSOLUTE path. The default `--config` is the relative
+    // `rocky.toml`, so the derivation yields `./.rocky/pending-demands` and two
+    // servers rooted at different projects would report the identical string —
+    // which defeats the whole point of naming the spool, the way
+    // `ScheduleHoldOutput` names its state file.
+    //
+    // `std::path::absolute` is lexical plus the cwd: it does NOT resolve
+    // symlinks. That is deliberate. A spool that IS a symlink must still be
+    // reported as the path the operator configured, and canonicalising would
+    // also fail outright on the dangling-symlink case this command reports as
+    // unreadable.
+    let reported_path = std::path::absolute(spool_path.as_path())
+        .unwrap_or_else(|_| spool_path.as_path().to_path_buf());
 
     // Fail-closed: `list_pending_files` distinguishes an ABSENT spool (`Ok`,
     // empty — no webhook has ever been accepted here) from a present one it
@@ -127,7 +145,7 @@ pub fn compute_schedule_spool(
     skipped.sort_by(|a, b| a.file.cmp(&b.file));
 
     Ok(ScheduleSpoolOutput::new(
-        spool_path.display().to_string(),
+        reported_path.display().to_string(),
         pending,
         skipped,
         corrupt,
@@ -382,6 +400,60 @@ mod tests {
             "the detail names the offending value: {}",
             out.skipped[0].detail
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_entry_is_labelled_unreadable_not_malformed() {
+        // The two reasons have different fixes: `malformed` means the file's
+        // JSON is wrong, `unreadable` means the bytes never arrived. A
+        // mutation that labelled every read failure `malformed` survived
+        // until this test existed, because the only entry-error case covered
+        // was bad JSON.
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, config) = project();
+        let path = spool_one(&dir, "orders", "good", "2026-09-10T10:00:00Z");
+
+        // A pending file with no read permission: present, listed, unreadable.
+        let bad = path.with_file_name("unreadable-entry");
+        std::fs::write(&bad, b"{}").unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let out = compute_schedule_spool(&config).unwrap();
+
+        // Running as root defeats a mode-0 file; skip rather than assert a
+        // falsehood about the environment.
+        if out.counts.skipped == 0 {
+            return;
+        }
+        assert_eq!(out.counts.pending, 1, "the healthy demand is still listed");
+        assert_eq!(out.skipped[0].file, "unreadable-entry");
+        assert_eq!(
+            out.skipped[0].reason, "unreadable",
+            "a byte-level read failure must not be reported as bad JSON"
+        );
+    }
+
+    #[test]
+    fn the_reported_spool_path_is_absolute() {
+        // A relative `--config` (the default) derives `./.rocky`, so two
+        // servers rooted at different projects would report the identical
+        // string and a wrong-instance read would look like an empty queue.
+        let (dir, _config) = project();
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let out = compute_schedule_spool(std::path::Path::new("rocky.toml"));
+        std::env::set_current_dir(prev).unwrap();
+
+        let out = out.unwrap();
+        assert!(
+            std::path::Path::new(&out.spool_path).is_absolute(),
+            "spool_path must be absolute, got {}",
+            out.spool_path
+        );
+        assert!(out.spool_path.ends_with("pending-demands"));
     }
 
     #[test]

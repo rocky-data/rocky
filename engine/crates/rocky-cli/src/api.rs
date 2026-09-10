@@ -5805,6 +5805,80 @@ mod tests {
         assert_eq!(api.pipelines[0].cron, reference.pipelines[0].cron);
     }
 
+    /// The route returns the producer's document, whole. Unlike
+    /// `schedule_status`, this output carries no `now`, so every byte is
+    /// comparable — a handler that reshaped, filtered or fabricated any part
+    /// of it fails here.
+    #[tokio::test]
+    async fn schedule_spool_matches_the_backing_output() {
+        let (dir, config_path, state) = scheduled_project();
+        let rocky_dir = dir.path().join(".rocky");
+
+        // Two queued demands and one file that will not parse, so the
+        // comparison covers `pending`, `skipped` and `counts` at once.
+        for (token, at) in [
+            ("delivery-2", "2026-09-10T11:00:00Z"),
+            ("delivery-1", "2026-09-10T10:00:00Z"),
+        ] {
+            rocky_core::schedule::spool::accept(
+                &rocky_dir,
+                "sales",
+                rocky_core::schedule::spool::WebhookKind::Id,
+                token,
+                "deadbeef",
+                chrono::DateTime::parse_from_rfc3339(at)
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            )
+            .unwrap();
+        }
+        std::fs::write(rocky_dir.join("pending-demands/notjson"), b"{ not json").unwrap();
+
+        let base = spawn_router(state).await;
+        let resp = get_retrying_on_busy(&format!("{base}/api/v1/schedule/spool")).await;
+        assert_eq!(resp.status(), 200);
+        let api: serde_json::Value = resp.json().await.unwrap();
+
+        let reference = crate::commands::compute_schedule_spool(&config_path).unwrap();
+        let reference = serde_json::to_value(&reference).unwrap();
+
+        assert_eq!(api, reference, "the route reshaped the producer's document");
+        assert_eq!(api["counts"]["pending"], 2);
+        assert_eq!(api["counts"]["skipped"], 1);
+    }
+
+    /// An unreadable spool is `500 spool_unreadable`, never `200` with an
+    /// empty queue. The producer fails closed; this pins that the route does
+    /// not undo it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn schedule_spool_reports_an_unreadable_spool_as_500() {
+        let (dir, _config_path, state) = scheduled_project();
+        let rocky_dir = dir.path().join(".rocky");
+        std::fs::create_dir_all(&rocky_dir).unwrap();
+        // Present (a dangling symlink), but impossible to enumerate.
+        std::os::unix::fs::symlink(
+            dir.path().join("nowhere"),
+            rocky_dir.join("pending-demands"),
+        )
+        .unwrap();
+
+        let base = spawn_router(state).await;
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/api/v1/schedule/spool"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            500,
+            "an unreadable spool must not answer 200"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], "spool_unreadable");
+    }
+
     const POLICY_PROJECT_CONFIG: &str = "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
          [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
          [pipeline.p.target.governance]\nauto_create_schemas = true\n\n\

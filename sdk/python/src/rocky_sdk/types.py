@@ -1360,6 +1360,7 @@ from .types_generated import (  # noqa: E402, F401
     ReviewStatusOutput,
     RunHistoryRecord,
     RunOutput,
+    ScheduleSpoolOutput,
     SignatureAlgorithm,
     SkippedDemandOutput,
     SourceEvaluation,
@@ -1466,6 +1467,7 @@ RockyOutput = (
     | PlanResult
     | StateResult
     | ClearSchemaCacheOutput
+    | ScheduleSpoolOutput
     | CompileResult
     | ModelLineageResult
     | ColumnLineageResult
@@ -1518,6 +1520,7 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "plan": PlanResult,
     "state": StateResult,
     "state-clear-schema-cache": ClearSchemaCacheOutput,
+    "state-schedule-spool": ScheduleSpoolOutput,
     "compile": CompileResult,
     "test": TestResult,
     "ci": CiResult,

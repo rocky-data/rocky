@@ -2951,10 +2951,9 @@ enum ScheduleAction {
     },
     /// List the webhook demands accepted but not yet consumed by a tick.
     ///
-    /// `rocky state schedule status` (and `GET /api/v1/schedule`) reports
-    /// claims, which exist only after a tick picks a demand up — so a demand
-    /// queued here is invisible there. Read this when a webhook was delivered
-    /// and its pipeline never ran.
+    /// `GET /api/v1/schedule` reports claims, which exist only after a tick
+    /// picks a demand up — so a demand queued here is invisible there. Read
+    /// this when a webhook was delivered and its pipeline never ran.
     ///
     /// A spool that is present but unreadable is an error, not an empty list:
     /// "nothing is queued" and "we cannot tell" must never look the same.

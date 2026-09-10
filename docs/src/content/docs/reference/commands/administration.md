@@ -1153,7 +1153,7 @@ A pause reaches a running scheduler immediately. Editing `[schedule] enabled` in
 
 `rocky state schedule spool` lists the webhook demands the ingress accepted and no tick has consumed yet. Read it when a webhook was delivered and its pipeline never ran.
 
-`rocky state schedule status` and `GET /api/v1/schedule` cannot answer that question. They report *claims*, and a claim exists only once a tick has picked a demand up, so a demand still sitting in the queue appears in neither.
+`GET /api/v1/schedule` cannot answer that question. It reports *claims*, and a claim exists only once a tick has picked a demand up, so a demand still sitting in the queue appears nowhere in it. (That route is API-only; there is no `rocky state schedule status` verb.)
 
 ```
    POST /api/v1/hooks/trigger/<pipeline>
