@@ -389,7 +389,7 @@ mod tests {
         let d = dialect();
         let mut ir = rocky_core::models::parse_model_inline(
             "---toml\n[target]\ncatalog = \"wh\"\nschema = \"marts\"\n---\n\nSELECT order_id FROM upstream",
-            "fct_orders.sql",
+            std::path::Path::new("fct_orders.sql"),
             None,
         )
         .unwrap()
@@ -417,7 +417,7 @@ mod tests {
         let d = dialect();
         let mut ir = rocky_core::models::parse_model_inline(
             "---toml\n[target]\ncatalog = \"wh\"\nschema = \"marts\"\n---\n\nSELECT order_id FROM upstream",
-            "fct_orders.sql",
+            std::path::Path::new("fct_orders.sql"),
             None,
         )
         .unwrap()

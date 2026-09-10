@@ -5004,8 +5004,17 @@ pub async fn run(
         });
     }
 
+    // Set when an inline drain hits `fail_fast` or the error-rate threshold.
+    // The drain cannot abort the loop it runs inside, so it returns the cause
+    // and the abort happens here (#1724).
+    let mut drain_abort: Option<AbortCause> = None;
+    let abort_policy = AbortPolicy {
+        fail_fast,
+        error_rate_abort_pct,
+    };
+
     for (idx, task) in tables_to_process.iter().enumerate() {
-        if interrupted || freeze_withheld.is_some() {
+        if interrupted || freeze_withheld.is_some() || drain_abort.is_some() {
             break;
         }
 
@@ -5015,7 +5024,7 @@ pub async fn run(
         // spawning and collection, enabling the AIMD feedback loop.
         if throttle.is_some() {
             while let Some(completed) = join_set.try_join_next() {
-                process_completed_result(
+                let decision = process_completed_result(
                     completed,
                     &tables_to_process,
                     &throttle,
@@ -5041,8 +5050,30 @@ pub async fn run(
                     &shared_state,
                     &shared_run_id,
                     &mut total_completed,
+                    &abort_policy,
                 )
                 .await;
+                if let DrainDecision::AbortRemaining(cause) = decision {
+                    match cause {
+                        AbortCause::FailFast => {
+                            warn!("fail_fast: a table failed, aborting remaining tables")
+                        }
+                        AbortCause::ErrorRate {
+                            observed_pct,
+                            threshold_pct,
+                        } => warn!(
+                            error_rate = observed_pct,
+                            threshold = threshold_pct,
+                            "error rate exceeded threshold, aborting remaining tables"
+                        ),
+                    }
+                    join_set.abort_all();
+                    drain_abort = Some(cause);
+                    break;
+                }
+            }
+            if drain_abort.is_some() {
+                break;
             }
         }
 
@@ -5101,6 +5132,13 @@ pub async fn run(
     // hard-exit watcher and flips `interrupted = true`; tasks already in
     // flight keep running and their results are still collected below.
     loop {
+        // An inline drain already aborted every remaining task. Joining them
+        // would collect one cancellation per table as a fresh "task failed"
+        // error — noise the final drain's own abort path avoids by breaking
+        // rather than draining (#1724).
+        if drain_abort.is_some() {
+            break;
+        }
         let result = tokio::select! {
             res = join_set.join_next() => match res {
                 Some(r) => r,
@@ -14177,6 +14215,45 @@ async fn collect_materialized_table(
 
 /// Processes a single completed task result during the spawn loop's inline
 /// drain pass (adaptive concurrency only). This avoids duplicating the
+/// The two `[execution]` settings that can stop a run before its last table.
+///
+/// Carried as its own struct rather than threading the whole pipeline config:
+/// these are the only two fields an inline drain's decision depends on, and a
+/// wider struct would let a later edit reach settings this path has no business
+/// reading.
+pub(crate) struct AbortPolicy {
+    pub fail_fast: bool,
+    pub error_rate_abort_pct: u32,
+}
+
+/// Why a drain asked its caller to stop the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AbortCause {
+    /// `[execution] fail_fast` — the first failed table ends the run.
+    FailFast,
+    /// `[execution] error_rate_abort_pct` — too many of the completions so far
+    /// failed. Both numbers are carried so the log says what tripped it.
+    ErrorRate {
+        observed_pct: u32,
+        threshold_pct: u32,
+    },
+}
+
+/// What the caller must do after a drain collected one completion.
+///
+/// The inline drain runs INSIDE the spawn loop and does not own the `JoinSet`
+/// the caller is still feeding, so it cannot abort that loop itself. Returning
+/// the decision is what lets `fail_fast` and `error_rate_abort_pct` act from
+/// this path at all (#1724) — acting here would abort a set the caller is
+/// still adding to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrainDecision {
+    /// Nothing about this completion stops the run.
+    Continue,
+    /// Stop spawning and abort every table still in flight.
+    AbortRemaining(AbortCause),
+}
+
 /// result-handling logic from the main collection loop for results that
 /// arrive while we're still spawning tasks.
 ///
@@ -14184,14 +14261,19 @@ async fn collect_materialized_table(
 /// place a `TableResult` is consumed (#1718). The other three arms — pruned,
 /// failed and panicked — stay here: they are not a `TableResult`.
 ///
-/// The failed arm now matches the final drain on the two things an operator
-/// sees: the warehouse auth framing on `TableErrorOutput.error`, and the
-/// `materialize_error` hook (#1724). Two differences remain, and they are
-/// structural rather than oversights — an inline drain inside the spawn loop
-/// cannot break that loop, so neither `fail_fast`'s `abort_all` nor the
-/// `error_rate_abort_pct` check can act from here. Closing those means
-/// returning a decision to the caller instead of acting, which is a different
-/// change; it is tracked on #1724.
+/// The failed arm matches the final drain on the two things an operator sees:
+/// the warehouse auth framing on `TableErrorOutput.error`, and the
+/// `materialize_error` hook (#1724, first half).
+///
+/// The remaining two differences were structural — an inline drain inside the
+/// spawn loop cannot break that loop — so it returns a [`DrainDecision`]
+/// instead of acting, and the caller aborts. `fail_fast` and
+/// `error_rate_abort_pct` are therefore live on this path too, which under the
+/// default `ConcurrencyMode::Adaptive` is the path most tables take.
+///
+/// The order matches the final drain exactly: `fail_fast` is asked first and
+/// wins, then the error rate is checked on every completion — not only on a
+/// failed one, because a success moves the denominator.
 #[allow(clippy::too_many_arguments)]
 async fn process_completed_result(
     result: Result<(usize, Result<TableOutcome, anyhow::Error>), tokio::task::JoinError>,
@@ -14205,8 +14287,10 @@ async fn process_completed_result(
     shared_state: &Arc<StateStore>,
     shared_run_id: &str,
     total_completed: &mut usize,
-) {
+    policy: &AbortPolicy,
+) -> DrainDecision {
     *total_completed += 1;
+    let mut failed = false;
 
     match result {
         Ok((idx, Ok(TableOutcome::Pruned(pruned)))) => {
@@ -14259,7 +14343,10 @@ async fn process_completed_result(
                     rocky_core::state::TableStatus::Skipped,
                 )
                 .await;
-                return;
+                // A missing source table is a skip, not a failure: it enters no
+                // error and must not move the rate. The final drain's own
+                // `continue` past its rate check is the behaviour mirrored here.
+                return DrainDecision::Continue;
             }
 
             let table_key = tables_to_process
@@ -14333,6 +14420,7 @@ async fn process_completed_result(
                 failure_kind,
                 cooldown_seconds,
             });
+            failed = true;
         }
         Err(e) => {
             let msg = format!("task failed: {e}");
@@ -14361,8 +14449,25 @@ async fn process_completed_result(
                 failure_kind: FailureKind::Unknown,
                 cooldown_seconds: None,
             });
+            failed = true;
         }
     }
+
+    if failed && policy.fail_fast {
+        return DrainDecision::AbortRemaining(AbortCause::FailFast);
+    }
+    // Same guards as the final drain: the threshold is opt-in, and a rate over
+    // fewer than four completions is too noisy to act on.
+    if policy.error_rate_abort_pct > 0 && *total_completed >= 4 {
+        let observed_pct = (table_errors.len() as f64 / *total_completed as f64 * 100.0) as u32;
+        if observed_pct >= policy.error_rate_abort_pct {
+            return DrainDecision::AbortRemaining(AbortCause::ErrorRate {
+                observed_pct,
+                threshold_pct: policy.error_rate_abort_pct,
+            });
+        }
+    }
+    DrainDecision::Continue
 }
 
 /// Returns `true` if the error message indicates a warehouse rate limit.
@@ -17636,6 +17741,10 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                 &store,
                 "run-1",
                 &mut total_completed,
+                &AbortPolicy {
+                    fail_fast: false,
+                    error_rate_abort_pct: 0,
+                },
             )
             .await;
         }
@@ -22793,6 +22902,10 @@ timestamp_column = "ts"
             &state,
             "run-1",
             &mut total_completed,
+            &AbortPolicy {
+                fail_fast: false,
+                error_rate_abort_pct: 0,
+            },
         )
         .await;
 
@@ -26461,8 +26574,9 @@ backend = "local"
     #[test]
     fn content_addressed_dispatch_ir_is_typed() {
         let content = "---toml\nname = \"ca_events\"\n\n[strategy]\ntype = \"content_addressed\"\nstorage_prefix = \"s3://bucket/ca_events\"\n\n[target]\ncatalog = \"analytics\"\nschema = \"marts\"\ntable = \"ca_events\"\n---\n\nSELECT 1 AS id, 'a' AS name\n";
-        let model = rocky_core::models::parse_model_inline(content, "ca_events.sql", None)
-            .expect("parse content-addressed model");
+        let model =
+            rocky_core::models::parse_model_inline(content, Path::new("ca_events.sql"), None)
+                .expect("parse content-addressed model");
         assert!(
             model.to_model_ir().skip_hash().is_none(),
             "bare to_model_ir() has no typed columns — the regression shape"
@@ -28264,22 +28378,34 @@ auto_create_schemas = true
         );
     }
 
-    /// GUARANTEE-BOUNDARY parity (intentional, not a latent bug): for a read
-    /// Rocky cannot statically resolve — a CTE / anything `lineage_is_provably_
-    /// complete` rejects, i.e. an "uncertain" model — containment behaves
-    /// *identically* to a normal fail-fast run. Under `--parallel 2` a same-layer
-    /// uncertain reader of a failed producer materializes on stale data in BOTH
-    /// modes; that is a pre-existing property of parallel fail-fast, not a
-    /// containment regression.
+    /// Containment ⊆ fail-fast, on a CTE read — and **the boundary moved**
+    /// under it (#1867).
     ///
-    /// This test locks the achievable invariant — **containment never
-    /// materializes anything fail-fast wouldn't** (containment ⊆ fail-fast) — by
-    /// running the same project twice under `--parallel 2`, once with
-    /// `contain_failures = false` and once `= true`, and asserting identical
-    /// materialization sets. It will catch a future change that either
-    /// over-contains (would false-fail healthy CTE projects) or regresses below
-    /// fail-fast. Declaring the dependency via `ref()` lifts the read into the
-    /// resolved, guaranteed set (covered by the resolved-read tests above).
+    /// The invariant this test locks is unchanged: run the same project twice
+    /// under `--parallel 2`, once with `contain_failures = false` and once
+    /// `= true`, and the materialization sets must be identical. It catches a
+    /// change that either over-contains (false-failing healthy CTE projects) or
+    /// regresses below fail-fast.
+    ///
+    /// What changed is the fixture's outcome, and it changed for the better.
+    /// This used to assert that `rollup` **builds** in both modes, on the
+    /// reasoning that its CTE read of the failed producer's target was
+    /// unenumerable, so nothing could order the two and a same-layer reader
+    /// materialized on stale data. That was the documented best-effort
+    /// boundary. Since #1867 the read inside a `WITH` body reaches
+    /// `referenced_tables`, so `derive_physical_edges` matches it against
+    /// `stage_orders`'s target `(main, orders_current)` and
+    /// `augment_physical_read_edges` puts the two in different layers. The
+    /// producer fails, so `rollup` is now withheld — in both modes.
+    ///
+    /// So the assertion is inverted deliberately: `rollup` must NOT build. That
+    /// is exactly the failure #1867 describes (a reader running before its
+    /// producer and reading stale data), and the old assertion pinned it as
+    /// acceptable because nothing could see the read.
+    ///
+    /// Declaring the dependency via `ref()` still lifts the read into the
+    /// resolved, guaranteed set (covered by the resolved-read tests above);
+    /// that path is unchanged and remains the hard guarantee.
     #[cfg(feature = "duckdb")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn containment_matches_fail_fast_for_same_layer_uncertain_read() {
@@ -28309,18 +28435,24 @@ auto_create_schemas = true
         assert_eq!(
             mat_set(&out_ff),
             mat_set(&out_ct),
-            "containment must not materialize anything fail-fast wouldn't for a same-layer \
-             uncertain (CTE) read — the achievable containment ⊆ fail-fast invariant"
+            "containment must not materialize anything fail-fast wouldn't for a CTE read — \
+             the achievable containment ⊆ fail-fast invariant"
         );
         assert!(
-            mat_set(&out_ct).contains("rollup"),
-            "the unenumerable (CTE) reader builds in BOTH modes — the documented best-effort \
-             boundary (declare the dep via ref() for a hard guarantee)"
+            !mat_set(&out_ct).contains("rollup"),
+            "the CTE reader must NOT build on the failed producer's stale target: the read \
+             inside the WITH body is visible since #1867, so the physical-edge derivation \
+             orders the two and the producer's failure withholds the reader; got {:?}",
+            mat_set(&out_ct)
         );
+        // The reader is now withheld for a reason containment can NAME, where
+        // before it was built and the staleness was invisible. Whether that
+        // shows up on `contained` is containment's own bookkeeping; what this
+        // pins is that it is not silently materialized.
         assert!(
-            out_ct.contained.is_empty(),
-            "a same-layer uncertain read is fail-fast parity, NOT over-contained: {:?}",
-            out_ct.contained
+            !mat_set(&out_ff).contains("rollup"),
+            "fail-fast withholds it too, so the two modes agree for the same reason: {:?}",
+            mat_set(&out_ff)
         );
     }
 
@@ -35816,6 +35948,142 @@ timestamp_column = "ts"
         }
     }
 
+    /// #1724: the inline drain returns the abort decision instead of acting,
+    /// so `fail_fast` finally reaches the path that collects most tables under
+    /// the default `ConcurrencyMode::Adaptive`.
+    ///
+    /// Four cases in one, because what matters is that each setting fires on
+    /// exactly its own trigger — a decision that always aborts would satisfy
+    /// any single case.
+    #[tokio::test]
+    async fn the_inline_drain_returns_the_abort_decision_for_both_settings() {
+        async fn decide(
+            outcome: Result<(usize, Result<TableOutcome, anyhow::Error>), tokio::task::JoinError>,
+            policy: &AbortPolicy,
+            prior_errors: usize,
+            prior_completed: usize,
+        ) -> DrainDecision {
+            let dir = tempfile::tempdir().unwrap();
+            let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+            let hook_registry = HookRegistry::from_config(&Default::default());
+            let tasks = vec![column_match_task(vec![], vec![])];
+            state
+                .init_run_progress(
+                    "run-1",
+                    &tasks.iter().map(table_key).collect::<Vec<_>>(),
+                    Some(&test_resume_scope("p1")),
+                )
+                .unwrap();
+
+            let semaphore = Semaphore::new(8);
+            let mut semaphore_capacity = 8;
+            let mut output = RunOutput::new(String::new(), 0, 1);
+            let mut pending_checks = HashMap::new();
+            let (mut source_refs, mut target_refs, mut freshness_refs) =
+                (Vec::new(), Vec::new(), Vec::new());
+            let mut batch_asset_keys = Vec::new();
+            let mut assertion_targets = Vec::new();
+            let (mut deferred_tags, mut deferred_watermarks) = (Vec::new(), Vec::new());
+            // Stand in for the failures already collected this run: the rate is
+            // errors over completions, so both sides have to be primed.
+            let mut table_errors: Vec<TableError> = (0..prior_errors)
+                .map(|_| TableError {
+                    asset_key: vec![],
+                    error: "earlier failure".to_string(),
+                    task_index: None,
+                    failure_kind: FailureKind::Unknown,
+                    cooldown_seconds: None,
+                })
+                .collect();
+            let mut total_completed = prior_completed;
+
+            process_completed_result(
+                outcome,
+                &tasks,
+                &None,
+                &semaphore,
+                &mut semaphore_capacity,
+                &mut MaterializedSinks {
+                    output: &mut output,
+                    pending_checks: &mut pending_checks,
+                    source_batch_refs: &mut source_refs,
+                    target_batch_refs: &mut target_refs,
+                    freshness_batch_refs: &mut freshness_refs,
+                    batch_asset_keys: &mut batch_asset_keys,
+                    assertion_targets: &mut assertion_targets,
+                    deferred_tags: &mut deferred_tags,
+                    deferred_watermarks: &mut deferred_watermarks,
+                },
+                &TableHookContext {
+                    registry: &hook_registry,
+                    run_id: "run-1",
+                    pipeline_name: "p1",
+                },
+                &mut table_errors,
+                &state,
+                "run-1",
+                &mut total_completed,
+                policy,
+            )
+            .await
+        }
+
+        let fail_fast = AbortPolicy {
+            fail_fast: true,
+            error_rate_abort_pct: 0,
+        };
+        let rate_50 = AbortPolicy {
+            fail_fast: false,
+            error_rate_abort_pct: 50,
+        };
+        let failure = || Ok((0usize, Err(anyhow::anyhow!("the warehouse said no"))));
+
+        assert_eq!(
+            decide(failure(), &fail_fast, 0, 0).await,
+            DrainDecision::AbortRemaining(AbortCause::FailFast),
+            "a failed table under fail_fast must stop the run from this path too",
+        );
+
+        // The success arm is the guard against a decision that always aborts.
+        assert_eq!(
+            decide(
+                Ok((
+                    0,
+                    Ok(TableOutcome::Pruned(PrunedTable {
+                        asset_key: vec!["t".into()],
+                        source_schema: "raw".into(),
+                        table_name: "orders".into(),
+                    })),
+                )),
+                &fail_fast,
+                0,
+                0,
+            )
+            .await,
+            DrainDecision::Continue,
+            "fail_fast reacts to a failure, not to every completion",
+        );
+
+        // Three prior errors + this one over four completions = 100%.
+        assert_eq!(
+            decide(failure(), &rate_50, 3, 3).await,
+            DrainDecision::AbortRemaining(AbortCause::ErrorRate {
+                observed_pct: 100,
+                threshold_pct: 50,
+            }),
+            "the error-rate abort must see the inline drain's completions",
+        );
+
+        // The same failure below the four-completion floor must NOT abort —
+        // that guard is what keeps one early failure from ending a large run,
+        // and it is the half a decision that always aborts would break.
+        assert_eq!(
+            decide(failure(), &rate_50, 1, 1).await,
+            DrainDecision::Continue,
+            "under four completions the rate is too noisy to act on",
+        );
+    }
+
     /// #1724. The inline drain's ERROR arm must match the final drain on the
     /// two things an operator sees: the warehouse-auth framing, and the
     /// `materialize_error` hook.
@@ -35916,6 +36184,10 @@ timestamp_column = "ts"
             &state,
             "run-1",
             &mut total_completed,
+            &AbortPolicy {
+                fail_fast: false,
+                error_rate_abort_pct: 0,
+            },
         )
         .await;
 
@@ -35989,6 +36261,10 @@ timestamp_column = "ts"
             &state,
             "run-1",
             &mut total_completed,
+            &AbortPolicy {
+                fail_fast: false,
+                error_rate_abort_pct: 0,
+            },
         )
         .await;
 
