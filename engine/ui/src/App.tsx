@@ -104,19 +104,65 @@ export function EnginePanel({
       return <StatusCard label="engine" value="unreachable" tone="risk" sub={state.message} />;
     case "ready": {
       const { meta } = state;
+      const count = meta.capabilities.length;
+      const capabilities = meta.capabilities.join(", ");
+      // One line, not three cards. It still proves the whole path works —
+      // embedded assets, token bootstrap, bearer header, typed payload — but
+      // it stops spending the top of every screen saying so. The full
+      // capability list moves into a tooltip, the idiom the governor tabs
+      // already use for their producer routes.
       return (
-        <div className="grid gap-3 sm:grid-cols-3">
-          <StatusCard label="engine" value={meta.engine_version} tone="ok" sub="rocky serve" />
-          <StatusCard label="state schema" value={`v${meta.state_schema_version}`} />
-          <StatusCard
-            label="capabilities"
-            value={meta.capabilities.length}
-            sub={meta.capabilities.join(", ")}
-          />
-        </div>
+        <p className="text-xs text-zinc-600 dark:text-zinc-300">
+          <span className="font-medium text-zinc-900 dark:text-zinc-100">
+            rocky {meta.engine_version}
+          </span>
+          <Dot />
+          state schema v{meta.state_schema_version}
+          <Dot />
+          {/*
+            The names reach a mouse through `title` and assistive technology
+            through `aria-describedby`. The description element is `hidden`,
+            so it is not a second node in the reading order: an otherwise
+            unused `title` already becomes the accessible description, and an
+            `sr-only` sibling would then be announced twice.
+          */}
+          <span title={capabilities} aria-describedby="engine-capabilities">
+            {count} {count === 1 ? "capability" : "capabilities"}
+          </span>
+          <span id="engine-capabilities" hidden>
+            {capabilities}
+          </span>
+        </p>
       );
     }
   }
+}
+
+/** The separator between the engine line's three facts. */
+function Dot() {
+  return <span className="px-1.5 text-zinc-400 dark:text-zinc-600">·</span>;
+}
+
+/**
+ * What the page is when this tab holds no token.
+ *
+ * It is the whole page, not a banner above one: every lane's panels read the
+ * API, and without a token each read is a refusal the viewer can do nothing
+ * about. Four `REFUSED (401)` cards under a "no token" notice describe the
+ * same single fact four times and read as a broken install.
+ */
+function NoToken() {
+  return (
+    <EmptyState
+      title="No token for this tab"
+      detail={
+        <>
+          Open the address <code>rocky serve --ui</code> printed. It carries the token in its
+          fragment, which this page reads once and then clears from the address bar.
+        </>
+      }
+    />
+  );
 }
 
 /** What each lane shows. */
@@ -141,16 +187,28 @@ function LaneScreen({
   }
 }
 
+/**
+ * The shell: the lane nav, the engine line, and the selected lane.
+ *
+ * The token check is **one boundary here**, above `LaneScreen`, rather than a
+ * gate inside each lane. A lane cannot gate itself: returning after its
+ * `useResource` calls is too late, the loads have already started, and
+ * returning before them makes the hooks conditional. One boundary is also the
+ * only shape that stays true when a fourth lane is added — a per-lane gate
+ * would let that lane fire requests nobody notices.
+ */
 export function App({
   engine,
   estate,
   review,
   governor,
+  token = currentToken(sessionStorage),
 }: {
   engine?: ReactNode;
   estate?: ReactNode;
   review?: ReactNode;
   governor?: ReactNode;
+  token?: string | null;
 }) {
   const lane = useLane();
   return (
@@ -181,19 +239,20 @@ export function App({
             </nav>
           </div>
         </header>
-        <main className="mx-auto max-w-6xl space-y-6 px-4 py-6">
-          <section aria-label="Engine">
-            <h1 className="mb-3 text-sm font-medium uppercase tracking-wide text-zinc-500">
-              Engine
-            </h1>
-            {engine ?? <EnginePanel />}
-          </section>
-          <LaneScreen
-            lane={lane}
-            estate={estate ?? <EstateScreen />}
-            review={review ?? <ReviewScreen />}
-            governor={governor ?? <GovernorScreen />}
-          />
+        <main className="mx-auto max-w-6xl space-y-4 px-4 py-6">
+          {token === null ? (
+            <NoToken />
+          ) : (
+            <>
+              <section aria-label="Engine">{engine ?? <EnginePanel />}</section>
+              <LaneScreen
+                lane={lane}
+                estate={estate ?? <EstateScreen />}
+                review={review ?? <ReviewScreen />}
+                governor={governor ?? <GovernorScreen />}
+              />
+            </>
+          )}
         </main>
       </div>
     </ErrorBoundary>
