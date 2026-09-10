@@ -55,8 +55,9 @@ use super::claim::{
     sweep_terminal_claim,
 };
 use super::demand::{
-    Demand, EvaluatedPipeline, HistoryError, ResolvedSchedule, RunHistoryView, RunSuccess,
-    ScheduleConfigError, ScheduleStateView, SkipReason, SourceSkip, evaluate_one, resolve_schedule,
+    CursorError, Demand, EvaluatedPipeline, HistoryError, ResolvedSchedule, RunHistoryView,
+    RunSuccess, ScheduleConfigError, ScheduleStateView, SkipReason, SourceSkip, evaluate_one,
+    resolve_schedule,
 };
 use super::lock::{TickAcquire, TickLock};
 use super::record::{ScheduleStateMutation, ScheduleStateRecord};
@@ -820,12 +821,15 @@ async fn consume_webhook_demands(
 struct StoreState<'a>(&'a StateStore);
 
 impl ScheduleStateView for StoreState<'_> {
-    fn get(&self, pipeline: &str) -> ScheduleStateRecord {
-        self.0
-            .get_schedule_state(pipeline)
-            .ok()
-            .flatten()
-            .unwrap_or_default()
+    fn get(&self, pipeline: &str) -> Result<ScheduleStateRecord, CursorError> {
+        // `Ok(None)` is "never evaluated" and IS the default cursor. A store
+        // fault is not, and the `.ok().flatten().unwrap_or_default()` this
+        // replaces made the two the same value (#1877).
+        match self.0.get_schedule_state(pipeline) {
+            Ok(Some(record)) => Ok(record),
+            Ok(None) => Ok(ScheduleStateRecord::default()),
+            Err(e) => Err(CursorError(e.to_string())),
+        }
     }
 }
 
@@ -1043,7 +1047,12 @@ fn map_skip(pipeline: &str, skip: &SourceSkip) -> Option<SkippedDemand> {
             resume_at: *resume_at,
         },
         // Recorded, never elided — a read fault must be visible in the report.
-        SkipReason::HistoryError => TickSkipReason::HistoryUnavailable,
+        // Same frozen-contract name as the history fault: both are "a store
+        // read fault made the classification unreliable, surfaced loudly". The
+        // reason set mirrors the tick contract and is asserted against
+        // `span_attrs::SCHEDULER_SKIP_REASONS`, so a new variant here would be
+        // a user-visible change for no gain in what an operator can do.
+        SkipReason::HistoryError | SkipReason::CursorError => TickSkipReason::HistoryUnavailable,
     };
     Some(SkippedDemand {
         pipeline: pipeline.to_string(),

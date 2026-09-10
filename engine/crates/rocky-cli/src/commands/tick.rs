@@ -466,7 +466,7 @@ fn map_source_skip(skip: &SourceSkip) -> SourceEvaluation {
         SkipReason::FailureBackoff { resume_at } => ("failure_backoff", Some(*resume_at), None),
         SkipReason::PartialBackoff { resume_at } => ("partial_backoff", Some(*resume_at), None),
         SkipReason::Superseded => ("superseded", None, None),
-        SkipReason::HistoryError => ("history_unavailable", None, None),
+        SkipReason::HistoryError | SkipReason::CursorError => ("history_unavailable", None, None),
     };
     SourceEvaluation {
         source: demand_kind_str(skip.source).to_string(),
