@@ -5837,14 +5837,21 @@ mod tests {
         let base = spawn_router(state).await;
         let resp = get_retrying_on_busy(&format!("{base}/api/v1/schedule/spool")).await;
         assert_eq!(resp.status(), 200);
-        let api: serde_json::Value = resp.json().await.unwrap();
+        // Raw bytes, not a parsed value: `PrettyJson` is `to_string_pretty`
+        // plus a newline, so the response is byte-comparable with the
+        // producer's own serialisation. Comparing parsed values would accept a
+        // route that reordered or reformatted the document.
+        let api = resp.text().await.unwrap();
 
         let reference = crate::commands::compute_schedule_spool(&config_path).unwrap();
-        let reference = serde_json::to_value(&reference).unwrap();
+        let reference_bytes = serde_json::to_string_pretty(&reference).unwrap() + "\n";
 
-        assert_eq!(api, reference, "the route reshaped the producer's document");
-        assert_eq!(api["counts"]["pending"], 2);
-        assert_eq!(api["counts"]["skipped"], 1);
+        assert_eq!(
+            api, reference_bytes,
+            "the route did not return the producer's bytes"
+        );
+        assert_eq!(reference.counts.pending, 2);
+        assert_eq!(reference.counts.skipped, 1);
     }
 
     /// An unreadable spool is `500 spool_unreadable`, never `200` with an
