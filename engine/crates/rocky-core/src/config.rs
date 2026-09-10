@@ -168,13 +168,21 @@ pub enum ConfigError {
     #[error("failed to parse TOML: {0}")]
     ParseToml(#[from] toml::de::Error),
 
-    /// TOML parse/deserialize error after env-var substitution, enriched with
-    /// the list of substituted env vars so the operator can narrow the cause
-    /// (e.g. a negative `timeout_secs` that came from `${TIMEOUT}`).
-    #[error("failed to parse TOML: {source}{env_var_hint}")]
+    /// TOML parse/deserialize error after env-var substitution, naming the
+    /// substituted env vars so the operator can narrow the cause (e.g. a
+    /// negative `timeout_secs` that came from `${TIMEOUT}`).
+    ///
+    /// Carries a pre-rendered, REDACTED message rather than the
+    /// `toml::de::Error` itself, and deliberately has no `#[source]`.
+    /// Substitution happens before the parse, so by the time toml renders the
+    /// offending line that line holds the RESOLVED value — and every route
+    /// that reports a config failure renders the whole chain with
+    /// `format!("{e:#}")`. Keeping the raw error reachable, in the source
+    /// chain or anywhere else, would put a live credential in an HTTP body.
+    /// See the redaction in `redact_substituted_values`.
+    #[error("failed to parse TOML: {rendered}{env_var_hint}")]
     ParseTomlWithEnvContext {
-        #[source]
-        source: toml::de::Error,
+        rendered: String,
         env_var_hint: String,
     },
 
@@ -2459,30 +2467,47 @@ fn substitute_env_vars_inner(input: &str) -> EnvExpansion {
 /// and a BARE `port = ${PORT}` then fails to parse — for a reason the parse
 /// error itself cannot express. Listing the unresolved names here keeps that
 /// error pointing at `PORT` instead of at a stray `$`.
+/// Replace every substituted env-var VALUE in `text` with `${NAME}`, the
+/// placeholder the operator actually wrote.
+///
+/// Substitution happens before the TOML is parsed, so a parse error renders
+/// the offending line with the resolved value already in it. `toml` gives no
+/// way to ask which byte ranges came from a substitution, and
+/// [`EnvVarSubstitution`] records only name and value, so this searches for
+/// each value and puts the placeholder back.
+///
+/// Longest value first, so a value that contains another value cannot leave a
+/// fragment of the longer one behind. Empty values are skipped: they match
+/// everywhere and would replace nothing useful.
+///
+/// This is a belt-and-braces pass over a rendering, not a parser. It is here
+/// because the alternative is a live credential in an HTTP error body, and a
+/// redaction that occasionally over-redacts a coincidentally identical string
+/// is the safe direction to be wrong in.
+pub fn redact_substituted_values(text: &str, substitutions: &[EnvVarSubstitution]) -> String {
+    let mut ordered: Vec<&EnvVarSubstitution> = substitutions
+        .iter()
+        .filter(|sub| !sub.value.is_empty())
+        .collect();
+    ordered.sort_by_key(|sub| std::cmp::Reverse(sub.value.len()));
+
+    let mut out = text.to_string();
+    for sub in ordered {
+        out = out.replace(&sub.value, &format!("${{{}}}", sub.name));
+    }
+    out
+}
+
 fn format_env_var_hint(substitutions: &[EnvVarSubstitution], unresolved: &[String]) -> String {
     if substitutions.is_empty() && unresolved.is_empty() {
         return String::new();
     }
-    const MAX_VALUE_LEN: usize = 40;
     // De-dup by name, keeping first occurrence.
     let mut seen = std::collections::HashSet::new();
     let parts: Vec<String> = substitutions
         .iter()
         .filter(|sub| seen.insert(&sub.name))
-        .map(|sub| {
-            let truncated = if sub.value.len() > MAX_VALUE_LEN {
-                // Truncate on a UTF-8 char boundary — a fixed byte slice panics
-                // when byte MAX_VALUE_LEN lands inside a multibyte character.
-                let end = (0..=MAX_VALUE_LEN)
-                    .rev()
-                    .find(|&i| sub.value.is_char_boundary(i))
-                    .unwrap_or(0);
-                format!("{}…", &sub.value[..end])
-            } else {
-                sub.value.clone()
-            };
-            format!("{}={:?}", sub.name, truncated)
-        })
+        .map(|sub| sub.name.clone())
         .collect();
     let mut hint = String::new();
     if !parts.is_empty() {
@@ -6444,10 +6469,18 @@ fn parse_rocky_config_str_with(
     let env_var_hint = format_env_var_hint(&substitutions, &missing_names);
     let to_parse_err = |source: toml::de::Error| -> ConfigError {
         if env_var_hint.is_empty() {
+            // No substitutions AND no unresolved vars: the rendered line is
+            // what the operator wrote, and there is nothing to say about it.
+            // Keyed on the hint, not on substitutions: an UNRESOLVED var
+            // produces a hint with no substitution, and an existing test
+            // caught this dropping that hint on the floor.
             ConfigError::ParseToml(source)
         } else {
+            // Render ONCE, here, where the substitutions are still in scope,
+            // and redact before the error exists. A caller cannot leak what
+            // the error never carried.
             ConfigError::ParseTomlWithEnvContext {
-                source,
+                rendered: redact_substituted_values(&source.to_string(), &substitutions),
                 env_var_hint: env_var_hint.clone(),
             }
         }
@@ -7543,19 +7576,142 @@ mod tests {
     }
     use super::*;
 
+    /// The hint names the env vars and never prints their values.
+    ///
+    /// It used to print `NAME="VALUE"`, truncated to 40 bytes, which is longer
+    /// than most tokens. That is a good affordance in a terminal the operator
+    /// already owns and a disclosure the moment the error is rendered over
+    /// HTTP, which every route does with `format!("{e:#}")`. The name alone
+    /// preserves what makes it useful: which var to go and look at.
     #[test]
-    fn format_env_var_hint_truncates_on_char_boundary() {
-        // Regression: a fixed `&value[..40]` slice panicked when byte 40 landed
-        // inside a multibyte character. A long value with multibyte chars
-        // spanning the boundary must truncate cleanly (no panic).
-        let value = "é".repeat(30); // 60 bytes; byte 40 is mid-character
+    fn the_env_var_hint_names_vars_without_printing_their_values() {
+        let subs = vec![
+            EnvVarSubstitution {
+                name: "DATABRICKS_TOKEN".to_string(),
+                value: "dapi-SUPERSECRET-abc123".to_string(),
+            },
+            EnvVarSubstitution {
+                name: "WAREHOUSE".to_string(),
+                value: "analytics".to_string(),
+            },
+        ];
+        let hint = format_env_var_hint(&subs, &[]);
+
+        assert!(hint.contains("DATABRICKS_TOKEN"), "{hint}");
+        assert!(hint.contains("WAREHOUSE"), "{hint}");
+        assert!(
+            !hint.contains("dapi-SUPERSECRET-abc123"),
+            "the hint must not carry a resolved value: {hint}"
+        );
+        assert!(
+            !hint.contains("analytics"),
+            "not only the secret-looking ones; the hint cannot tell them apart: {hint}"
+        );
+    }
+
+    /// A multibyte value must not panic the redactor or the hint.
+    ///
+    /// The hint previously truncated on a byte index and needed a char-boundary
+    /// search to avoid panicking. It no longer truncates, but the redactor now
+    /// does the string work, so the same input is worth keeping.
+    #[test]
+    fn multibyte_values_are_redacted_without_panicking() {
         let subs = vec![EnvVarSubstitution {
-            name: "SECRET".to_string(),
-            value,
+            name: "MOTTO".to_string(),
+            value: "日本語のテキストがここにあります".to_string(),
         }];
-        let hint = format_env_var_hint(&subs, &[]); // must not panic
-        assert!(hint.contains("SECRET"));
-        assert!(hint.contains('…'));
+        let _ = format_env_var_hint(&subs, &[]);
+        let out = redact_substituted_values("path = 日本語のテキストがここにあります", &subs);
+        assert_eq!(out, "path = ${MOTTO}");
+    }
+
+    /// The redactor puts back the placeholder the operator wrote.
+    #[test]
+    fn redaction_replaces_a_resolved_value_with_its_placeholder() {
+        let subs = vec![EnvVarSubstitution {
+            name: "TOKEN".to_string(),
+            value: "dapi-abc123".to_string(),
+        }];
+        let rendered =
+            "TOML parse error at line 3\n  |\n3 | path = dapi-abc123\n  |        ^^^^^^^^^^^";
+        let out = redact_substituted_values(rendered, &subs);
+
+        assert!(!out.contains("dapi-abc123"), "{out}");
+        assert!(out.contains("${TOKEN}"), "{out}");
+        assert!(
+            out.contains("TOML parse error at line 3"),
+            "the diagnosis survives: {out}"
+        );
+    }
+
+    /// A value that contains another value must not leave a fragment behind.
+    ///
+    /// Redacting the shorter one first would rewrite the inside of the longer
+    /// one and leave its outer characters exposed, so the pass goes longest
+    /// first. This is the case that makes the ordering load-bearing.
+    #[test]
+    fn a_value_containing_another_value_is_fully_redacted() {
+        let subs = vec![
+            EnvVarSubstitution {
+                name: "SHORT".to_string(),
+                value: "abc".to_string(),
+            },
+            EnvVarSubstitution {
+                name: "LONG".to_string(),
+                value: "xxabcxx".to_string(),
+            },
+        ];
+        let out = redact_substituted_values("a = xxabcxx", &subs);
+        assert!(
+            !out.contains("xxabcxx") && !out.contains("xx${SHORT}xx"),
+            "the longer value must be redacted whole, not have its middle rewritten: {out}"
+        );
+        assert_eq!(out, "a = ${LONG}");
+    }
+
+    /// An empty substitution must not match everywhere.
+    #[test]
+    fn an_empty_value_redacts_nothing() {
+        let subs = vec![EnvVarSubstitution {
+            name: "EMPTY".to_string(),
+            value: String::new(),
+        }];
+        assert_eq!(redact_substituted_values("a = 1", &subs), "a = 1");
+    }
+
+    /// End to end, through the real loader: a resolved value that breaks the
+    /// parse must not appear anywhere in the error a route would render.
+    ///
+    /// This asserts the VALUE is absent rather than that the message has some
+    /// shape, because a reworded hint that still interpolated would pass a
+    /// wording assertion and leak just the same.
+    #[test]
+    fn a_parse_failure_never_renders_the_resolved_value() {
+        const SECRET: &str = "SUPERSECRET-abc123-DO-NOT-LEAK";
+        // SAFETY: single-threaded test process; the var is removed below.
+        unsafe { std::env::set_var("ROCKY_TEST_LEAK_PROBE", SECRET) };
+
+        // Valid TOML before substitution, broken after: the value is bare.
+        let (_d, path) =
+            write_cfg("[adapter]\ntype = \"duckdb\"\npath = ${ROCKY_TEST_LEAK_PROBE}\n");
+        let err = load_rocky_config(&path).expect_err("a bare resolved value is not valid TOML");
+
+        let full = format!("{err:#}");
+        let display = format!("{err}");
+        unsafe { std::env::remove_var("ROCKY_TEST_LEAK_PROBE") };
+
+        assert!(
+            !full.contains(SECRET),
+            "the resolved value reached the rendered chain a route serves: {full}"
+        );
+        assert!(
+            !display.contains(SECRET),
+            "the resolved value reached the Display a route serves: {display}"
+        );
+        assert!(
+            full.contains("ROCKY_TEST_LEAK_PROBE"),
+            "the operator still needs to know which var to look at: {full}"
+        );
     }
 
     /// WP-01 PR-B: `load_rocky_config_fingerprinted` is deterministic across
