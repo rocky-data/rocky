@@ -1229,6 +1229,43 @@ fn route_table() -> Vec<Route> {
             auth_exempt: false,
         },
         Route {
+            method: "get",
+            path: "/api/v1/policy",
+            operation_id: "getPolicy",
+            tag: "policy",
+            summary: "The policy plane",
+            description: "The `[policy]` rules in file order with their positional ids (the \
+                 `matched_rule` that `policy check` reports), the default agent effect, and \
+                 the freezes in force that this read could see, from the decision ledger \
+                 and the durable freeze markers. Read `freeze_sources` before treating the \
+                 list as exhaustive: `not_consulted` means no `[policy]` block, so nothing \
+                 is enforced; `local_mirror` means a remote `[state]` backend whose \
+                 authoritative ledger this read-only route does not download, so another \
+                 pod's freeze can be missing while an apply still denies. A missing \
+                 `rocky.toml` is the default posture. A source that exists but cannot be \
+                 read is a `500`, never an empty list. The same bytes as \
+                 `rocky policy show --output json`.",
+            path_params: &[],
+            query_params: &[],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The policy plane as configured and as it stands.",
+                    body: Body::Component("PolicyRulesOutput"),
+                },
+                Resp {
+                    status: "500",
+                    description: "The bound `rocky.toml` could not be parsed, or the decision \
+                         ledger or the freeze markers could not be read.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                ENGINE_BUSY_OR_NOT_READY,
+            ],
+            auth_exempt: false,
+        },
+        Route {
             method: "post",
             path: "/api/v1/hooks/trigger/{pipeline}",
             operation_id: "triggerWebhook",

@@ -2671,6 +2671,15 @@ enum PolicySubcommand {
         models: PathBuf,
     },
 
+    /// Show the policy plane: the rules with their positions, the default
+    /// posture, and every freeze in force.
+    ///
+    /// Reads `rocky.toml`, the decision ledger and, when `[state]` keeps them,
+    /// the durable freeze markers. A source that exists but cannot be read is
+    /// an error, never an empty list. `rocky serve` answers the same JSON at
+    /// `GET /api/v1/policy`.
+    Show {},
+
     /// Run the project's `[[policy.tests]]` scenario assertions.
     ///
     /// Each scenario declares a `(principal, capability, target)` triple and
@@ -3466,6 +3475,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 json,
             ),
             PolicySubcommand::Test {} => rocky_cli::commands::run_policy_test(&cli.config, json),
+            PolicySubcommand::Show {} => {
+                rocky_cli::commands::run_policy_show(&cli.config, &state_path, json).await
+            }
             PolicySubcommand::Freeze {
                 principal,
                 scope,

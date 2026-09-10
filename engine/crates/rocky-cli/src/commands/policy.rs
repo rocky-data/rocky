@@ -25,14 +25,18 @@ use rocky_core::config::{
     ConfigError, PolicyCapability, PolicyConfig, PolicyEffect, PolicyPrincipal, StateBackend,
     StateConfig,
 };
-use rocky_core::freeze_marker::{self, FreezeMarker, FreezeMarkerError, UnfreezeMarker};
-use rocky_core::policy::{self, ModelAttributes};
+use rocky_core::freeze_marker::{
+    self, ActiveMarkerFreeze, FreezeMarker, FreezeMarkerError, UnfreezeMarker,
+};
+use rocky_core::path_presence::{PathPresence, classify_not_found};
+use rocky_core::policy::{self, ActiveFreeze, ModelAttributes};
 use rocky_core::state::{PolicyDecisionRecord, StateStore};
 use rocky_core::state_sync::StateSyncError;
 
 use crate::output::{
-    PolicyCheckOutput, PolicyFreezeEntry, PolicyFreezeOutput, PolicyModelAttributes,
-    PolicyTestOutput, PolicyTestResult, print_json,
+    PolicyAutonomyBudgetOutput, PolicyCheckOutput, PolicyFreezeEntry, PolicyFreezeInForce,
+    PolicyFreezeOutput, PolicyFreezeSources, PolicyModelAttributes, PolicyRuleEntry,
+    PolicyRuleScopeOutput, PolicyRulesOutput, PolicyTestOutput, PolicyTestResult, print_json,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -276,6 +280,411 @@ pub fn run_policy_test(config_path: &Path, json: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The decision ledger's part of `rocky policy show`.
+///
+/// `source` is one of `"read"`, `"absent"` or `"local_mirror"`. Absent is
+/// proven, not assumed: a store path that is missing is absence, a store path
+/// that is there but cannot be read (a dangling link, an unreadable ancestor)
+/// is an error.
+#[derive(Debug)]
+pub struct PolicyShowLedger {
+    pub source: &'static str,
+    pub freezes: Vec<ActiveFreeze>,
+}
+
+/// Read the freezes from the decision ledger, fail-closed.
+///
+/// `remote_backend` is `true` when `[state]` is not the local backend. There the
+/// authoritative ledger lives remotely, and a governed apply downloads it before
+/// it gates. This is a read-only producer and that download REPLACES the local
+/// ledger file, so it must not run here. The read therefore reports
+/// `"local_mirror"`: what it returns came from a mirror that may be stale or
+/// empty, and a cross-pod freeze can be missing from it. Claiming `"absent"`
+/// there would assert a proven absence that was never proven.
+pub fn read_policy_show_ledger(
+    state_path: &Path,
+    remote_backend: bool,
+) -> Result<PolicyShowLedger> {
+    let read_label = if remote_backend {
+        "local_mirror"
+    } else {
+        "read"
+    };
+    let absent_label = if remote_backend {
+        "local_mirror"
+    } else {
+        "absent"
+    };
+    // `metadata` follows links: a dangling link is NotFound here, and the
+    // classifier then reports it present-but-unreadable. An open on that path
+    // would create the target through the link and report an empty ledger.
+    match std::fs::metadata(state_path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match classify_not_found(state_path) {
+                PathPresence::Absent => {
+                    return Ok(PolicyShowLedger {
+                        source: absent_label,
+                        freezes: Vec::new(),
+                    });
+                }
+                PathPresence::Present { detail } => bail!(
+                    "the state store at {} cannot be read ({detail}); refusing to report the \
+                 policy plane without its freezes",
+                    state_path.display()
+                ),
+            }
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!(
+                "the state store at {} cannot be read; refusing to report the policy plane \
+                 without its freezes",
+                state_path.display()
+            )));
+        }
+    }
+    let store = StateStore::open_read_only(state_path)
+        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+    let decisions = store
+        .list_policy_decisions()
+        .context("reading the policy decision ledger")?;
+    Ok(PolicyShowLedger {
+        source: read_label,
+        freezes: policy::active_freezes(&decisions),
+    })
+}
+
+/// What `rocky policy show` found when it looked for durable freeze markers.
+///
+/// Three outcomes, not two: "the backend keeps none" and "nothing enforces, so
+/// we did not look" are different facts and a reader needs to tell them apart.
+#[derive(Debug)]
+pub enum PolicyShowMarkers {
+    /// No `[policy]` block. The enforcement gate returns `NotConfigured`
+    /// before it reads either freeze source, so neither did we.
+    NotConsulted,
+    /// The `[state]` backend has no durable object tier, so there are no
+    /// markers to read.
+    NotConfigured,
+    /// The markers the durable tier holds.
+    Read(Vec<ActiveMarkerFreeze>),
+}
+
+/// Read the durable freeze markers, fail-closed.
+///
+/// Gated exactly the way the apply gate's `marker_gate_provider` is gated: on
+/// whether a durable object tier resolves, and NOT on `freeze_marker_writes`.
+/// That flag gates writes only. A marker written while it was on stays enforced
+/// after it is turned off, so a reader that honoured the flag would drop a live
+/// freeze out of the document while an apply still denied on it.
+///
+/// A tier that is configured but will not resolve is an error, never an empty
+/// list: reporting the ledger alone would read as a complete policy plane while
+/// markers the fleet is enforcing stayed invisible.
+///
+/// The caller decides whether to call this at all; see [`compute_policy_show`].
+pub async fn load_policy_show_markers(state_cfg: &StateConfig) -> Result<PolicyShowMarkers> {
+    let provider = rocky_core::state_sync::durable_tier_provider(state_cfg)
+        .context("resolving the durable object tier for freeze markers")?;
+    let Some(provider) = provider else {
+        return Ok(PolicyShowMarkers::NotConfigured);
+    };
+    let markers = freeze_marker::load_active_marker_freezes(&provider)
+        .await
+        .context(
+            "reading the durable freeze markers; refusing to report the policy plane without them",
+        )?;
+    Ok(PolicyShowMarkers::Read(markers))
+}
+
+/// What `rocky policy show` needs from `rocky.toml`: the `[policy]` block
+/// when there is one, and the `[state]` backend that says where freeze
+/// markers live. A missing file is the default posture on a local backend;
+/// a file that does not load is an error.
+pub fn policy_show_config(config_path: &Path) -> Result<(Option<PolicyConfig>, StateConfig)> {
+    match rocky_core::config::load_rocky_config(config_path) {
+        Ok(cfg) => Ok((cfg.policy, cfg.state)),
+        Err(ConfigError::FileNotFound { .. }) => Ok((None, StateConfig::default())),
+        Err(e) => Err(anyhow::Error::new(e).context("loading rocky.toml for [policy]")),
+    }
+}
+
+/// Build the report from its three inputs. Pure: the same inputs give the
+/// same bytes whether the CLI or a route assembled them.
+pub fn assemble_policy_show(
+    policy: Option<&PolicyConfig>,
+    ledger: PolicyShowLedger,
+    markers: PolicyShowMarkers,
+) -> PolicyRulesOutput {
+    let PolicyShowLedger {
+        source: ledger_source,
+        freezes: ledger_freezes,
+    } = ledger;
+    let configured = policy.is_some();
+    let default_posture;
+    let policy = match policy {
+        Some(p) => p,
+        None => {
+            default_posture = PolicyConfig::default_posture();
+            &default_posture
+        }
+    };
+    let rules = policy
+        .rules
+        .iter()
+        .enumerate()
+        .map(|(id, r)| PolicyRuleEntry {
+            id,
+            principal: r.principal,
+            capability: r.capability,
+            effect: r.effect,
+            scope: PolicyRuleScopeOutput {
+                any: r.scope.any,
+                models: r.scope.models.clone(),
+                tags: r.scope.tags.clone(),
+                classifications: r.scope.classifications.clone(),
+                exclude_classifications: r.scope.exclude_classifications.clone(),
+                contracted: r.scope.contracted,
+                layer: r.scope.layer.clone(),
+                max_downstreams: r.scope.max_downstreams,
+            },
+            verify_after: r.verify_after.clone(),
+            autonomy_budget: r
+                .autonomy_budget
+                .as_ref()
+                .map(|b| PolicyAutonomyBudgetOutput {
+                    failures: b.failures,
+                    window: b.window.clone(),
+                }),
+        })
+        .collect();
+    let mut freezes: Vec<PolicyFreezeInForce> = ledger_freezes
+        .into_iter()
+        .map(|f| PolicyFreezeInForce {
+            source: "ledger".to_string(),
+            principal: Some(f.principal),
+            scope: f.scope,
+            reason: f.reason,
+            since: Some(f.frozen_at),
+            plan_id: Some(f.plan_id),
+            freeze_id: None,
+        })
+        .collect();
+    let markers_source = match &markers {
+        PolicyShowMarkers::NotConsulted => "not_consulted",
+        PolicyShowMarkers::NotConfigured => "not_configured",
+        PolicyShowMarkers::Read(_) => "read",
+    };
+    if let PolicyShowMarkers::Read(markers) = markers {
+        freezes.extend(markers.into_iter().map(|m| PolicyFreezeInForce {
+            source: "marker".to_string(),
+            principal: m.principal,
+            scope: m.scope,
+            reason: m.reason,
+            since: m.created_at,
+            plan_id: None,
+            freeze_id: Some(m.freeze_id),
+        }));
+    }
+    PolicyRulesOutput {
+        version: VERSION.to_string(),
+        command: "policy_show".to_string(),
+        configured,
+        policy_version: policy.version,
+        default_agent_effect: policy.default_agent_effect,
+        rules,
+        freezes,
+        freeze_sources: PolicyFreezeSources {
+            ledger: ledger_source.to_string(),
+            markers: markers_source.to_string(),
+        },
+    }
+}
+
+/// The report `rocky policy show` prints and `GET /api/v1/policy` serves:
+/// [`policy_show_config`], [`read_policy_show_ledger`],
+/// [`load_policy_show_markers`], then [`assemble_policy_show`]. Pure
+/// compute, no printing; [`run_policy_show`] renders it.
+pub async fn compute_policy_show(
+    config_path: &Path,
+    state_path: &Path,
+) -> Result<PolicyRulesOutput> {
+    let (policy, state_cfg) = policy_show_config(config_path)?;
+    let (ledger, markers) = if policy.is_some() {
+        let remote = policy_show_remote_backend(&state_cfg);
+        (
+            read_policy_show_ledger(state_path, remote)?,
+            load_policy_show_markers(&state_cfg).await?,
+        )
+    } else {
+        (
+            policy_show_unconsulted_ledger(),
+            PolicyShowMarkers::NotConsulted,
+        )
+    };
+    Ok(assemble_policy_show(policy.as_ref(), ledger, markers))
+}
+
+/// `true` when the authoritative ledger lives on a remote `[state]` backend.
+///
+/// The same condition the apply gate's `remote_state_backend_for_gate` uses, so
+/// the two agree on when a local read is only a mirror. Deliberately "not the
+/// local backend" rather than "a durable object tier resolves": Valkey has no
+/// object tier but its ledger is still remote, and calling a Valkey project's
+/// local file authoritative is exactly the error this guards.
+pub fn policy_show_remote_backend(state_cfg: &StateConfig) -> bool {
+    !matches!(state_cfg.backend, StateBackend::Local)
+}
+
+/// The ledger half of a plane with no `[policy]` block.
+///
+/// With no policy the enforcement gate returns `NotConfigured` before it reads
+/// any freeze source, so nothing is in force whatever either source holds.
+/// Reading them anyway and listing what came back would put freezes in a
+/// document whose own `configured` field says nothing enforces.
+pub fn policy_show_unconsulted_ledger() -> PolicyShowLedger {
+    PolicyShowLedger {
+        source: "not_consulted",
+        freezes: Vec::new(),
+    }
+}
+
+/// `rocky policy show`: [`compute_policy_show`], rendered as JSON or text.
+pub async fn run_policy_show(config_path: &Path, state_path: &Path, json: bool) -> Result<()> {
+    let output = compute_policy_show(config_path, state_path).await?;
+    if json {
+        print_json(&output)?;
+    } else {
+        render_show_text(&output);
+    }
+    Ok(())
+}
+
+fn scope_text(scope: &PolicyRuleScopeOutput) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if scope.any {
+        parts.push("any".to_string());
+    }
+    if !scope.models.is_empty() {
+        parts.push(format!("models={}", scope.models.join(",")));
+    }
+    for (k, v) in &scope.tags {
+        parts.push(format!("tags.{k}={v}"));
+    }
+    if !scope.classifications.is_empty() {
+        parts.push(format!(
+            "classifications={}",
+            scope.classifications.join(",")
+        ));
+    }
+    if !scope.exclude_classifications.is_empty() {
+        parts.push(format!(
+            "exclude_classifications={}",
+            scope.exclude_classifications.join(",")
+        ));
+    }
+    if let Some(c) = scope.contracted {
+        parts.push(format!("contracted={c}"));
+    }
+    if let Some(l) = &scope.layer {
+        parts.push(format!("layer={l}"));
+    }
+    if let Some(n) = scope.max_downstreams {
+        parts.push(format!("max_downstreams={n}"));
+    }
+    if parts.is_empty() {
+        "(unscoped)".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+/// How a freeze's principal reads in the text output.
+///
+/// `principal` is absent ONLY on a marker whose body could not be read, which
+/// the loader widens to scope `any` and to both principals so the freeze fails
+/// closed. Printing a plain `both` there would read as a marker that
+/// deliberately froze both, which is a different and much less alarming fact.
+///
+/// This is a function rather than a line inside the `println!` so a test can
+/// assert it. Round two of the review pointed out that the wording was
+/// unreachable from any test, so reverting it would have gone unnoticed.
+fn freeze_principal_text(f: &PolicyFreezeInForce) -> String {
+    match f.principal {
+        Some(p) => serde_plain(&p),
+        None => "both (marker body unreadable)".to_string(),
+    }
+}
+
+/// Render the policy plane as a compact human-readable block.
+fn render_show_text(out: &PolicyRulesOutput) {
+    if out.configured {
+        println!("policy: [policy] version {}", out.policy_version);
+    } else {
+        println!("policy: default posture (no [policy] block in rocky.toml)");
+    }
+    println!(
+        "default agent effect: {}",
+        serde_plain(&out.default_agent_effect)
+    );
+    println!("rules: {}", out.rules.len());
+    for rule in &out.rules {
+        print!(
+            "  #{}  {}  {}  {}  {}",
+            rule.id,
+            serde_plain(&rule.principal),
+            serde_plain(&rule.capability),
+            serde_plain(&rule.effect),
+            scope_text(&rule.scope)
+        );
+        if let Some(b) = &rule.autonomy_budget {
+            print!("  budget={}/{}", b.failures, b.window);
+        }
+        if !rule.verify_after.is_empty() {
+            print!("  verify_after={}", rule.verify_after.join(","));
+        }
+        println!();
+    }
+    // "recorded" not "in force": with no `[policy]` block the gate returns
+    // NotConfigured before it reads a freeze source, so the list would be a
+    // claim the engine does not honour. The sources line below says which were
+    // consulted at all.
+    let heading = if out.configured {
+        "freezes in force"
+    } else {
+        "freezes in force (none: no [policy] block, so nothing is enforced)"
+    };
+    println!("{}: {}", heading, out.freezes.len());
+    for f in &out.freezes {
+        let principal = freeze_principal_text(f);
+        let since = f
+            .since
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_else(|| "-".to_string());
+        print!(
+            "  {}  {}  {}  since {}  reason: {}",
+            f.source, principal, f.scope, since, f.reason
+        );
+        if let Some(id) = &f.freeze_id {
+            print!("  id={id}");
+        }
+        if let Some(plan) = &f.plan_id {
+            print!("  plan={plan}");
+        }
+        println!();
+    }
+    println!(
+        "freeze sources: ledger {}, markers {}",
+        out.freeze_sources.ledger, out.freeze_sources.markers
+    );
+    if out.freeze_sources.ledger == "local_mirror" {
+        println!(
+            "  note: [state] is a remote backend. The ledger above is the local mirror; the \
+remote authority was not downloaded, so a freeze recorded by another pod may be missing."
+        );
+    }
 }
 
 /// Render the scenario results as a compact pass/fail report.
@@ -1689,5 +2098,507 @@ expect = \"allow\"
         assert!(!out.results[1].passed);
         assert_eq!(out.results[1].name, "wrong on purpose");
         assert_eq!(out.results[1].actual, PolicyEffect::Deny);
+    }
+
+    /// No `[policy]` block and no state store yet: the default posture, no
+    /// rules, no freezes, and the sources say why. Both read `not_consulted`,
+    /// because the enforcement gate returns `NotConfigured` before it reads
+    /// either source — so reporting "absent" would answer a question this
+    /// producer never asked. An honest empty, not a silent one.
+    #[tokio::test]
+    async fn compute_policy_show_reports_the_default_posture_without_a_policy_block() {
+        let (dir, config) = config_with(NO_POLICY_BODY);
+        let state_path = dir.path().join("state.redb");
+
+        let out = compute_policy_show(&config, &state_path).await.unwrap();
+        assert_eq!(out.command, "policy_show");
+        assert!(!out.configured);
+        assert_eq!(out.policy_version, 1);
+        assert_eq!(out.default_agent_effect, PolicyEffect::RequireReview);
+        assert!(out.rules.is_empty());
+        assert!(out.freezes.is_empty());
+        assert_eq!(out.freeze_sources.ledger, "not_consulted");
+        assert_eq!(out.freeze_sources.markers, "not_consulted");
+    }
+
+    /// The rules come out in file order with their position as `id`, and a
+    /// freeze recorded through `rocky policy freeze` is in force from the
+    /// ledger. `run_policy_show --output json` is `compute_policy_show` plus
+    /// one `print_json`, so this pins the producer both callers share.
+    #[tokio::test]
+    async fn compute_policy_show_lists_rules_by_position_and_the_freezes_in_force() {
+        let (dir, config) = config_with(&format!("{NO_POLICY_BODY}\n{POLICY}"));
+        let state_path = dir.path().join("state.redb");
+        run_policy_freeze(
+            &config,
+            &state_path,
+            Some(PolicyPrincipal::Agent),
+            Some("model=fct_*".to_string()),
+            Some("incident 42".to_string()),
+            false,
+            true,
+        )
+        .unwrap();
+
+        let out = compute_policy_show(&config, &state_path).await.unwrap();
+        assert!(out.configured);
+        assert_eq!(out.policy_version, 1);
+        assert_eq!(
+            out.rules.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(out.rules[0].effect, PolicyEffect::Deny);
+        assert_eq!(out.rules[0].scope.contracted, Some(true));
+        assert_eq!(
+            out.rules[1].scope.tags.get("layer").map(String::as_str),
+            Some("bronze")
+        );
+        assert_eq!(out.rules[1].scope.max_downstreams, Some(5));
+        assert_eq!(out.rules[2].scope.max_downstreams, None);
+
+        assert_eq!(out.freezes.len(), 1, "{:?}", out.freezes);
+        let f = &out.freezes[0];
+        assert_eq!(f.source, "ledger");
+        assert_eq!(f.principal, Some(PolicyPrincipal::Agent));
+        assert_eq!(f.scope, "model=fct_*");
+        assert_eq!(f.reason, "incident 42");
+        assert!(f.since.is_some());
+        assert!(f.plan_id.is_some());
+        assert!(f.freeze_id.is_none());
+        assert_eq!(out.freeze_sources.ledger, "read");
+        assert_eq!(out.freeze_sources.markers, "not_configured");
+
+        // Lifting it takes it out of force: the report reads the ledger's
+        // projection, not its raw rows.
+        run_policy_freeze(
+            &config,
+            &state_path,
+            Some(PolicyPrincipal::Agent),
+            Some("model=fct_*".to_string()),
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        let out = compute_policy_show(&config, &state_path).await.unwrap();
+        assert!(out.freezes.is_empty(), "{:?}", out.freezes);
+    }
+
+    /// A rule's `id` is the number `rocky policy check` reports as
+    /// `matched_rule`: the two commands agree on which rule won.
+    #[test]
+    fn a_rule_id_is_the_matched_rule_policy_check_reports() {
+        let (dir, config) = config_with(&format!("{NO_POLICY_BODY}\n{POLICY}"));
+        let models = dir.path().join("models");
+        fs::create_dir_all(&models).unwrap();
+        fs::write(models.join("orders.sql"), "SELECT 1 AS id\n").unwrap();
+        fs::write(
+            models.join("orders.toml"),
+            "name = \"orders\"\n[target]\ncatalog = \"w\"\nschema = \"s\"\ntable = \"orders\"\n\
+             [tags]\nlayer = \"bronze\"\n",
+        )
+        .unwrap();
+        let check = compute_policy_check(
+            &config,
+            &models,
+            PolicyPrincipal::Agent,
+            PolicyCapability::SchemaChangeAdditive,
+            "orders",
+        )
+        .unwrap();
+        let matched = check
+            .matched_rule
+            .expect("a bronze additive change matches a rule");
+
+        let (_, state_cfg) = policy_show_config(&config).unwrap();
+        let ledger = read_policy_show_ledger(&dir.path().join("state.redb"), false).unwrap();
+        let (policy, _) = policy_show_config(&config).unwrap();
+        let show = assemble_policy_show(policy.as_ref(), ledger, PolicyShowMarkers::NotConfigured);
+        assert!(matches!(state_cfg.backend, StateBackend::Local));
+        let rule = &show.rules[matched];
+        assert_eq!(rule.id, matched);
+        assert_eq!(rule.capability, PolicyCapability::SchemaChangeAdditive);
+        assert_eq!(rule.effect, check.effect);
+    }
+
+    /// A state store path that is there but cannot be read is an error, not
+    /// an empty freeze list: an empty list would say "nothing is frozen" for
+    /// a plane whose freezes could not be read at all.
+    #[cfg(unix)]
+    #[test]
+    fn read_policy_show_ledger_refuses_a_dangling_state_store_link() {
+        let dir = TempDir::new().unwrap();
+        let state_path = dir.path().join("state.redb");
+        std::os::unix::fs::symlink(dir.path().join("gone.redb"), &state_path).unwrap();
+
+        let err = read_policy_show_ledger(&state_path, false).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("cannot be read"),
+            "the refusal says the store is unreadable, not absent: {err:#}"
+        );
+    }
+
+    /// A durable marker is a freeze in force with `source` `"marker"` and its
+    /// id; the ledger's entries come first and `freeze_sources.markers` says
+    /// the markers were read.
+    ///
+    /// The marker here carries no principal, which the loader produces ONLY
+    /// for a marker whose body it could not read: it widens such a marker to
+    /// scope `any` and to both principals so the freeze fails closed. It is
+    /// not a marker that deliberately froze both, and the reason text says so.
+    #[test]
+    fn assemble_policy_show_maps_markers_after_the_ledger() {
+        let policy = PolicyConfig::default_posture();
+        let frozen_at = chrono::Utc::now();
+        let ledger = PolicyShowLedger {
+            source: "read",
+            freezes: vec![ActiveFreeze {
+                principal: PolicyPrincipal::Agent,
+                scope: "model=fct_*".to_string(),
+                frozen_at,
+                plan_id: "freeze-1".to_string(),
+                reason: "from the ledger".to_string(),
+            }],
+        };
+        // Shaped exactly as `project_active` builds an unreadable marker:
+        // principal None, scope widened to `any`, and a reason that names the
+        // unreadable body. A hand-built fixture that dropped the reason would
+        // hide the very thing this asserts.
+        let markers = vec![ActiveMarkerFreeze {
+            freeze_id: "marker-1".to_string(),
+            principal: None,
+            scope: "any".to_string(),
+            reason: "unreadable freeze marker body (expected value at line 1)".to_string(),
+            created_at: None,
+        }];
+
+        let out = assemble_policy_show(Some(&policy), ledger, PolicyShowMarkers::Read(markers));
+        assert_eq!(out.freeze_sources.markers, "read");
+        assert_eq!(out.freezes.len(), 2);
+        assert_eq!(out.freezes[0].source, "ledger");
+        assert_eq!(out.freezes[0].plan_id.as_deref(), Some("freeze-1"));
+        assert_eq!(out.freezes[0].since, Some(frozen_at));
+        let m = &out.freezes[1];
+        assert_eq!(m.source, "marker");
+        assert_eq!(m.freeze_id.as_deref(), Some("marker-1"));
+        assert_eq!(
+            m.principal, None,
+            "an unreadable marker body names no principal; the loader widens it to both"
+        );
+        assert_eq!(m.scope, "any", "an unreadable body widens the scope");
+        assert!(
+            m.reason.contains("unreadable freeze marker body"),
+            "the reason must say the body was unreadable, not imply a deliberate freeze: {}",
+            m.reason
+        );
+        assert_eq!(m.since, None);
+        assert_eq!(m.plan_id, None);
+    }
+
+    /// `freeze_marker_writes = true` on a backend whose durable tier cannot be
+    /// resolved is a refusal, not an empty marker list. Without this the policy
+    /// plane would report the ledger's freezes alone and read as complete,
+    /// while durable markers the fleet is enforcing stayed invisible. No
+    /// network: the bucket is missing, so the tier never resolves.
+    #[tokio::test]
+    async fn a_marker_tier_that_cannot_be_resolved_refuses_the_policy_plane() {
+        let body = format!(
+            "{NO_POLICY_BODY}\n{POLICY}\n[state]\nbackend = \"s3\"\nfreeze_marker_writes = true\n"
+        );
+        let (dir, config) = config_with(&body);
+        let (policy, state_cfg) = policy_show_config(&config).unwrap();
+        assert!(
+            policy.is_some(),
+            "the producer only consults a freeze source when a [policy] block exists, so this \
+             case needs one"
+        );
+
+        let err = load_policy_show_markers(&state_cfg).await.unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("state.s3_bucket"),
+            "the refusal must name the missing key, got: {text}"
+        );
+
+        // The whole producer refuses too, so no caller sees a partial plane.
+        let state_path = dir.path().join("state.redb");
+        assert!(
+            compute_policy_show(&config, &state_path).await.is_err(),
+            "compute_policy_show must not report a plane whose markers it could not read"
+        );
+    }
+
+    /// A local backend has no durable object tier, so there are no markers to
+    /// read and the reader says `NotConfigured` rather than erroring.
+    ///
+    /// The read is NOT gated on `freeze_marker_writes`. That flag gates writes:
+    /// a marker written while it was on stays enforced after it is turned off,
+    /// and the apply gate resolves the tier without consulting the flag. A
+    /// reader that honoured it would drop a live freeze out of the document
+    /// while an apply still denied on it. So the flag changes nothing here, in
+    /// either direction, and both assertions below must hold.
+    #[tokio::test]
+    async fn a_local_backend_reports_markers_as_not_configured() {
+        let (_dir, config) = config_with(NO_POLICY_BODY);
+        let (_policy, state_cfg) = policy_show_config(&config).unwrap();
+        assert!(matches!(state_cfg.backend, StateBackend::Local));
+        assert!(matches!(
+            load_policy_show_markers(&state_cfg).await.unwrap(),
+            PolicyShowMarkers::NotConfigured
+        ));
+
+        let flagged = StateConfig {
+            freeze_marker_writes: true,
+            ..StateConfig::default()
+        };
+        assert!(
+            matches!(
+                load_policy_show_markers(&flagged).await.unwrap(),
+                PolicyShowMarkers::NotConfigured
+            ),
+            "the write flag must not change what a reader sees"
+        );
+    }
+
+    /// On a remote `[state]` backend the local file is a MIRROR, not the
+    /// authority. A governed apply downloads the remote ledger before it
+    /// gates; this producer must not, because that download replaces the local
+    /// ledger and this is a read-only route. So it must not claim `"absent"`
+    /// either — absence there was never proven, it was never looked for. A
+    /// screen that read `"absent"` as "nothing is frozen" would contradict an
+    /// apply that denies on another pod's freeze.
+    #[test]
+    fn a_remote_backend_reports_the_ledger_as_a_local_mirror_not_as_absent() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("state.redb");
+
+        let local = read_policy_show_ledger(&missing, false).unwrap();
+        assert_eq!(local.source, "absent", "a local backend proves absence");
+
+        let remote = read_policy_show_ledger(&missing, true).unwrap();
+        assert_eq!(
+            remote.source, "local_mirror",
+            "a remote backend never proves absence from the local file alone"
+        );
+        assert!(remote.freezes.is_empty());
+    }
+
+    /// `policy_show_remote_backend` must agree with the apply gate's
+    /// `remote_state_backend_for_gate`: every backend that is not Local keeps
+    /// its authority remotely. Valkey has no durable OBJECT tier but its
+    /// ledger is still remote, so a tier-based test would wrongly call a
+    /// Valkey project's local file authoritative.
+    #[test]
+    fn every_backend_but_local_keeps_its_ledger_authority_remotely() {
+        for backend in [
+            StateBackend::S3,
+            StateBackend::Gcs,
+            StateBackend::Valkey,
+            StateBackend::Tiered,
+        ] {
+            let cfg = StateConfig {
+                backend,
+                ..StateConfig::default()
+            };
+            assert!(
+                policy_show_remote_backend(&cfg),
+                "{backend} keeps its ledger remotely"
+            );
+        }
+        assert!(!policy_show_remote_backend(&StateConfig::default()));
+    }
+
+    /// With no `[policy]` block the enforcement gate returns `NotConfigured`
+    /// BEFORE it reads a freeze source, so nothing is in force whatever the
+    /// ledger holds. The document must not list a freeze the engine would not
+    /// honour: both sources report `not_consulted` and the list is empty, even
+    /// though this project has a freeze recorded in its ledger.
+    #[tokio::test]
+    async fn a_recorded_freeze_is_not_in_force_without_a_policy_block() {
+        let (dir, config) = config_with(&format!("{NO_POLICY_BODY}\n{POLICY}"));
+        let state_path = dir.path().join("state.redb");
+        run_policy_freeze(
+            &config,
+            &state_path,
+            Some(PolicyPrincipal::Agent),
+            Some("model=fct_*".to_string()),
+            Some("incident 42".to_string()),
+            false,
+            true,
+        )
+        .unwrap();
+
+        // Same state store, same recorded freeze, but the config no longer has
+        // a [policy] block: only the plane changed.
+        let (_dir2, no_policy) = config_with(NO_POLICY_BODY);
+        let out = compute_policy_show(&no_policy, &state_path).await.unwrap();
+
+        assert!(!out.configured);
+        assert!(
+            out.freezes.is_empty(),
+            "a freeze the gate never reads is not in force: {:?}",
+            out.freezes
+        );
+        assert_eq!(out.freeze_sources.ledger, "not_consulted");
+        assert_eq!(out.freeze_sources.markers, "not_consulted");
+
+        // And with the block restored, the same store reports it in force.
+        let back = compute_policy_show(&config, &state_path).await.unwrap();
+        assert_eq!(back.freezes.len(), 1, "the freeze itself never moved");
+        assert_eq!(back.freeze_sources.ledger, "read");
+    }
+
+    /// `verify_after` is a first-class rule field that decides whether a
+    /// mutation this rule governs is gated on named post-apply checks. Two
+    /// rules that differ only here govern differently, so a document that
+    /// omitted it would render them identically. `conditions` is deliberately
+    /// absent: it decides nothing and can hold a resolved `${VAR}`.
+    #[tokio::test]
+    async fn rules_carry_verify_after_and_never_carry_conditions() {
+        let body = format!(
+            "{NO_POLICY_BODY}\n{POLICY}\n\n[[policy.rules]]\nprincipal = \"agent\"\n\
+             capability = \"apply\"\nscope = {{ any = true }}\neffect = \"allow\"\n\
+             verify_after = [\"row_count\", \"freshness\"]\n\
+             conditions = {{ token = \"super-secret-value\" }}\n"
+        );
+        let (dir, config) = config_with(&body);
+        let state_path = dir.path().join("state.redb");
+
+        let out = compute_policy_show(&config, &state_path).await.unwrap();
+        let last = out.rules.last().expect("the appended rule");
+        assert_eq!(last.verify_after, vec!["row_count", "freshness"]);
+
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(
+            !json.contains("conditions"),
+            "the document must not carry a rule's conditions"
+        );
+        assert!(
+            !json.contains("super-secret-value"),
+            "an authored condition can hold a resolved ${{VAR}}; it must not reach the output"
+        );
+    }
+
+    /// A marker must be READ even when `freeze_marker_writes` is false.
+    ///
+    /// The round-two review called the first version of this test vacuous, and
+    /// it was right: it used a local backend, where the OLD gate returned no
+    /// markers either, so restoring the old condition would still have passed.
+    /// This one needs a REMOTE backend with a marker actually present, because
+    /// that is the only shape where the two conditions disagree. The flag
+    /// gates writes; a marker written while it was on stays enforced after it
+    /// is turned off, and the apply gate reads it regardless.
+    #[tokio::test]
+    async fn a_marker_is_read_even_when_the_write_flag_is_off() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let _harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+
+        let body = format!(
+            "{NO_POLICY_BODY}\n{POLICY}\n[state]\nbackend = \"s3\"\ns3_bucket = \"test\"\n\
+             freeze_marker_writes = false\n"
+        );
+        let (_dir, config) = config_with(&body);
+        let (_policy, state_cfg) = policy_show_config(&config).unwrap();
+        assert!(
+            !state_cfg.freeze_marker_writes,
+            "this test is only meaningful with the write flag OFF"
+        );
+
+        let provider = rocky_core::state_sync::durable_tier_provider(&state_cfg)
+            .unwrap()
+            .expect("an s3 backend resolves a durable tier");
+        rocky_core::freeze_marker::write_freeze_marker(
+            &provider,
+            &rocky_core::freeze_marker::FreezeMarker {
+                freeze_id: "marker-kept".to_string(),
+                principal: PolicyPrincipal::Agent,
+                scope: "any".to_string(),
+                reason: "written while the flag was on".to_string(),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        match load_policy_show_markers(&state_cfg).await.unwrap() {
+            PolicyShowMarkers::Read(markers) => {
+                assert_eq!(markers.len(), 1, "the marker is still enforced, so read it");
+                assert_eq!(markers[0].freeze_id, "marker-kept");
+            }
+            other => panic!(
+                "the write flag must not stop a reader from seeing an enforced marker, got \
+                 {other:?}"
+            ),
+        }
+    }
+
+    /// The PRESENT-file half of the local-mirror rule.
+    ///
+    /// The first version of this only covered a missing file, which left the
+    /// `read_label` path unproved: a remote backend that found a populated
+    /// local store could still have said `"read"` and no test would have
+    /// noticed. A mirror that HAS rows is exactly the dangerous case, because
+    /// a non-empty list is the one a reader is most likely to trust.
+    #[tokio::test]
+    async fn a_populated_local_store_still_reads_as_a_mirror_on_a_remote_backend() {
+        let (dir, config) = config_with(&format!("{NO_POLICY_BODY}\n{POLICY}"));
+        let state_path = dir.path().join("state.redb");
+        run_policy_freeze(
+            &config,
+            &state_path,
+            Some(PolicyPrincipal::Agent),
+            Some("model=fct_*".to_string()),
+            Some("incident 42".to_string()),
+            false,
+            true,
+        )
+        .unwrap();
+
+        let local = read_policy_show_ledger(&state_path, false).unwrap();
+        assert_eq!(local.source, "read");
+        assert_eq!(local.freezes.len(), 1);
+
+        let mirrored = read_policy_show_ledger(&state_path, true).unwrap();
+        assert_eq!(
+            mirrored.source, "local_mirror",
+            "a populated local store on a remote backend is still only a mirror"
+        );
+        assert_eq!(
+            mirrored.freezes.len(),
+            1,
+            "the rows it did see are still reported; only the completeness claim changes"
+        );
+    }
+
+    /// The text must not call an unreadable marker a deliberate both-principal
+    /// freeze. Round two found this wording had no test at all: it lived
+    /// inside a `println!`, so reverting it to a plain `both` would have
+    /// passed everything. Now it is a function, and this is that test.
+    #[test]
+    fn an_unreadable_marker_does_not_read_as_a_deliberate_both_principal_freeze() {
+        let unreadable = PolicyFreezeInForce {
+            source: "marker".to_string(),
+            principal: None,
+            scope: "any".to_string(),
+            reason: "unreadable freeze marker body (expected value at line 1)".to_string(),
+            since: None,
+            plan_id: None,
+            freeze_id: Some("marker-1".to_string()),
+        };
+        let text = freeze_principal_text(&unreadable);
+        assert_ne!(
+            text, "both",
+            "a bare `both` hides why the principal is absent"
+        );
+        assert!(
+            text.contains("unreadable"),
+            "the principal column must say the body was unreadable, got: {text}"
+        );
+
+        let deliberate = PolicyFreezeInForce {
+            principal: Some(PolicyPrincipal::Agent),
+            ..unreadable
+        };
+        assert_eq!(freeze_principal_text(&deliberate), "agent");
     }
 }

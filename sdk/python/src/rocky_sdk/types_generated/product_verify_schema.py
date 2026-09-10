@@ -8,7 +8,7 @@ from enum import StrEnum
 from pydantic import BaseModel
 
 
-class PolicyEffect21(StrEnum):
+class PolicyEffect24(StrEnum):
     """
     Permit the action outright.
     """
@@ -16,7 +16,7 @@ class PolicyEffect21(StrEnum):
     allow = "allow"
 
 
-class PolicyEffect22(StrEnum):
+class PolicyEffect25(StrEnum):
     """
     Permit only after human review. The safe default posture.
     """
@@ -24,7 +24,7 @@ class PolicyEffect22(StrEnum):
     require_review = "require_review"
 
 
-class PolicyEffect23(StrEnum):
+class PolicyEffect26(StrEnum):
     """
     Refuse the action. A hard override — no `allow` overturns it.
     """
@@ -61,7 +61,7 @@ class ProductVerifyOutput(BaseModel):
     JSON output of `rocky product verify`.
     """
 
-    apply_effect: PolicyEffect21 | PolicyEffect22 | PolicyEffect23 | None = None
+    apply_effect: PolicyEffect24 | PolicyEffect25 | PolicyEffect26 | None = None
     """
     The resolved agent-apply effect, when evaluation ran.
     """
@@ -78,7 +78,7 @@ class ProductVerifyOutput(BaseModel):
     """
     `product:<name>`.
     """
-    propose_effect: PolicyEffect21 | PolicyEffect22 | PolicyEffect23 | None = None
+    propose_effect: PolicyEffect24 | PolicyEffect25 | PolicyEffect26 | None = None
     """
     The resolved agent-propose effect, when evaluation ran.
     """

@@ -558,6 +558,22 @@ pub(crate) fn refuse_on_scheduling_warnings(strict: bool, warnings: &[String]) -
     )
 }
 
+/// The checkpoint identity of a planned table: `catalog.schema.table` of its
+/// TARGET.
+///
+/// Every site that writes a [`rocky_core::state::TableProgress`], the resume
+/// filter that reads one back, and the planned set stamped on the checkpoint
+/// all call this. The set comparison in `ensure_the_resume_would_do_work`
+/// only means anything while the plan and the recordings are spelled the same
+/// way, so they are spelled in exactly one place — a divergence has to be an
+/// edit here rather than a silent drift between six `format!`s.
+fn table_key(task: &TableTask) -> String {
+    format!(
+        "{}.{}.{}",
+        task.target_catalog, task.target_schema, task.target_table_name
+    )
+}
+
 fn copy_endpoints(task: &TableTask) -> (TableRef, TableRef) {
     (
         TableRef {
@@ -1968,6 +1984,65 @@ fn ensure_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> 
     }
 }
 
+/// Whether a checkpoint proves that every table its run planned was copied.
+///
+/// Three answers, not two, because the pre-v30 shape is genuinely a third one:
+/// a checkpoint written before [`RunProgress::planned_tables`] existed cannot
+/// prove anything about the SET, only about the count. The caller treats it
+/// the same as `Complete` — that is what shipped — but it is a separate
+/// answer so the weaker evidence is visible rather than laundered by a `bool`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyCompleteness {
+    /// Every planned key is present and `Success`.
+    Complete,
+    /// A planned key is missing or not `Success` — real copy work remains.
+    Incomplete,
+    /// No planned set on the checkpoint (pre-v30), and the count of `Success`
+    /// entries reaches `total_tables`.
+    CompleteByCount,
+}
+
+/// Decide [`CopyCompleteness`] for a checkpoint.
+///
+/// With a planned set this is a set comparison: every planned key must have a
+/// `Success` entry. A recorded key that is NOT in the plan contributes
+/// nothing — which is the whole point, because that is the shape a count got
+/// wrong (#1674).
+///
+/// Without one — a checkpoint written before schema v30 — the count is the
+/// only answer available, and it is the answer that shipped. It comes back as
+/// [`CopyCompleteness::CompleteByCount`] so the call site can see which
+/// evidence it acted on.
+fn copy_completeness(progress: &RunProgress) -> CopyCompleteness {
+    let succeeded: std::collections::HashSet<&str> = progress
+        .tables
+        .iter()
+        .filter(|t| t.status == rocky_core::state::TableStatus::Success)
+        .map(|t| t.table_key.as_str())
+        .collect();
+    let Some(planned) = progress.planned_tables.as_ref() else {
+        // Counts ENTRIES, not distinct keys — the arithmetic that shipped.
+        // `succeeded.len()` would dedup, and the pre-v8 inline-header
+        // fallback (`get_run_progress` keeps the header's own `tables`) can
+        // still hand back a repeated `table_key`.
+        let copied = progress
+            .tables
+            .iter()
+            .filter(|t| t.status == rocky_core::state::TableStatus::Success)
+            .count();
+        return if copied < progress.total_tables {
+            CopyCompleteness::Incomplete
+        } else {
+            CopyCompleteness::CompleteByCount
+        };
+    };
+    if planned.iter().all(|key| succeeded.contains(key.as_str())) {
+        CopyCompleteness::Complete
+    } else {
+        CopyCompleteness::Incomplete
+    }
+}
+
 /// Refuse a *failed* run that left no copy work behind (#1598).
 ///
 /// The two failure statuses stay resumable because a failed run usually has
@@ -2011,32 +2086,29 @@ fn ensure_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> 
 /// those failed entries are the compile failures, the failed copies, and the
 /// post-apply custody failures. A check failure adds none.
 ///
-/// `total_tables` is what the recorded run planned to copy *after* its own
+/// The planned set is what the recorded run planned to copy *after* its own
 /// resume filtering, not the pipeline's whole table set. So a resume of a
 /// resume — run N-1 copied 3 of 5, run N copied its remaining 2 — reads as
-/// complete and is refused even though 3 tables would be re-copied. That is
-/// the conservative direction: the refusal is loud and says to re-run, while
-/// admitting it would risk the silent exit-0 this gate exists to stop.
+/// complete and is refused even though 3 tables would be re-copied. Recording
+/// identities does not fix that on its own, because the resumed run's plan is
+/// genuinely smaller; it is tracked separately on #1674. The refusal stays the
+/// conservative direction: it is loud and says to re-run, while admitting it
+/// would risk the silent exit-0 this gate exists to stop.
 ///
-/// # The invariant this refusal depends on, stated
+/// # How "every planned table copied" is decided
 ///
-/// "Every planned table copied" is decided by comparing a count of `Success`
-/// entries against `total_tables`. A count can only stand in for the planned
-/// SET while every recorded key comes from the invocation's own plan. That
-/// producer invariant holds today and is enforced entirely by the callers:
-/// `init_run_progress` is called once per run with `tables_to_process.len()`,
-/// both `record_table_progress` sites iterate that same `tables_to_process`,
-/// entries are keyed `{run_id}|{table_key}` so a table cannot be counted twice,
-/// and DAG sub-runs mint their own run ids rather than sharing a checkpoint.
+/// By [`copy_completeness`], from the planned SET the checkpoint carries
+/// (`RunProgress::planned_tables`, schema v30, #1674) — not from a count. A
+/// count could only stand in for the set while every recorded key came from
+/// the invocation's own plan, and nothing enforced that. A checkpoint holding
+/// `Success(a)` and `Success(x)` against a plan of `{a, b}` has the right
+/// count and the wrong set, so the count said "complete" and refused a resume
+/// that still owed `b`.
 ///
-/// This function cannot check any of that, and no arithmetic on counts can
-/// recover it: a checkpoint holding `Success(a)` and `Success(x)` against a
-/// plan of `{a, b}` has the right count and the wrong set, and would be refused
-/// although `b` still needs copying. Proving completeness properly needs the
-/// planned table identities on the checkpoint, which is a `RunProgress` shape
-/// change and so out of scope here. **If you add a `record_table_progress` call
-/// site, it must record a table from `tables_to_process` or this gate becomes
-/// wrong.**
+/// A pre-v30 checkpoint has no planned set and falls back to the count, which
+/// is exactly what shipped before. That is
+/// [`CopyCompleteness::CompleteByCount`], kept a distinct answer rather than
+/// folded into `Complete` so the weaker evidence stays visible here.
 ///
 /// The non-`Success` guard below narrows the exposure rather than removing it.
 /// It is what makes every mixed-state checkpoint resumable regardless of the
@@ -2069,13 +2141,9 @@ fn ensure_the_resume_would_do_work(
     {
         return Ok(());
     }
-    let copied = progress
-        .tables
-        .iter()
-        .filter(|t| t.status == rocky_core::state::TableStatus::Success)
-        .count();
-    if copied < progress.total_tables {
-        return Ok(());
+    match copy_completeness(progress) {
+        CopyCompleteness::Incomplete => return Ok(()),
+        CopyCompleteness::Complete | CopyCompleteness::CompleteByCount => {}
     }
     // The checks gated this run and no copy work remains (#1720). A resume
     // rebuilds its check inputs only from the tables it copies, so it would
@@ -4680,13 +4748,7 @@ pub async fn run(
 
     let original_count = tables_to_process.len();
     if !completed_keys.is_empty() {
-        tables_to_process.retain(|task| {
-            let key = format!(
-                "{}.{}.{}",
-                task.target_catalog, task.target_schema, task.target_table_name
-            );
-            !completed_keys.contains(&key)
-        });
+        tables_to_process.retain(|task| !completed_keys.contains(&table_key(task)));
         let skipped = original_count - tables_to_process.len();
         output.tables_skipped = skipped;
         info!(
@@ -4698,9 +4760,11 @@ pub async fn run(
 
     // Initialize run progress tracking, stamped with this invocation's
     // pipeline scope so a later resume can prove the checkpoint is its own
-    // (#1549).
+    // (#1549), and with the table keys it plans to copy so a later resume can
+    // prove completeness as a set rather than a count (#1674).
+    let planned_table_keys: Vec<String> = tables_to_process.iter().map(table_key).collect();
     state_store
-        .init_run_progress(&run_id, tables_to_process.len(), Some(&resume_scope))
+        .init_run_progress(&run_id, &planned_table_keys, Some(&resume_scope))
         .context("failed to initialize run progress")?;
 
     // --- Process tables concurrently ---
@@ -5166,11 +5230,7 @@ pub async fn run(
                 // Checkpoint: record failed table progress
                 {
                     let task = tables_to_process.get(idx);
-                    let table_key = task
-                        .map(|t| {
-                            format!("{}.{}.{}", t.target_catalog, t.target_schema, t.target_table_name)
-                        })
-                        .unwrap_or_default();
+                    let table_key = task.map(table_key).unwrap_or_default();
 
                     // §P2.6 per-table emit: materialize_error.
                     let _ = hook_registry
@@ -5320,10 +5380,7 @@ pub async fn run(
 
         {
             for (idx, task) in tables_to_process.iter().enumerate() {
-                let key = format!(
-                    "{}.{}.{}",
-                    task.target_catalog, task.target_schema, task.target_table_name
-                );
+                let key = table_key(task);
                 if !settled.contains(&key) {
                     let mut asset_key = task.asset_key_prefix.clone();
                     asset_key.push(task.target_table_name.clone());
@@ -13135,10 +13192,7 @@ async fn checkpoint_planned_table(
         run_id,
         rocky_core::state::TableProgress {
             index,
-            table_key: format!(
-                "{}.{}.{}",
-                task.target_catalog, task.target_schema, task.target_table_name
-            ),
+            table_key: table_key(task),
             asset_key,
             status,
             error: None,
@@ -13768,7 +13822,7 @@ async fn process_table(
         None
     };
 
-    let target_table_full_name = target_table.full_name();
+    let target_table_full_name = table_key(task);
 
     // Record the source change-marker captured at the prune decision point
     // (not a post-copy re-read): if the source advanced mid-copy the recorded
@@ -14210,12 +14264,7 @@ async fn process_completed_result(
 
             let table_key = tables_to_process
                 .get(idx)
-                .map(|t| {
-                    format!(
-                        "{}.{}.{}",
-                        t.target_catalog, t.target_schema, t.target_table_name
-                    )
-                })
+                .map(table_key)
                 .unwrap_or_default();
 
             // Frame common warehouse auth failures (403/401) into an actionable
@@ -15808,7 +15857,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
         store
-            .init_run_progress("run-empty", 0, Some(&scope))
+            .init_run_progress("run-empty", &planned_keys(0), Some(&scope))
             .unwrap();
 
         let explicit = resolve_resume_progress(&store, Some("run-empty"), false, &scope)
@@ -15842,7 +15891,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         store
-            .init_run_progress("run-p2", 1, Some(&test_resume_scope("p2")))
+            .init_run_progress("run-p2", &planned_keys(1), Some(&test_resume_scope("p2")))
             .unwrap();
 
         let err = resolve_resume_progress(&store, Some("run-p2"), false, &test_resume_scope("p1"))
@@ -15864,7 +15913,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
     fn resume_refuses_a_scopeless_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
-        store.init_run_progress("run-legacy", 1, None).unwrap();
+        store
+            .init_run_progress("run-legacy", &planned_keys(1), None)
+            .unwrap();
 
         let scope = test_resume_scope("p1");
         for (resume_run_id, resume_latest) in [(Some("run-legacy"), false), (None, true)] {
@@ -15885,7 +15936,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         store
-            .init_run_progress("run-p2", 1, Some(&test_resume_scope("p2")))
+            .init_run_progress("run-p2", &planned_keys(1), Some(&test_resume_scope("p2")))
             .unwrap();
 
         let err = resolve_resume_progress(&store, None, true, &test_resume_scope("p1"))
@@ -15904,7 +15955,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
-        store.init_run_progress("run-1", 1, Some(&scope)).unwrap();
+        store
+            .init_run_progress("run-1", &planned_keys(1), Some(&scope))
+            .unwrap();
 
         // Both entry points, because a run id names the same checkpoint
         // either way. `--resume <id>` skipped this gate entirely until
@@ -15944,7 +15997,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
-        store.init_run_progress("run-1", 1, Some(&scope)).unwrap();
+        store
+            .init_run_progress("run-1", &planned_keys(1), Some(&scope))
+            .unwrap();
 
         let entry_points = [(None, true), (Some("run-1"), false)];
 
@@ -15992,6 +16047,16 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         store.record_run(&record).unwrap();
     }
 
+    /// The `count` table keys [`complete_tables`] records, in plan order — the
+    /// planned set a run with those tables stamps on its checkpoint (#1674).
+    /// Kept beside `complete_tables` on purpose: a test whose plan and whose
+    /// recordings are spelled differently proves nothing about the gate.
+    fn planned_keys(count: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| format!("wh.staging_p1__acme.t{index}"))
+            .collect()
+    }
+
     /// Mark `count` of the checkpoint's tables copied.
     fn complete_tables(store: &StateStore, run_id: &str, count: usize) {
         for index in 0..count {
@@ -16021,7 +16086,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
-        store.init_run_progress("run-1", 2, Some(&scope)).unwrap();
+        store
+            .init_run_progress("run-1", &planned_keys(2), Some(&scope))
+            .unwrap();
         complete_tables(&store, "run-1", 2);
 
         for status in ["PartialFailure", "Failure"] {
@@ -16054,7 +16121,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
-        store.init_run_progress("run-1", 2, Some(&scope)).unwrap();
+        store
+            .init_run_progress("run-1", &planned_keys(2), Some(&scope))
+            .unwrap();
         complete_tables(&store, "run-1", 2);
         seed_run_record_with_a_failed_model(&store, "run-1", "PartialFailure");
 
@@ -16107,7 +16176,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
-        store.init_run_progress("run-1", 2, Some(&scope)).unwrap();
+        store
+            .init_run_progress("run-1", &planned_keys(2), Some(&scope))
+            .unwrap();
         complete_tables(&store, "run-1", 2);
 
         for status in ["PartialFailure", "Failure"] {
@@ -16126,6 +16197,174 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         }
     }
 
+    /// #1674, the defect the count could not see. The checkpoint plans
+    /// `{t0, t1}`, records `Success` for `t0` and for a table that is NOT in
+    /// the plan, and the run was gated by its checks.
+    ///
+    /// ```text
+    ///   planned  {wh.staging_p1__acme.t0, wh.staging_p1__acme.t1}
+    ///   Success  {wh.staging_p1__acme.t0, wh.other.stray}
+    ///
+    ///   count  2 >= 2          -> "complete" -> refuse   <- wrong: t1 unread
+    ///   set    t1 not copied   -> incomplete -> resume    <- right
+    /// ```
+    ///
+    /// The count refuses a resume that still owes `t1`. The set admits it.
+    /// This is the ONLY test that separates the two, so it is the one the
+    /// mutation check reverts.
+    #[test]
+    fn a_checkpoint_whose_successes_are_not_its_planned_set_still_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        let planned = planned_keys(2);
+        store
+            .init_run_progress("run-1", &planned, Some(&scope))
+            .unwrap();
+        for (index, key) in [planned[0].as_str(), "wh.other.stray"].iter().enumerate() {
+            store
+                .record_table_progress(
+                    "run-1",
+                    &table_entry(index, key, rocky_core::state::TableStatus::Success),
+                )
+                .unwrap();
+        }
+        seed_gated_run_record(&store, "run-1", "PartialFailure");
+
+        for (resume_run_id, resume_latest) in [(None, true), (Some("run-1"), false)] {
+            let progress = resolve_resume_progress(&store, resume_run_id, resume_latest, &scope)
+                .expect("a planned table that was never copied must stay resumable")
+                .expect("the checkpoint resolves");
+            assert_eq!(progress.run_id, "run-1");
+        }
+    }
+
+    /// The negative control for the test above, and the reason "always
+    /// incomplete" is not a fix. Same plan, same gate — but every planned key
+    /// really did succeed, so the refusal must still fire. Without this,
+    /// deleting the comparison entirely would satisfy the test above.
+    #[test]
+    fn a_checkpoint_whose_planned_set_all_succeeded_is_still_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        store
+            .init_run_progress("run-1", &planned_keys(2), Some(&scope))
+            .unwrap();
+        complete_tables(&store, "run-1", 2);
+        seed_gated_run_record(&store, "run-1", "PartialFailure");
+
+        let err = resolve_resume_progress(&store, None, true, &scope)
+            .expect_err("a fully-copied gated run must still refuse");
+        assert!(
+            format!("{err:#}").contains("gated by its checks"),
+            "unexpected refusal: {err:#}"
+        );
+    }
+
+    /// A pre-v30 checkpoint carries no planned set, and the gate falls back to
+    /// the count — the behaviour that shipped. Written against the stored
+    /// bytes rather than through `init_run_progress`, because this build's
+    /// writer always stamps the set and so cannot produce the old shape.
+    #[test]
+    fn a_planless_checkpoint_is_still_decided_by_the_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        store
+            .init_run_progress("run-1", &planned_keys(2), Some(&scope))
+            .unwrap();
+        complete_tables(&store, "run-1", 2);
+        seed_gated_run_record(&store, "run-1", "PartialFailure");
+
+        let stored = store.get_run_progress("run-1").unwrap().unwrap();
+        assert!(
+            stored.planned_tables.is_some(),
+            "this build must stamp the planned set"
+        );
+        let planless = rocky_core::state::RunProgress {
+            planned_tables: None,
+            ..stored
+        };
+        assert_eq!(
+            super::copy_completeness(&planless),
+            super::CopyCompleteness::CompleteByCount,
+            "without a plan the count is the only evidence, and it says complete"
+        );
+    }
+
+    /// The three answers, stated directly on the decision rather than through
+    /// the whole resume path. A key recorded outside the plan contributes
+    /// nothing — that is the fix in one line.
+    #[test]
+    fn copy_completeness_reads_the_set_not_the_count() {
+        use rocky_core::state::TableStatus;
+
+        let progress = |planned: Option<Vec<&str>>, recorded: Vec<(&str, TableStatus)>| {
+            rocky_core::state::RunProgress {
+                run_id: "run-1".to_string(),
+                started_at: Utc::now(),
+                total_tables: planned.as_ref().map(Vec::len).unwrap_or(2),
+                tables: recorded
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (key, status))| table_entry(index, key, status))
+                    .collect(),
+                scope: None,
+                planned_tables: planned.map(|keys| keys.into_iter().map(str::to_string).collect()),
+            }
+        };
+
+        assert_eq!(
+            super::copy_completeness(&progress(
+                Some(vec!["c.s.a", "c.s.b"]),
+                vec![
+                    ("c.s.a", TableStatus::Success),
+                    ("c.s.b", TableStatus::Success)
+                ],
+            )),
+            super::CopyCompleteness::Complete
+        );
+        assert_eq!(
+            super::copy_completeness(&progress(
+                Some(vec!["c.s.a", "c.s.b"]),
+                vec![
+                    ("c.s.a", TableStatus::Success),
+                    ("c.s.x", TableStatus::Success)
+                ],
+            )),
+            super::CopyCompleteness::Incomplete,
+            "a key outside the plan must not stand in for a planned one"
+        );
+        assert_eq!(
+            super::copy_completeness(&progress(
+                Some(vec!["c.s.a", "c.s.b"]),
+                vec![
+                    ("c.s.a", TableStatus::Success),
+                    ("c.s.b", TableStatus::Failed)
+                ],
+            )),
+            super::CopyCompleteness::Incomplete,
+            "a planned key that did not succeed is not copied"
+        );
+        assert_eq!(
+            super::copy_completeness(&progress(
+                None,
+                vec![
+                    ("c.s.a", TableStatus::Success),
+                    ("c.s.x", TableStatus::Success)
+                ],
+            )),
+            super::CopyCompleteness::CompleteByCount,
+            "with no plan the count is all there is"
+        );
+        assert_eq!(
+            super::copy_completeness(&progress(None, vec![("c.s.a", TableStatus::Success)])),
+            super::CopyCompleteness::Incomplete,
+            "the count still catches the tables it can"
+        );
+    }
+
     /// The narrowing conjunct for the refusal above: a gated run with copy
     /// work left is still admitted, because a resume of it does real work.
     /// What keeps THAT honest is the carry-forward, not a refusal — see
@@ -16136,7 +16375,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
-        store.init_run_progress("run-1", 3, Some(&scope)).unwrap();
+        store
+            .init_run_progress("run-1", &planned_keys(3), Some(&scope))
+            .unwrap();
         complete_tables(&store, "run-1", 2);
         seed_gated_run_record(&store, "run-1", "PartialFailure");
 
@@ -16162,7 +16403,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
-        store.init_run_progress("run-1", 3, Some(&scope)).unwrap();
+        store
+            .init_run_progress("run-1", &planned_keys(3), Some(&scope))
+            .unwrap();
         complete_tables(&store, "run-1", 2);
         seed_run_record(&store, "run-1", "PartialFailure");
 
@@ -16187,7 +16430,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
-        store.init_run_progress("run-1", 3, Some(&scope)).unwrap();
+        store
+            .init_run_progress("run-1", &planned_keys(3), Some(&scope))
+            .unwrap();
         complete_tables(&store, "run-1", 2);
         // `seed_run_record` builds the record from a JSON object with no
         // `check_gate_failed` key — the v24 blob shape.
@@ -16206,7 +16451,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
-        store.init_run_progress("run-1", 2, Some(&scope)).unwrap();
+        store
+            .init_run_progress("run-1", &planned_keys(2), Some(&scope))
+            .unwrap();
         complete_tables(&store, "run-1", 1);
         seed_run_record(&store, "run-1", "PartialFailure");
 
@@ -16230,7 +16477,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             let dir = tempfile::tempdir().unwrap();
             let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
             let scope = test_resume_scope("p1");
-            store.init_run_progress("run-1", 2, Some(&scope)).unwrap();
+            store
+                .init_run_progress("run-1", &planned_keys(2), Some(&scope))
+                .unwrap();
             complete_tables(&store, "run-1", 1);
             store
                 .record_table_progress("run-1", &table_entry(1, "wh.staging_p1__acme.t1", status))
@@ -16270,7 +16519,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             let scope = test_resume_scope("p1");
             // Two copied tables against a post-filter plan of ONE, plus an
             // unfinished third: a count alone would read this as complete.
-            store.init_run_progress("run-1", 1, Some(&scope)).unwrap();
+            store
+                .init_run_progress("run-1", &planned_keys(1), Some(&scope))
+                .unwrap();
             complete_tables(&store, "run-1", 2);
             store
                 .record_table_progress("run-1", &table_entry(2, "wh.staging_p1__acme.t2", trailing))
@@ -16291,7 +16542,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
-        store.init_run_progress("run-0", 0, Some(&scope)).unwrap();
+        store
+            .init_run_progress("run-0", &planned_keys(0), Some(&scope))
+            .unwrap();
         seed_run_record(&store, "run-0", "Failure");
         let progress = resolve_resume_progress(&store, Some("run-0"), false, &scope)
             .unwrap()
@@ -16314,7 +16567,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let scope = test_resume_scope("p1");
         // Run N was itself a resume: it planned only the 2 tables run N-1
         // left behind, and copied both.
-        store.init_run_progress("run-2", 2, Some(&scope)).unwrap();
+        store
+            .init_run_progress("run-2", &planned_keys(2), Some(&scope))
+            .unwrap();
         complete_tables(&store, "run-2", 2);
         seed_run_record(&store, "run-2", "PartialFailure");
 
@@ -16337,11 +16592,14 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
-        store.init_run_progress("run-1", 2, Some(&scope)).unwrap();
-        for (index, key) in ["wh.staging_p1__acme.orders", "wh.staging_p1__acme.items"]
-            .iter()
-            .enumerate()
-        {
+        let planned = [
+            "wh.staging_p1__acme.orders".to_string(),
+            "wh.staging_p1__acme.items".to_string(),
+        ];
+        store
+            .init_run_progress("run-1", &planned, Some(&scope))
+            .unwrap();
+        for (index, key) in planned.iter().enumerate() {
             store
                 .record_table_progress("run-1", &table_entry(index, key, TableStatus::Success))
                 .unwrap();
@@ -16418,7 +16676,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         store
-            .init_run_progress("run-forged", 1, Some(&forged))
+            .init_run_progress("run-forged", &planned_keys(1), Some(&forged))
             .unwrap();
 
         let err = resolve_resume_progress(&store, Some("run-forged"), false, &genuine)
@@ -16476,7 +16734,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
 
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
-        store.init_run_progress("run-a", 1, Some(&scope_a)).unwrap();
+        store
+            .init_run_progress("run-a", &planned_keys(1), Some(&scope_a))
+            .unwrap();
 
         let err = resolve_resume_progress(&store, Some("run-a"), false, &scope_b)
             .expect_err("another gateway path's checkpoint must not resume");
@@ -16518,7 +16778,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
 
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
-        store.init_run_progress("run-a", 1, Some(&scope_a)).unwrap();
+        store
+            .init_run_progress("run-a", &planned_keys(1), Some(&scope_a))
+            .unwrap();
         let err = resolve_resume_progress(&store, Some("run-a"), false, &scope_b)
             .expect_err("another route's checkpoint must not resume");
 
@@ -16669,7 +16931,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         store
-            .init_run_progress("run-underscore", 1, Some(&underscore))
+            .init_run_progress("run-underscore", &planned_keys(1), Some(&underscore))
             .unwrap();
 
         let err = resolve_resume_progress(&store, Some("run-underscore"), false, &dashes)
@@ -16737,7 +16999,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         store
-            .init_run_progress("run-underscore", 1, Some(&underscore))
+            .init_run_progress("run-underscore", &planned_keys(1), Some(&underscore))
             .unwrap();
 
         let err = resolve_resume_progress(&store, Some("run-underscore"), false, &dashes)
@@ -16800,7 +17062,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             let dir = tempfile::tempdir().unwrap();
             let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
             store
-                .init_run_progress("run-written", 1, Some(&written))
+                .init_run_progress("run-written", &planned_keys(1), Some(&written))
                 .unwrap();
             resolve_resume_progress(&store, Some("run-written"), false, &edited)
                 .unwrap_or_else(|err| panic!("'{schema_template}' must still resume: {err:#}"))
@@ -16897,7 +17159,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         store
-            .init_run_progress("run-written", 1, Some(&written))
+            .init_run_progress("run-written", &planned_keys(1), Some(&written))
             .unwrap();
         resolve_resume_progress(&store, Some("run-written"), false, &edited)
             .expect("the bypassed separator must still resume")
@@ -16928,7 +17190,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         store
-            .init_run_progress("run-catalog", 1, Some(&catalog_written))
+            .init_run_progress("run-catalog", &planned_keys(1), Some(&catalog_written))
             .unwrap();
         let err = resolve_resume_progress(&store, Some("run-catalog"), false, &catalog_edited)
             .expect_err("another catalog separator's checkpoint must not resume");
@@ -17036,7 +17298,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         store
-            .init_run_progress("run-written", 1, Some(&written))
+            .init_run_progress("run-written", &planned_keys(1), Some(&written))
             .unwrap();
         resolve_resume_progress(&store, Some("run-written"), false, &edited)
             .expect("a bypassed template edit must still resume")
@@ -17062,7 +17324,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         store
-            .init_run_progress("run-plain", 1, Some(&plain_written))
+            .init_run_progress("run-plain", &planned_keys(1), Some(&plain_written))
             .unwrap();
         let err = resolve_resume_progress(&store, Some("run-plain"), false, &plain_edited)
             .expect_err("another schema template's checkpoint must not resume");
@@ -17183,7 +17445,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         store
-            .init_run_progress("run-written", 1, Some(&written))
+            .init_run_progress("run-written", &planned_keys(1), Some(&written))
             .unwrap();
         let err = resolve_resume_progress(&store, Some("run-written"), false, &edited)
             .expect_err("an edited source separator must not resume");
@@ -17212,7 +17474,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             target: None,
             ..scope.clone()
         };
-        store.init_run_progress("run-flat", 1, Some(&flat)).unwrap();
+        store
+            .init_run_progress("run-flat", &planned_keys(1), Some(&flat))
+            .unwrap();
 
         let err = resolve_resume_progress(&store, Some("run-flat"), false, &scope)
             .expect_err("a scope without a structured target must not resume");
@@ -17251,7 +17515,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
             let scope = test_resume_scope("p1");
             store
-                .init_run_progress("run-1", planned, Some(&scope))
+                .init_run_progress("run-1", &planned_keys(planned), Some(&scope))
                 .unwrap();
             for (index, status) in recorded.iter().enumerate() {
                 let key = format!("wh.staging_p1__acme.t{index}");
@@ -17307,7 +17571,11 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let store = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
         let tasks = vec![planned_task("orders"), planned_task("items")];
         store
-            .init_run_progress("run-1", tasks.len(), Some(&test_resume_scope("p1")))
+            .init_run_progress(
+                "run-1",
+                &tasks.iter().map(table_key).collect::<Vec<_>>(),
+                Some(&test_resume_scope("p1")),
+            )
             .unwrap();
 
         let semaphore = Semaphore::new(1);
@@ -17383,6 +17651,20 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             progress.total_tables,
             "every planned table is recorded: {:?}",
             progress.tables
+        );
+        assert_eq!(
+            progress
+                .tables
+                .iter()
+                .map(|t| t.table_key.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            progress
+                .planned_tables
+                .clone()
+                .unwrap()
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the recorded keys are the planned keys (#1674)"
         );
         assert_eq!(progress.tables[0].table_key, "cat.staging.orders");
         assert_eq!(progress.tables[0].status, TableStatus::Success);
@@ -17820,7 +18102,11 @@ auto_create_schemas = true
         // left a table behind is the shape this test is about, and it stays
         // resumable. The refusal has its own coverage in
         // `resume_refuses_a_complete_checkpoint_whose_failure_was_not_a_copy_or_a_model`.
-        for (run_record_status, planned_tables) in [(None, 2), (Some("Failure"), 2)] {
+        let planned_tables = [
+            "warehouse.staging_p2__acme.orders".to_string(),
+            "warehouse.staging_p2__acme.items".to_string(),
+        ];
+        for run_record_status in [None, Some("Failure")] {
             let dir = tempfile::tempdir().unwrap();
             let (config_path, state_path, db_path) = write_two_pipeline_project(
                 dir.path(),
@@ -17862,7 +18148,7 @@ auto_create_schemas = true
                 );
                 let store = StateStore::open(&state_path).unwrap();
                 store
-                    .init_run_progress("run-seeded", planned_tables, Some(&scope))
+                    .init_run_progress("run-seeded", &planned_tables, Some(&scope))
                     .unwrap();
                 store
                     .record_table_progress(
@@ -17965,7 +18251,11 @@ auto_create_schemas = true
             );
             let store = StateStore::open(&state_path).unwrap();
             store
-                .init_run_progress("run-branch", 1, Some(&scope))
+                .init_run_progress(
+                    "run-branch",
+                    &["warehouse.branch__feature.orders".to_string()],
+                    Some(&scope),
+                )
                 .unwrap();
             store
                 .record_table_progress(
@@ -18124,7 +18414,11 @@ auto_create_schemas = true
             );
             let store = StateStore::open(&state_path).unwrap();
             store
-                .init_run_progress("run-crashed", 1, Some(&scope))
+                .init_run_progress(
+                    "run-crashed",
+                    &["warehouse.staging_p2__acme.orders".to_string()],
+                    Some(&scope),
+                )
                 .unwrap();
             store
                 .record_table_progress(
@@ -22467,7 +22761,11 @@ timestamp_column = "ts"
         let hook_registry = HookRegistry::from_config(&Default::default());
         let tasks = vec![task.clone()];
         state
-            .init_run_progress("run-1", tasks.len(), Some(&test_resume_scope("p1")))
+            .init_run_progress(
+                "run-1",
+                &tasks.iter().map(table_key).collect::<Vec<_>>(),
+                Some(&test_resume_scope("p1")),
+            )
             .unwrap();
         process_completed_result(
             Ok((0, Ok(TableOutcome::Materialized(result)))),
@@ -23451,7 +23749,9 @@ backend = "local"
             "the severity-resolved verdict must reach the record"
         );
         store.record_run(&first_record).unwrap();
-        store.init_run_progress("run-1", 3, None).unwrap();
+        store
+            .init_run_progress("run-1", &planned_keys(3), None)
+            .unwrap();
         let progress = store.get_run_progress("run-1").unwrap().unwrap();
 
         // --- the resume: it copies the one table that failed, and nothing
@@ -23492,7 +23792,9 @@ backend = "local"
         );
         assert!(!matches!(resumed_record.status, RunStatus::Success));
         store.record_run(&resumed_record).unwrap();
-        store.init_run_progress("run-2", 1, None).unwrap();
+        store
+            .init_run_progress("run-2", &planned_keys(1), None)
+            .unwrap();
         let progress2 = store.get_run_progress("run-2").unwrap().unwrap();
         assert_eq!(
             super::inherited_check_gate(&store, Some(&progress2)).as_deref(),
@@ -23560,7 +23862,9 @@ backend = "local"
             "precondition: the synthetic entry is what admits the resume today"
         );
         store.record_run(&record).unwrap();
-        store.init_run_progress("run-1", 1, None).unwrap();
+        store
+            .init_run_progress("run-1", &["wh.raw.orders".to_string()], None)
+            .unwrap();
         store
             .record_table_progress(
                 "run-1",
@@ -23631,7 +23935,9 @@ backend = "local"
         );
         assert!(first_record.verify_after_failed);
         store.record_run(&first_record).unwrap();
-        store.init_run_progress("run-1", 3, None).unwrap();
+        store
+            .init_run_progress("run-1", &planned_keys(3), None)
+            .unwrap();
         let progress = store.get_run_progress("run-1").unwrap().unwrap();
 
         // The resume copies the one failed table. It auto-applies no drift, so
@@ -23664,7 +23970,9 @@ backend = "local"
             "the standing verdict must survive onto the resumed run's own record"
         );
         store.record_run(&resumed_record).unwrap();
-        store.init_run_progress("run-2", 1, None).unwrap();
+        store
+            .init_run_progress("run-2", &planned_keys(1), None)
+            .unwrap();
         let progress2 = store.get_run_progress("run-2").unwrap().unwrap();
         assert_eq!(
             super::inherited_verify_after(&store, Some(&progress2)).as_deref(),
@@ -35541,7 +35849,11 @@ timestamp_column = "ts"
         let task = column_match_task(vec![], vec![]);
         let tasks = vec![task.clone()];
         state
-            .init_run_progress("run-1", tasks.len(), Some(&test_resume_scope("p1")))
+            .init_run_progress(
+                "run-1",
+                &tasks.iter().map(table_key).collect::<Vec<_>>(),
+                Some(&test_resume_scope("p1")),
+            )
             .unwrap();
 
         let table_key = format!(
@@ -35647,7 +35959,11 @@ timestamp_column = "ts"
 
         let tasks = vec![planned_task("events")];
         state
-            .init_run_progress("run-1", tasks.len(), Some(&test_resume_scope("p1")))
+            .init_run_progress(
+                "run-1",
+                &tasks.iter().map(table_key).collect::<Vec<_>>(),
+                Some(&test_resume_scope("p1")),
+            )
             .unwrap();
 
         let semaphore = Semaphore::new(1);
@@ -35725,7 +36041,11 @@ timestamp_column = "ts"
 
         let tasks = [planned_task("a"), planned_task("events")];
         state
-            .init_run_progress("run-1", tasks.len(), Some(&test_resume_scope("p1")))
+            .init_run_progress(
+                "run-1",
+                &tasks.iter().map(table_key).collect::<Vec<_>>(),
+                Some(&test_resume_scope("p1")),
+            )
             .unwrap();
 
         let hook_registry = HookRegistry::from_config(&Default::default());
