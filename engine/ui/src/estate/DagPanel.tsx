@@ -7,7 +7,14 @@ import {
   useReactFlow,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { useEffect, useMemo, useRef, type RefObject } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type RefObject,
+} from "react";
 import type { DagOutput } from "@rocky-types/dag";
 import { EmptyState } from "../components";
 import { layeredFlow, type ModelNodeData } from "./layout";
@@ -31,11 +38,23 @@ const MIN_ZOOM = 0.1;
  * `fitView` cannot pass `minZoom`, and the library default of 0.5 could not
  * fit a 744px graph into the ~288px of canvas a 320px phone leaves — that
  * needs 0.39, so both end nodes were simply cut off. A deep DAG needs less
- * again. Kept a little under the interaction floor rather than far under it:
- * a fit below `MIN_ZOOM` is clamped back up by the next zoom gesture, so the
- * gap between the two is a discontinuity to be spent sparingly.
+ * again: eleven execution layers already need 0.0965 at that width.
  */
 const FIT = { minZoom: 0.02 } as const;
+
+/**
+ * The floor a fit actually used, so the next zoom gesture does not snap.
+ *
+ * A fit is allowed below `MIN_ZOOM`, but D3 applies the interaction floor to
+ * the next gesture, so an eleven-layer graph fitted at 0.0965 would jump to
+ * 0.1 — and a forty-two-layer one from 0.0225 to 0.1, which is 5× and throws
+ * away most of the graph the fit had just framed. So the floor follows the
+ * fit down. It never rises above `MIN_ZOOM`, so a small graph keeps a floor
+ * that stops anyone shrinking a node to a few pixels for no reason.
+ */
+function floorFor(fitted: number): number {
+  return Math.min(MIN_ZOOM, fitted);
+}
 
 /**
  * Re-fit the graph when the canvas changes width.
@@ -49,8 +68,14 @@ const FIT = { minZoom: 0.02 } as const;
  * fight a scroll. A refit does discard a manual pan or zoom, which is the
  * right trade when the alternative is a graph that is partly off-screen.
  */
-function RefitOnResize({ canvas }: { canvas: RefObject<HTMLDivElement | null> }) {
-  const { fitView } = useReactFlow();
+function RefitOnResize({
+  canvas,
+  onFitted,
+}: {
+  canvas: RefObject<HTMLDivElement | null>;
+  onFitted: (zoom: number) => void;
+}) {
+  const { fitView, getZoom } = useReactFlow();
   const lastWidth = useRef(0);
 
   useEffect(() => {
@@ -65,11 +90,11 @@ function RefitOnResize({ canvas }: { canvas: RefObject<HTMLDivElement | null> })
       lastWidth.current = width;
       // `fitView` changes the inner transform, not the observed box, so this
       // cannot feed itself.
-      void fitView(FIT);
+      void fitView(FIT).then(() => onFitted(getZoom()));
     });
     observer.observe(pane);
     return () => observer.disconnect();
-  }, [canvas, fitView]);
+  }, [canvas, fitView, getZoom, onFitted]);
 
   return null;
 }
@@ -83,6 +108,8 @@ function RefitOnResize({ canvas }: { canvas: RefObject<HTMLDivElement | null> })
  */
 export function DagPanel({ dag, onSelect }: { dag: DagOutput; onSelect: (name: string) => void }) {
   const canvasRef = useRef<HTMLDivElement | null>(null);
+  const [minZoom, setMinZoom] = useState(MIN_ZOOM);
+  const onFitted = useCallback((zoom: number) => setMinZoom(floorFor(zoom)), []);
   const flow = useMemo(() => layeredFlow(dag), [dag]);
   const dataById = useMemo(
     () => new Map(flow.nodes.map((node) => [node.id, node.data])),
@@ -142,17 +169,18 @@ export function DagPanel({ dag, onSelect }: { dag: DagOutput; onSelect: (name: s
             edges={flow.edges}
             nodeTypes={nodeTypes}
             fitView
-            // Two different floors, because they answer different questions:
-            // how small a fit may go, and how small a person may drag it.
+            // The fit may go lower than the hand, and the hand's floor
+            // follows it down so the first gesture after a fit does not snap.
             fitViewOptions={FIT}
-            minZoom={MIN_ZOOM}
+            minZoom={minZoom}
+            onInit={(flow) => onFitted(flow.getZoom())}
             nodesDraggable={false}
             nodesConnectable={false}
             proOptions={{ hideAttribution: true }}
             colorMode="system"
             onNodeClick={(_, node) => open(node.data)}
           >
-            <RefitOnResize canvas={canvasRef} />
+            <RefitOnResize canvas={canvasRef} onFitted={onFitted} />
             <Background />
             <MiniMap pannable zoomable />
             <Controls showInteractive={false} fitViewOptions={FIT} />

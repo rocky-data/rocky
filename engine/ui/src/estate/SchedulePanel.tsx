@@ -56,7 +56,7 @@ export function SchedulePanel({ status, now }: { status: ScheduleStatusOutput; n
         <div
           className="overflow-x-auto focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-500"
           tabIndex={0}
-          role="region"
+          role="group"
           aria-label="Schedules, scrollable"
         >
         <table className="w-full min-w-max text-left text-xs" aria-label="Schedules">

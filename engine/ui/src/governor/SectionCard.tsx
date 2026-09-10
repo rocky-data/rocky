@@ -79,7 +79,7 @@ export function Rows({
     <div
       className="overflow-x-auto focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-500"
       tabIndex={0}
-      role="region"
+      role="group"
       aria-label={`${ariaLabel}, scrollable`}
     >
     <table className="w-full min-w-max text-left text-xs" aria-label={ariaLabel}>
