@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { TOKEN_STORAGE_KEY, bootstrapToken, tokenFromFragment, type TokenWindow } from "./token";
+import {
+  TOKEN_STORAGE_KEY,
+  bootstrapToken,
+  currentToken,
+  tokenFromFragment,
+  type TokenWindow,
+} from "./token";
 
 function fakeWindow(hash: string, stored: string | null = null): TokenWindow & {
   replaced: string[];
@@ -59,5 +65,29 @@ describe("bootstrapToken", () => {
     expect(bootstrapToken(win)).toBeNull();
     expect(win.store.size).toBe(0);
     expect(win.replaced).toEqual([]);
+  });
+});
+
+describe("an empty stored token", () => {
+  // Three readers ask "is there a token", and they must not disagree. `apiGet`
+  // sends no Authorization header for "" because it is falsy, so any reader
+  // that called "" a token would mount the lanes and let them fetch without
+  // credentials -- the wall of 401s the shell's gate exists to remove.
+  it("is not a token, to currentToken", () => {
+    expect(currentToken(fakeWindow("", "").sessionStorage)).toBeNull();
+    expect(currentToken(fakeWindow("", "real").sessionStorage)).toBe("real");
+  });
+
+  it("is not a token, to bootstrapToken either", () => {
+    const win = fakeWindow("", "");
+    expect(bootstrapToken(win)).toBeNull();
+    // And the address is left alone: there was no fragment to scrub.
+    expect(win.replaced).toEqual([]);
+  });
+
+  it("never reaches storage from a fragment in the first place", () => {
+    const win = fakeWindow("#token=");
+    expect(bootstrapToken(win)).toBeNull();
+    expect(win.store.has(TOKEN_STORAGE_KEY)).toBe(false);
   });
 });
