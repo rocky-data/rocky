@@ -460,6 +460,40 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// The origins CORS will actually enforce, paired with the header value it
+/// enforces them as.
+///
+/// An origin that is not a valid header value is dropped with a warning — it
+/// cannot be installed, so it allows nothing. That silent narrowing is why this
+/// is a function rather than a `filter_map` inside [`build_cors_layer`]:
+/// `GET /api/v1/settings` reports the CORS allowlist, and a report built from
+/// the RAW `--allowed-origin` list would name an origin the browser will never
+/// be granted. One derivation, two readers, so the report cannot drift from the
+/// layer.
+fn accepted_origins(allowed_origins: &[String]) -> Vec<(String, HeaderValue)> {
+    allowed_origins
+        .iter()
+        .filter_map(|o| match HeaderValue::from_str(o) {
+            Ok(v) => Some((o.clone(), v)),
+            Err(e) => {
+                tracing::warn!(origin = %o, error = %e, "invalid CORS origin, ignoring");
+                None
+            }
+        })
+        .collect()
+}
+
+/// The subset of `--allowed-origin` that [`build_cors_layer`] installs.
+///
+/// What a settings route must report: the enforced allowlist, not the typed
+/// one.
+pub fn enforced_cors_origins(allowed_origins: &[String]) -> Vec<String> {
+    accepted_origins(allowed_origins)
+        .into_iter()
+        .map(|(origin, _)| origin)
+        .collect()
+}
+
 /// Build the CORS layer from a configured allowlist.
 ///
 /// - Empty allowlist → no `Access-Control-Allow-Origin` header is sent
@@ -487,15 +521,9 @@ pub fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
         return CorsLayer::new();
     }
 
-    let parsed: Vec<HeaderValue> = allowed_origins
-        .iter()
-        .filter_map(|o| match HeaderValue::from_str(o) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                tracing::warn!(origin = %o, error = %e, "invalid CORS origin, ignoring");
-                None
-            }
-        })
+    let parsed: Vec<HeaderValue> = accepted_origins(allowed_origins)
+        .into_iter()
+        .map(|(_, value)| value)
         .collect();
 
     CorsLayer::new()

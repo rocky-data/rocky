@@ -246,7 +246,7 @@ pub enum ConfigStatus {
 /// Only fields that are NOT already on [`ServerState`] live here. `ui`,
 /// `allowed_hosts`, `allowed_origins` and the token's scope are read back off
 /// the state itself, so there is no second copy to drift.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct SettingsSnapshot {
     /// The host the listener binds. The same `String` `ServeConfig` carries, so
     /// the reported value cannot disagree with the bound one.
@@ -259,13 +259,31 @@ pub struct SettingsSnapshot {
     /// Whether `ROCKY_WEBHOOK_SECRET` can sign a webhook. Captured even when the
     /// scheduler is off, via a probe that never bails.
     pub webhook_secret: WebhookSecret,
-    /// `[state] backend`, read from `rocky.toml` at server start. `None` when
-    /// there was no readable config — see [`SettingsSnapshot::config_status`].
+    /// The two `[state]` labels, resolved the FIRST time the settings route is
+    /// asked and then fixed for the life of the process.
+    ///
+    /// Deliberately not resolved in `build_serve_state`. Everything else here
+    /// is a flag or an env var, but these come from reading `rocky.toml`, and
+    /// `rocky serve` binds its listener before anything reads that file. Doing
+    /// the read eagerly would put a blocking full-file read on the pre-bind
+    /// path, so a `rocky.toml` that is a FIFO or sits on a stalled mount would
+    /// hang startup — a read-only settings route turning into the reason the
+    /// server never binds. Ordinary loader errors are already tolerated; a read
+    /// that never returns is not something tolerance can catch.
+    ///
+    /// Once resolved it never changes, so the document stays a snapshot rather
+    /// than a live view.
+    pub config_labels: std::sync::OnceLock<ConfigLabels>,
+}
+
+/// The `[state]` labels a settings document reports, and why they may be absent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConfigLabels {
+    /// `[state] backend`. `None` when there was no readable config.
     pub state_backend: Option<rocky_core::config::StateBackend>,
-    /// `[state] concurrency_control`, read at server start. `None` on the same
-    /// condition as [`SettingsSnapshot::state_backend`].
+    /// `[state] concurrency_control`. `None` on the same condition.
     pub concurrency_control: Option<rocky_core::config::ConcurrencyControl>,
-    /// Why the two fields above may be `None`.
+    /// Why the two above may be `None`.
     pub config_status: ConfigStatus,
 }
 

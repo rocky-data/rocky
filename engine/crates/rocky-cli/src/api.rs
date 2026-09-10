@@ -2139,7 +2139,39 @@ async fn schedule_status(
 /// Never fails. Every value was resolved at startup; there is no I/O, no
 /// state-store permit, and nothing to be busy.
 async fn settings(State(state): State<Arc<ServerState>>) -> PrettyJson<SettingsOutput> {
-    PrettyJson(settings_output(&state))
+    PrettyJson(settings_output(&state, resolve_config_labels(&state).await))
+}
+
+/// The `[state]` labels, read from `rocky.toml` once and then fixed.
+///
+/// Deliberately NOT read in `build_serve_state`. Every other field in the
+/// document is a flag or an env var; these come from a file, and `rocky serve`
+/// binds its listener before anything reads that file. An eager read would put
+/// a blocking full-file read on the path to `TcpListener::bind`, so a
+/// `rocky.toml` that is a FIFO or sits on a stalled mount would stop the server
+/// binding at all — a read-only settings route becoming the reason nothing
+/// serves. Loader *errors* are already tolerated; a read that never returns is
+/// not something tolerance catches.
+///
+/// Runs on a blocking thread, and only the first caller pays for it.
+async fn resolve_config_labels(state: &Arc<ServerState>) -> rocky_server::state::ConfigLabels {
+    if let Some(labels) = state.settings.config_labels.get() {
+        return *labels;
+    }
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        *state
+            .settings
+            .config_labels
+            .get_or_init(|| crate::commands::serve::config_posture(state.config_path.as_deref()))
+    })
+    .await
+    // A panic in a config read should not take the route down; report it the
+    // way an unreadable config is reported.
+    .unwrap_or(rocky_server::state::ConfigLabels {
+        config_status: rocky_server::state::ConfigStatus::Unreadable,
+        ..Default::default()
+    })
 }
 
 /// Project [`ServerState`] onto the settings document.
@@ -2148,7 +2180,10 @@ async fn settings(State(state): State<Arc<ServerState>>) -> PrettyJson<SettingsO
 /// serves — the lesson `build_serve_state` records one level up. This function
 /// IS the allowlist: every field is named here, and each `match` is exhaustive,
 /// so a new posture variant fails to compile rather than serialising silently.
-pub(crate) fn settings_output(state: &ServerState) -> SettingsOutput {
+pub(crate) fn settings_output(
+    state: &ServerState,
+    labels: rocky_server::state::ConfigLabels,
+) -> SettingsOutput {
     use rocky_server::state::{ConfigStatus as SnapStatus, WebhookSecret};
 
     let snapshot = &state.settings;
@@ -2162,7 +2197,10 @@ pub(crate) fn settings_output(state: &ServerState) -> SettingsOutput {
             .as_ref()
             .map(|ui| ui.allowed_hosts.clone())
             .unwrap_or_default(),
-        allowed_origins: state.allowed_origins.clone(),
+        // The ENFORCED allowlist, not the typed one: `build_cors_layer` drops
+        // an origin that is not a valid header value, so the raw list can name
+        // an origin the browser will never be granted.
+        allowed_origins: rocky_server::auth::enforced_cors_origins(&state.allowed_origins),
         scheduler: snapshot.scheduler,
         ui: state.ui.is_some(),
         webhook_secret: match snapshot.webhook_secret {
@@ -2178,9 +2216,9 @@ pub(crate) fn settings_output(state: &ServerState) -> SettingsOutput {
                 TokenScope::ReadOnly => TokenScopeLabel::ReadOnly,
             },
         }),
-        state_backend: snapshot.state_backend,
-        concurrency_control: snapshot.concurrency_control,
-        config_status: match snapshot.config_status {
+        state_backend: labels.state_backend,
+        concurrency_control: labels.concurrency_control,
+        config_status: match labels.config_status {
             SnapStatus::Loaded => ConfigStatus::Loaded,
             SnapStatus::Absent => ConfigStatus::Absent,
             SnapStatus::Unreadable => ConfigStatus::Unreadable,
@@ -5908,9 +5946,6 @@ mod tests {
         )
         .unwrap();
 
-        let (state_backend, concurrency_control, config_status) =
-            crate::commands::serve::config_posture(Some(&config_path));
-
         let state = ServerState::with_auth_and_webhook(
             models_dir,
             false,
@@ -5933,12 +5968,111 @@ mod tests {
                 bind_host: "127.0.0.1".to_string(),
                 scheduler: true,
                 webhook_secret: rocky_server::state::WebhookSecret::Present,
-                state_backend,
-                concurrency_control,
-                config_status,
+                // Left unresolved, exactly as `build_serve_state` leaves it;
+                // each test projects with the labels it wants.
+                config_labels: std::sync::OnceLock::new(),
             },
         );
         (dir, state)
+    }
+
+    /// **Red team, round 1.** `build_cors_layer` drops an origin that is not a
+    /// valid header value, so the raw `--allowed-origin` list and the list CORS
+    /// enforces are not the same thing. Reporting the raw one would name an
+    /// origin the browser is never granted — the same defect `allowed_hosts`
+    /// already avoids, in the field next to it.
+    ///
+    /// Both now come from one derivation (`auth::accepted_origins`), so this
+    /// pins the report to the layer rather than to a second copy of the filter.
+    #[tokio::test]
+    async fn allowed_origins_report_what_cors_enforces() {
+        use rocky_server::auth::enforced_cors_origins;
+
+        // A bare newline cannot be a header value, so CORS silently drops it.
+        let typed = vec![
+            "https://good.test".to_string(),
+            "https://bad\n.test".to_string(),
+        ];
+        assert_eq!(
+            enforced_cors_origins(&typed),
+            ["https://good.test"],
+            "the enforced list must exclude what the layer could not install"
+        );
+
+        let (_dir, state) = project_with_three_secrets();
+        let output = settings_output(
+            &state,
+            crate::commands::serve::config_posture(state.config_path.as_deref()),
+        );
+        // The fixture's origin is valid, so it survives -- proving the filter
+        // does not simply empty the field.
+        assert_eq!(output.allowed_origins, ["https://example.test"]);
+    }
+
+    /// **The containment contract, across every safe route.**
+    ///
+    /// `settings_never_discloses_a_configured_secret` proves one route is
+    /// clean. The claim a token holder actually cares about is broader: nothing
+    /// I can GET hands back a secret. So this walks the live route table with
+    /// three real secrets configured and greps every response body.
+    ///
+    /// Non-200s are grepped, not skipped. An error envelope that echoes a
+    /// config value back is the classic leak site, and a route that 404s on
+    /// this fixture still proves its error path is clean.
+    ///
+    /// Safe methods only. The mutating routes would submit real jobs, and a
+    /// containment test must not run a pipeline to make its point.
+    #[tokio::test]
+    async fn no_safe_route_discloses_a_configured_secret() {
+        let (_dir, state) = project_with_three_secrets();
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+
+        let mut checked = 0;
+        for route in api_v1_routes() {
+            let Some(path) = route.strip_prefix("GET ") else {
+                continue;
+            };
+            // Placeholders get values that exist in this fixture where one
+            // does, and arbitrary ones otherwise -- a 404's body is still a
+            // body worth grepping.
+            let path = path
+                .replace("{name}", "m")
+                .replace("{plan_id}", "p1")
+                .replace("{id}", "1")
+                .replace("{subject}", "s1")
+                .replace("{column}", "id")
+                .replace("{pipeline}", "sales");
+
+            let resp = client
+                .get(format!("{base}{path}"))
+                .header("Authorization", "Bearer BEARER_SECRET_ABC")
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("{path} did not answer: {e}"));
+            let status = resp.status();
+            let body = resp.text().await.unwrap();
+
+            for secret in [
+                "BEARER_SECRET_ABC",
+                "WEBHOOK_SECRET_DEF",
+                "CONFIG_SECRET_XYZ",
+            ] {
+                assert!(
+                    !body.contains(secret),
+                    "GET {path} answered {status} and disclosed {secret}:\n{body}"
+                );
+            }
+            checked += 1;
+        }
+
+        // Without this the loop could cover nothing and still pass -- the
+        // failure mode that makes a containment test look green while proving
+        // nothing.
+        assert!(
+            checked >= 20,
+            "only {checked} routes were exercised; the walk is not covering the router"
+        );
     }
 
     /// **The allowlist.** Asserts the document's field list against a literal,
@@ -5951,7 +6085,11 @@ mod tests {
     #[tokio::test]
     async fn settings_reports_exactly_the_allowlisted_fields() {
         let (_dir, state) = project_with_three_secrets();
-        let value = serde_json::to_value(settings_output(&state)).unwrap();
+        let value = serde_json::to_value(settings_output(
+            &state,
+            crate::commands::serve::config_posture(state.config_path.as_deref()),
+        ))
+        .unwrap();
 
         let mut fields: Vec<&str> = value
             .as_object()
@@ -6024,7 +6162,11 @@ mod tests {
             "the fixture must hold a real credential inside the config"
         );
 
-        let body = serde_json::to_string(&settings_output(&state)).unwrap();
+        let body = serde_json::to_string(&settings_output(
+            &state,
+            crate::commands::serve::config_posture(state.config_path.as_deref()),
+        ))
+        .unwrap();
         for secret in [
             "BEARER_SECRET_ABC",
             "WEBHOOK_SECRET_DEF",
@@ -6042,7 +6184,10 @@ mod tests {
     #[tokio::test]
     async fn allowed_hosts_report_the_guard_not_the_flags() {
         let (_dir, state) = project_with_three_secrets();
-        let output = settings_output(&state);
+        let output = settings_output(
+            &state,
+            crate::commands::serve::config_posture(state.config_path.as_deref()),
+        );
 
         assert!(!output.ui, "this fixture has no UI");
         assert!(
@@ -6059,7 +6204,11 @@ mod tests {
     #[tokio::test]
     async fn no_configured_token_is_null_not_a_named_token() {
         let (_dir, _config_path, state) = scheduled_project();
-        let value = serde_json::to_value(settings_output(&state)).unwrap();
+        let value = serde_json::to_value(settings_output(
+            &state,
+            crate::commands::serve::config_posture(state.config_path.as_deref()),
+        ))
+        .unwrap();
 
         assert!(state.auth.is_none(), "this fixture configures no token");
         assert!(value["token"].is_null(), "{value}");
@@ -6073,7 +6222,10 @@ mod tests {
     #[tokio::test]
     async fn settings_route_returns_the_projections_bytes() {
         let (_dir, _config_path, state) = scheduled_project();
-        let reference = reference_bytes(&settings_output(&state));
+        let reference = reference_bytes(&settings_output(
+            &state,
+            crate::commands::serve::config_posture(state.config_path.as_deref()),
+        ));
 
         let base = spawn_router(state).await;
         let resp = get_retrying_on_busy(&format!("{base}/api/v1/settings")).await;

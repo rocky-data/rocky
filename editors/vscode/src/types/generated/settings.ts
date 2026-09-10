@@ -37,13 +37,19 @@ export type WebhookSecretStatus = "present" | "absent" | "set_but_unusable";
 /**
  * The running server's posture, served by `GET /api/v1/settings`.
  *
- * **An allowlist, not a config dump.** Every field below is projected individually from a [`rocky_server::state::SettingsSnapshot`] of primitives taken when the process started. Nothing here is reached through `Debug` or serde of a `RockyConfig`: `AdapterConfig`'s `Debug` prints its `.extra` map, which is unbounded caller-supplied TOML, so a config that merely *passed through* this type would be a disclosure surface. Two fieldless enum labels are taken out of the config file and the config is dropped.
+ * **An allowlist, not a config dump.** Every field below is projected individually, by hand, in `crate::api::settings_output` — from a [`rocky_server::state::SettingsSnapshot`] of primitives plus two fieldless enum labels taken out of the config file, after which the config is dropped. No `RockyConfig` is serialised or `Debug`-printed anywhere on that path: `AdapterConfig`'s `Debug` prints its `.extra` map, which is unbounded caller-supplied TOML, so a config that merely *passed through* this type would be a disclosure surface.
  *
- * No secret appears, by construction — not the Bearer token, not `ROCKY_WEBHOOK_SECRET`. The token is reported as its name and scope; the webhook secret as whether it is usable.
+ * No secret appears — not the Bearer token, not `ROCKY_WEBHOOK_SECRET`. The token is reported as its name and scope; the webhook secret as whether it is usable.
+ *
+ * To be exact about what enforces that: the **projection function** does, not the type. Rust would happily let a future field carry a secret. What makes it hold is that the projection names every field explicitly, and three tests stand behind it — `settings_reports_exactly_the_allowlisted_fields` fails when a field is *added*, `settings_never_discloses_a_configured_secret` greps this document for three real configured secrets, and `no_safe_route_discloses_a_configured_secret` greps every safe route for the same three.
  *
  * **API-only, deliberately.** There is no `rocky settings` verb, because this document describes *a server that is running* and a one-shot CLI invocation would have to invent one. [`ScheduleStatusOutput`] is the established precedent for a route with no CLI oracle.
  *
- * **Freshness.** Everything except `state_backend` and `concurrency_control` is fixed when the process starts and cannot change while it runs. Those two are read from `rocky.toml` at startup; the scheduler re-reads that file every tick, so a config edited afterwards is not reflected here.
+ * **Freshness.** Everything except `state_backend` and `concurrency_control` is fixed when the process starts and cannot change while it runs.
+ *
+ * Those two come from `rocky.toml`, and are read **once, on the first request to this route**, then fixed for the life of the process. Deliberately not at startup: `rocky serve` binds its listener before anything reads that file, and an eager read would let a `rocky.toml` that is a FIFO or sits on a stalled mount stop the server binding at all.
+ *
+ * So they are a snapshot, not a live view, and the scheduler re-reads that same file every tick — a config edited after the first request to this route is not reflected here, while the scheduler acts on the new one.
  */
 export interface SettingsOutput {
   /**
@@ -53,7 +59,9 @@ export interface SettingsOutput {
    */
   allowed_hosts: string[];
   /**
-   * The CORS allowlist. Empty means same-origin only.
+   * The CORS allowlist actually installed. Empty means same-origin only.
+   *
+   * Like `allowed_hosts`, this is what is **enforced**: `build_cors_layer` drops an `--allowed-origin` that is not a valid header value, and an origin it could not install grants nothing. Both this and the layer come from one derivation, so the report cannot drift from the layer.
    */
   allowed_origins: string[];
   /**
@@ -63,11 +71,11 @@ export interface SettingsOutput {
    */
   bind_host: string;
   /**
-   * `[state] concurrency_control` as read at server start. `null` on the same condition as `state_backend`.
+   * `[state] concurrency_control`, read at the same moment as `state_backend`. `null` on the same condition.
    */
   concurrency_control?: ConcurrencyControl | null;
   /**
-   * What happened when `rocky.toml` was read at startup.
+   * What happened when `rocky.toml` was read.
    *
    * Carried so a `null` backend is explainable: a project with no config and a project whose config is broken are different facts, and no other HTTP route distinguishes them today.
    */
@@ -77,7 +85,7 @@ export interface SettingsOutput {
    */
   scheduler: boolean;
   /**
-   * `[state] backend` as read at server start. `null` when there was no readable config — `config_status` says which.
+   * `[state] backend`, as read on the first request to this route. `null` when there was no readable config — `config_status` says which.
    */
   state_backend?: StateBackend | null;
   /**
