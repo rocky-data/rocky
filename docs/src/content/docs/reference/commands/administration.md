@@ -24,6 +24,7 @@ rocky history [flags]
 | `--model <NAME>` | `string` | | Filter history to a specific model. |
 | `--since <DATE>` | `string` | | Only show runs since this date (ISO 8601 or `YYYY-MM-DD`). |
 | `--audit` | `bool` | `false` | Include the governance audit trail for each run in JSON output, and print a second governance table after the default summary in text output. See [Audit trail](#audit-trail) below. |
+| `--run <RUN_ID>` | `string` | | Show exactly one run by its id. The output has the same shape as the list, with `count` set to `1`, so a consumer reads one shape either way. A run the store does not hold is an error naming the id, not an empty list. Conflicts with `--model`, `--recipe` and `--since`; composes with `--audit`. |
 
 ### Examples
 
@@ -62,6 +63,12 @@ rocky history
     }
   ]
 }
+```
+
+Show one run by id. The document has the list's shape with `count` set to `1`; add `--audit` for its governance trail:
+
+```bash
+rocky history --run run_20260401_143022 --audit --output json
 ```
 
 Show history for a specific model since a date. The `--model` variant returns a flat list of that model's executions:
