@@ -105,6 +105,7 @@ export function EnginePanel({
     case "ready": {
       const { meta } = state;
       const count = meta.capabilities.length;
+      const capabilities = meta.capabilities.join(", ");
       // One line, not three cards. It still proves the whole path works —
       // embedded assets, token bootstrap, bearer header, typed payload — but
       // it stops spending the top of every screen saying so. The full
@@ -118,16 +119,19 @@ export function EnginePanel({
           <Dot />
           state schema v{meta.state_schema_version}
           <Dot />
-          <span title={meta.capabilities.join(", ")}>
+          {/*
+            The names reach a mouse through `title` and assistive technology
+            through `aria-describedby`. The description element is `hidden`,
+            so it is not a second node in the reading order: an otherwise
+            unused `title` already becomes the accessible description, and an
+            `sr-only` sibling would then be announced twice.
+          */}
+          <span title={capabilities} aria-describedby="engine-capabilities">
             {count} {count === 1 ? "capability" : "capabilities"}
           </span>
-          {/*
-            A `title` is a mouse affordance: it is not in the tab order and
-            screen-reader support for it is inconsistent. The names would
-            otherwise be reachable by hover alone, so they are also here, off
-            the page but in the accessibility tree.
-          */}
-          <span className="sr-only">: {meta.capabilities.join(", ")}</span>
+          <span id="engine-capabilities" hidden>
+            {capabilities}
+          </span>
         </p>
       );
     }

@@ -39,7 +39,9 @@ export function bootstrapToken(win: TokenWindow): string | null {
     win.history.replaceState(null, "", win.location.pathname + win.location.search);
     return fromFragment;
   }
-  return win.sessionStorage.getItem(TOKEN_STORAGE_KEY);
+  // Through `currentToken`, not straight out of storage: an empty stored
+  // value is not a token, and every reader has to agree about that.
+  return currentToken(win.sessionStorage);
 }
 
 /**

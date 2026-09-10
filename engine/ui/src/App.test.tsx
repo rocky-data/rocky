@@ -64,10 +64,16 @@ describe("EnginePanel", () => {
     // The separators are spaced with CSS padding, not literal spaces, so the
     // text node itself has none around the dots.
     const visible = line.cloneNode(true) as HTMLElement;
-    visible.querySelectorAll(".sr-only").forEach((node) => node.remove());
+    visible.querySelectorAll(".sr-only, [hidden]").forEach((node) => node.remove());
     expect(visible.textContent).toBe("rocky 1.74.0·state schema v23·2 capabilities");
-    // And the capability names are still reachable without a mouse.
-    expect(line.querySelector(".sr-only")?.textContent).toBe(": estate, products");
+    // The names reach a mouse via `title` and assistive technology via a
+    // hidden description. Hidden, so it is not read a second time in flow.
+    const count = screen.getByText("2 capabilities");
+    expect(count).toHaveAttribute("title", "estate, products");
+    const describedBy = count.getAttribute("aria-describedby");
+    const description = describedBy ? document.getElementById(describedBy) : null;
+    expect(description?.textContent).toBe("estate, products");
+    expect(description).toHaveAttribute("hidden");
     // Three cards became one line, so no grid survives.
     expect(container.querySelector(".grid")).toBeNull();
   });

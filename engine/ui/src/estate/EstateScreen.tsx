@@ -115,22 +115,28 @@ export function EstateScreen({
  * does not — the idiom the governor tabs already use (`GovernorScreen`).
  */
 function Panel({ title, producer, children }: { title: string; producer: string; children: ReactNode }) {
+  const descriptionId = `producer-${title.toLowerCase().replace(/\s+/g, "-")}`;
   return (
     <section aria-label={title}>
+      {/*
+        The route reaches a mouse through `title` and assistive technology
+        through `aria-describedby`. Both, because `title` alone is a mouse
+        affordance — not in the tab order, and inconsistently announced.
+        The description element is `hidden`, which keeps it out of the
+        reading order while `aria-describedby` still takes its text: an
+        `sr-only` sibling would be read a second time, since an otherwise
+        unused `title` already becomes the accessible description.
+      */}
       <h3
         className="mb-2 text-base font-semibold text-zinc-900 dark:text-zinc-100"
         title={producer}
+        aria-describedby={descriptionId}
       >
         {title}
       </h3>
-      {/*
-        A `title` is a mouse affordance: not in the tab order, and screen
-        readers treat it inconsistently. The route is also here, off the page
-        but in the accessibility tree, so it is not hover-only. It sits
-        OUTSIDE the heading so that navigating by heading still announces
-        "DAG" rather than "DAG GET /api/v1/dag".
-      */}
-      <p className="sr-only">Producer: {producer}</p>
+      <span id={descriptionId} hidden>
+        {producer}
+      </span>
       {children}
     </section>
   );

@@ -105,11 +105,17 @@ describe("EstateScreen", () => {
       expect(h).toHaveAttribute("title", route);
       // Navigating by heading still announces just the panel's name.
       expect(h.textContent).toBe(heading);
-      // The route is not on the page as visible text...
-      expect(screen.queryByText(route)).toBeNull();
+      // The route is not on the page as visible text. `hidden` is excluded
+      // explicitly: testing-library ignores only script and style by default,
+      // so the description element would otherwise match here.
+      expect(screen.queryByText(route, { ignore: "[hidden], script, style" })).toBeNull();
       // ...but it is not hover-only either: a `title` is not in the tab order
-      // and screen readers treat it inconsistently.
-      expect(screen.getByText(`Producer: ${route}`)).toHaveClass("sr-only");
+      // and screen readers treat it inconsistently. The description is
+      // `hidden`, so it is not announced a second time in reading order.
+      const describedBy = h.getAttribute("aria-describedby");
+      const description = describedBy ? document.getElementById(describedBy) : null;
+      expect(description?.textContent).toBe(route);
+      expect(description).toHaveAttribute("hidden");
     }
   });
 

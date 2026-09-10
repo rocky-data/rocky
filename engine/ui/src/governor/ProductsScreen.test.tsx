@@ -182,7 +182,13 @@ describe("ProductsScreen", () => {
     // [fulfill.driver] is configured in rocky.toml", so naming the command
     // alone would send a reader at something that does nothing.
     expect(copy).toContain("[fulfill.driver]");
-    expect(copy).toMatch(/does nothing without one/);
+    expect(copy).toMatch(/cannot stage one without it/);
+    // "does nothing without one" would be FALSE, and visibly so on this very
+    // screen: driverless `rocky fulfill demo` stages no file (products/ does
+    // not exist) but takes the product's ownership, so the list goes 0 -> 1
+    // and shows "demo". The copy has to say that or it contradicts the page.
+    expect(copy).toMatch(/still registers the product/);
+    expect(copy).not.toMatch(/does nothing without one/);
 
     // And it must not invent a scaffold verb.
     expect(copy).not.toMatch(/rocky product (init|new|create|scaffold|add)/);
