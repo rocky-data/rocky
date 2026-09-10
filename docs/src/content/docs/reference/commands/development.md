@@ -23,6 +23,41 @@ rocky playground [path]
 |----------|------|---------|-------------|
 | `path` | `string` | `rocky-playground` | Directory name for the playground project. |
 
+### Ask the server what it is doing
+
+`GET /api/v1/settings` reports the posture of the running server. Read it when you want to check what a server is actually enforcing, rather than what its start command looked like.
+
+```bash
+curl -H "Authorization: Bearer $ROCKY_SERVE_TOKEN" \
+  http://127.0.0.1:8080/api/v1/settings
+```
+
+It reports the bind host, the CORS allowlist, the `Host` values the UI guard accepts, whether the scheduler and the UI are on, the token's scope, and the state backend.
+
+No secret is in the response. The token appears as its name and scope. The webhook secret appears only as whether it can sign a webhook:
+
+```text
+  webhook_secret       what it means
+  ------------------   --------------------------------------------------
+  present              webhook requests must carry a signature
+  absent               loopback accepts UNSIGNED; non-loopback answers 404
+  set_but_unusable     blank or not valid UTF-8 -- --scheduler will REFUSE
+                       to start
+```
+
+That field is reported even when the scheduler is off. It tells you what will happen when you turn the scheduler on, which is the point.
+
+Two fields have a different freshness from the rest. `state_backend` and `concurrency_control` are read from `rocky.toml` when the server starts, so a config edited afterwards is not reflected. They are `null` when there was no readable config, and `config_status` says which:
+
+```text
+  loaded       read and parsed
+  absent       no rocky.toml -- an ordinary fact, not a failure
+  unreadable   present but would not parse; the scheduler will skip every
+               tick until it does
+```
+
+`allowed_hosts` reports what is enforced, not what was typed. `--allowed-host` only becomes a guard under `--ui`, so the list is empty without one.
+
 ### Flags
 
 | Flag | Type | Default | Description |

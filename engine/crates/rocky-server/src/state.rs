@@ -209,13 +209,13 @@ fn millis(duration: std::time::Duration) -> u64 {
 /// display contradicting the gate it describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WebhookSecret {
-/// Set, non-blank, and valid UTF-8.
-Present,
-/// Not set at all.
-#[default]
-Absent,
-/// Set, but blank or not valid UTF-8 — `--scheduler` will refuse to start.
-SetButUnusable,
+    /// Set, non-blank, and valid UTF-8.
+    Present,
+    /// Not set at all.
+    #[default]
+    Absent,
+    /// Set, but blank or not valid UTF-8 — `--scheduler` will refuse to start.
+    SetButUnusable,
 }
 
 /// What happened when `rocky.toml` was read at server start.
@@ -225,13 +225,13 @@ SetButUnusable,
 /// diagnostic surface distinguishes them today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConfigStatus {
-/// Read and parsed.
-Loaded,
-/// No `rocky.toml` — an ordinary fact about the project, not a failure.
-#[default]
-Absent,
-/// Present but could not be read or parsed.
-Unreadable,
+    /// Read and parsed.
+    Loaded,
+    /// No `rocky.toml` — an ordinary fact about the project, not a failure.
+    #[default]
+    Absent,
+    /// Present but could not be read or parsed.
+    Unreadable,
 }
 
 /// The server-posture facts `GET /api/v1/settings` reports, frozen when the
@@ -248,25 +248,25 @@ Unreadable,
 /// the state itself, so there is no second copy to drift.
 #[derive(Debug, Clone, Default)]
 pub struct SettingsSnapshot {
-/// The host the listener binds. The same `String` `ServeConfig` carries, so
-/// the reported value cannot disagree with the bound one.
-pub bind_host: String,
-/// Whether `--scheduler` stood up a resident reconciler.
-///
-/// Stored rather than derived from `webhook.is_some()`: those agree today
-/// only incidentally.
-pub scheduler: bool,
-/// Whether `ROCKY_WEBHOOK_SECRET` can sign a webhook. Captured even when the
-/// scheduler is off, via a probe that never bails.
-pub webhook_secret: WebhookSecret,
-/// `[state] backend`, read from `rocky.toml` at server start. `None` when
-/// there was no readable config — see [`SettingsSnapshot::config_status`].
-pub state_backend: Option<rocky_core::config::StateBackend>,
-/// `[state] concurrency_control`, read at server start. `None` on the same
-/// condition as [`SettingsSnapshot::state_backend`].
-pub concurrency_control: Option<rocky_core::config::ConcurrencyControl>,
-/// Why the two fields above may be `None`.
-pub config_status: ConfigStatus,
+    /// The host the listener binds. The same `String` `ServeConfig` carries, so
+    /// the reported value cannot disagree with the bound one.
+    pub bind_host: String,
+    /// Whether `--scheduler` stood up a resident reconciler.
+    ///
+    /// Stored rather than derived from `webhook.is_some()`: those agree today
+    /// only incidentally.
+    pub scheduler: bool,
+    /// Whether `ROCKY_WEBHOOK_SECRET` can sign a webhook. Captured even when the
+    /// scheduler is off, via a probe that never bails.
+    pub webhook_secret: WebhookSecret,
+    /// `[state] backend`, read from `rocky.toml` at server start. `None` when
+    /// there was no readable config — see [`SettingsSnapshot::config_status`].
+    pub state_backend: Option<rocky_core::config::StateBackend>,
+    /// `[state] concurrency_control`, read at server start. `None` on the same
+    /// condition as [`SettingsSnapshot::state_backend`].
+    pub concurrency_control: Option<rocky_core::config::ConcurrencyControl>,
+    /// Why the two fields above may be `None`.
+    pub config_status: ConfigStatus,
 }
 
 impl ServerState {
