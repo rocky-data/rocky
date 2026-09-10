@@ -17,7 +17,7 @@ import {
 } from "react";
 import type { DagOutput } from "@rocky-types/dag";
 import { EmptyState } from "../components";
-import { layeredFlow, type ModelNodeData } from "./layout";
+import { layeredFlow, type ModelFlowNode, type ModelNodeData } from "./layout";
 import { ModelNode } from "./ModelNode";
 import { nodeRoute } from "./nodeRoute";
 
@@ -35,10 +35,13 @@ const MIN_ZOOM = 0.1;
 /**
  * How far an automatic fit may zoom out, which has to go further.
  *
- * `fitView` cannot pass `minZoom`, and the library default of 0.5 could not
- * fit a 744px graph into the ~288px of canvas a 320px phone leaves — that
- * needs 0.39, so both end nodes were simply cut off. A deep DAG needs less
- * again: eleven execution layers already need 0.0965 at that width.
+ * The library's default floor of 0.5 could not fit a 744px graph into the
+ * ~288px of canvas a 320px phone leaves — that needs 0.39, so both end nodes
+ * were cut off. A deep DAG needs less again: eleven execution layers already
+ * need 0.0965 at that width.
+ *
+ * This is passed per fit — to `fitViewOptions`, to `fitView()` and to the
+ * Controls — so it never becomes the floor for a hand on the canvas.
  */
 const FIT = { minZoom: 0.02 } as const;
 
@@ -52,8 +55,22 @@ const FIT = { minZoom: 0.02 } as const;
  * fit down. It never rises above `MIN_ZOOM`, so a small graph keeps a floor
  * that stops anyone shrinking a node to a few pixels for no reason.
  */
-function floorFor(fitted: number): number {
+export function floorFor(fitted: number): number {
   return Math.min(MIN_ZOOM, fitted);
+}
+
+/**
+ * What counts as "the graph changed", for deciding whether to re-fit.
+ *
+ * Not the node ids. A node's position comes from its `execution_layers` index
+ * and its row (`layout.ts`), so adding a `depends_on` between two models that
+ * already exist moves nodes and changes the graph's span while the id set is
+ * identical. Keyed on ids alone that reshape would not re-fit, and the graph
+ * could reach past the canvas — which is the defect this whole mechanism
+ * exists to prevent, arriving by one more route.
+ */
+export function layoutIdentity(nodes: readonly ModelFlowNode[]): string {
+  return nodes.map((n) => `${n.id}@${n.position.x},${n.position.y}`).join("\u0000");
 }
 
 /**
@@ -95,7 +112,8 @@ function RefitOnChange({
     void fitView(FIT).then(() => onFitted(getZoom()));
   }, [fitView, getZoom, onFitted]);
 
-  // On mount and on every graph change. `onInit` is not used for this: it
+  // On mount, and whenever the layout identity changes. `onInit` is not
+  // used for this: it
   // gates viewport initialisation and is not guaranteed to follow the initial
   // fit, so a floor taken from it could come from an unfitted viewport.
   useEffect(() => {
@@ -131,12 +149,19 @@ function RefitOnChange({
  * floor behind, which is the snap coming back by a third route.
  */
 function FittingControls({ onFitted }: { onFitted: (zoom: number) => void }) {
-  const { getZoom } = useReactFlow();
+  const { fitView, getZoom } = useReactFlow();
   return (
     <Controls
       showInteractive={false}
       fitViewOptions={FIT}
-      onFitView={() => onFitted(getZoom())}
+      // Its own awaited fit, not a read after the control's. The control
+      // calls `fitView()` and then `onFitView` immediately, but that call
+      // only QUEUES the transform, so reading the zoom there returns the one
+      // from BEFORE the fit. Pressing this while zoomed in would then record
+      // a high floor, and the queued fit would drop below it — the snap
+      // again. Both fits target the same bounds, so the extra one is
+      // redundant rather than conflicting.
+      onFitView={() => void fitView(FIT).then(() => onFitted(getZoom()))}
     />
   );
 }
@@ -153,8 +178,8 @@ export function DagPanel({ dag, onSelect }: { dag: DagOutput; onSelect: (name: s
   const [minZoom, setMinZoom] = useState(MIN_ZOOM);
   const onFitted = useCallback((zoom: number) => setMinZoom(floorFor(zoom)), []);
   const flow = useMemo(() => layeredFlow(dag), [dag]);
-  // The identity of the graph, so a Refresh that replaces it refits.
-  const graph = useMemo(() => flow.nodes.map((n) => n.id).join("\u0000"), [flow]);
+  // The identity of the LAYOUT, so a Refresh that reshapes it refits.
+  const graph = useMemo(() => layoutIdentity(flow.nodes), [flow]);
   const dataById = useMemo(
     () => new Map(flow.nodes.map((node) => [node.id, node.data])),
     [flow],
