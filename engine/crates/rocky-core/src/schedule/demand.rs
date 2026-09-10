@@ -218,6 +218,14 @@ pub enum SkipReason {
     /// standing demand was skipped rather than misclassified. Fail-closed: never
     /// a false-skip (`after`) or false-fire (`freshness`).
     HistoryError,
+    /// The schedule CURSOR could not be read, so every source was skipped
+    /// rather than evaluated against a default that says "not paused, never
+    /// ran, no failures" (#1877). Distinct from [`Self::HistoryError`] because
+    /// it is a different read with a different blast radius — it suppresses
+    /// the cron path too, not only the standing demands — though both render
+    /// as `history_unavailable` in the tick report, which is the frozen
+    /// contract's name for this class.
+    CursorError,
 }
 
 /// A per-source skip record.
@@ -256,10 +264,33 @@ pub struct RunSuccess {
     pub finished_at: DateTime<Utc>,
 }
 
+/// A cursor read that could not be completed (a store fault or a corrupt
+/// row). Like [`HistoryError`] it is **never** conflated with "never
+/// evaluated": the default cursor says `paused = false`, no anchor and no
+/// consecutive failures, and a fault read as that default runs a paused
+/// pipeline, re-derives catchup from scratch, and resets the failure-backoff
+/// ladder (#1877).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorError(pub String);
+
+impl std::fmt::Display for CursorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "schedule-cursor read failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for CursorError {}
+
 /// Read-only view of the schedule cursors.
 pub trait ScheduleStateView {
     /// The cursor for a pipeline, or its default when never evaluated.
-    fn get(&self, pipeline: &str) -> ScheduleStateRecord;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CursorError`] when the cursor cannot be read. Callers MUST
+    /// fail closed on this — never treat it as "never evaluated", which is a
+    /// legitimate `Ok(default)` and means something else entirely.
+    fn get(&self, pipeline: &str) -> Result<ScheduleStateRecord, CursorError>;
 }
 
 /// A run-history read that could not be completed (a store fault or a corrupt
@@ -507,7 +538,26 @@ pub fn evaluate_one(
         return out;
     }
 
-    let cursor = state.get(&schedule.pipeline);
+    // A cursor that cannot be READ is not a cursor that says "not paused".
+    // Before #1877 the live view collapsed a store fault into the default
+    // record, and `evaluate_one` gated on `cursor.paused` — so a fault ran a
+    // paused pipeline on the primary scheduling path. Two more fields go with
+    // it, which is why this returns rather than continuing with a default:
+    //
+    //   paused               -> false      a paused pipeline fires
+    //   last-run anchor      -> unset      catchup re-derives from scratch
+    //   consecutive_failures -> 0          the failure backoff ladder resets
+    //
+    // The backoff reset is the quiet one: a pipeline failing repeatedly is
+    // backing off precisely when the store is under stress, so a fault that
+    // clears the ladder makes it fire again immediately.
+    let Ok(cursor) = state.get(&schedule.pipeline) else {
+        out.skips.push(SourceSkip {
+            source: DemandKind::Cron,
+            reason: SkipReason::CursorError,
+        });
+        return out;
+    };
 
     // Runtime hold — the state-level sibling of `enabled = false`, checked
     // after the cursor fetch because that is where it lives. Suppresses every
@@ -746,8 +796,18 @@ mod tests {
     #[derive(Default)]
     struct States(HashMap<String, ScheduleStateRecord>);
     impl ScheduleStateView for States {
-        fn get(&self, pipeline: &str) -> ScheduleStateRecord {
-            self.0.get(pipeline).cloned().unwrap_or_default()
+        fn get(&self, pipeline: &str) -> Result<ScheduleStateRecord, CursorError> {
+            Ok(self.0.get(pipeline).cloned().unwrap_or_default())
+        }
+    }
+
+    /// A cursor view whose read always faults — the state the live store
+    /// reaches on a failed read transaction or a corrupt row, which no test
+    /// double could express before the trait could return an error.
+    struct UnreadableCursor;
+    impl ScheduleStateView for UnreadableCursor {
+        fn get(&self, _pipeline: &str) -> Result<ScheduleStateRecord, CursorError> {
+            Err(CursorError("injected cursor read fault".to_string()))
         }
     }
 
@@ -1187,6 +1247,96 @@ mod tests {
         let e = evaluate_one(&s, &states, &History::default(), ts(2026, 6, 1, 4, 0));
         assert!(e.due.is_none(), "a paused pipeline must produce no demand");
         assert!(e.skips.iter().any(|k| k.reason == SkipReason::Paused));
+    }
+
+    /// #1877. A cursor that cannot be READ is not a cursor that says
+    /// "not paused". `StoreState::get` used to do
+    /// `get_schedule_state(...).ok().flatten().unwrap_or_default()`, and
+    /// `ScheduleStateRecord::default()` has `paused: false` — so a read
+    /// transaction that failed to open, a table that failed to open, or a
+    /// corrupt cursor row RAN A PAUSED PIPELINE, on the primary scheduling
+    /// path.
+    ///
+    /// The trait could not express the fault at all, which is why no test
+    /// could reach this state before: the fix is the signature.
+    #[test]
+    fn an_unreadable_cursor_skips_every_source_instead_of_running_the_pipeline() {
+        let s = cron_schedule("raw", Catchup::Latest);
+        let e = evaluate_one(
+            &s,
+            &UnreadableCursor,
+            &History::default(),
+            ts(2026, 6, 1, 4, 0),
+        );
+        assert!(
+            e.due.is_none(),
+            "a cursor fault must not fire a demand: {:?}",
+            e.due
+        );
+        assert!(
+            e.skips.iter().any(|k| k.reason == SkipReason::CursorError),
+            "and it must be recorded loudly, not silently dropped: {:?}",
+            e.skips
+        );
+    }
+
+    /// The two things that go with `paused` when a default stands in for a
+    /// real cursor, which is why the fault returns rather than continuing:
+    ///
+    /// ```text
+    ///   paused               -> false      a paused pipeline fires
+    ///   last-run anchor      -> unset      catchup re-derives from scratch
+    ///   consecutive_failures -> 0          the failure backoff ladder resets
+    /// ```
+    ///
+    /// The backoff reset is the quiet one. A pipeline failing repeatedly is
+    /// backing off precisely when the store is under stress, so a fault that
+    /// clears the ladder makes it fire again immediately — the opposite of
+    /// what the ladder is for. This pins that a faulting cursor produces NO
+    /// anchor write either: a tick that could not read the cursor must not
+    /// advance it.
+    #[test]
+    fn a_cursor_fault_writes_no_anchor_and_does_not_clear_a_backoff() {
+        let s = cron_schedule("raw", Catchup::Latest);
+        let e = evaluate_one(
+            &s,
+            &UnreadableCursor,
+            &History::default(),
+            ts(2026, 6, 1, 4, 0),
+        );
+        assert!(
+            e.anchor_init.is_none(),
+            "a tick that could not read the cursor must not initialise its anchor"
+        );
+        assert!(
+            e.catchup_advance.is_none(),
+            "nor advance it past occurrences it never evaluated"
+        );
+    }
+
+    /// The negative control, and the reason "always skip" is not a fix. An
+    /// ABSENT cursor — `Ok(None)` from the store, a pipeline never evaluated —
+    /// is a legitimate default and must still fire. Without this, returning
+    /// `Err` for every read would satisfy the fault tests above while
+    /// silencing every schedule in the project.
+    #[test]
+    fn a_never_evaluated_cursor_still_fires() {
+        let s = cron_schedule("raw", Catchup::Latest);
+        let e = evaluate_one(
+            &s,
+            &States::default(),
+            &History::default(),
+            ts(2026, 6, 1, 4, 0),
+        );
+        assert!(
+            e.skips.iter().all(|k| k.reason != SkipReason::CursorError),
+            "an absent cursor is not a fault: {:?}",
+            e.skips
+        );
+        assert!(
+            e.due.is_some() || e.anchor_init.is_some(),
+            "a first evaluation either fires or initialises its anchor: {e:?}"
+        );
     }
 
     /// The hold releases: the identical evaluation with `paused` cleared is

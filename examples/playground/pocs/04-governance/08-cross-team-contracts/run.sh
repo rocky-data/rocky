@@ -11,15 +11,27 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROCKY="$HERE/../../../../../engine/target/release/rocky"
+# ROCKY_BIN first — it is how the POC harness names the binary under test
+# (#1676). Then a local release build, then a debug one, then PATH. Before
+# this the release path was the ONLY candidate, so a debug-built run failed
+# here with a message about building the engine, on a machine where the engine
+# was already built.
+ROCKY="${ROCKY_BIN:-}"
+if [[ -z "$ROCKY" ]]; then
+    REPO_ROOT="$(cd "$HERE/../../../../.." && pwd)"
+    for cand in "$REPO_ROOT/engine/target/release/rocky" "$REPO_ROOT/engine/target/debug/rocky"; do
+        [[ -x "$cand" ]] && { ROCKY="$cand"; break; }
+    done
+fi
+[[ -z "$ROCKY" ]] && ROCKY="$(command -v rocky || true)"
 
 PRODUCER="$HERE/orders-producer"
 CONSUMER="$HERE/shipments-consumer"
 VENDOR="$CONSUMER/vendor/orders"
 
 if [[ ! -x "$ROCKY" ]]; then
-    echo "ERROR: built rocky binary not found at $ROCKY"
-    echo "Build it first:  (cd engine && cargo build --release -p rocky)"
+    echo "ERROR: no rocky binary. Set ROCKY_BIN, or build one:"
+    echo "  (cd engine && cargo build -p rocky)"
     exit 1
 fi
 

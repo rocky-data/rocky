@@ -174,6 +174,11 @@ pub async fn run_tick(
             // `rocky tick` reports the reconciler's own tally, not a
             // replication run's check gate — there is no gate to report here.
             check_gate_failed: false,
+            // `rocky tick` holds no remote-state session of its own, and this
+            // sentinel is the reconciler's tally rather than one run's record.
+            // `Lost` is the honest value: no record was written for THIS error,
+            // so nothing may be uploaded on its authority (#1836).
+            custody: crate::commands::run::RecordCustody::Lost,
         }
         .into()),
     }
@@ -461,7 +466,7 @@ fn map_source_skip(skip: &SourceSkip) -> SourceEvaluation {
         SkipReason::FailureBackoff { resume_at } => ("failure_backoff", Some(*resume_at), None),
         SkipReason::PartialBackoff { resume_at } => ("partial_backoff", Some(*resume_at), None),
         SkipReason::Superseded => ("superseded", None, None),
-        SkipReason::HistoryError => ("history_unavailable", None, None),
+        SkipReason::HistoryError | SkipReason::CursorError => ("history_unavailable", None, None),
     };
     SourceEvaluation {
         source: demand_kind_str(skip.source).to_string(),

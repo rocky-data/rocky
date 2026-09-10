@@ -86,6 +86,20 @@ pub fn run_compact(
         .map_err(|e| anyhow::anyhow!("invalid --target-size: {e}"))?
         .unwrap_or(256);
 
+    // The plan must name a TABLE, fully qualified (#1829). This argument is
+    // documented `catalog.schema.table`, but a bare name used to be recorded
+    // verbatim, and the apply gate's resolver reads a bare name that matches a
+    // model as THAT MODEL — so policy was evaluated for a logical model while
+    // the regenerated `OPTIMIZE`/`VACUUM` ran against a physical table of the
+    // same name. Two readings of one string, on a destructive operation.
+    //
+    // Refused rather than guessed. Resolving a bare name to a same-named
+    // model's target would be the opposite guess and just as wrong: an
+    // operator who meant the physical table would silently compact something
+    // else. The message names the model's target when one matches, so the
+    // operator can say which they meant.
+    require_fully_qualified_compact_target(config_path, model)?;
+
     // Resolve the configured target dialect (config-only, no credentials) and
     // generate through the gated `compact_from_ir`, so `rocky compact` fails
     // fast off Databricks at plan time instead of printing OPTIMIZE/VACUUM SQL
@@ -1275,6 +1289,36 @@ fn pick_sample_tables(stats: &DedupStats, max: usize) -> Vec<String> {
 /// CLI args and config files (via `--catalog` scope resolution), both of
 /// which are untrusted from the engine's perspective. See the validation
 /// rules in `engine/CLAUDE.md`.
+/// Refuse a compact target that is not a three-part `catalog.schema.table`.
+///
+/// See the call site for why this is a refusal and not a resolution. The model
+/// lookup exists ONLY to make the message actionable — it never rewrites the
+/// target — and a project whose models cannot be loaded still gets the plain
+/// refusal rather than an error about model loading.
+fn require_fully_qualified_compact_target(config_path: &Path, target: &str) -> Result<()> {
+    if crate::commands::apply::is_three_part_fqn(target) {
+        return Ok(());
+    }
+    let hint = rocky_core::config::load_rocky_config(config_path)
+        .ok()
+        .and_then(|cfg| crate::commands::apply::model_target_fqns(&cfg, config_path).ok())
+        .and_then(|by_name| by_name.get(target).cloned());
+    let Some(fqn) = hint else {
+        anyhow::bail!(
+            "refusing to plan a compaction of '{target}': `rocky compact` takes a fully \
+             qualified table (catalog.schema.table). A bare name cannot say whether it means \
+             a physical table or a model, and this plan regenerates OPTIMIZE/VACUUM against \
+             whatever it names"
+        );
+    };
+    anyhow::bail!(
+        "refusing to plan a compaction of '{target}': `rocky compact` takes a fully qualified \
+         table (catalog.schema.table), and '{target}' is also the name of a model. If you mean \
+         that model's table, run `rocky compact {fqn}`; if you mean a physical table called \
+         '{target}', name it in full"
+    )
+}
+
 fn generate_compact_sql(
     model: &str,
     target_size_mb: u64,
@@ -1766,6 +1810,90 @@ mod tests {
         /// with the given `[policy]` rules spliced in. No credentials are used:
         /// the injectable sink never builds the real adapter, and the gate/
         /// dialect only read the parsed config.
+        /// A project with one model whose NAME and whose TARGET TABLE differ,
+        /// which is the fixture #1829 asks for: it is the only shape where
+        /// reading a bare string as a model and reading it as a table give
+        /// different answers.
+        fn write_project_with_a_differently_targeted_model(dir: &Path) -> std::path::PathBuf {
+            let models = dir.join("models");
+            std::fs::create_dir_all(&models).unwrap();
+            std::fs::write(models.join("orders.sql"), "SELECT 1 AS id\n").unwrap();
+            std::fs::write(
+                models.join("orders.toml"),
+                "name = \"orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"wh\"\nschema = \"marts\"\ntable = \"orders_v2\"\n",
+            )
+            .unwrap();
+            write_config(dir, "")
+        }
+
+        /// #1829(1). `rocky compact orders` used to record `target_table =
+        /// "orders"` verbatim. Apply then regenerated `OPTIMIZE orders` — a
+        /// PHYSICAL table — while `resolve_touched_apply_targets` read the
+        /// same bare string as the LOGICAL model `orders` and keyed policy on
+        /// its attributes. Two readings of one string, on a destructive
+        /// operation.
+        ///
+        /// Refused, not resolved. Rewriting `orders` to the model's
+        /// `wh.marts.orders_v2` would be the opposite guess and just as wrong
+        /// for an operator who meant a physical table called `orders`. The
+        /// message names the model's table so they can say which they meant.
+        #[test]
+        fn compact_refuses_a_bare_target_and_names_the_models_own_table() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = write_project_with_a_differently_targeted_model(dir.path());
+
+            let err = super::require_fully_qualified_compact_target(&config, "orders")
+                .expect_err("a bare target that is also a model name must refuse");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("wh.marts.orders_v2"),
+                "the refusal must name the model's actual table: {msg}"
+            );
+            assert!(
+                msg.contains("also the name of a model"),
+                "and say why it cannot choose: {msg}"
+            );
+        }
+
+        /// The same refusal with no model in sight: still refused, because a
+        /// bare name cannot say what it means whether or not a model happens
+        /// to share it. Without this, "refuse only on collision" would look
+        /// like a fix while leaving `OPTIMIZE orders` resolving through the
+        /// warehouse's search path.
+        #[test]
+        fn compact_refuses_a_bare_target_with_no_model_of_that_name() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = write_project_with_a_differently_targeted_model(dir.path());
+
+            let err = super::require_fully_qualified_compact_target(&config, "events")
+                .expect_err("a bare target must refuse even with no same-named model");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("fully") && msg.contains("catalog.schema.table"),
+                "the refusal says what to pass instead: {msg}"
+            );
+            assert!(
+                !msg.contains("also the name of a model"),
+                "and does not claim a collision that is not there: {msg}"
+            );
+        }
+
+        /// The control. A fully qualified target is what this command is
+        /// documented to take, and it must still pass — including one whose
+        /// leaf is a model name, which is the case a name-based refusal would
+        /// have broken.
+        #[test]
+        fn compact_accepts_a_fully_qualified_target() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = write_project_with_a_differently_targeted_model(dir.path());
+
+            super::require_fully_qualified_compact_target(&config, "wh.marts.orders_v2")
+                .expect("the model's own table, named in full");
+            super::require_fully_qualified_compact_target(&config, "wh.raw.orders")
+                .expect("a physical table whose leaf matches a model name");
+        }
+
         fn write_config(dir: &Path, policy_rules: &str) -> std::path::PathBuf {
             let toml = format!(
                 r#"
