@@ -113,8 +113,12 @@ export function QueuePanel({ load = defaultQueueLoader, now }: { load?: QueueLoa
       )}
       {pending.length === 0 ? (
         <p className="text-sm text-zinc-600 dark:text-zinc-300">
-          No escalation is outstanding. A plan appears here when policy asks a human to sign it
-          off.
+          No escalation is outstanding. A plan appears here when something asks for a change that
+          policy will not let through unreviewed. <code>rocky backfill --model &lt;name&gt;</code>{" "}
+          makes one, because a backfill is always review-gated; the model has to be one this
+          project compiles, and <code>rocky compile</code> lists those names. Nothing needs to have
+          run first. This queue is not only for AI work — a plan is listed the same way whoever
+          asked for it.
         </p>
       ) : (
         <ul className="space-y-2">
