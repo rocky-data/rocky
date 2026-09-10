@@ -158,6 +158,29 @@ describe("ProductsScreen", () => {
     expect(rendered[1]).toContain("@22");
   });
 
+  it("names both routes to a spec file, and no command that does not exist", async () => {
+    const { container } = render(
+      <ProductsScreen
+        name={null}
+        loaders={loaders({ list: vi.fn(async () => ({ ...LIST, products: [], count: 0 })) })}
+      />,
+    );
+    await screen.findByText("This project declares no products");
+    const copy = container.textContent ?? "";
+
+    // Both routes. Verified: `rocky product --help` lists verify, compile,
+    // status, list, journal and approve — none of which creates a spec. The
+    // second route is real: rocky-fulfill writes "candidate spec
+    // products/<name>.toml written (<digest>); awaiting approval".
+    expect(copy).toContain("products/<name>.toml");
+    expect(copy).toMatch(/you write it/);
+    expect(copy).toContain("rocky fulfill");
+    expect(copy).toMatch(/No rocky product subcommand creates one/);
+
+    // And it must not invent a scaffold verb.
+    expect(copy).not.toMatch(/rocky product (init|new|create|scaffold|add)/);
+  });
+
   it("lists every product, including one whose spec file is gone", async () => {
     render(<ProductsScreen name={null} loaders={loaders()} />);
 

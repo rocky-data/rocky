@@ -88,6 +88,24 @@ describe("EstateScreen", () => {
     expect(screen.getByText("No schedules configured")).toBeInTheDocument();
   });
 
+  it("keeps each panel's producer route in a tooltip, not on the page", async () => {
+    render(<EstateScreen loaders={loaders()} refreshMs={0} now={NOW} />);
+    await screen.findByRole("list", { name: "Models in the DAG" });
+
+    // The route answers "where does this come from" for the reader who asks,
+    // and costs nothing for the reader who does not. This is the idiom the
+    // governor tabs already use.
+    for (const [heading, route] of [
+      ["Project", "GET /api/v1/project"],
+      ["DAG", "GET /api/v1/dag"],
+      ["Runs", "GET /api/v1/runs"],
+      ["Schedule", "GET /api/v1/schedule"],
+    ]) {
+      expect(screen.getByRole("heading", { name: heading })).toHaveAttribute("title", route);
+      expect(screen.queryByText(route)).toBeNull();
+    }
+  });
+
   it("renders a hostile model name and SQL as text, never as markup", async () => {
     const hostile = '<img src=x onerror="alert(1)">';
     const dag: DagOutput = {

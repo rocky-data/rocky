@@ -1,5 +1,5 @@
 import { render, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MetaOutput } from "@rocky-types/meta";
 import { ApiError } from "./api";
 import { App, EnginePanel } from "./App";
@@ -17,15 +17,17 @@ const META: MetaOutput = {
 describe("EnginePanel", () => {
   it("renders the engine version and the capabilities", async () => {
     render(<EnginePanel token="t" fetchMeta={async () => META} />);
-    await waitFor(() => expect(screen.getByText("1.74.0")).toBeInTheDocument());
-    expect(screen.getByText("v23")).toBeInTheDocument();
-    expect(screen.getByText("estate, products")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText("rocky 1.74.0")).toBeInTheDocument());
+    expect(screen.getByText(/state schema v23/)).toBeInTheDocument();
+    expect(screen.getByText("2 capabilities")).toHaveAttribute("title", "estate, products");
   });
 
   it("renders a hostile engine version as text, never as markup", async () => {
     const hostile = { ...META, engine_version: '<img src=x onerror="alert(1)">' };
     const { container } = render(<EnginePanel token="t" fetchMeta={async () => hostile} />);
-    await waitFor(() => expect(screen.getByText(hostile.engine_version)).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByText(`rocky ${hostile.engine_version}`)).toBeInTheDocument(),
+    );
     expect(container.querySelector("img")).toBeNull();
   });
 
@@ -47,6 +49,23 @@ describe("EnginePanel", () => {
     expect(screen.getByText("open the printed address")).toBeInTheDocument();
   });
 
+  it("is one line, and that line carries all three facts", async () => {
+    // Row 3 asked for a screenshot. This environment has no browser (the
+    // Chrome extension is not connected and no headless browser is
+    // installed), so the claim is pinned mechanically instead: the whole
+    // engine block is a single element whose text is one line.
+    const { container } = render(<EnginePanel token="t" fetchMeta={async () => META} />);
+    await waitFor(() => expect(screen.getByText("rocky 1.74.0")).toBeInTheDocument());
+
+    const line = container.firstElementChild as HTMLElement;
+    expect(line.tagName).toBe("P");
+    // The separators are spaced with CSS padding, not literal spaces, so the
+    // text node itself has none around the dots.
+    expect(line.textContent).toBe("rocky 1.74.0·state schema v23·2 capabilities");
+    // Three cards became one line, so no grid survives.
+    expect(container.querySelector(".grid")).toBeNull();
+  });
+
   it("explains the missing token instead of calling the engine", () => {
     render(<EnginePanel token={null} />);
     expect(screen.getByText("No token for this tab")).toBeInTheDocument();
@@ -55,7 +74,7 @@ describe("EnginePanel", () => {
 
 describe("App", () => {
   it("renders the three lanes and the engine slot", () => {
-    render(<App engine={<span>engine slot</span>} estate={<span>estate slot</span>} />);
+    render(<App token="t" engine={<span>engine slot</span>} estate={<span>estate slot</span>} />);
     for (const lane of ["Estate", "Review", "Governor"]) {
       expect(screen.getByRole("link", { name: lane })).toHaveAttribute(
         "href",
@@ -69,6 +88,7 @@ describe("App", () => {
     window.history.pushState(null, "", "/ui/governor");
     render(
       <App
+        token="t"
         engine={<span>engine slot</span>}
         estate={<span>estate slot</span>}
         review={<span>review slot</span>}
@@ -86,4 +106,52 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByText("review slot")).toBeInTheDocument());
     expect(window.location.pathname).toBe("/ui/review");
   });
+});
+
+describe("the no-token page", () => {
+  // The whole point of one boundary is that this is true for every lane at
+  // once. So these render the REAL lanes — passing a slot would prove nothing
+  // about the screen that actually reads the API.
+  function countingFetch() {
+    const calls: string[] = [];
+    const stub = vi.fn(async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    });
+    vi.stubGlobal("fetch", stub);
+    return calls;
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    window.sessionStorage.clear();
+  });
+
+  it.each(["estate", "review", "governor"])(
+    "issues no request at all on the %s lane",
+    async (lane) => {
+      const calls = countingFetch();
+      window.history.pushState(null, "", `/ui/${lane}`);
+      render(<App token={null} />);
+
+      expect(screen.getByText("No token for this tab")).toBeInTheDocument();
+      // Give any effect that was going to fire the chance to fire.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(calls).toEqual([]);
+    },
+  );
+
+  it.each(["estate", "review", "governor"])(
+    "does issue requests on the %s lane once a token is present",
+    async (lane) => {
+      // Without this the assertion above is vacuous: it would also pass if
+      // the lanes never called `fetch` for some unrelated reason.
+      const calls = countingFetch();
+      window.history.pushState(null, "", `/ui/${lane}`);
+      render(<App token="t" />);
+
+      await waitFor(() => expect(calls.length).toBeGreaterThan(0));
+      expect(screen.queryByText("No token for this tab")).not.toBeInTheDocument();
+    },
+  );
 });

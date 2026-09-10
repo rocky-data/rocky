@@ -107,13 +107,22 @@ export function EstateScreen({
   );
 }
 
+/**
+ * One panel and the route behind it.
+ *
+ * The route is a tooltip, not a line of the page. It answers "where does this
+ * come from" for the reader who asks, and costs nothing for the reader who
+ * does not — the idiom the governor tabs already use (`GovernorScreen`).
+ */
 function Panel({ title, producer, children }: { title: string; producer: string; children: ReactNode }) {
   return (
     <section aria-label={title}>
-      <div className="mb-2 flex items-baseline gap-2">
-        <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">{title}</h3>
-        <code className="text-[11px] text-zinc-500 dark:text-zinc-400">{producer}</code>
-      </div>
+      <h3
+        className="mb-2 text-base font-semibold text-zinc-900 dark:text-zinc-100"
+        title={producer}
+      >
+        {title}
+      </h3>
       {children}
     </section>
   );

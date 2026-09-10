@@ -104,8 +104,11 @@ export function ProductList({ load }: { load: () => Promise<ProductListOutput> }
       </h2>
       {rows.length === 0 ? (
         <p className="text-sm text-zinc-600 dark:text-zinc-300">
-          A product appears here once `products/&lt;name&gt;.toml` exists, or once the store holds a
-          record for one.
+          A product appears here once <code>products/&lt;name&gt;.toml</code> exists, or once the
+          store holds a record for one. That file arrives one of two ways: you write it, or{" "}
+          <code>rocky fulfill</code> stages a candidate for you to approve. No{" "}
+          <code>rocky product</code> subcommand creates one — they read, verify, compile and
+          approve a spec that is already there.
         </p>
       ) : (
         <ul className="space-y-2">
