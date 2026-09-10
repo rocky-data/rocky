@@ -28264,22 +28264,34 @@ auto_create_schemas = true
         );
     }
 
-    /// GUARANTEE-BOUNDARY parity (intentional, not a latent bug): for a read
-    /// Rocky cannot statically resolve — a CTE / anything `lineage_is_provably_
-    /// complete` rejects, i.e. an "uncertain" model — containment behaves
-    /// *identically* to a normal fail-fast run. Under `--parallel 2` a same-layer
-    /// uncertain reader of a failed producer materializes on stale data in BOTH
-    /// modes; that is a pre-existing property of parallel fail-fast, not a
-    /// containment regression.
+    /// Containment ⊆ fail-fast, on a CTE read — and **the boundary moved**
+    /// under it (#1867).
     ///
-    /// This test locks the achievable invariant — **containment never
-    /// materializes anything fail-fast wouldn't** (containment ⊆ fail-fast) — by
-    /// running the same project twice under `--parallel 2`, once with
-    /// `contain_failures = false` and once `= true`, and asserting identical
-    /// materialization sets. It will catch a future change that either
-    /// over-contains (would false-fail healthy CTE projects) or regresses below
-    /// fail-fast. Declaring the dependency via `ref()` lifts the read into the
-    /// resolved, guaranteed set (covered by the resolved-read tests above).
+    /// The invariant this test locks is unchanged: run the same project twice
+    /// under `--parallel 2`, once with `contain_failures = false` and once
+    /// `= true`, and the materialization sets must be identical. It catches a
+    /// change that either over-contains (false-failing healthy CTE projects) or
+    /// regresses below fail-fast.
+    ///
+    /// What changed is the fixture's outcome, and it changed for the better.
+    /// This used to assert that `rollup` **builds** in both modes, on the
+    /// reasoning that its CTE read of the failed producer's target was
+    /// unenumerable, so nothing could order the two and a same-layer reader
+    /// materialized on stale data. That was the documented best-effort
+    /// boundary. Since #1867 the read inside a `WITH` body reaches
+    /// `referenced_tables`, so `derive_physical_edges` matches it against
+    /// `stage_orders`'s target `(main, orders_current)` and
+    /// `augment_physical_read_edges` puts the two in different layers. The
+    /// producer fails, so `rollup` is now withheld — in both modes.
+    ///
+    /// So the assertion is inverted deliberately: `rollup` must NOT build. That
+    /// is exactly the failure #1867 describes (a reader running before its
+    /// producer and reading stale data), and the old assertion pinned it as
+    /// acceptable because nothing could see the read.
+    ///
+    /// Declaring the dependency via `ref()` still lifts the read into the
+    /// resolved, guaranteed set (covered by the resolved-read tests above);
+    /// that path is unchanged and remains the hard guarantee.
     #[cfg(feature = "duckdb")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn containment_matches_fail_fast_for_same_layer_uncertain_read() {
@@ -28309,18 +28321,24 @@ auto_create_schemas = true
         assert_eq!(
             mat_set(&out_ff),
             mat_set(&out_ct),
-            "containment must not materialize anything fail-fast wouldn't for a same-layer \
-             uncertain (CTE) read — the achievable containment ⊆ fail-fast invariant"
+            "containment must not materialize anything fail-fast wouldn't for a CTE read — \
+             the achievable containment ⊆ fail-fast invariant"
         );
         assert!(
-            mat_set(&out_ct).contains("rollup"),
-            "the unenumerable (CTE) reader builds in BOTH modes — the documented best-effort \
-             boundary (declare the dep via ref() for a hard guarantee)"
+            !mat_set(&out_ct).contains("rollup"),
+            "the CTE reader must NOT build on the failed producer's stale target: the read \
+             inside the WITH body is visible since #1867, so the physical-edge derivation \
+             orders the two and the producer's failure withholds the reader; got {:?}",
+            mat_set(&out_ct)
         );
+        // The reader is now withheld for a reason containment can NAME, where
+        // before it was built and the staleness was invisible. Whether that
+        // shows up on `contained` is containment's own bookkeeping; what this
+        // pins is that it is not silently materialized.
         assert!(
-            out_ct.contained.is_empty(),
-            "a same-layer uncertain read is fail-fast parity, NOT over-contained: {:?}",
-            out_ct.contained
+            !mat_set(&out_ff).contains("rollup"),
+            "fail-fast withholds it too, so the two modes agree for the same reason: {:?}",
+            mat_set(&out_ff)
         );
     }
 

@@ -337,13 +337,14 @@ fn extract_deps_from_lineage(
     // Already lower-cased and already stripped of `WITH`-bound names by
     // `extract_lineage`, so the CTE-shadowing rule (#1892) holds here too.
     for name in &lineage_result.nested_sources {
-        if let TableRefKind::ModelRef(name) = classify_table_ref(name, model_names) {
-            if name != model_name && seen.insert(name.clone()) {
-                if renamed_targets.contains_key(name.as_str()) {
-                    renamed_target_reads.push(name.clone());
-                }
-                deps.push(name);
+        if let TableRefKind::ModelRef(name) = classify_table_ref(name, model_names)
+            && name != model_name
+            && seen.insert(name.clone())
+        {
+            if renamed_targets.contains_key(name.as_str()) {
+                renamed_target_reads.push(name.clone());
             }
+            deps.push(name);
         }
     }
 
@@ -878,6 +879,45 @@ mod tests {
         );
     }
 
+    /// The one user-visible REFUSAL this change introduces, decided
+    /// deliberately rather than discovered later.
+    ///
+    /// Two models that genuinely read each other through subqueries compiled
+    /// before #1867 — one execution layer, silently mis-ordered — because
+    /// neither read derived an edge. Now both edges exist and they close a
+    /// cycle, so `topological_sort` refuses the project.
+    ///
+    /// That is correct: it IS a cycle, and Rocky was running it in whatever
+    /// order the alphabetical root walk produced. But it is a divergence worth
+    /// naming — `augment_physical_read_edges` guarantees the opposite for its
+    /// own derivation ("this recompute cannot turn a compiling project into a
+    /// refused one"), because it skips cycle-closing candidates and warns.
+    /// Compile-time has no such guard and does not want one: a compile-time
+    /// cycle is a project error, not a scheduling hint.
+    #[test]
+    fn mutual_subquery_reads_are_refused_as_the_cycle_they_are() {
+        let models = vec![
+            make_model("alpha", "SELECT id FROM (SELECT id FROM beta) AS s"),
+            make_model("beta", "SELECT id FROM (SELECT id FROM alpha) AS s"),
+        ];
+
+        let (dag_nodes, _lineage_cache, _diags) = resolve_dependencies(&models).unwrap();
+        assert_eq!(
+            dag_nodes
+                .iter()
+                .find(|n| n.name == "alpha")
+                .unwrap()
+                .depends_on,
+            vec!["beta"]
+        );
+        let err = rocky_ir::dag::topological_sort(&dag_nodes)
+            .expect_err("the two models really do read each other");
+        assert!(
+            format!("{err}").contains("circular"),
+            "and it is reported as a cycle: {err}"
+        );
+    }
+
     /// A model reading its own name from inside a subquery is still a
     /// self-reference and still gets no edge — the nested path applies the
     /// same exclusion the top-level one does, or the model would depend on
@@ -891,7 +931,6 @@ mod tests {
 
         let (dag_nodes, _lineage_cache, _diags) = resolve_dependencies(&models).unwrap();
         assert!(dag_nodes[0].depends_on.is_empty());
-        rocky_ir::dag::topological_sort(&dag_nodes)
-            .expect("a self-read must not close a cycle");
+        rocky_ir::dag::topological_sort(&dag_nodes).expect("a self-read must not close a cycle");
     }
 }

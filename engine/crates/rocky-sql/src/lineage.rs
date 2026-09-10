@@ -331,10 +331,7 @@ fn extract_query_lineage(query: &Query, outer_ctes: &CteScope) -> Result<Lineage
 /// table there (#1867). The two are returned separately because they answer
 /// different questions: the first is what the query can select from, the second
 /// is what it depends on.
-fn extract_tables(
-    from: &[TableWithJoins],
-    ctes: &CteScope,
-) -> (Vec<TableReference>, Vec<String>) {
+fn extract_tables(from: &[TableWithJoins], ctes: &CteScope) -> (Vec<TableReference>, Vec<String>) {
     let mut tables = Vec::new();
     let mut nested = Vec::new();
 
