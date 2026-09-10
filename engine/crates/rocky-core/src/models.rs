@@ -1633,14 +1633,21 @@ pub fn load_models_from_dir_filtered(
     };
 
     // Collect all .sql file paths first (fs::read_dir is not Send)
+    //
+    // Compared as `OsStr`, not `&str`. `to_str()` returns `None` for a
+    // filename that is not valid UTF-8, and inside a `filter_map` that `?`
+    // DROPPED the file — before the extension was even looked at. So a model
+    // whose name carried one such byte was invisible to Rocky entirely: it did
+    // not compile, did not run, did not appear in `rocky dag`, and nothing
+    // said so (#1814). An `OsStr` comparison is byte-exact and total.
     let sql_files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let path = entry.path();
-            if path.file_name()?.to_str()? == "_defaults.toml" {
+            if path.file_name()? == std::ffi::OsStr::new("_defaults.toml") {
                 return None;
             }
-            if path.extension()?.to_str()? == "sql" && include(&path) {
+            if path.extension()? == std::ffi::OsStr::new("sql") && include(&path) {
                 Some(path)
             } else {
                 None
