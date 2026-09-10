@@ -74,6 +74,7 @@ from .types import (
     RetentionStatusOutput,
     ReviewStatusOutput,
     RunResult,
+    ScheduleSpoolOutput,
     StateHealthResult,
     StateResult,
     TestResult,
@@ -1539,6 +1540,16 @@ class RockyResource(dg.ConfigurableResource):
         """
         with _translating():
             return self._get_client().retention_status(env=env)
+
+    def schedule_spool(self) -> ScheduleSpoolOutput:
+        """Run ``rocky state schedule spool``: webhook demands not yet consumed.
+
+        A sensor can read this to tell "the tick is healthy and nothing is
+        queued" from "demands are piling up" — ``GET /api/v1/schedule`` reports
+        claims, which only exist once a tick has picked a demand up.
+        """
+        with _translating():
+            return self._get_client().schedule_spool()
 
     def resume_run(
         self,

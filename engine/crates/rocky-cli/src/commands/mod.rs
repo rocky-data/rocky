@@ -70,6 +70,7 @@ mod run_content_addressed;
 mod run_dag_exec;
 mod run_local;
 mod run_watch;
+pub mod schedule_spool;
 pub mod schedule_status;
 pub mod scheduler;
 mod seed;
@@ -190,6 +191,7 @@ pub use review::{
     compute_review, compute_review_queue, compute_review_status, plan_is_reviewable, run_review,
     run_review_queue, run_review_status,
 };
+pub use schedule_spool::{ScheduleSpoolError, compute_schedule_spool, state_schedule_spool};
 pub use schedule_status::{ScheduleStatusError, schedule_status_output};
 // Re-exported so the `rocky` bin can build a clap ValueEnum for
 // `--target-dialect` without taking a direct dep on rocky-sql.

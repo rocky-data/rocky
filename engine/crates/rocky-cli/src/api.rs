@@ -110,8 +110,8 @@ use crate::output::{
     ColumnLineageOutput, CompileOutput, DagExecutionOutput, DagLayersOutput, DagNodeResultOutput,
     DagNodeStatusOutput, DagOutput, DagStatusOutput, ErrorEnvelope, HealthOutput, HistoryOutput,
     JobKind, JobState, JobStatus, LineageOutput, MetaOutput, MetricsOutput, ModelColumnOutput,
-    ModelDetailOutput, ModelHistoryOutput, ModelListEntry, ModelListOutput, ScheduleStatusOutput,
-    TypedColumnOutput, cap_model_sql,
+    ModelDetailOutput, ModelHistoryOutput, ModelListEntry, ModelListOutput, ScheduleSpoolOutput,
+    ScheduleStatusOutput, TypedColumnOutput, cap_model_sql,
 };
 
 /// Bind config for [`serve`].
@@ -184,6 +184,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/jobs/apply", post(submit_apply))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/schedule", get(schedule_status))
+        .route("/api/v1/schedule/spool", get(schedule_spool))
         .route("/api/v1/policy", get(policy_show))
         .route("/api/v1/products", get(list_products))
         .route("/api/v1/products/{name}", get(get_product))
@@ -813,6 +814,7 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "POST /api/v1/jobs/apply",
         "GET /api/v1/jobs/{id}",
         "GET /api/v1/schedule",
+        "GET /api/v1/schedule/spool",
         "GET /api/v1/policy",
         "GET /api/v1/products",
         "GET /api/v1/products/{name}",
@@ -2114,6 +2116,53 @@ async fn schedule_status(
     })
     .await?
     .map_err(|e| map_schedule_err(e, running_job_id))?;
+    Ok(PrettyJson(output))
+}
+
+/// `GET /api/v1/schedule/spool`: the webhook demands accepted but not yet
+/// consumed — the same bytes as `rocky state schedule spool --output json`.
+///
+/// [`schedule_status`] reports claims, which exist only once a tick has picked
+/// a demand up, so a queued demand appears nowhere in `GET /api/v1/schedule`.
+/// This is the other half.
+///
+/// Fail-closed: a spool directory that is present but unreadable is a `500`,
+/// never an empty list. An absent spool is `200` with nothing pending — no
+/// webhook has ever been accepted for this project.
+///
+/// Takes no state-store permit. The spool is plain files under `.rocky`, so
+/// this read never touches redb and cannot be blocked by a running job; the
+/// filesystem work runs on a blocking thread.
+async fn schedule_spool(
+    State(state): State<Arc<ServerState>>,
+) -> Result<PrettyJson<ScheduleSpoolOutput>, ApiError> {
+    let Some(config_path) = state.config_path.clone() else {
+        return Err(ApiError::engine_not_ready());
+    };
+
+    let output =
+        tokio::task::spawn_blocking(move || crate::commands::compute_schedule_spool(&config_path))
+            .await
+            .map_err(|e| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    format!("the spool read panicked: {e}"),
+                    None,
+                )
+            })?
+            .map_err(|e| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "spool_unreadable",
+                    e.to_string(),
+                    Some(
+                        "inspect the spool directory's permissions — queued webhook \
+                 demands cannot be counted while it is unreadable",
+                    ),
+                )
+            })?;
+
     Ok(PrettyJson(output))
 }
 
@@ -5754,6 +5803,87 @@ mod tests {
         assert_eq!(api.counts.scheduled, reference.counts.scheduled);
         assert_eq!(api.pipelines.len(), reference.pipelines.len());
         assert_eq!(api.pipelines[0].cron, reference.pipelines[0].cron);
+    }
+
+    /// The route returns the producer's document, whole. Unlike
+    /// `schedule_status`, this output carries no `now`, so every byte is
+    /// comparable — a handler that reshaped, filtered or fabricated any part
+    /// of it fails here.
+    #[tokio::test]
+    async fn schedule_spool_matches_the_backing_output() {
+        let (dir, config_path, state) = scheduled_project();
+        let rocky_dir = dir.path().join(".rocky");
+
+        // Two queued demands and one file that will not parse, so the
+        // comparison covers `pending`, `skipped` and `counts` at once.
+        for (token, at) in [
+            ("delivery-2", "2026-09-10T11:00:00Z"),
+            ("delivery-1", "2026-09-10T10:00:00Z"),
+        ] {
+            rocky_core::schedule::spool::accept(
+                &rocky_dir,
+                "sales",
+                rocky_core::schedule::spool::WebhookKind::Id,
+                token,
+                "deadbeef",
+                chrono::DateTime::parse_from_rfc3339(at)
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            )
+            .unwrap();
+        }
+        std::fs::write(rocky_dir.join("pending-demands/notjson"), b"{ not json").unwrap();
+
+        let base = spawn_router(state).await;
+        let resp = get_retrying_on_busy(&format!("{base}/api/v1/schedule/spool")).await;
+        assert_eq!(resp.status(), 200);
+        // Raw bytes, not a parsed value: `PrettyJson` is `to_string_pretty`
+        // plus a newline, so the response is byte-comparable with the
+        // producer's own serialisation. Comparing parsed values would accept a
+        // route that reordered or reformatted the document.
+        let api = resp.text().await.unwrap();
+
+        let reference = crate::commands::compute_schedule_spool(&config_path).unwrap();
+        let reference_bytes = serde_json::to_string_pretty(&reference).unwrap() + "\n";
+
+        assert_eq!(
+            api, reference_bytes,
+            "the route did not return the producer's bytes"
+        );
+        assert_eq!(reference.counts.pending, 2);
+        assert_eq!(reference.counts.skipped, 1);
+    }
+
+    /// An unreadable spool is `500 spool_unreadable`, never `200` with an
+    /// empty queue. The producer fails closed; this pins that the route does
+    /// not undo it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn schedule_spool_reports_an_unreadable_spool_as_500() {
+        let (dir, _config_path, state) = scheduled_project();
+        let rocky_dir = dir.path().join(".rocky");
+        std::fs::create_dir_all(&rocky_dir).unwrap();
+        // Present (a dangling symlink), but impossible to enumerate.
+        std::os::unix::fs::symlink(
+            dir.path().join("nowhere"),
+            rocky_dir.join("pending-demands"),
+        )
+        .unwrap();
+
+        let base = spawn_router(state).await;
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/api/v1/schedule/spool"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            500,
+            "an unreadable spool must not answer 200"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], "spool_unreadable");
     }
 
     const POLICY_PROJECT_CONFIG: &str = "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\

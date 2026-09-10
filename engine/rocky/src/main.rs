@@ -2917,16 +2917,17 @@ enum StateAction {
         #[command(subcommand)]
         action: RetentionAction,
     },
-    /// Runtime schedule holds: pause or resume a pipeline's schedule.
+    /// Runtime schedule controls: pause or resume a pipeline's schedule, or
+    /// list the webhook demands waiting for a tick.
     Schedule {
         #[command(subcommand)]
-        action: ScheduleHoldAction,
+        action: ScheduleAction,
     },
 }
 
 /// Subcommands under `rocky state schedule`.
 #[derive(Subcommand)]
-enum ScheduleHoldAction {
+enum ScheduleAction {
     /// Pause a pipeline's schedule: a durable hold that suppresses every
     /// demand source (cron, after, freshness, webhook) until resumed, with a
     /// `paused` skip recorded each tick. Reaches a RUNNING `serve --scheduler`
@@ -2948,6 +2949,15 @@ enum ScheduleHoldAction {
         /// The pipeline whose schedule to resume.
         pipeline: String,
     },
+    /// List the webhook demands accepted but not yet consumed by a tick.
+    ///
+    /// `GET /api/v1/schedule` reports claims, which exist only after a tick
+    /// picks a demand up — so a demand queued here is invisible there. Read
+    /// this when a webhook was delivered and its pipeline never ran.
+    ///
+    /// A spool that is present but unreadable is an error, not an empty list:
+    /// "nothing is queued" and "we cannot tell" must never look the same.
+    Spool,
 }
 
 /// Subcommands under `rocky state retention`.
@@ -4080,10 +4090,20 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             }) => {
                 rocky_cli::commands::state_retention_sweep(&cli.config, &state_path, dry_run, json)
             }
+            // `Spool` is a read and carries no pipeline, so it cannot go
+            // through the hold's `(pipeline, paused)` shape — the holds
+            // collapse to that tuple among themselves and the read dispatches
+            // on its own.
+            Some(StateAction::Schedule {
+                action: ScheduleAction::Spool,
+            }) => rocky_cli::commands::state_schedule_spool(&cli.config, json),
             Some(StateAction::Schedule { action }) => {
                 let (pipeline, paused) = match action {
-                    ScheduleHoldAction::Pause { pipeline } => (pipeline, true),
-                    ScheduleHoldAction::Resume { pipeline } => (pipeline, false),
+                    ScheduleAction::Pause { pipeline } => (pipeline, true),
+                    ScheduleAction::Resume { pipeline } => (pipeline, false),
+                    // Dispatched above; listed so a new variant fails this
+                    // build rather than falling into the hold path.
+                    ScheduleAction::Spool => unreachable!("dispatched above"),
                 };
                 rocky_cli::commands::state_schedule_hold(
                     &cli.config,
