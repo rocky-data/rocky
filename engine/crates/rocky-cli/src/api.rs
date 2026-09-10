@@ -2148,20 +2148,6 @@ async fn settings(
     Ok(PrettyJson(settings_output(&state, labels)))
 }
 
-/// Test hook: when armed, the blocking config read blocks on this until the
-/// test releases it, so a test can observe the permit WHILE a read is in
-/// flight.
-///
-/// Exists because the obvious tests cannot see permit lifetime. Holding the
-/// permit from outside proves a held permit refuses a second caller; it does
-/// not prove the production path holds one for the read's duration. Dropping
-/// the permit inside the blocking closure restores unbounded blocked workers
-/// and leaves those tests passing — which is the whole bound, silently gone.
-/// Same shape as `ServerState::publish_hold`.
-#[cfg(test)]
-static CONFIG_READ_GATE: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>> =
-    std::sync::Mutex::new(None);
-
 /// How long the one `rocky.toml` read behind this route may take before the
 /// caller is told to retry. Generous for a local file; the point is that it
 /// ends, not that it is tight.
@@ -2225,14 +2211,6 @@ async fn resolve_config_labels(
         // `the_permit_is_held_for_the_whole_read` pins it.
         let _permit = permit;
 
-        // Let a test observe the permit while this read is "running".
-        #[cfg(test)]
-        {
-            let gate = CONFIG_READ_GATE.lock().unwrap().take();
-            if let Some(rx) = gate {
-                let _ = rx.recv();
-            }
-        }
         *for_read
             .settings
             .config_labels
@@ -6155,32 +6133,79 @@ mod tests {
         );
     }
 
-    /// **Red team, round 3.** The bound is not "a permit exists", it is "the
-    /// permit is held for as long as the read runs".
+    /// **Red team, round 3.** The whole lifecycle of the bounded config read,
+    /// driven by the hazard it exists for: a `rocky.toml` that is a FIFO, so
+    /// `read_to_string` genuinely never returns until this test lets it.
     ///
-    /// The two tests above cannot see that. They hold the permit from outside
-    /// to stand in for an in-flight read, which proves a held permit refuses a
-    /// second caller — but dropping the permit inside the blocking closure,
-    /// just before the read, leaves both of them passing while every concurrent
-    /// request goes back to occupying its own blocking worker. That mutation
-    /// removes the entire bound invisibly.
+    /// The earlier admission tests could not see any of this. Holding the
+    /// permit from outside shows that a held permit refuses a second caller; it
+    /// does not show the production path holds one for the read's DURATION.
+    /// Dropping the permit inside the blocking closure leaves those tests
+    /// passing while every concurrent request goes back to occupying its own
+    /// blocking worker — the entire bound, silently gone.
     ///
-    /// So this drives the real path and looks at the lane WHILE the read is in
-    /// flight, using the same kind of test gate `publish_hold` uses.
-    #[tokio::test]
-    async fn the_permit_is_held_for_the_whole_read() {
-        let (_dir, state) = project_with_three_secrets();
+    /// ```text
+    ///   request 1   -> parks in read_to_string on the FIFO, holding the permit
+    ///   request 2   -> 503 engine_busy, at once (not queued behind it)
+    ///   request 1   -> 504 settings_config_timeout after the deadline
+    ///   write+close -> the parked read completes and releases the lane
+    ///   request 3   -> 200, the route recovers
+    /// ```
+    ///
+    /// Unix-only: it needs a FIFO. The repo already guards filesystem-shape
+    /// tests this way.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stuck_config_read_is_bounded_refused_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
 
-        // Arm the gate so the read parks inside the blocking closure.
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        *CONFIG_READ_GATE.lock().unwrap() = Some(rx);
+        // A `rocky.toml` that is a FIFO: `read_to_string` blocks until someone
+        // writes and closes it. This is the hazard the bound exists for, not a
+        // stand-in for it.
+        let fifo = dir.path().join("rocky.toml");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("mkfifo runs")
+                .success(),
+            "could not create the FIFO this test needs"
+        );
 
-        let driving = state.clone();
-        let read = tokio::spawn(async move { resolve_config_labels(&driving).await.is_ok() });
+        // No token configured, so the requests below need no header.
+        let state = ServerState::with_auth_and_webhook(
+            models_dir,
+            false,
+            None,
+            Some(fifo.clone()),
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            rocky_server::state::SettingsSnapshot {
+                bind_host: "127.0.0.1".to_string(),
+                ..Default::default()
+            },
+        );
+        assert!(state.settings.config_labels.get().is_none());
 
-        // Wait for the read to actually take the lane.
+        let base = spawn_router(state.clone()).await;
+        let client = reqwest::Client::new();
+        let url = format!("{base}/api/v1/settings");
+
+        // Request 1 parks inside the read, holding the permit.
+        let first = tokio::spawn({
+            let client = client.clone();
+            let url = url.clone();
+            async move { client.get(url).send().await.unwrap().status() }
+        });
+
+        // Wait for it to actually take the lane.
         let mut taken = false;
-        for _ in 0..200 {
+        for _ in 0..400 {
             if Arc::clone(&state.settings_reads)
                 .try_acquire_owned()
                 .is_err()
@@ -6188,29 +6213,45 @@ mod tests {
                 taken = true;
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(taken, "the read never took the admission lane");
 
-        // THE ASSERTION: still held, with the read parked mid-flight.
-        assert!(
-            Arc::clone(&state.settings_reads)
-                .try_acquire_owned()
-                .is_err(),
-            "the permit was released while the read was still running, so \
-             concurrent requests would each occupy a blocking worker"
+        // THE BOUND: a second caller is refused at once, not queued behind a
+        // read that may never return.
+        let second = client.get(&url).send().await.unwrap();
+        assert_eq!(
+            second.status(),
+            503,
+            "a second read must be refused, not queued"
+        );
+        assert!(second.headers().contains_key("retry-after"));
+
+        // The first caller gets its own deadline back -- 504, and deliberately
+        // NOT 503 with a retry hint, because this read will not finish on its
+        // own.
+        assert_eq!(
+            first.await.unwrap(),
+            504,
+            "the parked caller must time out rather than hang forever"
         );
 
-        // Release and let it finish.
-        tx.send(()).unwrap();
-        assert!(read.await.unwrap(), "the read should resolve once released");
+        // Unblock the parked read; it completes, caches, and frees the lane.
+        std::fs::write(&fifo, "[adapter]\ntype = \"duckdb\"\n").unwrap();
 
-        // And the lane comes back afterwards.
-        assert!(
-            Arc::clone(&state.settings_reads)
-                .try_acquire_owned()
-                .is_ok(),
-            "the lane must be free again once the read returned"
+        // RECOVERY: the route works again once the read returns.
+        let mut recovered = 0;
+        for _ in 0..400 {
+            let status = client.get(&url).send().await.unwrap().status();
+            if status == 200 {
+                recovered = 200;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            recovered, 200,
+            "the route must recover once the stuck read finally returns"
         );
     }
 
