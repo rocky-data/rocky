@@ -263,6 +263,39 @@ fn tombstone_path(key_path: &Path) -> PathBuf {
 /// (`EIO`/`ENOSPC`) a duplicate returns an error (surfaced as `500`) rather than
 /// the pre-durability `202` — the sender retries, and no ack is ever more
 /// durable than the entry it deduplicates against.
+/// The RFC 3339 rendering of `now`, refused if the reader cannot parse it back.
+///
+/// `DateTime::to_rfc3339` renders a year outside `0..=9999` with an expanded
+/// signed year — `+10000-01-01T00:00:00+00:00` — and chrono's own RFC 3339
+/// parser requires exactly four year digits. So [`accept`] could durably
+/// store a `received_at` that no reader would ever accept back.
+///
+/// The check is the round trip itself, through the same `parse_from_rfc3339`
+/// the reader calls, rather than a year-range test that restates chrono's rule
+/// and would go stale if chrono changed it.
+///
+/// Refusing at the write is what keeps the invariant one-sided. `rocky
+/// schedule spool` already reports an unparseable `received_at` as `skipped`
+/// with reason `bad_timestamp`, and that report should mean "this file was
+/// corrupted or hand-written", never "the accept path is allowed to produce
+/// this".
+///
+/// Not reachable through the webhook ingress, which stamps `Utc::now()`.
+/// [`accept`] is public, so it is reachable.
+fn round_trippable_rfc3339(now: DateTime<Utc>) -> io::Result<String> {
+    let rendered = now.to_rfc3339();
+    if let Err(e) = DateTime::parse_from_rfc3339(&rendered) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to spool a demand stamped {rendered:?}: it does not parse back as \
+                 RFC 3339 ({e}), so the reader would report it as bad_timestamp forever"
+            ),
+        ));
+    }
+    Ok(rendered)
+}
+
 pub fn accept(
     rocky_dir: &Path,
     pipeline: &str,
@@ -294,6 +327,9 @@ pub fn accept_journaled(
     now: DateTime<Utc>,
     journal: &dyn SpoolJournal,
 ) -> io::Result<AcceptOutcome> {
+    // Before `create_dir_all`, so a refused stamp leaves no trace on disk.
+    let received_at = round_trippable_rfc3339(now)?;
+
     let dir = spool_dir(rocky_dir);
     std::fs::create_dir_all(&dir)?;
 
@@ -321,7 +357,7 @@ pub fn accept_journaled(
         pipeline: pipeline.to_string(),
         kind,
         token: token.to_string(),
-        received_at: now.to_rfc3339(),
+        received_at,
         body_hash: body_hash.to_string(),
     };
     let bytes =
@@ -687,6 +723,77 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap()
+    }
+
+    /// #1903. The write refuses a stamp the reader cannot parse back.
+    ///
+    /// Year 10000 renders as `+10000-01-01T00:00:00+00:00` — an expanded
+    /// signed year, which `parse_from_rfc3339` rejects. Before this, `accept`
+    /// stored it durably and every reader thereafter reported the file as
+    /// `bad_timestamp`, forever, for a demand the spool itself had written.
+    #[test]
+    fn a_stamp_the_reader_cannot_parse_is_refused_at_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let rocky_dir = dir.path().join(".rocky");
+        let far_future = Utc.with_ymd_and_hms(10000, 1, 1, 0, 0, 0).unwrap();
+
+        // PRECONDITION: this stamp really is one the reader refuses. Without
+        // it the test passes for any `accept` that errors for any reason.
+        let rendered = far_future.to_rfc3339();
+        assert!(
+            DateTime::parse_from_rfc3339(&rendered).is_err(),
+            "PRECONDITION: {rendered} must be unparseable, or this test proves nothing"
+        );
+
+        let err = accept(
+            &rocky_dir,
+            "sales",
+            WebhookKind::Id,
+            "delivery-1",
+            "hash",
+            far_future,
+        )
+        .expect_err("a stamp the reader refuses must not be spooled");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains(&rendered),
+            "the refusal must name the stamp it refused, got: {err}"
+        );
+        assert!(
+            !spool_dir(&rocky_dir).as_path().try_exists().unwrap(),
+            "a refused stamp must leave nothing on disk"
+        );
+    }
+
+    /// The control. The boundary chrono can still render in four digits is
+    /// accepted, and comes back out.
+    #[test]
+    fn the_last_four_digit_year_is_accepted_and_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let rocky_dir = dir.path().join(".rocky");
+        let last = Utc.with_ymd_and_hms(9999, 12, 31, 23, 59, 59).unwrap();
+
+        accept(
+            &rocky_dir,
+            "sales",
+            WebhookKind::Id,
+            "delivery-1",
+            "hash",
+            last,
+        )
+        .expect("year 9999 round-trips");
+
+        let files = list_pending_files(&rocky_dir).expect("list");
+        assert_eq!(files.len(), 1);
+        let demand: PendingDemand =
+            serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+        assert_eq!(
+            DateTime::parse_from_rfc3339(&demand.received_at)
+                .expect("the spooled stamp parses back")
+                .with_timezone(&Utc),
+            last,
+        );
     }
 
     /// A journal that records the step order for the crash-safety assertion.
