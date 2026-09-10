@@ -7,12 +7,15 @@ import type { ProjectOutput } from "@rocky-types/project";
 import type { ScheduleStatusOutput } from "@rocky-types/schedule_status";
 import dagFixture from "@rocky-fixtures/dag.json";
 import historyFixture from "@rocky-fixtures/history.json";
+import mixedDag from "../test/fixtures/dag-mixed-kinds.json";
 import { ApiError } from "../api";
 import { NOT_RECORDED } from "../format";
 import { EstateScreen, type EstateLoaders } from "./EstateScreen";
 
 const capturedDag = dagFixture as unknown as DagOutput;
 const capturedHistory = historyFixture as unknown as HistoryOutput;
+/** The captured DAG that has a transformation node in it. See its README. */
+const mixedNodes = (mixedDag as unknown as DagOutput).nodes;
 
 const NOW = Date.parse("2026-09-05T08:00:00Z");
 
@@ -168,19 +171,30 @@ describe("EstateScreen", () => {
     expect(await screen.findByRole("table", { name: "Runs" })).toBeInTheDocument();
   });
 
-  it("opens a model's detail on selection and renders its SQL as text", async () => {
+  it("opens a model's detail under the name the route can serve", async () => {
     render(<EstateScreen loaders={loaders()} refreshMs={0} now={NOW} />);
     await screen.findByRole("list", { name: "Models in the DAG" });
-    // The canvas cannot be clicked in jsdom (React Flow paints after a
-    // measure), so the detail pane is exercised through the same loader the
-    // click reaches.
+    // What the panel sends is covered in DagPanel.test.tsx, which renders the
+    // real canvas. This covers the other half: what the pane does with the
+    // name it is handed. The loader here answers only for a name the real
+    // route answers for, so handing it a `kind:`-prefixed id fails the test
+    // rather than passing on a fake that accepts any string.
+    const model = mixedNodes.find((node) => node.kind === "transformation");
+    expect(model).toBeDefined();
+    const strictLoader: EstateLoaders["detail"] = async (name) => {
+      const servable = mixedNodes
+        .filter((node) => node.kind === "transformation")
+        .map((node) => node.label);
+      if (!servable.includes(name)) {
+        throw new ApiError(404, { code: "model_not_found", message: name });
+      }
+      return detail(name);
+    };
     const { getByText, getByRole } = within(
-      render(
-        <DetailHarness name={capturedDag.nodes[0].id} load={loaders().detail} />,
-      ).container,
+      render(<DetailHarness name={model!.label} load={strictLoader} />).container,
     );
     await waitFor(() => expect(getByRole("complementary")).toBeInTheDocument());
-    expect(getByText(`SELECT 1 AS id -- ${capturedDag.nodes[0].id}`)).toBeInTheDocument();
+    expect(getByText(`SELECT 1 AS id -- ${model!.label}`)).toBeInTheDocument();
     expect(getByText("INT64")).toBeInTheDocument();
   });
 });
