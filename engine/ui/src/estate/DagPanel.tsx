@@ -1,6 +1,13 @@
-import { Background, Controls, MiniMap, ReactFlow, ReactFlowProvider } from "@xyflow/react";
+import {
+  Background,
+  Controls,
+  MiniMap,
+  ReactFlow,
+  ReactFlowProvider,
+  useReactFlow,
+} from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import type { DagOutput } from "@rocky-types/dag";
 import { EmptyState } from "../components";
 import { layeredFlow, type ModelNodeData } from "./layout";
@@ -8,6 +15,38 @@ import { ModelNode } from "./ModelNode";
 import { nodeRoute } from "./nodeRoute";
 
 const nodeTypes = { model: ModelNode };
+
+/**
+ * Re-fit the graph when the canvas changes width.
+ *
+ * `fitView` runs once, at mount. Opening the detail pane takes the canvas from
+ * the full width down to `1fr` beside a 360px column — measured, 990px to
+ * 620px at a 1024px viewport — and the graph kept its old zoom, so the last
+ * node simply left the canvas. Rotating a phone does the same thing.
+ *
+ * Width only: the height is fixed, and re-fitting on every height change would
+ * fight a scroll. A refit does discard a manual pan or zoom, which is the
+ * right trade when the alternative is a graph that is partly off-screen.
+ */
+function RefitOnResize() {
+  const { fitView } = useReactFlow();
+  const lastWidth = useRef(0);
+
+  useEffect(() => {
+    const pane = document.querySelector(".react-flow__renderer")?.parentElement;
+    if (!pane || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver((entries) => {
+      const width = Math.round(entries[0]?.contentRect.width ?? 0);
+      if (width === 0 || width === lastWidth.current) return;
+      lastWidth.current = width;
+      void fitView();
+    });
+    observer.observe(pane);
+    return () => observer.disconnect();
+  }, [fitView]);
+
+  return null;
+}
 
 /**
  * The project's DAG, laid out by the engine's execution layers. Clicking a
@@ -75,12 +114,21 @@ export function DagPanel({ dag, onSelect }: { dag: DagOutput; onSelect: (name: s
             edges={flow.edges}
             nodeTypes={nodeTypes}
             fitView
+            // `fitView` cannot zoom out past `minZoom`, and the library's
+            // default of 0.5 is not enough to fit this graph on a phone: three
+            // nodes span 3×184 + 2×96 = 744px, so a 320px viewport's ~288px of
+            // canvas needs 0.39. Clamped at 0.5 the graph is simply cut off at
+            // both edges, which is what a narrow viewport showed. The floor is
+            // a real limit, not a preference, so it is set low enough for the
+            // fit to happen; a deeper DAG needs it lower still.
+            minZoom={0.05}
             nodesDraggable={false}
             nodesConnectable={false}
             proOptions={{ hideAttribution: true }}
             colorMode="system"
             onNodeClick={(_, node) => open(node.data)}
           >
+            <RefitOnResize />
             <Background />
             <MiniMap pannable zoomable />
             <Controls showInteractive={false} />

@@ -74,7 +74,10 @@ export function Rows({
   ariaLabel: string;
 }) {
   return (
-    <table className="w-full text-left text-xs" aria-label={ariaLabel}>
+    // The scroller is on the table, not the page: without it the widest cell
+    // pushes the whole page body sideways on a phone.
+    <div className="overflow-x-auto">
+    <table className="w-full min-w-max text-left text-xs" aria-label={ariaLabel}>
       <thead className="text-zinc-500 dark:text-zinc-400">
         <tr>
           {columns.map((column) => (
@@ -96,5 +99,6 @@ export function Rows({
         ))}
       </tbody>
     </table>
+    </div>
   );
 }

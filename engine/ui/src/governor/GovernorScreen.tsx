@@ -77,7 +77,16 @@ export function GovernorScreen({
 
   return (
     <div className="space-y-4">
-      <nav aria-label="Governor screens" className="flex gap-4 border-b border-zinc-200 text-sm dark:border-zinc-800">
+      {/*
+        `flex-wrap`, because five tabs do not fit 320px: measured, the row ran
+        3–4px past the page body and took the whole page sideways with it.
+        Wrapping to a second line costs a few pixels of height and keeps every
+        tab reachable, which a horizontal page scroll does not.
+      */}
+      <nav
+        aria-label="Governor screens"
+        className="flex flex-wrap gap-x-4 gap-y-1 border-b border-zinc-200 text-sm dark:border-zinc-800"
+      >
         {TABS.map((entry) => (
           <a
             key={entry.id}

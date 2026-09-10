@@ -53,7 +53,8 @@ export function SchedulePanel({ status, now }: { status: ScheduleStatusOutput; n
           detail="No pipeline declares a [schedule], so the resident scheduler has nothing to evaluate."
         />
       ) : (
-        <table className="w-full text-left text-xs" aria-label="Schedules">
+        <div className="overflow-x-auto">
+        <table className="w-full min-w-max text-left text-xs" aria-label="Schedules">
           <thead className="text-zinc-500 dark:text-zinc-400">
             <tr>
               <th className="pr-3 font-medium">pipeline</th>
@@ -92,6 +93,7 @@ export function SchedulePanel({ status, now }: { status: ScheduleStatusOutput; n
             ))}
           </tbody>
         </table>
+        </div>
       )}
     </div>
   );

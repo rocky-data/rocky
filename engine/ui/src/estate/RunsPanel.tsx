@@ -37,7 +37,13 @@ export function RunsPanel({ history, now }: { history: HistoryOutput; now?: numb
   }
   return (
     <div>
-      <table className="w-full text-left text-xs" aria-label="Runs">
+      {/*
+        The scroller is on the table, not the page. Seven columns do not fit a
+        phone, and without this the widest cell pushes the whole page body
+        sideways — every panel above and below it included.
+      */}
+      <div className="overflow-x-auto">
+      <table className="w-full min-w-max text-left text-xs" aria-label="Runs">
         <thead className="text-zinc-500 dark:text-zinc-400">
           <tr>
             <th className="pr-3 font-medium">run</th>
@@ -67,6 +73,7 @@ export function RunsPanel({ history, now }: { history: HistoryOutput; now?: numb
           ))}
         </tbody>
       </table>
+      </div>
       <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
         {history.count} run(s) in the newest 50
       </p>
