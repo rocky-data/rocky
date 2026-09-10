@@ -329,6 +329,25 @@ fn extract_deps_from_lineage(
         }
     }
 
+    // Reads that live inside a derived table or a `WITH` body (#1867). They
+    // are dependencies, not relations the outer query selects from, so they
+    // arrive on their own field rather than in `source_tables` — but they
+    // derive edges exactly like a top-level read.
+    //
+    // Already lower-cased and already stripped of `WITH`-bound names by
+    // `extract_lineage`, so the CTE-shadowing rule (#1892) holds here too.
+    for name in &lineage_result.nested_sources {
+        if let TableRefKind::ModelRef(name) = classify_table_ref(name, model_names)
+            && name != model_name
+            && seen.insert(name.clone())
+        {
+            if renamed_targets.contains_key(name.as_str()) {
+                renamed_target_reads.push(name.clone());
+            }
+            deps.push(name);
+        }
+    }
+
     (deps, renamed_target_reads)
 }
 
@@ -794,5 +813,124 @@ mod tests {
         let (dag_nodes, _lineage_cache, _diags) = resolve_dependencies(&models).unwrap();
         let mixed = dag_nodes.iter().find(|n| n.name == "mixed").unwrap();
         assert_eq!(mixed.depends_on, vec!["orders"]);
+    }
+
+    /// #1867: a read inside a derived table derives the edge. Before this the
+    /// pair shared an execution layer, so `--parallel` raced them and a serial
+    /// run got its order from the alphabetical root walk.
+    ///
+    /// The reader is named to sort FIRST, because that is what makes the
+    /// assertion mean something: without the edge the walk would put it first.
+    #[test]
+    fn a_subquery_read_derives_the_edge() {
+        let models = vec![
+            make_model("orders", "SELECT 1 AS id"),
+            make_model("a_reader", "SELECT id FROM (SELECT id FROM orders) AS s"),
+        ];
+
+        let (dag_nodes, _lineage_cache, _diags) = resolve_dependencies(&models).unwrap();
+        let reader = dag_nodes.iter().find(|n| n.name == "a_reader").unwrap();
+        assert_eq!(reader.depends_on, vec!["orders"]);
+
+        let order = rocky_ir::dag::topological_sort(&dag_nodes).unwrap();
+        let pos = |name: &str| order.iter().position(|n| n == name).unwrap();
+        assert!(
+            pos("orders") < pos("a_reader"),
+            "the producer must run first: {order:?}"
+        );
+    }
+
+    /// The same for a read inside a `WITH` body.
+    #[test]
+    fn a_cte_body_read_derives_the_edge() {
+        let models = vec![
+            make_model("orders", "SELECT 1 AS id"),
+            make_model(
+                "a_reader",
+                "WITH c AS (SELECT id FROM orders) SELECT id FROM c",
+            ),
+        ];
+
+        let (dag_nodes, _lineage_cache, _diags) = resolve_dependencies(&models).unwrap();
+        let reader = dag_nodes.iter().find(|n| n.name == "a_reader").unwrap();
+        assert_eq!(reader.depends_on, vec!["orders"]);
+    }
+
+    /// #1892's rule survives one level down: a name a `WITH` clause bound is
+    /// not a table read wherever it appears, including inside another body.
+    #[test]
+    fn a_shadowed_name_inside_a_body_still_derives_no_edge() {
+        let models = vec![
+            make_model("orders", "SELECT 1 AS id"),
+            make_model(
+                "a_reader",
+                "WITH orders AS (SELECT 2 AS id), \
+                 c AS (SELECT id FROM orders) \
+                 SELECT id FROM c",
+            ),
+        ];
+
+        let (dag_nodes, _lineage_cache, _diags) = resolve_dependencies(&models).unwrap();
+        let reader = dag_nodes.iter().find(|n| n.name == "a_reader").unwrap();
+        assert!(
+            reader.depends_on.is_empty(),
+            "the body reads the CTE above it, not the model: {:?}",
+            reader.depends_on
+        );
+    }
+
+    /// The one user-visible REFUSAL this change introduces, decided
+    /// deliberately rather than discovered later.
+    ///
+    /// Two models that genuinely read each other through subqueries compiled
+    /// before #1867 — one execution layer, silently mis-ordered — because
+    /// neither read derived an edge. Now both edges exist and they close a
+    /// cycle, so `topological_sort` refuses the project.
+    ///
+    /// That is correct: it IS a cycle, and Rocky was running it in whatever
+    /// order the alphabetical root walk produced. But it is a divergence worth
+    /// naming — `augment_physical_read_edges` guarantees the opposite for its
+    /// own derivation ("this recompute cannot turn a compiling project into a
+    /// refused one"), because it skips cycle-closing candidates and warns.
+    /// Compile-time has no such guard and does not want one: a compile-time
+    /// cycle is a project error, not a scheduling hint.
+    #[test]
+    fn mutual_subquery_reads_are_refused_as_the_cycle_they_are() {
+        let models = vec![
+            make_model("alpha", "SELECT id FROM (SELECT id FROM beta) AS s"),
+            make_model("beta", "SELECT id FROM (SELECT id FROM alpha) AS s"),
+        ];
+
+        let (dag_nodes, _lineage_cache, _diags) = resolve_dependencies(&models).unwrap();
+        assert_eq!(
+            dag_nodes
+                .iter()
+                .find(|n| n.name == "alpha")
+                .unwrap()
+                .depends_on,
+            vec!["beta"]
+        );
+        let err = rocky_ir::dag::topological_sort(&dag_nodes)
+            .expect_err("the two models really do read each other");
+        assert!(
+            format!("{err}").contains("circular"),
+            "and it is reported as a cycle: {err}"
+        );
+    }
+
+    /// A model reading its own name from inside a subquery is still a
+    /// self-reference and still gets no edge — the nested path applies the
+    /// same exclusion the top-level one does, or the model would depend on
+    /// itself and `topological_sort` would refuse the project.
+    #[test]
+    fn a_nested_self_read_derives_no_edge() {
+        let models = vec![make_model(
+            "orders",
+            "SELECT id FROM (SELECT id FROM orders) AS s",
+        )];
+
+        let (dag_nodes, _lineage_cache, _diags) = resolve_dependencies(&models).unwrap();
+        assert!(dag_nodes[0].depends_on.is_empty());
+        rocky_ir::dag::topological_sort(&dag_nodes).expect("a self-read must not close a cycle");
     }
 }
