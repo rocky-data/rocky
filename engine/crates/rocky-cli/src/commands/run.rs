@@ -164,6 +164,40 @@ pub struct Interrupted;
 /// "use --resume … to retry" with nothing said about the checks. A resume
 /// re-copies the failed table and rebuilds its check inputs only from what it
 /// copies, so it re-runs none of the checks that gated the run.
+/// Whether a finished run's [`rocky_core::state::RunRecord`] reached the
+/// state store.
+///
+/// A caller that still holds the run's remote-state session decides
+/// finalize-versus-abandon on this (#1836). Finalizing publishes the local
+/// ledger; doing that when the record is missing hands every other pod an
+/// AUTHORITATIVE history with this run absent from it, which is worse than
+/// the stale history abandoning leaves them, because a stale history is not
+/// wrong about this run — it simply has not heard of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordCustody {
+    /// The record is in the store. A held session must FINALIZE so the record
+    /// rides the terminal upload.
+    Persisted,
+    /// The record is NOT in the store — [`persist_run_record`] logged a failed
+    /// write, or there was no store to write to. A held session must ABANDON.
+    ///
+    /// The no-store half never coincides with a live session: the arm that
+    /// passes `None` is the lazy no-op transformation run, which acquires no
+    /// session either.
+    Lost,
+}
+
+impl RecordCustody {
+    /// `true` when [`persist_run_record`] reported the record landed.
+    pub fn from_persisted(persisted: bool) -> Self {
+        if persisted {
+            RecordCustody::Persisted
+        } else {
+            RecordCustody::Lost
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PartialFailure {
     pub count: usize,
@@ -171,6 +205,12 @@ pub struct PartialFailure {
     /// Whether the same run ALSO failed its check gate. Changes the advice,
     /// never the exit code — both shapes are exit 2.
     pub check_gate_failed: bool,
+    /// Whether this run's record is persisted (#1836). Read by
+    /// [`session_disposition`]; never changes the exit code, which stays 2
+    /// either way — the run failed the same amount, and downgrading it to the
+    /// generic exit 1 would tell an orchestrator "hard failure" about a run
+    /// that is still resumable.
+    pub custody: RecordCustody,
 }
 
 impl std::fmt::Display for PartialFailure {
@@ -208,6 +248,9 @@ impl std::error::Error for PartialFailure {}
 pub struct RunFailed {
     pub count: usize,
     pub run_id: String,
+    /// Whether this run's record is persisted (#1836). Read by
+    /// [`session_disposition`]; the exit code is 1 either way.
+    pub custody: RecordCustody,
 }
 
 /// Sentinel error signalling that a quality run completed its terminal state
@@ -286,6 +329,39 @@ impl std::fmt::Display for CheckGateFailure {
 
 impl std::error::Error for CheckGateFailure {}
 
+/// What a caller still holding a run's remote-state session must do with it
+/// when the dispatch came back `Err`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionDisposition {
+    /// The run reached its terminal state writes and its record is persisted.
+    /// Upload: the record and any committed state ride the terminal upload.
+    Finalize,
+    /// Either the error is a pre-terminal hard exit, or the run's record never
+    /// landed. Upload nothing.
+    Abandon,
+}
+
+/// Decide [`SessionDisposition`] for a failed dispatch (#1816, #1836).
+///
+/// The typed post-terminal sentinels are the dispatcher's only evidence that a
+/// record exists to upload. Before #1836 the TYPE alone decided, and the type
+/// came back whether or not [`persist_run_record`] had succeeded — so a failed
+/// write was logged, swallowed, and then published as an authoritative ledger
+/// with the run missing from it.
+///
+/// The custody the sentinel now carries is what decides. Every other error is
+/// a pre-terminal hard exit and abandons, as before.
+pub(crate) fn session_disposition(error: &anyhow::Error) -> SessionDisposition {
+    let custody = error
+        .downcast_ref::<RunFailed>()
+        .map(|e| e.custody)
+        .or_else(|| error.downcast_ref::<PartialFailure>().map(|e| e.custody));
+    match custody {
+        Some(RecordCustody::Persisted) => SessionDisposition::Finalize,
+        Some(RecordCustody::Lost) | None => SessionDisposition::Abandon,
+    }
+}
+
 /// Map a finalized [`RunOutput`]'s derived status onto the CLI exit-code
 /// contract for the transformation / model-only execution paths.
 ///
@@ -300,7 +376,14 @@ impl std::error::Error for CheckGateFailure {}
 /// JSON consumer reads regardless of exit code. This is what makes a
 /// compile-failed model a first-class run failure instead of a silently
 /// skipped no-op that still reported `status: "Success"`, exit 0.
-pub(crate) fn run_status_exit_result(output: &RunOutput, run_id: &str) -> Result<()> {
+pub(crate) fn run_status_exit_result(
+    output: &RunOutput,
+    run_id: &str,
+    // Whether this run's record landed (#1836). The sentinel carries it so a
+    // caller still holding the remote-state session decides on the FACT rather
+    // than on the error type, which says nothing about the write.
+    custody: RecordCustody,
+) -> Result<()> {
     match output.derive_run_status() {
         rocky_core::state::RunStatus::PartialFailure => Err(PartialFailure {
             count: output.tables_failed,
@@ -310,11 +393,13 @@ pub(crate) fn run_status_exit_result(output: &RunOutput, run_id: &str) -> Result
             // (#1720). `false` on the transformation / model-only paths, which
             // never stamp the gate — those messages are unchanged.
             check_gate_failed: output.check_gate_failed,
+            custody,
         }
         .into()),
         rocky_core::state::RunStatus::Failure => Err(RunFailed {
             count: output.tables_failed,
             run_id: run_id.to_string(),
+            custody,
         }
         .into()),
         _ => Ok(()),
@@ -888,10 +973,16 @@ pub(crate) static FAIL_RECORD_WRITE_FOR_TEST: std::sync::Mutex<Option<String>> =
 /// is persisted, upload it" should check this before returning that type:
 /// finalizing on a record that is not there publishes a ledger without the
 /// run, and a fresh pod then reads an authoritative history with the failure
-/// missing. `run_quality` checks it before its `QualityGateFailure` (#1816);
-/// the transformation, snapshot and load arms do not yet, and their typed
-/// sentinels carry the same exposure (#1836). Nothing forces the check — a
-/// `bool` can be dropped — which is the shape #1836 is about.
+/// missing. `run_quality` checks it before its `QualityGateFailure` (#1816),
+/// and every caller of [`run_status_exit_result`] now threads it onto the
+/// sentinel as a [`RecordCustody`] so [`session_disposition`] decides on the
+/// fact rather than on the error type (#1836).
+///
+/// A SUCCESSFUL run whose record write failed still finalizes and still exits
+/// 0. That is deliberate, not an oversight: its session also carries the run's
+/// other state writes, and abandoning to punish a lost record would discard
+/// those too. Making that run non-zero changes `rocky run`'s exit contract and
+/// is #1836's open half.
 pub(crate) fn persist_run_record(
     state_store: Option<&StateStore>,
     output: &RunOutput,
@@ -2757,7 +2848,7 @@ pub async fn run(
             None,
         );
         let audit = audit_to_record(&audit_ctx);
-        persist_run_record(
+        let custody = RecordCustody::from_persisted(persist_run_record(
             state_store.as_ref(),
             &output,
             &run_id,
@@ -2766,7 +2857,7 @@ pub async fn run(
             &audit,
             // Model-only run — no single pipeline to attribute.
             None,
-        );
+        ));
         finalize_idempotency(
             &mut idempotency_ctx,
             state_store.as_ref(),
@@ -2804,7 +2895,7 @@ pub async fn run(
         // compile is recorded in `output.errors` / `tables_failed` by
         // `execute_models`; propagate the non-zero exit so it doesn't
         // report exit 0 with a JSON payload that says the model failed.
-        return run_status_exit_result(&output, &run_id);
+        return run_status_exit_result(&output, &run_id, custody);
     }
 
     let (pipeline_name, pipeline_config) =
@@ -3118,29 +3209,39 @@ pub async fn run(
                     return Ok(());
                 }
                 Err(e) => {
-                    // A typed run-status failure (`RunFailed` / the
-                    // `PartialFailure` sentinel) means `run_transformation`
-                    // completed its terminal state writes — the recorded
-                    // errors and the `RunRecord` are already persisted — so
-                    // the session must FINALIZE: the Failure record and any
-                    // committed models' state ride the terminal upload. A
+                    // `session_disposition` decides. A typed run-status
+                    // failure (`RunFailed` / the `PartialFailure` sentinel)
+                    // means `run_transformation` completed its terminal state
+                    // writes, so the session FINALIZES: the Failure record and
+                    // any committed models' state ride the terminal upload. A
                     // freeze-fence withhold or a failed model is a partial
                     // failure, never state loss (docs/adr/ADR-CONCURRENCY.md
                     // D3); abandoning here stranded the persisted record
-                    // locally, invisible to every other pod. Every other
-                    // error is a pre-terminal hard exit: abandon, never
+                    // locally, invisible to every other pod.
+                    //
+                    // But the type alone said nothing about whether the record
+                    // actually landed (#1836), and `persist_run_record` is
+                    // best-effort. So the sentinel carries its
+                    // `RecordCustody`, and a `Lost` one abandons with every
+                    // other error — a pre-terminal hard exit: abandon, never
                     // upload (the `?` this replaces would have leaked the
                     // session past this arm's return).
                     if let Some(session) = tx_session {
-                        if e.is::<RunFailed>() || e.is::<PartialFailure>() {
-                            session.finalize().await.context(
-                                "the run's recorded failure state could not be persisted to \
-                                 the remote [state] backend",
-                            )?;
-                        } else {
-                            session
-                                .abandon("transformation exited before terminal state writes")
-                                .await;
+                        match session_disposition(&e) {
+                            SessionDisposition::Finalize => {
+                                session.finalize().await.context(
+                                    "the run's recorded failure state could not be persisted \
+                                     to the remote [state] backend",
+                                )?;
+                            }
+                            SessionDisposition::Abandon => {
+                                session
+                                    .abandon(
+                                        "transformation exited before terminal state writes, \
+                                         or its run record did not land",
+                                    )
+                                    .await;
+                            }
                         }
                     }
                     return Err(e);
@@ -5991,7 +6092,12 @@ pub async fn run(
     // `rocky trace`, and `rocky cost` have real data to read.
     // Record-store failures never fail the command — the user's run
     // succeeded, bookkeeping can't be allowed to flip the exit code.
-    persist_run_record(
+    // Carried to the sentinels below (#1836). On this path the session has
+    // already finalized by the time they are returned, so the custody is
+    // informational rather than load-bearing — but a sentinel that claims a
+    // record exists when it does not is the defect, and it must not be
+    // reintroduced by a future caller that reads it.
+    let record_custody = RecordCustody::from_persisted(persist_run_record(
         state_store.as_ref(),
         &output,
         &run_id,
@@ -5999,7 +6105,7 @@ pub async fn run(
         &config_hash,
         &audit,
         Some(pipeline_name),
-    );
+    ));
 
     // Post-apply `verify_after` gate for any additive drift this run
     // auto-applied. Writes an allow/deny verification custody row per healed
@@ -6042,7 +6148,14 @@ pub async fn run(
         output.verify_after_failed = true;
         // Re-persist so `rocky history` records a Failure (status is derived
         // from the now-failed tallies), and finalize idempotency as failed.
-        persist_run_record(
+        // Deliberately not folded into `record_custody`: this branch returns
+        // `verify_after_result`, an untyped error, and finalizes below no
+        // matter what — so no sentinel reads a custody from here. The finalize
+        // is not unconditional by accident either: the session also carries
+        // the verify-after CUSTODY ROW written just above, and abandoning to
+        // punish a lost run record would discard that row too. Same trade as
+        // the successful-run half of #1836.
+        let _ = persist_run_record(
             state_store.as_ref(),
             &output,
             &run_id,
@@ -6232,6 +6345,7 @@ pub async fn run(
                 count,
                 run_id: run_id.clone(),
                 check_gate_failed: gated,
+                custody: record_custody,
             }
             .into());
         }
@@ -6265,7 +6379,7 @@ pub async fn run(
             .fire(&HookContext::pipeline_error(&run_id, pipeline_name, &msg))
             .await;
         let _ = hook_registry.wait_async_webhooks().await;
-        return run_status_exit_result(&output, &run_id);
+        return run_status_exit_result(&output, &run_id, record_custody);
     }
 
     // Check gate. Separate from both branches above on purpose: a failed
@@ -9137,7 +9251,7 @@ pub(crate) async fn execute_backfill_set(
 
         let audit_ctx = AuditContext::detect(None, None);
         let audit = audit_to_record(&audit_ctx);
-        persist_run_record(
+        let custody = RecordCustody::from_persisted(persist_run_record(
             state_store.as_ref(),
             &output,
             &run_id,
@@ -9146,14 +9260,14 @@ pub(crate) async fn execute_backfill_set(
             &audit,
             // A backfill spans a model set, not a single pipeline.
             None,
-        );
+        ));
 
         output.status = output.derive_run_status();
         if output_json {
             print_json(&output)?;
         }
         budget_result?;
-        run_status_exit_result(&output, &run_id)
+        run_status_exit_result(&output, &run_id, custody)
     }
     .await;
 
@@ -14677,6 +14791,212 @@ max_retries = 0
         assert!(
             record.check_gate_failed,
             "and it carries the gate the run failed on"
+        );
+    }
+
+    /// Drive a FAILING transformation run on pod A, through `run()`'s
+    /// dispatcher so the transformation arm's session decision really runs.
+    ///
+    /// The models dir holds one model that reads a table which does not exist,
+    /// so `execute_models` records a failure, nothing is built, and
+    /// `derive_run_status()` is `Failure` — the shape that returns `RunFailed`.
+    #[cfg(feature = "duckdb")]
+    fn run_failing_transformation_on_pod_a(
+        rt: &tokio::runtime::Runtime,
+        harness: &rocky_core::test_harness::CrossPodHarness,
+        project: &std::path::Path,
+        run_id: &str,
+    ) -> anyhow::Result<super::RunTermination> {
+        let models = project.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(
+            models.join("broken.sql"),
+            "SELECT * FROM no_such_source_table\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("broken.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )
+        .unwrap();
+
+        let config_path = project.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = '{}'
+
+[pipeline.tx]
+type = "transformation"
+models = '{}'
+
+[pipeline.tx.target]
+adapter = "default"
+
+[state]
+backend = "s3"
+s3_bucket = "test"
+on_upload_failure = "fail"
+
+[state.retry]
+max_retries = 0
+"#,
+                project.join("tx.duckdb").display(),
+                models.join("**").display(),
+            ),
+        )
+        .unwrap();
+
+        rt.block_on(async {
+            let loaded = std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+            );
+            super::run(
+                &config_path,
+                loaded,
+                None,
+                None,
+                &harness.pod_a.state_path,
+                None,
+                true,
+                None,
+                false,
+                None,
+                false,
+                None,
+                &PartitionRunOptions::default(),
+                None,
+                None,
+                None,
+                None,
+                &DeferOptions::default(),
+                &SkipRunOptions::default(),
+                &rocky_core::run_vars::RunVars::new(),
+                Some(run_id),
+                None,
+                false,
+                None,
+            )
+            .await
+        })
+    }
+
+    /// #1836. The transformation arm finalized on the TYPE of the error, and
+    /// the type came back whether or not `persist_run_record` had succeeded.
+    /// So a failed run whose record write failed uploaded a ledger that does
+    /// not contain the run, and a fresh pod read an AUTHORITATIVE history with
+    /// the failure missing — worse than the stale history abandoning leaves,
+    /// because stale is not wrong about this run, it simply has not heard of
+    /// it.
+    ///
+    /// The sentinel now carries its `RecordCustody`, `session_disposition`
+    /// reads it, and a `Lost` record abandons. The exit code is unchanged.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn a_failed_transformation_whose_record_did_not_land_is_not_uploaded_as_if_it_had() {
+        use rocky_core::state::StateStore;
+        use rocky_core::test_harness::CrossPodHarness;
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let project = tempfile::tempdir().unwrap();
+        let run_id = "transformation-record-write-failed";
+        let rt = remote_state_test_runtime();
+
+        *super::FAIL_RECORD_WRITE_FOR_TEST.lock().unwrap() = Some(run_id.to_string());
+        let outcome = run_failing_transformation_on_pod_a(&rt, &harness, project.path(), run_id);
+        *super::FAIL_RECORD_WRITE_FOR_TEST.lock().unwrap() = None;
+
+        let err = outcome.expect_err("the broken model still fails the run");
+        let custody = err
+            .downcast_ref::<super::RunFailed>()
+            .map(|e| e.custody)
+            .or_else(|| {
+                err.downcast_ref::<super::PartialFailure>()
+                    .map(|e| e.custody)
+            })
+            .expect("the run failed with a post-terminal sentinel");
+        assert_eq!(
+            custody,
+            super::RecordCustody::Lost,
+            "the sentinel must report the record it did NOT write: {err:#}"
+        );
+
+        // Pod A has no record: the injected write failure held.
+        let local = StateStore::open(&harness.pod_a.state_path).unwrap();
+        assert!(
+            local.get_run(run_id).unwrap().is_none(),
+            "precondition: the injected write failure held"
+        );
+
+        // Nothing was uploaded. Pod B finds no remote object at all, rather
+        // than an authoritative ledger with the run missing from it.
+        let authority = rt
+            .block_on(harness.download(&harness.pod_b))
+            .expect("pod B's download itself succeeds");
+        assert!(
+            matches!(
+                authority,
+                rocky_core::state_sync::StateAuthority::FreshStart
+            ),
+            "the session must abandon, not publish a ledger without the run: {authority:?}"
+        );
+    }
+
+    /// The negative control. The SAME failing run with its record write
+    /// working must still FINALIZE — that is #1816's fix, and "always abandon"
+    /// would undo it, stranding a persisted failure record in the pod-local
+    /// file where no other pod ever sees it.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn a_failed_transformation_whose_record_landed_still_rides_the_terminal_upload() {
+        use rocky_core::state::{RunStatus, StateStore};
+        use rocky_core::test_harness::CrossPodHarness;
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let project = tempfile::tempdir().unwrap();
+        let run_id = "transformation-record-landed";
+        let rt = remote_state_test_runtime();
+
+        let outcome = run_failing_transformation_on_pod_a(&rt, &harness, project.path(), run_id);
+        outcome.expect_err("the broken model still fails the run");
+
+        // Pod A wrote the record.
+        {
+            let local = StateStore::open(&harness.pod_a.state_path).unwrap();
+            let record = local
+                .get_run(run_id)
+                .unwrap()
+                .expect("the failed run is persisted locally");
+            assert!(
+                matches!(
+                    record.status,
+                    RunStatus::Failure | RunStatus::PartialFailure
+                ),
+                "{:?}",
+                record.status
+            );
+        }
+
+        // And pod B, a fresh process elsewhere, sees it: the session finalized.
+        let authority = rt
+            .block_on(harness.download(&harness.pod_b))
+            .expect("pod B downloads the shared state");
+        assert!(
+            matches!(
+                authority,
+                rocky_core::state_sync::StateAuthority::Authoritative
+            ),
+            "pod B found a remote object to download: {authority:?}"
+        );
+        let remote = harness.open_store(&harness.pod_b);
+        assert!(
+            remote.get_run(run_id).unwrap().is_some(),
+            "the failed run rode the terminal upload; abandoning would strand it locally"
         );
     }
 
@@ -22989,13 +23309,14 @@ backend = "local"
         // Clean run → Ok.
         let mut ok = RunOutput::new(String::new(), 0, 1);
         ok.tables_copied = 1;
-        assert!(super::run_status_exit_result(&ok, "r").is_ok());
+        assert!(super::run_status_exit_result(&ok, "r", super::RecordCustody::Persisted).is_ok());
 
         // Some progress + a failure → PartialFailure sentinel (exit 2).
         let mut partial = RunOutput::new(String::new(), 0, 1);
         partial.tables_copied = 1;
         partial.tables_failed = 1;
-        let err = super::run_status_exit_result(&partial, "r").unwrap_err();
+        let err = super::run_status_exit_result(&partial, "r", super::RecordCustody::Persisted)
+            .unwrap_err();
         assert!(
             err.downcast_ref::<PartialFailure>().is_some(),
             "PartialFailure must map to the exit-2 sentinel, got: {err:#}"
@@ -23004,8 +23325,97 @@ backend = "local"
         // No progress + a failure → a plain error (exit 1).
         let mut total = RunOutput::new(String::new(), 0, 1);
         total.tables_failed = 1;
-        let err = super::run_status_exit_result(&total, "r").unwrap_err();
+        let err = super::run_status_exit_result(&total, "r", super::RecordCustody::Persisted)
+            .unwrap_err();
         assert!(err.downcast_ref::<PartialFailure>().is_none());
+    }
+
+    /// #1836. The sentinel is the only evidence a caller holding the run's
+    /// remote-state session has that a record exists to upload, and before
+    /// this the TYPE alone decided. `persist_run_record` is best-effort, so
+    /// the type came back whether or not the write succeeded — and finalizing
+    /// then published an authoritative ledger with the run missing from it.
+    ///
+    /// ```text
+    ///   error                            disposition
+    ///   RunFailed      { Persisted }  ->  Finalize
+    ///   RunFailed      { Lost }       ->  Abandon
+    ///   PartialFailure { Persisted }  ->  Finalize
+    ///   PartialFailure { Lost }       ->  Abandon
+    ///   anything else                 ->  Abandon   (pre-terminal hard exit)
+    /// ```
+    ///
+    /// The exit CODE is unchanged in every row: a `Lost` partial failure is
+    /// still the exit-2 sentinel, because the run failed the same amount and
+    /// telling an orchestrator "hard failure" about a resumable run to signal
+    /// a bookkeeping problem would be a worse lie than the one being fixed.
+    #[test]
+    fn session_disposition_reads_the_record_custody_not_the_error_type() {
+        use super::{PartialFailure, RecordCustody, RunFailed, SessionDisposition};
+
+        let run_failed = |custody| {
+            anyhow::Error::from(RunFailed {
+                count: 1,
+                run_id: "r".to_string(),
+                custody,
+            })
+        };
+        let partial = |custody| {
+            anyhow::Error::from(PartialFailure {
+                count: 1,
+                run_id: "r".to_string(),
+                check_gate_failed: false,
+                custody,
+            })
+        };
+
+        assert_eq!(
+            super::session_disposition(&run_failed(RecordCustody::Persisted)),
+            SessionDisposition::Finalize
+        );
+        assert_eq!(
+            super::session_disposition(&run_failed(RecordCustody::Lost)),
+            SessionDisposition::Abandon,
+            "a record that never landed must not be published as if it had"
+        );
+        assert_eq!(
+            super::session_disposition(&partial(RecordCustody::Persisted)),
+            SessionDisposition::Finalize
+        );
+        assert_eq!(
+            super::session_disposition(&partial(RecordCustody::Lost)),
+            SessionDisposition::Abandon
+        );
+        assert_eq!(
+            super::session_disposition(&anyhow::anyhow!("adapter auth failed")),
+            SessionDisposition::Abandon,
+            "a pre-terminal hard exit has no record to upload"
+        );
+    }
+
+    /// The negative control for the test above: "always abandon" is not a
+    /// fix. A typed post-terminal failure whose record DID land must still
+    /// finalize — abandoning there is the #1816 bug in reverse, stranding a
+    /// persisted failure record in the pod-local file where no other pod sees
+    /// it.
+    ///
+    /// And the exit contract does not move: both custodies keep their type,
+    /// so `main.rs` maps a `Lost` partial failure to exit 2 exactly as it
+    /// maps a `Persisted` one.
+    #[test]
+    fn a_lost_record_changes_the_disposition_and_never_the_exit_code() {
+        use super::{PartialFailure, RecordCustody};
+
+        let mut partial = RunOutput::new(String::new(), 0, 1);
+        partial.tables_copied = 1;
+        partial.tables_failed = 1;
+        for custody in [RecordCustody::Persisted, RecordCustody::Lost] {
+            let err = super::run_status_exit_result(&partial, "r", custody).unwrap_err();
+            let sentinel = err
+                .downcast_ref::<PartialFailure>()
+                .expect("the exit-2 sentinel survives a lost record");
+            assert_eq!(sentinel.custody, custody);
+        }
     }
 
     /// Build a parallel-copy `TableError` for the merge tests below.
@@ -23794,6 +24204,7 @@ backend = "local"
             count: 1,
             run_id: "run-1".to_string(),
             check_gate_failed: false,
+            custody: super::RecordCustody::Persisted,
         }
         .to_string();
         assert_eq!(
@@ -23806,6 +24217,7 @@ backend = "local"
             count: 1,
             run_id: "run-1".to_string(),
             check_gate_failed: true,
+            custody: super::RecordCustody::Persisted,
         }
         .to_string();
         assert!(
