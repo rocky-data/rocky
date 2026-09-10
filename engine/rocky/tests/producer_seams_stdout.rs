@@ -23,8 +23,8 @@ use std::process::{Command, Output};
 use chrono::{TimeZone, Utc};
 use rocky_cli::commands::{
     CostGroupBy, compute_branch_list, compute_branch_show, compute_compliance, compute_cost,
-    compute_estimate, compute_policy_check, compute_policy_test, compute_replay_check,
-    compute_trace, history_run_output, run_branch_create,
+    compute_estimate, compute_policy_check, compute_policy_show, compute_policy_test,
+    compute_replay_check, compute_trace, history_run_output, run_branch_create,
 };
 use rocky_core::config::{PolicyCapability, PolicyPrincipal};
 use rocky_core::state::{
@@ -410,6 +410,127 @@ fn policy_check_and_test_print_what_their_seams_return() {
     assert!(
         test.contains("\"command\": \"policy_test\""),
         "the document is the scenario report: {test}"
+    );
+}
+
+/// `policy show` before and after a freeze recorded through the real binary:
+/// an absent ledger says so, and a freeze in force is in the document.
+#[tokio::test]
+async fn policy_show_prints_what_compute_policy_show_returns() {
+    let (dir, config_path, _models_dir) =
+        policy_project(&format!("{POLICY_BASE}{PASSING_SCENARIO}"));
+    let state_path = dir.path().join("state.redb");
+    let state = state_path.to_str().unwrap();
+
+    let before = rocky_stdout(
+        dir.path(),
+        &["--state-path", state, "policy", "show", "--output", "json"],
+    );
+    assert_eq!(
+        before,
+        reference_bytes!(
+            compute_policy_show(&config_path, &state_path)
+                .await
+                .unwrap()
+        )
+    );
+    assert!(before.contains("\"ledger\": \"absent\""), "{before}");
+    assert!(
+        before.contains("\"id\": 0"),
+        "the rule carries its position: {before}"
+    );
+
+    rocky_stdout(
+        dir.path(),
+        &[
+            "--state-path",
+            state,
+            "policy",
+            "freeze",
+            "--principal",
+            "agent",
+            "--scope",
+            "model=fct_*",
+            "--reason",
+            "incident 42",
+            "--output",
+            "json",
+        ],
+    );
+    let after = rocky_stdout(
+        dir.path(),
+        &["--state-path", state, "policy", "show", "--output", "json"],
+    );
+    assert_eq!(
+        after,
+        reference_bytes!(
+            compute_policy_show(&config_path, &state_path)
+                .await
+                .unwrap()
+        )
+    );
+    assert!(after.contains("\"source\": \"ledger\""), "{after}");
+    assert!(after.contains("incident 42"), "{after}");
+    assert_ne!(before, after, "the freeze changes the document");
+}
+
+/// The TEXT rendering of `policy show`, which the JSON parity test cannot see.
+///
+/// Every field the document carries and a person needs must reach the text, or
+/// the terminal quietly shows less than the route does. This pins the three
+/// that were missing or wrong: a ledger freeze's audit `plan_id`, a rule's
+/// `verify_after`, and the fact that an absent principal means the marker body
+/// could not be read rather than a deliberate both-principal freeze.
+#[test]
+fn policy_show_text_carries_the_plan_id_and_verify_after() {
+    let policy = format!(
+        "{POLICY_BASE}{PASSING_SCENARIO}\n[[policy.rules]]\nprincipal = \"agent\"\n\
+         capability = \"apply\"\nscope = {{ any = true }}\neffect = \"allow\"\n\
+         verify_after = [\"row_count\"]\n"
+    );
+    let (dir, _config_path, _models_dir) = policy_project(&policy);
+    let state_path = dir.path().join("state.redb");
+    let state = state_path.to_str().unwrap();
+
+    rocky_stdout(
+        dir.path(),
+        &[
+            "--state-path",
+            state,
+            "policy",
+            "freeze",
+            "--principal",
+            "agent",
+            "--scope",
+            "model=fct_*",
+            "--reason",
+            "incident 42",
+            "--output",
+            "json",
+        ],
+    );
+
+    let text = rocky_stdout(
+        dir.path(),
+        &["--state-path", state, "policy", "show", "--output", "table"],
+    );
+
+    assert!(
+        text.contains("verify_after=row_count"),
+        "a rule's post-apply gate must be visible in the text: {text}"
+    );
+    assert!(
+        text.contains("plan="),
+        "a ledger freeze's audit plan id must be visible in the text: {text}"
+    );
+    assert!(text.contains("incident 42"), "{text}");
+    assert!(
+        text.contains("freezes in force"),
+        "the freeze heading is present when a [policy] block exists: {text}"
+    );
+    assert!(
+        !text.contains("conditions"),
+        "a rule's conditions are not carried at all: {text}"
     );
 }
 
