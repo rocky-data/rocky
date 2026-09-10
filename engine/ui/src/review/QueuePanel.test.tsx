@@ -113,6 +113,31 @@ describe("QueuePanel", () => {
     expect(screen.queryByText(/further rows in the ledger/)).toBeNull();
   });
 
+  it("says what fills the queue: a command, its prerequisite, and who it is for", async () => {
+    const load = vi.fn(async () => ({ ...QUEUE, total: 0, excluded_non_plan_rows: 0, pending: [] }));
+    const { container } = render(<QueuePanel load={load} now={NOW} />);
+    await screen.findByText("Nothing is waiting for review");
+    const copy = container.textContent ?? "";
+
+    // The command. Reproduced live before this copy was written: on a fresh
+    // playground, `rocky backfill --model customer_orders` puts one plan in
+    // GET /api/v1/review/queue.
+    expect(copy).toContain("rocky backfill --model <name>");
+
+    // The prerequisite, which is NOT "run it first" — the same command works
+    // on a project that has never run. It is that the model must compile; an
+    // unknown one exits with "unknown model(s) requested for backfill".
+    expect(copy).toMatch(/model has to be one this project compiles/);
+    expect(copy).toContain("rocky compile");
+    expect(copy).toMatch(/Nothing needs to have run first/);
+
+    // And it must not claim the queue is AI-only. The queue row for the plan
+    // above carries principal "agent" even though a person typed the command,
+    // so that field must not become the copy.
+    expect(copy).toMatch(/not only for AI/);
+    expect(copy).not.toMatch(/only .{0,20}(AI|agent)s? (can|ask|create)/i);
+  });
+
   it("renders a refusal as the engine's own code, not as a generic failure", async () => {
     const load = vi.fn(async () => {
       throw new ApiError(503, {

@@ -107,13 +107,36 @@ export function EstateScreen({
   );
 }
 
+/**
+ * One panel and the route behind it.
+ *
+ * The route is a tooltip, not a line of the page. It answers "where does this
+ * come from" for the reader who asks, and costs nothing for the reader who
+ * does not — the idiom the governor tabs already use (`GovernorScreen`).
+ */
 function Panel({ title, producer, children }: { title: string; producer: string; children: ReactNode }) {
+  const descriptionId = `producer-${title.toLowerCase().replace(/\s+/g, "-")}`;
   return (
     <section aria-label={title}>
-      <div className="mb-2 flex items-baseline gap-2">
-        <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">{title}</h3>
-        <code className="text-[11px] text-zinc-500 dark:text-zinc-400">{producer}</code>
-      </div>
+      {/*
+        The route reaches a mouse through `title` and assistive technology
+        through `aria-describedby`. Both, because `title` alone is a mouse
+        affordance — not in the tab order, and inconsistently announced.
+        The description element is `hidden`, which keeps it out of the
+        reading order while `aria-describedby` still takes its text: an
+        `sr-only` sibling would be read a second time, since an otherwise
+        unused `title` already becomes the accessible description.
+      */}
+      <h3
+        className="mb-2 text-base font-semibold text-zinc-900 dark:text-zinc-100"
+        title={producer}
+        aria-describedby={descriptionId}
+      >
+        {title}
+      </h3>
+      <span id={descriptionId} hidden>
+        {producer}
+      </span>
       {children}
     </section>
   );
