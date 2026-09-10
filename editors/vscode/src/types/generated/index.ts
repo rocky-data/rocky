@@ -353,3 +353,49 @@ export type { ListPipelinesOutput, ListPipelineEntry } from "./list_pipelines";
 export type { ListAdaptersOutput, ListAdapterEntry } from "./list_adapters";
 export type { ListModelsOutput, ListModelEntry } from "./list_models";
 export type { ListSourcesOutput, ListSourceEntry } from "./list_sources";
+
+// Backfilled (#1853). Every command-output type the codegen produces is
+// re-exported here; `generatedBarrelCompleteness.test.ts` fails when one
+// is not. A name defined in more than one generated module is re-exported
+// from the SAME module the Python barrel's `_LAZY` map picks, so the two
+// hand-maintained barrels name one binding rather than each choosing.
+export type { ApplyOutput } from "./apply";
+export type { ArchiveApplyOutput } from "./archive_apply";
+export type { AuditOutput } from "./audit";
+export type { AuditForOutput } from "./audit_for";
+export type { AuditScorecardOutput } from "./audit_scorecard";
+export type { BackfillOutput } from "./backfill";
+export type { CompactApplyOutput, StatementResult } from "./compact_apply";
+export type { CompactDedupOutput } from "./compact_dedup";
+export type { CostOutput } from "./cost";
+export type { DagEdgeOutput, DagNodeOutput, DagOutput, DagSummaryOutput, PartitionShapeOutput } from "./dag";
+export type { DagRunNodeOutput, DagRunOutput } from "./dag_run";
+export type { CollisionCandidateOutput, FailedSourceOutput, ResolvedCheckNameOutput } from "./discover";
+export type { EstimateOutput } from "./estimate";
+export type { FulfillOutput } from "./fulfill";
+export type { GcCandidateOutput, GcCheckOutput, GcRebuildCostOutput, GcReportOutput } from "./gc";
+export type { GcApplyOutput, GcEvictedOutput, GcRefusedOutput } from "./gc_apply";
+export type { GcPlanOutput } from "./gc_plan";
+export type { ContractResult, LoadFileOutput, LoadOutput } from "./load";
+export type { PolicyCheckOutput } from "./policy_check";
+export type { PolicyFreezeOutput } from "./policy_freeze";
+export type { PolicyTestOutput, PolicyTestResult } from "./policy_test";
+export type { PerModelBudgetBreachOutput } from "./preview_cost";
+export type { BisectionStatsOutput } from "./preview_diff";
+export type { ProductApproveOutput } from "./product_approve";
+export type { ProductArtifactOutput, ProductCompileOutput } from "./product_compile";
+export type { ProductVerifyOutput } from "./product_verify";
+export type { ProfileOutput } from "./profile";
+export type { RestoreApplyOutput, RestoreRefusedOutput, RestoredOutput } from "./restore_apply";
+export type { RestorePlanOutput } from "./restore_plan";
+export type { RetentionStatusOutput } from "./retention_status";
+export type { ReviewOutput } from "./review";
+export type { ReviewQueueOutput } from "./review_queue";
+export type { ReviewStatusOutput } from "./review_status";
+export type { BudgetBreachOutput, CheckResult, ContainedModelOutput, ExcludedTableOutput, ModelDecisionOutput, OverrideWarningOutput, QuarantineOutput } from "./run";
+export type { SeedOutput, SeedTableOutput } from "./seed";
+export type { RetentionSweepOutput } from "./state_retention_sweep";
+export type { ScheduleHoldOutput } from "./state_schedule_hold";
+export type { DeclarativeTestResult, ModelTestResult, UnitTestResult } from "./test";
+export type { TraceOutput } from "./trace";
+export type { ValidateOutput } from "./validate";

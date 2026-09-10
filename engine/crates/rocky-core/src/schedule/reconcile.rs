@@ -312,9 +312,13 @@ pub enum TickSkipReason {
     /// A spooled webhook demand targeted a pipeline no longer in config: it was
     /// finalized without running (never left pending forever).
     ConfigError,
-    /// The run history could not be read (store fault or a corrupt row), so the
-    /// standing demand was skipped rather than misclassified — fail-closed, and
-    /// surfaced loudly rather than silently dropped.
+    /// A state-store read the decision depended on failed (store fault or a
+    /// corrupt row), so the demand was skipped rather than misclassified —
+    /// fail-closed, and surfaced loudly rather than silently dropped.
+    ///
+    /// Covers the run history for a standing demand, and the schedule cursor
+    /// for a spooled webhook demand (#1831): in both cases an unreadable
+    /// answer must not be resolved into a permissive one.
     HistoryUnavailable,
     /// The state store was held by another `rocky` process past the bounded
     /// reopen retry, so this demand's post-run bookkeeping (or the whole tick,
@@ -760,21 +764,14 @@ async fn consume_webhook_demands(
         // red team confirmed) and rather than dropping them: the file stays
         // PENDING, unconsumed, so an accepted (202'd) delivery fires on
         // resume instead of vanishing. Recorded as a skip each tick, like
-        // every other suppressed source. A cursor read failure falls through
-        // to normal consumption — fail-open on the READ here would hold every
-        // webhook hostage to a transient store error, and the pause check
-        // re-runs next tick.
-        let paused = phase
-            .store()
-            .get_schedule_state(&demand_record.pipeline)
-            .ok()
-            .flatten()
-            .is_some_and(|cursor| cursor.paused);
-        if paused {
+        // every other suppressed source.
+        if let PauseGate::Skip(reason) =
+            webhook_pause_gate(phase.store().get_schedule_state(&demand_record.pipeline))
+        {
             report.skipped.push(SkippedDemand {
                 pipeline: demand_record.pipeline.clone(),
                 source: Some(DemandKind::Webhook),
-                reason: TickSkipReason::Paused,
+                reason,
             });
             continue;
         }
@@ -849,6 +846,43 @@ impl RunHistoryView for StoreHistory<'_> {
             })),
             Err(e) => Err(HistoryError(e.to_string())),
         }
+    }
+}
+
+/// What the pause gate decides for one spooled webhook demand.
+enum PauseGate {
+    /// The cursor was read and the pipeline is not paused.
+    Run,
+    /// Defer, recording this reason. The pending file is left in place.
+    Skip(TickSkipReason),
+}
+
+/// Decide from the cursor read whether a spooled webhook demand may run.
+///
+/// An UNKNOWN pause state is not "not paused" (#1831). This used to read
+/// `.ok().flatten()`, so a read fault — the read transaction failing to open,
+/// the table failing to open, a corrupt cursor row — was indistinguishable
+/// from a live cursor saying "not paused". A transient fault that cleared
+/// before the claim therefore let a PAUSED pipeline claim, spawn and dispose
+/// of its pending file.
+///
+/// Failing closed costs nothing a pause does not already cost. The file stays
+/// PENDING and the demand is retried next tick, which is exactly what
+/// `Paused` does. The previous justification — that failing closed would
+/// "hold every webhook hostage to a transient store error" — conflated
+/// deferral with loss: an accepted (202'd) delivery is dropped in neither
+/// case.
+///
+/// Reuses `HistoryUnavailable` rather than adding a variant. The reason set
+/// mirrors the frozen tick contract and is asserted against
+/// `span_attrs::SCHEDULER_SKIP_REASONS`, and this is the same class that
+/// reason already names: a store read fault that makes the classification
+/// unreliable, surfaced loudly rather than silently resolved.
+fn webhook_pause_gate<E>(cursor: Result<Option<ScheduleStateRecord>, E>) -> PauseGate {
+    match cursor {
+        Ok(Some(record)) if record.paused => PauseGate::Skip(TickSkipReason::Paused),
+        Ok(_) => PauseGate::Run,
+        Err(_) => PauseGate::Skip(TickSkipReason::HistoryUnavailable),
     }
 }
 
@@ -3987,6 +4021,57 @@ adapter = "db"
             "the deferred delivery is still pending — the sweep left it alone"
         );
         assert_eq!(spawner.run_count(), 1, "the paused pipeline did not run");
+    }
+
+    // --- #1831: an unreadable pause state must not read as "not paused" ------
+
+    /// A cursor read FAULT defers the demand instead of running it.
+    ///
+    /// The gate used to be `.ok().flatten()`, which collapsed "the store could
+    /// not answer" into "not paused". A transient fault that cleared before
+    /// the claim then let a PAUSED pipeline claim, spawn and dispose of its
+    /// pending file — the webhook bypass #1334's red team found, reachable
+    /// again through an error path.
+    #[test]
+    fn an_unreadable_cursor_defers_a_spooled_demand_instead_of_running_it() {
+        let faulted: Result<Option<ScheduleStateRecord>, &str> = Err("read txn failed");
+        match webhook_pause_gate(faulted) {
+            PauseGate::Skip(TickSkipReason::HistoryUnavailable) => {}
+            PauseGate::Skip(other) => panic!("wrong skip reason: {other:?}"),
+            PauseGate::Run => panic!(
+                "an unreadable pause state must not run the demand — that is the \
+                 fail-open #1831 is about"
+            ),
+        }
+    }
+
+    /// A readable paused cursor still skips as `Paused`, not as a fault. The
+    /// two reasons stay distinguishable in the tick report.
+    #[test]
+    fn a_readable_paused_cursor_still_skips_as_paused() {
+        let ok: Result<Option<ScheduleStateRecord>, &str> = Ok(Some(ScheduleStateRecord {
+            paused: true,
+            ..Default::default()
+        }));
+        assert!(matches!(
+            webhook_pause_gate(ok),
+            PauseGate::Skip(TickSkipReason::Paused)
+        ));
+    }
+
+    /// The ordinary cases still run: a cursor that says not-paused, and no
+    /// cursor at all (a pipeline that has never been paused or resumed).
+    ///
+    /// Without these the fix could be "always skip", which would defer every
+    /// webhook forever and satisfy the fault test above.
+    #[test]
+    fn a_live_cursor_and_an_absent_one_both_run() {
+        let running: Result<Option<ScheduleStateRecord>, &str> =
+            Ok(Some(ScheduleStateRecord::default()));
+        assert!(matches!(webhook_pause_gate(running), PauseGate::Run));
+
+        let absent: Result<Option<ScheduleStateRecord>, &str> = Ok(None);
+        assert!(matches!(webhook_pause_gate(absent), PauseGate::Run));
     }
 
     // --- #1716: dedup must survive a pause, and `--now` must not erase it ----
