@@ -134,6 +134,12 @@ pub struct ServerState {
     /// The browser UI (`rocky serve --ui`): its files, the `Host` values it
     /// accepts. `None` means no UI routes and no host guard.
     pub ui: Option<crate::ui::UiConfig>,
+    /// Server posture frozen at startup, served by `GET /api/v1/settings`.
+    ///
+    /// Carries only what is not already on this struct; `ui`, `allowed_origins`
+    /// and the token scope are projected from the fields above instead, so
+    /// there is no second copy of them to drift.
+    pub settings: SettingsSnapshot,
     /// Per-session throttle for the "N sources hit" info log so it
     /// emits once per server start, not once per recompile. Keyed on
     /// `models_dir`, which stays constant.
@@ -180,6 +186,87 @@ pub struct ServerState {
 /// A duration as whole milliseconds, saturating rather than truncating.
 fn millis(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Whether `ROCKY_WEBHOOK_SECRET` can actually sign a webhook, decided once at
+/// server start.
+///
+/// The three values are chosen by **operator consequence**, not by error kind,
+/// because that is the question the settings route answers: what happens if I
+/// turn the scheduler on?
+///
+/// ```text
+///   Present         -> scheduler starts; webhooks must carry a signature
+///   Absent          -> scheduler starts; a loopback bind accepts UNSIGNED
+///                      requests, a non-loopback bind answers 404
+///   SetButUnusable  -> scheduler REFUSES to start (blank, or not valid UTF-8)
+/// ```
+///
+/// `SetButUnusable` exists because the startup gate is two reads deep:
+/// `webhook_secret_fail_closed` bails on a blank value, and the
+/// `env_var_fail_closed` beneath it bails on `NotUnicode`. A probe written as
+/// `std::env::var(..).ok()` would report a non-UTF-8 secret as `Absent` — the
+/// display contradicting the gate it describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WebhookSecret {
+/// Set, non-blank, and valid UTF-8.
+Present,
+/// Not set at all.
+#[default]
+Absent,
+/// Set, but blank or not valid UTF-8 — `--scheduler` will refuse to start.
+SetButUnusable,
+}
+
+/// What happened when `rocky.toml` was read at server start.
+///
+/// Kept as its own field so a `null` `state_backend` is explainable: an absent
+/// config and an unparsable one are different facts, and only the LSP
+/// diagnostic surface distinguishes them today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConfigStatus {
+/// Read and parsed.
+Loaded,
+/// No `rocky.toml` — an ordinary fact about the project, not a failure.
+#[default]
+Absent,
+/// Present but could not be read or parsed.
+Unreadable,
+}
+
+/// The server-posture facts `GET /api/v1/settings` reports, frozen when the
+/// process started.
+///
+/// Deliberately **plain primitives**, and deliberately NOT a `RockyConfig`.
+/// `AdapterConfig`'s `Debug` prints its `.extra` map, which is unbounded
+/// caller-supplied TOML, so anything that reaches this struct must be projected
+/// field by field. Two fieldless enum labels are projected out of the config and
+/// the config itself is dropped.
+///
+/// Only fields that are NOT already on [`ServerState`] live here. `ui`,
+/// `allowed_hosts`, `allowed_origins` and the token's scope are read back off
+/// the state itself, so there is no second copy to drift.
+#[derive(Debug, Clone, Default)]
+pub struct SettingsSnapshot {
+/// The host the listener binds. The same `String` `ServeConfig` carries, so
+/// the reported value cannot disagree with the bound one.
+pub bind_host: String,
+/// Whether `--scheduler` stood up a resident reconciler.
+///
+/// Stored rather than derived from `webhook.is_some()`: those agree today
+/// only incidentally.
+pub scheduler: bool,
+/// Whether `ROCKY_WEBHOOK_SECRET` can sign a webhook. Captured even when the
+/// scheduler is off, via a probe that never bails.
+pub webhook_secret: WebhookSecret,
+/// `[state] backend`, read from `rocky.toml` at server start. `None` when
+/// there was no readable config — see [`SettingsSnapshot::config_status`].
+pub state_backend: Option<rocky_core::config::StateBackend>,
+/// `[state] concurrency_control`, read at server start. `None` on the same
+/// condition as [`SettingsSnapshot::state_backend`].
+pub concurrency_control: Option<rocky_core::config::ConcurrencyControl>,
+/// Why the two fields above may be `None`.
+pub config_status: ConfigStatus,
 }
 
 impl ServerState {
@@ -243,6 +330,11 @@ impl ServerState {
             state_path,
             None,
             None,
+            // This constructor backs the LSP, the scheduler and tests — none of
+            // which binds the HTTP server, so there is no posture to report.
+            // `rocky serve` goes through `build_serve_state`, which always
+            // builds a real snapshot.
+            SettingsSnapshot::default(),
         )
     }
 
@@ -262,6 +354,7 @@ impl ServerState {
         state_path: Option<PathBuf>,
         webhook: Option<crate::webhook_ingress::WebhookIngress>,
         ui: Option<crate::ui::UiConfig>,
+        settings: SettingsSnapshot,
     ) -> Arc<Self> {
         let state = Arc::new(Self {
             models_dir,
@@ -271,6 +364,7 @@ impl ServerState {
             state_path,
             webhook,
             ui,
+            settings,
             compile_result: RwLock::new(None),
             compile_failure: RwLock::new(None),
             compile_gate: tokio::sync::Mutex::new(()),

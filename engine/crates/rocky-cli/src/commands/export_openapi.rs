@@ -1266,6 +1266,35 @@ fn route_table() -> Vec<Route> {
         },
         Route {
             method: "get",
+            path: "/api/v1/settings",
+            operation_id: "getSettings",
+            tag: "meta",
+            summary: "Server posture",
+            description: "How this server is bound and what it will accept: bind host, the \
+                 CORS allowlist, the `Host` values the UI guard accepts, whether the \
+                 scheduler and the UI are on, whether `ROCKY_WEBHOOK_SECRET` can sign a \
+                 webhook, and the token's scope. An allowlist, not a config dump — no \
+                 secret appears, and nothing is reached through serde of `RockyConfig`. \
+                 `webhook_secret` is reported even with the scheduler off, which is the \
+                 point: it says what will happen when you turn the scheduler on. \
+                 `state_backend` and `concurrency_control` are read from `rocky.toml` when \
+                 the server starts and are `null` when there was no readable config — \
+                 `config_status` says which. Everything else is fixed for the life of the \
+                 process.",
+            path_params: &[],
+            query_params: &[],
+            header_params: &[],
+            request_body: None,
+            responses: &[Resp {
+                status: "200",
+                description: "The running server's posture. Never fails: every value was \
+                     resolved at startup.",
+                body: Body::Component("SettingsOutput"),
+            }],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
             path: "/api/v1/policy",
             operation_id: "getPolicy",
             tag: "policy",
