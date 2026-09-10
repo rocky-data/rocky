@@ -1,0 +1,392 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "PolicyAutonomyBudgetOutput": {
+      "description": "A rule's autonomy budget: `failures` within `window` degrade its effect.",
+      "properties": {
+        "failures": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "window": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "failures",
+        "window"
+      ],
+      "type": "object"
+    },
+    "PolicyCapability": {
+      "description": "The class of action a policy rule governs.\n\n`read` is always allowed (short-circuit). The mutating verbs (`propose` … `quarantine`) name coarse operations; `schema_change.additive`, `schema_change.breaking`, and `value_change` are *refinements* of the apply/promote verbs — a rule naming a bare verb (`apply`/`promote`) matches those refinements too, but a rule naming a refinement matches only that exact refinement.",
+      "oneOf": [
+        {
+          "description": "Read model output / metadata. Always allowed.",
+          "enum": [
+            "read"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Draft a plan for later review.",
+          "enum": [
+            "propose"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Apply a plan against the warehouse.",
+          "enum": [
+            "apply"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Promote a branch / environment.",
+          "enum": [
+            "promote"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Backfill historical partitions.",
+          "enum": [
+            "backfill"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Garbage-collect / reclaim storage.",
+          "enum": [
+            "gc"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Restore a gc-evicted artifact from its tombstone (*attempts* a rebuild, then verifies hash-exact — supported only for a recipe that reads no recorded upstreams; a multi-input recipe is refused).",
+          "enum": [
+            "restore"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Retry a failed run.",
+          "enum": [
+            "retry"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Quarantine a partition / model.",
+          "enum": [
+            "quarantine"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "An additive schema change (refinement of apply/promote).",
+          "enum": [
+            "schema_change.additive"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A breaking schema change (refinement of apply/promote).",
+          "enum": [
+            "schema_change.breaking"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A value-only data change (refinement of apply/promote).",
+          "enum": [
+            "value_change"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "PolicyEffect": {
+      "description": "The verdict a policy rule (or the default posture) yields.\n\nOrdered by restrictiveness for incomparable-rule tie-breaking: `Deny` is a hard override (handled separately), and among non-deny verdicts `RequireReview` is more restrictive than `Allow`.",
+      "oneOf": [
+        {
+          "description": "Permit the action outright.",
+          "enum": [
+            "allow"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Permit only after human review. The safe default posture.",
+          "enum": [
+            "require_review"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Refuse the action. A hard override — no `allow` overturns it.",
+          "enum": [
+            "deny"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "PolicyFreezeInForce": {
+      "description": "One freeze in force.",
+      "properties": {
+        "freeze_id": {
+          "description": "The marker's id.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plan_id": {
+          "description": "The ledger decision's plan id.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "principal": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PolicyPrincipal"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The frozen principal. Absent on a marker that froze both."
+        },
+        "reason": {
+          "type": "string"
+        },
+        "scope": {
+          "description": "The scope selector as given to `rocky policy freeze`; `any` is every model.",
+          "type": "string"
+        },
+        "since": {
+          "description": "When the freeze was recorded, when the source recorded it.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "description": "`\"ledger\"` (a `rocky policy freeze` decision) or `\"marker\"` (a durable freeze marker in the remote object tier).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "scope",
+        "source"
+      ],
+      "type": "object"
+    },
+    "PolicyFreezeSources": {
+      "description": "Which freeze sources the report read.",
+      "properties": {
+        "ledger": {
+          "description": "`\"read\"`, or `\"absent\"` when the project has no state store yet.",
+          "type": "string"
+        },
+        "markers": {
+          "description": "`\"read\"`, or `\"not_configured\"` when `[state]` keeps no durable markers (a local backend, or `freeze_marker_writes = false`).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ledger",
+        "markers"
+      ],
+      "type": "object"
+    },
+    "PolicyPrincipal": {
+      "description": "Who is attempting an action.\n\n`agent` is a non-human caller (an AI harness authoring, applying, or remediating). `human` is a person. In v0 the principal is supplied explicitly (`rocky policy check --principal …`); auto-detection is a later phase.",
+      "oneOf": [
+        {
+          "description": "A person.",
+          "enum": [
+            "human"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A non-human caller (AI agent / automation).",
+          "enum": [
+            "agent"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "PolicyRuleEntry": {
+      "description": "One `[[policy.rules]]` entry.",
+      "properties": {
+        "autonomy_budget": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PolicyAutonomyBudgetOutput"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The rolling failure ceiling that degrades this rule's effect."
+        },
+        "capability": {
+          "$ref": "#/definitions/PolicyCapability"
+        },
+        "conditions": {
+          "description": "Free-form conditions the rule was written with, as authored. The engine parses them and never evaluates them: no `conditions` predicate narrows a rule's effect today, so a reader must not show them as part of what decided an outcome. They are here because a policy screen should be able to show what a rule's author wrote, including the part not yet in force."
+        },
+        "effect": {
+          "$ref": "#/definitions/PolicyEffect"
+        },
+        "id": {
+          "description": "Zero-based position in `[[policy.rules]]`; the `matched_rule` that `rocky policy check` reports.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "principal": {
+          "$ref": "#/definitions/PolicyPrincipal"
+        },
+        "scope": {
+          "$ref": "#/definitions/PolicyRuleScopeOutput"
+        }
+      },
+      "required": [
+        "capability",
+        "effect",
+        "id",
+        "principal",
+        "scope"
+      ],
+      "type": "object"
+    },
+    "PolicyRuleScopeOutput": {
+      "description": "What a rule matches. Every field is as authored; an empty list or `None` means the field does not narrow the rule.",
+      "properties": {
+        "any": {
+          "type": "boolean"
+        },
+        "classifications": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "contracted": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "exclude_classifications": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "layer": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_downstreams": {
+          "description": "The blast-radius ceiling: the rule matches only a model with at most this many downstreams.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "models": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tags": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "any",
+        "classifications",
+        "exclude_classifications",
+        "models",
+        "tags"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky policy show`, and the body of `GET /api/v1/policy`: the policy plane as configured and as it stands.\n\nThe rules carry their position in `[[policy.rules]]` as `id`, the only identity a rule has today and the number `rocky policy check` reports as `matched_rule`. `freezes` is every freeze in force, from the decision ledger and, when the project keeps them, the durable freeze markers; `freeze_sources` says which of the two was read. A source that exists but cannot be read is an error, never an empty list: an empty list would say \"nothing is frozen\" for a plane whose freezes could not be read at all.",
+  "properties": {
+    "command": {
+      "description": "Always `\"policy_show\"`.",
+      "type": "string"
+    },
+    "configured": {
+      "description": "Whether `rocky.toml` carries a `[policy]` block. `false` is the default posture: no rules, `default_agent_effect` as the engine defaults it.",
+      "type": "boolean"
+    },
+    "default_agent_effect": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/PolicyEffect"
+        }
+      ],
+      "description": "The effect an agent gets when no rule matches."
+    },
+    "freeze_sources": {
+      "$ref": "#/definitions/PolicyFreezeSources"
+    },
+    "freezes": {
+      "description": "Every freeze in force, ledger entries first, then markers.",
+      "items": {
+        "$ref": "#/definitions/PolicyFreezeInForce"
+      },
+      "type": "array"
+    },
+    "policy_version": {
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "rules": {
+      "description": "The rules in file order.",
+      "items": {
+        "$ref": "#/definitions/PolicyRuleEntry"
+      },
+      "type": "array"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "configured",
+    "default_agent_effect",
+    "freeze_sources",
+    "freezes",
+    "policy_version",
+    "rules",
+    "version"
+  ],
+  "title": "PolicyRulesOutput",
+  "type": "object"
+}

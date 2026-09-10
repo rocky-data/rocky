@@ -12659,6 +12659,24 @@
         ],
         "type": "object"
       },
+      "PolicyAutonomyBudgetOutput": {
+        "description": "A rule's autonomy budget: `failures` within `window` degrade its effect.",
+        "properties": {
+          "failures": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "window": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "failures",
+          "window"
+        ],
+        "type": "object"
+      },
       "PolicyCapability": {
         "description": "The class of action a policy rule governs.\n\n`read` is always allowed (short-circuit). The mutating verbs (`propose` … `quarantine`) name coarse operations; `schema_change.additive`, `schema_change.breaking`, and `value_change` are *refinements* of the apply/promote verbs — a rule naming a bare verb (`apply`/`promote`) matches those refinements too, but a rule naming a refinement matches only that exact refinement.",
         "oneOf": [
@@ -12926,6 +12944,61 @@
         ],
         "type": "object"
       },
+      "PolicyFreezeInForce": {
+        "description": "One freeze in force.",
+        "properties": {
+          "freeze_id": {
+            "description": "The marker's id.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "plan_id": {
+            "description": "The ledger decision's plan id.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "principal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PolicyPrincipal"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The frozen principal. Absent on a marker that froze both."
+          },
+          "reason": {
+            "type": "string"
+          },
+          "scope": {
+            "description": "The scope selector as given to `rocky policy freeze`; `any` is every model.",
+            "type": "string"
+          },
+          "since": {
+            "description": "When the freeze was recorded, when the source recorded it.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "description": "`\"ledger\"` (a `rocky policy freeze` decision) or `\"marker\"` (a durable freeze marker in the remote object tier).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason",
+          "scope",
+          "source"
+        ],
+        "type": "object"
+      },
       "PolicyFreezeOutput": {
         "description": "JSON output for `rocky policy freeze` / `rocky policy unfreeze` — the kill switch.\n\nA freeze records a decision entry per matched principal into the existing policy-decision ledger; at the enforcement seam an active freeze forces `deny`. `unfreeze` records a superseding entry that lifts it. No config file is rewritten and no new table is created.",
         "properties": {
@@ -12970,6 +13043,24 @@
           "recorded_at",
           "scope",
           "version"
+        ],
+        "type": "object"
+      },
+      "PolicyFreezeSources": {
+        "description": "Which freeze sources the report read.",
+        "properties": {
+          "ledger": {
+            "description": "`\"read\"`, or `\"absent\"` when the project has no state store yet.",
+            "type": "string"
+          },
+          "markers": {
+            "description": "`\"read\"`, or `\"not_configured\"` when `[state]` keeps no durable markers (a local backend, or `freeze_marker_writes = false`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ledger",
+          "markers"
         ],
         "type": "object"
       },
@@ -13113,6 +13204,169 @@
           "capability",
           "effect",
           "principal"
+        ],
+        "type": "object"
+      },
+      "PolicyRuleEntry": {
+        "description": "One `[[policy.rules]]` entry.",
+        "properties": {
+          "autonomy_budget": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PolicyAutonomyBudgetOutput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The rolling failure ceiling that degrades this rule's effect."
+          },
+          "capability": {
+            "$ref": "#/components/schemas/PolicyCapability"
+          },
+          "conditions": {
+            "description": "Free-form conditions the rule was written with, as authored. The engine parses them and never evaluates them: no `conditions` predicate narrows a rule's effect today, so a reader must not show them as part of what decided an outcome. They are here because a policy screen should be able to show what a rule's author wrote, including the part not yet in force."
+          },
+          "effect": {
+            "$ref": "#/components/schemas/PolicyEffect"
+          },
+          "id": {
+            "description": "Zero-based position in `[[policy.rules]]`; the `matched_rule` that `rocky policy check` reports.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "principal": {
+            "$ref": "#/components/schemas/PolicyPrincipal"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/PolicyRuleScopeOutput"
+          }
+        },
+        "required": [
+          "capability",
+          "effect",
+          "id",
+          "principal",
+          "scope"
+        ],
+        "type": "object"
+      },
+      "PolicyRuleScopeOutput": {
+        "description": "What a rule matches. Every field is as authored; an empty list or `None` means the field does not narrow the rule.",
+        "properties": {
+          "any": {
+            "type": "boolean"
+          },
+          "classifications": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "contracted": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "exclude_classifications": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "layer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_downstreams": {
+            "description": "The blast-radius ceiling: the rule matches only a model with at most this many downstreams.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "models": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tags": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "any",
+          "classifications",
+          "exclude_classifications",
+          "models",
+          "tags"
+        ],
+        "type": "object"
+      },
+      "PolicyRulesOutput": {
+        "description": "JSON output for `rocky policy show`, and the body of `GET /api/v1/policy`: the policy plane as configured and as it stands.\n\nThe rules carry their position in `[[policy.rules]]` as `id`, the only identity a rule has today and the number `rocky policy check` reports as `matched_rule`. `freezes` is every freeze in force, from the decision ledger and, when the project keeps them, the durable freeze markers; `freeze_sources` says which of the two was read. A source that exists but cannot be read is an error, never an empty list: an empty list would say \"nothing is frozen\" for a plane whose freezes could not be read at all.",
+        "properties": {
+          "command": {
+            "description": "Always `\"policy_show\"`.",
+            "type": "string"
+          },
+          "configured": {
+            "description": "Whether `rocky.toml` carries a `[policy]` block. `false` is the default posture: no rules, `default_agent_effect` as the engine defaults it.",
+            "type": "boolean"
+          },
+          "default_agent_effect": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PolicyEffect"
+              }
+            ],
+            "description": "The effect an agent gets when no rule matches."
+          },
+          "freeze_sources": {
+            "$ref": "#/components/schemas/PolicyFreezeSources"
+          },
+          "freezes": {
+            "description": "Every freeze in force, ledger entries first, then markers.",
+            "items": {
+              "$ref": "#/components/schemas/PolicyFreezeInForce"
+            },
+            "type": "array"
+          },
+          "policy_version": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "rules": {
+            "description": "The rules in file order.",
+            "items": {
+              "$ref": "#/components/schemas/PolicyRuleEntry"
+            },
+            "type": "array"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "configured",
+          "default_agent_effect",
+          "freeze_sources",
+          "freezes",
+          "policy_version",
+          "rules",
+          "version"
         ],
         "type": "object"
       },
@@ -23055,6 +23309,48 @@
         "summary": "A bounded, masked sample of a model's rows",
         "tags": [
           "estate"
+        ]
+      }
+    },
+    "/api/v1/policy": {
+      "get": {
+        "description": "The `[policy]` rules in file order with their positional ids (the `matched_rule` that `policy check` reports), the default agent effect, and every freeze in force from the decision ledger and, when `[state]` keeps them, the durable freeze markers; `freeze_sources` says which was read. A missing `rocky.toml` is the default posture. A source that exists but cannot be read is a `500`, never an empty list. The same bytes as `rocky policy show --output json`.",
+        "operationId": "getPolicy",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyRulesOutput"
+                }
+              }
+            },
+            "description": "The policy plane as configured and as it stands."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The bound `rocky.toml` could not be parsed, or the decision ledger or the freeze markers could not be read."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "The policy plane",
+        "tags": [
+          "policy"
         ]
       }
     },

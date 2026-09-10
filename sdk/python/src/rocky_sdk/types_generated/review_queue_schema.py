@@ -16,7 +16,7 @@ class PolicyCapability(StrEnum):
     read = "read"
 
 
-class PolicyCapability64(StrEnum):
+class PolicyCapability77(StrEnum):
     """
     Draft a plan for later review.
     """
@@ -24,7 +24,7 @@ class PolicyCapability64(StrEnum):
     propose = "propose"
 
 
-class PolicyCapability65(StrEnum):
+class PolicyCapability78(StrEnum):
     """
     Apply a plan against the warehouse.
     """
@@ -32,7 +32,7 @@ class PolicyCapability65(StrEnum):
     apply = "apply"
 
 
-class PolicyCapability66(StrEnum):
+class PolicyCapability79(StrEnum):
     """
     Promote a branch / environment.
     """
@@ -40,7 +40,7 @@ class PolicyCapability66(StrEnum):
     promote = "promote"
 
 
-class PolicyCapability67(StrEnum):
+class PolicyCapability80(StrEnum):
     """
     Backfill historical partitions.
     """
@@ -48,7 +48,7 @@ class PolicyCapability67(StrEnum):
     backfill = "backfill"
 
 
-class PolicyCapability68(StrEnum):
+class PolicyCapability81(StrEnum):
     """
     Garbage-collect / reclaim storage.
     """
@@ -56,7 +56,7 @@ class PolicyCapability68(StrEnum):
     gc = "gc"
 
 
-class PolicyCapability69(StrEnum):
+class PolicyCapability82(StrEnum):
     """
     Restore a gc-evicted artifact from its tombstone (*attempts* a rebuild, then verifies hash-exact — supported only for a recipe that reads no recorded upstreams; a multi-input recipe is refused).
     """
@@ -64,7 +64,7 @@ class PolicyCapability69(StrEnum):
     restore = "restore"
 
 
-class PolicyCapability70(StrEnum):
+class PolicyCapability83(StrEnum):
     """
     Retry a failed run.
     """
@@ -72,7 +72,7 @@ class PolicyCapability70(StrEnum):
     retry = "retry"
 
 
-class PolicyCapability71(StrEnum):
+class PolicyCapability84(StrEnum):
     """
     Quarantine a partition / model.
     """
@@ -80,7 +80,7 @@ class PolicyCapability71(StrEnum):
     quarantine = "quarantine"
 
 
-class PolicyCapability72(StrEnum):
+class PolicyCapability85(StrEnum):
     """
     An additive schema change (refinement of apply/promote).
     """
@@ -88,7 +88,7 @@ class PolicyCapability72(StrEnum):
     schema_change_additive = "schema_change.additive"
 
 
-class PolicyCapability73(StrEnum):
+class PolicyCapability86(StrEnum):
     """
     A breaking schema change (refinement of apply/promote).
     """
@@ -96,7 +96,7 @@ class PolicyCapability73(StrEnum):
     schema_change_breaking = "schema_change.breaking"
 
 
-class PolicyCapability74(StrEnum):
+class PolicyCapability87(StrEnum):
     """
     A value-only data change (refinement of apply/promote).
     """
@@ -112,7 +112,7 @@ class PolicyPrincipal(StrEnum):
     human = "human"
 
 
-class PolicyPrincipal16(StrEnum):
+class PolicyPrincipal18(StrEnum):
     """
     A non-human caller (AI agent / automation).
     """
@@ -135,17 +135,17 @@ class ReviewQueueEntry(BaseModel):
     """
     capability: (
         PolicyCapability
-        | PolicyCapability64
-        | PolicyCapability65
-        | PolicyCapability66
-        | PolicyCapability67
-        | PolicyCapability68
-        | PolicyCapability69
-        | PolicyCapability70
-        | PolicyCapability71
-        | PolicyCapability72
-        | PolicyCapability73
-        | PolicyCapability74
+        | PolicyCapability77
+        | PolicyCapability78
+        | PolicyCapability79
+        | PolicyCapability80
+        | PolicyCapability81
+        | PolicyCapability82
+        | PolicyCapability83
+        | PolicyCapability84
+        | PolicyCapability85
+        | PolicyCapability86
+        | PolicyCapability87
     )
     """
     The capability that was evaluated (its `schema_change.*` refinement is the change class the ranking weighs).
@@ -178,7 +178,7 @@ class ReviewQueueEntry(BaseModel):
 
     What this cannot promise is the request itself: the adapter's reachability and credentials at query time, the masking of classified columns, the route's concurrency and time limits. Those refusals arrive as the route's own envelope and render as themselves.
     """
-    principal: PolicyPrincipal | PolicyPrincipal16
+    principal: PolicyPrincipal | PolicyPrincipal18
     """
     Who authored the change (`human` / `agent`).
     """

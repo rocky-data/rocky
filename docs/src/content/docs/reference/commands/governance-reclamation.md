@@ -108,6 +108,7 @@ The agent-authority policy plane. A `[policy]` rule in `rocky.toml` resolves a `
 ```bash
 rocky policy check --principal agent --capability apply --model fct_orders
 rocky policy test
+rocky policy show
 rocky policy freeze --principal agent --scope 'model=fct_*'
 rocky policy unfreeze --principal agent --scope 'model=fct_*'
 ```
@@ -116,10 +117,13 @@ rocky policy unfreeze --principal agent --scope 'model=fct_*'
 |---|---|
 | `check` | Explain the effect the policy plane resolves for a `(principal, capability, model)` triple: the verdict, the winning rule, and the reason. Read-only. |
 | `test` | Run the project's `[[policy.tests]]` scenario assertions through the real evaluator; exits non-zero if any resolved effect differs from its expectation, so a policy edit cannot silently open a hole in CI. |
+| `show` | The policy plane as it stands: the rules in file order with their position as `id` (the `matched_rule` that `check` reports), the default agent effect, and every freeze in force from the decision ledger and, when `[state]` keeps them, the durable freeze markers. `freeze_sources` says which was read. Read-only. A source that exists but cannot be read is an error, never an empty list. |
 | `freeze` | The kill switch. Records a freeze decision in the decision ledger; at the enforcement seam an active freeze forces `deny` for the matched `(principal, scope)`. No config file is rewritten, and freezing is always allowed. Omitting `--principal` freezes both principals; omitting `--scope` freezes every model. |
 | `unfreeze` | Lift a matching freeze by recording a superseding decision. Pass the same `--principal` / `--scope` used to freeze. |
 
 Policy can only tighten at runtime: freeze and the autonomy-budget degradation move effects toward `require_review` / `deny`, never toward `allow`.
+
+`rocky serve` answers `rocky policy show --output json` byte for byte at `GET /api/v1/policy`.
 
 ---
 

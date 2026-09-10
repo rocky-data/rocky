@@ -7851,6 +7851,115 @@ pub struct PolicyFreezeEntry {
     pub reason: String,
 }
 
+/// JSON output for `rocky policy show`, and the body of `GET /api/v1/policy`:
+/// the policy plane as configured and as it stands.
+///
+/// The rules carry their position in `[[policy.rules]]` as `id`, the only
+/// identity a rule has today and the number `rocky policy check` reports as
+/// `matched_rule`. `freezes` is every freeze in force, from the decision
+/// ledger and, when the project keeps them, the durable freeze markers;
+/// `freeze_sources` says which of the two was read. A source that exists but
+/// cannot be read is an error, never an empty list: an empty list would say
+/// "nothing is frozen" for a plane whose freezes could not be read at all.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyRulesOutput {
+    pub version: String,
+    /// Always `"policy_show"`.
+    pub command: String,
+    /// Whether `rocky.toml` carries a `[policy]` block. `false` is the default
+    /// posture: no rules, `default_agent_effect` as the engine defaults it.
+    pub configured: bool,
+    pub policy_version: u32,
+    /// The effect an agent gets when no rule matches.
+    pub default_agent_effect: rocky_core::config::PolicyEffect,
+    /// The rules in file order.
+    pub rules: Vec<PolicyRuleEntry>,
+    /// Every freeze in force, ledger entries first, then markers.
+    pub freezes: Vec<PolicyFreezeInForce>,
+    pub freeze_sources: PolicyFreezeSources,
+}
+
+/// One `[[policy.rules]]` entry.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyRuleEntry {
+    /// Zero-based position in `[[policy.rules]]`; the `matched_rule` that
+    /// `rocky policy check` reports.
+    pub id: usize,
+    pub principal: rocky_core::config::PolicyPrincipal,
+    pub capability: rocky_core::config::PolicyCapability,
+    pub effect: rocky_core::config::PolicyEffect,
+    pub scope: PolicyRuleScopeOutput,
+    /// Free-form conditions the rule was written with, as authored. The engine
+    /// parses them and never evaluates them: no `conditions` predicate narrows
+    /// a rule's effect today, so a reader must not show them as part of what
+    /// decided an outcome. They are here because a policy screen should be able
+    /// to show what a rule's author wrote, including the part not yet in force.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<serde_json::Value>,
+    /// The rolling failure ceiling that degrades this rule's effect.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub autonomy_budget: Option<PolicyAutonomyBudgetOutput>,
+}
+
+/// What a rule matches. Every field is as authored; an empty list or `None`
+/// means the field does not narrow the rule.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyRuleScopeOutput {
+    pub any: bool,
+    pub models: Vec<String>,
+    pub tags: BTreeMap<String, String>,
+    pub classifications: Vec<String>,
+    pub exclude_classifications: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contracted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+    /// The blast-radius ceiling: the rule matches only a model with at most
+    /// this many downstreams.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_downstreams: Option<u64>,
+}
+
+/// A rule's autonomy budget: `failures` within `window` degrade its effect.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyAutonomyBudgetOutput {
+    pub failures: u64,
+    pub window: String,
+}
+
+/// One freeze in force.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyFreezeInForce {
+    /// `"ledger"` (a `rocky policy freeze` decision) or `"marker"` (a durable
+    /// freeze marker in the remote object tier).
+    pub source: String,
+    /// The frozen principal. Absent on a marker that froze both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal: Option<rocky_core::config::PolicyPrincipal>,
+    /// The scope selector as given to `rocky policy freeze`; `any` is every model.
+    pub scope: String,
+    pub reason: String,
+    /// When the freeze was recorded, when the source recorded it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<DateTime<Utc>>,
+    /// The ledger decision's plan id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    /// The marker's id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freeze_id: Option<String>,
+}
+
+/// Which freeze sources the report read.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyFreezeSources {
+    /// `"read"`, or `"absent"` when the project has no state store yet.
+    pub ledger: String,
+    /// `"read"`, or `"not_configured"` when `[state]` keeps no durable markers
+    /// (a local backend, or `freeze_marker_writes = false`).
+    pub markers: String,
+}
+
 /// JSON output for `rocky audit` — the agent-policy decision ledger.
 ///
 /// Lists every policy decision recorded at a mutating enforcement seam
