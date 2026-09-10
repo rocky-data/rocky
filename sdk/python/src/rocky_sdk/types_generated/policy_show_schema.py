@@ -279,7 +279,13 @@ class PolicyRulesOutput(BaseModel):
     """
     JSON output for `rocky policy show`, and the body of `GET /api/v1/policy`: the policy plane as configured and as it stands.
 
-    The rules carry their position in `[[policy.rules]]` as `id`, the only identity a rule has today and the number `rocky policy check` reports as `matched_rule`. `freezes` is every freeze in force, from the decision ledger and, when the project keeps them, the durable freeze markers; `freeze_sources` says which of the two was read. A source that exists but cannot be read is an error, never an empty list: an empty list would say "nothing is frozen" for a plane whose freezes could not be read at all.
+    The rules carry their position in `[[policy.rules]]` as `id`, the only identity a rule has today and the number `rocky policy check` reports as `matched_rule`.
+
+    `freezes` is every freeze in force **that this reader could see**, from the decision ledger and the durable freeze markers, and `freeze_sources` says what it saw. That qualifier is load-bearing and is not a hedge:
+
+    - `not_consulted` on both means no `[policy]` block, so the enforcement gate answers before it reads a freeze source and nothing is in force. - `local_mirror` on the ledger means a remote `[state]` backend, where the authority is remote and this read-only producer will not download it. A freeze recorded by another pod can be absent from `freezes` while an apply, which downloads first, still denies. Only when the ledger reads `read` or `absent` is the list exhaustive.
+
+    A source that exists but cannot be read is an error, never an empty list: an empty list would say "nothing is frozen" for a plane whose freezes could not be read at all.
     """
 
     command: str
@@ -297,7 +303,7 @@ class PolicyRulesOutput(BaseModel):
     freeze_sources: PolicyFreezeSources
     freezes: list[PolicyFreezeInForce]
     """
-    Every freeze in force, ledger entries first, then markers.
+    The freezes in force that this reader could see, ledger entries first, then markers. Read `freeze_sources` before treating it as exhaustive: a `local_mirror` ledger read may be missing another pod's freeze.
     """
     policy_version: conint(ge=0)
     rules: list[PolicyRuleEntry]

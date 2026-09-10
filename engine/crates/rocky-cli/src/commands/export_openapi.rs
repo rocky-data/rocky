@@ -1236,10 +1236,14 @@ fn route_table() -> Vec<Route> {
             summary: "The policy plane",
             description: "The `[policy]` rules in file order with their positional ids (the \
                  `matched_rule` that `policy check` reports), the default agent effect, and \
-                 every freeze in force from the decision ledger and, when `[state]` keeps \
-                 them, the durable freeze markers; `freeze_sources` says which was read. A \
-                 missing `rocky.toml` is the default posture. A source that exists but \
-                 cannot be read is a `500`, never an empty list. The same bytes as \
+                 the freezes in force that this read could see, from the decision ledger \
+                 and the durable freeze markers. Read `freeze_sources` before treating the \
+                 list as exhaustive: `not_consulted` means no `[policy]` block, so nothing \
+                 is enforced; `local_mirror` means a remote `[state]` backend whose \
+                 authoritative ledger this read-only route does not download, so another \
+                 pod's freeze can be missing while an apply still denies. A missing \
+                 `rocky.toml` is the default posture. A source that exists but cannot be \
+                 read is a `500`, never an empty list. The same bytes as \
                  `rocky policy show --output json`.",
             path_params: &[],
             query_params: &[],

@@ -13318,7 +13318,7 @@
         "type": "object"
       },
       "PolicyRulesOutput": {
-        "description": "JSON output for `rocky policy show`, and the body of `GET /api/v1/policy`: the policy plane as configured and as it stands.\n\nThe rules carry their position in `[[policy.rules]]` as `id`, the only identity a rule has today and the number `rocky policy check` reports as `matched_rule`. `freezes` is every freeze in force, from the decision ledger and, when the project keeps them, the durable freeze markers; `freeze_sources` says which of the two was read. A source that exists but cannot be read is an error, never an empty list: an empty list would say \"nothing is frozen\" for a plane whose freezes could not be read at all.",
+        "description": "JSON output for `rocky policy show`, and the body of `GET /api/v1/policy`: the policy plane as configured and as it stands.\n\nThe rules carry their position in `[[policy.rules]]` as `id`, the only identity a rule has today and the number `rocky policy check` reports as `matched_rule`.\n\n`freezes` is every freeze in force **that this reader could see**, from the decision ledger and the durable freeze markers, and `freeze_sources` says what it saw. That qualifier is load-bearing and is not a hedge:\n\n- `not_consulted` on both means no `[policy]` block, so the enforcement gate answers before it reads a freeze source and nothing is in force. - `local_mirror` on the ledger means a remote `[state]` backend, where the authority is remote and this read-only producer will not download it. A freeze recorded by another pod can be absent from `freezes` while an apply, which downloads first, still denies. Only when the ledger reads `read` or `absent` is the list exhaustive.\n\nA source that exists but cannot be read is an error, never an empty list: an empty list would say \"nothing is frozen\" for a plane whose freezes could not be read at all.",
         "properties": {
           "command": {
             "description": "Always `\"policy_show\"`.",
@@ -13340,7 +13340,7 @@
             "$ref": "#/components/schemas/PolicyFreezeSources"
           },
           "freezes": {
-            "description": "Every freeze in force, ledger entries first, then markers.",
+            "description": "The freezes in force that this reader could see, ledger entries first, then markers. Read `freeze_sources` before treating it as exhaustive: a `local_mirror` ledger read may be missing another pod's freeze.",
             "items": {
               "$ref": "#/components/schemas/PolicyFreezeInForce"
             },
@@ -23318,7 +23318,7 @@
     },
     "/api/v1/policy": {
       "get": {
-        "description": "The `[policy]` rules in file order with their positional ids (the `matched_rule` that `policy check` reports), the default agent effect, and every freeze in force from the decision ledger and, when `[state]` keeps them, the durable freeze markers; `freeze_sources` says which was read. A missing `rocky.toml` is the default posture. A source that exists but cannot be read is a `500`, never an empty list. The same bytes as `rocky policy show --output json`.",
+        "description": "The `[policy]` rules in file order with their positional ids (the `matched_rule` that `policy check` reports), the default agent effect, and the freezes in force that this read could see, from the decision ledger and the durable freeze markers. Read `freeze_sources` before treating the list as exhaustive: `not_consulted` means no `[policy]` block, so nothing is enforced; `local_mirror` means a remote `[state]` backend whose authoritative ledger this read-only route does not download, so another pod's freeze can be missing while an apply still denies. A missing `rocky.toml` is the default posture. A source that exists but cannot be read is a `500`, never an empty list. The same bytes as `rocky policy show --output json`.",
         "operationId": "getPolicy",
         "responses": {
           "200": {

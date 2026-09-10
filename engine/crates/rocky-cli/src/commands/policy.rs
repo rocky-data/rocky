@@ -601,6 +601,23 @@ fn scope_text(scope: &PolicyRuleScopeOutput) -> String {
     }
 }
 
+/// How a freeze's principal reads in the text output.
+///
+/// `principal` is absent ONLY on a marker whose body could not be read, which
+/// the loader widens to scope `any` and to both principals so the freeze fails
+/// closed. Printing a plain `both` there would read as a marker that
+/// deliberately froze both, which is a different and much less alarming fact.
+///
+/// This is a function rather than a line inside the `println!` so a test can
+/// assert it. Round two of the review pointed out that the wording was
+/// unreachable from any test, so reverting it would have gone unnoticed.
+fn freeze_principal_text(f: &PolicyFreezeInForce) -> String {
+    match f.principal {
+        Some(p) => serde_plain(&p),
+        None => "both (marker body unreadable)".to_string(),
+    }
+}
+
 /// Render the policy plane as a compact human-readable block.
 fn render_show_text(out: &PolicyRulesOutput) {
     if out.configured {
@@ -641,13 +658,7 @@ fn render_show_text(out: &PolicyRulesOutput) {
     };
     println!("{}: {}", heading, out.freezes.len());
     for f in &out.freezes {
-        // `principal` is absent only on a marker whose body could not be read,
-        // which the loader widens to both principals to fail closed. Saying
-        // plain "both" would read as a deliberate both-principal freeze.
-        let principal = f
-            .principal
-            .map(|p| serde_plain(&p))
-            .unwrap_or_else(|| "both (marker body unreadable)".to_string());
+        let principal = freeze_principal_text(f);
         let since = f
             .since
             .map(|t| t.to_rfc3339())
@@ -2227,9 +2238,14 @@ expect = \"allow\"
         );
     }
 
-    /// A durable marker is a freeze in force with `source` `"marker"`, its
-    /// id, and no principal when it froze both; the ledger's entries come
-    /// first and `freeze_sources.markers` says the markers were read.
+    /// A durable marker is a freeze in force with `source` `"marker"` and its
+    /// id; the ledger's entries come first and `freeze_sources.markers` says
+    /// the markers were read.
+    ///
+    /// The marker here carries no principal, which the loader produces ONLY
+    /// for a marker whose body it could not read: it widens such a marker to
+    /// scope `any` and to both principals so the freeze fails closed. It is
+    /// not a marker that deliberately froze both, and the reason text says so.
     #[test]
     fn assemble_policy_show_maps_markers_after_the_ledger() {
         let policy = PolicyConfig::default_posture();
@@ -2244,11 +2260,15 @@ expect = \"allow\"
                 reason: "from the ledger".to_string(),
             }],
         };
+        // Shaped exactly as `project_active` builds an unreadable marker:
+        // principal None, scope widened to `any`, and a reason that names the
+        // unreadable body. A hand-built fixture that dropped the reason would
+        // hide the very thing this asserts.
         let markers = vec![ActiveMarkerFreeze {
             freeze_id: "marker-1".to_string(),
             principal: None,
             scope: "any".to_string(),
-            reason: "from a marker".to_string(),
+            reason: "unreadable freeze marker body (expected value at line 1)".to_string(),
             created_at: None,
         }];
 
@@ -2265,8 +2285,12 @@ expect = \"allow\"
             m.principal, None,
             "an unreadable marker body names no principal; the loader widens it to both"
         );
-        assert_eq!(m.scope, "any");
-        assert_eq!(m.reason, "from a marker");
+        assert_eq!(m.scope, "any", "an unreadable body widens the scope");
+        assert!(
+            m.reason.contains("unreadable freeze marker body"),
+            "the reason must say the body was unreadable, not imply a deliberate freeze: {}",
+            m.reason
+        );
         assert_eq!(m.since, None);
         assert_eq!(m.plan_id, None);
     }
@@ -2453,5 +2477,128 @@ expect = \"allow\"
             !json.contains("super-secret-value"),
             "an authored condition can hold a resolved ${{VAR}}; it must not reach the output"
         );
+    }
+
+    /// A marker must be READ even when `freeze_marker_writes` is false.
+    ///
+    /// The round-two review called the first version of this test vacuous, and
+    /// it was right: it used a local backend, where the OLD gate returned no
+    /// markers either, so restoring the old condition would still have passed.
+    /// This one needs a REMOTE backend with a marker actually present, because
+    /// that is the only shape where the two conditions disagree. The flag
+    /// gates writes; a marker written while it was on stays enforced after it
+    /// is turned off, and the apply gate reads it regardless.
+    #[tokio::test]
+    async fn a_marker_is_read_even_when_the_write_flag_is_off() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let _harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+
+        let body = format!(
+            "{NO_POLICY_BODY}\n{POLICY}\n[state]\nbackend = \"s3\"\ns3_bucket = \"test\"\n\
+             freeze_marker_writes = false\n"
+        );
+        let (_dir, config) = config_with(&body);
+        let (_policy, state_cfg) = policy_show_config(&config).unwrap();
+        assert!(
+            !state_cfg.freeze_marker_writes,
+            "this test is only meaningful with the write flag OFF"
+        );
+
+        let provider = rocky_core::state_sync::durable_tier_provider(&state_cfg)
+            .unwrap()
+            .expect("an s3 backend resolves a durable tier");
+        rocky_core::freeze_marker::write_freeze_marker(
+            &provider,
+            &rocky_core::freeze_marker::FreezeMarker {
+                freeze_id: "marker-kept".to_string(),
+                principal: PolicyPrincipal::Agent,
+                scope: "any".to_string(),
+                reason: "written while the flag was on".to_string(),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        match load_policy_show_markers(&state_cfg).await.unwrap() {
+            PolicyShowMarkers::Read(markers) => {
+                assert_eq!(markers.len(), 1, "the marker is still enforced, so read it");
+                assert_eq!(markers[0].freeze_id, "marker-kept");
+            }
+            other => panic!(
+                "the write flag must not stop a reader from seeing an enforced marker, got \
+                 {other:?}"
+            ),
+        }
+    }
+
+    /// The PRESENT-file half of the local-mirror rule.
+    ///
+    /// The first version of this only covered a missing file, which left the
+    /// `read_label` path unproved: a remote backend that found a populated
+    /// local store could still have said `"read"` and no test would have
+    /// noticed. A mirror that HAS rows is exactly the dangerous case, because
+    /// a non-empty list is the one a reader is most likely to trust.
+    #[tokio::test]
+    async fn a_populated_local_store_still_reads_as_a_mirror_on_a_remote_backend() {
+        let (dir, config) = config_with(&format!("{NO_POLICY_BODY}\n{POLICY}"));
+        let state_path = dir.path().join("state.redb");
+        run_policy_freeze(
+            &config,
+            &state_path,
+            Some(PolicyPrincipal::Agent),
+            Some("model=fct_*".to_string()),
+            Some("incident 42".to_string()),
+            false,
+            true,
+        )
+        .unwrap();
+
+        let local = read_policy_show_ledger(&state_path, false).unwrap();
+        assert_eq!(local.source, "read");
+        assert_eq!(local.freezes.len(), 1);
+
+        let mirrored = read_policy_show_ledger(&state_path, true).unwrap();
+        assert_eq!(
+            mirrored.source, "local_mirror",
+            "a populated local store on a remote backend is still only a mirror"
+        );
+        assert_eq!(
+            mirrored.freezes.len(),
+            1,
+            "the rows it did see are still reported; only the completeness claim changes"
+        );
+    }
+
+    /// The text must not call an unreadable marker a deliberate both-principal
+    /// freeze. Round two found this wording had no test at all: it lived
+    /// inside a `println!`, so reverting it to a plain `both` would have
+    /// passed everything. Now it is a function, and this is that test.
+    #[test]
+    fn an_unreadable_marker_does_not_read_as_a_deliberate_both_principal_freeze() {
+        let unreadable = PolicyFreezeInForce {
+            source: "marker".to_string(),
+            principal: None,
+            scope: "any".to_string(),
+            reason: "unreadable freeze marker body (expected value at line 1)".to_string(),
+            since: None,
+            plan_id: None,
+            freeze_id: Some("marker-1".to_string()),
+        };
+        let text = freeze_principal_text(&unreadable);
+        assert_ne!(
+            text, "both",
+            "a bare `both` hides why the principal is absent"
+        );
+        assert!(
+            text.contains("unreadable"),
+            "the principal column must say the body was unreadable, got: {text}"
+        );
+
+        let deliberate = PolicyFreezeInForce {
+            principal: Some(PolicyPrincipal::Agent),
+            ..unreadable
+        };
+        assert_eq!(freeze_principal_text(&deliberate), "agent");
     }
 }
