@@ -34,9 +34,8 @@ use crate::output::{
     ReplayExecuteOutput, ReplayOutput, RestoreApplyOutput, RestorePlanOutput,
     RetentionStatusOutput, RetentionSweepOutput, ReviewOutput, ReviewQueueOutput,
     ReviewStatusOutput, RunOutput, ScheduleHoldOutput, ScheduleSpoolOutput, ScheduleStatusOutput,
-    SeedOutput,
-    StateOutput, TestAdapterOutput, TestOutput, TickOutput, TraceOutput, ValidateMigrationOutput,
-    ValidateOutput,
+    SeedOutput, StateOutput, TestAdapterOutput, TestOutput, TickOutput, TraceOutput,
+    ValidateMigrationOutput, ValidateOutput,
 };
 
 /// Top-level command output types currently covered by schemars.

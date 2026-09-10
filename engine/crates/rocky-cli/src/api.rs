@@ -111,8 +111,7 @@ use crate::output::{
     DagNodeStatusOutput, DagOutput, DagStatusOutput, ErrorEnvelope, HealthOutput, HistoryOutput,
     JobKind, JobState, JobStatus, LineageOutput, MetaOutput, MetricsOutput, ModelColumnOutput,
     ModelDetailOutput, ModelHistoryOutput, ModelListEntry, ModelListOutput, ScheduleSpoolOutput,
-    ScheduleStatusOutput,
-    TypedColumnOutput, cap_model_sql,
+    ScheduleStatusOutput, TypedColumnOutput, cap_model_sql,
 };
 
 /// Bind config for [`serve`].
@@ -815,6 +814,7 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "POST /api/v1/jobs/apply",
         "GET /api/v1/jobs/{id}",
         "GET /api/v1/schedule",
+        "GET /api/v1/schedule/spool",
         "GET /api/v1/policy",
         "GET /api/v1/products",
         "GET /api/v1/products/{name}",
@@ -2140,29 +2140,28 @@ async fn schedule_spool(
         return Err(ApiError::engine_not_ready());
     };
 
-    let output = tokio::task::spawn_blocking(move || {
-        crate::commands::compute_schedule_spool(&config_path)
-    })
-    .await
-    .map_err(|e| {
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            format!("the spool read panicked: {e}"),
-            None,
-        )
-    })?
-    .map_err(|e| {
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "spool_unreadable",
-            e.to_string(),
-            Some(
-                "inspect the spool directory's permissions — queued webhook \
+    let output =
+        tokio::task::spawn_blocking(move || crate::commands::compute_schedule_spool(&config_path))
+            .await
+            .map_err(|e| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    format!("the spool read panicked: {e}"),
+                    None,
+                )
+            })?
+            .map_err(|e| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "spool_unreadable",
+                    e.to_string(),
+                    Some(
+                        "inspect the spool directory's permissions — queued webhook \
                  demands cannot be counted while it is unreadable",
-            ),
-        )
-    })?;
+                    ),
+                )
+            })?;
 
     Ok(PrettyJson(output))
 }

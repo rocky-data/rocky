@@ -899,7 +899,10 @@ fn schedule_spool_prints_what_compute_schedule_spool_returns() {
 
     let seam = compute_schedule_spool(&config).unwrap();
     assert_eq!(seam.counts.pending, 2, "both demands are queued");
-    assert_eq!(seam.counts.skipped, 1, "the bad file is reported, not hidden");
+    assert_eq!(
+        seam.counts.skipped, 1,
+        "the bad file is reported, not hidden"
+    );
 
     // Pass the same absolute `--config` the seam was given: the binary's
     // default is the RELATIVE `rocky.toml`, whose parent is empty, so the

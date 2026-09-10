@@ -43,7 +43,9 @@ pub enum ScheduleSpoolError {
 ///
 /// The single producer behind both the CLI verb and the route, so the two
 /// cannot drift.
-pub fn compute_schedule_spool(config_path: &Path) -> Result<ScheduleSpoolOutput, ScheduleSpoolError> {
+pub fn compute_schedule_spool(
+    config_path: &Path,
+) -> Result<ScheduleSpoolOutput, ScheduleSpoolError> {
     let rocky_dir = crate::commands::scheduler::rocky_dir_for_config(config_path);
     let spool_path = spool::spool_dir(&rocky_dir);
 
@@ -216,7 +218,9 @@ mod tests {
     }
 
     fn spool_one(dir: &tempfile::TempDir, pipeline: &str, token: &str, at: &str) -> PathBuf {
-        let now = DateTime::parse_from_rfc3339(at).unwrap().with_timezone(&Utc);
+        let now = DateTime::parse_from_rfc3339(at)
+            .unwrap()
+            .with_timezone(&Utc);
         let outcome = accept(
             &rocky_dir(dir),
             pipeline,
