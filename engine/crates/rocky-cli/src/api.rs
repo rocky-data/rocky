@@ -2136,14 +2136,31 @@ async fn schedule_status(
 /// three real secrets, and `settings_reports_exactly_the_allowlisted_fields`
 /// fails when a field is *added* — an allowlist, not a denylist.
 ///
-/// Never fails. Every value was resolved at startup; there is no I/O, no
-/// state-store permit, and nothing to be busy.
+/// Almost every value was resolved at startup and cannot fail here. The two
+/// `[state]` labels are the exception: they need one `rocky.toml` read, which
+/// is why this route can answer `503 engine_busy` (that read is already in
+/// flight, or missed its deadline) or `500` (it panicked). See
+/// [`resolve_config_labels`].
 async fn settings(
     State(state): State<Arc<ServerState>>,
 ) -> Result<PrettyJson<SettingsOutput>, ApiError> {
     let labels = resolve_config_labels(&state).await?;
     Ok(PrettyJson(settings_output(&state, labels)))
 }
+
+/// Test hook: when armed, the blocking config read blocks on this until the
+/// test releases it, so a test can observe the permit WHILE a read is in
+/// flight.
+///
+/// Exists because the obvious tests cannot see permit lifetime. Holding the
+/// permit from outside proves a held permit refuses a second caller; it does
+/// not prove the production path holds one for the read's duration. Dropping
+/// the permit inside the blocking closure restores unbounded blocked workers
+/// and leaves those tests passing — which is the whole bound, silently gone.
+/// Same shape as `ServerState::publish_hold`.
+#[cfg(test)]
+static CONFIG_READ_GATE: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>> =
+    std::sync::Mutex::new(None);
 
 /// How long the one `rocky.toml` read behind this route may take before the
 /// caller is told to retry. Generous for a local file; the point is that it
@@ -2198,8 +2215,19 @@ async fn resolve_config_labels(
 
     let for_read = state.clone();
     let read = tokio::task::spawn_blocking(move || {
-        // Held for the life of the read, not just the spawn.
+        // Held for the life of the read, not just the spawn. Dropping this
+        // early is exactly the mutation that removes the bound, so
+        // `the_permit_is_held_for_the_whole_read` pins it.
         let _permit = permit;
+
+        // Let a test observe the permit while this read is "running".
+        #[cfg(test)]
+        {
+            let gate = CONFIG_READ_GATE.lock().unwrap().take();
+            if let Some(rx) = gate {
+                let _ = rx.recv();
+            }
+        }
         *for_read
             .settings
             .config_labels
@@ -6114,6 +6142,65 @@ mod tests {
             resp.status(),
             200,
             "a resolved read must not queue behind the admission lane"
+        );
+    }
+
+    /// **Red team, round 3.** The bound is not "a permit exists", it is "the
+    /// permit is held for as long as the read runs".
+    ///
+    /// The two tests above cannot see that. They hold the permit from outside
+    /// to stand in for an in-flight read, which proves a held permit refuses a
+    /// second caller — but dropping the permit inside the blocking closure,
+    /// just before the read, leaves both of them passing while every concurrent
+    /// request goes back to occupying its own blocking worker. That mutation
+    /// removes the entire bound invisibly.
+    ///
+    /// So this drives the real path and looks at the lane WHILE the read is in
+    /// flight, using the same kind of test gate `publish_hold` uses.
+    #[tokio::test]
+    async fn the_permit_is_held_for_the_whole_read() {
+        let (_dir, state) = project_with_three_secrets();
+
+        // Arm the gate so the read parks inside the blocking closure.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        *CONFIG_READ_GATE.lock().unwrap() = Some(rx);
+
+        let driving = state.clone();
+        let read = tokio::spawn(async move { resolve_config_labels(&driving).await.is_ok() });
+
+        // Wait for the read to actually take the lane.
+        let mut taken = false;
+        for _ in 0..200 {
+            if Arc::clone(&state.settings_reads)
+                .try_acquire_owned()
+                .is_err()
+            {
+                taken = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(taken, "the read never took the admission lane");
+
+        // THE ASSERTION: still held, with the read parked mid-flight.
+        assert!(
+            Arc::clone(&state.settings_reads)
+                .try_acquire_owned()
+                .is_err(),
+            "the permit was released while the read was still running, so \
+             concurrent requests would each occupy a blocking worker"
+        );
+
+        // Release and let it finish.
+        tx.send(()).unwrap();
+        assert!(read.await.unwrap(), "the read should resolve once released");
+
+        // And the lane comes back afterwards.
+        assert!(
+            Arc::clone(&state.settings_reads)
+                .try_acquire_owned()
+                .is_ok(),
+            "the lane must be free again once the read returned"
         );
     }
 
