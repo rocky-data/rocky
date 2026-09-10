@@ -310,6 +310,14 @@ fn extract_deps_from_lineage(
     let mut renamed_target_reads = Vec::new();
 
     for table_ref in &lineage_result.source_tables {
+        // A CTE is local to the query and names no object outside it, so a CTE
+        // that happens to share a model's name must not derive an edge to it
+        // — and two models with mutual local CTE names must not close a cycle
+        // that does not exist (#1892).
+        match table_ref.binding {
+            lineage::TableBinding::Cte => continue,
+            lineage::TableBinding::Physical => {}
+        }
         if let TableRefKind::ModelRef(name) = classify_table_ref(&table_ref.name, model_names) {
             // Don't add self-references
             if name != model_name && seen.insert(name.clone()) {
@@ -719,5 +727,69 @@ mod tests {
         let (dag_nodes, _lineage_cache, _diags) = resolve_dependencies(&models).unwrap();
         let node = dag_nodes.iter().find(|n| n.name == "summary").unwrap();
         assert_eq!(node.depends_on, vec!["orders"]);
+    }
+
+    /// #1892: a CTE named after a model must derive no edge. The reader never
+    /// reads the model — the `WITH` clause shadows the name for the whole
+    /// query — so ordering it after the model is an invented dependency.
+    #[test]
+    fn a_cte_named_after_a_model_derives_no_edge() {
+        let models = vec![
+            make_model("orders", "SELECT 1 AS id"),
+            make_model(
+                "cte_reader",
+                "WITH orders AS (SELECT 2 AS id) SELECT id FROM orders",
+            ),
+        ];
+
+        let (dag_nodes, _lineage_cache, _diags) = resolve_dependencies(&models).unwrap();
+        let reader = dag_nodes.iter().find(|n| n.name == "cte_reader").unwrap();
+        assert!(
+            reader.depends_on.is_empty(),
+            "the CTE shadows the model name, so there is nothing to depend on: {:?}",
+            reader.depends_on
+        );
+    }
+
+    /// The worst form of the same defect, and the one that made it a refusal
+    /// rather than a mis-ordering: two models with mutual local CTE names have
+    /// no dependency in either direction, but the invented edges close a cycle
+    /// and `topological_sort` refuses the project outright (#1892).
+    #[test]
+    fn mutual_cte_names_do_not_close_a_cycle() {
+        let models = vec![
+            make_model("alpha", "WITH beta AS (SELECT 1 AS id) SELECT id FROM beta"),
+            make_model("beta", "WITH alpha AS (SELECT 2 AS id) SELECT id FROM alpha"),
+        ];
+
+        let (dag_nodes, _lineage_cache, _diags) = resolve_dependencies(&models).unwrap();
+        for node in &dag_nodes {
+            assert!(
+                node.depends_on.is_empty(),
+                "model '{}' has an invented dependency: {:?}",
+                node.name,
+                node.depends_on
+            );
+        }
+        rocky_ir::dag::topological_sort(&dag_nodes)
+            .expect("neither model reads the other, so the project must compile");
+    }
+
+    /// The guard against over-suppressing. A query that binds a CTE and ALSO
+    /// reads a real model must keep the real edge — the fix shadows the bound
+    /// name, not the whole `FROM` clause.
+    #[test]
+    fn a_query_with_a_cte_keeps_its_real_read_edge() {
+        let models = vec![
+            make_model("orders", "SELECT 1 AS id"),
+            make_model(
+                "mixed",
+                "WITH c AS (SELECT 1 AS id) SELECT c.id FROM c JOIN orders USING (id)",
+            ),
+        ];
+
+        let (dag_nodes, _lineage_cache, _diags) = resolve_dependencies(&models).unwrap();
+        let mixed = dag_nodes.iter().find(|n| n.name == "mixed").unwrap();
+        assert_eq!(mixed.depends_on, vec!["orders"]);
     }
 }
