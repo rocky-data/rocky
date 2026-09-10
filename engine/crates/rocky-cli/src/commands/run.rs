@@ -26574,8 +26574,9 @@ backend = "local"
     #[test]
     fn content_addressed_dispatch_ir_is_typed() {
         let content = "---toml\nname = \"ca_events\"\n\n[strategy]\ntype = \"content_addressed\"\nstorage_prefix = \"s3://bucket/ca_events\"\n\n[target]\ncatalog = \"analytics\"\nschema = \"marts\"\ntable = \"ca_events\"\n---\n\nSELECT 1 AS id, 'a' AS name\n";
-        let model = rocky_core::models::parse_model_inline(content, "ca_events.sql", None)
-            .expect("parse content-addressed model");
+        let model =
+            rocky_core::models::parse_model_inline(content, Path::new("ca_events.sql"), None)
+                .expect("parse content-addressed model");
         assert!(
             model.to_model_ir().skip_hash().is_none(),
             "bare to_model_ir() has no typed columns — the regression shape"

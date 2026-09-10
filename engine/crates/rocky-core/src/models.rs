@@ -1515,7 +1515,7 @@ pub fn load_model_pair_with_context(
 /// editor support (syntax highlighting, linting, autocomplete).
 pub fn parse_model_inline(
     content: &str,
-    file_path: &str,
+    file_path: &Path,
     defaults: Option<&DirDefaults>,
 ) -> Result<Model, ModelError> {
     parse_model_inline_with_context(content, file_path, defaults, &ModelLoadContext::default())
@@ -1524,32 +1524,43 @@ pub fn parse_model_inline(
 /// [`parse_model_inline`] with directory-level config resolution (groups +
 /// named tests). See [`load_model_pair_with_context`]. Bare `parse_model_inline`
 /// passes an empty context.
+///
+/// `file_path` is a `&Path`, not a `&str`. The directory loader hands it the
+/// real path off the filesystem walk, and a `&str` parameter forced that
+/// through `Path::display().to_string()` — which replaces every non-UTF-8 byte
+/// with U+FFFD. `Model::file_path` then no longer equalled the path any other
+/// caller held, and #1778 widened that field to `PathBuf` precisely so it
+/// would. The LSP's model lookup is `m.file_path == uri.to_file_path()`
+/// (`rocky-server/src/lsp.rs`), so on such a filename it silently matched
+/// nothing: no diagnostics, no hover, no go-to-definition (#1814).
 pub fn parse_model_inline_with_context(
     content: &str,
-    file_path: &str,
+    file_path: &Path,
     defaults: Option<&DirDefaults>,
     ctx: &ModelLoadContext,
 ) -> Result<Model, ModelError> {
-    let (frontmatter, sql) =
-        split_frontmatter(content).ok_or_else(|| ModelError::MissingFrontmatter {
-            path: file_path.to_string(),
-        })?;
+    // Only for the human-readable `path` on an error. Lossy is correct there —
+    // a diagnostic is text — and it never reaches `Model::file_path`.
+    let displayed = || file_path.display().to_string();
+
+    let (frontmatter, sql) = split_frontmatter(content)
+        .ok_or_else(|| ModelError::MissingFrontmatter { path: displayed() })?;
 
     let declared = extract_declared_fields(frontmatter);
 
     let frontmatter =
         substitute_env_vars(frontmatter).map_err(|source| ModelError::EnvSubstitution {
-            path: file_path.to_string(),
+            path: displayed(),
             source: Box::new(source),
         })?;
 
     let raw: RawModelConfig =
         toml::from_str(&frontmatter).map_err(|e| ModelError::ParseFrontmatter {
-            path: file_path.to_string(),
+            path: displayed(),
             source: e,
         })?;
 
-    let file_stem = Path::new(file_path)
+    let file_stem = file_path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
@@ -1557,15 +1568,12 @@ pub fn parse_model_inline_with_context(
     let config = resolve_model_config(raw, &file_stem, defaults, ctx, declared)?;
 
     // Inline models can have a sibling contract too — same probe, same rule.
-    let contract_path = sibling_contract_path(Path::new(file_path));
+    let contract_path = sibling_contract_path(file_path);
 
     Ok(Model {
         config,
         sql: sql.to_string(),
-        // Lossless: this parser's `file_path` is a `&str` label supplied by
-        // the caller (a synthetic name like "fct_orders.sql"), never a path
-        // read off the filesystem, so widening it cannot lose bytes.
-        file_path: std::path::PathBuf::from(file_path),
+        file_path: file_path.to_path_buf(),
         contract_path,
     })
 }
@@ -1650,12 +1658,7 @@ pub fn load_models_from_dir_filtered(
                 load_model_pair_with_context(path, &toml_path, defaults.as_ref(), &ctx)
             } else {
                 let content = read_model_text(path)?;
-                parse_model_inline_with_context(
-                    &content,
-                    &path.display().to_string(),
-                    defaults.as_ref(),
-                    &ctx,
-                )
+                parse_model_inline_with_context(&content, path, defaults.as_ref(), &ctx)
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -2209,7 +2212,7 @@ target = { catalog = "analytics", schema = "staging", table = "orders" }
 
 SELECT * FROM raw.orders
 "#;
-        let model = parse_model_inline(content, "stg_orders.sql", None).unwrap();
+        let model = parse_model_inline(content, Path::new("stg_orders.sql"), None).unwrap();
         assert_eq!(model.config.name, "stg_orders");
         assert!(model.config.depends_on.is_empty());
         assert!(model.sql.contains("SELECT * FROM raw.orders"));
@@ -2235,7 +2238,7 @@ table = "dim_customers"
 SELECT customer_id, name, email
 FROM analytics.staging.customers
 "#;
-        let model = parse_model_inline(content, "dim_customers.sql", None).unwrap();
+        let model = parse_model_inline(content, Path::new("dim_customers.sql"), None).unwrap();
         assert_eq!(model.config.name, "dim_customers");
         assert_eq!(model.config.depends_on, vec!["stg_customers"]);
         assert!(matches!(
@@ -2262,7 +2265,7 @@ table = "fct_events"
 
 SELECT id, payload, region FROM raw.events
 "#;
-        let model = parse_model_inline(content, "fct_events.sql", None).unwrap();
+        let model = parse_model_inline(content, Path::new("fct_events.sql"), None).unwrap();
         match &model.config.strategy {
             StrategyConfig::ContentAddressed {
                 storage_prefix,
@@ -2306,7 +2309,7 @@ table = "fct_events"
 
 SELECT id, payload FROM raw.events
 "#;
-        let model = parse_model_inline(content, "fct_events.sql", None).unwrap();
+        let model = parse_model_inline(content, Path::new("fct_events.sql"), None).unwrap();
         match &model.config.strategy {
             StrategyConfig::ContentAddressed {
                 storage_prefix,
@@ -2349,7 +2352,7 @@ SELECT o.order_id, c.name, o.amount
 FROM analytics.staging.orders o
 JOIN analytics.marts.dim_customers c ON o.customer_id = c.customer_id
 "#;
-        let model = parse_model_inline(content, "fct_orders.sql", None).unwrap();
+        let model = parse_model_inline(content, Path::new("fct_orders.sql"), None).unwrap();
         assert_eq!(model.config.name, "fct_orders");
         assert_eq!(model.config.depends_on.len(), 2);
         assert_eq!(model.config.sources.len(), 2);
@@ -2362,7 +2365,7 @@ JOIN analytics.marts.dim_customers c ON o.customer_id = c.customer_id
     #[test]
     fn test_parse_model_missing_frontmatter() {
         let content = "SELECT * FROM raw.orders";
-        let result = parse_model_inline(content, "bad.sql", None);
+        let result = parse_model_inline(content, Path::new("bad.sql"), None);
         assert!(matches!(result, Err(ModelError::MissingFrontmatter { .. })));
     }
 
@@ -2376,7 +2379,7 @@ target = { catalog = "c", schema = "s", table = "t" }
 ---
 SELECT 1
 "#,
-            "b.sql",
+            Path::new("b.sql"),
             None,
         )
         .unwrap();
@@ -2401,7 +2404,7 @@ table = "t"
 ---
 SELECT id, name, status FROM raw.src
 "#,
-            "dim.sql",
+            Path::new("dim.sql"),
             None,
         )
         .unwrap();
@@ -2436,7 +2439,7 @@ table = "v_active_customers"
 ---
 SELECT customer_id, name FROM analytics.marts.dim_customers WHERE status = 'active'
 "#;
-        let model = parse_model_inline(content, "v_active_customers.sql", None).unwrap();
+        let model = parse_model_inline(content, Path::new("v_active_customers.sql"), None).unwrap();
         assert!(matches!(model.config.strategy, StrategyConfig::View));
         let ir = model.to_model_ir();
         assert!(matches!(ir.materialization, MaterializationStrategy::View));
@@ -2457,7 +2460,7 @@ table = "mv_orders_daily"
 ---
 SELECT DATE(created_at) AS day, COUNT(*) FROM analytics.marts.fct_orders GROUP BY 1
 "#;
-        let model = parse_model_inline(content, "mv_orders_daily.sql", None).unwrap();
+        let model = parse_model_inline(content, Path::new("mv_orders_daily.sql"), None).unwrap();
         assert!(matches!(
             model.config.strategy,
             StrategyConfig::MaterializedView
@@ -2485,7 +2488,7 @@ table = "dt_orders_recent"
 ---
 SELECT id, customer_id, total FROM analytics.marts.fct_orders
 "#;
-        let model = parse_model_inline(content, "dt_orders_recent.sql", None).unwrap();
+        let model = parse_model_inline(content, Path::new("dt_orders_recent.sql"), None).unwrap();
         match &model.config.strategy {
             StrategyConfig::DynamicTable { target_lag } => {
                 assert_eq!(target_lag, "1 minute");
@@ -2525,7 +2528,7 @@ table = "fct_orders_v2"
 ---
 SELECT 1
 "#,
-            "fct_orders.sql",
+            Path::new("fct_orders.sql"),
             None,
         )
         .unwrap();
@@ -3136,6 +3139,77 @@ schema = "s"
         assert!(err_msg.contains("catalog"));
     }
 
+    /// #1814 finding 2: a legacy inline model's `file_path` must be the path it
+    /// was given, byte for byte.
+    ///
+    /// The parameter used to be a `&str`, so the directory loader passed
+    /// `path.display().to_string()` — which replaces every non-UTF-8 byte with
+    /// U+FFFD. `Model::file_path` then no longer equalled the path any other
+    /// caller held, and #1778 widened that field to `PathBuf` precisely so it
+    /// would. The LSP looks a model up with `m.file_path == uri.to_file_path()`
+    /// (`rocky-server/src/lsp.rs`), so on such a filename it matched nothing:
+    /// no diagnostics, no hover, no go-to-definition, silently.
+    ///
+    /// Unix-only: it needs a filename that is not valid UTF-8, and
+    /// `OsStrExt::from_bytes` is the only way to build one.
+    #[cfg(unix)]
+    #[test]
+    fn an_inline_model_keeps_a_non_utf8_path_byte_for_byte() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        // 0xFF is not valid UTF-8 anywhere, so `display()` renders it U+FFFD.
+        let path = std::path::PathBuf::from(OsStr::from_bytes(b"models/caf\xffe.sql"));
+        assert_ne!(
+            path,
+            std::path::PathBuf::from(path.display().to_string()),
+            "PRECONDITION: this path must actually be lossy under display(), \
+             else the assertion below holds for any implementation"
+        );
+
+        let model = parse_model_inline(
+            "---toml\n[target]\ncatalog = \"c\"\nschema = \"s\"\n---\nSELECT 1 AS id\n",
+            &path,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(model.file_path, path);
+        assert_eq!(
+            model.config.name, "caf\u{fffd}e",
+            "the NAME is derived through `to_string_lossy` and stays lossy — a \
+             model name is an identifier, not a path"
+        );
+    }
+
+    /// The same property one layer up, through the real directory walk — the
+    /// call site that actually did the lossy conversion.
+    ///
+    /// Linux-only, and that is a real coverage limit rather than a preference:
+    /// APFS refuses a non-UTF-8 filename outright (`EILSEQ`), so this cannot be
+    /// exercised on macOS at all. CI runs `ubuntu-latest`, so it runs there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_directory_loader_keeps_a_non_utf8_filename_byte_for_byte() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(OsStr::from_bytes(b"caf\xffe.sql"));
+        std::fs::write(
+            &path,
+            "---toml\n[target]\ncatalog = \"c\"\nschema = \"s\"\n---\nSELECT 1 AS id\n",
+        )
+        .unwrap();
+
+        let models = load_models_from_dir(dir.path(), None).unwrap();
+        assert_eq!(models.len(), 1, "the inline model must load");
+        assert_eq!(
+            models[0].file_path, path,
+            "a lossy round-trip here makes every path-keyed lookup miss this model"
+        );
+    }
+
     #[test]
     fn test_filename_with_dot_in_stem() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -3233,7 +3307,7 @@ ssn = "confidential"
 
 SELECT email, phone, ssn FROM raw.users
 "#;
-        let model = parse_model_inline(content, "users.sql", None).unwrap();
+        let model = parse_model_inline(content, Path::new("users.sql"), None).unwrap();
         assert_eq!(
             model.config.classification.get("email"),
             Some(&"pii".to_string())
@@ -3264,7 +3338,7 @@ ip_address = "location_adjacent"
 
 SELECT * FROM raw.events
 "#;
-        let model = parse_model_inline(content, "telemetry.sql", None).unwrap();
+        let model = parse_model_inline(content, Path::new("telemetry.sql"), None).unwrap();
         assert_eq!(
             model.config.classification.get("user_id"),
             Some(&"gdpr_subject".to_string())
@@ -3293,7 +3367,7 @@ tier = "gold"
 
 SELECT 1
 "#;
-        let model = parse_model_inline(content, "fct_orders.sql", None).unwrap();
+        let model = parse_model_inline(content, Path::new("fct_orders.sql"), None).unwrap();
         assert_eq!(
             model.config.governance.tags.get("domain"),
             Some(&"finance".to_string())
@@ -3326,7 +3400,7 @@ target = { catalog = "c", schema = "s", table = "t" }
 
 SELECT 1
 "#;
-        let model = parse_model_inline(content, "no_gov.sql", None).unwrap();
+        let model = parse_model_inline(content, Path::new("no_gov.sql"), None).unwrap();
         assert!(model.config.governance.tags.is_empty());
     }
 
@@ -3339,7 +3413,7 @@ target = { catalog = "c", schema = "s", table = "t" }
 
 SELECT 1
 "#;
-        let model = parse_model_inline(content, "no_class.sql", None).unwrap();
+        let model = parse_model_inline(content, Path::new("no_class.sql"), None).unwrap();
         assert!(model.config.classification.is_empty());
     }
 
@@ -3355,7 +3429,7 @@ retention = "90d"
 
 SELECT * FROM raw.events
 "#;
-        let model = parse_model_inline(content, "events_daily.sql", None).unwrap();
+        let model = parse_model_inline(content, Path::new("events_daily.sql"), None).unwrap();
         assert_eq!(model.config.retention.map(|r| r.duration_days), Some(90));
     }
 
@@ -3369,7 +3443,7 @@ retention = "3y"
 
 SELECT * FROM raw.events
 "#;
-        let model = parse_model_inline(content, "long_history.sql", None).unwrap();
+        let model = parse_model_inline(content, Path::new("long_history.sql"), None).unwrap();
         assert_eq!(
             model.config.retention.map(|r| r.duration_days),
             Some(3 * 365)
@@ -3385,7 +3459,7 @@ target = { catalog = "c", schema = "s", table = "t" }
 
 SELECT 1
 "#;
-        let model = parse_model_inline(content, "no_retention.sql", None).unwrap();
+        let model = parse_model_inline(content, Path::new("no_retention.sql"), None).unwrap();
         assert!(model.config.retention.is_none());
     }
 
@@ -3405,7 +3479,7 @@ retention = "{bad}"
 SELECT 1
 "#
             );
-            let err = parse_model_inline(&content, "m.sql", None).unwrap_err();
+            let err = parse_model_inline(&content, Path::new("m.sql"), None).unwrap_err();
             match err {
                 ModelError::InvalidRetention { value, .. } => {
                     assert_eq!(value, *bad, "value field should be {bad}, got {value}");
@@ -4158,7 +4232,7 @@ table   = "inline_model"
 SELECT 1
 "#;
 
-        let model = parse_model_inline(content, "inline_model.sql", None).unwrap();
+        let model = parse_model_inline(content, Path::new("inline_model.sql"), None).unwrap();
         assert_eq!(model.config.target.catalog, "inline_warehouse");
         assert_eq!(model.config.target.schema, "staging");
 
@@ -4189,7 +4263,7 @@ table = "${ROCKY_TABLE_OVERRIDE:-customer_facts}"
 
 SELECT 1
 "#;
-        let model = parse_model_inline(content, "customer_facts.sql", None).unwrap();
+        let model = parse_model_inline(content, Path::new("customer_facts.sql"), None).unwrap();
 
         // Resolved values: env unset, so the default collapses to the literal.
         assert_eq!(model.config.name, "customer_facts");
@@ -4218,7 +4292,7 @@ schema = "marts"
 
 SELECT 1
 "#;
-        let model = parse_model_inline(content, "stg_orders.sql", None).unwrap();
+        let model = parse_model_inline(content, Path::new("stg_orders.sql"), None).unwrap();
         assert_eq!(model.config.name, "stg_orders");
         assert_eq!(model.config.target.table, "stg_orders");
         assert_eq!(model.config.name_declared, "stg_orders");
@@ -4240,7 +4314,7 @@ max_usd = 5.0
 
 SELECT 1
 "#;
-        let model = parse_model_inline(content, "fct_orders.sql", None).unwrap();
+        let model = parse_model_inline(content, Path::new("fct_orders.sql"), None).unwrap();
         let ir = model.to_model_ir();
         let ceiling = ir
             .cost_ceiling
@@ -4264,7 +4338,7 @@ on_breach = "warn"
 
 SELECT 1
 "#;
-        let model = parse_model_inline(content, "fct_orders.sql", None).unwrap();
+        let model = parse_model_inline(content, Path::new("fct_orders.sql"), None).unwrap();
         let ir = model.to_model_ir();
         assert!(
             ir.cost_ceiling.is_none(),
@@ -4282,7 +4356,7 @@ schema = "marts"
 
 SELECT 1
 "#;
-        let model = parse_model_inline(content, "fct_orders.sql", None).unwrap();
+        let model = parse_model_inline(content, Path::new("fct_orders.sql"), None).unwrap();
         let ir = model.to_model_ir();
         assert!(
             ir.cost_ceiling.is_none(),
