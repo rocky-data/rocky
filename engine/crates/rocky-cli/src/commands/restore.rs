@@ -998,6 +998,7 @@ pub(crate) async fn run_restore_apply_in_with(
         models_glob.as_deref(),
         state_path,
         &marker_freezes,
+        crate::commands::apply::GateSubjects::CompiledModels,
     );
     if let PolicyGate::Deny {
         model,

@@ -1699,9 +1699,11 @@ enum Command {
         /// Watch for file changes and auto-recompile
         #[arg(long)]
         watch: bool,
-        /// Bearer token required by every API request (except
-        /// `/api/v1/health`). Falls back to the `ROCKY_SERVE_TOKEN` env
-        /// var when omitted. Required when `--host` is non-loopback.
+        /// Bearer token. When set, every request must carry it except the
+        /// exempt paths (`/api/v1/health`, and the HMAC-checked webhook
+        /// route); when unset, a loopback server asks no request for a
+        /// token. Falls back to the `ROCKY_SERVE_TOKEN` env var when
+        /// omitted. Required when `--host` is non-loopback, and with `--ui`.
         #[arg(long)]
         token: Option<String>,
         /// What `--token` may do. `full` (the default) reaches every route.
@@ -3820,7 +3822,15 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 Some(rocky_core::shadow::ShadowConfig {
                     suffix: shadow_suffix,
                     schema_override: shadow_schema,
-                    cleanup_after: false,
+                    // A one-off `--shadow` object is disposable: it exists to
+                    // be compared against production and then go away
+                    // (#1273). This honours the documented default that
+                    // nothing read before — the `false` here is what made
+                    // shadow objects accumulate and let the next run write
+                    // over its own leftover. The `--branch` arm above keeps
+                    // `false` deliberately: a named branch's objects are the
+                    // point of the branch.
+                    cleanup_after: true,
                 })
             } else {
                 None

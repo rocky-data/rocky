@@ -156,17 +156,32 @@ pub const SCHEDULER_DRAINED: &str = "rocky.scheduler.drained";
 /// reads as an empty list and never sets this (#1731).
 pub const SCHEDULER_SPOOL_UNREADABLE: &str = "rocky.scheduler.spool_unreadable";
 
+/// The one string that names an unreadable webhook spool wherever a tick
+/// reports it: the tick's `outcome`, the `reason` of the skip the tick
+/// synthesises for it, and the JSON `skipped` entry `rocky tick` writes. One
+/// constant so the three surfaces cannot drift (#1812: the JSON said it and
+/// the metrics did not).
+pub const SPOOL_UNREADABLE_LABEL: &str = "spool_unreadable";
+
 // ---------------------------------------------------------------------------
 // Enumerations
 // ---------------------------------------------------------------------------
 
 /// Recognised values for [`SCHEDULER_OUTCOME`].
+///
+/// `spool_unreadable` is a tick that reconciled its configured schedules
+/// (cron, after, freshness) but could not read the webhook spool, so no
+/// webhook demand was consumed. It is not
+/// `completed`: a scheduler that cannot read its spool was indistinguishable
+/// from a healthy idle one in the metrics an alert reads (#1812). The counts
+/// still describe the schedules that ran.
 pub const SCHEDULER_OUTCOMES: &[&str] = &[
     "completed",
     "config_error",
     "permit_held",
     "lock_skipped",
     "fault",
+    SPOOL_UNREADABLE_LABEL,
 ];
 
 /// Recognised values for the `reason` attribute on the
@@ -188,6 +203,10 @@ pub const SCHEDULER_SKIP_REASONS: &[&str] = &[
     "config_error",
     "history_unavailable",
     "state_busy",
+    // Not a per-demand reason the reconciler produces: the tick synthesises
+    // one skip for the whole webhook source when the spool cannot be read,
+    // exactly as `rocky tick --output json` does (#1812).
+    SPOOL_UNREADABLE_LABEL,
 ];
 
 /// Recognised warehouse-adapter values for [`ADAPTER_NAME`] /

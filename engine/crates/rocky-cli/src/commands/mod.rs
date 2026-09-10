@@ -74,6 +74,7 @@ pub mod schedule_status;
 pub mod scheduler;
 mod seed;
 mod serve;
+mod shadow_lifecycle;
 mod shell;
 mod skip_gate;
 mod snapshot;
@@ -122,8 +123,8 @@ pub use compact::{run_compact, run_compact_apply, run_compact_catalog, run_measu
 pub use compare::compare;
 pub use compile::{compile_output, run_compile};
 pub use completions::run_completions;
-pub use compliance::run_compliance;
-pub use cost::run_cost;
+pub use compliance::{compute_compliance, run_compliance};
+pub use cost::{CostGroupBy, compute_cost, run_cost};
 pub use dag::{dag_output, run_dag};
 pub use discover::discover;
 pub use docs::run_docs;
@@ -163,6 +164,8 @@ pub use policy::{run_policy_check, run_policy_freeze, run_policy_test};
 pub use preview::{
     PreviewDiffAlgorithmSelector, run_preview_cost, run_preview_create, run_preview_diff,
 };
+#[cfg(test)]
+pub(crate) use preview_rows::PREPARE_HOLD_FOR_TEST;
 pub use preview_rows::{PreviewFailure, compute_preview_rows, run_preview_rows};
 pub use product::{
     run_product_approve, run_product_compile, run_product_journal, run_product_list,
@@ -199,7 +202,7 @@ pub use test::run_declarative_tests;
 pub use test::{run_test, test_output};
 pub use test_adapter::{run_test_adapter, run_test_adapter_builtin};
 pub use tick::run_tick;
-pub use trace::run_trace;
+pub use trace::{compute_trace, run_trace};
 pub use validate::validate;
 pub use validate_migration::run_validate_migration;
 pub use watch::run_watch;

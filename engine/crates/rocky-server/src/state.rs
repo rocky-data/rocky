@@ -16,6 +16,24 @@ use rocky_core::dag_status::DagStatusStore;
 use crate::auth::ServeToken;
 use crate::schema_cache_throttle::SchemaCacheThrottle;
 
+/// How long `GET /api/v1/models/{name}/rows` waits for a sample before
+/// answering `504 sample_timeout`, unless [`ServerState::set_sample_timeout`]
+/// changed it. The query itself may keep running past it: cancelling one is
+/// adapter-specific and is not in this package, which the guide says plainly.
+pub const DEFAULT_SAMPLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What one [`ServerState::recompile`] invocation found: its own outcome,
+/// not a re-read of the shared fields after the fact (#1823).
+#[derive(Debug, Clone, Default)]
+pub struct RecompileOutcome {
+    /// Why the project config could not be read, when it could not. The
+    /// compile still ran (#1625); the project-level checks were silent.
+    pub config_error: Option<String>,
+    /// Why the compile produced no result, when it did not. `None` means a
+    /// result was published.
+    pub compile_error: Option<String>,
+}
+
 /// Shared server state holding the latest compilation result.
 pub struct ServerState {
     pub models_dir: PathBuf,
@@ -34,6 +52,50 @@ pub struct ServerState {
     pub contracts_dir: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
     pub compile_result: RwLock<Option<CompileResult>>,
+    /// Why the LAST compile produced no result, when it did not (#1823).
+    ///
+    /// `recompile` runs in the background and used to log a failed compile
+    /// and carry on; `compile_result` then held either nothing or an earlier
+    /// compile's result, and every reader of "no result" — `GET
+    /// /api/v1/project`, the SPA — presented a project whose models cannot
+    /// be read as clean: no diagnostics, `has_errors: false`. This is the
+    /// third state beside "compiled clean" and "compiled with errors":
+    /// "the compile did not complete", with its reason. Set by every
+    /// failing exit of `recompile` (a compile error, a panicked compile
+    /// task); cleared by a compile that produces a result.
+    ///
+    /// `compile_result` is cleared WITH it. A failed compile used to leave
+    /// the previous compile's result in place, so the model, lineage and
+    /// DAG routes went on serving models the project no longer has as
+    /// current while the project route said the compile failed. "No
+    /// result" now means no result: those routes answer `engine_not_ready`
+    /// until a compile succeeds again. (The LSP is not a reason to keep it:
+    /// it has its own compile state.)
+    ///
+    /// Written under [`Self::compile_gate`] and always in the order failure
+    /// lock, then result lock. A reader that wants the pair one recompile
+    /// published takes the failure read guard and HOLDS it while reading the
+    /// result (the project route does): the writer needs the failure write
+    /// lock first, so it waits, and the reader sees both old or both new.
+    /// Reading the failure, releasing it, and then reading the result can
+    /// pair an earlier failure with a newer result.
+    pub compile_failure: RwLock<Option<String>>,
+    /// Serialises [`Self::recompile`]: the constructor's background compile,
+    /// the file watcher and concurrent `POST /api/v1/compile` requests all
+    /// call it, and two compiles in flight at once could publish each
+    /// other's outcome — one's failure recorded after the other's success
+    /// cleared it, or the reverse. One at a time, and each returns its own
+    /// [`RecompileOutcome`] rather than re-reading the shared fields.
+    compile_gate: tokio::sync::Mutex<()>,
+    /// Test hook: the first `recompile` on THIS state that finds it set
+    /// signals `reached` and then waits on `hold` before publishing, so a
+    /// test can have a second recompile queue behind the gate and observe
+    /// the shared pair while a compile has finished but not yet published
+    /// (#1823, round two). Taken on first use, so one invocation holds; per
+    /// state, so no other test's compile can be caught by it.
+    #[cfg(test)]
+    pub(crate) publish_hold:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     /// Latest DAG execution status, exposed at `GET /api/v1/dag/status`.
     pub dag_status: DagStatusStore,
     /// App-level single-mutating-job guard for the HTTP job model. A second
@@ -107,9 +169,35 @@ pub struct ServerState {
     /// with `Retry-After`, because queueing behind a possible 30 seconds is
     /// worse for it than a fast refusal.
     pub warehouse_samples: Arc<tokio::sync::Semaphore>,
+    /// The sample deadline, in milliseconds: [`DEFAULT_SAMPLE_TIMEOUT`]
+    /// unless [`ServerState::set_sample_timeout`] changed it. An atomic
+    /// rather than a constructor argument because the state is handed out as
+    /// an `Arc` (and cloned into the initial compile) before a test can reach
+    /// it (#1816).
+    sample_timeout_ms: std::sync::atomic::AtomicU64,
+}
+
+/// A duration as whole milliseconds, saturating rather than truncating.
+fn millis(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 impl ServerState {
+    /// How long the samples route waits before answering `504 sample_timeout`.
+    pub fn sample_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.sample_timeout_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Change the sample deadline for every later request. Tests shorten it
+    /// to watch the deadline fire; nothing in the server itself calls this.
+    pub fn set_sample_timeout(&self, timeout: std::time::Duration) {
+        self.sample_timeout_ms
+            .store(millis(timeout), std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Create new server state and perform initial compilation.
     ///
     /// Defaults to the LSP-style configuration (no token, empty CORS
@@ -184,6 +272,10 @@ impl ServerState {
             webhook,
             ui,
             compile_result: RwLock::new(None),
+            compile_failure: RwLock::new(None),
+            compile_gate: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            publish_hold: std::sync::Mutex::new(None),
             dag_status: DagStatusStore::new(),
             mutation_permit: crate::jobs::MutationPermit::new(),
             jobs: crate::jobs::JobRegistry::new(),
@@ -193,6 +285,7 @@ impl ServerState {
             store_access: Arc::new(tokio::sync::Semaphore::new(1)),
             review_diffs: Arc::new(tokio::sync::Semaphore::new(1)),
             warehouse_samples: Arc::new(tokio::sync::Semaphore::new(1)),
+            sample_timeout_ms: std::sync::atomic::AtomicU64::new(millis(DEFAULT_SAMPLE_TIMEOUT)),
         });
 
         // Initial compile
@@ -205,33 +298,73 @@ impl ServerState {
     }
 
     /// Recompile the project and update the stored result.
-    pub async fn recompile(&self) {
+    ///
+    /// Returns this invocation's own [`RecompileOutcome`]: the reason the
+    /// project config could not be READ, when that is what happened (`None`
+    /// covers both "it loaded" and "there is none" — a project with no
+    /// `rocky.toml` is an ordinary project, not a failure), and the reason
+    /// the compile produced no result, when it did not (#1823). Invocations
+    /// are serialised on [`Self::compile_gate`], so the outcome a caller gets
+    /// is the outcome of the compile it asked for, never a concurrent one's.
+    ///
+    /// `serve` keeps compiling on an unreadable config, which is a contract
+    /// rather than an accident (#1625): a resident server watching a
+    /// directory should not go dark because someone is mid-edit in
+    /// `rocky.toml`. What it must not do is what it did — carry on silently,
+    /// so a caller cannot tell "this project declares no masks" from "the
+    /// file that declares them could not be parsed". The reason now rides
+    /// out on a W013 diagnostic and on this return value.
+    pub async fn recompile(&self) -> RecompileOutcome {
+        let _one_at_a_time = self.compile_gate.lock().await;
         info!(models_dir = %self.models_dir.display(), "compiling project");
+
+        // ONE read of `rocky.toml` for the whole recompile. It used to be
+        // loaded twice — here and again inside the schema-cache loader —
+        // and each copy decided independently what a broken config meant.
+        // That per-caller decision is the defect #1625 is about, so there
+        // is now one snapshot and one decision.
+        let project_config =
+            rocky_core::config::load_optional_project_config(self.config_path.as_deref());
+
+        let config_unreadable = match &project_config {
+            // `Ok(None)` is "no rocky.toml", which is an ordinary fact
+            // about the project rather than a failure to read one.
+            Ok(_) => None,
+            Err(e) => {
+                let path = self
+                    .config_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "rocky.toml".to_string());
+                warn!(error = %e, config = %path, "rocky.toml could not be read");
+                Some(format!("{path} could not be read: {e}"))
+            }
+        };
+        let project_config = project_config.ok().flatten();
 
         // Load cached source schemas so the server's hover/inlay-hint
         // surfaces typecheck against real warehouse types when the cache
         // is warm. Degrades to empty on cold cache, missing state.redb,
         // or `[cache.schemas] enabled = false`. See
         // `rocky-cli::source_schemas` for the CLI equivalent.
-        let source_schemas = self.load_cached_source_schemas().await;
+        let schema_cache_config = project_config
+            .as_ref()
+            .map(|c| c.cache.schemas.clone())
+            .unwrap_or_default();
+        let source_schemas = self.load_cached_source_schemas(schema_cache_config).await;
 
-        // Load `[mask]` + `[classifications.allow_unmasked]` (W004) and the
-        // `[freshness]` default bit (W005) from rocky.toml, mirroring the
-        // CLI compile path. Without a config_path (or on a parse error) both
-        // come through empty and the checks stay silent — matching standalone
-        // `rocky compile --models models/`.
-        let (mask, allow_unmasked, project_freshness) = match &self.config_path {
-            Some(path) => match rocky_core::config::load_rocky_config(path) {
-                Ok(cfg) => (
-                    cfg.mask.clone(),
-                    cfg.classifications.allow_unmasked.clone(),
-                    cfg.freshness.clone(),
-                ),
-                Err(e) => {
-                    debug!(error = %e, "rocky.toml load failed; W004/W005 will be silent");
-                    (Default::default(), Vec::new(), Default::default())
-                }
-            },
+        // `[mask]` + `[classifications.allow_unmasked]` (W004) and the
+        // `[freshness]` default bit (W005), mirroring the CLI compile path.
+        // With no rocky.toml these come through empty and the checks stay
+        // silent — matching standalone `rocky compile --models models/`.
+        // With an UNREADABLE one they also come through empty, but that is
+        // now reported rather than assumed equivalent.
+        let (mask, allow_unmasked, project_freshness) = match &project_config {
+            Some(cfg) => (
+                cfg.mask.clone(),
+                cfg.classifications.allow_unmasked.clone(),
+                cfg.freshness.clone(),
+            ),
             None => (Default::default(), Vec::new(), Default::default()),
         };
 
@@ -259,27 +392,96 @@ impl ServerState {
                 Ok(r) => r,
                 Err(join_err) => {
                     warn!(error = %join_err, "compile task join failed");
-                    return;
+                    let reason = format!("the compile task did not complete: {join_err}");
+                    self.publish_failure(reason.clone()).await;
+                    return RecompileOutcome {
+                        config_error: config_unreadable,
+                        compile_error: Some(reason),
+                    };
                 }
             };
 
+        #[cfg(test)]
+        {
+            let hold = self
+                .publish_hold
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some((reached, hold)) = hold {
+                reached.notify_one();
+                hold.notified().await;
+            }
+        }
+
         match compile_result {
-            Ok(result) => {
+            Ok(mut result) => {
+                // The compiler never saw the config, so it cannot raise
+                // this itself. Attach W013 to the stored result so every
+                // reader of `compile_result` — the diagnostics counts on
+                // `GET /api/v1/meta`, the browser UI — sees that the
+                // project-level checks were silent because the file could
+                // not be parsed, not because the project declares nothing.
+                if let Some(ref reason) = config_unreadable {
+                    result
+                        .diagnostics
+                        .push(rocky_compiler::diagnostic::Diagnostic::warning(
+                            rocky_compiler::diagnostic::W013,
+                            "rocky.toml",
+                            format!(
+                                "{reason}. The models still compile, but the project-level \
+                                 checks are silent: masking (W004), the project [freshness] \
+                                 default (W005), and the cached warehouse schemas all came \
+                                 through empty."
+                            ),
+                        ));
+                }
                 let model_count = result.project.model_count();
                 let diag_count = result.diagnostics.len();
                 let has_errors = result.has_errors;
-                *self.compile_result.write().await = Some(result);
+                {
+                    // Failure lock first, then result: the order every
+                    // two-lock reader uses, so it sees both old or both new.
+                    let mut failure = self.compile_failure.write().await;
+                    *self.compile_result.write().await = Some(result);
+                    *failure = None;
+                }
                 info!(
                     models = model_count,
                     diagnostics = diag_count,
                     has_errors,
                     "compilation complete"
                 );
+                RecompileOutcome {
+                    config_error: config_unreadable,
+                    compile_error: None,
+                }
             }
             Err(e) => {
+                // Logged, as before — and RECORDED (#1823), so a reader of
+                // the state can tell "the compile failed" from "nothing to
+                // report". The warning alone left `GET /api/v1/project` and
+                // the SPA describing a project whose models cannot be read as
+                // clean.
                 warn!(error = %e, "compilation failed");
+                let reason = e.to_string();
+                self.publish_failure(reason.clone()).await;
+                RecompileOutcome {
+                    config_error: config_unreadable,
+                    compile_error: Some(reason),
+                }
             }
         }
+    }
+
+    /// Record that the compile produced no result, and drop the previous
+    /// result with it (#1823): "no result" means no result, so the routes
+    /// that read one answer `engine_not_ready` rather than serve models the
+    /// project no longer has. Lock order as in [`Self::compile_failure`].
+    async fn publish_failure(&self, reason: String) {
+        let mut failure = self.compile_failure.write().await;
+        *self.compile_result.write().await = None;
+        *failure = Some(reason);
     }
 
     /// Load the schema-cache-backed `source_schemas` map for this
@@ -288,19 +490,17 @@ impl ServerState {
     /// server observes exactly the same file that `rocky run` writes to
     /// (unified default — `<models>/.rocky-state.redb` — with the legacy
     /// CWD fallback for existing projects).
+    ///
+    /// `schema_cache_config` comes from the caller's single `rocky.toml`
+    /// snapshot rather than a second read of the file. This used to load the
+    /// config again and `unwrap_or_default()` the error, making it the second
+    /// place in one function that independently decided a broken config meant
+    /// "defaults" (#1625). Absent a config it still falls back to the
+    /// defaults (enabled + 24h TTL), so zero-config projects mirror the CLI.
     async fn load_cached_source_schemas(
         &self,
+        schema_cache_config: rocky_core::config::SchemaCacheConfig,
     ) -> HashMap<String, Vec<rocky_compiler::types::TypedColumn>> {
-        // Config lookup: fall back to defaults (enabled + 24h TTL) when
-        // no rocky.toml is wired in, so LSP/server behaviour mirrors the
-        // CLI for zero-config projects.
-        let schema_cache_config = match &self.config_path {
-            Some(path) => rocky_core::config::load_rocky_config(path)
-                .map(|c| c.cache.schemas)
-                .unwrap_or_default(),
-            None => rocky_core::config::SchemaCacheConfig::default(),
-        };
-
         if !schema_cache_config.enabled {
             return HashMap::new();
         }
@@ -426,6 +626,259 @@ mod tests {
             w004_count(result),
             0,
             "allow_unmasked must suppress W004 in the server compile path"
+        );
+    }
+
+    /// #1823. A compile that FAILS — here the `models` entry is a dangling
+    /// symlink, which the walker refuses since #1817 — was logged and
+    /// dropped: `compile_result` stayed `None`, and every reader of `None`
+    /// took it for "nothing to report". The failure is recorded now, with
+    /// its reason, and a compile that produces a result clears it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_compile_is_recorded_and_a_later_success_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::os::unix::fs::symlink(dir.path().join("gone"), &models_dir).unwrap();
+        let state = ServerState::new(models_dir.clone(), None, None);
+
+        let outcome = state.recompile().await;
+        assert!(
+            outcome.compile_error.is_some(),
+            "the invocation reports its own failure: {outcome:?}"
+        );
+        let failure = state
+            .compile_failure
+            .read()
+            .await
+            .clone()
+            .expect("a compile that produced no result is recorded, not just logged");
+        assert!(
+            failure.contains("models"),
+            "the reason names what could not be read: {failure}"
+        );
+        assert!(
+            state.compile_result.read().await.is_none(),
+            "precondition: there is no result to read"
+        );
+
+        // Repair the project: the link becomes a directory with one model.
+        std::fs::remove_file(&models_dir).unwrap();
+        std::fs::create_dir(&models_dir).unwrap();
+        std::fs::write(models_dir.join("users.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("users.toml"),
+            "name = \"users\"\n\n[target]\ncatalog = \"demo\"\nschema = \"main\"\ntable = \"users\"\n",
+        )
+        .unwrap();
+        let outcome = state.recompile().await;
+        assert!(outcome.compile_error.is_none(), "{outcome:?}");
+        assert!(
+            state.compile_failure.read().await.is_none(),
+            "a compile that produced a result clears the recorded failure"
+        );
+        assert!(state.compile_result.read().await.is_some());
+
+        // Break it again: the failure is recorded AND the previous result is
+        // dropped with it, so no reader serves the old models as current.
+        std::fs::remove_dir_all(&models_dir).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("gone"), &models_dir).unwrap();
+        let outcome = state.recompile().await;
+        assert!(outcome.compile_error.is_some(), "{outcome:?}");
+        assert!(
+            state.compile_result.read().await.is_none(),
+            "a failed compile does not leave the previous compile's result in place"
+        );
+    }
+
+    /// #1823, round two. Two recompiles in flight at once used to publish
+    /// each other's outcome: B's success could clear A's failure before A
+    /// recorded it, or A's failure could land after B's success and describe
+    /// a project B had just compiled. Recompiles are serialised on
+    /// `compile_gate` now, and each returns its own outcome.
+    ///
+    /// The hook holds A after its compile finished and before it publishes;
+    /// B, asked for while A is held, must queue behind the gate rather than
+    /// run beside it. While A is held the shared pair is untouched, A's
+    /// outcome is A's, B's is B's, and the state that stands at the end is
+    /// the outcome of the LAST compile asked for.
+    ///
+    /// The deterministic proof is the gate itself: while A is held, the gate
+    /// is locked, so `try_lock` fails; with the gate gone it succeeds. The
+    /// pair check while A is held is a second observation, not a proof: a
+    /// B that ran beside A would usually have published within the wait,
+    /// but a slow B could still be compiling. Without the gate the ordinary
+    /// schedule is B publishing first and A's stale failure landing on top.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overlapping_recompiles_are_serialised_and_each_reports_its_own_outcome() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::os::unix::fs::symlink(dir.path().join("gone"), &models_dir).unwrap();
+        let state = ServerState::new(models_dir.clone(), None, None);
+
+        // The constructor spawns a background compile of its own. Let it
+        // finish and record its failure before arming the hold, so the hold
+        // catches A and not that compile.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while state.compile_failure.read().await.is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the constructor's compile never finished"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // A: the broken project. Held after its compile, before publication.
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let hold = Arc::new(tokio::sync::Notify::new());
+        *state.publish_hold.lock().unwrap() = Some((Arc::clone(&reached), Arc::clone(&hold)));
+        let a = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { state.recompile().await })
+        };
+        tokio::time::timeout(Duration::from_secs(20), reached.notified())
+            .await
+            .expect("A reaches the publish point");
+
+        // Repair the project under A, and ask for B. B must wait for A.
+        std::fs::remove_file(&models_dir).unwrap();
+        std::fs::create_dir(&models_dir).unwrap();
+        std::fs::write(models_dir.join("users.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("users.toml"),
+            "name = \"users\"\n\n[target]\ncatalog = \"demo\"\nschema = \"main\"\ntable = \"users\"\n",
+        )
+        .unwrap();
+        let b = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { state.recompile().await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The proof that B is queued behind A and not running beside it: A
+        // holds the gate for the whole of its compile, including this hold,
+        // so nobody else can take it. Deterministic, whatever B's timing.
+        assert!(
+            state.compile_gate.try_lock().is_err(),
+            "the gate is not held while A compiles, so B can run beside it"
+        );
+
+        // A second observation, timing-dependent: nothing has changed since
+        // A started. The pair is still the constructor's failure, and B's
+        // success is not there. Read the pair the way the project route
+        // does: failure guard held across the result.
+        {
+            let failure = state.compile_failure.read().await;
+            let result = state.compile_result.read().await;
+            assert!(
+                failure.is_some() && result.is_none(),
+                "B ran beside A instead of queueing behind it: its success is already published"
+            );
+        }
+
+        // Release A. A publishes its failure; B then compiles the repaired
+        // project and publishes its success.
+        hold.notify_one();
+        let a = tokio::time::timeout(Duration::from_secs(20), a)
+            .await
+            .expect("A finishes")
+            .unwrap();
+        let b = tokio::time::timeout(Duration::from_secs(20), b)
+            .await
+            .expect("B finishes")
+            .unwrap();
+        assert!(a.compile_error.is_some(), "A's outcome is A's: {a:?}");
+        assert!(b.compile_error.is_none(), "B's outcome is B's: {b:?}");
+
+        // The last compile asked for was B's, and B's is what stands.
+        let failure = state.compile_failure.read().await;
+        let result = state.compile_result.read().await;
+        assert!(
+            failure.is_none() && result.is_some(),
+            "the state that stands is the last compile's, not a stale failure landing on it"
+        );
+    }
+
+    /// The case #1625 is about, on the `serve` side.
+    ///
+    /// A `rocky.toml` that is present and unparseable used to be swallowed
+    /// by `debug!` + defaults. The compile then ran with an empty `[mask]`,
+    /// an empty `allow_unmasked` and no project `[freshness]`, and every
+    /// reader — `POST /api/v1/compile`, the diagnostics counts, the UI —
+    /// was told the same thing as a project that genuinely declares none of
+    /// those. `serve` still compiles (a resident server must not go dark
+    /// mid-edit), but it now says WHY the project-level checks are silent.
+    #[tokio::test]
+    async fn an_unreadable_config_is_reported_rather_than_treated_as_absent() {
+        // Valid enough to exist, invalid as TOML.
+        let (_dir, models_dir, config_path) = pii_project("[classifications\nnot = toml\n");
+        let state = ServerState::new(models_dir, None, Some(config_path.clone()));
+
+        let reason = state.recompile().await.config_error.expect(
+            "a present-but-unparseable rocky.toml must be reported; returning None would \
+             make POST /api/v1/compile answer plain success after degrading",
+        );
+        assert!(
+            reason.contains(&config_path.display().to_string()),
+            "the reason must name the file to fix, got: {reason}"
+        );
+
+        let guard = state.compile_result.read().await;
+        let result = guard.as_ref().expect("compile result");
+
+        // The contract: still usable. Serve does not refuse.
+        assert!(
+            result.project.model_count() > 0,
+            "serve must keep compiling the models on a broken config"
+        );
+
+        // And the silence is visible to every reader of `compile_result`.
+        let w013: Vec<&str> = result
+            .diagnostics
+            .iter()
+            .filter(|d| &*d.code == "W013")
+            .map(|d| &*d.message)
+            .collect();
+        assert_eq!(
+            w013.len(),
+            1,
+            "exactly one W013 must reach the stored result; without it the compile \
+             is indistinguishable from a project that declares nothing"
+        );
+    }
+
+    /// The other half, and the reason W013 cannot simply fire whenever the
+    /// project inputs are empty: a project with NO `rocky.toml` is an
+    /// ordinary project. Squiggling it would make the warning noise.
+    #[tokio::test]
+    async fn a_project_with_no_config_is_not_reported_as_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let mut sql = std::fs::File::create(models_dir.join("users.sql")).unwrap();
+        write!(sql, "SELECT 1 AS id").unwrap();
+        let mut sidecar = std::fs::File::create(models_dir.join("users.toml")).unwrap();
+        write!(
+            sidecar,
+            "name = \"users\"\n\n[target]\ncatalog = \"demo\"\nschema = \"main\"\ntable = \"users\"\n"
+        )
+        .unwrap();
+
+        // No `rocky.toml` written at this path.
+        let state = ServerState::new(models_dir, None, Some(dir.path().join("rocky.toml")));
+        assert!(
+            state.recompile().await.config_error.is_none(),
+            "an ABSENT rocky.toml is a fact about the project, not a failure to read one"
+        );
+
+        let guard = state.compile_result.read().await;
+        let result = guard.as_ref().expect("compile result");
+        assert!(
+            !result.diagnostics.iter().any(|d| &*d.code == "W013"),
+            "W013 must not fire on a project that simply has no config"
         );
     }
 

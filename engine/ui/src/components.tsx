@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { clipHead, clipMiddle } from "./format";
 
 /** Trust-signal tone, the idiom the VS Code Inspector uses. */
 export type Tone = "ok" | "warn" | "risk" | "muted" | "pending";
@@ -41,6 +42,31 @@ export function StatusCard({
         <div className="mt-0.5 text-xs text-zinc-500 dark:text-zinc-400">{sub}</div>
       )}
     </div>
+  );
+}
+
+/**
+ * A long identifier cut for a cell, with the full value in `title`.
+ *
+ * The marker is its own element, rendered only when something was cut, and
+ * dimmed so it reads as the screen's mark and not the value's text. A value
+ * that happens to end in "…" renders that character as plain text, so a
+ * reader — and a test — can tell the two apart (#1815). `keepEnds` keeps both
+ * ends for a compound id whose tail distinguishes it (#1756).
+ */
+export function Clip({ value, keepEnds = false }: { value: string; keepEnds?: boolean }) {
+  const clipped = keepEnds ? clipMiddle(value) : clipHead(value);
+  if (!clipped.clipped) {
+    return <span title={value}>{clipped.text}</span>;
+  }
+  return (
+    <span title={value}>
+      {clipped.head}
+      <span data-clipped="" aria-hidden="true" className="text-zinc-400 dark:text-zinc-500">
+        …
+      </span>
+      {clipped.tail}
+    </span>
   );
 }
 

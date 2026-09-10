@@ -24,6 +24,9 @@ class ProjectDiagnosticsOutput(BaseModel):
     """
 
     has_errors: bool
+    """
+    `true` when the compile reported an error-severity diagnostic — and also when the last compile produced no result at all (`compile_error` on the project), with `total` and `warnings` at zero: "did not compile" is never "no errors" (#1823).
+    """
     total: conint(ge=0)
     warnings: conint(ge=0)
 
@@ -76,6 +79,10 @@ class ProjectOutput(BaseModel):
     """
     Every `[adapter.<name>]`, in config order.
     """
+    compile_error: str | None = None
+    """
+    Why the last compile produced no result, when it did not: the models could not be read, a model failed to load, the compile task panicked. While this stands `models_compiled` is absent and `diagnostics.has_errors` is `true`, whatever an earlier compile found: a project whose models cannot be compiled is not a clean project, and counts from a compile that no longer describes it are not shown beside its failure (#1823). Absent when the last compile produced a result, and before the first compile finishes.
+    """
     config_error: str | None = None
     """
     Why the config could not be loaded, when it could not. The lists below are then empty.
@@ -94,7 +101,7 @@ class ProjectOutput(BaseModel):
     """
     models_compiled: conint(ge=0) | None = None
     """
-    Models in the in-memory compile result; `null` before the first compile finishes.
+    Models in the in-memory compile result. Absent (not `null`) before the first compile finishes and while `compile_error` stands; absent with no `compile_error` is the pending state, which the browser UI shows as pending rather than as zero diagnostics.
     """
     name: str
     """

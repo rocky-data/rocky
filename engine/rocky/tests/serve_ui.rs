@@ -1,10 +1,27 @@
-//! The real `rocky serve --ui` on the playground: the printed address carries
-//! the token, the page is served with its headers and without a token, and
-//! the API behind it still wants one.
+//! What `rocky serve` gives the browser UI.
 //!
-//! This test exists only in a build with the `ui` feature (the CI `ui` job
-//! builds `engine/ui/dist` first and runs `cargo test --features ui`); a
-//! plain `cargo test` compiles an empty file here.
+//! Two tests, and they need different things from the build:
+//!
+//! - The page itself: the printed address carries the token, the page is
+//!   served with its headers and without a token, and the API behind it
+//!   still wants one. This one needs `engine/ui/dist` in the binary, so it
+//!   returns early when the embed is empty.
+//! - The click path: which DAG node the model route can serve, and under
+//!   which of its two names. This one asks only the API, so it never skips.
+//!
+//! Both live in a build with the `ui` feature; a plain `cargo test` compiles
+//! an empty file here. Locally:
+//!
+//! ```text
+//! cargo test --features ui --test serve_ui
+//! ```
+//!
+//! In CI the job that runs them is **`Test`**, through `cargo nextest run
+//! --all-features` (`engine-ci.yml`), which turns the feature on. That job
+//! never builds `engine/ui/dist`, so the page test above takes its early
+//! return there and only the click test does real work. The `Browser UI` job
+//! is node only and has no Rust toolchain; the release-build smoke does embed
+//! a real page, but it runs curl rather than this binary.
 
 #![cfg(feature = "ui")]
 
@@ -12,6 +29,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+
+use rocky_core::unified_dag::NodeKind;
 
 fn rocky() -> Command {
     Command::new(env!("CARGO_BIN_EXE_rocky"))
@@ -177,4 +196,325 @@ fn real_server_prints_the_token_address_and_serves_the_public_page() {
         raw.starts_with("HTTP/1.0 421") || raw.starts_with("HTTP/1.1 421"),
         "{raw}"
     );
+}
+
+/// The click path, against the live API rather than a fixture.
+///
+/// The SPA's DAG panel opens a model's pane by asking
+/// `GET /api/v1/models/{name}`. Which node can answer that, and under which
+/// of its two names, is the whole of D1: the route searches the compiled
+/// model set, so only a transformation node is there, and it is there under
+/// its `label`, never under its `kind:`-prefixed `id`.
+///
+/// This test needs no page, only the API, so it does **not** pass `--ui` and
+/// does **not** skip when `engine/ui/dist` is absent. That is what lets CI's
+/// `Test` job run it, since that job never builds the page.
+///
+/// The match in [`servable`] is exhaustive on purpose. A new variant in
+/// `unified_dag.rs` fails this file to compile, which is the one mechanical
+/// link this package has between the engine's kinds and the click path.
+#[test]
+fn only_a_transformation_node_is_servable_and_only_under_its_label() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("project");
+    let out = rocky()
+        .args(["playground", root.to_str().unwrap()])
+        .output()
+        .expect("spawn rocky playground");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let config = root.join("rocky.toml");
+    widen_to_seven_kinds(&root, &config);
+
+    let port = TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port();
+    // No `--ui` and no `--token`: a loopback server with no token needs no
+    // auth, and the page this test never asks for is what needs the embed.
+    let child = rocky()
+        .current_dir(&root)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "serve",
+            "--port",
+            &port.to_string(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn rocky serve");
+    let server = Server(child);
+    let _keep_alive = &server;
+    wait_for_health(port);
+    // `/health` and `/dag` both answer before the project has compiled:
+    // `health` is an unconditional handler and `full_dag` gates only on
+    // `config_path`, which is set at construction. The model routes gate on
+    // `compile_result`, and `serve` merely sleeps 100ms for the compile it
+    // spawned. So without this latch a slow compile answers the first model
+    // request `503 engine_not_ready`, which is neither the 200 nor the 404
+    // this test asserts, and every assertion below fails on timing alone.
+    wait_for_compiled_models(port);
+
+    let (status, _, body) = http_get(port, "/api/v1/dag", "");
+    assert!(status.contains("200"), "{status}: {body}");
+    let dag: serde_json::Value = serde_json::from_str(&body).expect("a JSON DAG");
+    let nodes = dag["nodes"].as_array().expect("nodes").clone();
+    assert!(!nodes.is_empty(), "the DAG has no nodes: {body}");
+
+    let mut kinds_seen = std::collections::BTreeSet::new();
+    let mut servable_labels = Vec::new();
+    for node in &nodes {
+        let id = node["id"].as_str().expect("a node id");
+        let label = node["label"].as_str().expect("a node label");
+        // An unclassified kind fails here: `NodeKind` is the engine's own
+        // enum, so a string it does not name will not deserialize.
+        let kind: NodeKind = serde_json::from_value(node["kind"].clone())
+            .unwrap_or_else(|e| panic!("unclassified node kind {}: {e}", node["kind"]));
+        kinds_seen.insert((
+            node["kind"].as_str().expect("a kind string").to_string(),
+            id.to_string(),
+            label.to_string(),
+        ));
+
+        let (label_status, _, label_body) = http_get(
+            port,
+            &format!("/api/v1/models/{}", percent_encode(label)),
+            "",
+        );
+        let (id_status, _, _) =
+            http_get(port, &format!("/api/v1/models/{}", percent_encode(id)), "");
+
+        if servable(kind) {
+            assert!(
+                label_status.contains("200"),
+                "{kind:?} {label:?} should be servable: {label_status}: {label_body}"
+            );
+            servable_labels.push(label.to_string());
+        } else {
+            assert!(
+                label_status.contains("404"),
+                "{kind:?} {label:?} should not be servable: {label_status}: {label_body}"
+            );
+        }
+        // The id is never the name the route wants — not even for the one
+        // kind that is servable. This is the defect the panel used to have.
+        assert!(
+            id_status.contains("404"),
+            "{kind:?} id {id:?} should always 404: {id_status}"
+        );
+    }
+
+    servable_labels.sort();
+    assert_eq!(
+        servable_labels,
+        vec!["customer_orders", "raw_orders", "revenue_summary"],
+        "the playground's three models, each under its bare label"
+    );
+    // Without several kinds the loop above proves only one branch, and the set
+    // is read from the fixture the SPA's own tests run against rather than
+    // written out here, so the two cannot drift apart unnoticed.
+    //
+    // Every node is compared by kind, id AND label, not by kind alone. A kind
+    // set would still match after a node was added, removed or renamed, which
+    // is most of what a stale capture looks like. What is deliberately NOT
+    // compared is the rest of the payload — edges, targets, the engine version
+    // string — because that is release churn, not drift the SPA can see. What
+    // the SPA reads from this fixture is exactly these three fields.
+    assert_eq!(
+        kinds_seen,
+        nodes_in_ui_fixture(),
+        "the live DAG and engine/ui/src/test/fixtures/dag-mixed-kinds.json \
+         disagree about their nodes (kind, id, label); recapture the fixture \
+         (its README says how) or fix the project this test builds"
+    );
+}
+
+/// Every node in the capture the SPA's tests read, as (kind, id, label).
+///
+/// The fixture is recorded by hand from a real `rocky serve` — no script
+/// regenerates it — so nothing but this comparison keeps it honest.
+fn nodes_in_ui_fixture() -> std::collections::BTreeSet<(String, String, String)> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../ui/src/test/fixtures/dag-mixed-kinds.json");
+    let raw =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let dag: serde_json::Value = serde_json::from_str(&raw).expect("the fixture is JSON");
+    dag["nodes"]
+        .as_array()
+        .expect("the fixture has nodes")
+        .iter()
+        .map(|n| {
+            let field = |name: &str| {
+                n[name]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("every fixture node has a {name}"))
+                    .to_string()
+            };
+            (field("kind"), field("id"), field("label"))
+        })
+        .collect()
+}
+
+/// Which node kinds `GET /api/v1/models/{label}` can answer.
+///
+/// Exhaustive with no wildcard: a new [`NodeKind`] variant must be decided
+/// here, and the same table lives in `engine/ui/src/estate/nodeRoute.ts`.
+fn servable(kind: NodeKind) -> bool {
+    match kind {
+        // The only kind whose label names a compiled model.
+        NodeKind::Transformation => true,
+        // A pipeline name, a seed name, a test label, or a phrase with a
+        // space in it — none of them are in `Project.models`.
+        NodeKind::Source
+        | NodeKind::Replication
+        | NodeKind::Quality
+        | NodeKind::Snapshot
+        | NodeKind::Load
+        | NodeKind::Seed
+        | NodeKind::Test => false,
+    }
+}
+
+/// Grow `rocky playground` (three models) into a project that emits seven of
+/// the engine's eight node kinds. The eighth, `Replication`, cannot be
+/// configured: the parser expands a replication pipeline into `Source` +
+/// `Load` and keeps the variant only to read stored DAGs.
+fn widen_to_seven_kinds(root: &std::path::Path, config: &std::path::Path) {
+    let mut toml = std::fs::OpenOptions::new()
+        .append(true)
+        .open(config)
+        .expect("open rocky.toml");
+    toml.write_all(
+        br#"
+[pipeline.ecommerce]
+type = "replication"
+strategy = "full_refresh"
+timestamp_column = "_updated_at"
+
+[pipeline.ecommerce.source.discovery]
+adapter = "default"
+
+[pipeline.ecommerce.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.ecommerce.target]
+catalog_template = "playground"
+schema_template = "staging__{source}"
+
+[pipeline.nightly_dq]
+type = "quality"
+
+[pipeline.nightly_dq.target]
+adapter = "default"
+
+[[pipeline.nightly_dq.tables]]
+catalog = "playground"
+schema = "main"
+table = "raw_orders"
+
+[pipeline.nightly_dq.checks]
+enabled = true
+row_count = true
+
+[pipeline.customer_history]
+type = "snapshot"
+unique_key = ["customer_id"]
+updated_at = "updated_at"
+
+[pipeline.customer_history.source]
+catalog = "playground"
+schema = "main"
+table = "customer_orders"
+
+[pipeline.customer_history.target]
+catalog = "playground"
+schema = "snapshots"
+table = "customer_orders_history"
+"#,
+    )
+    .expect("append pipelines");
+
+    let mut sidecar = std::fs::OpenOptions::new()
+        .append(true)
+        .open(root.join("models/revenue_summary.toml"))
+        .expect("open the model sidecar");
+    sidecar
+        .write_all(
+            br#"
+[[tests]]
+type = "not_null"
+column = "customer_id"
+"#,
+        )
+        .expect("append a declarative test");
+
+    std::fs::create_dir_all(root.join("seeds")).expect("seeds dir");
+    std::fs::write(
+        root.join("seeds/country_codes.csv"),
+        "code,name\nUS,United States\nPT,Portugal\n",
+    )
+    .expect("write a seed");
+}
+
+/// Percent-encode one path segment, as `encodeURIComponent` does for the
+/// SPA. Two node labels carry a space (`ecommerce (source)`), which would
+/// otherwise end the request line early.
+fn percent_encode(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for byte in segment.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// Block until the compile the server spawned at start-up has landed.
+///
+/// `GET /api/v1/models` reads the same `compile_result` the per-model route
+/// reads, so a `200` here is the readiness the model assertions need. Before
+/// it lands the route answers `503 engine_not_ready`, which would fail an
+/// assertion that expects `200` or `404`.
+fn wait_for_compiled_models(port: u16) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let (status, _, _) = http_get(port, "/api/v1/models", "");
+        if status.contains("200") {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the project never compiled; /api/v1/models last said {status}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Block until the server answers `/api/v1/health`, or fail the test.
+fn wait_for_health(port: u16) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            let (status, _, _) = http_get(port, "/api/v1/health", "");
+            if status.contains("200") {
+                return;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rocky serve did not come up on {port}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }

@@ -96,6 +96,12 @@ jobs:
           # (2026-08-20) and turn required checks red with no code change,
           # while cache-busting every Rust job at once. Bump deliberately.
           toolchain: 1.98.0
+          # `cargo-llvm-cov` reads the raw profile data with the toolchain's
+          # own `llvm-profdata` / `llvm-cov`, which ship in this component.
+          # It would install the component itself on first run; asking for it
+          # here keeps the dependency visible and resolved against the SAME
+          # pinned toolchain.
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: engine
@@ -104,11 +110,16 @@ jobs:
           # every PR restores from. Latency does not matter on a schedule.
           save-if: false
       # Headroom for the coverage build, which is the largest thing this
-      # repository builds anywhere. It buys back roughly 25 GB and it is NOT
-      # enough: the instrumented build needs ~105 GB and still fills the
-      # 145 GB disk, so this job remains red. See #1638 — closing it means
-      # changing what the job is (a bigger runner, per-crate runs, or a
-      # different coverage engine), not freeing more space.
+      # repository builds anywhere. Buys back roughly 25 GB.
+      #
+      # Under tarpaulin this was not enough and the job was red from
+      # 2026-08-24: `-Clink-dead-code`, which tarpaulin forces and cannot be
+      # talked out of, took the instrumented build to ~105 GB of a 145 GB
+      # disk. The linker writes through `mmap`, so filling it faults rather
+      # than returning ENOSPC — which is why six weeks of logs carry
+      # `signal 7` and never `No space left`. #1638 replaced the engine
+      # rather than the disk. The reclaim stays: it is cheap, and it is what
+      # gives the numbers below something to be early warning about.
       - name: Free disk space and add swap
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
@@ -116,10 +127,23 @@ jobs:
                       /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force || true
           sudo fallocate -l 4G /mnt/swapfile && sudo chmod 600 /mnt/swapfile && sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile || true
-      - run: sudo apt-get update && sudo apt-get install -y cmake
-      - name: Install cargo-tarpaulin
+      # `apt-get update` exits non-zero when ANY configured source serves a
+      # bad index, including the third-party ones the GitHub runner image
+      # ships (Google Chrome, Microsoft). On 2026-09-09 Chrome's repo served
+      # a stale `Packages.gz` and every engine job died here before
+      # compiling a line. Neither cmake nor the cross toolchain comes from
+      # those repos, so they are removed first — and cmake is usually
+      # preinstalled, so the whole block is skipped.
+      - name: Install cmake
+        run: |
+          command -v cmake >/dev/null 2>&1 && exit 0
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
+          sudo apt-get update
+          sudo apt-get install -y cmake
+      - name: Install cargo-llvm-cov
         # Pinned + --locked for the same reason as cargo-audit above.
-        run: cargo install cargo-tarpaulin --version 0.31.2 --locked
+        run: cargo install cargo-llvm-cov --version 0.9.1 --locked
       # Kept permanently. Every failure since 2026-08-24 carried a bus error
       # and no word about the machine it happened on, and the cause turned
       # out to be the one thing these two numbers show immediately. Headroom
@@ -129,13 +153,29 @@ jobs:
           df -h / /mnt /tmp || true
           free -m || true
       - name: Run coverage
-        # No --all-targets: that pulls the criterion benches into the run, and
-        # the `binary_startup` bench shells out to `cargo run` on every
-        # iteration. Under tarpaulin's ptrace instrumentation that subprocess
-        # never returns (it contends on the target/ lock) and the bench blows
-        # the --timeout, failing the whole job. tarpaulin's default target set
-        # (lib + bins + tests) is what we want coverage for anyway.
-        run: cargo tarpaulin --timeout 600 --out xml --output-dir coverage/
+        # Source-based instrumentation, not ptrace: no `-Clink-dead-code`,
+        # no forced `-Cdebuginfo=2`, and the profile is honoured. That is
+        # what removes every term in the disk blow-up above (#1638).
+        #
+        # No --all-targets, for the reason it never had one: that pulls in
+        # the criterion benches, and `binary_startup` shells out to
+        # `cargo run` on every iteration, contending on the target/ lock.
+        # The default target set (lib + bins + tests) is what we want
+        # coverage for anyway.
+        #
+        # The total is NOT comparable to the 2026-08-17 tarpaulin baseline
+        # (run 32012139494): the denominator changes when dead code is no
+        # longer linked in. Read the first green run as the new baseline.
+        run: |
+          mkdir -p coverage
+          cargo llvm-cov --workspace --cobertura \
+            --output-path coverage/cobertura.xml
+      - name: Coverage summary
+        # The cobertura file goes to an artifact nobody opens unless they
+        # are already looking. Print the number too, so the run itself says
+        # what it measured. `report` re-renders the profile data the step
+        # above already produced — it does not re-run the tests.
+        run: cargo llvm-cov report --summary-only
       - name: Machine state after coverage
         # `always()` so a failing coverage step still reports. Note the
         # limit: when the disk fills hard enough the runner AGENT dies, and
@@ -176,7 +216,20 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           sudo fallocate -l 4G /mnt/swapfile && sudo chmod 600 /mnt/swapfile && sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile || true
-      - run: sudo apt-get update && sudo apt-get install -y cmake
+      # `apt-get update` exits non-zero when ANY configured source serves a
+      # bad index, including the third-party ones the GitHub runner image
+      # ships (Google Chrome, Microsoft). On 2026-09-09 Chrome's repo served
+      # a stale `Packages.gz` and every engine job died here before
+      # compiling a line. Neither cmake nor the cross toolchain comes from
+      # those repos, so they are removed first — and cmake is usually
+      # preinstalled, so the whole block is skipped.
+      - name: Install cmake
+        run: |
+          command -v cmake >/dev/null 2>&1 && exit 0
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
+          sudo apt-get update
+          sudo apt-get install -y cmake
       - name: Build rocky binary
         working-directory: engine
         run: cargo build --release

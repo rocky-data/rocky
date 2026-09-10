@@ -12,6 +12,19 @@ export function ProjectStrip({ project, now }: { project: ProjectOutput; now?: n
     : project.diagnostics.warnings > 0
       ? "warn"
       : "ok";
+  // A compile that produced no result is its own state, with its reason:
+  // the counts would describe a compile that no longer exists (#1823). And
+  // before the first compile finishes there is nothing to count yet: that
+  // is pending, not "0 diagnostics" in the healthy tone.
+  const compilePending = project.models_compiled == null && !project.compile_error;
+  const compileTone = compilePending ? "pending" : diagnosticsTone;
+  const compileSub = project.compile_error
+    ? `compile failed: ${project.compile_error}`
+    : compilePending
+      ? "compile pending"
+      : `${project.diagnostics.total} diagnostics, ${project.diagnostics.warnings} warnings${
+          project.diagnostics.has_errors ? ", errors" : ""
+        }`;
   const list = (items: { name: string; kind: string }[]) =>
     items.length === 0 ? "none" : items.map((item) => `${item.name} (${item.kind})`).join(", ");
 
@@ -37,10 +50,8 @@ export function ProjectStrip({ project, now }: { project: ProjectOutput; now?: n
         <StatusCard
           label="models compiled"
           value={orNotRecorded(project.models_compiled)}
-          tone={diagnosticsTone}
-          sub={`${project.diagnostics.total} diagnostics, ${project.diagnostics.warnings} warnings${
-            project.diagnostics.has_errors ? ", errors" : ""
-          }`}
+          tone={compileTone}
+          sub={compileSub}
         />
       </div>
       <StatusCard

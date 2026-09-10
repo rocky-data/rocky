@@ -45,16 +45,7 @@ pub fn run_compliance(
     fail_on_exception: bool,
     json: bool,
 ) -> Result<()> {
-    let cfg = rocky_core::config::load_rocky_config(config_path)
-        .with_context(|| format!("failed to load Rocky config from {}", config_path.display()))?;
-
-    let models = if models_dir.exists() {
-        load_all_models(models_dir, Some(&cfg.freshness))?
-    } else {
-        Vec::new()
-    };
-
-    let output = build_report(&cfg, &models, env, exceptions_only);
+    let output = compute_compliance(config_path, models_dir, env, exceptions_only)?;
 
     if json {
         print_json(&output)?;
@@ -67,6 +58,33 @@ pub fn run_compliance(
     }
 
     Ok(())
+}
+
+/// The typed payload behind `rocky compliance`: the classification-versus-
+/// masking rollup for one project.
+///
+/// This is the one producer of [`ComplianceOutput`]. The CLI renders it and
+/// decides its exit code; a server route can serve it unchanged. No
+/// warehouse I/O.
+///
+/// The models directory goes straight to the shared loader, which tells
+/// "no `models/` yet" (an empty report, the honest answer) apart from "a
+/// `models` that is there but cannot be read" — a dangling symlink, an
+/// unreadable ancestor — which is an error (#1822). An `exists()` check in
+/// front of the loader used to fold the second case into the first: a
+/// broken models path reported "no classified columns found".
+pub fn compute_compliance(
+    config_path: &Path,
+    models_dir: &Path,
+    env: Option<&str>,
+    exceptions_only: bool,
+) -> Result<ComplianceOutput> {
+    let cfg = rocky_core::config::load_rocky_config(config_path)
+        .with_context(|| format!("failed to load Rocky config from {}", config_path.display()))?;
+
+    let models = load_all_models(models_dir, Some(&cfg.freshness))?;
+
+    Ok(build_report(&cfg, &models, env, exceptions_only))
 }
 
 /// Pure resolver — separated from I/O so it's unit-testable against
@@ -273,6 +291,45 @@ mod tests {
     use rocky_core::models::{Model, ModelConfig, StrategyConfig, TargetConfig};
     use rocky_ir::MaskStrategy;
     use std::collections::BTreeMap;
+
+    const MINIMAL_CONFIG: &str = "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+         [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+         [pipeline.p.target.governance]\nauto_create_schemas = true\n";
+
+    /// No `models/` at all is the honest empty report — the case the old
+    /// `exists()` guard was written for, kept.
+    #[test]
+    fn compute_compliance_reports_an_absent_models_dir_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(&config_path, MINIMAL_CONFIG).unwrap();
+
+        let out =
+            compute_compliance(&config_path, &dir.path().join("models"), None, false).unwrap();
+        assert_eq!(out.command, "compliance");
+        assert!(out.per_column.is_empty(), "nothing to classify");
+        assert!(out.exceptions.is_empty());
+    }
+
+    /// A `models` that IS there but cannot be read is not an empty project:
+    /// with the `exists()` guard back in front of the loader, this reports
+    /// "no classified columns found" for a broken path (#1822's class).
+    #[cfg(unix)]
+    #[test]
+    fn compute_compliance_refuses_a_dangling_models_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(&config_path, MINIMAL_CONFIG).unwrap();
+        let models_dir = dir.path().join("models");
+        std::os::unix::fs::symlink(dir.path().join("gone"), &models_dir).unwrap();
+
+        let err = compute_compliance(&config_path, &models_dir, None, false).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("cannot be read") || text.contains("cannot be resolved"),
+            "a dangling models link must refuse, not report an empty estate: {text}"
+        );
+    }
 
     fn make_model(name: &str, classifications: &[(&str, &str)]) -> Model {
         let mut classification = BTreeMap::new();

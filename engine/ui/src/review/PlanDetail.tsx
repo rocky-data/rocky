@@ -4,9 +4,9 @@ import type { BreakingFinding, ReviewOutput } from "@rocky-types/review";
 import type { ReviewQueueEntry, ReviewQueueOutput } from "@rocky-types/review_queue";
 import type { ReviewStatusOutput } from "@rocky-types/review_status";
 import { apiGet } from "../api";
-import { StatusCard } from "../components";
+import { Clip, StatusCard } from "../components";
 import { type Resource, useResource } from "../estate/useResource";
-import { formatInstant, shortId } from "../format";
+import { formatInstant } from "../format";
 import { CustodyLink } from "../governor/links";
 import { ResourceState } from "./ResourceState";
 import { SamplePanel } from "./SamplePanel";
@@ -25,15 +25,63 @@ export const defaultPlanLoaders: PlanLoaders = {
   product: (name) => apiGet<ProductStatusOutput>(`products/${encodeURIComponent(name)}`),
 };
 
-/**
- * What the samples route will accept as a model name — the same shape as
- * `rocky_sql::validation::validate_identifier` (`^[a-zA-Z0-9_]+$`).
- */
-const MODEL_NAME = /^[a-zA-Z0-9_]+$/;
-
 /** A `product:<name>` identity reduced to the name the products route takes. */
 export function productNameFromId(productId: string): string {
   return productId.startsWith("product:") ? productId.slice("product:".length) : productId;
+}
+
+/**
+ * What the queue says about one plan. Three answers, because the queue is a
+ * resource and a resource has three ways to stand: it named the plan, it was
+ * read and did not name it, or it could not be read. Only the middle one is
+ * "not in the queue". The last is unknown, and unknown is never shown as
+ * absent: a queue refused with `engine_busy` says nothing about whether the
+ * plan is in it, and a screen that said "no longer in the queue" beside that
+ * refusal was asserting what it could not know (#1815).
+ *
+ * A present plan carries EVERY row that names it. The apply-time gate records
+ * one decision per touched model and the queue keeps one row per (plan,
+ * model), so a plan over two models under two rules pends twice, with two
+ * reasons. Keeping the first row showed one reason beside a command that
+ * clears both (#1815).
+ */
+export type QueueLookup =
+  | { kind: "unknown"; queue: Resource<ReviewQueueOutput> }
+  | { kind: "absent" }
+  | { kind: "present"; entries: ReviewQueueEntry[] };
+
+export function lookupQueueEntry(
+  queue: Resource<ReviewQueueOutput>,
+  planId: string,
+): QueueLookup {
+  if (queue.kind !== "ready") return { kind: "unknown", queue };
+  const entries = queue.value.pending.filter((row) => row.plan_id === planId);
+  return entries.length === 0 ? { kind: "absent" } : { kind: "present", entries };
+}
+
+/** The distinct compiled models a plan's rows name, in the queue's order. */
+export function modelsNamedBy(entries: ReviewQueueEntry[]): string[] {
+  return Array.from(new Set(entries.flatMap((entry) => entry.models)));
+}
+
+/**
+ * The distinct models the samples route would read for a plan's rows. The
+ * engine decides this per row under the route's own admission rules
+ * (`preview_model`); a graph key in `models` is for ranking and audit and is
+ * not a licence to read — a dotted name, a model a restore plan recorded
+ * that is gone from the project, a model that no longer compiles are all
+ * keys the route refuses (#1815).
+ */
+export function previewTargetsOf(entries: ReviewQueueEntry[]): string[] {
+  return Array.from(
+    new Set(
+      entries.flatMap((entry) =>
+        entry.preview_model === null || entry.preview_model === undefined
+          ? []
+          : [entry.preview_model],
+      ),
+    ),
+  );
 }
 
 /** One breaking finding as a sentence, from the tagged union the engine emits. */
@@ -142,7 +190,11 @@ function SpecDrift({
       <StatusCard
         label="the spec it was planned against"
         value="unchanged"
-        sub={`Still ${shortId(planned)}.`}
+        sub={
+          <>
+            Still <Clip value={planned} />.
+          </>
+        }
       />
     );
   }
@@ -151,37 +203,32 @@ function SpecDrift({
       label="the spec it was planned against"
       value="the spec moved"
       tone="risk"
-      sub={`Planned against ${shortId(planned)}; the product is now ${shortId(
-        current,
-      )}. Applying this plan would be refused, because apply checks the digest.`}
+      sub={
+        <>
+          Planned against <Clip value={planned} />; the product is now <Clip value={current} />.
+          Applying this plan would be refused, because apply checks the digest.
+        </>
+      }
     />
   );
 }
 
-function Escalation({
-  entry,
-  queue,
-  planId,
-}: {
-  entry: ReviewQueueEntry | null;
-  queue: Resource<ReviewQueueOutput>;
-  planId: string;
-}) {
+function Escalation({ lookup, planId }: { lookup: QueueLookup; planId: string }) {
   // "The queue does not name this plan" and "the queue could not be read" are
   // different facts, and only the first is safe to state. Collapsing them told
   // a reader that an escalation had been resolved when the server had in fact
   // refused the request.
-  if (queue.kind !== "ready") {
+  if (lookup.kind === "unknown") {
     return (
       <section aria-label="Why it needs a human" className="space-y-2">
         <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
           Why it needs a human
         </h3>
-        <ResourceState resource={queue} loadingLine="reading the review queue…" />
+        <ResourceState resource={lookup.queue} loadingLine="reading the review queue…" />
       </section>
     );
   }
-  if (entry === null) {
+  if (lookup.kind === "absent") {
     return (
       <StatusCard
         label="why it needs a human"
@@ -190,30 +237,49 @@ function Escalation({
       />
     );
   }
+  const { entries } = lookup;
   return (
-    <section aria-label="Why it needs a human" className="space-y-2">
+    <section aria-label="Why it needs a human" className="space-y-3">
       <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
         Why it needs a human
       </h3>
-      <p className="text-sm text-zinc-800 dark:text-zinc-200">{entry.reason}</p>
-      <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-zinc-600 sm:grid-cols-4 dark:text-zinc-300">
-        <div>
-          <dt className="text-zinc-500 dark:text-zinc-400">capability</dt>
-          <dd>{entry.capability}</dd>
+      {entries.length > 1 && (
+        <p className="text-xs text-zinc-600 dark:text-zinc-300">
+          {entries.length} escalations name this plan, one per model policy stopped. Approving
+          the plan clears all of them.
+        </p>
+      )}
+      {entries.map((entry) => (
+        <div key={entry.decision_ref} className="space-y-2">
+          <p className="text-sm text-zinc-800 dark:text-zinc-200">{entry.reason}</p>
+          <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-zinc-600 sm:grid-cols-5 dark:text-zinc-300">
+            <div>
+              <dt className="text-zinc-500 dark:text-zinc-400">model</dt>
+              <dd className="font-mono break-all">{entry.model}</dd>
+            </div>
+            <div>
+              <dt className="text-zinc-500 dark:text-zinc-400">capability</dt>
+              <dd>{entry.capability}</dd>
+            </div>
+            <div>
+              <dt className="text-zinc-500 dark:text-zinc-400">principal</dt>
+              <dd>{entry.principal}</dd>
+            </div>
+            <div>
+              <dt className="text-zinc-500 dark:text-zinc-400">rule</dt>
+              <dd>
+                {entry.rule_id === undefined || entry.rule_id === null
+                  ? "the default effect"
+                  : `#${entry.rule_id}`}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-zinc-500 dark:text-zinc-400">blast radius</dt>
+              <dd>{entry.blast_radius ?? "not computed"}</dd>
+            </div>
+          </dl>
         </div>
-        <div>
-          <dt className="text-zinc-500 dark:text-zinc-400">principal</dt>
-          <dd>{entry.principal}</dd>
-        </div>
-        <div>
-          <dt className="text-zinc-500 dark:text-zinc-400">rule</dt>
-          <dd>{entry.rule_id === undefined || entry.rule_id === null ? "the default effect" : `#${entry.rule_id}`}</dd>
-        </div>
-        <div>
-          <dt className="text-zinc-500 dark:text-zinc-400">blast radius</dt>
-          <dd>{entry.blast_radius ?? "not computed"}</dd>
-        </div>
-      </dl>
+      ))}
       <p className="text-xs text-zinc-600 dark:text-zinc-300">
         Every decision recorded about this plan: <CustodyLink subject={planId} />
       </p>
@@ -221,7 +287,13 @@ function Escalation({
   );
 }
 
-function HowToApprove({ status, entry }: { status: ReviewStatusOutput; entry: ReviewQueueEntry | null }) {
+function HowToApprove({
+  status,
+  entries,
+}: {
+  status: ReviewStatusOutput;
+  entries: ReviewQueueEntry[];
+}) {
   if (status.reviewed) {
     return (
       <StatusCard
@@ -233,18 +305,88 @@ function HowToApprove({ status, entry }: { status: ReviewStatusOutput; entry: Re
       />
     );
   }
-  const command = entry?.approve_command ?? `rocky review ${status.plan_id} --approve`;
+  // Every row of one plan carries the same command: approval is per plan.
+  const command = entries[0]?.approve_command ?? `rocky review ${status.plan_id} --approve`;
   return (
     <section aria-label="How to approve" className="space-y-2">
       <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">How to approve</h3>
       <p className="text-xs text-zinc-600 dark:text-zinc-300">
         Approving happens in a terminal, on purpose: the marker records a git identity, and this
         page holds a read-only token. Copy the command.
+        {entries.length > 1 ? ` It clears every one of the ${entries.length} escalations above.` : ""}
       </p>
       <pre className="overflow-x-auto rounded bg-zinc-50 p-2 font-mono text-xs dark:bg-zinc-800">
         {command}
       </pre>
     </section>
+  );
+}
+
+/**
+ * Why there is no sample panel, said only as far as the payloads support.
+ *
+ * Absent is not empty. A missing panel reads as "this plan touches no data";
+ * this says instead which fact is missing, and it is a different fact each
+ * time: the queue named several models, or none; the product could not be
+ * read; the queue could not be read. Only when the queue was READ and does
+ * not name the plan, and no product names a model, does the screen say the
+ * plan has left the queue — that is the one case it knows (#1815).
+ */
+function SampleFallback({
+  lookup,
+  productId,
+  product,
+}: {
+  lookup: QueueLookup;
+  productId: string | null;
+  product: Resource<ProductStatusOutput>;
+}) {
+  const pending = (resource: Resource<unknown>, loadingLine: string) => (
+    <section aria-label="Sample rows" className="space-y-2">
+      <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Sample rows</h3>
+      <p className="text-xs text-zinc-600 dark:text-zinc-300">
+        Which model to sample is not known yet.
+      </p>
+      <ResourceState resource={resource} loadingLine={loadingLine} />
+    </section>
+  );
+  if (lookup.kind === "unknown") {
+    return pending(lookup.queue, "reading the review queue…");
+  }
+  if (productId !== null && product.kind !== "ready") {
+    return pending(product, "reading the product…");
+  }
+  if (lookup.kind === "present") {
+    const { entries } = lookup;
+    const named = modelsNamedBy(entries);
+    const subjects = entries.map((entry) => `${entry.capability} "${entry.model}"`).join(", ");
+    let sub: string;
+    if (named.length === 0) {
+      // The engine could not vouch for a compiled model behind the row: its
+      // subject is not one (a replication target, a label), the model is
+      // gone, or the compile could not name it. The screen does not guess
+      // which.
+      sub = `The queue names no compiled model for this plan (${subjects}), so there is nothing to read rows from. Sample from the estate screen instead.`;
+    } else if (named.length > 1) {
+      sub = `This plan touches ${named.length} models: ${named.join(", ")}. Sample each from the estate screen instead.`;
+    } else {
+      // One model named, and no preview target offered for it: the samples
+      // route would refuse it. The engine applied the route's own rules;
+      // the screen repeats them rather than guessing which one bit.
+      sub = `The samples route would read none of the models this plan names (${named.join(", ")}): it reads one model at a time, in the current project, with no compile errors and not time-interval. Sample from the estate screen instead.`;
+    }
+    return <StatusCard label="sample rows" value="no single model to sample" sub={sub} />;
+  }
+  return (
+    <StatusCard
+      label="sample rows"
+      value="no single model to sample"
+      sub={
+        productId !== null
+          ? "The plan is no longer in the review queue and its product names no output model, so there is nothing to read rows from."
+          : "Neither the review queue nor a product names a model for this plan, so there is nothing to read rows from. A plan that is not product-bound and no longer in the queue has no model on this screen."
+      }
+    />
   );
 }
 
@@ -284,43 +426,47 @@ export function PlanDetail({
     return (
       <section aria-label="The plan" className="space-y-3">
         <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-          Plan <span title={planId}>{shortId(planId)}</span>
+          Plan <Clip value={planId} />
         </h2>
         <ResourceState resource={status} loadingLine="reading the plan…" />
       </section>
     );
   }
 
-  const entry =
-    queue.kind === "ready"
-      ? (queue.value.pending.find((row) => row.plan_id === planId) ?? null)
-      : null;
-  // Which model to sample. The queue entry names it, but the queue is not a
-  // durable source: an approval marker resolves the escalation, so the entry
-  // disappears the moment the plan is signed off — and that is exactly when
-  // the table it built starts existing. Reading the queue alone meant the
-  // panel could never show real rows for a product's first plan: before the
-  // approval there is no table, and after it there is no entry.
+  const lookup = lookupQueueEntry(queue, planId);
+  const entries = lookup.kind === "present" ? lookup.entries : [];
+  // Which model to sample. Each row's `models` is the set of compiled models
+  // the engine vouches for — the real names, kept apart from `model`, which
+  // is display text ("backfill: 3 model(s)", a replication target's table
+  // name) and is never parsed here. A regex on it once decided a label was a
+  // name, and `backfill_3_models` would have sampled a real model of that
+  // name (#1815). The panel takes the plan's rows together, and only when
+  // the engine says the samples route would read exactly one model for them
+  // (`preview_model`, decided under that route's own admission rules).
   //
-  // The product's own status carries `output_model`, and this screen already
+  // The queue is not a durable source: an approval marker resolves the
+  // escalation, so the entry disappears the moment the plan is signed off —
+  // and that is exactly when the table it built starts existing. The
+  // product's own status carries `output_model`, and this screen already
   // reads it for the spec-drift card, so the fallback costs no request.
-  //
-  // The queue entry's `model` is not always a model name. A backfill escalation
-  // puts a display sentence there — "backfill: 3 model(s)" — and feeding that to
-  // the samples route earns a 400 `invalid_model_name` on every click. So take
-  // the field only when it could be a name. The server stays the authority
-  // (`rocky_sql::validation::validate_identifier`, `^[a-zA-Z0-9_]+$`); this only
-  // withholds an offer the server would refuse, so a drift here declines to ask
-  // rather than asking wrongly.
-  const named = entry?.model !== undefined && MODEL_NAME.test(entry.model) ? entry.model : null;
-  const model =
-    named ?? (product.kind === "ready" ? (product.value.output_model ?? null) : null);
+  const targets = previewTargetsOf(entries);
+  const fromQueue = targets.length === 1 ? targets[0] : null;
+  // The product's output model stands in only once the plan has LEFT the
+  // queue (approved, its table now real). While the plan is in the queue the
+  // engine has already said which model, if any, the samples route would
+  // read, and a null there is an answer — a product fallback beside it
+  // offered a read the route refuses (#1815, review round three).
+  const fromProduct =
+    lookup.kind === "absent" && product.kind === "ready"
+      ? (product.value.output_model ?? null)
+      : null;
+  const model = fromQueue ?? fromProduct;
 
   return (
     <div className="space-y-4">
       <section aria-label="The plan" className="space-y-2">
         <h2 className="font-mono text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-          <span title={planId}>{shortId(planId)}</span>
+          <Clip value={planId} />
         </h2>
         <div className="grid gap-2 sm:grid-cols-3">
           <StatusCard label="kind" value={status.value.kind} />
@@ -347,7 +493,7 @@ export function PlanDetail({
         </section>
       )}
 
-      <Escalation entry={entry} queue={queue} planId={planId} />
+      <Escalation lookup={lookup} planId={planId} />
 
       {productId !== null &&
         (product.kind === "ready" ? (
@@ -364,26 +510,10 @@ export function PlanDetail({
       {model !== null ? (
         <SamplePanel model={model} />
       ) : (
-        // Absent is not empty. A missing panel reads as "this plan touches no
-        // data"; say instead that the screen could not work out which model to
-        // sample, which is a different thing and has a different fix.
-        //
-        // Say only what the payload supports. Backfill is not the only
-        // capability whose `model` field holds a sentence — gc and restore
-        // write one too — so quote the sentence and name the capability the
-        // engine gave, rather than describing a backfill the plan may not be.
-        <StatusCard
-          label="sample rows"
-          value="no single model to sample"
-          sub={
-            entry !== null
-              ? `The queue describes this ${entry.capability} plan as "${entry.model}", which is not a model name this panel can read rows from. Sample the models it touches from the estate screen instead.`
-              : "Neither the review queue nor the product names a model for this plan, so there is nothing to read rows from. A plan that is not product-bound and no longer in the queue has no model on this screen."
-          }
-        />
+        <SampleFallback lookup={lookup} productId={productId} product={product} />
       )}
 
-      <HowToApprove status={status.value} entry={entry} />
+      <HowToApprove status={status.value} entries={entries} />
     </div>
   );
 }

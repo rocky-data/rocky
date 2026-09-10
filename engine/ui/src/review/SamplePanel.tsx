@@ -78,6 +78,12 @@ function SampleTable({ sample }: { sample: PreviewRowsOutput }) {
  * renders as itself through [`ResourceState`], because "the adapter cannot
  * express this column's mask" and "nobody consented" are different problems
  * with different fixes.
+ *
+ * Consent is given for one model. The panel is keyed on the model, so when
+ * the screen swaps the model under it — the queue answers after the product,
+ * the route names another plan — the panel remounts with consent withdrawn
+ * and the button back. Without the key a viewer who had pressed the button
+ * for model A had, in effect, pressed it for whatever came next (#1815).
  */
 export function SamplePanel({
   model,
@@ -86,6 +92,10 @@ export function SamplePanel({
   model: string;
   load?: SampleLoader;
 }) {
+  return <ConsentedSample key={model} model={model} load={load} />;
+}
+
+function ConsentedSample({ model, load }: { model: string; load: SampleLoader }) {
   const [asked, setAsked] = useState(false);
   const loader = useCallback(() => load(model), [load, model]);
   // The hook fetches on mount, so it is mounted only once the viewer asks.

@@ -1580,6 +1580,7 @@ async fn gc_seam_regate(
         principal,
         touched,
         &attrs_map,
+        crate::commands::apply::GateSubjects::CompiledModels,
         prior_decisions,
         &fresh_markers,
         false,
@@ -1771,6 +1772,7 @@ pub(crate) async fn run_gc_apply_in_with(
         models_glob.as_deref(),
         state_path,
         &marker_freezes,
+        crate::commands::apply::GateSubjects::CompiledModels,
     );
     if let PolicyGate::Deny {
         model,
@@ -4441,6 +4443,7 @@ auto_create_schemas = true
         // A ledger-only freeze row for THIS principal → deny. This is the
         // marker-blind bypass the review caught: no marker exists at all.
         let freeze = rocky_core::state::PolicyDecisionRecord {
+            keys_recorded: false,
             models: Vec::new(),
             timestamp: Utc::now(),
             plan_id: "freeze:unit".to_string(),
@@ -4567,6 +4570,7 @@ auto_create_schemas = true
                         let store = StateStore::open(&self.path).unwrap();
                         store
                             .record_policy_decision(&rocky_core::state::PolicyDecisionRecord {
+                                keys_recorded: false,
                                 models: Vec::new(),
                                 timestamp: Utc::now(),
                                 plan_id: "freeze:mid-seam".to_string(),

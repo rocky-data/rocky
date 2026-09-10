@@ -14,7 +14,7 @@
       "id": 1,
       "type": "timeseries",
       "title": "Ticks per second, by outcome",
-      "description": "rate(rocky_scheduler_ticks) by outcome — reconciliation passes the resident scheduler runs, split by how each ended (completed, config_error, permit_held, lock_skipped, fault). Summed, this is the loop's liveness signal; a flat line at zero means the loop stopped ticking. A stack dominated by config_error or fault is the alive-but-not-reconciling case the tick-errors alert catches. rocky.scheduler.ticks is a true counter (add_metric_suffixes is off in the shipped Alloy config, so it arrives as rocky_scheduler_ticks with no _total), so read it with rate(), not last-value.",
+      "description": "rate(rocky_scheduler_ticks) by outcome — reconciliation passes the resident scheduler runs, split by how each ended (completed, config_error, permit_held, lock_skipped, fault, spool_unreadable). Summed, this is the loop's liveness signal; a flat line at zero means the loop stopped ticking. A stack dominated by config_error or fault is the alive-but-not-reconciling case the tick-errors alert catches; spool_unreadable is a tick whose schedules ran but whose webhook spool could not be read, which the spool-unreadable alert catches. rocky.scheduler.ticks is a true counter (add_metric_suffixes is off in the shipped Alloy config, so it arrives as rocky_scheduler_ticks with no _total), so read it with rate(), not last-value.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
       "fieldConfig": {
@@ -83,7 +83,7 @@
       "id": 4,
       "type": "timeseries",
       "title": "Skipped demands per second, by reason",
-      "description": "rate(rocky_scheduler_skipped) split by the reason label (not_due, disabled, in_flight, catchup_skipped, failure_backoff, partial_backoff, dedup, history_unavailable, state_busy). failure_backoff / partial_backoff climbing is the fingerprint of a sick pipeline the loop is deliberately backing off.",
+      "description": "rate(rocky_scheduler_skipped) split by the reason label (not_due, disabled, paused, in_flight, catchup_skipped, failure_backoff, partial_backoff, dedup, config_error, history_unavailable, state_busy, spool_unreadable). failure_backoff / partial_backoff climbing is the fingerprint of a sick pipeline the loop is deliberately backing off.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
       "fieldConfig": {
