@@ -852,27 +852,45 @@ fn build_queue(
     // unchanged. Only the config leg above refuses, and it already ran.
     let compiled = compile_project_with_schemas(source_schemas, models_dir).ok();
 
+    // Whether the samples route would get past its own front door for this
+    // project: the strict config loader, the adapter registry, and pipeline
+    // resolution with no `pipeline` parameter (the UI sends none). The queue
+    // itself tolerates an unset credential and an absent config on purpose;
+    // the route does not, and a queue that offered a read there would be
+    // advertising an answer the route cannot give (#1815, review round
+    // three). Decided once; it is the project's, not a row's.
+    let route_front_door_open = rocky_core::config::load_rocky_config(config_path)
+        .ok()
+        .filter(|cfg| crate::registry::AdapterRegistry::from_config(cfg).is_ok())
+        .is_some_and(|cfg| crate::registry::resolve_pipeline(&cfg, None).is_ok());
+
     let mut entries: Vec<ReviewQueueEntry> = outstanding
         .into_iter()
         .map(|d| {
-            // The keys that must RESOLVE are the recorded model set — or, on
-            // an ordinary row that has none, the single `model`, which is the
-            // graph key there. `graph_keys` is deliberately not used for this:
-            // it also yields the human label so `audit --for` can match it, and
-            // a label resolves in no graph, so requiring it to resolve would
-            // make every plan-level row unknown forever.
-            let radius_keys: Vec<&str> = if d.models.is_empty() {
-                vec![d.model.as_str()]
-            } else {
-                d.models.iter().map(String::as_str).collect()
+            // One derivation serves both the ranking and the entry's `models`,
+            // so what a consumer is told the row stands for is exactly what
+            // the blast radius was computed over.
+            let models = queue_graph_keys(d, compiled.as_ref());
+            // What the samples route would read for this row, decided by the
+            // route's own admission (`preview_rows::admit_model`) and not by
+            // any consumer's reading of a name. `models` ranks and audits;
+            // only this licenses an offer to read (#1815).
+            let preview_model = match (models.as_slice(), compiled.as_ref()) {
+                ([only], Some(result)) if route_front_door_open => {
+                    crate::commands::preview_rows::admit_model(result, models_dir, only)
+                        .ok()
+                        .map(|_| only.clone())
+                }
+                _ => None,
             };
             // Deduplicated union, all-or-nothing: an absent member makes the
             // whole answer unknown rather than a partial count dressed as a
-            // measurement. See `blast_radius_union` for why union and not
-            // `max`, and why the plan's own models stay in.
+            // measurement, and no members at all is unknown too. See
+            // `blast_radius_union` for why union and not `max`, and why the
+            // plan's own models stay in.
             let blast_radius = compiled
                 .as_ref()
-                .and_then(|r| blast_radius_union(r, radius_keys.iter().copied()))
+                .and_then(|r| blast_radius_union(r, models.iter().map(String::as_str)))
                 .map(|reached| reached.len() as u64);
             let classification_weight = classification_weight(d.capability);
             let staleness_seconds = (now - d.timestamp).num_seconds().max(0);
@@ -884,6 +902,8 @@ fn build_queue(
                 principal: d.principal,
                 capability: d.capability,
                 model: d.model.clone(),
+                models,
+                preview_model,
                 rule_id: d.rule_id,
                 reason: d.reason.clone(),
                 blast_radius,
@@ -932,9 +952,17 @@ pub(crate) fn select_outstanding<'a>(
     plan_exists: impl Fn(&str) -> bool,
 ) -> (Vec<&'a PolicyDecisionRecord>, u64) {
     let mut latest: BTreeMap<(&str, &str), &PolicyDecisionRecord> = BTreeMap::new();
+    // A `deny` row is left out of the latest-row pick, so it neither queues
+    // nor supersedes. It cannot supersede: the fail-closed path records a
+    // `deny` when the ledger snapshot could not be read — an operational
+    // refusal, not a policy decision about the plan — and the row cannot say
+    // which kind it is. Letting it supersede hid an escalation the policy
+    // still required until someone retried the mutation (#1815, review round
+    // three). A superseded-by-deny escalation stays approvable, which is what
+    // it was before; approval then meets the deny at apply, loudly.
     for d in decisions
         .into_iter()
-        .filter(|d| d.effect == PolicyEffect::RequireReview)
+        .filter(|d| d.effect != PolicyEffect::Deny)
     {
         latest
             .entry((d.plan_id.as_str(), d.model.as_str()))
@@ -948,6 +976,12 @@ pub(crate) fn select_outstanding<'a>(
     let mut excluded_non_plan: u64 = 0;
     let outstanding = latest
         .into_values()
+        // The LATEST of `require_review` and `allow` per key decides. A
+        // `require_review` that a later `allow` for the same (plan, model)
+        // superseded is history: policy loosened, the plan re-ran, approving
+        // it is moot. Filtering to `require_review` BEFORE picking the
+        // latest kept such rows approvable (#1815, review round two).
+        .filter(|d| d.effect == PolicyEffect::RequireReview)
         .filter(|d| !is_reviewed(&d.plan_id))
         .filter(|d| {
             if plan_exists(&d.plan_id) {
@@ -959,6 +993,47 @@ pub(crate) fn select_outstanding<'a>(
         })
         .collect();
     (outstanding, excluded_non_plan)
+}
+
+/// The graph keys a queue row stands for — what the ranking resolves and what
+/// the entry reports as `models`, from one derivation so the two cannot drift.
+///
+/// The recorded set when there is one: producers write it when they know
+/// their subject is a compiled model (the apply-time gate, since #1815) or
+/// which models a plan-level escalation covers (#1766). Otherwise the row's
+/// bare `model` is a key only if the compiled graph has it. Nothing about the
+/// string itself can say: the same field holds a compiled model's name, a
+/// replication target's table name (gated under bare `apply`, never a model)
+/// and, on a pre-v28 plan-level row, a label — and a model name may carry a
+/// dot (`v2.fct_orders`), so an identifier check fails both ways. Two rules
+/// were tried and rejected on the record: the capability (the gate records
+/// ordinary rows with the plan's capability) and identifier syntax (admits a
+/// replication target, rejects a dotted name).
+///
+/// No keys means unknown: a subject no graph can name, a model since removed,
+/// a compile that failed, or a row from before its producer recorded the set.
+/// `graph_keys` is deliberately not used here: it also yields the label, on
+/// purpose, so `audit --for` can match it.
+///
+/// **The producer's word stands.** A row whose producer recorded its set
+/// (`keys_recorded`) is taken as written, an empty set included: the gate
+/// wrote "no compiled model" for a replication target, and resolving its
+/// bare name against the graph anyway turned a target called `orders` into
+/// the compiled model `orders` and offered its rows (#1815, review round
+/// seven). Only a row that never said — pre-v29 — is resolved by the graph.
+fn queue_graph_keys(
+    d: &PolicyDecisionRecord,
+    compiled: Option<&rocky_compiler::compile::CompileResult>,
+) -> Vec<String> {
+    if !d.models.is_empty() || d.keys_recorded {
+        return d.models.clone();
+    }
+    let in_graph = compiled.is_some_and(|r| r.semantic_graph.model_schema(&d.model).is_some());
+    if in_graph {
+        vec![d.model.clone()]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Record the "this plan awaits review" escalation for an unconditionally
@@ -993,6 +1068,8 @@ pub(crate) fn record_plan_review_escalation(
     reason: &str,
 ) {
     let record = PolicyDecisionRecord {
+        // The plan-level writer names its set on purpose.
+        keys_recorded: true,
         models,
         timestamp: Utc::now(),
         plan_id: plan_id.to_string(),
@@ -1081,6 +1158,16 @@ fn render_queue_text(out: &ReviewQueueOutput) {
             e.score,
         );
         println!("     {}", e.reason);
+        // The label above is display text; on a plan-level row the names are
+        // in `models`, and the JSON carries them, so the text does too.
+        if e.models.as_slice() != std::slice::from_ref(&e.model) {
+            let listed = if e.models.is_empty() {
+                "none the compiled graph can name".to_string()
+            } else {
+                e.models.join(", ")
+            };
+            println!("     models: {listed}");
+        }
         println!("     approve: {}", e.approve_command);
     }
 }
@@ -1337,6 +1424,7 @@ mod tests {
         cap: PolicyCapability,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            keys_recorded: false,
             models: Vec::new(),
             timestamp: Utc.with_ymd_and_hms(2026, 7, 7, 0, 0, secs).unwrap(),
             plan_id: plan_id.to_string(),
@@ -1433,6 +1521,73 @@ mod tests {
         assert_eq!(d.model, "x");
         // The newest of the two planA/x rows wins (the breaking one at secs=9).
         assert_eq!(d.capability, PolicyCapability::SchemaChangeBreaking);
+    }
+
+    /// The latest of `require_review` and `allow` per (plan, model) decides.
+    /// A `require_review` followed by an `allow` (policy loosened, plan
+    /// re-run) is moot and used to stay in the queue, because the effect
+    /// filter ran before the latest-row pick. A later `deny` does NOT
+    /// supersede: a deny may be the fail-closed refusal of an unreadable
+    /// ledger, which says nothing about the plan, and the row cannot tell
+    /// the two apart — so the escalation stays, as it always did. The
+    /// reverse orders queue: the newest row is the escalation.
+    #[test]
+    fn a_later_allow_supersedes_an_older_require_review_but_a_deny_does_not() {
+        let decisions = vec![
+            qd(
+                1,
+                "planA",
+                "x",
+                PolicyEffect::RequireReview,
+                PolicyCapability::Apply,
+            ),
+            qd(
+                5,
+                "planA",
+                "x",
+                PolicyEffect::Allow,
+                PolicyCapability::Apply,
+            ),
+            qd(
+                1,
+                "planB",
+                "y",
+                PolicyEffect::RequireReview,
+                PolicyCapability::Apply,
+            ),
+            qd(5, "planB", "y", PolicyEffect::Deny, PolicyCapability::Apply),
+            qd(
+                1,
+                "planC",
+                "z",
+                PolicyEffect::Allow,
+                PolicyCapability::Apply,
+            ),
+            qd(
+                5,
+                "planC",
+                "z",
+                PolicyEffect::RequireReview,
+                PolicyCapability::Apply,
+            ),
+            qd(1, "planD", "w", PolicyEffect::Deny, PolicyCapability::Apply),
+            qd(
+                5,
+                "planD",
+                "w",
+                PolicyEffect::RequireReview,
+                PolicyCapability::Apply,
+            ),
+        ];
+        let (out, excluded) = select_outstanding(&decisions, |_| false, |_| true);
+        assert_eq!(excluded, 0);
+        let mut plans: Vec<&str> = out.iter().map(|d| d.plan_id.as_str()).collect();
+        plans.sort_unstable();
+        assert_eq!(
+            plans,
+            vec!["planB", "planC", "planD"],
+            "an allow supersedes; a deny does not; new escalations queue"
+        );
     }
 
     /// FIX: decision-only custody rows (`draft:*`, `autoapply:*`, …) whose
@@ -2210,6 +2365,589 @@ mod tests {
                 e.plan_id
             );
         }
+        // And the entry says which it is. The pre-v28 row's `model` is a label
+        // that resolves nowhere, and the entry does not hand it over as if it
+        // were a name: `models` is empty, which is the documented "unknown".
+        let by_plan = |plan: &str| {
+            out.pending
+                .iter()
+                .find(|e| e.plan_id == plan)
+                .unwrap_or_else(|| panic!("{plan} must be listed"))
+        };
+        assert!(
+            by_plan("p_empty").models.is_empty(),
+            "a pre-v28 plan-level row reports no keys, never its label as one"
+        );
+        assert_eq!(by_plan("p_empty").model, "backfill: 2 model(s)");
+        assert_eq!(by_plan("p_gone").models, vec!["deleted_since".to_string()]);
+    }
+
+    /// The entry's `models` is the set the ranking resolved, from the same
+    /// derivation, so a consumer that wants a model NAME reads it from there
+    /// and never parses the label. Three shapes, one rule each:
+    ///
+    /// - an ordinary evaluation row: `models` is the one graph key, which is
+    ///   `model` itself;
+    /// - a plan-level row with its set: `models` is that set, and `model`
+    ///   stays the label;
+    /// - a plan-level row without one (covered above): `models` is empty.
+    ///
+    /// The UI used a `^[a-zA-Z0-9_]+$` regex on `model` to decide whether it
+    /// could sample it, which accepted `"backfill_3_models"` as a name and
+    /// would have sampled a real model of that name (#1815). Restoring the
+    /// label as the ordinary row's key, dropping the set from a plan-level
+    /// row, or deciding by capability or by identifier syntax instead of by
+    /// the compiled graph, makes this fail: the dotted model below is a real
+    /// graph key an identifier check rejects, and the replication target is
+    /// an identifier no graph has.
+    #[test]
+    fn the_entry_reports_the_graph_keys_the_ranking_resolved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let models_dir = root.join("models");
+        write_blast_graph(&models_dir);
+        let config_path = write_single_pipeline_config(root);
+        let state_path = root.join("state.redb");
+
+        // An ordinary evaluation row: `model` is the graph key, the set empty.
+        touch_plan_file(root, "ordinary");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .record_policy_decision(&qd(
+                    1,
+                    "ordinary",
+                    "a",
+                    PolicyEffect::RequireReview,
+                    PolicyCapability::SchemaChangeBreaking,
+                ))
+                .unwrap();
+        }
+        // A model whose name carries a dot. Rocky loads it as a model, the
+        // graph indexes it by that exact string, and an identifier check
+        // rejects it — so the graph, not the syntax, must decide.
+        std::fs::write(models_dir.join("v2.fct_orders.sql"), "SELECT id FROM a").unwrap();
+        std::fs::write(
+            models_dir.join("v2.fct_orders.toml"),
+            "name = \"v2.fct_orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"fct_orders\"\n",
+        )
+        .unwrap();
+        touch_plan_file(root, "dotted");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .record_policy_decision(&qd(
+                    4,
+                    "dotted",
+                    "v2.fct_orders",
+                    PolicyEffect::RequireReview,
+                    PolicyCapability::Apply,
+                ))
+                .unwrap();
+        }
+        // A replication target: gated under bare `apply` by TABLE name, which
+        // is an identifier and is not a model. It must not be handed over as
+        // one — the UI would offer to sample it, and a compiled model that
+        // happened to share the name would be what got sampled.
+        touch_plan_file(root, "replication");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .record_policy_decision(&qd(
+                    3,
+                    "replication",
+                    "raw_orders",
+                    PolicyEffect::RequireReview,
+                    PolicyCapability::Apply,
+                ))
+                .unwrap();
+        }
+        // The apply-time gate's row for a gc plan: the plan's capability, a
+        // real model name, no set. A capability-based rule called this
+        // plan-level and threw the name away; the name is the key.
+        touch_plan_file(root, "gc_applied");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .record_policy_decision(&qd(
+                    2,
+                    "gc_applied",
+                    "b",
+                    PolicyEffect::RequireReview,
+                    PolicyCapability::Gc,
+                ))
+                .unwrap();
+        }
+        // A plan-level row with its set; its `model` is a label that would
+        // pass the identifier regex the UI used to trust.
+        touch_plan_file(root, "bf");
+        record_plan_review_escalation(
+            &state_path,
+            "bf",
+            PolicyPrincipal::Agent,
+            PolicyCapability::Backfill,
+            "backfill_2_models",
+            vec!["b".to_string(), "d".to_string()],
+            "backfill plan awaits review",
+        );
+
+        let out = compute_review_queue(root, &config_path, &state_path, &models_dir)
+            .expect("the queue must rank");
+        let by_plan = |plan: &str| {
+            out.pending
+                .iter()
+                .find(|e| e.plan_id == plan)
+                .unwrap_or_else(|| panic!("{plan} must be listed"))
+        };
+        let ordinary = by_plan("ordinary");
+        assert_eq!(ordinary.model, "a");
+        assert_eq!(ordinary.models, vec!["a".to_string()]);
+        // b, c, d and the dotted model below all sit downstream of `a`.
+        assert_eq!(ordinary.blast_radius, Some(4), "ranked on `a`, the one key");
+
+        let gc_applied = by_plan("gc_applied");
+        assert_eq!(gc_applied.models, vec!["b".to_string()]);
+        assert_eq!(
+            gc_applied.blast_radius,
+            Some(1),
+            "a gc row over a real name ranks on it"
+        );
+
+        let dotted = by_plan("dotted");
+        assert_eq!(dotted.models, vec!["v2.fct_orders".to_string()]);
+        assert_eq!(
+            dotted.blast_radius,
+            Some(0),
+            "a leaf the graph has: a measured zero"
+        );
+
+        let replication = by_plan("replication");
+        assert!(
+            replication.models.is_empty(),
+            "a replication target is not a model, whatever its name looks like"
+        );
+        assert_eq!(replication.blast_radius, None);
+
+        let bf = by_plan("bf");
+        assert_eq!(bf.model, "backfill_2_models", "the label is untouched");
+        assert_eq!(bf.models, vec!["b".to_string(), "d".to_string()]);
+        // `b` reaches `c`; `d` is a leaf. Ranked on the label it would be
+        // unknown (`None`), since no graph has a model called that.
+        assert_eq!(
+            bf.blast_radius,
+            Some(1),
+            "ranked on the set, not on the label"
+        );
+
+        // A graph key is not a licence to read: the samples route refuses a
+        // dotted name, so the queue offers none — while `a` is readable, a
+        // target is not a model, and two models are not one to read.
+        assert_eq!(ordinary.preview_model.as_deref(), Some("a"));
+        assert_eq!(dotted.preview_model, None);
+        assert_eq!(replication.preview_model, None);
+        assert_eq!(bf.preview_model, None);
+    }
+
+    /// `preview_model` follows the samples route's own admission, not the
+    /// graph's: a model a restore plan recorded that is gone from the current
+    /// project, and a model that no longer compiles, are graph keys the route
+    /// would refuse, so no offer is made. Deciding from `models` alone makes
+    /// this fail.
+    #[test]
+    fn the_entry_offers_a_read_only_where_the_samples_route_would_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let models_dir = root.join("models");
+        write_blast_graph(&models_dir);
+        let config_path = write_single_pipeline_config(root);
+        // A model whose SQL does not parse: in the project, with an error.
+        std::fs::write(models_dir.join("shaky.sql"), "SELECT FROM WHERE").unwrap();
+        std::fs::write(
+            models_dir.join("shaky.toml"),
+            "name = \"shaky\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"shaky\"\n",
+        )
+        .unwrap();
+        let state_path = root.join("state.redb");
+
+        // A restore plan's recorded set names a tombstoned model the current
+        // project no longer has.
+        touch_plan_file(root, "restore_gone");
+        record_plan_review_escalation(
+            &state_path,
+            "restore_gone",
+            PolicyPrincipal::Human,
+            PolicyCapability::Restore,
+            "restore: gone (abc123…)",
+            vec!["gone".to_string()],
+            "restore plan awaits review",
+        );
+        touch_plan_file(root, "shaky_plan");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .record_policy_decision(&qd(
+                    1,
+                    "shaky_plan",
+                    "shaky",
+                    PolicyEffect::RequireReview,
+                    PolicyCapability::Apply,
+                ))
+                .unwrap();
+        }
+
+        let out = compute_review_queue(root, &config_path, &state_path, &models_dir)
+            .expect("a model that fails to parse degrades the ranking, it does not refuse");
+        let by_plan = |plan: &str| out.pending.iter().find(|e| e.plan_id == plan).unwrap();
+        assert_eq!(by_plan("restore_gone").models, vec!["gone".to_string()]);
+        assert_eq!(
+            by_plan("restore_gone").preview_model,
+            None,
+            "not in the current project"
+        );
+        assert_eq!(
+            by_plan("shaky_plan").preview_model,
+            None,
+            "the route refuses compile errors"
+        );
+    }
+
+    /// The samples route has a front door the queue must not promise past:
+    /// the strict config loader, the adapter registry, and pipeline
+    /// resolution with no name. With two pipelines the UI (which sends no
+    /// `pipeline`) would get `pipeline_error` on every click; with no config
+    /// at all, `config_error`. The queue still ranks — its own tolerance is
+    /// deliberate and pinned elsewhere — but offers no read. Dropping the
+    /// front-door check makes this fail.
+    #[test]
+    fn the_entry_offers_no_read_where_the_routes_front_door_is_shut() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let models_dir = root.join("models");
+        write_blast_graph(&models_dir);
+        let state_path = root.join("state.redb");
+        touch_plan_file(root, "ordinary");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .record_policy_decision(&qd(
+                    1,
+                    "ordinary",
+                    "a",
+                    PolicyEffect::RequireReview,
+                    PolicyCapability::Apply,
+                ))
+                .unwrap();
+        }
+
+        // No config at all: the queue ranks, the route would refuse.
+        let out = compute_review_queue(root, &root.join("rocky.toml"), &state_path, &models_dir)
+            .expect("the queue ranks without a config");
+        assert_eq!(
+            out.pending[0].models,
+            vec!["a".to_string()],
+            "still a graph key"
+        );
+        assert_eq!(
+            out.pending[0].preview_model, None,
+            "no config, no front door"
+        );
+
+        // Two pipelines: the route cannot pick one without a name.
+        let config_path = root.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.p.target.governance]\nauto_create_schemas = true\n\n\
+             [pipeline.q]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.q.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        let out = compute_review_queue(root, &config_path, &state_path, &models_dir)
+            .expect("the queue ranks with two pipelines");
+        assert_eq!(
+            out.pending[0].preview_model, None,
+            "two pipelines, no name: shut"
+        );
+
+        // One pipeline: open, and `a` is readable.
+        write_single_pipeline_config(root);
+        let out = compute_review_queue(root, &config_path, &state_path, &models_dir)
+            .expect("the queue ranks with one pipeline");
+        assert_eq!(out.pending[0].preview_model.as_deref(), Some("a"));
+    }
+
+    /// A config the samples route's front door accepts: the strict loader,
+    /// the adapter registry, and pipeline resolution with no name. The queue
+    /// tolerates more than the route does, so a queue that offers a read
+    /// without this would be advertising an answer the route cannot give.
+    fn write_single_pipeline_config(root: &Path) -> std::path::PathBuf {
+        let config_path = root.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.p.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        config_path
+    }
+
+    /// `blast_radius_union` over no names is `None`, not `Some(∅)`: an empty
+    /// union would report as a measured zero for a row that named nothing.
+    /// The queue reaches this through a pre-v28 plan-level row, and the test
+    /// above pins the queue's answer; this one pins the function's, so the
+    /// guard cannot quietly move to one caller.
+    /// **The producer binds the contract.** This drives the real apply-time
+    /// gate, not a hand-built row: with a policy that escalates every agent
+    /// apply, a touched set holding a compiled model and a replication-target
+    /// name records two rows under ONE plan. The compiled model's row carries
+    /// its own key; the target's carries none, because the gate could not
+    /// name a model for it. The queue then reports exactly that, and lists
+    /// both rows — one per (plan, model), never one per plan.
+    ///
+    /// Restoring `models: Vec::new()` in the gate's record makes the first
+    /// assertion fail; making the queue accept any identifier makes the
+    /// target's assertion fail.
+    #[test]
+    fn the_apply_gate_records_a_compiled_models_key_and_no_key_for_a_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let models_dir = root.join("models");
+        write_blast_graph(&models_dir);
+        let state_path = root.join("state.redb");
+        let config_path = root.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.p.target.governance]\nauto_create_schemas = true\n\n\
+             [policy]\nversion = 1\ndefault_agent_effect = \"require_review\"\n",
+        )
+        .unwrap();
+
+        touch_plan_file(root, "plan_e2e");
+        let touched: BTreeMap<String, PolicyCapability> = [
+            ("a".to_string(), PolicyCapability::Apply),
+            ("raw_orders".to_string(), PolicyCapability::Apply),
+        ]
+        .into_iter()
+        .collect();
+        let gate = crate::commands::apply::evaluate_apply_policy(
+            &config_path,
+            "plan_e2e",
+            PolicyPrincipal::Agent,
+            &touched,
+            &models_dir,
+            &state_path,
+            &[],
+        );
+        assert!(
+            matches!(
+                gate,
+                crate::commands::apply::PolicyGate::RequireReview { .. }
+            ),
+            "the default posture escalates: {gate:?}"
+        );
+
+        // What the gate wrote.
+        let rows = StateStore::open(&state_path)
+            .unwrap()
+            .list_policy_decisions()
+            .unwrap();
+        let row = |model: &str| {
+            rows.iter()
+                .find(|r| r.plan_id == "plan_e2e" && r.model == model)
+                .unwrap_or_else(|| panic!("a row for {model}"))
+        };
+        assert_eq!(
+            row("a").models,
+            vec!["a".to_string()],
+            "a compiled model records its key"
+        );
+        assert!(
+            row("raw_orders").models.is_empty(),
+            "a target is not a model"
+        );
+
+        // What the queue says about it.
+        let out = compute_review_queue(root, &config_path, &state_path, &models_dir)
+            .expect("the queue must rank");
+        let entries: Vec<_> = out
+            .pending
+            .iter()
+            .filter(|e| e.plan_id == "plan_e2e")
+            .collect();
+        assert_eq!(entries.len(), 2, "one row per (plan, model), both listed");
+        let entry = |model: &str| entries.iter().find(|e| e.model == model).unwrap();
+        assert_eq!(entry("a").models, vec!["a".to_string()]);
+        assert_eq!(entry("a").blast_radius, Some(3));
+        assert!(entry("raw_orders").models.is_empty());
+        assert_eq!(entry("raw_orders").blast_radius, None);
+    }
+
+    /// **The queue must not undo the gate's word.** A replication target
+    /// called `orders`, gated beside a compiled model also called `orders`:
+    /// the gate records `keys_recorded` with an empty set — "this is no
+    /// model" — and the queue used to resolve the bare name against the graph
+    /// anyway, hand over the compiled model as the key, and offer its rows
+    /// (#1815, review round seven). Dropping the `keys_recorded` check makes
+    /// this fail.
+    #[test]
+    fn the_queue_keeps_a_gates_no_model_word_even_when_a_model_shares_the_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let models_dir = root.join("models");
+        write_blast_graph(&models_dir);
+        // A compiled model that happens to share the target's name.
+        std::fs::write(models_dir.join("orders.sql"), "SELECT id FROM a").unwrap();
+        std::fs::write(
+            models_dir.join("orders.toml"),
+            "name = \"orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"orders\"\n",
+        )
+        .unwrap();
+        let state_path = root.join("state.redb");
+        let config_path = root.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.p.target.governance]\nauto_create_schemas = true\n\n\
+             [policy]\nversion = 1\ndefault_agent_effect = \"require_review\"\n",
+        )
+        .unwrap();
+        touch_plan_file(root, "repl");
+        let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+        {
+            // The real replication gate path, through the held-store evaluator.
+            let ledger = StateStore::open(&state_path).unwrap();
+            let touched: BTreeMap<String, PolicyCapability> =
+                [("orders".to_string(), PolicyCapability::Apply)]
+                    .into_iter()
+                    .collect();
+            let _ = crate::commands::apply::evaluate_apply_policy_with_store(
+                cfg.policy.as_ref(),
+                "repl",
+                PolicyPrincipal::Agent,
+                &touched,
+                &models_dir,
+                None,
+                &ledger,
+                &[],
+                crate::commands::apply::GateSubjects::ReplicationTargets,
+            );
+            let rows = ledger.list_policy_decisions().unwrap();
+            let row = rows
+                .iter()
+                .find(|r| r.plan_id == "repl")
+                .expect("the target's row");
+            assert!(
+                row.keys_recorded && row.models.is_empty(),
+                "the gate's word: no model"
+            );
+        }
+
+        let out = compute_review_queue(root, &config_path, &state_path, &models_dir)
+            .expect("the queue must rank");
+        let entry = out
+            .pending
+            .iter()
+            .find(|e| e.plan_id == "repl")
+            .expect("listed");
+        assert!(
+            entry.models.is_empty(),
+            "the queue keeps the gate's word: {:?}",
+            entry.models
+        );
+        assert_eq!(
+            entry.preview_model, None,
+            "and offers no read of the same-named model"
+        );
+        assert_eq!(entry.blast_radius, None);
+    }
+
+    /// When the compile fails, a bare `model` cannot be checked against any
+    /// graph, so it is unknown — but a set the producer recorded stands,
+    /// because the producer knew. The ranking is unchanged either way (every
+    /// radius is already unknown under a failed compile); what this pins is
+    /// that the entry does not invent a key it cannot vouch for, and does not
+    /// drop one it was given.
+    #[test]
+    fn a_failed_compile_keeps_recorded_keys_and_vouches_for_no_bare_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let models_dir = root.join("models");
+        write_blast_graph(&models_dir);
+        // A model that does not parse breaks the compile.
+        std::fs::write(models_dir.join("broken.sql"), "SELECT FROM WHERE").unwrap();
+        std::fs::write(
+            models_dir.join("broken.toml"),
+            "name = \"broken\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"broken\"\n",
+        )
+        .unwrap();
+        let state_path = root.join("state.redb");
+
+        touch_plan_file(root, "bare");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .record_policy_decision(&qd(
+                    1,
+                    "bare",
+                    "a",
+                    PolicyEffect::RequireReview,
+                    PolicyCapability::Apply,
+                ))
+                .unwrap();
+        }
+        touch_plan_file(root, "recorded");
+        record_plan_review_escalation(
+            &state_path,
+            "recorded",
+            PolicyPrincipal::Agent,
+            PolicyCapability::Backfill,
+            "backfill: 2 model(s)",
+            vec!["a".to_string(), "b".to_string()],
+            "backfill plan awaits review",
+        );
+
+        let out = compute_review_queue(root, &root.join("rocky.toml"), &state_path, &models_dir)
+            .expect("a failed compile degrades the ranking, it does not refuse the queue");
+        let by_plan = |plan: &str| out.pending.iter().find(|e| e.plan_id == plan).unwrap();
+        assert!(
+            by_plan("bare").models.is_empty(),
+            "no graph to check the bare name against"
+        );
+        assert_eq!(
+            by_plan("recorded").models,
+            vec!["a".to_string(), "b".to_string()]
+        );
+        for e in &out.pending {
+            assert_eq!(
+                e.blast_radius, None,
+                "{}: nothing resolves without a compile",
+                e.plan_id
+            );
+        }
+    }
+
+    #[test]
+    fn a_union_over_no_subjects_is_unknown_not_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models_dir = tmp.path().join("models");
+        write_blast_graph(&models_dir);
+        let compiled = compile_project_with_schemas(Default::default(), &models_dir)
+            .expect("the blast graph compiles");
+        assert_eq!(blast_radius_union(&compiled, std::iter::empty()), None);
+        assert_eq!(
+            blast_radius_union(&compiled, ["c"]).map(|s| s.len()),
+            Some(0),
+            "a live leaf alone really is a measured zero — the discriminator"
+        );
     }
 
     /// A present-but-unloadable `rocky.toml` refuses the queue, and the error

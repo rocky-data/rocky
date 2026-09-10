@@ -3369,12 +3369,31 @@ impl RockyMcpServer {
     /// the warehouse, so an unset `${VAR}` in an adapter's connection field
     /// must not block them (#1536).
     fn make_ai_client(&self) -> anyhow::Result<Option<rocky_ai::client::LlmClient>> {
+        self.make_ai_client_with_key(
+            std::env::var(rocky_ai::client::AI_API_KEY_ENV)
+                .ok()
+                .filter(|v| !v.is_empty()),
+        )
+    }
+
+    /// [`Self::make_ai_client`] with the key supplied rather than read from the
+    /// environment.
+    ///
+    /// The seam exists so the refusal can be TESTED (#1702). The ordering below
+    /// is the whole behaviour — key first, config second — and a test that
+    /// cannot supply a key only ever exercises the early `Ok(None)`, never the
+    /// config read. `std::env::set_var` is `unsafe` on edition 2024 and racy
+    /// across the test binary's threads, so injecting the key is the honest way
+    /// to reach the second line.
+    fn make_ai_client_with_key(
+        &self,
+        api_key: Option<String>,
+    ) -> anyhow::Result<Option<rocky_ai::client::LlmClient>> {
         // The key check stays FIRST. A server with no key never builds a client
         // at all, so the token ceiling is moot there and refusing on the config
         // would be a new failure on a healthy keyless server.
-        let api_key = match std::env::var(rocky_ai::client::AI_API_KEY_ENV) {
-            Ok(v) if !v.is_empty() => v,
-            _ => return Ok(None),
+        let Some(api_key) = api_key else {
+            return Ok(None);
         };
         let max_tokens = self.ai_max_tokens()?;
         let ai_config = rocky_ai::client::AiConfig {
@@ -10517,6 +10536,41 @@ database = ":memory:"
     // `make_ai_client` BEFORE its compile, so this is the first config read
     // those tools make.
     // ------------------------------------------------------------------
+
+    /// The refusal reaches the path callers actually take (#1702).
+    ///
+    /// `ai_max_tokens_refuses_a_present_but_unloadable_config` below proves the
+    /// helper refuses. It does NOT prove `make_ai_client` propagates that — it
+    /// calls a different function, and the tools call this one. With no key in
+    /// the environment the production entry point returns `Ok(None)` before it
+    /// ever reads the config, so the whole class was covered one function away
+    /// from where it fires.
+    #[test]
+    fn make_ai_client_refuses_an_unloadable_config_once_a_key_is_present() {
+        let (_tmp, server) = write_mcp_project(Some(INVALID_MCP_TOML));
+        // `LlmClient` is not `Debug`, so `expect_err` is unavailable here.
+        let Err(err) = server.make_ai_client_with_key(Some("sk-test-not-a-real-key".to_string()))
+        else {
+            panic!("a present-but-unloadable rocky.toml must refuse, not default")
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("failed to load config from"),
+            "the refusal must name the file to fix, got: {msg}"
+        );
+    }
+
+    /// And the ordering it depends on: no key means no client, whatever the
+    /// config says. A keyless server is healthy, so a broken `rocky.toml` must
+    /// not turn it into a failing one.
+    #[test]
+    fn make_ai_client_without_a_key_is_none_even_on_an_unloadable_config() {
+        let (_tmp, server) = write_mcp_project(Some(INVALID_MCP_TOML));
+        let Ok(client) = server.make_ai_client_with_key(None) else {
+            panic!("a keyless server must not fail on the config it never reads")
+        };
+        assert!(client.is_none());
+    }
 
     /// A present-but-unloadable `rocky.toml` refuses, naming the file, instead
     /// of silently falling back to `DEFAULT_MAX_TOKENS`.

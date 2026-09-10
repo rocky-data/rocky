@@ -3,9 +3,9 @@ import type { ProductJournalEntry, ProductJournalOutput } from "@rocky-types/pro
 import type { ProductListEntry, ProductListOutput } from "@rocky-types/product_list";
 import type { ProductStatusOutput } from "@rocky-types/product_status";
 import { apiGet } from "../api";
-import { StatusCard } from "../components";
+import { Clip, StatusCard } from "../components";
 import { useResource } from "../estate/useResource";
-import { elideMiddle, formatInstant, shortId } from "../format";
+import { formatInstant } from "../format";
 import { navigateTo, pathForLane } from "../router";
 import { ResourceState } from "../review/ResourceState";
 import { reviewPath } from "../review/paths";
@@ -141,13 +141,17 @@ function JournalRow({ entry }: { entry: ProductJournalEntry }) {
       <td className={`${cell} text-[11px] break-words text-zinc-500 dark:text-zinc-400`}>
         <div className="flex flex-wrap gap-x-3 gap-y-1">
           {entry.spec_digest != null && (
-            <span title={entry.spec_digest}>spec {shortId(entry.spec_digest)}</span>
+            <span>
+              spec <Clip value={entry.spec_digest} />
+            </span>
           )}
           {entry.idempotency_key != null && (
-            // Not `shortId`: every key for this product begins
-            // `product:<name>@`, so a leading slice distinguishes nothing, and
-            // the product name is already the page title (#1756).
-            <span title={entry.idempotency_key}>key {elideMiddle(entry.idempotency_key)}</span>
+            // Both ends: every key for this product begins `product:<name>@`,
+            // so a leading slice distinguishes nothing, and the product name is
+            // already the page title (#1756).
+            <span>
+              key <Clip value={entry.idempotency_key} keepEnds />
+            </span>
           )}
           {entry.plan_id != null && (
             <a
@@ -157,9 +161,8 @@ function JournalRow({ entry }: { entry: ProductJournalEntry }) {
                 navigateTo(reviewPath(entry.plan_id as string));
               }}
               className="font-mono text-sky-700 underline-offset-2 hover:underline dark:text-sky-400"
-              title={entry.plan_id}
             >
-              plan {shortId(entry.plan_id)}
+              plan <Clip value={entry.plan_id} />
             </a>
           )}
         </div>
@@ -259,7 +262,7 @@ function Standing({ status }: { status: ProductStatusOutput }) {
           label="working spec"
           value={
             status.spec_digest ? (
-              <span title={status.spec_digest}>{shortId(status.spec_digest)}</span>
+              <Clip value={status.spec_digest} />
             ) : (
               "not present"
             )

@@ -162,7 +162,14 @@ jobs:
         # Present on the current ubuntu-24.04 image, but the `ubuntu-latest`
         # alias is mutable — guard on the binary, not on the image, so this is
         # a no-op today and still self-heals if a future image drops cmake.
-        run: command -v cmake >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y cmake; }
+        run: |
+          # Already guarded on cmake being absent; the strip covers the case
+          # where it is. See the note in engine-ci.yml.
+          command -v cmake >/dev/null 2>&1 && exit 0
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
+          sudo apt-get update
+          sudo apt-get install -y cmake
 
       - name: Free disk space and add swap
         run: |

@@ -355,6 +355,12 @@ enum TickOutcome {
     PermitHeld,
     LockSkipped,
     Fault,
+    /// The tick reconciled its configured schedules (cron, after, freshness)
+    /// but could not read the webhook spool, so no webhook demand was consumed. Reported as its own outcome
+    /// rather than `Completed`: in the metrics — the surface an alert reads —
+    /// a scheduler that cannot read its spool was identical to a healthy idle
+    /// one, and only the trace span carried a boolean (#1812).
+    SpoolUnreadable,
 }
 
 impl TickOutcome {
@@ -365,6 +371,7 @@ impl TickOutcome {
             TickOutcome::PermitHeld => "permit_held",
             TickOutcome::LockSkipped => "lock_skipped",
             TickOutcome::Fault => "fault",
+            TickOutcome::SpoolUnreadable => span_attrs::SPOOL_UNREADABLE_LABEL,
         }
     }
 }
@@ -387,8 +394,51 @@ fn tick_counts(report: &TickReport) -> TickCounts {
             .iter()
             .filter(|e| e.outcome != rocky_core::schedule::TerminalOutcome::Success)
             .count(),
-        skipped: report.skipped.len(),
+        // The per-demand skips plus the ones the tick synthesises for a whole
+        // source or the whole pass, from the one derivation the JSON and the
+        // metrics use too, so the span's `skipped`, the log's, the sum of the
+        // metric's `reason` series and the JSON's list are the same number.
+        skipped: report.skipped.len() + synthesized_skips(report).len(),
     }
+}
+
+/// A skip the tick synthesises for a whole source or the whole pass, beside
+/// the per-demand skips the reconciler records: `spool_unreadable` for the
+/// `webhook` source when the spool could not be read, and a pipeline-less
+/// `state_busy` when the state store was held by another process before any
+/// pipeline was evaluated (unless a mid-tick reopen already recorded a
+/// pipeline-scoped one).
+///
+/// ONE derivation for every surface — the JSON's `skipped` list, the span's
+/// and the log's `skipped` count, the metric's `reason` series — so their
+/// sums cannot drift. They did: the JSON synthesised `state_busy` and the
+/// metrics never saw it (#1812, review round one).
+pub(crate) struct SynthesizedSkip {
+    /// A value from [`span_attrs::SCHEDULER_SKIP_REASONS`].
+    pub(crate) reason: &'static str,
+    /// The demand source the skip silenced, when it is one source's.
+    pub(crate) source: Option<&'static str>,
+}
+
+pub(crate) fn synthesized_skips(report: &TickReport) -> Vec<SynthesizedSkip> {
+    let mut out = Vec::new();
+    if report.spool_unreadable.is_some() {
+        out.push(SynthesizedSkip {
+            reason: span_attrs::SPOOL_UNREADABLE_LABEL,
+            source: Some("webhook"),
+        });
+    }
+    let has_state_busy_skip = report
+        .skipped
+        .iter()
+        .any(|s| matches!(s.reason, TickSkipReason::StateBusy));
+    if report.state_busy && !has_state_busy_skip {
+        out.push(SynthesizedSkip {
+            reason: skip_reason_label(&TickSkipReason::StateBusy),
+            source: None,
+        });
+    }
+    out
 }
 
 /// Record a tick's terminal outcome onto both the `scheduler.tick` span and the
@@ -410,7 +460,14 @@ fn record_tick(report: &TickReport, metrics: &SchedulerMetrics) {
         record_outcome(TickOutcome::LockSkipped, metrics);
         return;
     }
-    record_outcome(TickOutcome::Completed, metrics);
+    // Not `Completed` when the spool could not be read: the tick counter is
+    // what an alert reads, and `completed` there said the loop was healthy.
+    let outcome = if report.spool_unreadable.is_some() {
+        TickOutcome::SpoolUnreadable
+    } else {
+        TickOutcome::Completed
+    };
+    record_outcome(outcome, metrics);
     let counts = tick_counts(report);
     let span = tracing::Span::current();
     span.record(span_attrs::SCHEDULER_DUE, counts.due);
@@ -448,6 +505,7 @@ fn log_tick(report: &TickReport) {
         lock_overridden = report.lock_overridden,
         state_busy = report.state_busy,
         drained = report.drained,
+        spool_unreadable = report.spool_unreadable.is_some(),
         "scheduler: tick complete",
     );
 }
@@ -471,6 +529,13 @@ fn record_metrics(report: &TickReport, now: DateTime<Utc>, metrics: &SchedulerMe
     // the span's `rocky.scheduler.skipped`.
     for skip in &report.skipped {
         metrics.record_skip(skip_reason_label(&skip.reason));
+    }
+    // The skips the tick synthesises for a whole source or the whole pass —
+    // the same entries the JSON carries. Without them `rocky.scheduler.skipped`
+    // never said the spool was unreadable or the store was held, and the
+    // `.ticks` counter above said `completed` (#1812).
+    for skip in synthesized_skips(report) {
+        metrics.record_skip(skip.reason);
     }
 
     // Per executed demand: its execution lag, and its outcome folded into the
@@ -716,9 +781,19 @@ cron = "* * * * *"
     /// relies on a thread-local default subscriber. Awaiting `run_one_tick`
     /// inline keeps it unambiguously in scope.
     async fn capture_one_tick(config: &str) -> Vec<SpanFields> {
+        capture_one_tick_prepared(config, |_| {}).await
+    }
+
+    /// [`capture_one_tick`] with a hook that runs against the project directory
+    /// before the tick — to plant a state the reconciler must find already there.
+    async fn capture_one_tick_prepared(
+        config: &str,
+        prepare: impl FnOnce(&Path),
+    ) -> Vec<SpanFields> {
         use tracing_subscriber::layer::SubscriberExt;
 
         let (dir, config_path) = temp_project(config);
+        prepare(dir.path());
         let state = test_state(dir.path());
         let capture = SpanCapture::default();
         let spawner = Arc::new(CapturingSpawner::new(0));
@@ -758,6 +833,7 @@ cron = "* * * * *"
             TickOutcome::PermitHeld,
             TickOutcome::LockSkipped,
             TickOutcome::Fault,
+            TickOutcome::SpoolUnreadable,
         ] {
             // Exhaustiveness guard: a new variant fails to compile here.
             match outcome {
@@ -765,7 +841,8 @@ cron = "* * * * *"
                 | TickOutcome::ConfigError
                 | TickOutcome::PermitHeld
                 | TickOutcome::LockSkipped
-                | TickOutcome::Fault => {}
+                | TickOutcome::Fault
+                | TickOutcome::SpoolUnreadable => {}
             }
             assert!(
                 span_attrs::SCHEDULER_OUTCOMES.contains(&outcome.as_str()),
@@ -981,7 +1058,20 @@ cron = "* * * * *"
         spawner: Arc<dyn Spawner>,
         ticks: usize,
     ) -> Vec<MetricPoint> {
+        drive_ticks_with_metrics_prepared(config, spawner, ticks, |_| {}).await
+    }
+
+    /// [`drive_ticks_with_metrics`] with a hook that runs against the project
+    /// directory before the first tick — to plant a state the reconciler must
+    /// find already there.
+    async fn drive_ticks_with_metrics_prepared(
+        config: &str,
+        spawner: Arc<dyn Spawner>,
+        ticks: usize,
+        prepare: impl FnOnce(&Path),
+    ) -> Vec<MetricPoint> {
         let (dir, config_path) = temp_project(config);
+        prepare(dir.path());
         let state = test_state(dir.path());
         let harness = MetricsHarness::new();
         let metrics = harness.metrics();
@@ -1096,6 +1186,225 @@ cron = "* * * * *"
             failure_gauges[0].value, 0.0,
             "a success ⇒ zero-length failure streak",
         );
+    }
+
+    /// A tick whose webhook spool cannot be read counts under its own
+    /// `outcome` and emits a `spool_unreadable` skip — in the METRICS, which
+    /// is what an alert reads. #1752 carried the refusal onto the JSON and the
+    /// span; the `.ticks` counter still said `completed` and no skip was ever
+    /// emitted, so a scheduler that could not read its spool looked exactly
+    /// like a healthy idle one (#1812). The assertions are on the exported
+    /// points: a report-level check passed without the wiring, which is how
+    /// this shipped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_spool_counts_under_its_own_outcome_and_reason() {
+        let spawner: Arc<dyn Spawner> = Arc::new(CapturingSpawner::new(0));
+        let points = drive_ticks_with_metrics_prepared(CRON_EVERY_MINUTE, spawner, 2, |root| {
+            // A dangling symlink where the spool directory should be: present
+            // and unreadable, which #1710 made the scan refuse.
+            let rocky_dir = root.join(".rocky");
+            std::fs::create_dir_all(&rocky_dir).unwrap();
+            std::os::unix::fs::symlink("nowhere", rocky_dir.join("pending-demands")).unwrap();
+        })
+        .await;
+
+        let ticks: Vec<&MetricPoint> = points
+            .iter()
+            .filter(|p| p.name == "rocky.scheduler.ticks")
+            .collect();
+        assert!(
+            ticks
+                .iter()
+                .all(|p| p.attr("outcome") == Some(span_attrs::SPOOL_UNREADABLE_LABEL)),
+            "no tick may count as completed while the spool is unreadable: {ticks:?}"
+        );
+        assert_eq!(
+            ticks.iter().map(|p| p.value).sum::<f64>(),
+            2.0,
+            "both passes ticked, both under the unreadable-spool outcome"
+        );
+        let skips: Vec<&MetricPoint> = points
+            .iter()
+            .filter(|p| p.name == "rocky.scheduler.skipped")
+            .collect();
+        let spool = skips
+            .iter()
+            .find(|p| p.attr("reason") == Some(span_attrs::SPOOL_UNREADABLE_LABEL))
+            .expect("a `spool_unreadable` skip series, the entry the JSON already carries");
+        assert_eq!(spool.value, 2.0, "one synthesised skip per tick");
+        // The configured schedules still ran: the firing pass executed its
+        // cron occurrence.
+        assert_eq!(
+            metric(&points, "rocky.scheduler.executed").unwrap().value,
+            1.0,
+        );
+    }
+
+    /// The span and the log carry the same `skipped` count the metric and the
+    /// JSON do: an unreadable spool is one skip there too. The round-one review
+    /// showed that reverting the count left every requested test green
+    /// (#1812), so this reads the closed span itself.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_spool_closes_a_span_with_its_outcome_and_one_skip() {
+        let spans = capture_one_tick_prepared(CRON_EVERY_MINUTE, |root| {
+            let rocky_dir = root.join(".rocky");
+            std::fs::create_dir_all(&rocky_dir).unwrap();
+            std::os::unix::fs::symlink("nowhere", rocky_dir.join("pending-demands")).unwrap();
+        })
+        .await;
+        assert_eq!(spans.len(), 1, "one tick ⇒ one span");
+        let fields = &spans[0];
+        assert_eq!(
+            fields
+                .get(span_attrs::SCHEDULER_OUTCOME)
+                .map(String::as_str),
+            Some(span_attrs::SPOOL_UNREADABLE_LABEL),
+        );
+        assert_eq!(
+            fields
+                .get(span_attrs::SCHEDULER_SKIPPED)
+                .map(String::as_str),
+            Some("1"),
+            "the synthesised skip is counted on the span: {fields:?}"
+        );
+        assert_eq!(
+            fields
+                .get(span_attrs::SCHEDULER_SPOOL_UNREADABLE)
+                .map(String::as_str),
+            Some("true"),
+        );
+    }
+
+    /// The whole-pass `state_busy` skip the JSON has always synthesised now
+    /// reaches the metrics through the same derivation: a store held by
+    /// another process before any pipeline was evaluated is one
+    /// `reason="state_busy"` skip, not silence (#1812, review round one).
+    #[tokio::test]
+    async fn a_busy_store_counts_one_state_busy_skip_in_the_metrics() {
+        let (dir, config_path) = temp_project(CRON_EVERY_MINUTE);
+        let state = test_state(dir.path());
+        let harness = MetricsHarness::new();
+        let metrics = harness.metrics();
+        let shutdown = Drain::new();
+        let clock = FakeClock::new(at(2026, 5, 2, 3, 0));
+        let state_path = dir.path().join(".rocky-state.redb");
+        // Another process holds the store's exclusive lock for the whole tick.
+        let held = rocky_core::state::StateStore::open(&state_path).unwrap();
+        let spawner: Arc<dyn Spawner> = Arc::new(CapturingSpawner::new(0));
+        run_one_tick(
+            &state,
+            &config_path,
+            &state_path,
+            &dir.path().join(".rocky"),
+            clock.as_ref(),
+            &shutdown,
+            spawner.as_ref(),
+            &metrics,
+        )
+        .await;
+        drop(held);
+        let points = harness.collect();
+        let busy = points
+            .iter()
+            .find(|p| p.name == "rocky.scheduler.skipped" && p.attr("reason") == Some("state_busy"))
+            .expect("a `state_busy` skip series, the entry the JSON already carries");
+        assert_eq!(busy.value, 1.0, "one synthesised skip for the whole pass");
+    }
+
+    /// The whole-pass `state_busy` on the closed span: a store held by another
+    /// process before any pipeline was evaluated is one skip there too, from
+    /// the derivation the JSON and the metrics share. Restoring the old count
+    /// formula (per-demand skips plus the spool alone) leaves the spool span
+    /// test green and this one red (#1812, review round two).
+    #[tokio::test]
+    async fn a_busy_store_closes_a_span_with_one_skip() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let (dir, config_path) = temp_project(CRON_EVERY_MINUTE);
+        let state = test_state(dir.path());
+        let capture = SpanCapture::default();
+        let spawner = Arc::new(CapturingSpawner::new(0));
+        let shutdown = Drain::new();
+        let clock = FakeClock::new(at(2026, 5, 2, 3, 0));
+        let state_path = dir.path().join(".rocky-state.redb");
+        let held = rocky_core::state::StateStore::open(&state_path).unwrap();
+
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        run_one_tick(
+            &state,
+            &config_path,
+            &state_path,
+            &dir.path().join(".rocky"),
+            clock.as_ref(),
+            &shutdown,
+            spawner.as_ref(),
+            &SchedulerMetrics::disabled(),
+        )
+        .await;
+        drop(_guard);
+        drop(held);
+
+        let spans = capture.spans_named("scheduler.tick");
+        assert_eq!(spans.len(), 1, "one tick ⇒ one span");
+        let fields = &spans[0];
+        assert_eq!(
+            fields
+                .get(span_attrs::SCHEDULER_STATE_BUSY)
+                .map(String::as_str),
+            Some("true"),
+        );
+        assert_eq!(
+            fields
+                .get(span_attrs::SCHEDULER_SKIPPED)
+                .map(String::as_str),
+            Some("1"),
+            "the synthesised whole-pass skip is counted on the span: {fields:?}"
+        );
+    }
+
+    /// The one derivation, case by case: what each whole-source or
+    /// whole-pass state synthesises, and that a pipeline-scoped `state_busy`
+    /// already recorded is not doubled.
+    #[test]
+    fn synthesized_skips_cover_the_whole_tick_cases_once_each() {
+        let spool = TickReport {
+            spool_unreadable: Some("dangling".to_string()),
+            ..TickReport::default()
+        };
+        let got: Vec<&str> = synthesized_skips(&spool).iter().map(|s| s.reason).collect();
+        assert_eq!(got, vec![span_attrs::SPOOL_UNREADABLE_LABEL]);
+
+        let busy = TickReport {
+            state_busy: true,
+            ..TickReport::default()
+        };
+        let got: Vec<&str> = synthesized_skips(&busy).iter().map(|s| s.reason).collect();
+        assert_eq!(got, vec!["state_busy"]);
+
+        let busy_already_recorded = TickReport {
+            state_busy: true,
+            skipped: vec![rocky_core::schedule::SkippedDemand {
+                pipeline: "raw".to_string(),
+                source: None,
+                reason: TickSkipReason::StateBusy,
+            }],
+            ..TickReport::default()
+        };
+        assert!(
+            synthesized_skips(&busy_already_recorded).is_empty(),
+            "a pipeline-scoped state_busy skip is not doubled"
+        );
+
+        let both = TickReport {
+            spool_unreadable: Some("dangling".to_string()),
+            state_busy: true,
+            ..TickReport::default()
+        };
+        assert_eq!(synthesized_skips(&both).len(), 2);
+        assert!(synthesized_skips(&TickReport::default()).is_empty());
     }
 
     /// A failing run climbs the per-pipeline consecutive-failure gauge — the

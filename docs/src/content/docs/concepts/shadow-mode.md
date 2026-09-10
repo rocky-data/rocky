@@ -46,10 +46,49 @@ isolation:
 A stored `rocky plan --shadow` carries its routing into `rocky apply`.
 :::
 
+## Who owns a shadow object, and how long it lives
+
+The two modes answer this differently, and everything below follows from it.
+
+```
+  rocky run --shadow          the objects belong to THIS RUN
+      built  ─▶  compared  ─▶  dropped
+      A name that is already taken is refused, not overwritten.
+
+  rocky run --branch <name>   the objects belong to the BRANCH
+      built  ─▶  compared  ─▶  kept
+      The next run on that branch replaces them. That is the point.
+```
+
+An unnamed shadow run is disposable. It creates its objects and drops them when
+it finishes. Nothing accumulates, and a second run of the same command starts
+clean.
+
+A run that **fails** keeps them, on purpose. The tables are the evidence you
+need to see why. The next run then refuses rather than overwriting them, and
+prints the `DROP` that clears them — so a leftover is a refusal with a remedy,
+never a silent overwrite.
+
+Because it drops what it made, it must be sure it made them. So before writing,
+it checks every derived shadow target in the warehouse. If one already exists,
+the run is refused and names the object, the model, and the `DROP` statement
+that would clear it. Rocky will not delete an object it did not create.
+
+A named branch is a persistent workspace. Its objects survive the run so you can
+query them, and the next run on that branch replaces them. Rocky does **not**
+check them for prior occupancy — a branch namespace is yours wholesale, and
+per-object ownership there is still open (issue #1273). Give a branch a
+namespace nothing else writes to.
+
+Cleanup is best effort. A drop that fails is reported as a run warning rather
+than failing the run: the comparison already happened, and the answer you came
+for should not be withheld because a leftover table could not be removed.
+
 ## Models a shadow run refuses
 
-Shadow and branch runs reject `content_addressed`, `time_interval` and
-`ephemeral` models.
+Shadow and branch runs reject `content_addressed`, `time_interval`, `ephemeral`
+and the incremental family (`incremental`, `merge`, `delete_insert`,
+`microbatch`).
 
 - `content_addressed` and `time_interval` models persist object-storage or
   partition-state identities. Rewriting the warehouse target alone cannot
@@ -57,15 +96,15 @@ Shadow and branch runs reject `content_addressed`, `time_interval` and
 - An `ephemeral` model is neither materialized nor inlined into its consumers.
   The consumer would read the production table, and no rewrite could redirect
   that read. Give the model a materialized strategy to shadow it.
+- An **incremental** model appends to whatever its target already holds. A
+  shadow target starts empty while production holds full history, so the first
+  run compares a partial table against a complete one, and every later run
+  appends again and drifts further. The comparison would get worse, not better.
+  Run the model as `full_refresh` to shadow it, or compare it in production
+  through `rocky compare`.
 
 Rocky also refuses a derived shadow target that matches a configured production
 target, or that matches another selected model's shadow target.
-
-Rocky does **not** yet check whether a derived shadow target is already occupied
-by an object it does not know about. Suppose a table with the derived name
-already exists and is not a Rocky model target — a source, a seed, or an ad-hoc
-table. A full-refresh model will replace it. Prefer a dedicated shadow schema
-that you own.
 
 ## How Rocky redirects a read to a shadow table
 

@@ -793,10 +793,17 @@ pub(crate) fn blast_radius_of(
 /// re-open the ranking collapse this exists to fix. Here the question is how
 /// much the plan's change reaches, and a model rebuilt because another member
 /// changed is part of that reach.
+///
+/// **No subjects, no answer.** An empty set of names unions to an empty set,
+/// which would report as a measured zero for a row that named nothing — the
+/// same partial-count-as-measurement the all-or-nothing rule refuses. A row
+/// that resolves to no keys (a pre-v28 plan-level escalation) is unknown.
 pub(crate) fn blast_radius_union<'a>(
     result: &compile::CompileResult,
     models: impl IntoIterator<Item = &'a str>,
 ) -> Option<BTreeSet<String>> {
+    let mut models = models.into_iter().peekable();
+    models.peek()?;
     let mut union: BTreeSet<String> = BTreeSet::new();
     for model in models {
         let (_, transitive) = blast_radius_of(result, model)?;
@@ -1337,6 +1344,7 @@ mod tests {
         effect: PolicyEffect,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            keys_recorded: false,
             models: Vec::new(),
             timestamp: Utc.with_ymd_and_hms(2026, 7, 7, 0, 0, secs).unwrap(),
             plan_id: plan_id.to_string(),
@@ -1381,6 +1389,7 @@ mod tests {
 
         let label = "backfill: 2 model(s)";
         let plan_level = PolicyDecisionRecord {
+            keys_recorded: false,
             models: vec!["dim_customer".to_string(), "fct_orders".to_string()],
             timestamp: Utc::now(),
             plan_id: "planBF".to_string(),
@@ -1434,6 +1443,7 @@ mod tests {
         use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
 
         let decisions = vec![PolicyDecisionRecord {
+            keys_recorded: false,
             models: Vec::new(),
             timestamp: Utc::now(),
             plan_id: "planA".to_string(),
@@ -1474,6 +1484,7 @@ mod tests {
         let state_path = root.join("state.redb");
 
         let plan_level = |plan_id: &str, models: Vec<&str>, label: &str| PolicyDecisionRecord {
+            keys_recorded: false,
             models: models.into_iter().map(str::to_string).collect(),
             timestamp: Utc.with_ymd_and_hms(2026, 9, 8, 0, 0, 1).unwrap(),
             plan_id: plan_id.to_string(),
@@ -1762,6 +1773,7 @@ mod tests {
         reason: &str,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            keys_recorded: false,
             models: Vec::new(),
             timestamp: Utc.with_ymd_and_hms(2026, 7, 7, 0, 0, secs).unwrap(),
             plan_id: plan_id.to_string(),
@@ -1922,6 +1934,7 @@ mod tests {
         effect: PolicyEffect,
     ) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
+            keys_recorded: false,
             models: Vec::new(),
             timestamp: Utc.with_ymd_and_hms(2026, 7, 7, 0, 0, secs).unwrap(),
             plan_id: plan_id.to_string(),

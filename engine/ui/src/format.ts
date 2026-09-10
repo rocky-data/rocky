@@ -46,21 +46,51 @@ function formatAgo(deltaMs: number): string {
 }
 
 /**
- * The first 12 characters of a long id, for a table cell, with an ellipsis so
- * a truncation reads as one. Put the full id in `title` at the call site.
+ * Text cut for display. `clipped` is the fact a marker stands for, kept apart
+ * from the text so the marker is rendered from it and never inferred from the
+ * characters — a value that happens to contain "…" is not a value that was
+ * cut, and before this the two rendered identically (#1815). `<Clip>` in
+ * `components.tsx` is the one renderer.
+ */
+export type Clipped =
+  | { clipped: false; text: string }
+  | { clipped: true; head: string; tail: string };
+
+/**
+ * The units a cut may fall between. `String` indexes UTF-16 code units, and
+ * slicing at one splits a surrogate pair: a slice can end in a lone high
+ * surrogate. Where the runtime has `Intl.Segmenter` the units are grapheme
+ * clusters — what a reader sees, an `é` written as `e` plus a combining
+ * accent included. Without it they are code points, which keeps every
+ * surrogate pair whole but can still part a combining mark from its base;
+ * that is the guarantee the fallback makes, and the only one.
+ */
+function characters(value: string): string[] {
+  if (typeof Intl !== "undefined" && typeof Intl.Segmenter === "function") {
+    const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+    return Array.from(segmenter.segment(value), (part) => part.segment);
+  }
+  return Array.from(value);
+}
+
+/**
+ * The first 12 characters of a long id, and whether that cut anything. Put
+ * the full id in `title` at the call site — `<Clip>` does.
  *
  * Right for an id whose HEAD identifies it — a hex digest, a run id. A
- * compound id whose tail is the distinguishing part wants `elideMiddle`
+ * compound id whose tail is the distinguishing part wants `clipMiddle`
  * instead: every fulfillment idempotency key for one product begins
  * `product:<name>@`, so twelve leading characters of it distinguish nothing
  * (#1756).
  */
-export function shortId(id: string): string {
-  return id.length > 12 ? `${id.slice(0, 12)}…` : id;
+export function clipHead(id: string, keep = 12): Clipped {
+  const chars = characters(id);
+  if (chars.length <= keep) return { clipped: false, text: id };
+  return { clipped: true, head: chars.slice(0, keep).join(""), tail: "" };
 }
 
 /**
- * Keeps both ends of a compound identifier and elides the middle:
+ * Keeps both ends of a compound identifier and cuts the middle:
  * `product:revenue_daily@sha256:5b1bf5c@21` renders as `product:re…1bf5c@21`,
  * keeping the digest tail and the sequence number that tell two keys apart.
  *
@@ -68,11 +98,16 @@ export function shortId(id: string): string {
  * text and knows nothing about any identifier's grammar, so a key whose shape
  * changes still renders, just with a different slice shown.
  *
- * Returns the input unchanged when eliding would not make it shorter, so a
- * value near the limit never renders LONGER than it is.
+ * Returns the input uncut when cutting would not make it shorter, so a value
+ * near the limit never renders LONGER than it is.
  */
-export function elideMiddle(value: string, head = 10, tail = 8): string {
-  if (head < 0 || tail < 0) return value;
-  if (value.length <= head + tail + 1) return value;
-  return `${value.slice(0, head)}…${value.slice(value.length - tail)}`;
+export function clipMiddle(value: string, head = 10, tail = 8): Clipped {
+  if (head < 0 || tail < 0) return { clipped: false, text: value };
+  const chars = characters(value);
+  if (chars.length <= head + tail + 1) return { clipped: false, text: value };
+  return {
+    clipped: true,
+    head: chars.slice(0, head).join(""),
+    tail: chars.slice(chars.length - tail).join(""),
+  };
 }
