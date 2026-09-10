@@ -696,8 +696,24 @@ def test_governance_compliance_drops_exceptions_for_unknown_models(
 def test_governance_compliance_failure_does_not_fail_materialization(
     discover_json: str, run_json: str, tmp_path: Path
 ):
-    """If ``rocky compliance`` raises, the multi-asset logs a warning and
-    continues — the drift/anomaly path has the same tolerance."""
+    """If ``rocky compliance`` raises, the multi-asset logs a warning and the
+    materialization still succeeds — but the check reports NOT EVALUATED, not
+    passed (#1790).
+
+    This assertion was reversed deliberately. It used to require
+    ``passed is True``, on the reading that a transient governance read failure
+    is "not a user-facing compliance violation". That is true and is not the
+    question: ``passed=True`` claims the scan ran and found nothing, and a scan
+    that crashed did neither. The third answer — evaluated, clean, or not
+    evaluated — is what WARN plus ``status: not_evaluated`` says, and it is the
+    rule this codebase already settled one layer down in #1741 and again for
+    measurement checks in #1645: a check that did not run is not a check that
+    passed.
+
+    What has NOT changed is the tolerance the old name describes: the
+    materialization still succeeds. A governance read failure degrades a check,
+    it does not fail the run.
+    """
     defs = _build_defs_with_flags(discover_json, tmp_path, surface_compliance=True)
     run_result = RunResult.model_validate_json(run_json)
     orders_key = dg.AssetKey(["fivetran", "acme", "us_west", "shopify", "orders"])
@@ -716,24 +732,24 @@ def test_governance_compliance_failure_does_not_fail_materialization(
             raise_on_error=False,
         )
 
-    # Materialization still succeeds — compliance error is swallowed.
+    # The failure degrades the check; it does not fail the run.
     assert exec_result.success
-    # The pre-declared ``compliance_exception`` spec still produces a
-    # placeholder (Dagster requires every declared spec to yield a
-    # result) — but the placeholder passes rather than propagating the
-    # binary crash as a WARN. That's the design: a transient governance
-    # read failure is a logged-and-skipped event, not a user-facing
-    # compliance violation.
     check_evaluations = [
         e for e in exec_result.all_events if e.event_type_value == "ASSET_CHECK_EVALUATION"
     ]
     compliance_checks = [
         e for e in check_evaluations if e.event_specific_data.check_name == "compliance_exception"
     ]
-    # Exactly one placeholder result, and it must be passing (not WARN).
+    # Exactly one result — the explicit not-evaluated one, which also means the
+    # PASS_BY_ABSENCE placeholder did not fire. If it had, this would be two.
     assert len(compliance_checks) == 1
     eval_data = compliance_checks[0].event_specific_data
-    assert eval_data.passed is True
+    assert eval_data.passed is False, (
+        "a compliance scan that crashed must not report a green badge (#1790)"
+    )
+    assert eval_data.severity == dg.AssetCheckSeverity.WARN
+    assert eval_data.metadata["status"].value == "not_evaluated"
+    assert "simulated binary crash" in eval_data.metadata["reason"].value
 
 
 # ---------------------------------------------------------------------------
