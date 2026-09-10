@@ -152,13 +152,19 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Execute `rocky trace`.
-pub fn run_trace(
+/// The typed payload behind `rocky trace`: one recorded run as a timeline.
+///
+/// This is the one producer of [`TraceOutput`]. The CLI renders it as JSON
+/// or as text; a server route can serve it unchanged, so the two can never
+/// disagree about a run. The store is opened read-only. A `model_filter`
+/// that names a model the run did not execute is an error, not an empty
+/// timeline: an empty answer would read as "that model ran and did
+/// nothing".
+pub fn compute_trace(
     state_path: &Path,
     target: &str,
     model_filter: Option<&str>,
-    json: bool,
-) -> Result<()> {
+) -> Result<TraceOutput> {
     let store = StateStore::open_read_only(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
@@ -185,46 +191,63 @@ pub fn run_trace(
 
     let lane_count = assign_lanes(&mut entries);
 
+    Ok(TraceOutput {
+        version: VERSION.to_string(),
+        command: "trace".to_string(),
+        run_id: record.run_id.clone(),
+        status: status_str(&record.status).to_string(),
+        trigger: trigger_str(&record.trigger).to_string(),
+        started_at: record.started_at.to_rfc3339(),
+        finished_at: record.finished_at.to_rfc3339(),
+        run_duration_ms: run_duration_ms.max(0) as u64,
+        lane_count,
+        models: entries,
+    })
+}
+
+/// Execute `rocky trace`.
+pub fn run_trace(
+    state_path: &Path,
+    target: &str,
+    model_filter: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let output = compute_trace(state_path, target, model_filter)?;
     if json {
-        let output = TraceOutput {
-            version: VERSION.to_string(),
-            command: "trace".to_string(),
-            run_id: record.run_id.clone(),
-            status: status_str(&record.status).to_string(),
-            trigger: trigger_str(&record.trigger).to_string(),
-            started_at: record.started_at.to_rfc3339(),
-            finished_at: record.finished_at.to_rfc3339(),
-            run_duration_ms: run_duration_ms.max(0) as u64,
-            lane_count,
-            models: entries,
-        };
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        println!("run: {}", record.run_id);
-        println!(
-            "status: {}   trigger: {}   duration: {:.2}s",
-            status_str(&record.status),
-            trigger_str(&record.trigger),
-            run_duration_ms.max(0) as f64 / 1000.0,
-        );
-        println!("started:  {}", record.started_at.to_rfc3339());
-        println!("finished: {}", record.finished_at.to_rfc3339());
-        if lane_count > 1 {
-            println!("parallelism: {lane_count} lanes");
-        }
-        println!();
-        let bar_width: usize = 40;
-        println!(
-            "  {:<28}  {:<bar$}    duration  status",
-            "model",
-            "timeline",
-            bar = bar_width + 2,
-        );
-        for entry in &entries {
-            println!("{}", render_row(entry, run_duration_ms.max(1), bar_width));
-        }
+        render_text(&output);
     }
     Ok(())
+}
+
+/// The human rendering: a header, then one bar per model, all read from
+/// the same payload the JSON mode prints.
+fn render_text(output: &TraceOutput) {
+    let run_duration_ms = i64::try_from(output.run_duration_ms).unwrap_or(i64::MAX);
+    println!("run: {}", output.run_id);
+    println!(
+        "status: {}   trigger: {}   duration: {:.2}s",
+        output.status,
+        output.trigger,
+        run_duration_ms as f64 / 1000.0,
+    );
+    println!("started:  {}", output.started_at);
+    println!("finished: {}", output.finished_at);
+    if output.lane_count > 1 {
+        println!("parallelism: {} lanes", output.lane_count);
+    }
+    println!();
+    let bar_width: usize = 40;
+    println!(
+        "  {:<28}  {:<bar$}    duration  status",
+        "model",
+        "timeline",
+        bar = bar_width + 2,
+    );
+    for entry in &output.models {
+        println!("{}", render_row(entry, run_duration_ms.max(1), bar_width));
+    }
 }
 
 #[cfg(test)]
@@ -290,6 +313,64 @@ mod tests {
             check_gate_failed: false,
             verify_after_failed: false,
         }
+    }
+
+    /// The seam serves what the store recorded, and it is the same payload
+    /// the CLI prints: `run_trace --output json` is `compute_trace` plus
+    /// one `println!`, so this pins the producer both callers share.
+    #[test]
+    fn compute_trace_serves_the_recorded_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let start = Utc::now();
+        {
+            let store = StateStore::open(&path).unwrap();
+            store
+                .record_run(&sample_run(vec![
+                    exec("a", start, 1_000),
+                    exec("b", start + chrono::Duration::milliseconds(1_000), 500),
+                ]))
+                .unwrap();
+        }
+
+        let output = compute_trace(&path, "latest", None).unwrap();
+        assert_eq!(output.command, "trace");
+        assert_eq!(output.run_id, "run-trace-test");
+        assert_eq!(output.status, "success");
+        assert_eq!(
+            output
+                .models
+                .iter()
+                .map(|m| m.model_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"],
+            "entries in start order"
+        );
+        assert_eq!(output.lane_count, 1, "sequential models share a lane");
+
+        let filtered = compute_trace(&path, "run-trace-test", Some("b")).unwrap();
+        assert_eq!(filtered.models.len(), 1);
+        assert_eq!(filtered.models[0].model_name, "b");
+    }
+
+    /// A model the run did not execute is an error, never an empty
+    /// timeline: an empty answer would read as "it ran and did nothing".
+    #[test]
+    fn compute_trace_refuses_a_model_the_run_did_not_execute() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        {
+            let store = StateStore::open(&path).unwrap();
+            store
+                .record_run(&sample_run(vec![exec("a", Utc::now(), 100)]))
+                .unwrap();
+        }
+
+        let err = compute_trace(&path, "latest", Some("zzz")).unwrap_err();
+        assert!(
+            err.to_string().contains("did not execute model 'zzz'"),
+            "{err}"
+        );
     }
 
     #[test]

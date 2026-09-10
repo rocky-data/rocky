@@ -1166,6 +1166,7 @@ rocky compliance [--env NAME] [--exceptions-only] [--fail-on exception]
 ### Behavior
 
 - Loads `rocky.toml` and every model sidecar with a non-empty `[classification]` block. Each `(model, column, env)` triple is evaluated against the resolved masking strategy.
+- A project with no `models/` directory yet is an empty report. A `models` path that is there but cannot be read — a dangling symlink, or one under a broken ancestor — is an error that names the path, never an empty report: an empty answer would say the estate has no classified columns when it could not be read at all.
 - `MaskStrategy::None` ("explicit identity") counts as masked: the project has deliberately opted out, which is a conscious policy decision, not an enforcement gap.
 - Tags listed on `[classifications] allow_unmasked` suppress exception emission but still report `enforced = false` in the per-column breakdown; the allow list doesn't pretend the column is masked.
 - Exit `1` with `--fail-on exception` when any exception is emitted; otherwise exit `0` regardless of exception count (the JSON payload still reports them).

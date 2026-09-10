@@ -449,15 +449,22 @@ fn adapter_pricing(config_path: &Path) -> Result<Option<(String, WarehouseType, 
 /// config and a config-less project produced the same rollup. `rocky cost`
 /// reads the state store and prices from the run record — it opens no
 /// warehouse connection — so the loader is the credential-tolerant one.
-pub fn run_cost(
+/// The typed payload behind `rocky cost`: one recorded run's per-model cost
+/// attribution.
+///
+/// This is the one producer of [`CostOutput`]. The CLI renders it as JSON
+/// or as a table; a server route can serve it unchanged. The store is
+/// opened read-only; the config is read for adapter pricing and its absence
+/// degrades to `adapter_type: None`, as the module doc says. A
+/// `model_filter` that names a model the run did not execute is an error,
+/// not an empty rollup.
+pub fn compute_cost(
     state_path: &Path,
     config_path: &Path,
     target: &str,
     model_filter: Option<&str>,
-    by: Option<&str>,
-    json: bool,
-) -> Result<()> {
-    let group_by = by.map(CostGroupBy::parse).transpose()?;
+    group_by: Option<CostGroupBy>,
+) -> Result<CostOutput> {
     let store = StateStore::open_read_only(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
@@ -467,13 +474,25 @@ pub fn run_cost(
 
     let output = build_output(&record, adapter_info.as_ref(), model_filter, group_by);
 
-    if model_filter.is_some() && output.per_model.is_empty() {
-        anyhow::bail!(
-            "run '{}' did not execute model '{}'",
-            record.run_id,
-            model_filter.unwrap_or("")
-        );
+    if let Some(name) = model_filter
+        && output.per_model.is_empty()
+    {
+        anyhow::bail!("run '{}' did not execute model '{name}'", record.run_id);
     }
+
+    Ok(output)
+}
+
+pub fn run_cost(
+    state_path: &Path,
+    config_path: &Path,
+    target: &str,
+    model_filter: Option<&str>,
+    by: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let group_by = by.map(CostGroupBy::parse).transpose()?;
+    let output = compute_cost(state_path, config_path, target, model_filter, group_by)?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&output)?);
@@ -784,6 +803,50 @@ mod tests {
 
         let resolved = resolve(&store, "run-1").unwrap();
         assert_eq!(resolved.run_id, "run-1");
+    }
+
+    /// The seam serves what the store recorded; `run_cost --output json` is
+    /// `compute_cost` plus one `println!`, so this pins the producer both
+    /// callers share. A config that cannot be read degrades to no adapter,
+    /// as the module doc promises, rather than failing the rollup.
+    #[test]
+    fn compute_cost_reads_the_recorded_run() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        {
+            let store = StateStore::open(&path).unwrap();
+            store
+                .record_run(&sample_run(
+                    "run-1",
+                    vec![
+                        sample_exec("m", "success", 10, Some(100), None),
+                        sample_exec("n", "success", 5, None, None),
+                    ],
+                ))
+                .unwrap();
+        }
+        let missing_config = dir.path().join("rocky.toml");
+
+        let out = compute_cost(&path, &missing_config, "latest", None, None).unwrap();
+        assert_eq!(out.command, "cost");
+        assert_eq!(out.run_id, "run-1");
+        assert_eq!(out.adapter_type, None, "no config, no adapter");
+        assert_eq!(
+            out.per_model
+                .iter()
+                .map(|m| m.model_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m", "n"]
+        );
+
+        let one = compute_cost(&path, &missing_config, "run-1", Some("n"), None).unwrap();
+        assert_eq!(one.per_model.len(), 1);
+
+        let err = compute_cost(&path, &missing_config, "run-1", Some("zzz"), None).unwrap_err();
+        assert!(
+            err.to_string().contains("did not execute model 'zzz'"),
+            "{err}"
+        );
     }
 
     #[test]
