@@ -818,7 +818,25 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   unchanged, so it behaves exactly as it does today. It does not reach the
 ///   blob anyway — the version check runs at OPEN and `[state]
 ///   on_schema_mismatch` engages there.
-const CURRENT_SCHEMA_VERSION: u32 = 28;
+///
+/// - **v29** — records whether a policy decision's model set was the
+///   producer's word: a new serde-additive
+///   [`PolicyDecisionRecord::keys_recorded`] flag. Not a table change; no blob
+///   walk. A v28 blob forward-deserializes with it `false`, guarded by
+///   `test_v28_policy_decision_forward_deserializes_keys_recorded_false`.
+///
+///   **What it fixes (#1815).** v28's `models` could not tell "the gate said
+///   this subject is no model" (an empty set it wrote on purpose) from "the
+///   row predates the set" (an empty set by default). A consumer that
+///   resolved the bare `model` against the compiled graph for the second
+///   case did it for the first too, and a replication target named like a
+///   compiled model was offered for sampling as that model.
+///
+///   **On upgrade.** A v28 store is stamped v29 in place and every record is
+///   kept, reading back with the flag `false` — "unknown", the only honest
+///   reading of a row that never said. **On rollback.** One extra key,
+///   ignored; the version check at OPEN engages `[state] on_schema_mismatch`.
+const CURRENT_SCHEMA_VERSION: u32 = 29;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -2783,6 +2801,63 @@ pub struct ResumeScope {
     /// resume refuses it as a scope mismatch.
     #[serde(default)]
     pub target: Option<ResumeTarget>,
+    /// Where the run READ from: the discovery adapter behind the alias, the
+    /// source catalog, and the shape of the schema pattern that maps source
+    /// schema names onto target names (#1583).
+    ///
+    /// The scope used to record nothing about the source, so pointing
+    /// `source.discovery.adapter` at another adapter moved no field in it. A
+    /// resume then matched its checkpoint by TARGET key, skipped every table
+    /// it had never copied from the new source, and exited 0.
+    ///
+    /// `None` on a checkpoint written before this field existed. A current
+    /// scope always records `Some`, so such a checkpoint never equals one and
+    /// a resume refuses it as a scope mismatch — the same fail-closed
+    /// treatment [`ResumeScope::target`] gets.
+    #[serde(default)]
+    pub source: Option<ResumeSource>,
+}
+
+/// Where a replication run read from, for the resume scope (#1583).
+///
+/// # Why the pattern's SHAPE and not the pattern
+///
+/// Discovery parses every source schema name with this pattern, and the
+/// values it extracts render the target names a run checkpoints by. So two
+/// runs whose patterns differ can map different source tables onto the same
+/// target key — which is exactly the silent skip. What matters is the shape
+/// that does the mapping: the prefix that selects which schemas are seen at
+/// all, the separator that splits them, and the ordered components that name
+/// the captured values.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResumeSource {
+    /// The discovery adapter name (a config alias), when the pipeline
+    /// declares discovery. `None` is not "unrecorded" — it is a pipeline
+    /// with no `[source.discovery]` block, which is itself a difference
+    /// worth refusing a resume over.
+    #[serde(default)]
+    pub discovery_adapter: Option<String>,
+    /// The data location behind that alias. An alias can be re-pointed
+    /// without renaming it, so the alias alone does not identify a source —
+    /// the same argument [`ResumeTarget::endpoint`] answers on the write
+    /// side.
+    #[serde(default)]
+    pub endpoint: Option<crate::config::EndpointIdentity>,
+    /// `[source] catalog`, verbatim.
+    #[serde(default)]
+    pub catalog: Option<String>,
+    /// The schema pattern's prefix — which source schemas discovery sees.
+    pub pattern_prefix: String,
+    /// The schema pattern's own separator, which splits every source schema
+    /// name. Distinct from [`ResumeTarget::separator_role`], which is the
+    /// TARGET separator and may be overridden by `[target] separator`.
+    pub pattern_separator: String,
+    /// The ordered components, each rendered to a stable tag
+    /// (`fixed:`, `var:`, `varlen:`, `term:`). A rendering rather than the
+    /// component enum so the recorded blob does not move when that enum
+    /// gains a variant or a field.
+    #[serde(default)]
+    pub pattern_components: Vec<String>,
 }
 
 /// Where a replication run routed its writes: the target adapter alias, the
@@ -2891,8 +2966,36 @@ impl std::fmt::Display for ResumeScope {
             None => write!(f, ", no filter")?,
         }
         match &self.target {
-            Some(target) => write!(f, ", target {target}"),
-            None => write!(f, ", target unrecorded"),
+            Some(target) => write!(f, ", target {target}")?,
+            None => write!(f, ", target unrecorded")?,
+        }
+        match &self.source {
+            Some(source) => write!(f, ", source {source}"),
+            None => write!(f, ", source unrecorded"),
+        }
+    }
+}
+
+impl std::fmt::Display for ResumeSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.discovery_adapter {
+            Some(adapter) => write!(f, "{adapter}")?,
+            None => write!(f, "<no discovery>")?,
+        }
+        match &self.catalog {
+            Some(catalog) => write!(f, ":{catalog}")?,
+            None => write!(f, ":<no catalog>")?,
+        }
+        write!(
+            f,
+            " pattern({}{}[{}])",
+            self.pattern_prefix,
+            self.pattern_separator,
+            self.pattern_components.join(",")
+        )?;
+        match &self.endpoint {
+            Some(endpoint) => write!(f, " endpoint({endpoint})"),
+            None => write!(f, " endpoint unrecorded"),
         }
     }
 }
@@ -6097,20 +6200,40 @@ pub struct PolicyDecisionRecord {
     pub capability: crate::config::PolicyCapability,
     /// The model the decision was about — the concrete scope that matched.
     pub model: String,
-    /// The graph keys this decision covers, when [`Self::model`] cannot be one.
+    /// The graph keys this decision covers, as the producer knew them.
     ///
-    /// Empty on an ordinary evaluation row, where `model` **is** the graph key
-    /// and this field would only repeat it. Non-empty on a **plan-level**
-    /// escalation (`backfill` / `gc` / `restore`), where `model` is a
-    /// human-readable summary — `"backfill: 3 model(s)"` — that no graph lookup
-    /// can resolve. Those rows record the real model names here so a consumer
-    /// can compute a blast radius or match `rocky audit --for <model>` without
-    /// parsing the label.
+    /// Non-empty on a **plan-level** escalation (`backfill` / `gc` /
+    /// `restore`), where `model` is a human-readable summary — `"backfill: 3
+    /// model(s)"` — that no graph lookup can resolve, so the real names go
+    /// here. Also the single name on an apply-time evaluation row whose
+    /// subject is a model of the compiled project (#1815) — the gate is the
+    /// one place that knows, because the same `model` field carries a
+    /// replication target's table name, which is gated by name and is not a
+    /// model. Empty when the producer could not name a graph key, or on a row
+    /// written before it recorded one.
     ///
     /// Read through [`Self::graph_keys`], never directly: an empty vec means
-    /// "fall back to `model`", not "this decision covers no model".
+    /// "fall back to `model`", not "this decision covers no model". The
+    /// review queue, which must not hand a non-model over as a name, resolves
+    /// an empty set against the compiled graph instead.
     #[serde(default)]
     pub models: Vec<String>,
+    /// Whether the producer decided [`Self::models`] on purpose.
+    ///
+    /// `true` means the set is the producer's word — including an EMPTY set,
+    /// which then says "this subject is no compiled model": a replication
+    /// target gated by table name, a maintenance table no model owns, a
+    /// promote target the current project no longer maps. `false` means the
+    /// row was written before producers recorded the set (pre-v29), where an
+    /// empty set says only "unknown" and a consumer may still resolve the
+    /// bare `model` against the compiled graph.
+    ///
+    /// Without this bit the two were the same bytes, and the review queue
+    /// undid a gate's "not a model" by re-resolving the name — a replication
+    /// target called `orders` became the compiled model `orders`, and its
+    /// rows were offered for sampling (#1815, review round seven).
+    #[serde(default)]
+    pub keys_recorded: bool,
     /// The resolved verdict.
     pub effect: crate::config::PolicyEffect,
     /// Index of the winning `[[policy.rules]]` entry, or `None` for the
@@ -6454,13 +6577,35 @@ pub struct AnomalyResult {
 /// Detects row count anomalies by comparing against historical baseline.
 ///
 /// An anomaly is flagged when the current count deviates from the moving average
-/// by more than `threshold_pct` (e.g., 50.0 = 50% deviation).
+/// by more than `threshold_pct` (e.g., 50.0 = 50% deviation). `threshold_pct <= 0`
+/// disables detection and says so in `reason`.
+///
+/// A threshold that is not a finite number (`NaN`, `±inf`) cannot be compared
+/// against, and used to fall through both branches to "within normal range"
+/// with detection silently off (#1816). Config loading now refuses such a
+/// value, so this is reached only by a caller that bypassed it; it fails
+/// closed — `is_anomaly: true`, with a `reason` that names the threshold —
+/// because the one outcome it must not have is a quiet "normal".
 pub fn detect_anomaly(
     table_key: &str,
     current_count: u64,
     history: &[CheckSnapshot],
     threshold_pct: f64,
 ) -> AnomalyResult {
+    if !threshold_pct.is_finite() {
+        return AnomalyResult {
+            table: table_key.to_string(),
+            current_count,
+            baseline_avg: current_count as f64,
+            deviation_pct: 0.0,
+            is_anomaly: true,
+            reason: format!(
+                "anomaly_threshold_pct is {threshold_pct}, not a finite number: the threshold \
+                 cannot be evaluated, so this count is flagged rather than called normal"
+            ),
+        };
+    }
+
     if history.is_empty() {
         return AnomalyResult {
             table: table_key.to_string(),
@@ -7328,6 +7473,59 @@ mod tests {
         assert!(detect_anomaly("tbl", 105, &history, 1.0).is_anomaly);
         // 5% move against a 10% threshold: not one.
         assert!(!detect_anomaly("tbl", 105, &history, 10.0).is_anomaly);
+    }
+
+    /// #1816. `NaN` failed both `threshold_pct > 0.0` and `threshold_pct <= 0.0`,
+    /// so a 400% spike came back `is_anomaly: false`, "within normal range":
+    /// detection off, and the result described as measured. `+inf` reached
+    /// the same place through the other branch — no deviation exceeds it.
+    /// Neither may be called normal. The threshold is refused at config load;
+    /// here, for a caller that bypassed it, the result fails closed.
+    #[test]
+    fn a_non_finite_threshold_is_never_called_normal() {
+        let history = vec![
+            CheckSnapshot {
+                timestamp: Utc::now(),
+                row_count: 100,
+            },
+            CheckSnapshot {
+                timestamp: Utc::now(),
+                row_count: 100,
+            },
+        ];
+        for threshold in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            // A 400% spike, unmissable at any real threshold.
+            let spike = detect_anomaly("tbl", 500, &history, threshold);
+            assert!(spike.is_anomaly, "{threshold}: {}", spike.reason);
+            assert!(
+                !spike.reason.contains("within normal range"),
+                "{threshold}: {}",
+                spike.reason
+            );
+            assert!(
+                spike.reason.contains("not a finite number"),
+                "{threshold}: the reason names the misconfiguration: {}",
+                spike.reason
+            );
+            // An unchanged count is flagged too: the flag is about the
+            // threshold, not the data, so it cannot be mistaken for a
+            // measurement that cleared.
+            let flat = detect_anomaly("tbl", 100, &history, threshold);
+            assert!(flat.is_anomaly, "{threshold}: {}", flat.reason);
+            // And a first run, which has no baseline to compare against,
+            // still refuses to report a threshold it cannot evaluate.
+            let first = detect_anomaly("tbl", 100, &[], threshold);
+            assert!(first.is_anomaly, "{threshold}: {}", first.reason);
+        }
+        // The discriminator: the same spike at the default threshold is an
+        // ordinary anomaly with a measured reason, and the flat count is not
+        // one at all.
+        assert!(
+            detect_anomaly("tbl", 500, &history, 50.0)
+                .reason
+                .contains("spiked")
+        );
+        assert!(!detect_anomaly("tbl", 100, &history, 50.0).is_anomaly);
     }
 
     #[test]
@@ -9417,6 +9615,7 @@ mod tests {
         ResumeScope {
             pipeline: pipeline.to_string(),
             filter: None,
+            source: None,
             target: Some(ResumeTarget {
                 adapter: "default".to_string(),
                 catalog_template: "wh".to_string(),
@@ -9576,7 +9775,11 @@ mod tests {
         assert_ne!(recorded, progress_scope("p1"));
         assert_eq!(
             recorded.to_string(),
-            "pipeline 'p1', no filter, target unrecorded"
+            // Both halves read "unrecorded": a pre-release blob carries
+            // neither the structured target nor the source (#1583). Saying
+            // so is the point — it is what makes the mismatch below legible
+            // rather than a silent inequality.
+            "pipeline 'p1', no filter, target unrecorded, source unrecorded"
         );
 
         assert!(
@@ -11713,6 +11916,7 @@ mod tests {
         let (store, _dir) = temp_store();
         // Two decisions with distinct timestamps → forward scan is oldest-first.
         let earlier = PolicyDecisionRecord {
+            keys_recorded: false,
             models: Vec::new(),
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-07-07T10:00:00Z")
                 .unwrap()
@@ -11728,6 +11932,7 @@ mod tests {
             auto_apply: None,
         };
         let later = PolicyDecisionRecord {
+            keys_recorded: false,
             models: Vec::new(),
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-07-07T11:00:00Z")
                 .unwrap()
@@ -11767,6 +11972,7 @@ mod tests {
 
         // A full record serialized with `models` stripped — a v27 blob.
         let record = PolicyDecisionRecord {
+            keys_recorded: false,
             models: vec!["dim_customer".to_string()],
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-09-07T10:00:00Z")
                 .unwrap()
@@ -11803,6 +12009,46 @@ mod tests {
         );
     }
 
+    /// A v28 policy decision — one whose blob has no `keys_recorded` key —
+    /// must forward-deserialize with the flag `false`: a row that never said
+    /// whether its set was deliberate is "unknown", and a consumer may still
+    /// resolve its bare `model`. Guards the v29 bump.
+    #[test]
+    fn test_v28_policy_decision_forward_deserializes_keys_recorded_false() {
+        use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+
+        let record = PolicyDecisionRecord {
+            keys_recorded: true,
+            models: Vec::new(),
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-09-09T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            plan_id: "plan_v28".to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::Apply,
+            model: "orders".to_string(),
+            effect: PolicyEffect::RequireReview,
+            rule_id: None,
+            reason: "replication target awaits review".to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+        };
+        let mut value = serde_json::to_value(&record).expect("serialize record");
+        value
+            .as_object_mut()
+            .expect("record is an object")
+            .remove("keys_recorded");
+        let blob = serde_json::to_vec(&value).expect("reserialize without field");
+
+        let read: PolicyDecisionRecord = serde_json::from_slice(&blob)
+            .expect("v28 PolicyDecisionRecord must forward-deserialize");
+        assert_eq!(read.plan_id, "plan_v28");
+        assert!(
+            !read.keys_recorded,
+            "a v28 blob never said whether its set was deliberate: unknown, not vouched"
+        );
+    }
+
     /// `graph_keys` yields the model set when there is one and the single
     /// `model` when there is not — and NEVER yields nothing.
     ///
@@ -11816,6 +12062,7 @@ mod tests {
         use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
 
         let base = PolicyDecisionRecord {
+            keys_recorded: false,
             models: Vec::new(),
             timestamp: Utc::now(),
             plan_id: "p".to_string(),
@@ -11842,6 +12089,7 @@ mod tests {
         // keeps the audit screen's `subject={entry.model}` custody link
         // working, which an exclusive matcher would have broken.
         let with_models = PolicyDecisionRecord {
+            keys_recorded: false,
             models: vec!["dim_customer".to_string(), "fct_orders".to_string()],
             ..base.clone()
         };
@@ -11852,6 +12100,7 @@ mod tests {
 
         // An ordinary row: `model` is the graph key and there is no set.
         let ordinary = PolicyDecisionRecord {
+            keys_recorded: false,
             models: Vec::new(),
             model: "fct_orders".to_string(),
             ..base
@@ -11868,6 +12117,7 @@ mod tests {
 
         // A full v17 record serialized with `auto_apply` stripped.
         let record = PolicyDecisionRecord {
+            keys_recorded: false,
             models: Vec::new(),
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-07-07T10:00:00Z")
                 .unwrap()
@@ -12634,8 +12884,9 @@ mod tests {
     }
 
     /// The v28 upgrade claim, exercised rather than asserted in a comment:
-    /// a v27 store is stamped v28 **in place**, every policy-decision row is
-    /// KEPT, and each one reads back with `models` empty.
+    /// a v27 store is stamped forward **in place** (to v28 then, to the
+    /// current version now), every policy-decision row is KEPT, and each one
+    /// reads back with `models` empty.
     ///
     /// The generic `open_with_policy_recreate_upgrades_older_store_without_
     /// recreating` above stamps version 6 and checks a watermark. It proves
@@ -12653,6 +12904,7 @@ mod tests {
             let store = StateStore::open(&path).unwrap();
             store
                 .record_policy_decision(&PolicyDecisionRecord {
+                    keys_recorded: false,
                     models: Vec::new(),
                     timestamp: Utc::now(),
                     plan_id: "planPre28".to_string(),
@@ -12802,13 +13054,17 @@ mod tests {
         // serde-additive shape. NO table change either — so this stanza moves
         // the version only; guarded by
         // `test_v25_run_record_forward_deserializes_verify_after_failed_false`.
-        const EXPECTED_VERSION: u32 = 28;
+        const EXPECTED_VERSION: u32 = 29;
         // v28 adds `PolicyDecisionRecord::models` (#1766), the graph keys
         // behind a plan-level review escalation's human label. The same
         // serde-additive shape as v25-v27: NO table change — `EXPECTED_TABLES`
         // is deliberately unchanged below — so this stanza moves the version
         // only; guarded by
         // `test_v27_policy_decision_forward_deserializes_models_empty`.
+        // v29 adds `PolicyDecisionRecord::keys_recorded` (#1815), whether
+        // that set was the producer's word. Same serde-additive shape: NO
+        // table change, the version moves only; guarded by
+        // `test_v28_policy_decision_forward_deserializes_keys_recorded_false`.
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",

@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { ReviewQueueOutput } from "@rocky-types/review_queue";
 import { ApiError } from "../api";
@@ -20,6 +20,8 @@ const QUEUE: ReviewQueueOutput = {
       principal: "agent",
       capability: "schema_change.breaking",
       model: "orders",
+      models: ["orders"],
+      preview_model: "orders",
       rule_id: 2,
       reason: "a breaking schema change needs a human",
       blast_radius: 7,
@@ -35,6 +37,8 @@ const QUEUE: ReviewQueueOutput = {
       principal: "agent",
       capability: "schema_change.additive",
       model: "customers",
+      models: ["customers"],
+      preview_model: "customers",
       rule_id: null,
       reason: "the default effect asks for review",
       blast_radius: null,
@@ -67,6 +71,32 @@ describe("QueuePanel", () => {
     // The excluded rows are explained, not hidden: "2 waiting" beside a ledger
     // holding five rows is otherwise a question the screen leaves open.
     expect(screen.getByText(/3 further rows in the ledger/)).toBeTruthy();
+  });
+
+  /// On a plan-level row `model` is a label — "backfill: 3 model(s)" — and
+  /// the engine reports the names in `models`. The row shows them; an
+  /// ordinary row, whose set is its label, does not repeat itself.
+  it("lists the recorded model set on a plan-level row, and only there", async () => {
+    const load = vi.fn(async () => ({
+      ...QUEUE,
+      pending: [
+        QUEUE.pending[0],
+        {
+          ...QUEUE.pending[1],
+          capability: "backfill" as const,
+          model: "backfill: 3 model(s)",
+          models: ["orders", "customers", "payments"],
+          preview_model: null,
+        },
+      ],
+    }));
+    render(<QueuePanel load={load} now={NOW} />);
+
+    await screen.findByText("2 waiting for review");
+    const [ordinary, planLevel] = screen.getAllByRole("listitem");
+    expect(within(planLevel).getByText("models")).toBeTruthy();
+    expect(within(planLevel).getByText("orders, customers, payments")).toBeTruthy();
+    expect(within(ordinary).queryByText("models")).toBeNull();
   });
 
   it("says plainly when nothing is waiting", async () => {

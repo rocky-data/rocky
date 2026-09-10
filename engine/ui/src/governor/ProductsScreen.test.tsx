@@ -280,8 +280,11 @@ describe("ProductsScreen", () => {
   it("renders a hostile event and product name as text, never as markup", async () => {
     const hostile = '<img src=x onerror="alert(1)">';
     const { container } = render(
+      // The name reaches the heading and the custody link. An earlier
+      // version of this test passed a benign name and only put the hostile
+      // value in the event, so the heading was never exercised (#1815).
       <ProductsScreen
-        name="revenue_daily"
+        name={hostile}
         loaders={loaders({
           journal: vi.fn(async () => ({
             ...JOURNAL,
@@ -293,7 +296,34 @@ describe("ProductsScreen", () => {
     );
 
     expect(await screen.findByText(hostile)).toBeTruthy();
+    expect(screen.getByRole("heading", { name: hostile })).toBeTruthy();
+    expect(screen.getByRole("link", { name: `product:${hostile}` })).toBeTruthy();
     expect(container.querySelector("img")).toBeNull();
+  });
+
+  /// Product A's standing and journal must not sit under product B's heading
+  /// while B's reads are still in flight (#1815).
+  it("carries nothing of product A under product B's heading", async () => {
+    let releaseB!: (value: ProductStatusOutput) => void;
+    const statusB = new Promise<ProductStatusOutput>((resolve) => {
+      releaseB = resolve;
+    });
+    const shared = loaders({
+      status: vi.fn(async (name: string) => (name === "revenue_daily" ? STATUS : statusB)),
+    });
+    const view = render(<ProductsScreen name="revenue_daily" loaders={shared} />);
+    await screen.findByText("observed_passing");
+    await screen.findAllByText("change proposed");
+
+    view.rerender(<ProductsScreen name="costs_daily" loaders={shared} />);
+
+    expect(screen.getByRole("heading", { name: "costs_daily" })).toBeTruthy();
+    expect(screen.queryByText("observed_passing")).toBeNull();
+    expect(screen.getByText("reading the product…")).toBeTruthy();
+
+    releaseB({ ...STATUS, fulfill_state: "proposed" } as ProductStatusOutput);
+    await screen.findByText("proposed");
+    expect(screen.queryByText("observed_passing")).toBeNull();
   });
 
   it("builds a product path that survives an awkward name", () => {

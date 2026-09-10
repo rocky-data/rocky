@@ -2156,6 +2156,10 @@ mod tests {
         );
     }
 
+    // Unix-only: the fixture is a dangling SYMLINK, and
+    // `std::os::unix::fs::symlink` does not exist on Windows — where
+    // `cargo check --all-targets` compiles this test and fails on it.
+    #[cfg(unix)]
     #[test]
     fn a_dangling_model_sidecar_refuses_instead_of_compiling_against_defaults() {
         let dir = tempfile::tempdir().unwrap();

@@ -1795,6 +1795,331 @@ impl GovernanceAdapter for NoopGovernanceAdapter {
 }
 
 // ---------------------------------------------------------------------------
+// Recording governance adapter
+// ---------------------------------------------------------------------------
+
+/// One [`GovernanceAdapter`] call, captured by [`RecordingGovernanceAdapter`].
+///
+/// There is exactly one variant per trait method, including the ones with a
+/// default body. A method that went unrecorded would make every "this issued
+/// no governance calls" assertion pass for the wrong reason, so the mapping is
+/// pinned by `every_governance_method_is_recorded`.
+#[derive(Debug, Clone)]
+pub enum GovernanceCall {
+    SetTags {
+        target: TagTarget,
+        tags: BTreeMap<String, String>,
+    },
+    GetGrants {
+        target: GrantTarget,
+    },
+    ApplyGrants {
+        grants: Vec<Grant>,
+    },
+    RevokeGrants {
+        grants: Vec<Grant>,
+    },
+    BindWorkspace {
+        catalog: String,
+        workspace_id: u64,
+        binding_type: String,
+    },
+    SetIsolation {
+        catalog: String,
+        enabled: bool,
+    },
+    ListWorkspaceBindings {
+        catalog: String,
+    },
+    RemoveWorkspaceBinding {
+        catalog: String,
+        workspace_id: u64,
+    },
+    ApplyColumnTags {
+        table: TableRef,
+        column_tags: BTreeMap<String, BTreeMap<String, String>>,
+    },
+    ApplyMaskingPolicy {
+        table: TableRef,
+        policy: MaskingPolicy,
+        env: String,
+    },
+    ReconcileRoleGraph {
+        roles: BTreeMap<String, rocky_ir::ResolvedRole>,
+        catalogs: Vec<String>,
+    },
+    ApplyRetentionPolicy {
+        table: TableRef,
+        retention: RetentionPolicy,
+    },
+    ReadRetentionDays {
+        table: TableRef,
+    },
+    WriteRecipeManifest {
+        table: TableRef,
+        properties: BTreeMap<String, String>,
+    },
+}
+
+impl GovernanceCall {
+    /// The trait method this call came from, spelled exactly as in the trait.
+    ///
+    /// Assertions read better against these names than against the variants:
+    /// `assert_eq!(log.methods(), ["set_tags"])` says what the code did.
+    pub fn method(&self) -> &'static str {
+        match self {
+            Self::SetTags { .. } => "set_tags",
+            Self::GetGrants { .. } => "get_grants",
+            Self::ApplyGrants { .. } => "apply_grants",
+            Self::RevokeGrants { .. } => "revoke_grants",
+            Self::BindWorkspace { .. } => "bind_workspace",
+            Self::SetIsolation { .. } => "set_isolation",
+            Self::ListWorkspaceBindings { .. } => "list_workspace_bindings",
+            Self::RemoveWorkspaceBinding { .. } => "remove_workspace_binding",
+            Self::ApplyColumnTags { .. } => "apply_column_tags",
+            Self::ApplyMaskingPolicy { .. } => "apply_masking_policy",
+            Self::ReconcileRoleGraph { .. } => "reconcile_role_graph",
+            Self::ApplyRetentionPolicy { .. } => "apply_retention_policy",
+            Self::ReadRetentionDays { .. } => "read_retention_days",
+            Self::WriteRecipeManifest { .. } => "write_recipe_manifest",
+        }
+    }
+}
+
+/// The shared call log a [`RecordingGovernanceAdapter`] writes into.
+///
+/// Governance call sites take the adapter by value (`Box<dyn
+/// GovernanceAdapter>`) or borrow one they do not own, so a test cannot read
+/// the adapter back after handing it over. The log is a separate, cloneable
+/// handle: clone it before constructing the adapter and the assertions still
+/// have somewhere to look.
+#[derive(Debug, Clone, Default)]
+pub struct GovernanceLog {
+    calls: std::sync::Arc<std::sync::Mutex<Vec<GovernanceCall>>>,
+}
+
+impl GovernanceLog {
+    /// Every call recorded so far, oldest first.
+    pub fn calls(&self) -> Vec<GovernanceCall> {
+        self.lock().clone()
+    }
+
+    /// The method name of every call recorded so far, oldest first.
+    pub fn methods(&self) -> Vec<&'static str> {
+        self.lock().iter().map(GovernanceCall::method).collect()
+    }
+
+    /// `true` when nothing has been recorded.
+    ///
+    /// Read this only alongside a test proving the same wiring *does* record
+    /// when a call happens. On its own it cannot tell "no governance call was
+    /// issued" from "this adapter was never reached".
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    fn push(&self, call: GovernanceCall) {
+        self.lock().push(call);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<GovernanceCall>> {
+        // A panicking test must not turn every later assertion into a second
+        // panic about poisoning — recover the log so the first failure stays
+        // the one that gets reported.
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// A [`GovernanceAdapter`] that records every call and then forwards it.
+///
+/// Wraps another adapter — [`NoopGovernanceAdapter`] by default — so inserting
+/// the recorder does not change what the code under test observes: every
+/// return value, including the errors the unsupported-operation defaults
+/// produce, is the inner adapter's.
+///
+/// ```rust
+/// use rocky_core::traits::{GovernanceLog, RecordingGovernanceAdapter};
+/// let log = GovernanceLog::default();
+/// let governance = RecordingGovernanceAdapter::new(log.clone());
+/// // hand `governance` to the code under test, then:
+/// assert!(log.is_empty());
+/// ```
+pub struct RecordingGovernanceAdapter {
+    log: GovernanceLog,
+    inner: Box<dyn GovernanceAdapter>,
+}
+
+impl RecordingGovernanceAdapter {
+    /// Record into `log`, forwarding to [`NoopGovernanceAdapter`].
+    pub fn new(log: GovernanceLog) -> Self {
+        Self {
+            log,
+            inner: Box::new(NoopGovernanceAdapter),
+        }
+    }
+
+    /// Record into `log`, forwarding to `inner`.
+    ///
+    /// Use this to keep a real adapter's behaviour — or a fake that returns
+    /// specific errors — while still seeing the call sequence.
+    pub fn wrapping(log: GovernanceLog, inner: Box<dyn GovernanceAdapter>) -> Self {
+        Self { log, inner }
+    }
+}
+
+#[async_trait]
+impl GovernanceAdapter for RecordingGovernanceAdapter {
+    async fn set_tags(
+        &self,
+        target: &TagTarget,
+        tags: &BTreeMap<String, String>,
+    ) -> AdapterResult<()> {
+        self.log.push(GovernanceCall::SetTags {
+            target: target.clone(),
+            tags: tags.clone(),
+        });
+        self.inner.set_tags(target, tags).await
+    }
+
+    async fn get_grants(&self, target: &GrantTarget) -> AdapterResult<Vec<Grant>> {
+        self.log.push(GovernanceCall::GetGrants {
+            target: target.clone(),
+        });
+        self.inner.get_grants(target).await
+    }
+
+    async fn apply_grants(&self, grants: &[Grant]) -> AdapterResult<()> {
+        self.log.push(GovernanceCall::ApplyGrants {
+            grants: grants.to_vec(),
+        });
+        self.inner.apply_grants(grants).await
+    }
+
+    async fn revoke_grants(&self, grants: &[Grant]) -> AdapterResult<()> {
+        self.log.push(GovernanceCall::RevokeGrants {
+            grants: grants.to_vec(),
+        });
+        self.inner.revoke_grants(grants).await
+    }
+
+    async fn bind_workspace(
+        &self,
+        catalog: &str,
+        workspace_id: u64,
+        binding_type: &str,
+    ) -> AdapterResult<()> {
+        self.log.push(GovernanceCall::BindWorkspace {
+            catalog: catalog.to_string(),
+            workspace_id,
+            binding_type: binding_type.to_string(),
+        });
+        self.inner
+            .bind_workspace(catalog, workspace_id, binding_type)
+            .await
+    }
+
+    async fn set_isolation(&self, catalog: &str, enabled: bool) -> AdapterResult<()> {
+        self.log.push(GovernanceCall::SetIsolation {
+            catalog: catalog.to_string(),
+            enabled,
+        });
+        self.inner.set_isolation(catalog, enabled).await
+    }
+
+    async fn list_workspace_bindings(&self, catalog: &str) -> AdapterResult<Vec<(u64, String)>> {
+        self.log.push(GovernanceCall::ListWorkspaceBindings {
+            catalog: catalog.to_string(),
+        });
+        self.inner.list_workspace_bindings(catalog).await
+    }
+
+    async fn remove_workspace_binding(
+        &self,
+        catalog: &str,
+        workspace_id: u64,
+    ) -> AdapterResult<()> {
+        self.log.push(GovernanceCall::RemoveWorkspaceBinding {
+            catalog: catalog.to_string(),
+            workspace_id,
+        });
+        self.inner
+            .remove_workspace_binding(catalog, workspace_id)
+            .await
+    }
+
+    async fn apply_column_tags(
+        &self,
+        table: &TableRef,
+        column_tags: &BTreeMap<String, BTreeMap<String, String>>,
+    ) -> AdapterResult<()> {
+        self.log.push(GovernanceCall::ApplyColumnTags {
+            table: table.clone(),
+            column_tags: column_tags.clone(),
+        });
+        self.inner.apply_column_tags(table, column_tags).await
+    }
+
+    async fn apply_masking_policy(
+        &self,
+        table: &TableRef,
+        policy: &MaskingPolicy,
+        env: &str,
+    ) -> AdapterResult<()> {
+        self.log.push(GovernanceCall::ApplyMaskingPolicy {
+            table: table.clone(),
+            policy: policy.clone(),
+            env: env.to_string(),
+        });
+        self.inner.apply_masking_policy(table, policy, env).await
+    }
+
+    async fn reconcile_role_graph(
+        &self,
+        roles: &BTreeMap<String, rocky_ir::ResolvedRole>,
+        catalogs: &[&str],
+    ) -> AdapterResult<()> {
+        self.log.push(GovernanceCall::ReconcileRoleGraph {
+            roles: roles.clone(),
+            catalogs: catalogs.iter().map(|c| (*c).to_string()).collect(),
+        });
+        self.inner.reconcile_role_graph(roles, catalogs).await
+    }
+
+    async fn apply_retention_policy(
+        &self,
+        table: &TableRef,
+        retention: &RetentionPolicy,
+    ) -> AdapterResult<()> {
+        self.log.push(GovernanceCall::ApplyRetentionPolicy {
+            table: table.clone(),
+            retention: *retention,
+        });
+        self.inner.apply_retention_policy(table, retention).await
+    }
+
+    async fn read_retention_days(&self, table: &TableRef) -> AdapterResult<Option<u32>> {
+        self.log.push(GovernanceCall::ReadRetentionDays {
+            table: table.clone(),
+        });
+        self.inner.read_retention_days(table).await
+    }
+
+    async fn write_recipe_manifest(
+        &self,
+        table: &TableRef,
+        properties: &BTreeMap<String, String>,
+    ) -> AdapterResult<()> {
+        self.log.push(GovernanceCall::WriteRecipeManifest {
+            table: table.clone(),
+            properties: properties.clone(),
+        });
+        self.inner.write_recipe_manifest(table, properties).await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Type mapping
 // ---------------------------------------------------------------------------
 
@@ -1926,6 +2251,148 @@ mod tests {
     fn _assert_batch_check_object_safe(_: &dyn BatchCheckAdapter) {}
     // SqlDialect is not async, but still needs to be object-safe.
     fn _assert_dialect_object_safe(_: &dyn SqlDialect) {}
+
+    // -----------------------------------------------------------------
+    // RecordingGovernanceAdapter
+    // -----------------------------------------------------------------
+
+    /// Method names inside the `{ … }` block a `header` line opens, where
+    /// `header` is a line of this file with no leading whitespace.
+    ///
+    /// Reading the source is the only way to compare a trait's declared
+    /// surface against what one impl overrides: a method the recorder does
+    /// not override still *compiles*, because the trait default supplies a
+    /// body — it just silently never reaches the log.
+    fn method_names_in_block(header: &str) -> Vec<String> {
+        let source = include_str!("traits.rs");
+        let opens: Vec<usize> = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| *line == header)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            opens.len(),
+            1,
+            "expected exactly one line reading {header:?}, found {}",
+            opens.len()
+        );
+
+        let mut names = Vec::new();
+        for line in source.lines().skip(opens[0] + 1) {
+            if line == "}" {
+                break;
+            }
+            let Some(rest) = line.strip_prefix("    ") else {
+                continue;
+            };
+            let rest = rest.strip_prefix("async ").unwrap_or(rest);
+            let Some(rest) = rest.strip_prefix("fn ") else {
+                continue;
+            };
+            let Some(name) = rest.split('(').next() else {
+                continue;
+            };
+            names.push(name.to_string());
+        }
+        names.sort();
+        names
+    }
+
+    /// A `GovernanceAdapter` method the recorder does not override inherits
+    /// the trait default, runs, and writes nothing to the log — so a "this
+    /// issued no governance calls" assertion would pass while the call was
+    /// made. Adding a method to the trait must therefore fail here until the
+    /// recorder covers it.
+    #[test]
+    fn every_governance_method_is_recorded() {
+        let declared = method_names_in_block("pub trait GovernanceAdapter: Send + Sync {");
+        let recorded =
+            method_names_in_block("impl GovernanceAdapter for RecordingGovernanceAdapter {");
+
+        assert!(
+            declared.len() >= 14,
+            "the trait scan found only {declared:?} — the scan is broken, not the trait"
+        );
+        assert_eq!(
+            declared, recorded,
+            "every GovernanceAdapter method must be recorded; \
+             add the missing variant to GovernanceCall and override the method"
+        );
+    }
+
+    /// The positive control for every "the log is empty" assertion: the same
+    /// wiring, with calls actually made, records them in order and names each
+    /// one after the method it came from.
+    #[tokio::test]
+    async fn a_recorded_call_names_the_method_it_came_from() {
+        let log = GovernanceLog::default();
+        let governance = RecordingGovernanceAdapter::new(log.clone());
+
+        assert!(log.is_empty(), "nothing has been called yet");
+
+        governance.apply_grants(&[]).await.unwrap();
+        governance.set_isolation("analytics", true).await.unwrap();
+        governance
+            .set_tags(
+                &TagTarget::Catalog("analytics".to_string()),
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            log.methods(),
+            vec!["apply_grants", "set_isolation", "set_tags"],
+            "calls are recorded in the order they were made"
+        );
+    }
+
+    /// The recorder is transparent: it forwards to the adapter it wraps and
+    /// returns that adapter's answer unchanged, errors included. A double
+    /// that swallowed the inner error would make the code under test take a
+    /// path it does not take in production.
+    #[tokio::test]
+    async fn the_recorder_returns_what_its_inner_adapter_returns() {
+        let noop_log = GovernanceLog::default();
+        let over_noop = RecordingGovernanceAdapter::new(noop_log.clone());
+        assert!(
+            over_noop.list_workspace_bindings("analytics").await.is_ok(),
+            "NoopGovernanceAdapter overrides list_workspace_bindings with Ok"
+        );
+
+        let minimal_log = GovernanceLog::default();
+        let over_minimal =
+            RecordingGovernanceAdapter::wrapping(minimal_log.clone(), Box::new(MinimalGovernance));
+        let err = over_minimal
+            .list_workspace_bindings("analytics")
+            .await
+            .expect_err("MinimalGovernance inherits the erroring trait default");
+        assert!(
+            err.to_string().contains("list_workspace_bindings"),
+            "unexpected error: {err}"
+        );
+
+        assert_eq!(noop_log.methods(), vec!["list_workspace_bindings"]);
+        assert_eq!(minimal_log.methods(), vec!["list_workspace_bindings"]);
+    }
+
+    /// A log handed out before the adapter was boxed still sees the calls.
+    /// Governance call sites take `Box<dyn GovernanceAdapter>` by value, so
+    /// this is the only way a test gets its assertions back.
+    #[tokio::test]
+    async fn the_log_outlives_the_adapter_it_was_given_to() {
+        let log = GovernanceLog::default();
+        let boxed: Box<dyn GovernanceAdapter> =
+            Box::new(RecordingGovernanceAdapter::new(log.clone()));
+
+        async fn consume(governance: Box<dyn GovernanceAdapter>) {
+            governance.apply_grants(&[]).await.unwrap();
+        }
+        consume(boxed).await;
+
+        assert_eq!(log.methods(), vec!["apply_grants"]);
+    }
 
     // Default workspace-binding primitives error out so adapters that don't
     // support the concept must override with explicit semantics.

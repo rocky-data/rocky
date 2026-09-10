@@ -210,6 +210,28 @@ pub struct RunFailed {
     pub run_id: String,
 }
 
+/// Sentinel error signalling that a quality run completed its terminal state
+/// writes and then failed its check gate: at least one error-severity check
+/// failed, or could not be evaluated, while `[pipeline.<name>.checks]
+/// fail_on_error` was on. Exit 1, as the untyped `bail!` it replaces was; the
+/// message is the one it printed, plus the run id.
+///
+/// The TYPE exists for the same reason [`RunFailed`] does (#1816): the
+/// quality arm of the dispatcher still holds the run's remote-state session
+/// when this comes back, and it must FINALIZE — the `Failure` record with
+/// `check_gate_failed` is already persisted and must ride the terminal
+/// upload — rather than abandon, which uploads nothing. Abandoning on a bare
+/// `anyhow` error stranded the record in the pod-local file: every other pod,
+/// and the scheduler on it, kept reading the previous history. Not
+/// [`CheckGateFailure`], whose exit-2 partial-success contract belongs to a
+/// replication run that moved data first; a quality run moves none.
+#[derive(Debug, thiserror::Error)]
+#[error("quality pipeline failed: {count} error-severity check(s) failed (run_id: {run_id})")]
+pub struct QualityGateFailure {
+    pub count: usize,
+    pub run_id: String,
+}
+
 /// Sentinel error signalling that a replication run moved its data and then
 /// failed its declared check gate (#1598): at least one error-severity check
 /// failed, or could not be evaluated, while
@@ -826,6 +848,26 @@ fn run_trigger_from_env() -> rocky_core::state::RunTrigger {
     }
 }
 
+/// Test hook (#1816): make [`persist_run_record`] fail the record write for
+/// this run id, as `StateStore::record_run` does on a full disk or a failed
+/// commit, so a test can drive the real dispatcher through the path where the
+/// gate failed AND the record did not land. One id at a time.
+#[cfg(test)]
+pub(crate) static FAIL_RECORD_WRITE_FOR_TEST: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+/// Persist the run's terminal record, best-effort: a failed write is logged
+/// and the run goes on, because history is advisory for most of its readers.
+///
+/// Returns whether the record landed (`false` when there is no store, or the
+/// write failed). A caller whose error TYPE tells the dispatcher "my record
+/// is persisted, upload it" should check this before returning that type:
+/// finalizing on a record that is not there publishes a ledger without the
+/// run, and a fresh pod then reads an authoritative history with the failure
+/// missing. `run_quality` checks it before its `QualityGateFailure` (#1816);
+/// the transformation, snapshot and load arms do not yet, and their typed
+/// sentinels carry the same exposure (#1836). Nothing forces the check — a
+/// `bool` can be dropped — which is the shape #1836 is about.
 pub(crate) fn persist_run_record(
     state_store: Option<&StateStore>,
     output: &RunOutput,
@@ -838,9 +880,9 @@ pub(crate) fn persist_run_record(
     // succeed?" for `after`/`freshness` demands. `None` for a model-only run or
     // a multi-pipeline set (a backfill), which the reconciler never matches.
     pipeline: Option<&str>,
-) {
+) -> bool {
     let Some(store) = state_store else {
-        return;
+        return false;
     };
     let finished_at = Utc::now();
     let status = output.derive_run_status();
@@ -862,12 +904,31 @@ pub(crate) fn persist_run_record(
     record.submission_id = std::env::var("ROCKY_SUBMISSION_ID")
         .ok()
         .filter(|s| !s.is_empty());
-    if let Err(e) = store.record_run(&record) {
-        warn!(
-            error = %e,
-            run_id = run_id,
-            "failed to record run to state store — history/replay/cost/trace will not surface this run"
-        );
+    #[cfg(test)]
+    let written = if FAIL_RECORD_WRITE_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_deref()
+        == Some(run_id)
+    {
+        Err(rocky_core::state::StateError::from(
+            serde_json::from_str::<()>("injected record-write failure").unwrap_err(),
+        ))
+    } else {
+        store.record_run(&record)
+    };
+    #[cfg(not(test))]
+    let written = store.record_run(&record);
+    match written {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(
+                error = %e,
+                run_id = run_id,
+                "failed to record run to state store — history/replay/cost/trace will not surface this run"
+            );
+            false
+        }
     }
 }
 
@@ -1591,6 +1652,7 @@ fn require_resume_progress(
 /// [`SchemaPattern::parse`]: rocky_core::schema::SchemaPattern::parse
 /// [`ResumeSeparator::Unused`]: rocky_core::state::ResumeSeparator::Unused
 /// [`ResumeShadow::Schema`]: rocky_core::state::ResumeShadow::Schema
+#[allow(clippy::too_many_arguments)]
 fn replication_resume_scope(
     pipeline_name: &str,
     target: &rocky_core::config::PipelineTargetConfig,
@@ -1599,6 +1661,8 @@ fn replication_resume_scope(
     shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
     separator: &str,
     pattern: &rocky_core::schema::SchemaPattern,
+    source: &rocky_core::config::PipelineSourceConfig,
+    discovery_adapter: Option<&rocky_core::config::AdapterConfig>,
 ) -> ResumeScope {
     use rocky_core::state::{ResumeSeparator, ResumeShadow, ResumeTarget};
 
@@ -1631,9 +1695,40 @@ fn replication_resume_scope(
     } else {
         ResumeSeparator::Unused
     };
+    // The source half (#1583). The scope recorded nothing about where the
+    // run READ from, so re-pointing `source.discovery.adapter` moved no
+    // field: a resume matched its checkpoint by TARGET key, skipped every
+    // table it had never copied from the new source, and exited 0.
+    //
+    // The pattern goes in as a SHAPE rather than as itself. Discovery parses
+    // each source schema name with it and the captured values render the
+    // target names the checkpoint is keyed by, so two patterns that differ
+    // can map different source tables onto one key. Prefix, separator and
+    // the ordered components are what does that mapping.
+    let resume_source = rocky_core::state::ResumeSource {
+        discovery_adapter: source.discovery.as_ref().map(|d| d.adapter.clone()),
+        endpoint: discovery_adapter.map(rocky_core::config::AdapterConfig::endpoint_identity),
+        catalog: source.catalog.clone(),
+        pattern_prefix: pattern.prefix.clone(),
+        pattern_separator: pattern.separator.clone(),
+        pattern_components: pattern
+            .components
+            .iter()
+            .map(|component| {
+                use rocky_core::schema::PatternComponent as C;
+                match component {
+                    C::Fixed(value) => format!("fixed:{value}"),
+                    C::Variable { name } => format!("var:{name}"),
+                    C::VariableLength { name } => format!("varlen:{name}"),
+                    C::Terminal { name } => format!("term:{name}"),
+                }
+            })
+            .collect(),
+    };
     ResumeScope {
         pipeline: pipeline_name.to_string(),
         filter: filter.map(str::to_string),
+        source: Some(resume_source),
         target: Some(ResumeTarget {
             adapter: target.adapter.clone(),
             catalog_template: target.catalog_template.clone(),
@@ -3072,9 +3167,26 @@ pub async fn run(
                     return Ok(());
                 }
                 Err(e) => {
-                    session
-                        .abandon("quality exited before terminal state writes")
-                        .await;
+                    // A typed gate failure means `run_quality` completed its
+                    // terminal state writes — the `Failure` record carrying
+                    // `check_gate_failed` is persisted — so the session must
+                    // FINALIZE, exactly as the transformation arm does for
+                    // `RunFailed`: the record rides the terminal upload.
+                    // Abandoning here (the previous shape) uploaded nothing,
+                    // so under a remote `[state]` backend every other pod
+                    // kept reading the history from before the failed run
+                    // (#1816). Every other error is a pre-terminal hard exit:
+                    // abandon, never upload.
+                    if e.is::<QualityGateFailure>() {
+                        session.finalize().await.context(
+                            "the run's recorded check-gate failure could not be persisted to \
+                             the remote [state] backend",
+                        )?;
+                    } else {
+                        session
+                            .abandon("quality exited before terminal state writes")
+                            .await;
+                    }
                     return Err(e);
                 }
             }
@@ -3424,6 +3536,16 @@ pub async fn run(
         .separator
         .as_deref()
         .unwrap_or(&pattern.separator);
+    // Resolved from the same adapter map the target came from, so the
+    // recorded endpoint is the one discovery will actually read (#1583).
+    // A missing entry is not an error here: the discovery call below raises
+    // it with the context this function does not have, and a scope that
+    // records `None` still differs from one that records an endpoint.
+    let discovery_adapter_config = pipeline
+        .source
+        .discovery
+        .as_ref()
+        .and_then(|disc| rocky_cfg.adapters.get(&disc.adapter));
     let resume_scope = replication_resume_scope(
         pipeline_name,
         &pipeline.target,
@@ -3432,6 +3554,8 @@ pub async fn run(
         shadow_config,
         target_sep,
         &pattern,
+        &pipeline.source,
+        discovery_adapter_config,
     );
     // Before any checkpoint is consulted (#1611). A key that cannot name a
     // database is not evidence a table was copied, so the refusal belongs
@@ -8181,11 +8305,51 @@ fn apply_shadow_rewrite(
                     model.config.name
                 );
             }
-            rocky_core::models::StrategyConfig::FullRefresh
-            | rocky_core::models::StrategyConfig::Incremental { .. }
+            // The incremental family cannot produce a comparable shadow
+            // (#1273). These strategies build on what the target ALREADY
+            // holds, and a shadow target holds nothing:
+            //
+            //   first run   the CTAS *is* the load, so the shadow gets one
+            //               delta while production holds full history — the
+            //               comparison reports a near-total row-count loss
+            //               that says nothing about the change under review;
+            //   self-read   `WHERE ts > (SELECT MAX(ts) FROM main.events)`
+            //               is deliberately NOT redirected (pointing it at
+            //               the empty shadow would change what the model
+            //               computes), so the shadow gets rows strictly
+            //               newer than production's maximum — normally zero;
+            //   repeat run  with nothing dropped between runs, the second
+            //               run appends to the first run's leftover and the
+            //               row count drifts further every time.
+            //
+            // Producing an incomparable number is worse than refusing, so
+            // these join the two strategies above rather than running.
+            // Seeding the shadow from production first would make the
+            // comparison meaningful, but that is a full copy per model and
+            // a cost decision nobody has taken.
+            rocky_core::models::StrategyConfig::Incremental { .. }
             | rocky_core::models::StrategyConfig::Merge { .. }
             | rocky_core::models::StrategyConfig::DeleteInsert { .. }
-            | rocky_core::models::StrategyConfig::Microbatch { .. }
+            | rocky_core::models::StrategyConfig::Microbatch { .. } => {
+                anyhow::bail!(
+                    "shadow/branch execution is not supported for model '{}': its \
+                     '{}' strategy builds on rows the target already holds, and a shadow \
+                     target starts empty — so the shadow would be compared against a \
+                     production table it was never built the same way as. Give the model \
+                     `full_refresh` to shadow it, or exclude it from this run with --model",
+                    model.config.name,
+                    match &model.config.strategy {
+                        rocky_core::models::StrategyConfig::Incremental { .. } => "incremental",
+                        rocky_core::models::StrategyConfig::Merge { .. } => "merge",
+                        rocky_core::models::StrategyConfig::DeleteInsert { .. } => "delete_insert",
+                        _ => "microbatch",
+                    }
+                );
+            }
+            // What survives is exactly the set that REPLACES its target
+            // rather than adding to it, so a shadow build is a complete,
+            // comparable output and the object is disposable.
+            rocky_core::models::StrategyConfig::FullRefresh
             | rocky_core::models::StrategyConfig::View
             | rocky_core::models::StrategyConfig::MaterializedView
             | rocky_core::models::StrategyConfig::DynamicTable { .. } => {}
@@ -9540,6 +9704,10 @@ pub(crate) async fn execute_models(
         )?;
     }
 
+    // Shadow objects this run derived, in selection order. Empty on every
+    // non-shadow run, so the ownership preflight and the cleanup below are
+    // both no-ops there (#1273).
+    let mut shadow_objects: Vec<crate::commands::shadow_lifecycle::ShadowObject> = Vec::new();
     if let Some(config) = shadow_config {
         apply_shadow_rewrite(
             &mut compile_result,
@@ -9549,6 +9717,48 @@ pub(crate) async fn execute_models(
             warehouse.dialect(),
             resilience.contain_failures,
         )?;
+        // `apply_shadow_rewrite` rewrote each selected model's target in
+        // place, so the models now carry their shadow names. Collect them
+        // BEFORE anything executes: the ownership check and the cleanup are
+        // the same list, and deriving it twice is how the two would drift.
+        for model in &compile_result.project.models {
+            let selected = model_name_filter.is_none_or(|f| f == model.config.name)
+                && model_set.is_none_or(|set| set.contains(&model.config.name));
+            if !selected {
+                continue;
+            }
+            shadow_objects.push(crate::commands::shadow_lifecycle::ShadowObject {
+                model: model.config.name.clone(),
+                target: rocky_ir::TargetRef {
+                    catalog: model.config.target.catalog.clone(),
+                    schema: model.config.target.schema.clone(),
+                    table: model.config.target.table.clone(),
+                },
+            });
+        }
+        // Refuse before any write — but ONLY in the disposable mode.
+        //
+        // `cleanup_after` is exactly the axis this turns on, because it is
+        // what makes "the name should be free" a true invariant: a run that
+        // drops what it made leaves nothing, so an object sitting there is
+        // either not Rocky's or debris from a run that did not finish, and
+        // replacing it silently is the defect #1273 reported.
+        //
+        // With `cleanup_after` off — a named `--branch`, or any caller that
+        // asks for objects outliving the run — the previous run's objects
+        // are SUPPOSED to still be there, and the next run is supposed to
+        // replace them. Refusing would break the feature outright. Rocky
+        // cannot tell its own leftover from a stranger's without a
+        // persisted owner record, so it does not guess: the persistent mode
+        // keeps no per-object ownership check, and #1273 stays open for it.
+        if config.cleanup_after {
+            crate::commands::shadow_lifecycle::refuse_occupied_shadow_targets(
+                warehouse,
+                warehouse.dialect(),
+                &shadow_objects,
+            )
+            .await?;
+        }
         output.shadow = true;
     } else {
         augment_physical_read_edges(
@@ -10809,6 +11019,36 @@ pub(crate) async fn execute_models(
                 entries = reuse_index_entries.len(),
                 "recorded auditable-reuse input-match spine"
             );
+        }
+    }
+
+    // `cleanup_after` finally has a consumer (#1273). It has always been
+    // documented as "whether to drop shadow tables after comparison
+    // completes" and defaulted to `true`, while nothing read it and every
+    // construction hard-coded `false` — so shadow objects accumulated, and
+    // the next run wrote over its own leftover.
+    //
+    // Dropped only on the success path, on purpose: a run that failed is
+    // evidence, and destroying it to save the operator one statement is the
+    // wrong trade. The next run refuses on those leftovers rather than
+    // replacing them, and prints the drop — so the failure mode is a
+    // refusal with a remedy, never a silent overwrite.
+    //
+    // A named `--branch` sets `cleanup_after = false`: its objects are the
+    // point of the branch, not debris.
+    if let Some(config) = shadow_config
+        && config.cleanup_after
+        && !shadow_objects.is_empty()
+    {
+        let warnings = crate::commands::shadow_lifecycle::drop_owned_shadow_objects(
+            warehouse,
+            warehouse.dialect(),
+            &shadow_objects,
+        )
+        .await;
+        for warning in warnings {
+            warn!("{warning}");
+            output.scheduling_warnings.push(warning);
         }
     }
 
@@ -14032,6 +14272,365 @@ fn post_copy_column_match(
 #[cfg(test)]
 mod tests {
 
+    // ---------------------------------------------------------------------
+    // Governance seams, observed through a recording adapter (#1609)
+    //
+    // These four sites take `&dyn GovernanceAdapter`, so a recorder drops in
+    // without changing any signature. Every "the adapter was not called"
+    // assertion below is paired with one where the same wiring DOES record,
+    // because on its own an empty log cannot tell "no call was issued" from
+    // "the recorder was never reached".
+    // ---------------------------------------------------------------------
+
+    /// One snapshot entry with nothing governed. Callers switch on the fields
+    /// they are testing so each test states only what it depends on.
+    fn ungoverned_model(name: &str) -> super::GovernedModelGovernance {
+        super::GovernedModelGovernance {
+            name: name.to_string(),
+            target_catalog: "analytics".to_string(),
+            target_schema: "marts".to_string(),
+            target_table: name.to_string(),
+            strategy: rocky_core::models::StrategyConfig::FullRefresh,
+            classification: std::collections::BTreeMap::new(),
+            retention: None,
+            governance_tags: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn one_entry(key: &str, value: &str) -> std::collections::BTreeMap<String, String> {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(key.to_string(), value.to_string());
+        m
+    }
+
+    /// `reconcile_model_governance`'s doc comment claims a fixed order —
+    /// `apply_column_tags` → `apply_masking_policy` → `apply_retention_policy`
+    /// → `set_tags`, **per model, in compiled model order**.
+    ///
+    /// `replication_reconcile_uses_snapshot` pins that sequence for a single
+    /// model. The per-model half of the claim — that a second model's calls
+    /// follow the first's rather than grouping by method — had nothing
+    /// checking it.
+    #[tokio::test]
+    async fn a_reconcile_interleaves_its_calls_per_model_in_compiled_order() {
+        let mut first = ungoverned_model("orders");
+        first.classification = one_entry("email", "pii");
+        first.retention = Some(rocky_core::retention::RetentionPolicy { duration_days: 90 });
+        first.governance_tags = one_entry("owner", "analytics");
+
+        // The second model needs a leg BEFORE its set_tags too, or the
+        // expected sequence is identical whether the tags leg runs inside the
+        // per-model loop or in a second pass over every model.
+        let mut second = ungoverned_model("customers");
+        second.classification = one_entry("region", "pii");
+        second.governance_tags = one_entry("owner", "crm");
+
+        let snapshot = super::GovernanceSnapshot {
+            models: vec![first, second],
+        };
+        let mut tag_to_strategy = std::collections::BTreeMap::new();
+        tag_to_strategy.insert("pii".to_string(), rocky_ir::MaskStrategy::Hash);
+
+        let log = rocky_core::traits::GovernanceLog::default();
+        let governance = rocky_core::traits::RecordingGovernanceAdapter::new(log.clone());
+
+        super::reconcile_model_governance(&snapshot, &governance, &tag_to_strategy).await;
+
+        assert_eq!(
+            log.methods(),
+            vec![
+                // "orders" — every leg configured, in the documented order.
+                "apply_column_tags",
+                "apply_masking_policy",
+                "apply_retention_policy",
+                "set_tags",
+                // "customers" — no retention, so that leg is skipped, and its
+                // calls follow orders' rather than grouping by method.
+                "apply_column_tags",
+                "apply_masking_policy",
+                "set_tags",
+            ],
+            "the reconcile must finish one model before starting the next, and \
+             skip the legs a model does not configure"
+        );
+    }
+
+    /// The negative control the positive test above licenses: a snapshot with
+    /// nothing governed reaches the adapter and issues no call at all.
+    #[tokio::test]
+    async fn a_reconcile_of_ungoverned_models_issues_no_adapter_call() {
+        let snapshot = super::GovernanceSnapshot {
+            models: vec![ungoverned_model("orders"), ungoverned_model("customers")],
+        };
+
+        let log = rocky_core::traits::GovernanceLog::default();
+        let governance = rocky_core::traits::RecordingGovernanceAdapter::new(log.clone());
+
+        super::reconcile_model_governance(
+            &snapshot,
+            &governance,
+            &std::collections::BTreeMap::new(),
+        )
+        .await;
+
+        assert!(
+            log.is_empty(),
+            "models with no classification, retention or tags must not reach \
+             the warehouse at all, but recorded {:?}",
+            log.methods()
+        );
+    }
+
+    /// A classification with no matching `[mask]` entry tags the column but
+    /// applies no policy — the masking leg is skipped, not called with an
+    /// empty policy.
+    #[tokio::test]
+    async fn an_unmapped_classification_tags_the_column_without_a_masking_call() {
+        let mut model = ungoverned_model("orders");
+        model.classification = one_entry("email", "pii");
+
+        let snapshot = super::GovernanceSnapshot {
+            models: vec![model],
+        };
+
+        let log = rocky_core::traits::GovernanceLog::default();
+        let governance = rocky_core::traits::RecordingGovernanceAdapter::new(log.clone());
+
+        super::reconcile_model_governance(
+            &snapshot,
+            &governance,
+            // "pii" is unmapped: no strategy resolves for the column.
+            &std::collections::BTreeMap::new(),
+        )
+        .await;
+
+        assert_eq!(log.methods(), vec!["apply_column_tags"]);
+    }
+
+    /// Shared by the two remote-state quality tests below. Pod A of `harness`
+    /// runs the REAL dispatcher on a quality pipeline whose only table does
+    /// not exist in the (empty) DuckDB file: the row-count query fails, the
+    /// check is error-severity and not evaluated, and the gate trips with
+    /// nothing seeded. The DuckDB path is absolute, so the test never moves
+    /// the process's working directory (other tests in this binary do, and
+    /// nothing serialises them). Returns what `run` returned.
+    fn run_failing_quality_on_pod_a(
+        rt: &tokio::runtime::Runtime,
+        harness: &rocky_core::test_harness::CrossPodHarness,
+        project: &std::path::Path,
+        run_id: &str,
+    ) -> anyhow::Result<super::RunTermination> {
+        let config_path = project.join("rocky.toml");
+        // A TOML literal string (single quotes), so a path with backslashes
+        // is not read as escape sequences.
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = '{}'
+
+[pipeline.dq]
+type = "quality"
+
+[pipeline.dq.target]
+adapter = "default"
+
+[[pipeline.dq.tables]]
+catalog = "probe"
+schema = "main"
+table = "missing"
+
+[pipeline.dq.checks]
+enabled = true
+row_count = true
+
+[state]
+backend = "s3"
+s3_bucket = "test"
+on_upload_failure = "fail"
+
+[state.retry]
+max_retries = 0
+"#,
+                project.join("probe.duckdb").display()
+            ),
+        )
+        .unwrap();
+        rt.block_on(async {
+            let loaded = std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+            );
+            super::run(
+                &config_path,
+                loaded,
+                None,
+                None,
+                &harness.pod_a.state_path,
+                None,
+                true,
+                None,
+                false,
+                None,
+                false,
+                None,
+                &PartitionRunOptions::default(),
+                None,
+                None,
+                None,
+                None,
+                &DeferOptions::default(),
+                &SkipRunOptions::default(),
+                &rocky_core::run_vars::RunVars::new(),
+                Some(run_id),
+                None,
+                false,
+                None,
+            )
+            .await
+        })
+    }
+
+    fn remote_state_test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime")
+    }
+
+    /// #1816. A quality run that fails its check gate persists a `Failure`
+    /// record with `check_gate_failed` and then returns an error; the
+    /// dispatcher's quality arm treated every error as pre-terminal and
+    /// ABANDONED the remote-state session, which uploads nothing. Under an
+    /// S3 / GCS / Valkey / tiered `[state]` backend the record stayed in the
+    /// pod-local file, and a fresh pod downloading the shared state saw the
+    /// history from before the run. The transformation arm already
+    /// distinguished its typed `RunFailed` from a hard error; the quality arm
+    /// now does the same with `QualityGateFailure`.
+    ///
+    /// Two pods over one in-memory "S3": pod A runs the failing quality
+    /// pipeline through the real dispatcher; pod B downloads the remote state
+    /// into its own empty store and must find the record.
+    #[test]
+    fn a_failed_quality_gate_is_uploaded_to_remote_state_not_abandoned() {
+        use rocky_core::state::{RunStatus, StateStore};
+        use rocky_core::test_harness::CrossPodHarness;
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let project = tempfile::tempdir().unwrap();
+        let run_id = "quality-gate-under-remote-state";
+        let rt = remote_state_test_runtime();
+
+        let outcome = run_failing_quality_on_pod_a(&rt, &harness, project.path(), run_id);
+        let err = outcome.expect_err("a failed quality gate fails the run");
+        assert!(
+            err.is::<super::QualityGateFailure>(),
+            "the gate failure is typed so the dispatcher can tell it from a hard exit: {err:#}"
+        );
+
+        // Pod A's own file has the record (it always did).
+        {
+            let local = StateStore::open(&harness.pod_a.state_path).unwrap();
+            let record = local
+                .get_run(run_id)
+                .unwrap()
+                .expect("the failed run is persisted locally");
+            assert!(
+                matches!(record.status, RunStatus::Failure),
+                "{:?}",
+                record.status
+            );
+            assert!(record.check_gate_failed);
+        }
+
+        // Pod B, a fresh process elsewhere, downloads the shared state and
+        // must see the same record: the session FINALIZED after the gate.
+        let authority = rt
+            .block_on(harness.download(&harness.pod_b))
+            .expect("pod B downloads the shared state");
+        assert!(
+            matches!(
+                authority,
+                rocky_core::state_sync::StateAuthority::Authoritative
+            ),
+            "pod B found a remote object to download: {authority:?}"
+        );
+        let remote = harness.open_store(&harness.pod_b);
+        let record = remote.get_run(run_id).unwrap().expect(
+            "the failed quality run rode the terminal upload; abandoning stranded it locally",
+        );
+        assert!(
+            matches!(record.status, RunStatus::Failure),
+            "the remote record is the failure: {:?}",
+            record.status
+        );
+        assert!(
+            record.check_gate_failed,
+            "and it carries the gate the run failed on"
+        );
+    }
+
+    /// #1816, round two. The typed sentinel is the dispatcher's proof that the
+    /// record is persisted and may be uploaded, so it must not come back when
+    /// the record did NOT land. `persist_run_record` is best-effort (a failed
+    /// write is logged and the run goes on), and a run whose gate failed AND
+    /// whose record write failed returned `QualityGateFailure` anyway: the
+    /// dispatcher finalized, and the upload published a ledger without the
+    /// run, so pod B read an authoritative history with the failure missing.
+    /// Now the gate failure is untyped when the record is missing, the
+    /// dispatcher abandons, nothing is uploaded, and the message says the run
+    /// is not in the history.
+    #[test]
+    fn a_failed_quality_gate_whose_record_did_not_land_is_not_uploaded_as_if_it_had() {
+        use rocky_core::state::StateStore;
+        use rocky_core::test_harness::CrossPodHarness;
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let project = tempfile::tempdir().unwrap();
+        let run_id = "quality-gate-record-write-failed";
+        let rt = remote_state_test_runtime();
+
+        *super::FAIL_RECORD_WRITE_FOR_TEST.lock().unwrap() = Some(run_id.to_string());
+        let outcome = run_failing_quality_on_pod_a(&rt, &harness, project.path(), run_id);
+        *super::FAIL_RECORD_WRITE_FOR_TEST.lock().unwrap() = None;
+
+        let err = outcome.expect_err("the gate still fails the run");
+        assert!(
+            !err.is::<super::QualityGateFailure>(),
+            "a typed gate failure claims the record is persisted, and it is not: {err:#}"
+        );
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("error-severity check(s) failed")
+                && message.contains("could not be written"),
+            "the message names the gate AND the missing record: {message}"
+        );
+
+        // Pod A has no record: the write failed.
+        let local = StateStore::open(&harness.pod_a.state_path).unwrap();
+        assert!(
+            local.get_run(run_id).unwrap().is_none(),
+            "precondition: the injected write failure held"
+        );
+
+        // Nothing was uploaded: pod B's download finds no remote object at
+        // all, rather than an authoritative ledger with the run missing.
+        let authority = rt
+            .block_on(harness.download(&harness.pod_b))
+            .expect("pod B's download itself succeeds");
+        assert!(
+            matches!(
+                authority,
+                rocky_core::state_sync::StateAuthority::FreshStart
+            ),
+            "the session must abandon, not publish a ledger without the run: {authority:?}"
+        );
+    }
+
     /// Every partition-status write in `run_one_partition` must cover the WHOLE
     /// batch, not just its leading key.
     ///
@@ -14166,6 +14765,7 @@ mod tests {
 
         ResumeScope {
             pipeline: pipeline.to_string(),
+            source: None,
             filter: None,
             target: Some(ResumeTarget {
                 adapter: "default".to_string(),
@@ -14226,6 +14826,198 @@ mod tests {
         resume_scope_with_pattern(pipeline, target, adapter, &test_schema_pattern())
     }
 
+    /// #1583 step 2, the issue's own reproduction: point
+    /// `source.discovery.adapter` at another adapter and the scope must
+    /// move.
+    ///
+    /// It did not. The scope recorded pipeline, filter and the whole TARGET
+    /// block and nothing about the source, so this edit left every field
+    /// identical. `completed_keys` then matched the checkpoint's `Success`
+    /// entries by target key, skipped every table never copied from the new
+    /// source, and the run exited 0.
+    #[test]
+    fn re_pointing_the_discovery_adapter_changes_the_resume_scope() {
+        let target: rocky_core::config::PipelineTargetConfig = toml::from_str(
+            r#"
+adapter = "default"
+catalog_template = "wh"
+schema_template = "staging"
+"#,
+        )
+        .unwrap();
+        let adapter = test_duckdb_adapter(None);
+        let pattern = test_schema_pattern();
+
+        let mut moved = test_source_config();
+        moved.discovery.as_mut().expect("discovery").adapter = "other".to_string();
+
+        let before = replication_resume_scope(
+            "p1",
+            &target,
+            &adapter,
+            None,
+            None,
+            "__",
+            &pattern,
+            &test_source_config(),
+            None,
+        );
+        let after = replication_resume_scope(
+            "p1", &target, &adapter, None, None, "__", &pattern, &moved, None,
+        );
+        assert_ne!(
+            before, after,
+            "a different discovery adapter is a different source; resuming across it \
+             skips tables that were never copied"
+        );
+    }
+
+    /// The endpoint half: the alias can stay put while the data location
+    /// behind it moves. Recording only the alias would let a re-pointed
+    /// adapter resume a checkpoint written against a different database —
+    /// the same argument `ResumeTarget::endpoint` answers on the write side.
+    #[test]
+    fn re_pointing_the_adapter_behind_the_alias_changes_the_resume_scope() {
+        let target: rocky_core::config::PipelineTargetConfig = toml::from_str(
+            r#"
+adapter = "default"
+catalog_template = "wh"
+schema_template = "staging"
+"#,
+        )
+        .unwrap();
+        let target_adapter = test_duckdb_adapter(None);
+        let pattern = test_schema_pattern();
+        let source = test_source_config();
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let one = test_duckdb_adapter(Some(&dir.path().join("one.duckdb")));
+        let two = test_duckdb_adapter(Some(&dir.path().join("two.duckdb")));
+
+        let scope = |discovery: &rocky_core::config::AdapterConfig| {
+            replication_resume_scope(
+                "p1",
+                &target,
+                &target_adapter,
+                None,
+                None,
+                "__",
+                &pattern,
+                &source,
+                Some(discovery),
+            )
+        };
+        assert_ne!(
+            scope(&one),
+            scope(&two),
+            "the same alias over a different database is a different source"
+        );
+    }
+
+    /// The pattern's SHAPE, which is the other half of the issue: discovery
+    /// parses source schema names with it and the captured values render the
+    /// target names the checkpoint is keyed by, so two patterns can map
+    /// different source tables onto one key.
+    ///
+    /// `prefix` and `components` were not in the scope at all. Only the
+    /// separator was, and only through the TARGET's `separator_role` — which
+    /// is a different value whenever `[target] separator` overrides it.
+    #[test]
+    fn a_different_source_pattern_changes_the_resume_scope() {
+        let target: rocky_core::config::PipelineTargetConfig = toml::from_str(
+            r#"
+adapter = "default"
+catalog_template = "wh"
+schema_template = "staging"
+"#,
+        )
+        .unwrap();
+        let adapter = test_duckdb_adapter(None);
+        let source = test_source_config();
+        let base = test_schema_pattern();
+
+        let scope = |pattern: &rocky_core::schema::SchemaPattern| {
+            replication_resume_scope(
+                "p1", &target, &adapter, None, None, "__", pattern, &source, None,
+            )
+        };
+
+        let mut other_prefix = base.clone();
+        other_prefix.prefix = format!("{}_v2", base.prefix);
+        assert_ne!(
+            scope(&base),
+            scope(&other_prefix),
+            "the prefix selects WHICH source schemas discovery sees"
+        );
+
+        let mut other_components = base.clone();
+        other_components
+            .components
+            .push(rocky_core::schema::PatternComponent::Variable {
+                name: "region".to_string(),
+            });
+        assert_ne!(
+            scope(&base),
+            scope(&other_components),
+            "the components name the captured values that render target names"
+        );
+    }
+
+    /// The counterpart, so the refusal is not simply "always". An unrelated
+    /// edit must leave the source half alone: two scopes built from the same
+    /// source and pattern are equal, whatever else the test varies.
+    #[test]
+    fn an_unchanged_source_leaves_the_source_scope_equal() {
+        let target: rocky_core::config::PipelineTargetConfig = toml::from_str(
+            r#"
+adapter = "default"
+catalog_template = "wh"
+schema_template = "staging"
+"#,
+        )
+        .unwrap();
+        let adapter = test_duckdb_adapter(None);
+        let pattern = test_schema_pattern();
+        let build = || {
+            replication_resume_scope(
+                "p1",
+                &target,
+                &adapter,
+                None,
+                None,
+                "__",
+                &pattern,
+                &test_source_config(),
+                None,
+            )
+        };
+        assert_eq!(
+            build().source,
+            build().source,
+            "the source half must be a function of the config, not of anything \
+             incidental to the call"
+        );
+    }
+
+    /// A `[source]` block for the resume-scope tests: one discovery adapter,
+    /// one catalog. Tests that vary the SOURCE half build their own.
+    fn test_source_config() -> rocky_core::config::PipelineSourceConfig {
+        rocky_core::config::PipelineSourceConfig {
+            adapter: "default".to_string(),
+            catalog: Some("src".to_string()),
+            schema_pattern: rocky_core::config::SchemaPatternConfig {
+                prefix: "src".to_string(),
+                separator: "__".to_string(),
+                components: vec!["tenant".to_string(), "source".to_string()],
+            },
+            discovery: Some(rocky_core::config::DiscoveryConfig {
+                adapter: "default".to_string(),
+                report_new_sources: false,
+                on_collision: rocky_core::config::OnCollision::Off,
+            }),
+        }
+    }
+
     /// The same scope, for a case that varies the source pattern instead of
     /// the target block.
     fn resume_scope_with_pattern(
@@ -14242,6 +15034,8 @@ mod tests {
             None,
             target.separator.as_deref().unwrap_or("__"),
             pattern,
+            &test_source_config(),
+            None,
         )
     }
 
@@ -14349,6 +15143,8 @@ token = "dapi-SECRET"
             Some(&branch_shadow),
             "__",
             &test_schema_pattern(),
+            &test_source_config(),
+            None,
         );
         assert_eq!(
             serde_json::to_value(&scope).unwrap(),
@@ -14374,6 +15170,20 @@ token = "dapi-SECRET"
                     },
                     "shadow": { "schema": "branch__feature" },
                 },
+                // The source half (#1583). It was absent, which is the
+                // whole defect: re-pointing `source.discovery.adapter`
+                // moved no field in this blob. `endpoint` is null only
+                // because this call passes no discovery adapter config;
+                // the run resolves one from the same adapter map the
+                // target came from.
+                "source": {
+                    "discovery_adapter": "default",
+                    "endpoint": null,
+                    "catalog": "src",
+                    "pattern_prefix": "src__",
+                    "pattern_separator": "__",
+                    "pattern_components": ["var:tenant", "varlen:regions", "term:source"],
+                },
             })
         );
         assert_eq!(
@@ -14382,7 +15192,9 @@ token = "dapi-SECRET"
                 "pipeline 'p1', filter 'client=acme', target default:wh.<overridden> \
                  separator(__) endpoint(databricks host=https://adb-1.azuredatabricks.net \
                  host_route_digest={DATABRICKS_ROUTE_DIGEST} \
-                 http_path=/sql/1.0/warehouses/abc) shadow(schema=branch__feature)"
+                 http_path=/sql/1.0/warehouses/abc) shadow(schema=branch__feature), \
+                 source default:src pattern(src____[var:tenant,varlen:regions,term:source]) \
+                 endpoint unrecorded"
             )
         );
 
@@ -14424,6 +15236,8 @@ token = "dapi-SECRET"
             Some(&branch_shadow),
             "--",
             &test_schema_pattern(),
+            &test_source_config(),
+            None,
         );
         assert_eq!(
             serde_json::to_value(&overridden).unwrap()["target"]["separator_role"],
@@ -14448,6 +15262,8 @@ token = "dapi-SECRET"
             Some(&suffix_shadow),
             "__",
             &test_schema_pattern(),
+            &test_source_config(),
+            None,
         );
         assert_eq!(
             serde_json::to_value(&shadowed).unwrap()["target"]["shadow"],
@@ -14526,6 +15342,8 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             Some(&real_shadow),
             "__",
             &test_schema_pattern(),
+            &test_source_config(),
+            None,
         );
         assert_eq!(
             serde_json::to_value(&genuine).unwrap()["target"]["separator_role"],
@@ -15214,6 +16032,8 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             Some(&real_shadow),
             "__",
             &test_schema_pattern(),
+            &test_source_config(),
+            None,
         );
         assert_eq!(forged.to_string(), genuine.to_string());
 
@@ -15260,10 +16080,18 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let scope_a = resume_scope_for_test("p1", &target, &gateway("a"));
         let scope_b = resume_scope_for_test("p1", &target, &gateway("b"));
         for rendered in [scope_a.to_string(), scope_b.to_string()] {
+            // The PATH is what must not leak, so the check names the path
+            // rather than the word "tenant". A bare substring test for that
+            // word also matched the schema pattern's component names, which
+            // the source half now renders (#1583) — it would have failed
+            // here for a reason that has nothing to do with a gateway route.
             assert!(
-                rendered.contains("host=https://gw.example.com:8443")
-                    && !rendered.contains("tenant"),
-                "the rendered scope must keep the path out of the message: {rendered}"
+                rendered.contains("host=https://gw.example.com:8443"),
+                "the rendered scope must still name the host: {rendered}"
+            );
+            assert!(
+                !rendered.contains("/tenant/"),
+                "the rendered scope must keep the gateway path out of the message: {rendered}"
             );
         }
         assert_ne!(scope_a, scope_b, "two gateway paths are two endpoints");
@@ -15646,6 +16474,8 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                 Some(&branch),
                 target.separator.as_deref().unwrap_or(&pattern.separator),
                 &pattern,
+                &test_source_config(),
+                None,
             )
         };
         // A source schema whose `regions` binds TWO values, so a separator
@@ -15788,6 +16618,8 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                 shadow,
                 target.separator.as_deref().unwrap_or(&pattern.separator),
                 &pattern,
+                &test_source_config(),
+                None,
             )
         };
         // A source schema whose `regions` binds TWO values, so a template
@@ -15952,6 +16784,8 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                 Some(&branch),
                 target.separator.as_deref().unwrap_or(&pattern.separator),
                 pattern,
+                &test_source_config(),
+                None,
             )
         };
         let written = scope(&source_pattern("__"));
@@ -16639,6 +17473,14 @@ auto_create_schemas = true
                     None,
                     target.separator.as_deref().unwrap_or(&pattern.separator),
                     &pattern,
+                    // The pipeline's own source, resolved the way the run
+                    // path resolves it (#1583).
+                    &replication.source,
+                    replication
+                        .source
+                        .discovery
+                        .as_ref()
+                        .and_then(|disc| loaded.config.adapters.get(&disc.adapter)),
                 );
                 let store = StateStore::open(&state_path).unwrap();
                 store
@@ -16727,6 +17569,16 @@ auto_create_schemas = true
                 Some(&branch),
                 target.separator.as_deref().unwrap_or(&pattern.separator),
                 &pattern,
+                // The pipeline's own source, resolved the way the run path
+                // resolves it (#1583): a fixture here would seed a scope the
+                // run never builds, and the lookup would miss for a reason
+                // that has nothing to do with what the test is about.
+                &replication.source,
+                replication
+                    .source
+                    .discovery
+                    .as_ref()
+                    .and_then(|disc| loaded.config.adapters.get(&disc.adapter)),
             );
             assert_eq!(
                 scope.target.as_ref().unwrap().schema_template,
@@ -16881,6 +17733,16 @@ auto_create_schemas = true
                 None,
                 target.separator.as_deref().unwrap_or(&pattern.separator),
                 &pattern,
+                // The pipeline's own source, resolved the way the run path
+                // resolves it (#1583): a fixture here would seed a scope the
+                // run never builds, and the lookup would miss for a reason
+                // that has nothing to do with what the test is about.
+                &replication.source,
+                replication
+                    .source
+                    .discovery
+                    .as_ref()
+                    .and_then(|disc| loaded.config.adapters.get(&disc.adapter)),
             );
             let store = StateStore::open(&state_path).unwrap();
             store

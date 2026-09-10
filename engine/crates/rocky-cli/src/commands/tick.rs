@@ -406,24 +406,16 @@ fn build_tick_output(
             reason = reason.as_str(),
             "webhook spool unreadable this tick"
         );
-        skipped.push(SkippedDemandOutput {
-            pipeline: None,
-            source: Some("webhook".to_string()),
-            reason: "spool_unreadable".to_string(),
-            resume_at: None,
-            missed: None,
-        });
     }
-
-    // The store was held by another `rocky` process. When it could not be opened
-    // at all, no per-demand skip exists yet, so synthesize a pipeline-less
-    // `state_busy` entry; a mid-tick reopen contention already pushed a
-    // pipeline-scoped `state_busy` skip, so don't duplicate it.
-    if report.state_busy && !skipped.iter().any(|s| s.reason == "state_busy") {
+    // The skips the tick synthesises for a whole source or the whole pass —
+    // the unreadable spool, the store held by another `rocky` process before
+    // any pipeline was evaluated — from the ONE derivation the scheduler's
+    // span, log and metrics use, so this list and those counts agree (#1812).
+    for synth in crate::commands::scheduler::synthesized_skips(report) {
         skipped.push(SkippedDemandOutput {
             pipeline: None,
-            source: None,
-            reason: "state_busy".to_string(),
+            source: synth.source.map(str::to_string),
+            reason: synth.reason.to_string(),
             resume_at: None,
             missed: None,
         });
@@ -713,6 +705,52 @@ freshness = true
         let clean = build_tick_output(&TickReport::default(), ts("2026-05-02T03:05:00Z"), false, 0);
         assert!(clean.skipped.is_empty());
         assert_eq!(clean.counts.skipped, 0);
+    }
+
+    /// The whole-pass `state_busy` — the store held by another process before
+    /// any pipeline was evaluated — reaches the JSON as one pipeline-less skip
+    /// and counts as one, from the derivation the scheduler's span, log and
+    /// metrics share; a pipeline-scoped `state_busy` the reconciler already
+    /// recorded is not doubled (#1812, review round two).
+    #[test]
+    fn a_held_store_reaches_the_json_as_one_pipeline_less_skip() {
+        let busy = TickReport {
+            state_busy: true,
+            ..TickReport::default()
+        };
+        let out = build_tick_output(&busy, ts("2026-05-02T03:05:00Z"), false, 0);
+        let entries: Vec<_> = out
+            .skipped
+            .iter()
+            .filter(|s| s.reason == "state_busy")
+            .collect();
+        assert_eq!(entries.len(), 1, "one whole-pass entry: {:?}", out.skipped);
+        assert!(entries[0].pipeline.is_none() && entries[0].source.is_none());
+        assert_eq!(out.counts.skipped, 1, "and it counts as a skip");
+
+        let already_recorded = TickReport {
+            state_busy: true,
+            skipped: vec![rocky_core::schedule::SkippedDemand {
+                pipeline: "raw".to_string(),
+                source: None,
+                reason: TickSkipReason::StateBusy,
+            }],
+            ..TickReport::default()
+        };
+        let out = build_tick_output(&already_recorded, ts("2026-05-02T03:05:00Z"), false, 0);
+        let entries: Vec<_> = out
+            .skipped
+            .iter()
+            .filter(|s| s.reason == "state_busy")
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the pipeline-scoped one, not doubled: {:?}",
+            out.skipped
+        );
+        assert_eq!(entries[0].pipeline.as_deref(), Some("raw"));
+        assert_eq!(out.counts.skipped, 1);
     }
 
     /// Build a report + output pair whose only executed run FAILED, so the
