@@ -175,6 +175,17 @@ pub struct ServerState {
     /// with `Retry-After`, because queueing behind a possible 30 seconds is
     /// worse for it than a fast refusal.
     pub warehouse_samples: Arc<tokio::sync::Semaphore>,
+    /// Admission for the single `rocky.toml` read behind
+    /// `GET /api/v1/settings`: one at a time, and only until it succeeds once.
+    ///
+    /// Deliberately its own lane, like the two above. The read is normally
+    /// microseconds, but `rocky.toml` is a path an operator controls: a FIFO or
+    /// a stalled mount makes `read_to_string` never return, and `spawn_blocking`
+    /// cannot be cancelled. Without admission control every concurrent settings
+    /// request would occupy another blocking worker forever and starve
+    /// unrelated `spawn_blocking` work — the state-store reads especially.
+    /// One permit bounds that to a single stuck worker.
+    pub settings_reads: Arc<tokio::sync::Semaphore>,
     /// The sample deadline, in milliseconds: [`DEFAULT_SAMPLE_TIMEOUT`]
     /// unless [`ServerState::set_sample_timeout`] changed it. An atomic
     /// rather than a constructor argument because the state is handed out as
@@ -246,7 +257,7 @@ pub enum ConfigStatus {
 /// Only fields that are NOT already on [`ServerState`] live here. `ui`,
 /// `allowed_hosts`, `allowed_origins` and the token's scope are read back off
 /// the state itself, so there is no second copy to drift.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SettingsSnapshot {
     /// The host the listener binds. The same `String` `ServeConfig` carries, so
     /// the reported value cannot disagree with the bound one.
@@ -264,12 +275,14 @@ pub struct SettingsSnapshot {
     ///
     /// Deliberately not resolved in `build_serve_state`. Everything else here
     /// is a flag or an env var, but these come from reading `rocky.toml`, and
-    /// `rocky serve` binds its listener before anything reads that file. Doing
-    /// the read eagerly would put a blocking full-file read on the pre-bind
-    /// path, so a `rocky.toml` that is a FIFO or sits on a stalled mount would
-    /// hang startup — a read-only settings route turning into the reason the
-    /// server never binds. Ordinary loader errors are already tolerated; a read
-    /// that never returns is not something tolerance can catch.
+    /// nothing on the path to `TcpListener::bind` reads a file. (The initial
+    /// compile reads the config, but on its own spawned task, so it does not
+    /// gate the listener.) Doing the read eagerly would put a blocking
+    /// full-file read *on* that path, so a `rocky.toml` that is a FIFO or sits
+    /// on a stalled mount would hang startup — a read-only settings route
+    /// turning into the reason the server never binds. Ordinary loader errors
+    /// are already tolerated; a read that never returns is not something
+    /// tolerance can catch.
     ///
     /// Once resolved it never changes, so the document stays a snapshot rather
     /// than a live view.
@@ -397,6 +410,7 @@ impl ServerState {
             store_access: Arc::new(tokio::sync::Semaphore::new(1)),
             review_diffs: Arc::new(tokio::sync::Semaphore::new(1)),
             warehouse_samples: Arc::new(tokio::sync::Semaphore::new(1)),
+            settings_reads: Arc::new(tokio::sync::Semaphore::new(1)),
             sample_timeout_ms: std::sync::atomic::AtomicU64::new(millis(DEFAULT_SAMPLE_TIMEOUT)),
         });
 

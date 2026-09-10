@@ -614,9 +614,12 @@ fn build_serve_state(
         // exactly what an operator needs before turning the scheduler on.
         webhook_secret: webhook_secret_posture(),
         // Left unresolved on purpose. Reading `rocky.toml` here would put a
-        // blocking full-file read on the path to `TcpListener::bind`, where
-        // there is none today, so a FIFO or a stalled mount would stop the
-        // server binding at all. The settings route resolves it on first ask.
+        // blocking full-file read on the path to `TcpListener::bind`, which
+        // reads no file today, so a FIFO or a stalled mount would stop the
+        // server binding at all. (The initial compile does read the config, but
+        // on its own spawned task, so it never gates the listener.) The
+        // settings route resolves it on first ask, under a permit and a
+        // deadline.
         config_labels: std::sync::OnceLock::new(),
     };
 
@@ -937,18 +940,22 @@ mod tests {
         );
     }
 
-    /// **Red team, round 1.** The settings route must not put a file read on
-    /// the path to `TcpListener::bind`.
+    /// **Red team.** `build_serve_state` must not read `rocky.toml`.
     ///
-    /// `rocky serve` reads no config before binding today, so an eager
-    /// `rocky.toml` read for two report fields would newly let a FIFO or a
-    /// stalled mount stop the server binding at all. Loader ERRORS are
-    /// tolerated; a read that never returns is not something tolerance catches.
+    /// It sits on the path to `TcpListener::bind`, and nothing on that path
+    /// reads a file today. An eager read for two report fields would let a
+    /// `rocky.toml` that is a FIFO or sits on a stalled mount stop the server
+    /// binding at all. Loader ERRORS are tolerated; a read that never returns
+    /// is not something tolerance catches.
     ///
-    /// So the labels stay unresolved until something asks for them. Asserting
-    /// on the cell is what makes that a property rather than an intention.
+    /// **What this does and does not prove.** It pins that THIS function leaves
+    /// the cell unresolved. It does not prove the listener binds, and it is not
+    /// a claim that nothing anywhere reads the config first: the initial
+    /// compile does, on its own spawned task, which is why it does not gate the
+    /// bind. Asserting on the cell is what makes the narrow property a fact
+    /// rather than an intention.
     #[tokio::test]
-    async fn the_config_is_not_read_before_the_listener_binds() {
+    async fn build_serve_state_does_not_read_the_config() {
         let models = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../rocky-compiler/tests/fixtures/simple_project/models");
         let dir = tempfile::tempdir().unwrap();
@@ -973,7 +980,7 @@ mod tests {
 
         assert!(
             state.settings.config_labels.get().is_none(),
-            "build_serve_state read the config; that read now sits before the bind"
+            "build_serve_state read the config; that read sits on the path to bind"
         );
     }
 

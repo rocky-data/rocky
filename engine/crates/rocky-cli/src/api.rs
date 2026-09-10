@@ -2138,40 +2138,93 @@ async fn schedule_status(
 ///
 /// Never fails. Every value was resolved at startup; there is no I/O, no
 /// state-store permit, and nothing to be busy.
-async fn settings(State(state): State<Arc<ServerState>>) -> PrettyJson<SettingsOutput> {
-    PrettyJson(settings_output(&state, resolve_config_labels(&state).await))
+async fn settings(
+    State(state): State<Arc<ServerState>>,
+) -> Result<PrettyJson<SettingsOutput>, ApiError> {
+    let labels = resolve_config_labels(&state).await?;
+    Ok(PrettyJson(settings_output(&state, labels)))
 }
+
+/// How long the one `rocky.toml` read behind this route may take before the
+/// caller is told to retry. Generous for a local file; the point is that it
+/// ends, not that it is tight.
+const SETTINGS_CONFIG_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The `[state]` labels, read from `rocky.toml` once and then fixed.
 ///
-/// Deliberately NOT read in `build_serve_state`. Every other field in the
-/// document is a flag or an env var; these come from a file, and `rocky serve`
-/// binds its listener before anything reads that file. An eager read would put
-/// a blocking full-file read on the path to `TcpListener::bind`, so a
-/// `rocky.toml` that is a FIFO or sits on a stalled mount would stop the server
-/// binding at all — a read-only settings route becoming the reason nothing
-/// serves. Loader *errors* are already tolerated; a read that never returns is
-/// not something tolerance catches.
+/// # Why this is not read at startup
 ///
-/// Runs on a blocking thread, and only the first caller pays for it.
-async fn resolve_config_labels(state: &Arc<ServerState>) -> rocky_server::state::ConfigLabels {
+/// Every other field in the document is a flag or an env var. These come from a
+/// file, and nothing on the path to `TcpListener::bind` reads a file today —
+/// `build_serve_state` does env and path work only, and `serve` does a
+/// state-store sweep. (The initial compile does read the config, but it runs on
+/// its own spawned task and does not gate the listener.) Reading it eagerly in
+/// `build_serve_state` would put a blocking full-file read *on* that path, so a
+/// `rocky.toml` that is a FIFO or sits on a stalled mount would stop the server
+/// binding at all. Loader *errors* are already tolerated; a read that never
+/// returns is not something tolerance catches.
+///
+/// # Why it is bounded
+///
+/// Moving the read here must not simply move the hang. `spawn_blocking` cannot
+/// be cancelled, so a stuck read holds its worker for the life of the process,
+/// and `OnceLock::get_or_init` makes every concurrent caller wait on the one
+/// initializer. Unbounded, enough authenticated requests would starve unrelated
+/// `spawn_blocking` work — the state-store reads especially.
+///
+/// So it takes the same shape as the sample route: one permit, refused
+/// immediately rather than queued, and a deadline. The permit travels into the
+/// blocking stage so a read that outlives the deadline keeps the lane until it
+/// returns (#1816). At most one worker can ever be stuck on this.
+///
+/// Once the cell is set every later caller takes the fast path and touches
+/// neither the permit nor the disk.
+async fn resolve_config_labels(
+    state: &Arc<ServerState>,
+) -> Result<rocky_server::state::ConfigLabels, ApiError> {
     if let Some(labels) = state.settings.config_labels.get() {
-        return *labels;
+        return Ok(*labels);
     }
-    let state = state.clone();
-    tokio::task::spawn_blocking(move || {
-        *state
+
+    let Ok(permit) = Arc::clone(&state.settings_reads).try_acquire_owned() else {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "engine_busy",
+            "another settings read is in flight",
+            Some("retry in a moment; rocky.toml is read once per server"),
+        )
+        .retry_after(5));
+    };
+
+    let for_read = state.clone();
+    let read = tokio::task::spawn_blocking(move || {
+        // Held for the life of the read, not just the spawn.
+        let _permit = permit;
+        *for_read
             .settings
             .config_labels
-            .get_or_init(|| crate::commands::serve::config_posture(state.config_path.as_deref()))
-    })
-    .await
-    // A panic in a config read should not take the route down; report it the
-    // way an unreadable config is reported.
-    .unwrap_or(rocky_server::state::ConfigLabels {
-        config_status: rocky_server::state::ConfigStatus::Unreadable,
-        ..Default::default()
-    })
+            .get_or_init(|| crate::commands::serve::config_posture(for_read.config_path.as_deref()))
+    });
+
+    match tokio::time::timeout(SETTINGS_CONFIG_READ_TIMEOUT, read).await {
+        Ok(Ok(labels)) => Ok(labels),
+        // A panicked read is a task failure, not a verdict about the config —
+        // reporting it as `config_status: unreadable` would claim we read the
+        // file and found it bad.
+        Ok(Err(e)) => Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("the settings config read panicked: {e}"),
+            None,
+        )),
+        Err(_) => Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "engine_busy",
+            "reading rocky.toml did not finish in time",
+            Some("check that rocky.toml is a regular file on responsive storage"),
+        )
+        .retry_after(5)),
+    }
 }
 
 /// Project [`ServerState`] onto the settings document.
@@ -5983,6 +6036,79 @@ mod tests {
         (dir, state)
     }
 
+    /// **Red team, round 2.** The one `rocky.toml` read behind this route is
+    /// admission-controlled, so a stuck file cannot occupy blocking workers
+    /// without bound.
+    ///
+    /// `spawn_blocking` cannot be cancelled and `OnceLock::get_or_init` makes
+    /// every concurrent caller wait on the one initializer, so without a permit
+    /// each concurrent request would hold another worker forever and starve
+    /// unrelated blocking work — the state-store reads especially.
+    ///
+    /// Holding the permit stands in for a read that has not finished.
+    #[tokio::test]
+    async fn a_settings_read_already_in_flight_is_refused_not_queued() {
+        let (_dir, state) = project_with_three_secrets();
+        assert!(
+            state.settings.config_labels.get().is_none(),
+            "the fixture must start unresolved or this exercises the fast path"
+        );
+
+        // Stand in for a read still running.
+        let _held = Arc::clone(&state.settings_reads)
+            .try_acquire_owned()
+            .expect("the lane starts free");
+
+        let base = spawn_router(state).await;
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/api/v1/settings"))
+            .header("Authorization", "Bearer BEARER_SECRET_ABC")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            503,
+            "a second read must be refused immediately, not queued behind the first"
+        );
+        assert!(resp.headers().contains_key("retry-after"));
+    }
+
+    /// The other half: once the labels are resolved, later callers take the
+    /// fast path and touch neither the permit nor the disk.
+    ///
+    /// Without this, the refusal above could be satisfied by a route that is
+    /// permanently broken after one slow read.
+    #[tokio::test]
+    async fn a_resolved_settings_read_needs_no_permit() {
+        let (_dir, state) = project_with_three_secrets();
+        // Resolve once, the way the first request would.
+        let Ok(_) = resolve_config_labels(&state).await else {
+            panic!("the first read must resolve");
+        };
+        assert!(state.settings.config_labels.get().is_some());
+
+        // The lane is now irrelevant: hold it and the route still answers.
+        let _held = Arc::clone(&state.settings_reads)
+            .try_acquire_owned()
+            .expect("the lane is free again once the read finished");
+
+        let base = spawn_router(state).await;
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/api/v1/settings"))
+            .header("Authorization", "Bearer BEARER_SECRET_ABC")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            200,
+            "a resolved read must not queue behind the admission lane"
+        );
+    }
+
     /// **Red team, round 1.** `build_cors_layer` drops an origin that is not a
     /// valid header value, so the raw `--allowed-origin` list and the list CORS
     /// enforces are not the same thing. Reporting the raw one would name an
@@ -6037,6 +6163,14 @@ mod tests {
     ///
     /// Safe methods only. The mutating routes would submit real jobs, and a
     /// containment test must not run a pipeline to make its point.
+    ///
+    /// **What it proves, precisely.** That every GET the route table declares
+    /// answers without echoing a secret. It walks `api_v1_routes()`, and
+    /// `paths_match_live_router_routes` is what pins that table to the live
+    /// router — neither test proves router coverage alone. Many routes answer
+    /// 4xx on this fixture; those bodies are still grepped, because an error
+    /// envelope that echoes a config value is the classic leak site. It is not
+    /// a claim that every SUCCESS path was exercised.
     #[tokio::test]
     async fn no_safe_route_discloses_a_configured_secret() {
         let (_dir, state) = project_with_three_secrets();
@@ -6053,7 +6187,11 @@ mod tests {
             // body worth grepping.
             let path = path
                 .replace("{name}", "m")
-                .replace("{plan_id}", "p1")
+                // A real plan-id SHAPE (64 lower-case hex). `p1` would be
+                // rejected by `is_plan_id` and 404 without the handler ever
+                // touching disk, so the review routes would contribute only a
+                // rejection body.
+                .replace("{plan_id}", &"a".repeat(64))
                 .replace("{id}", "1")
                 .replace("{subject}", "s1")
                 .replace("{column}", "id")

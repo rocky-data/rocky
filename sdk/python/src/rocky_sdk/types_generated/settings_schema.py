@@ -159,7 +159,7 @@ class SettingsOutput(BaseModel):
 
     **Freshness.** Everything except `state_backend` and `concurrency_control` is fixed when the process starts and cannot change while it runs.
 
-    Those two come from `rocky.toml`, and are read **once, on the first request to this route**, then fixed for the life of the process. Deliberately not at startup: `rocky serve` binds its listener before anything reads that file, and an eager read would let a `rocky.toml` that is a FIFO or sits on a stalled mount stop the server binding at all.
+    Those two come from `rocky.toml`, and are read **once, on the first request to this route**, then fixed for the life of the process. Deliberately not at startup: nothing on the path to binding the listener reads a file, and an eager read would put one there — letting a `rocky.toml` that is a FIFO or sits on a stalled mount stop the server binding at all. That read is bounded by one permit and a deadline, so a stuck file cannot starve the server either; a caller that finds it busy or slow gets `503 engine_busy`.
 
     So they are a snapshot, not a live view, and the scheduler re-reads that same file every tick — a config edited after the first request to this route is not reflected here, while the scheduler acts on the new one.
     """
