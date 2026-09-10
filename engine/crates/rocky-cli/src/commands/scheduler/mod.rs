@@ -47,9 +47,17 @@ use crate::commands::tick::build_member_budgets;
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(15);
 
 /// The `.rocky` directory for a config file: its parent directory (the project
-/// root, not the process cwd) joined with `.rocky`. The single derivation shared
-/// by the reconciler loop, the schedule-status endpoint, and the webhook-ingress
-/// accept path, so all three agree on the tick lock and the demand spool.
+/// root, not the process cwd) joined with `.rocky`.
+///
+/// The single derivation, so every caller contends on the same tick lock and
+/// reads the same demand spool. Two processes launched from different working
+/// directories against the same `rocky.toml` must agree, and they only do
+/// because the rule is anchored to the config file rather than to the cwd.
+///
+/// The caller list is deliberately not enumerated here: it goes stale on its
+/// own, and it did — the previous version named three callers while nine
+/// derived the path, three of them by keeping a private copy of these five
+/// lines (#1901).
 pub fn rocky_dir_for_config(config_path: &Path) -> PathBuf {
     config_path
         .parent()
@@ -563,6 +571,49 @@ fn skip_reason_label(reason: &TickSkipReason) -> &'static str {
         TickSkipReason::ConfigError => "config_error",
         TickSkipReason::HistoryUnavailable => "history_unavailable",
         TickSkipReason::StateBusy => "state_busy",
+    }
+}
+
+#[cfg(test)]
+mod rocky_dir_tests {
+    use super::rocky_dir_for_config;
+    use std::path::{Path, PathBuf};
+
+    /// #1901. A bare `rocky.toml` has a parent — the EMPTY path — and that is
+    /// the branch the `filter` exists for.
+    ///
+    /// ```text
+    /// with the filter     ->  "." + ".rocky"  ->  ./.rocky
+    /// without it          ->  ""  + ".rocky"  ->  .rocky
+    /// ```
+    ///
+    /// Both resolve to the same directory, so a caller that only opens the
+    /// path cannot tell them apart. A caller that absolutizes, canonicalizes,
+    /// or compares two of these as strings can. Three call sites kept a
+    /// private copy of these five lines, which is how a change to the rule
+    /// would have reached one of them and not the others.
+    #[test]
+    fn a_config_with_no_directory_anchors_to_the_current_directory() {
+        assert_eq!(
+            rocky_dir_for_config(Path::new("rocky.toml")),
+            PathBuf::from(".").join(".rocky"),
+        );
+    }
+
+    /// The rule the doc comment is about: the CONFIG's directory, never the
+    /// process cwd. Two ticks launched from different working directories
+    /// against the same `rocky.toml` contend on the same lock only because of
+    /// this.
+    #[test]
+    fn the_directory_comes_from_the_config_path_not_the_cwd() {
+        assert_eq!(
+            rocky_dir_for_config(Path::new("/srv/projects/sales/rocky.toml")),
+            PathBuf::from("/srv/projects/sales/.rocky"),
+        );
+        assert_eq!(
+            rocky_dir_for_config(Path::new("../sibling/rocky.toml")),
+            PathBuf::from("../sibling/.rocky"),
+        );
     }
 }
 

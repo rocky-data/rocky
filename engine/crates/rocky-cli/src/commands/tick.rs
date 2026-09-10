@@ -105,15 +105,10 @@ pub async fn run_tick(
     // the exact pre-wiring behavior.
     let member_budgets = build_member_budgets(&config, config_path, pipeline.as_deref());
 
-    // The `.rocky` directory holding the tick lock is anchored to the config
-    // file's directory (the project root), NOT the process cwd — two ticks
-    // launched from different cwds must contend on the same lock. It is also
-    // where the P3 webhook spool will live.
-    let rocky_dir = config_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-        .join(".rocky");
+    // Anchored to the config file's directory, NOT the process cwd — two ticks
+    // launched from different cwds must contend on the same lock and see the
+    // same webhook spool. `rocky_dir_for_config` is that rule.
+    let rocky_dir = crate::commands::scheduler::rocky_dir_for_config(config_path);
 
     let opts = TickOptions {
         dry_run,
