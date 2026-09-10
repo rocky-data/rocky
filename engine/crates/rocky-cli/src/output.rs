@@ -7889,13 +7889,18 @@ pub struct PolicyRuleEntry {
     pub capability: rocky_core::config::PolicyCapability,
     pub effect: rocky_core::config::PolicyEffect,
     pub scope: PolicyRuleScopeOutput,
-    /// Free-form conditions the rule was written with, as authored. The engine
-    /// parses them and never evaluates them: no `conditions` predicate narrows
-    /// a rule's effect today, so a reader must not show them as part of what
-    /// decided an outcome. They are here because a policy screen should be able
-    /// to show what a rule's author wrote, including the part not yet in force.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub conditions: Option<serde_json::Value>,
+    /// Post-apply verification: the named checks that must pass after a
+    /// mutation this rule governs. A failing or absent named check halts the
+    /// apply. Two rules that differ only here govern differently, so the
+    /// document carries it; without it a reader cannot tell them apart.
+    ///
+    /// A rule's `conditions` is deliberately NOT carried. The engine parses it
+    /// and never evaluates it, its shape is unbounded, and `${VAR}` in a config
+    /// string is resolved before parsing — so an authored condition can hold a
+    /// resolved secret that no key-based redaction could find. It decides
+    /// nothing, so nothing is lost by leaving it out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verify_after: Vec<String>,
     /// The rolling failure ceiling that degrades this rule's effect.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub autonomy_budget: Option<PolicyAutonomyBudgetOutput>,
@@ -7933,7 +7938,11 @@ pub struct PolicyFreezeInForce {
     /// `"ledger"` (a `rocky policy freeze` decision) or `"marker"` (a durable
     /// freeze marker in the remote object tier).
     pub source: String,
-    /// The frozen principal. Absent on a marker that froze both.
+    /// The frozen principal. Absent ONLY on a marker whose body could not be
+    /// read: the loader widens such a marker to scope `any` and to both
+    /// principals so it fails closed. It is not a marker that deliberately
+    /// froze both, and a reader must not present it as one — the `reason` says
+    /// the body was unreadable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub principal: Option<rocky_core::config::PolicyPrincipal>,
     /// The scope selector as given to `rocky policy freeze`; `any` is every model.
@@ -7953,10 +7962,27 @@ pub struct PolicyFreezeInForce {
 /// Which freeze sources the report read.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PolicyFreezeSources {
-    /// `"read"`, or `"absent"` when the project has no state store yet.
+    /// How the decision ledger was read.
+    ///
+    /// - `"read"` — a local backend, read in full.
+    /// - `"absent"` — a local backend with no state store yet. Proven absent,
+    ///   not assumed: a path that exists but cannot be read is an error.
+    /// - `"local_mirror"` — a remote `[state]` backend. What was read is the
+    ///   local mirror, which may be stale or empty; the remote authority was
+    ///   NOT downloaded, because this is a read-only route and the download
+    ///   replaces the local ledger. A freeze recorded by another pod can be
+    ///   missing here while an apply, which does download first, still denies.
+    /// - `"not_consulted"` — no `[policy]` block, so nothing is in force and
+    ///   the enforcement gate reads no ledger either.
     pub ledger: String,
-    /// `"read"`, or `"not_configured"` when `[state]` keeps no durable markers
-    /// (a local backend, or `freeze_marker_writes = false`).
+    /// How the durable freeze markers were read.
+    ///
+    /// - `"read"` — the `[state]` backend has a durable object tier, read in
+    ///   full. Reads are NOT gated on `freeze_marker_writes`: that flag gates
+    ///   writes only, and an existing marker stays enforced after it is turned
+    ///   off, so a reader that honoured it would hide a live freeze.
+    /// - `"not_configured"` — the backend keeps no durable object tier.
+    /// - `"not_consulted"` — no `[policy]` block, as above.
     pub markers: String,
 }
 

@@ -162,8 +162,9 @@ pub use plan::{
 };
 pub use playground::{run_playground, run_playground_with_template};
 pub use policy::{
-    PolicyShowLedger, assemble_policy_show, compute_policy_check, compute_policy_show,
-    compute_policy_test, load_policy_show_markers, policy_show_config, read_policy_show_ledger,
+    PolicyShowLedger, PolicyShowMarkers, assemble_policy_show, compute_policy_check,
+    compute_policy_show, compute_policy_test, load_policy_show_markers, policy_show_config,
+    policy_show_remote_backend, policy_show_unconsulted_ledger, read_policy_show_ledger,
     run_policy_check, run_policy_freeze, run_policy_show, run_policy_test,
 };
 pub use preview::{

@@ -474,6 +474,66 @@ async fn policy_show_prints_what_compute_policy_show_returns() {
     assert_ne!(before, after, "the freeze changes the document");
 }
 
+/// The TEXT rendering of `policy show`, which the JSON parity test cannot see.
+///
+/// Every field the document carries and a person needs must reach the text, or
+/// the terminal quietly shows less than the route does. This pins the three
+/// that were missing or wrong: a ledger freeze's audit `plan_id`, a rule's
+/// `verify_after`, and the fact that an absent principal means the marker body
+/// could not be read rather than a deliberate both-principal freeze.
+#[test]
+fn policy_show_text_carries_the_plan_id_and_verify_after() {
+    let policy = format!(
+        "{POLICY_BASE}{PASSING_SCENARIO}\n[[policy.rules]]\nprincipal = \"agent\"\n\
+         capability = \"apply\"\nscope = {{ any = true }}\neffect = \"allow\"\n\
+         verify_after = [\"row_count\"]\n"
+    );
+    let (dir, _config_path, _models_dir) = policy_project(&policy);
+    let state_path = dir.path().join("state.redb");
+    let state = state_path.to_str().unwrap();
+
+    rocky_stdout(
+        dir.path(),
+        &[
+            "--state-path",
+            state,
+            "policy",
+            "freeze",
+            "--principal",
+            "agent",
+            "--scope",
+            "model=fct_*",
+            "--reason",
+            "incident 42",
+            "--output",
+            "json",
+        ],
+    );
+
+    let text = rocky_stdout(
+        dir.path(),
+        &["--state-path", state, "policy", "show", "--output", "table"],
+    );
+
+    assert!(
+        text.contains("verify_after=row_count"),
+        "a rule's post-apply gate must be visible in the text: {text}"
+    );
+    assert!(
+        text.contains("plan="),
+        "a ledger freeze's audit plan id must be visible in the text: {text}"
+    );
+    assert!(text.contains("incident 42"), "{text}");
+    assert!(
+        text.contains("freezes in force"),
+        "the freeze heading is present when a [policy] block exists: {text}"
+    );
+    assert!(
+        !text.contains("conditions"),
+        "a rule's conditions are not carried at all: {text}"
+    );
+}
+
 /// A failing scenario is a row in the report, then a non-zero exit. The
 /// report must reach stdout first, in full, so CI shows which scenario broke.
 #[test]

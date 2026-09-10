@@ -117,11 +117,32 @@ rocky policy unfreeze --principal agent --scope 'model=fct_*'
 |---|---|
 | `check` | Explain the effect the policy plane resolves for a `(principal, capability, model)` triple: the verdict, the winning rule, and the reason. Read-only. |
 | `test` | Run the project's `[[policy.tests]]` scenario assertions through the real evaluator; exits non-zero if any resolved effect differs from its expectation, so a policy edit cannot silently open a hole in CI. |
-| `show` | The policy plane as it stands: the rules in file order with their position as `id` (the `matched_rule` that `check` reports), the default agent effect, and every freeze in force from the decision ledger and, when `[state]` keeps them, the durable freeze markers. `freeze_sources` says which was read. Read-only. A source that exists but cannot be read is an error, never an empty list. |
+| `show` | The policy plane as it stands: the rules in file order with their position as `id` (the `matched_rule` that `check` reports), each rule's scope and its `verify_after` checks, the default agent effect, and every freeze in force. Read-only. A source that exists but cannot be read is an error, never an empty list. `freeze_sources` says how each source was read, and the two cases below are the ones to know about. |
 | `freeze` | The kill switch. Records a freeze decision in the decision ledger; at the enforcement seam an active freeze forces `deny` for the matched `(principal, scope)`. No config file is rewritten, and freezing is always allowed. Omitting `--principal` freezes both principals; omitting `--scope` freezes every model. |
 | `unfreeze` | Lift a matching freeze by recording a superseding decision. Pass the same `--principal` / `--scope` used to freeze. |
 
 Policy can only tighten at runtime: freeze and the autonomy-budget degradation move effects toward `require_review` / `deny`, never toward `allow`.
+
+Two things `show` reports rather than hides.
+
+**No `[policy]` block means nothing is in force.** The enforcement gate answers
+`NotConfigured` before it reads a freeze source, so a freeze recorded earlier
+enforces nothing until a `[policy]` block exists. `show` reads no source either
+and reports both as `not_consulted`, so it never lists a freeze the engine would
+not honour.
+
+**On a remote `[state]` backend the ledger is read from the local mirror.** A
+governed apply downloads the authoritative remote ledger before it gates. `show`
+is read-only and that download replaces the local ledger file, so `show` does
+not do it. It reports `freeze_sources.ledger` as `local_mirror` to say so: a
+freeze recorded by another pod can be missing from the list while an apply still
+denies on it. A command that downloads remote state first, such as `rocky run`
+or a governed apply, refreshes the local mirror; there is no separate command
+that only pulls it.
+
+Durable freeze markers are read wherever the `[state]` backend has an object
+tier, whatever `freeze_marker_writes` says. That flag gates writes only, and a
+marker written while it was on stays enforced after it is turned off.
 
 `rocky serve` answers `rocky policy show --output json` byte for byte at `GET /api/v1/policy`.
 

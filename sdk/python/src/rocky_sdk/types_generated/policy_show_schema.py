@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
 
 from pydantic import AwareDatetime, BaseModel, conint
 
@@ -145,11 +144,15 @@ class PolicyFreezeSources(BaseModel):
 
     ledger: str
     """
-    `"read"`, or `"absent"` when the project has no state store yet.
+    How the decision ledger was read.
+
+    - `"read"` — a local backend, read in full. - `"absent"` — a local backend with no state store yet. Proven absent, not assumed: a path that exists but cannot be read is an error. - `"local_mirror"` — a remote `[state]` backend. What was read is the local mirror, which may be stale or empty; the remote authority was NOT downloaded, because this is a read-only route and the download replaces the local ledger. A freeze recorded by another pod can be missing here while an apply, which does download first, still denies. - `"not_consulted"` — no `[policy]` block, so nothing is in force and the enforcement gate reads no ledger either.
     """
     markers: str
     """
-    `"read"`, or `"not_configured"` when `[state]` keeps no durable markers (a local backend, or `freeze_marker_writes = false`).
+    How the durable freeze markers were read.
+
+    - `"read"` — the `[state]` backend has a durable object tier, read in full. Reads are NOT gated on `freeze_marker_writes`: that flag gates writes only, and an existing marker stays enforced after it is turned off, so a reader that honoured it would hide a live freeze. - `"not_configured"` — the backend keeps no durable object tier. - `"not_consulted"` — no `[policy]` block, as above.
     """
 
 
@@ -202,7 +205,7 @@ class PolicyFreezeInForce(BaseModel):
     """
     principal: PolicyPrincipal11 | PolicyPrincipal12 | None = None
     """
-    The frozen principal. Absent on a marker that froze both.
+    The frozen principal. Absent ONLY on a marker whose body could not be read: the loader widens such a marker to scope `any` and to both principals so it fails closed. It is not a marker that deliberately froze both, and a reader must not present it as one — the `reason` says the body was unreadable.
     """
     reason: str
     scope: str
@@ -247,10 +250,6 @@ class PolicyRuleEntry(BaseModel):
 
     `read` is always allowed (short-circuit). The mutating verbs (`propose` … `quarantine`) name coarse operations; `schema_change.additive`, `schema_change.breaking`, and `value_change` are *refinements* of the apply/promote verbs — a rule naming a bare verb (`apply`/`promote`) matches those refinements too, but a rule naming a refinement matches only that exact refinement.
     """
-    conditions: Any | None = None
-    """
-    Free-form conditions the rule was written with, as authored. The engine parses them and never evaluates them: no `conditions` predicate narrows a rule's effect today, so a reader must not show them as part of what decided an outcome. They are here because a policy screen should be able to show what a rule's author wrote, including the part not yet in force.
-    """
     effect: PolicyEffect17 | PolicyEffect18 | PolicyEffect19
     """
     The verdict a policy rule (or the default posture) yields.
@@ -268,6 +267,12 @@ class PolicyRuleEntry(BaseModel):
     `agent` is a non-human caller (an AI harness authoring, applying, or remediating). `human` is a person. In v0 the principal is supplied explicitly (`rocky policy check --principal …`); auto-detection is a later phase.
     """
     scope: PolicyRuleScopeOutput
+    verify_after: list[str] | None = None
+    """
+    Post-apply verification: the named checks that must pass after a mutation this rule governs. A failing or absent named check halts the apply. Two rules that differ only here govern differently, so the document carries it; without it a reader cannot tell them apart.
+
+    A rule's `conditions` is deliberately NOT carried. The engine parses it and never evaluates it, its shape is unbounded, and `${VAR}` in a config string is resolved before parsing — so an authored condition can hold a resolved secret that no key-based redaction could find. It decides nothing, so nothing is lost by leaving it out.
+    """
 
 
 class PolicyRulesOutput(BaseModel):
