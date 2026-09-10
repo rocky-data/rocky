@@ -18,19 +18,37 @@ use rocky_core::traits::WarehouseAdapter;
 use crate::output::{EstimateOutput, ModelEstimate, print_json};
 use crate::registry::{self, AdapterRegistry};
 
-/// Execute `rocky estimate`: compile models, generate SQL, and run EXPLAIN.
+/// What `rocky estimate` computed, before rendering: the typed document a
+/// JSON consumer gets, plus what the text report shows and the JSON
+/// deliberately omits (skips, EXPLAIN failures, the pricing table).
+#[derive(Debug)]
+pub struct EstimateReport {
+    /// The `--output json` document.
+    pub output: EstimateOutput,
+    /// Models whose SQL could not be generated, with the reason.
+    pub skipped: Vec<(String, String)>,
+    /// Models whose EXPLAIN failed, with the reason.
+    pub explain_failed: Vec<(String, String)>,
+    /// Which pricing table applied, named by adapter type.
+    pub pricing_source: &'static str,
+    /// The pricing table itself.
+    pub pricing: WarehouseCostModel,
+    /// How many models the filter matched. Zero is "No models found."
+    pub matched: usize,
+}
+
+/// Compile models, generate SQL, and run EXPLAIN against the warehouse.
 ///
-/// `verbose` affects the TEXT output only — the JSON output is byte-identical
-/// either way, so a `--output json` consumer cannot tell the flag was passed.
-pub async fn run_estimate(
+/// A `model_filter` naming no model is an error. No models at all is a
+/// report with `matched == 0` and the JSON document's `message` set; so is
+/// a project where every model was skipped or failed EXPLAIN, with the
+/// other message.
+pub async fn compute_estimate(
     config_path: &Path,
     models_dir: &Path,
     pipeline_name: Option<&str>,
     model_filter: Option<&str>,
-    output_json: bool,
-    verbose: bool,
-) -> Result<()> {
-    // 1. Load config + adapter registry.
+) -> Result<EstimateReport> {
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
         "failed to load config from {}",
         config_path.display()
@@ -39,10 +57,8 @@ pub async fn run_estimate(
     let adapter_registry = AdapterRegistry::from_config(&rocky_cfg)?;
     let warehouse_adapter = adapter_registry.warehouse_adapter(pipeline.target_adapter())?;
 
-    // Determine warehouse pricing model from the pipeline's target adapter.
     let (pricing_source, pricing) = resolve_pricing(&rocky_cfg, pipeline.target_adapter());
 
-    // 2. Load all models.
     let all_models = load_all_models(models_dir, Some(&rocky_cfg.freshness))?;
 
     let models_to_estimate: Vec<_> = all_models
@@ -56,36 +72,28 @@ pub async fn run_estimate(
         })
         .collect();
 
-    // An unknown `--model` is a mistake, not an empty result: refuse it the
-    // way `rocky compile --model` does, rather than reporting zero estimates
-    // at exit 0 (#1428).
     if let Some(filter) = model_filter
         && !all_models.iter().any(|m| m.config.name == filter)
     {
         return Err(anyhow::Error::new(super::ModelNotFound(filter.to_string())));
     }
 
-    if models_to_estimate.is_empty() {
+    let matched = models_to_estimate.len();
+    if matched == 0 {
         info!("no models found to estimate");
-        if output_json {
-            // Carries the same explanation the text path prints. Previously
-            // the human was told "No models found." and the JSON consumer got
-            // a bare empty array with no way to tell "nothing to estimate"
-            // from "the command did not run" (#1428).
-            print_json(&EstimateOutput::empty("no models found to estimate"))?;
-        } else {
-            println!("No models found.");
-        }
-        return Ok(());
+        return Ok(EstimateReport {
+            output: EstimateOutput::empty("no models found to estimate"),
+            skipped: Vec::new(),
+            explain_failed: Vec::new(),
+            pricing_source,
+            pricing,
+            matched,
+        });
     }
 
-    // 3. For each model, generate SQL and run EXPLAIN.
     let mut estimates = Vec::new();
-    // Models dropped before EXPLAIN ever ran. Without these the text report's
-    // "Estimated N model(s)" is a count of what SUCCEEDED, not of what was
-    // asked for, and the difference is otherwise only visible at debug log
-    // level. Surfaced under `--verbose` (the default output is unchanged).
     let mut skipped: Vec<(String, String)> = Vec::new();
+    let mut explain_failed: Vec<(String, String)> = Vec::new();
     for model in &models_to_estimate {
         let model_ir = model.to_model_ir();
         let dialect = warehouse_adapter.dialect();
@@ -105,32 +113,57 @@ pub async fn run_estimate(
             Ok(estimate) => estimates.push(estimate),
             Err(e) => {
                 debug!(model = %model.config.name, "explain failed: {e}");
-                if !output_json {
-                    println!("  ! {} — explain failed: {e}", model.config.name);
-                }
+                explain_failed.push((model.config.name.clone(), e.to_string()));
             }
         }
     }
 
-    // 4. Report.
-    if output_json {
-        // Models were selected but none produced an estimate — every SQL-gen
-        // or EXPLAIN failed (both are `debug!`-only above, and the per-model
-        // "explain failed" line is printed on the text path only). Without
-        // this, the payload is `{"estimates": [], "total_models": 0}`: the
-        // same silent-empty shape as a project with nothing to estimate, and
-        // a contract violation of `EstimateOutput::message`, which promises
-        // to say why an empty result is empty (#1428).
-        let output = if estimates.is_empty() {
-            EstimateOutput::empty("no model produced an estimate")
-        } else {
-            EstimateOutput::new(estimates)
-        };
-        print_json(&output)?;
+    let output = if estimates.is_empty() {
+        EstimateOutput::empty("no model produced an estimate")
     } else {
+        EstimateOutput::new(estimates)
+    };
+    Ok(EstimateReport {
+        output,
+        skipped,
+        explain_failed,
+        pricing_source,
+        pricing,
+        matched,
+    })
+}
+
+/// Execute `rocky estimate`: [`compute_estimate`], rendered.
+///
+/// `verbose` affects the TEXT output only — the JSON output is byte-identical
+/// either way, so a `--output json` consumer cannot tell the flag was passed.
+pub async fn run_estimate(
+    config_path: &Path,
+    models_dir: &Path,
+    pipeline_name: Option<&str>,
+    model_filter: Option<&str>,
+    output_json: bool,
+    verbose: bool,
+) -> Result<()> {
+    let report = compute_estimate(config_path, models_dir, pipeline_name, model_filter).await?;
+
+    if output_json {
+        print_json(&report.output)?;
+    } else if report.matched == 0 {
+        println!("No models found.");
+    } else {
+        for (name, e) in &report.explain_failed {
+            println!("  ! {name} — explain failed: {e}");
+        }
         print!(
             "{}",
-            render_estimates_text(&estimates, &skipped, pricing_source, &pricing, verbose)
+            render_estimates_text(
+                &report.output.estimates,
+                &report.skipped,
+                report.pricing_source,
+                &report.pricing,
+                verbose
+            )
         );
     }
 
@@ -451,5 +484,47 @@ type = "some-future-warehouse"
             real_rates.per_byte_io_cost, fallback_rates.per_byte_io_cost,
             "the fallback is Databricks pricing — only the label differs"
         );
+    }
+
+    /// `run_estimate --output json` is `compute_estimate` plus one
+    /// `print_json`. With no models the report says so in both shapes, and a
+    /// filter naming no model is an error, not an empty report.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn compute_estimate_reports_no_models_in_both_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("x.duckdb");
+        let config = dir.path().join("rocky.toml");
+        // A TOML literal string, so a Windows path's backslashes survive.
+        std::fs::write(
+            &config,
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\n\
+                 [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                 [pipeline.p.target.governance]\nauto_create_schemas = true\n",
+                db.display()
+            ),
+        )
+        .unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+
+        let report = compute_estimate(&config, &models, None, None)
+            .await
+            .unwrap();
+        assert_eq!(report.matched, 0);
+        assert_eq!(report.output.command, "estimate");
+        assert_eq!(report.output.total_models, 0);
+        assert_eq!(
+            report.output.message.as_deref(),
+            Some("no models found to estimate")
+        );
+        assert_eq!(report.pricing_source, "duckdb");
+        assert!(report.skipped.is_empty() && report.explain_failed.is_empty());
+
+        let err = compute_estimate(&config, &models, None, Some("ghost"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("ghost"), "{err}");
     }
 }

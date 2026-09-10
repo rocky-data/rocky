@@ -1,20 +1,32 @@
-//! `rocky trace`, `rocky cost` and `rocky compliance` print, byte for byte,
-//! what their producer seam returns.
+//! The commands with a producer seam print, byte for byte, what the seam
+//! returns.
 //!
-//! The seams (`compute_trace`, `compute_cost`, `compute_compliance`) exist so
-//! a server route can serve the same document the CLI prints. These tests
-//! spawn the real binary and compare its stdout against the seam's own
-//! serialisation, byte for byte. What they pin is the equality: a `run_*`
-//! that serialises differently, or a seam whose document drifts from what
-//! the CLI prints, fails here. They cannot see whether `run_*` calls the
-//! seam or reproduces its bytes another way; only the bytes are the
-//! contract a route needs.
+//! The seams (`compute_trace`, `compute_cost`, `compute_compliance`,
+//! `compute_replay_check`, `compute_policy_check`, `compute_policy_test`,
+//! `compute_branch_list`, `compute_branch_show`, `compute_estimate`,
+//! `history_run_output`) exist so a server route can serve the same document
+//! the CLI prints. These tests spawn the real binary and compare its stdout
+//! against the seam's own serialisation, byte for byte. What they pin is the
+//! equality: a `run_*` that serialises differently, or a seam whose document
+//! drifts from what the CLI prints, fails here. They cannot see whether
+//! `run_*` calls the seam or reproduces its bytes another way; only the
+//! bytes are the contract a route needs.
+//!
+//! Where a command's text rendering or exit code has structure of its own
+//! (`policy test` prints before it exits non-zero; `estimate` prints EXPLAIN
+//! failures before the table; `history --run` prints the run table and then
+//! the audit table), the text path is pinned here too.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
 
 use chrono::{TimeZone, Utc};
-use rocky_cli::commands::{CostGroupBy, compute_compliance, compute_cost, compute_trace};
+use rocky_cli::commands::{
+    CostGroupBy, compute_branch_list, compute_branch_show, compute_compliance, compute_cost,
+    compute_estimate, compute_policy_check, compute_policy_test, compute_replay_check,
+    compute_trace, history_run_output, run_branch_create,
+};
+use rocky_core::config::{PolicyCapability, PolicyPrincipal};
 use rocky_core::state::{
     ModelExecution, RunRecord, RunStatus, RunTrigger, SessionSource, StateStore,
 };
@@ -71,7 +83,7 @@ fn seed_state(state_path: &Path) {
             models_executed: models,
             trigger: RunTrigger::Manual,
             config_hash: "cfghash".to_string(),
-            triggering_identity: None,
+            triggering_identity: Some("seams-test".to_string()),
             session_source: SessionSource::Cli,
             git_commit: None,
             git_branch: None,
@@ -88,13 +100,18 @@ fn seed_state(state_path: &Path) {
         .unwrap();
 }
 
-/// Run the binary from `cwd` and return its stdout, asserting a clean exit.
-fn rocky_stdout(cwd: &Path, args: &[&str]) -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_rocky"))
+/// Run the binary from `cwd` and return everything it produced.
+fn rocky(cwd: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_rocky"))
         .current_dir(cwd)
         .args(args)
         .output()
-        .expect("spawn rocky");
+        .expect("spawn rocky")
+}
+
+/// Run the binary from `cwd` and return its stdout, asserting a clean exit.
+fn rocky_stdout(cwd: &Path, args: &[&str]) -> String {
+    let out = rocky(cwd, args);
     assert!(
         out.status.success(),
         "rocky {:?} exited {:?}\nstderr:\n{}",
@@ -216,5 +233,510 @@ fn compliance_prints_what_compute_compliance_returns() {
     assert!(
         printed.contains("\"command\": \"compliance\""),
         "the document is the compliance report: {printed}"
+    );
+}
+
+#[test]
+fn replay_check_prints_what_compute_replay_check_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_path = dir.path().join("state.redb");
+    seed_state(&state_path);
+    let state = state_path.to_str().unwrap();
+
+    let whole = rocky_stdout(
+        dir.path(),
+        &[
+            "--state-path",
+            state,
+            "replay",
+            RUN_ID,
+            "--check",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(
+        whole,
+        reference_bytes!(compute_replay_check(&state_path, RUN_ID, None).unwrap())
+    );
+    assert!(
+        whole.contains("\"command\": \"replay --check\""),
+        "the document is the replay check: {whole}"
+    );
+
+    let one = rocky_stdout(
+        dir.path(),
+        &[
+            "--state-path",
+            state,
+            "replay",
+            "latest",
+            "--check",
+            "--model",
+            "a",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(
+        one,
+        reference_bytes!(compute_replay_check(&state_path, "latest", Some("a")).unwrap())
+    );
+    assert_ne!(whole, one, "the model filter changes the document");
+}
+
+#[test]
+fn branch_list_and_show_print_what_their_seams_return() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_path = dir.path().join("state.redb");
+    // Seeded through the production create path, in process; its own JSON
+    // goes to this test's stdout and is not under test.
+    run_branch_create(&state_path, "fix-price", Some("a description"), true).unwrap();
+    let state = state_path.to_str().unwrap();
+
+    let list = rocky_stdout(
+        dir.path(),
+        &["--state-path", state, "branch", "list", "--output", "json"],
+    );
+    assert_eq!(
+        list,
+        reference_bytes!(compute_branch_list(&state_path).unwrap())
+    );
+    assert!(
+        list.contains("fix-price"),
+        "the list names the branch: {list}"
+    );
+
+    let show = rocky_stdout(
+        dir.path(),
+        &[
+            "--state-path",
+            state,
+            "branch",
+            "show",
+            "fix-price",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(
+        show,
+        reference_bytes!(compute_branch_show(&state_path, "fix-price").unwrap())
+    );
+    assert!(
+        show.contains("\"command\": \"branch show\""),
+        "the document is one branch: {show}"
+    );
+}
+
+const POLICY_BASE: &str = "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+     [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+     [pipeline.p.target.governance]\nauto_create_schemas = true\n\n\
+     [policy]\nversion = 1\ndefault_agent_effect = \"require_review\"\n\n\
+     [[policy.rules]]\nprincipal = \"agent\"\ncapability = \"apply\"\n\
+     scope = { contracted = true }\neffect = \"deny\"\n\n\
+     [[policy.tests]]\nname = \"contracted apply is denied\"\nprincipal = \"agent\"\n\
+     capability = \"apply\"\ncontracted = true\nexpect = \"deny\"\n\n";
+
+const PASSING_SCENARIO: &str = "[[policy.tests]]\nname = \"human is ungated\"\nprincipal = \"human\"\n\
+     capability = \"apply\"\ncontracted = true\nexpect = \"allow\"\n";
+
+const FAILING_SCENARIO: &str = "[[policy.tests]]\nname = \"wrong on purpose\"\nprincipal = \"agent\"\n\
+     capability = \"apply\"\ncontracted = true\nexpect = \"allow\"\n";
+
+fn policy_project(
+    config_body: &str,
+) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("rocky.toml");
+    std::fs::write(&config_path, config_body).unwrap();
+    let models_dir = dir.path().join("models");
+    std::fs::create_dir_all(&models_dir).unwrap();
+    std::fs::write(models_dir.join("orders.sql"), "SELECT 1 AS id\n").unwrap();
+    std::fs::write(
+        models_dir.join("orders.toml"),
+        "name = \"orders\"\n[target]\ncatalog = \"w\"\nschema = \"s\"\ntable = \"orders\"\n",
+    )
+    .unwrap();
+    (dir, config_path, models_dir)
+}
+
+#[test]
+fn policy_check_and_test_print_what_their_seams_return() {
+    let (dir, config_path, models_dir) =
+        policy_project(&format!("{POLICY_BASE}{PASSING_SCENARIO}"));
+    let models = models_dir.to_str().unwrap();
+
+    let check = rocky_stdout(
+        dir.path(),
+        &[
+            "policy",
+            "check",
+            "--principal",
+            "agent",
+            "--capability",
+            "apply",
+            "--model",
+            "orders",
+            "--models",
+            models,
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(
+        check,
+        reference_bytes!(
+            compute_policy_check(
+                &config_path,
+                &models_dir,
+                PolicyPrincipal::Agent,
+                PolicyCapability::Apply,
+                "orders",
+            )
+            .unwrap()
+        )
+    );
+    assert!(
+        check.contains("\"command\": \"policy_check\""),
+        "the document is the decision: {check}"
+    );
+
+    let test = rocky_stdout(dir.path(), &["policy", "test", "--output", "json"]);
+    assert_eq!(
+        test,
+        reference_bytes!(compute_policy_test(&config_path).unwrap())
+    );
+    assert!(
+        test.contains("\"command\": \"policy_test\""),
+        "the document is the scenario report: {test}"
+    );
+}
+
+/// A failing scenario is a row in the report, then a non-zero exit. The
+/// report must reach stdout first, in full, so CI shows which scenario broke.
+#[test]
+fn policy_test_prints_the_report_before_it_exits_non_zero() {
+    let (dir, config_path, _models_dir) =
+        policy_project(&format!("{POLICY_BASE}{FAILING_SCENARIO}"));
+
+    let out = rocky(dir.path(), &["policy", "test", "--output", "json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a failing scenario exits 1, the CI gate code"
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let report = compute_policy_test(&config_path).unwrap();
+    assert_eq!((report.total, report.passed, report.failed), (2, 1, 1));
+    assert_eq!(stdout, reference_bytes!(report));
+    assert!(
+        stdout.contains("\"name\": \"wrong on purpose\""),
+        "the failing scenario is in the printed report: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr, "Error: 1 of 2 policy scenario(s) failed\n",
+        "the exit reason is the whole of stderr, unchanged"
+    );
+}
+
+/// A DuckDB project whose `path` is absolute, so the binary and the in-process
+/// seam open the same database. A TOML literal string, so a Windows path's
+/// backslashes survive.
+fn duckdb_project(dir: &Path) -> std::path::PathBuf {
+    let db = dir.join("x.duckdb");
+    let config_path = dir.join("rocky.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.p.target.governance]\nauto_create_schemas = true\n",
+            db.display()
+        ),
+    )
+    .unwrap();
+    config_path
+}
+
+#[tokio::test]
+async fn estimate_prints_what_compute_estimate_returns_with_no_models() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = duckdb_project(dir.path());
+    // No models: the report says so, in the JSON document's `message`.
+    let models_dir = dir.path().join("models");
+    std::fs::create_dir_all(&models_dir).unwrap();
+    let models = models_dir.to_str().unwrap();
+
+    let printed = rocky_stdout(
+        dir.path(),
+        &["estimate", "--models", models, "--output", "json"],
+    );
+    let report = compute_estimate(&config_path, &models_dir, None, None)
+        .await
+        .unwrap();
+    assert_eq!(report.matched, 0);
+    assert_eq!(printed, reference_bytes!(report.output));
+    assert!(
+        printed.contains("no models found to estimate"),
+        "the document carries the empty-report message: {printed}"
+    );
+
+    let text = rocky_stdout(
+        dir.path(),
+        &["estimate", "--models", models, "--output", "table"],
+    );
+    assert_eq!(text, "No models found.\n");
+}
+
+/// Three models, three fates: `bad` fails EXPLAIN (its table does not exist),
+/// `skip` never reaches EXPLAIN (a dynamic table has no DuckDB SQL), `good`
+/// is estimated. The JSON holds only `good`; the text prints the EXPLAIN
+/// failure before the table, and the skip only under `--verbose`.
+#[tokio::test]
+async fn estimate_prints_what_compute_estimate_returns_with_mixed_outcomes() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = duckdb_project(dir.path());
+    let models_dir = dir.path().join("models");
+    std::fs::create_dir_all(&models_dir).unwrap();
+    let sidecar = |name: &str, strategy: &str| {
+        format!(
+            "name = \"{name}\"\n{strategy}[target]\ncatalog = \"x\"\nschema = \"main\"\ntable = \"{name}\"\n"
+        )
+    };
+    std::fs::write(models_dir.join("good.sql"), "SELECT 1 AS id\n").unwrap();
+    std::fs::write(models_dir.join("good.toml"), sidecar("good", "")).unwrap();
+    std::fs::write(models_dir.join("bad.sql"), "SELECT * FROM no_such_table\n").unwrap();
+    std::fs::write(models_dir.join("bad.toml"), sidecar("bad", "")).unwrap();
+    std::fs::write(models_dir.join("skip.sql"), "SELECT 2 AS id\n").unwrap();
+    std::fs::write(
+        models_dir.join("skip.toml"),
+        sidecar(
+            "skip",
+            "[strategy]\ntype = \"dynamic_table\"\ntarget_lag = \"1 hour\"\nwarehouse = \"wh\"\n",
+        ),
+    )
+    .unwrap();
+    let models = models_dir.to_str().unwrap();
+
+    let report = compute_estimate(&config_path, &models_dir, None, None)
+        .await
+        .unwrap();
+    assert_eq!(report.matched, 3);
+    assert_eq!(
+        report
+            .output
+            .estimates
+            .iter()
+            .map(|e| e.model_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["good"]
+    );
+    assert_eq!(report.explain_failed.len(), 1);
+    assert_eq!(report.explain_failed[0].0, "bad");
+    assert_eq!(report.skipped.len(), 1);
+    assert_eq!(report.skipped[0].0, "skip");
+    assert!(report.skipped[0].1.starts_with("SQL generation:"));
+
+    let printed = rocky_stdout(
+        dir.path(),
+        &["estimate", "--models", models, "--output", "json"],
+    );
+    assert_eq!(printed, reference_bytes!(report.output));
+
+    let text = rocky_stdout(
+        dir.path(),
+        &["estimate", "--models", models, "--output", "table"],
+    );
+    let failure_line = format!("  ! bad — explain failed: {}\n", report.explain_failed[0].1);
+    assert!(
+        text.starts_with(&failure_line),
+        "the EXPLAIN failure is the first line, before the table:\n{text}"
+    );
+    let table_at = text
+        .find("Estimated 1 model(s):\n")
+        .expect("the table follows");
+    assert!(table_at >= failure_line.len());
+    assert!(
+        text.contains("\n  good\n"),
+        "the estimated model is listed:\n{text}"
+    );
+    assert!(
+        !text.contains("Skipped before EXPLAIN"),
+        "skips are a --verbose detail:\n{text}"
+    );
+
+    let verbose = rocky_stdout(
+        dir.path(),
+        &[
+            "estimate",
+            "--models",
+            models,
+            "--output",
+            "table",
+            "--verbose",
+        ],
+    );
+    assert!(verbose.starts_with(&failure_line));
+    assert!(
+        verbose.contains("  Skipped before EXPLAIN (1):\n    skip — SQL generation:"),
+        "--verbose names the skipped model and why:\n{verbose}"
+    );
+}
+
+#[test]
+fn history_run_prints_what_history_run_output_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_path = dir.path().join("state.redb");
+    seed_state(&state_path);
+    let state = state_path.to_str().unwrap();
+
+    let one = rocky_stdout(
+        dir.path(),
+        &[
+            "--state-path",
+            state,
+            "history",
+            "--run",
+            RUN_ID,
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(
+        one,
+        reference_bytes!(history_run_output(&state_path, RUN_ID, false).unwrap())
+    );
+    assert!(one.contains("\"count\": 1"), "one run: {one}");
+    assert!(
+        !one.contains("seams-test-host"),
+        "audit fields stay absent without --audit: {one}"
+    );
+
+    let audited = rocky_stdout(
+        dir.path(),
+        &[
+            "--state-path",
+            state,
+            "history",
+            "--run",
+            RUN_ID,
+            "--audit",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(
+        audited,
+        reference_bytes!(history_run_output(&state_path, RUN_ID, true).unwrap())
+    );
+    assert!(
+        audited.contains("seams-test-host"),
+        "--audit carries the hostname: {audited}"
+    );
+
+    // A run the store does not hold is a refusal that names the id, not an
+    // empty list.
+    let out = rocky(
+        dir.path(),
+        &[
+            "--state-path",
+            state,
+            "history",
+            "--run",
+            "run-none",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(!out.status.success(), "an unknown run id must not exit 0");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("run-none"),
+        "the refusal names the id: {stderr}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "nothing is printed for a run that does not exist: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// The text path of `--run`: the same summary table the list prints, one
+/// row, then the governance table when `--audit` is set.
+#[test]
+fn history_run_text_prints_the_run_table_then_the_audit_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_path = dir.path().join("state.redb");
+    seed_state(&state_path);
+    let state = state_path.to_str().unwrap();
+
+    let expected_table = format!(
+        "{:<12} {:<24} {:<10} {:<8} {:<10}\n{}\n{:<12} {:<24} {:<10} {:<8} {:<10}\n\nTotal runs: 1\n",
+        "RUN ID",
+        "STARTED",
+        "STATUS",
+        "MODELS",
+        "TRIGGER",
+        "-".repeat(66),
+        "run-under-t",
+        "2026-04-21 12:00:00",
+        "Success",
+        2,
+        "Manual",
+    );
+
+    let text = rocky_stdout(
+        dir.path(),
+        &[
+            "--state-path",
+            state,
+            "history",
+            "--run",
+            RUN_ID,
+            "--output",
+            "table",
+        ],
+    );
+    assert_eq!(text, expected_table);
+
+    // With one run in the store, the list prints the same table: `--run`
+    // renders through the same rows as the list, not a second layout.
+    let list = rocky_stdout(
+        dir.path(),
+        &["--state-path", state, "history", "--output", "table"],
+    );
+    assert_eq!(list, expected_table);
+
+    let audited = rocky_stdout(
+        dir.path(),
+        &[
+            "--state-path",
+            state,
+            "history",
+            "--run",
+            RUN_ID,
+            "--audit",
+            "--output",
+            "table",
+        ],
+    );
+    assert!(
+        audited.starts_with(&expected_table),
+        "the run table comes first:\n{audited}"
+    );
+    let rest = &audited[expected_table.len()..];
+    assert!(
+        rest.starts_with("\nGovernance audit trail (--audit):\n"),
+        "then the audit table:\n{rest}"
+    );
+    assert!(
+        rest.contains("run-under-t  seams-test         cli      -          -                -                    seams-test-"),
+        "the audit row carries the identity, source and host:\n{rest}"
+    );
+    assert!(
+        rest.contains("  run-under-t  version=0.0.0-test  idempotency_key=-\n"),
+        "the detail line carries the version:\n{rest}"
     );
 }

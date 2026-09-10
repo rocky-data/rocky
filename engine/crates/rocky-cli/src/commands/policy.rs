@@ -37,19 +37,17 @@ use crate::output::{
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Execute `rocky policy check`.
-///
-/// Resolves the effect the policy plane would yield for
-/// `(principal, capability, model)` and renders it as text (default) or
-/// JSON (`--output json`).
-pub fn run_policy_check(
+/// The decision `rocky policy check` reports: the effect the policy plane
+/// would yield for `(principal, capability, model)`, with the matched rule,
+/// the reason and the model's attributes. Pure compute, no printing;
+/// [`run_policy_check`] renders it.
+pub fn compute_policy_check(
     config_path: &Path,
     models_dir: &Path,
     principal: PolicyPrincipal,
     capability: PolicyCapability,
     model_name: &str,
-    json: bool,
-) -> Result<()> {
+) -> Result<PolicyCheckOutput> {
     // Load the `[policy]` block. A missing rocky.toml falls back to the
     // default posture (agents on mutating actions require review, humans
     // are never gated); a *malformed* config (including an invalid
@@ -124,27 +122,41 @@ pub fn run_policy_check(
         },
     };
 
+    Ok(output)
+}
+
+/// `rocky policy check`: [`compute_policy_check`], rendered as JSON or
+/// text.
+pub fn run_policy_check(
+    config_path: &Path,
+    models_dir: &Path,
+    principal: PolicyPrincipal,
+    capability: PolicyCapability,
+    model_name: &str,
+    json: bool,
+) -> Result<()> {
+    let output = compute_policy_check(config_path, models_dir, principal, capability, model_name)?;
     if json {
         print_json(&output)?;
     } else {
         render_text(&output);
     }
-
     Ok(())
 }
 
-/// Execute `rocky policy test`.
+/// The report `rocky policy test` prints.
 ///
 /// Loads the project's `[policy]` block and its `[[policy.tests]]` scenarios,
 /// runs every scenario through [`policy::evaluate`], and reports the pass/fail
 /// verdict per scenario (actual vs expected effect, plus the deciding rule and
-/// reason on a failure). Returns an error — a non-zero exit for CI — when any
-/// scenario's resolved effect differs from its expectation.
+/// reason on a failure). A failing scenario is a row in the report, not an
+/// error: [`run_policy_test`] prints the report and then exits non-zero when
+/// `failed > 0`, so CI sees which scenario broke.
 ///
 /// A missing `rocky.toml`, an absent `[policy]` block, or zero scenarios are
 /// each treated as a hard error rather than a silent pass: a policy-test run
 /// that asserts nothing would defeat the guardrail it exists to be.
-pub fn run_policy_test(config_path: &Path, json: bool) -> Result<()> {
+pub fn compute_policy_test(config_path: &Path) -> Result<PolicyTestOutput> {
     let config = match rocky_core::config::load_rocky_config(config_path) {
         Ok(cfg) => cfg,
         Err(ConfigError::FileNotFound { .. }) => bail!(
@@ -241,14 +253,26 @@ pub fn run_policy_test(config_path: &Path, json: bool) -> Result<()> {
         results,
     };
 
+    Ok(output)
+}
+
+/// `rocky policy test`: [`compute_policy_test`], rendered, then a
+/// non-zero exit when any scenario failed. The report is printed first so
+/// a failing CI run still shows which scenario broke.
+pub fn run_policy_test(config_path: &Path, json: bool) -> Result<()> {
+    let output = compute_policy_test(config_path)?;
     if json {
         print_json(&output)?;
     } else {
         render_test_text(&output);
     }
 
-    if failed > 0 {
-        bail!("{failed} of {total} policy scenario(s) failed");
+    if output.failed > 0 {
+        bail!(
+            "{} of {} policy scenario(s) failed",
+            output.failed,
+            output.total
+        );
     }
 
     Ok(())
@@ -1599,5 +1623,71 @@ max_retries = 0
             unfreeze_keys.is_empty(),
             "no unfreeze marker may land before the superseding ledger row wins CAS"
         );
+    }
+
+    /// `run_policy_check --output json` is `compute_policy_check` plus one
+    /// `print_json`; this pins the producer both callers share.
+    #[test]
+    fn compute_policy_check_serves_the_decision() {
+        let (dir, config) = config_with(&format!("{NO_POLICY_BODY}\n{POLICY}"));
+        let models = dir.path().join("models");
+        fs::create_dir_all(&models).unwrap();
+        fs::write(models.join("orders.sql"), "SELECT 1 AS id\n").unwrap();
+        fs::write(
+            models.join("orders.toml"),
+            "name = \"orders\"\n[target]\ncatalog = \"w\"\nschema = \"s\"\ntable = \"orders\"\n",
+        )
+        .unwrap();
+
+        let out = compute_policy_check(
+            &config,
+            &models,
+            rocky_core::config::PolicyPrincipal::Agent,
+            rocky_core::config::PolicyCapability::Apply,
+            "orders",
+        )
+        .unwrap();
+        assert_eq!(out.command, "policy_check");
+        assert_eq!(out.model, "orders");
+        assert!(!out.model_attributes.contracted);
+        assert_eq!(
+            out.effect,
+            PolicyEffect::RequireReview,
+            "an uncontracted agent apply matches no rule and falls to the default posture"
+        );
+        assert_eq!(out.matched_rule, None);
+    }
+
+    /// `run_policy_test --output json` is `compute_policy_test` plus one
+    /// `print_json` and the exit code. The seam reports every scenario, pass
+    /// and fail alike, and never exits.
+    #[test]
+    fn compute_policy_test_reports_every_scenario() {
+        let body = format!(
+            "{POLICY}
+[[policy.tests]]
+name = \"contracted apply is denied\"
+principal = \"agent\"
+capability = \"apply\"
+contracted = true
+expect = \"deny\"
+
+[[policy.tests]]
+name = \"wrong on purpose\"
+principal = \"agent\"
+capability = \"apply\"
+contracted = true
+expect = \"allow\"
+"
+        );
+        let (_dir, path) = config_with(&body);
+
+        let out = compute_policy_test(&path).unwrap();
+        assert_eq!(out.command, "policy_test");
+        assert_eq!((out.total, out.passed, out.failed), (2, 1, 1));
+        assert!(out.results[0].passed);
+        assert!(!out.results[1].passed);
+        assert_eq!(out.results[1].name, "wrong on purpose");
+        assert_eq!(out.results[1].actual, PolicyEffect::Deny);
     }
 }
