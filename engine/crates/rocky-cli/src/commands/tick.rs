@@ -174,6 +174,11 @@ pub async fn run_tick(
             // `rocky tick` reports the reconciler's own tally, not a
             // replication run's check gate — there is no gate to report here.
             check_gate_failed: false,
+            // `rocky tick` holds no remote-state session of its own, and this
+            // sentinel is the reconciler's tally rather than one run's record.
+            // `Lost` is the honest value: no record was written for THIS error,
+            // so nothing may be uploaded on its authority (#1836).
+            custody: crate::commands::run::RecordCustody::Lost,
         }
         .into()),
     }
