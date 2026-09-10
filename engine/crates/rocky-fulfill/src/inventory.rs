@@ -84,9 +84,14 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     // F3 — the custody digest over the EXPANDED check set, so an edit to
     // a shared `test_definitions.toml` cannot change what observation
     // executes without the loop noticing.
+    "rocky_cli::commands::fulfill_api::DeclarativeCheckSnapshot",
     "rocky_cli::commands::fulfill_api::check_set_digest_scheme_is_current",
-    "rocky_cli::commands::fulfill_api::declarative_check_digest",
-    "rocky_cli::commands::fulfill_api::declarative_test_count",
+    // DELIBERATE, and it REPLACES the two routes that were here
+    // (`declarative_test_count` + `declarative_check_digest`). Called
+    // separately those were two reads of `models/` at two times, so an edit
+    // between them let the bundle report a deferred check the digest never
+    // pinned (#1804). One route, one load, both answers.
+    "rocky_cli::commands::fulfill_api::declarative_check_snapshot",
     "rocky_cli::commands::fulfill_api::lookup_apply_receipt",
     "rocky_cli::commands::fulfill_api::observe_declarative_checks",
     "rocky_cli::commands::fulfill_api::observe_max_time_column",

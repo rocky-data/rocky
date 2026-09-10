@@ -543,7 +543,15 @@ impl Runner {
         // Computed in the bundle rather than inside `scoped_tests_green`
         // so the count survives the `#[cfg(not(feature = "duckdb"))]`
         // build, which has no local test surface at all.
-        let (tests_deferred, deferred_note) = self.deferred_declared_checks(&spec);
+        //
+        // ONE reading, used for both the reported count and the pinned digest
+        // below. They used to be two calls with the posture, status and
+        // manifest checks between them — two reads of `models/` at two times —
+        // so an edit landing in that window let the bundle report a deferred
+        // check that the digest never pinned (#1804).
+        let snapshot = self.declared_check_snapshot(&spec);
+        let (tests_deferred, deferred_note) =
+            deferred_report(snapshot.as_ref().map(|s| s.count).map_err(Clone::clone));
         if let Some(note) = deferred_note {
             detail.push(note);
         }
@@ -591,7 +599,7 @@ impl Runner {
         // TERMINALLY, because nothing after apply can re-enter verify to
         // pin a digest. Declining into a pass on the verify side is the
         // same shape this work package removes on the observation side.
-        let checks_digest = match self.expanded_check_digest(&spec) {
+        let checks_digest = match snapshot.map(|s| s.digest) {
             Ok(digest) => Some(digest),
             Err(why) => {
                 detail.push(format!(
@@ -615,62 +623,42 @@ impl Runner {
 
     /// The deferred-checks report: the typed count, and the
     /// plain-language note for `detail`.
-    fn deferred_declared_checks(&self, spec: &ApprovedSpec) -> (Option<usize>, Option<String>) {
-        deferred_report(self.count_declared_checks(spec))
-    }
-
-    /// Count every declared data check that `rocky test --declarative`
-    /// would run for this product's model.
+    /// One verify-time reading of the model's declared check set: the count
+    /// the bundle reports and the digest it pins, from the same load (#1804).
     ///
-    /// ASKS THE RUNNER'S OWN LOADER rather than re-deriving the set.
-    /// Two earlier re-derivations both undercounted: the spec's
-    /// `generated_tests` misses the worker's appended `[[tests]]` (the
-    /// merge preserves them), and the sidecar's raw `[[tests]]` array
-    /// misses every `[[use_test]]` reference (the model loader resolves
-    /// those against `test_definitions.toml` and appends them to
-    /// `ModelConfig.tests`, which is the vector the runner iterates).
+    /// ASKS THE RUNNER'S OWN LOADER rather than re-deriving the set. Two
+    /// earlier re-derivations both undercounted: the spec's `generated_tests`
+    /// misses the worker's appended `[[tests]]` (the merge preserves them),
+    /// and the sidecar's raw `[[tests]]` array misses every `[[use_test]]`
+    /// reference (the model loader resolves those against
+    /// `test_definitions.toml` and appends them to `ModelConfig.tests`, which
+    /// is the vector the runner iterates). Hashing the loader's OUTPUT rather
+    /// than the files behind it is what makes the custody check cover
+    /// `test_definitions.toml`, which is not a lowering artifact.
     ///
-    /// Counting through `declarative_test_count` makes the counted set
-    /// the executed set by construction, so a future layer of expansion
-    /// cannot silently reopen the same hole.
+    /// Replaces a separate count and digest. Both went through the runner's
+    /// own loader, which made them the same PREDICATE — but they were two
+    /// reads, and `fulfill_api` says so in as many words: *"It is one LOADER,
+    /// not one read."* The digest covered approved → executed; nothing covered
+    /// reported → pinned.
     #[cfg(feature = "duckdb")]
-    fn count_declared_checks(&self, spec: &ApprovedSpec) -> Result<usize, String> {
-        fulfill_api::declarative_test_count(&self.models_dir, spec.parsed.output_model())
+    fn declared_check_snapshot(
+        &self,
+        spec: &ApprovedSpec,
+    ) -> Result<fulfill_api::DeclarativeCheckSnapshot, String> {
+        fulfill_api::declarative_check_snapshot(&self.models_dir, spec.parsed.output_model())
             .map_err(|err| format!("{err:#}"))
     }
 
-    /// Without the duckdb feature there is no declarative test surface
-    /// to ask, so the count is unavailable rather than invented. This
-    /// build already fails the verify gate closed (see
-    /// `scoped_tests_green`), so nothing is lost by declining here.
+    /// Without the duckdb feature there is no declarative surface to ask, so
+    /// neither number is invented. This build already fails the verify gate
+    /// closed (see `scoped_tests_green`), and an absent digest makes
+    /// observation HOLD rather than pass.
     #[cfg(not(feature = "duckdb"))]
-    fn count_declared_checks(&self, _spec: &ApprovedSpec) -> Result<usize, String> {
-        Err(
-            "this build has no duckdb feature, so the declarative test loader \
-             cannot be asked what it would run"
-                .to_string(),
-        )
-    }
-
-    /// Digest the EXPANDED check set through the runner's own loader.
-    ///
-    /// Same discipline as `count_declared_checks`, and for the same
-    /// reason: the counted set must be the executed set by construction.
-    /// This is its custody twin — hashing the loader's output rather
-    /// than the files behind it, so a `[[use_test]]` reference resolved
-    /// out of a shared `test_definitions.toml` is covered even though
-    /// that file is not a lowering artifact.
-    #[cfg(feature = "duckdb")]
-    fn expanded_check_digest(&self, spec: &ApprovedSpec) -> Result<String, String> {
-        fulfill_api::declarative_check_digest(&self.models_dir, spec.parsed.output_model())
-            .map_err(|err| format!("{err:#}"))
-    }
-
-    /// Without the duckdb feature there is no loader to ask, so no digest
-    /// is invented. Declining here makes observation HOLD (an absent
-    /// digest is a custody failure), never pass.
-    #[cfg(not(feature = "duckdb"))]
-    fn expanded_check_digest(&self, _spec: &ApprovedSpec) -> Result<String, String> {
+    fn declared_check_snapshot(
+        &self,
+        _spec: &ApprovedSpec,
+    ) -> Result<fulfill_api::DeclarativeCheckSnapshot, String> {
         Err(
             "this build has no duckdb feature, so the declarative loader cannot be asked \
              what it would execute"
@@ -1002,7 +990,7 @@ impl Runner {
         // about to run against the warehouse is different.
         //
         // So compare what the LOADER PRODUCES. That is the argument
-        // `count_declared_checks` already makes for counting, applied to
+        // `declared_check_snapshot` already makes for counting, applied to
         // custody: hash the expansion and no layer of indirection can
         // slip underneath it, because every expansion has to land in
         // that vector before it can run.
@@ -1215,7 +1203,7 @@ impl Runner {
 
     /// Without the duckdb feature there is no declarative check runner to
     /// ask, so the reading is unavailable rather than invented — the same
-    /// posture `count_declared_checks` takes at verify. The machine reads
+    /// posture `declared_check_snapshot` takes at verify. The machine reads
     /// an unknown count as unevaluable and holds.
     #[cfg(not(feature = "duckdb"))]
     async fn observe_checks(

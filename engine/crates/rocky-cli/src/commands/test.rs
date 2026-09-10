@@ -391,6 +391,54 @@ pub fn declarative_check_digest(models_dir: &Path, model: &str) -> Result<String
     check_set_digest(&load_all_models(models_dir, None)?, model)
 }
 
+/// How many declared checks there are, and the digest of the set they form —
+/// derived from **one** load.
+///
+/// [`declarative_test_count`] and [`declarative_check_digest`] each load the
+/// models directory themselves. Called separately, they are two reads at two
+/// times, and an edit landing between them makes the number reported describe
+/// a different set than the one pinned: "1 check deferred" alongside a digest
+/// taken over zero checks, both internally consistent, the digest comparison
+/// green because it was taken after the edit (#1804).
+///
+/// The digest still covers approved → executed. This covers reported →
+/// pinned, which nothing did. An edit BEFORE the snapshot is caught by the
+/// existing comparison at observation; an edit between the two derivations is
+/// now impossible by construction, because there is only one.
+///
+/// Both entry points above stay: they have callers that need one answer and
+/// should not pay for the other.
+#[cfg(feature = "duckdb")]
+pub fn declarative_check_snapshot(
+    models_dir: &Path,
+    model: &str,
+) -> Result<DeclarativeCheckSnapshot> {
+    let all_models = load_all_models(models_dir, None)?;
+    let found = all_models
+        .iter()
+        .find(|loaded| loaded.config.name == model)
+        .ok_or_else(|| anyhow::Error::new(ModelNotFound(model.to_string())))?;
+    let count = found.config.tests.len();
+    Ok(DeclarativeCheckSnapshot {
+        count,
+        digest: check_set_digest(&all_models, model)?,
+    })
+}
+
+/// One verify-time reading of a model's declared check set (#1804).
+///
+/// The two fields come from the same in-memory load, so they cannot describe
+/// different sets. That is the whole point of the type — a caller holding one
+/// of these is holding a count that provably belongs to the digest beside it.
+#[cfg(feature = "duckdb")]
+#[derive(Debug, Clone)]
+pub struct DeclarativeCheckSnapshot {
+    /// How many checks the runner would execute.
+    pub count: usize,
+    /// The digest pinning exactly that set.
+    pub digest: String,
+}
+
 /// Why [`LoadedCheckSet::bind`] could not hand back a runnable handle.
 ///
 /// Two failures, two different remedies, so they are two variants. A
@@ -1102,6 +1150,92 @@ mod tests {
         )
         .expect("write model sidecar");
         (tmp, models)
+    }
+
+    /// #1804: the count and the digest must describe the SAME set.
+    ///
+    /// The defect was two reads of `models/` at two times — the reported count
+    /// from one, the pinned digest from another, with the posture, status and
+    /// manifest checks in between. An edit landing in that window let the
+    /// bundle say "1 declarative check deferred" and pin a digest taken over
+    /// zero checks. Both internally consistent; the digest comparison green,
+    /// because it was taken after the edit.
+    ///
+    /// Exhibits the race rather than asserting the shape: the sidecar is
+    /// rewritten to zero checks between the two derivations the OLD code made,
+    /// and the assertion is that the snapshot's two halves still agree.
+    #[test]
+    fn the_count_and_the_digest_come_from_one_read() {
+        let (_tmp, models) = project("");
+
+        // What the old code did: count, then (after other work) digest.
+        let count_before = declarative_test_count(&models, "orders").expect("count");
+        assert_eq!(
+            count_before, 1,
+            "PRECONDITION: the project declares one check"
+        );
+
+        // The edit that lands in the window.
+        std::fs::write(
+            models.join("orders.toml"),
+            "name = \"orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"orders\"\n",
+        )
+        .expect("rewrite sidecar");
+
+        let digest_after = declarative_check_digest(&models, "orders").expect("digest");
+        let count_after = declarative_test_count(&models, "orders").expect("count");
+        assert_eq!(
+            count_after, 0,
+            "PRECONDITION: the edit really did remove the check, else the two \
+             derivations agree for a reason that is not the fix"
+        );
+        assert_ne!(
+            digest_after,
+            declarative_check_digest(&_tmp.path().join("nonexistent"), "orders")
+                .unwrap_or_default(),
+            "PRECONDITION: the post-edit digest is a real value"
+        );
+
+        // The snapshot cannot straddle the edit: whatever it reads, both
+        // halves read it. Taken now, it must describe the edited state.
+        let snapshot = super::declarative_check_snapshot(&models, "orders").expect("snapshot");
+        assert_eq!(snapshot.count, 0, "the count describes the set it pinned");
+        assert_eq!(
+            snapshot.digest, digest_after,
+            "and the digest is the one that set produces"
+        );
+    }
+
+    /// The other direction, and the one that makes the test above mean
+    /// something: on an UNCHANGED directory the snapshot must agree with both
+    /// single-purpose entry points. A snapshot that always reported zero would
+    /// satisfy the assertions above.
+    #[test]
+    fn the_snapshot_agrees_with_both_entry_points_on_a_quiet_directory() {
+        let (_tmp, models) = project("");
+
+        let snapshot = super::declarative_check_snapshot(&models, "orders").expect("snapshot");
+        assert_eq!(
+            snapshot.count,
+            declarative_test_count(&models, "orders").expect("count")
+        );
+        assert_eq!(
+            snapshot.digest,
+            declarative_check_digest(&models, "orders").expect("digest")
+        );
+        assert_eq!(snapshot.count, 1, "and it is the non-empty case");
+    }
+
+    /// An unknown model is an error, never a zero — the same rule
+    /// `declarative_test_count` follows. A caller must be able to tell
+    /// "no checks" from "no answer", and a snapshot reporting `count: 0`
+    /// for a model that does not exist would pin a digest for nothing.
+    #[test]
+    fn the_snapshot_refuses_an_unknown_model() {
+        let (_tmp, models) = project("");
+
+        assert!(super::declarative_check_snapshot(&models, "not_a_model").is_err());
     }
 
     /// Write a `rocky.toml` whose duckdb pipeline routes at `db_name`,
