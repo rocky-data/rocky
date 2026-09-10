@@ -6153,6 +6153,126 @@ pub struct SpoolCounts {
     pub corrupt: usize,
 }
 
+/// The running server's posture, served by `GET /api/v1/settings`.
+///
+/// **An allowlist, not a config dump.** Every field below is projected
+/// individually from a [`rocky_server::state::SettingsSnapshot`] of primitives
+/// taken when the process started. Nothing here is reached through `Debug` or
+/// serde of a `RockyConfig`: `AdapterConfig`'s `Debug` prints its `.extra` map,
+/// which is unbounded caller-supplied TOML, so a config that merely *passed
+/// through* this type would be a disclosure surface. Two fieldless enum labels
+/// are taken out of the config file and the config is dropped.
+///
+/// No secret appears, by construction — not the Bearer token, not
+/// `ROCKY_WEBHOOK_SECRET`. The token is reported as its name and scope; the
+/// webhook secret as whether it is usable.
+///
+/// **API-only, deliberately.** There is no `rocky settings` verb, because this
+/// document describes *a server that is running* and a one-shot CLI invocation
+/// would have to invent one. [`ScheduleStatusOutput`] is the established
+/// precedent for a route with no CLI oracle.
+///
+/// **Freshness.** Everything except `state_backend` and `concurrency_control`
+/// is fixed when the process starts and cannot change while it runs. Those two
+/// are read from `rocky.toml` at startup; the scheduler re-reads that file every
+/// tick, so a config edited afterwards is not reflected here.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SettingsOutput {
+    /// The host the listener is bound to, verbatim (`127.0.0.1`, `0.0.0.0`, …).
+    ///
+    /// The same `String` `ServeConfig` binds — `serve` lends one value to both,
+    /// so this cannot name a host the server is not actually on.
+    pub bind_host: String,
+    /// Extra `Host` header values the UI guard accepts.
+    ///
+    /// This is what is **enforced**, not what was typed: `--allowed-host` is
+    /// only wired into a guard when `--ui` is on, so this is `[]` whenever `ui`
+    /// is `false`. Reporting the raw flag list would claim a guard that is not
+    /// running.
+    pub allowed_hosts: Vec<String>,
+    /// The CORS allowlist. Empty means same-origin only.
+    pub allowed_origins: Vec<String>,
+    /// Whether a resident reconciler is running (`--scheduler`).
+    pub scheduler: bool,
+    /// Whether the embedded browser UI is served at `/ui/` (`--ui`).
+    pub ui: bool,
+    /// Whether `ROCKY_WEBHOOK_SECRET` can sign a webhook.
+    ///
+    /// Reported even when `scheduler` is `false`, which is the point: it tells
+    /// an operator what will happen when they turn the scheduler on.
+    pub webhook_secret: WebhookSecretStatus,
+    /// The configured Bearer token, as its name and scope — never its value.
+    ///
+    /// `null` means **no token is configured**, which the server permits only on
+    /// a loopback bind (`api::serve` refuses to bind a non-loopback host with no
+    /// auth). That is the most exposure-relevant answer this route gives, so it
+    /// is a distinguishable `null` rather than a token named "none".
+    pub token: Option<TokenSettings>,
+    /// `[state] backend` as read at server start. `null` when there was no
+    /// readable config — `config_status` says which.
+    pub state_backend: Option<rocky_core::config::StateBackend>,
+    /// `[state] concurrency_control` as read at server start. `null` on the same
+    /// condition as `state_backend`.
+    pub concurrency_control: Option<rocky_core::config::ConcurrencyControl>,
+    /// What happened when `rocky.toml` was read at startup.
+    ///
+    /// Carried so a `null` backend is explainable: a project with no config and
+    /// a project whose config is broken are different facts, and no other HTTP
+    /// route distinguishes them today.
+    pub config_status: ConfigStatus,
+}
+
+/// Whether `ROCKY_WEBHOOK_SECRET` can actually sign a webhook.
+///
+/// Named by operator consequence rather than by error kind — the question this
+/// answers is "what happens if I turn the scheduler on?".
+#[derive(Debug, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookSecretStatus {
+    /// Set, non-blank, readable. Webhook requests must carry a signature.
+    Present,
+    /// Not set. On a loopback bind the webhook accepts UNSIGNED requests; on a
+    /// non-loopback bind the route answers `404`.
+    Absent,
+    /// Set, but blank or not valid UTF-8. `--scheduler` will refuse to start —
+    /// the startup gate rejects both.
+    SetButUnusable,
+}
+
+/// What happened when `rocky.toml` was read at server start.
+#[derive(Debug, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigStatus {
+    /// Read and parsed.
+    Loaded,
+    /// No `rocky.toml`. An ordinary fact about the project, not a failure.
+    Absent,
+    /// Present, but could not be read or parsed. The server still started —
+    /// `rocky serve` does not require a config — but the scheduler will skip
+    /// every tick until it parses.
+    Unreadable,
+}
+
+/// The configured Bearer token, described without disclosing it.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct TokenSettings {
+    /// Always `default`. `rocky serve` holds exactly one token; the name exists
+    /// so a future multi-token server does not have to change this shape.
+    pub name: String,
+    /// What the token may do.
+    pub scope: TokenScopeLabel,
+}
+
+/// The spellings `--token-scope` accepts.
+#[derive(Debug, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TokenScopeLabel {
+    /// Every route, mutating included.
+    Full,
+    /// Safe HTTP methods only; anything else is refused `403`.
+    ReadOnly,
+}
+
 /// When set, [`print_json`] emits compact (single-line) JSON instead of
 /// pretty-printed. Used by `rocky run --watch` to honour its
 /// newline-delimited-stream contract: each iteration's `RunOutput` lands

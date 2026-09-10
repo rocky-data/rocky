@@ -172,12 +172,19 @@ pub async fn run_serve(
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("rocky.toml"));
 
+    // Built BEFORE the state so the settings snapshot can borrow the very
+    // `String` the listener binds. Reporting a bind host the server is not
+    // using would be a lie on a field an operator reads to decide whether the
+    // server is exposed; lending it from one owner makes that unrepresentable
+    // rather than merely untrue-today.
+    let serve_config = crate::api::ServeConfig { host, port };
+
     let state = build_serve_state(
         models_dir,
         models_dir_is_explicit,
         contracts_dir,
         config_path,
-        &host,
+        &serve_config.host,
         auth_token,
         token_scope,
         allowed_origins,
@@ -191,10 +198,10 @@ pub async fn run_serve(
     // fragment. The fragment never reaches the server, and the page clears it
     // after reading it once. Printed on stdout so a script can capture it.
     if let (true, Some(token)) = (ui, state.auth.as_ref()) {
-        let shown_host = if host == "0.0.0.0" || host == "::" {
+        let shown_host = if serve_config.host == "0.0.0.0" || serve_config.host == "::" {
             "localhost"
         } else {
-            host.as_str()
+            serve_config.host.as_str()
         };
         println!(
             "Rocky UI: http://{shown_host}:{port}/ui/#token={}",
@@ -266,7 +273,7 @@ pub async fn run_serve(
 
     let result = crate::api::serve(
         state,
-        crate::api::ServeConfig { host, port },
+        serve_config,
         shutdown.clone(),
         server_ready,
     )
@@ -302,9 +309,23 @@ pub async fn run_serve(
 /// distinct error worth its own message: unlike a bearer token, an empty HMAC
 /// key silently re-opens the unsigned-webhook path on a loopback bind.
 fn webhook_secret_fail_closed() -> Result<Option<String>> {
-    match env_var_fail_closed("ROCKY_WEBHOOK_SECRET")? {
+    webhook_secret_fail_closed_named(WEBHOOK_SECRET_ENV)
+}
+
+/// The env var both the startup gate and [`webhook_secret_posture`] read.
+///
+/// Named once so `the_gate_and_the_probe_read_one_variable` can pin that they
+/// cannot drift onto different variables — the parity test below is worthless
+/// if the two agree about different inputs.
+const WEBHOOK_SECRET_ENV: &str = "ROCKY_WEBHOOK_SECRET";
+
+/// [`webhook_secret_fail_closed`] over an arbitrary variable, so a test can use
+/// a name unique to itself rather than mutating the real one in a parallel test
+/// binary.
+fn webhook_secret_fail_closed_named(name: &str) -> Result<Option<String>> {
+    match env_var_fail_closed(name)? {
         Some(s) if s.trim().is_empty() => anyhow::bail!(
-            "ROCKY_WEBHOOK_SECRET is set but empty, so it cannot sign or verify \
+            "{name} is set but empty, so it cannot sign or verify \
              anything. Refusing to start: on a loopback bind an absent secret \
              makes the webhook accept UNSIGNED requests, which is not what \
              setting the variable asked for. Give it a value or unset it."
@@ -338,6 +359,71 @@ fn env_var_fail_closed(name: &str) -> Result<Option<String>> {
              {name} is less protection than you configured. Fix the value or \
              unset it."
         ),
+    }
+}
+
+/// Whether `ROCKY_WEBHOOK_SECRET` could sign a webhook — a **report**, not a
+/// decision. Never bails, so it is safe to run with the scheduler off, which is
+/// the case the settings route exists to answer: an operator needs to know the
+/// secret is usable *before* turning the scheduler on.
+///
+/// This deliberately mirrors the startup gate rather than re-deciding anything.
+/// The gate is two reads deep — [`webhook_secret_fail_closed`] refuses a blank
+/// value, and [`env_var_fail_closed`] beneath it refuses `NotUnicode` — so both
+/// collapse to `SetButUnusable` here. `std::env::var(..).ok()` would report a
+/// non-UTF-8 secret as absent, which is the display contradicting the gate it
+/// describes; `var_os` keeps the two apart.
+///
+/// `webhook_secret_posture_matches_the_startup_gate` pins the agreement.
+fn webhook_secret_posture() -> rocky_server::state::WebhookSecret {
+    webhook_secret_posture_named(WEBHOOK_SECRET_ENV)
+}
+
+/// [`webhook_secret_posture`] over an arbitrary variable — see
+/// [`webhook_secret_fail_closed_named`] for why.
+fn webhook_secret_posture_named(name: &str) -> rocky_server::state::WebhookSecret {
+    use rocky_server::state::WebhookSecret;
+    match std::env::var_os(name) {
+        None => WebhookSecret::Absent,
+        // Not valid UTF-8: set, and unreadable — `env_var_fail_closed` bails.
+        Some(raw) => match raw.to_str() {
+            None => WebhookSecret::SetButUnusable,
+            // Blank: set, and cannot authenticate — `webhook_secret_fail_closed` bails.
+            Some(value) if value.trim().is_empty() => WebhookSecret::SetButUnusable,
+            Some(_) => WebhookSecret::Present,
+        },
+    }
+}
+
+/// The two `[state]` labels the settings route reports, read once at startup.
+///
+/// Non-fatal by construction. `rocky serve` starts today against an absent or
+/// malformed `rocky.toml` — the scheduler re-reads the file every tick and skips
+/// the tick on a parse error (`scheduler/mod.rs`), and `resolved_poll_interval`
+/// already falls back to a default the same way. A read-only settings route must
+/// not be the thing that newly refuses to start a server.
+///
+/// Only two fieldless enum labels are taken; the `RockyConfig` is dropped here
+/// so nothing downstream can reach `AdapterConfig`'s unbounded `.extra` map.
+pub(crate) fn config_posture(
+    config_path: Option<&Path>,
+) -> (
+    Option<rocky_core::config::StateBackend>,
+    Option<rocky_core::config::ConcurrencyControl>,
+    rocky_server::state::ConfigStatus,
+) {
+    use rocky_server::state::ConfigStatus;
+    // The same loader the recompile path uses (`ServerState::recompile`), so a
+    // broken config means one thing in this process rather than one thing per
+    // caller — the defect #1625 is about.
+    match rocky_core::config::load_optional_project_config(config_path) {
+        Ok(Some(config)) => (
+            Some(config.state.backend),
+            Some(config.state.concurrency_control),
+            ConfigStatus::Loaded,
+        ),
+        Ok(None) => (None, None, ConfigStatus::Absent),
+        Err(_) => (None, None, ConfigStatus::Unreadable),
     }
 }
 
@@ -519,6 +605,26 @@ fn build_serve_state(
         None
     };
 
+    // The posture `GET /api/v1/settings` reports. Built field by field from
+    // primitives that are already in scope here, which is what keeps the
+    // allowlist honest: there is no `RockyConfig` and no `Debug` on the path
+    // from a config file to the response body.
+    let (state_backend, concurrency_control, config_status) = config_posture(config_path);
+    let settings = rocky_server::state::SettingsSnapshot {
+        // The SAME `String` the listener binds -- `serve` builds `ServeConfig`
+        // first and lends this from it, so the reported host cannot drift from
+        // the bound one.
+        bind_host: host.to_string(),
+        scheduler,
+        // Probed unconditionally, INCLUDING with the scheduler off: the branch
+        // above only reads the secret under `--scheduler`, and presence is
+        // exactly what an operator needs before turning the scheduler on.
+        webhook_secret: webhook_secret_posture(),
+        state_backend,
+        concurrency_control,
+        config_status,
+    };
+
     Ok(rocky_server::state::ServerState::with_auth_and_webhook(
         models_dir.to_path_buf(),
         models_dir_is_explicit,
@@ -529,6 +635,7 @@ fn build_serve_state(
         state_path.map(std::path::Path::to_path_buf),
         webhook,
         ui_config,
+        settings,
     ))
 }
 
@@ -644,6 +751,154 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("--token-scope"), "{msg}");
         assert!(msg.contains("ROCKY_SERVE_TOKEN_SCOPE"), "{msg}");
+    }
+
+    /// **The parity test.** A settings route that reports a secret's presence
+    /// is a display producer for the startup gate, so the two must never
+    /// disagree about the same value. Asserting the probe alone would pass for
+    /// a probe that is simply wrong in the same direction as itself.
+    ///
+    /// The gate is two reads deep — `webhook_secret_fail_closed` refuses a
+    /// blank value, `env_var_fail_closed` beneath it refuses `NotUnicode` — so
+    /// the interesting case is the one a naive `env::var(..).ok()` probe gets
+    /// wrong: a non-UTF-8 secret is SET, and must not read as absent.
+    ///
+    /// ```text
+    ///   gate Ok(Some) <-> Present          gate Err <-> SetButUnusable
+    ///   gate Ok(None) <-> Absent
+    /// ```
+    ///
+    /// Uses a variable unique to this test, so a parallel test binary is
+    /// unharmed; `the_gate_and_the_probe_read_one_variable` pins that the two
+    /// production spellings still name the same real variable.
+    #[test]
+    fn webhook_secret_posture_matches_the_startup_gate() {
+        use rocky_server::state::WebhookSecret;
+        use std::ffi::OsString;
+
+        let name = "ROCKY_TEST_WEBHOOK_SECRET_PARITY_PROBE";
+
+        // (what the variable holds, the posture we expect)
+        let mut cases: Vec<(Option<OsString>, WebhookSecret)> = vec![
+            (None, WebhookSecret::Absent),
+            (Some(OsString::from("s3cret")), WebhookSecret::Present),
+            (Some(OsString::from("   ")), WebhookSecret::SetButUnusable),
+            (Some(OsString::from("")), WebhookSecret::SetButUnusable),
+        ];
+        // A lone 0x80 byte is set, and unreadable. This is the case the obvious
+        // probe spelling reports as `Absent`.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            cases.push((
+                Some(OsString::from_vec(vec![0x80])),
+                WebhookSecret::SetButUnusable,
+            ));
+        }
+
+        for (value, expected) in cases {
+            // SAFETY: single-threaded test body; the variable is unique to this
+            // test and cleared on every iteration.
+            match &value {
+                Some(v) => unsafe { std::env::set_var(name, v) },
+                None => unsafe { std::env::remove_var(name) },
+            }
+
+            let posture = webhook_secret_posture_named(name);
+            let gate = webhook_secret_fail_closed_named(name);
+
+            unsafe { std::env::remove_var(name) };
+
+            assert_eq!(posture, expected, "posture for {value:?}");
+
+            // The agreement, which is the actual claim.
+            match (&posture, &gate) {
+                (WebhookSecret::Present, Ok(Some(_))) => {}
+                (WebhookSecret::Absent, Ok(None)) => {}
+                (WebhookSecret::SetButUnusable, Err(_)) => {}
+                (p, g) => panic!(
+                    "the settings route and the startup gate disagree about \
+                     {value:?}: route says {p:?}, gate says {}",
+                    match g {
+                        Ok(Some(_)) => "a usable secret".to_string(),
+                        Ok(None) => "no secret".to_string(),
+                        Err(e) => format!("refuse to start ({e})"),
+                    }
+                ),
+            }
+        }
+    }
+
+    /// The parity above proves the two agree about ONE variable. This proves it
+    /// is the variable that matters — a gate reading `ROCKY_WEBHOOK_SECRET`
+    /// while the route reports something else would satisfy every assertion in
+    /// that test and still be a lie.
+    #[test]
+    fn the_gate_and_the_probe_read_one_variable() {
+        assert_eq!(WEBHOOK_SECRET_ENV, "ROCKY_WEBHOOK_SECRET");
+    }
+
+    /// A settings route must never be the reason a server stops starting.
+    ///
+    /// `rocky serve` starts today against a malformed `rocky.toml` — the
+    /// scheduler re-reads that file each tick and skips the tick on a parse
+    /// error. Reading it at startup to fill two labels must keep that true, and
+    /// must say WHY the labels are missing rather than reporting a default that
+    /// looks like a real answer.
+    #[test]
+    fn a_malformed_config_is_reported_not_fatal() {
+        use rocky_server::state::ConfigStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("rocky.toml");
+        std::fs::write(&config, "this is not = [valid toml").unwrap();
+
+        let (backend, concurrency, status) = config_posture(Some(&config));
+
+        assert_eq!(status, ConfigStatus::Unreadable);
+        assert!(
+            backend.is_none() && concurrency.is_none(),
+            "an unparsable config must not yield a default that reads as configured"
+        );
+    }
+
+    /// An absent config is an ordinary fact, and a DIFFERENT one from a broken
+    /// config. Collapsing the two would leave `state_backend: null` unexplained
+    /// — no other HTTP route distinguishes them.
+    #[test]
+    fn an_absent_config_is_not_an_unreadable_one() {
+        use rocky_server::state::ConfigStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, concurrency, status) = config_posture(Some(&dir.path().join("rocky.toml")));
+
+        assert_eq!(status, ConfigStatus::Absent);
+        assert!(backend.is_none() && concurrency.is_none());
+    }
+
+    /// A readable config yields the real labels.
+    #[test]
+    fn a_readable_config_reports_its_state_backend() {
+        use rocky_core::config::{ConcurrencyControl, StateBackend};
+        use rocky_server::state::ConfigStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter]\ntype = \"duckdb\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.p.target]\nadapter = \"default\"\n\n\
+             [state]\nbackend = \"s3\"\ns3_bucket = \"example\"\n\
+             concurrency_control = \"cas\"\n",
+        )
+        .unwrap();
+
+        let (backend, concurrency, status) = config_posture(Some(&config));
+
+        assert_eq!(status, ConfigStatus::Loaded);
+        assert_eq!(backend, Some(StateBackend::S3));
+        assert_eq!(concurrency, Some(ConcurrencyControl::Cas));
     }
 
     /// Neither set → loopback-only mode, exactly as before.

@@ -111,8 +111,12 @@ use crate::output::{
     DagNodeStatusOutput, DagOutput, DagStatusOutput, ErrorEnvelope, HealthOutput, HistoryOutput,
     JobKind, JobState, JobStatus, LineageOutput, MetaOutput, MetricsOutput, ModelColumnOutput,
     ModelDetailOutput, ModelHistoryOutput, ModelListEntry, ModelListOutput, ScheduleSpoolOutput,
-    ScheduleStatusOutput, TypedColumnOutput, cap_model_sql,
+    ScheduleStatusOutput, SettingsOutput, TokenScopeLabel, TokenSettings, TypedColumnOutput,
+    WebhookSecretStatus, cap_model_sql,
 };
+
+use crate::output::ConfigStatus;
+use rocky_server::auth::TokenScope;
 
 /// Bind config for [`serve`].
 ///
@@ -185,6 +189,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/schedule", get(schedule_status))
         .route("/api/v1/schedule/spool", get(schedule_spool))
+        .route("/api/v1/settings", get(settings))
         .route("/api/v1/policy", get(policy_show))
         .route("/api/v1/products", get(list_products))
         .route("/api/v1/products/{name}", get(get_product))
@@ -815,6 +820,7 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "GET /api/v1/jobs/{id}",
         "GET /api/v1/schedule",
         "GET /api/v1/schedule/spool",
+        "GET /api/v1/settings",
         "GET /api/v1/policy",
         "GET /api/v1/products",
         "GET /api/v1/products/{name}",
@@ -2117,6 +2123,69 @@ async fn schedule_status(
     .await?
     .map_err(|e| map_schedule_err(e, running_job_id))?;
     Ok(PrettyJson(output))
+}
+
+/// `GET /api/v1/settings`: the running server's posture — how it is bound, what
+/// it will accept, and whether the pieces an operator is about to turn on are
+/// configured.
+///
+/// **The allowlist lives in [`settings_output`]**, which builds the document
+/// field by field from primitives. Nothing here serialises a `RockyConfig`, so
+/// no adapter `.extra` map and no resolved `${VAR}` can reach the response.
+/// `settings_never_discloses_a_configured_secret` greps every route's body for
+/// three real secrets, and `settings_reports_exactly_the_allowlisted_fields`
+/// fails when a field is *added* — an allowlist, not a denylist.
+///
+/// Never fails. Every value was resolved at startup; there is no I/O, no
+/// state-store permit, and nothing to be busy.
+async fn settings(State(state): State<Arc<ServerState>>) -> PrettyJson<SettingsOutput> {
+    PrettyJson(settings_output(&state))
+}
+
+/// Project [`ServerState`] onto the settings document.
+///
+/// Split out of the handler so a test can cross the SAME mapping production
+/// serves — the lesson `build_serve_state` records one level up. This function
+/// IS the allowlist: every field is named here, and each `match` is exhaustive,
+/// so a new posture variant fails to compile rather than serialising silently.
+pub(crate) fn settings_output(state: &ServerState) -> SettingsOutput {
+    use rocky_server::state::{ConfigStatus as SnapStatus, WebhookSecret};
+
+    let snapshot = &state.settings;
+    SettingsOutput {
+        bind_host: snapshot.bind_host.clone(),
+        // What the guard ENFORCES. `--allowed-host` is only wired into a guard
+        // under `--ui`, so with no UI there is no list -- reporting the flags
+        // anyway would claim a check that is not running.
+        allowed_hosts: state
+            .ui
+            .as_ref()
+            .map(|ui| ui.allowed_hosts.clone())
+            .unwrap_or_default(),
+        allowed_origins: state.allowed_origins.clone(),
+        scheduler: snapshot.scheduler,
+        ui: state.ui.is_some(),
+        webhook_secret: match snapshot.webhook_secret {
+            WebhookSecret::Present => WebhookSecretStatus::Present,
+            WebhookSecret::Absent => WebhookSecretStatus::Absent,
+            WebhookSecret::SetButUnusable => WebhookSecretStatus::SetButUnusable,
+        },
+        // `.secret` is deliberately not read. Only the scope crosses.
+        token: state.auth.as_ref().map(|token| TokenSettings {
+            name: "default".to_string(),
+            scope: match token.scope {
+                TokenScope::Full => TokenScopeLabel::Full,
+                TokenScope::ReadOnly => TokenScopeLabel::ReadOnly,
+            },
+        }),
+        state_backend: snapshot.state_backend,
+        concurrency_control: snapshot.concurrency_control,
+        config_status: match snapshot.config_status {
+            SnapStatus::Loaded => ConfigStatus::Loaded,
+            SnapStatus::Absent => ConfigStatus::Absent,
+            SnapStatus::Unreadable => ConfigStatus::Unreadable,
+        },
+    }
 }
 
 /// `GET /api/v1/schedule/spool`: the webhook demands accepted but not yet
@@ -4510,6 +4579,10 @@ mod tests {
                 allowed_hosts: allowed_hosts.iter().map(ToString::to_string).collect(),
                 assets: Arc::new(InMemoryAssets(files)),
             }),
+            rocky_server::state::SettingsSnapshot {
+                bind_host: "127.0.0.1".to_string(),
+                ..Default::default()
+            },
         )
     }
 
@@ -5803,6 +5876,201 @@ mod tests {
         assert_eq!(api.counts.scheduled, reference.counts.scheduled);
         assert_eq!(api.pipelines.len(), reference.pipelines.len());
         assert_eq!(api.pipelines[0].cron, reference.pipelines[0].cron);
+    }
+
+    // --- GET /api/v1/settings -------------------------------------------
+
+    /// A project whose config carries a credential, plus a Bearer token and a
+    /// webhook secret — three real secrets, in the three places a settings
+    /// route could leak one from.
+    fn project_with_three_secrets() -> (tempfile::TempDir, Arc<ServerState>) {
+        use rocky_server::auth::{ServeToken, TokenScope};
+
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("m.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("m.toml"),
+            "name = \"m\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"test.duckdb\"\n\n\
+             [pipeline.sales]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.sales.target]\nadapter = \"default\"\n\n\
+             [state]\nbackend = \"valkey\"\n\
+             valkey_url = \"redis://user:CONFIG_SECRET_XYZ@localhost:6379\"\n",
+        )
+        .unwrap();
+
+        let (state_backend, concurrency_control, config_status) =
+            crate::commands::serve::config_posture(Some(&config_path));
+
+        let state = ServerState::with_auth_and_webhook(
+            models_dir,
+            false,
+            None,
+            Some(config_path),
+            Some(ServeToken {
+                secret: "BEARER_SECRET_ABC".to_string(),
+                scope: TokenScope::ReadOnly,
+            }),
+            vec!["https://example.test".to_string()],
+            None,
+            Some(rocky_server::webhook_ingress::WebhookIngress {
+                secret: Some("WEBHOOK_SECRET_DEF".to_string()),
+                bind_is_loopback: true,
+                rocky_dir: dir.path().join(".rocky"),
+                rate_limiter: rocky_server::webhook_ingress::WebhookRateLimiter::new(10.0),
+            }),
+            None,
+            rocky_server::state::SettingsSnapshot {
+                bind_host: "127.0.0.1".to_string(),
+                scheduler: true,
+                webhook_secret: rocky_server::state::WebhookSecret::Present,
+                state_backend,
+                concurrency_control,
+                config_status,
+            },
+        );
+        (dir, state)
+    }
+
+    /// **The allowlist.** Asserts the document's field list against a literal,
+    /// so ADDING a field fails this test — a denylist would only catch fields
+    /// someone already thought were dangerous.
+    ///
+    /// This is the half the secret grep cannot do: a grep passes for a field
+    /// that happens to be empty in the fixture and populated in production.
+    /// Same lesson as #1874's `conditions`.
+    #[tokio::test]
+    async fn settings_reports_exactly_the_allowlisted_fields() {
+        let (_dir, state) = project_with_three_secrets();
+        let value = serde_json::to_value(settings_output(&state)).unwrap();
+
+        let mut fields: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        fields.sort_unstable();
+
+        assert_eq!(
+            fields,
+            [
+                "allowed_hosts",
+                "allowed_origins",
+                "bind_host",
+                "concurrency_control",
+                "config_status",
+                "scheduler",
+                "state_backend",
+                "token",
+                "ui",
+                "webhook_secret",
+            ],
+            "the settings document grew or lost a field. This is an ALLOWLIST: \
+             a new field must be a deliberate act, reviewed for what it \
+             discloses, not something that arrives because a struct changed."
+        );
+
+        // The nested token object is part of the same allowlist.
+        let mut token_fields: Vec<&str> = value["token"]
+            .as_object()
+            .expect("the fixture configures a token")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        token_fields.sort_unstable();
+        assert_eq!(token_fields, ["name", "scope"]);
+    }
+
+    /// Three configured secrets, none of which may appear in the body.
+    ///
+    /// The fixture is asserted to actually HOLD each secret first. Without that
+    /// the grep is worthless: it would pass just as happily against a state
+    /// where nothing was configured, which is the failure mode that makes a
+    /// containment test look green while proving nothing.
+    #[tokio::test]
+    async fn settings_never_discloses_a_configured_secret() {
+        let (_dir, state) = project_with_three_secrets();
+
+        // The fixture really does carry all three.
+        assert_eq!(
+            state.auth.as_ref().unwrap().secret,
+            "BEARER_SECRET_ABC",
+            "the fixture must hold a real Bearer secret or the grep proves nothing"
+        );
+        assert_eq!(
+            state.webhook.as_ref().unwrap().secret.as_deref(),
+            Some("WEBHOOK_SECRET_DEF"),
+            "the fixture must hold a real webhook secret"
+        );
+        let config = rocky_core::config::load_optional_project_config(state.config_path.as_deref())
+            .expect("fixture config parses")
+            .expect("fixture has a config");
+        assert!(
+            config
+                .state
+                .valkey_url
+                .as_ref()
+                .is_some_and(|url| url.expose().contains("CONFIG_SECRET_XYZ")),
+            "the fixture must hold a real credential inside the config"
+        );
+
+        let body = serde_json::to_string(&settings_output(&state)).unwrap();
+        for secret in ["BEARER_SECRET_ABC", "WEBHOOK_SECRET_DEF", "CONFIG_SECRET_XYZ"] {
+            assert!(
+                !body.contains(secret),
+                "the settings document disclosed {secret}: {body}"
+            );
+        }
+    }
+
+    /// `--allowed-host` only becomes a guard under `--ui`. Reporting the flag
+    /// list without the UI would name a check that is not running.
+    #[tokio::test]
+    async fn allowed_hosts_report_the_guard_not_the_flags() {
+        let (_dir, state) = project_with_three_secrets();
+        let output = settings_output(&state);
+
+        assert!(!output.ui, "this fixture has no UI");
+        assert!(
+            output.allowed_hosts.is_empty(),
+            "with no UI there is no host guard, so there is no list to report"
+        );
+        // The CORS allowlist is a different mechanism and does apply.
+        assert_eq!(output.allowed_origins, ["https://example.test"]);
+    }
+
+    /// No token configured is the single most exposure-relevant answer this
+    /// route gives, so it is a distinguishable `null` rather than a token
+    /// named "none" that a careless reader would take for a configured one.
+    #[tokio::test]
+    async fn no_configured_token_is_null_not_a_named_token() {
+        let (_dir, _config_path, state) = scheduled_project();
+        let value = serde_json::to_value(settings_output(&state)).unwrap();
+
+        assert!(state.auth.is_none(), "this fixture configures no token");
+        assert!(value["token"].is_null(), "{value}");
+    }
+
+    /// The route returns the projection's bytes.
+    ///
+    /// There is no CLI oracle to compare against — `/settings` describes a
+    /// server that is running, which a one-shot CLI invocation would have to
+    /// invent — so this pins the route to the mapping instead, byte for byte.
+    #[tokio::test]
+    async fn settings_route_returns_the_projections_bytes() {
+        let (_dir, _config_path, state) = scheduled_project();
+        let reference = reference_bytes(&settings_output(&state));
+
+        let base = spawn_router(state).await;
+        let resp = get_retrying_on_busy(&format!("{base}/api/v1/settings")).await;
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), reference);
     }
 
     /// The route returns the producer's document, whole. Unlike
@@ -7636,6 +7904,11 @@ adapter = "db"
             None,
             Some(ingress),
             None,
+            rocky_server::state::SettingsSnapshot {
+                bind_host: "127.0.0.1".to_string(),
+                scheduler: true,
+                ..Default::default()
+            },
         );
         (state, dir)
     }
