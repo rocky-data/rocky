@@ -498,7 +498,7 @@ mod tests {
                 .unwrap();
 
         let inline = format!("---toml\n{sidecar}---\n\nSELECT 1\n");
-        let model = parse_model_inline(&inline, "fct_orders.sql", None).unwrap();
+        let model = parse_model_inline(&inline, Path::new("fct_orders.sql"), None).unwrap();
 
         assert_eq!(model.config.name, "fct_orders");
         assert_eq!(model.config.target.catalog, "generated");
@@ -524,7 +524,7 @@ mod tests {
         .unwrap();
 
         let inline = format!("---toml\n{sidecar}---\n\nSELECT 1\n");
-        let model = parse_model_inline(&inline, "events.sql", None).unwrap();
+        let model = parse_model_inline(&inline, Path::new("events.sql"), None).unwrap();
 
         match model.config.strategy {
             StrategyConfig::Incremental { timestamp_column } => {
@@ -543,7 +543,7 @@ mod tests {
                 .unwrap();
 
         let inline = format!("---toml\n{sidecar}---\n\nSELECT 1\n");
-        let model = parse_model_inline(&inline, "staging_users.sql", None).unwrap();
+        let model = parse_model_inline(&inline, Path::new("staging_users.sql"), None).unwrap();
         assert!(matches!(model.config.strategy, StrategyConfig::Ephemeral));
     }
 
@@ -562,7 +562,7 @@ mod tests {
         assert!(sidecar.contains("unique_key = [\"id\", \"created_at\"]"));
 
         let inline = format!("---toml\n{sidecar}---\n\nSELECT 1\n");
-        let model = parse_model_inline(&inline, "fct_orders.sql", None).unwrap();
+        let model = parse_model_inline(&inline, Path::new("fct_orders.sql"), None).unwrap();
         match model.config.strategy {
             StrategyConfig::Merge {
                 unique_key,
