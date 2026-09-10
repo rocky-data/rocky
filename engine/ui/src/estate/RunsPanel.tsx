@@ -42,7 +42,12 @@ export function RunsPanel({ history, now }: { history: HistoryOutput; now?: numb
         phone, and without this the widest cell pushes the whole page body
         sideways — every panel above and below it included.
       */}
-      <div className="overflow-x-auto">
+      <div
+        className="overflow-x-auto focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-500"
+        tabIndex={0}
+        role="region"
+        aria-label="Runs, scrollable"
+      >
       <table className="w-full min-w-max text-left text-xs" aria-label="Runs">
         <thead className="text-zinc-500 dark:text-zinc-400">
           <tr>

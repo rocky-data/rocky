@@ -7,7 +7,7 @@ import {
   useReactFlow,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, type RefObject } from "react";
 import type { DagOutput } from "@rocky-types/dag";
 import { EmptyState } from "../components";
 import { layeredFlow, type ModelNodeData } from "./layout";
@@ -15,6 +15,27 @@ import { ModelNode } from "./ModelNode";
 import { nodeRoute } from "./nodeRoute";
 
 const nodeTypes = { model: ModelNode };
+
+/**
+ * How far a person may zoom out by hand.
+ *
+ * A node is 184×46, so at 0.1 it is about 18×5 CSS pixels: small, but still a
+ * shape you can read the graph from and zoom back out of. This is the
+ * *interaction* floor and it is deliberately not the fitting floor.
+ */
+const MIN_ZOOM = 0.1;
+
+/**
+ * How far an automatic fit may zoom out, which has to go further.
+ *
+ * `fitView` cannot pass `minZoom`, and the library default of 0.5 could not
+ * fit a 744px graph into the ~288px of canvas a 320px phone leaves — that
+ * needs 0.39, so both end nodes were simply cut off. A deep DAG needs less
+ * again. Kept a little under the interaction floor rather than far under it:
+ * a fit below `MIN_ZOOM` is clamped back up by the next zoom gesture, so the
+ * gap between the two is a discontinuity to be spent sparingly.
+ */
+const FIT = { minZoom: 0.02 } as const;
 
 /**
  * Re-fit the graph when the canvas changes width.
@@ -28,22 +49,27 @@ const nodeTypes = { model: ModelNode };
  * fight a scroll. A refit does discard a manual pan or zoom, which is the
  * right trade when the alternative is a graph that is partly off-screen.
  */
-function RefitOnResize() {
+function RefitOnResize({ canvas }: { canvas: RefObject<HTMLDivElement | null> }) {
   const { fitView } = useReactFlow();
   const lastWidth = useRef(0);
 
   useEffect(() => {
-    const pane = document.querySelector(".react-flow__renderer")?.parentElement;
+    // This panel's own canvas, passed by ref. A `document.querySelector` here
+    // would find the FIRST flow in the document, so a second panel would
+    // observe the first one's box and reset the first one's viewport.
+    const pane = canvas.current;
     if (!pane || typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver((entries) => {
       const width = Math.round(entries[0]?.contentRect.width ?? 0);
       if (width === 0 || width === lastWidth.current) return;
       lastWidth.current = width;
-      void fitView();
+      // `fitView` changes the inner transform, not the observed box, so this
+      // cannot feed itself.
+      void fitView(FIT);
     });
     observer.observe(pane);
     return () => observer.disconnect();
-  }, [fitView]);
+  }, [canvas, fitView]);
 
   return null;
 }
@@ -56,6 +82,7 @@ function RefitOnResize() {
  * once the canvas has a size.
  */
 export function DagPanel({ dag, onSelect }: { dag: DagOutput; onSelect: (name: string) => void }) {
+  const canvasRef = useRef<HTMLDivElement | null>(null);
   const flow = useMemo(() => layeredFlow(dag), [dag]);
   const dataById = useMemo(
     () => new Map(flow.nodes.map((node) => [node.id, node.data])),
@@ -106,6 +133,7 @@ export function DagPanel({ dag, onSelect }: { dag: DagOutput; onSelect: (name: s
       <div
         className="h-[480px] rounded-md border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900"
         data-testid="dag-canvas"
+        ref={canvasRef}
         onKeyDown={openFocusedNode}
       >
         <ReactFlowProvider>
@@ -114,24 +142,20 @@ export function DagPanel({ dag, onSelect }: { dag: DagOutput; onSelect: (name: s
             edges={flow.edges}
             nodeTypes={nodeTypes}
             fitView
-            // `fitView` cannot zoom out past `minZoom`, and the library's
-            // default of 0.5 is not enough to fit this graph on a phone: three
-            // nodes span 3×184 + 2×96 = 744px, so a 320px viewport's ~288px of
-            // canvas needs 0.39. Clamped at 0.5 the graph is simply cut off at
-            // both edges, which is what a narrow viewport showed. The floor is
-            // a real limit, not a preference, so it is set low enough for the
-            // fit to happen; a deeper DAG needs it lower still.
-            minZoom={0.05}
+            // Two different floors, because they answer different questions:
+            // how small a fit may go, and how small a person may drag it.
+            fitViewOptions={FIT}
+            minZoom={MIN_ZOOM}
             nodesDraggable={false}
             nodesConnectable={false}
             proOptions={{ hideAttribution: true }}
             colorMode="system"
             onNodeClick={(_, node) => open(node.data)}
           >
-            <RefitOnResize />
+            <RefitOnResize canvas={canvasRef} />
             <Background />
             <MiniMap pannable zoomable />
-            <Controls showInteractive={false} />
+            <Controls showInteractive={false} fitViewOptions={FIT} />
           </ReactFlow>
         </ReactFlowProvider>
       </div>

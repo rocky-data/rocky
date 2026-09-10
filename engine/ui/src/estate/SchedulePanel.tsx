@@ -53,7 +53,12 @@ export function SchedulePanel({ status, now }: { status: ScheduleStatusOutput; n
           detail="No pipeline declares a [schedule], so the resident scheduler has nothing to evaluate."
         />
       ) : (
-        <div className="overflow-x-auto">
+        <div
+          className="overflow-x-auto focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-500"
+          tabIndex={0}
+          role="region"
+          aria-label="Schedules, scrollable"
+        >
         <table className="w-full min-w-max text-left text-xs" aria-label="Schedules">
           <thead className="text-zinc-500 dark:text-zinc-400">
             <tr>

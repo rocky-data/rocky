@@ -12,6 +12,7 @@ import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { DagOutput } from "@rocky-types/dag";
 import mixedDag from "../test/fixtures/dag-mixed-kinds.json";
 import { DagPanel } from "./DagPanel";
+import { NODE_HEIGHT, NODE_WIDTH } from "./layout";
 
 const CANVAS = { width: 800, height: 480 };
 
@@ -112,6 +113,18 @@ describe("DagPanel", () => {
       expect(node).not.toHaveAttribute("tabindex");
       expect(node).toHaveAttribute("aria-disabled", "true");
     }
+  });
+
+  it("draws the card at the size the layout declares", () => {
+    // Measured in a real browser before this: the wrapper was 184x46 and the
+    // card inside it 184x34, so the node carried a 12px invisible clickable
+    // band and its handles sat 6px below the card's visual centre. The layout
+    // declares this size to React Flow and spaces rows by it, so the card has
+    // to actually be it.
+    render(<DagPanel dag={captured} onSelect={vi.fn()} />);
+    const card = nodeElement(MODEL).firstElementChild as HTMLElement;
+    expect(card.style.width).toBe(`${NODE_WIDTH}px`);
+    expect(card.style.height).toBe(`${NODE_HEIGHT}px`);
   });
 
   it("offers a pointer cursor only where there is something to open", () => {

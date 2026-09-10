@@ -76,7 +76,12 @@ export function Rows({
   return (
     // The scroller is on the table, not the page: without it the widest cell
     // pushes the whole page body sideways on a phone.
-    <div className="overflow-x-auto">
+    <div
+      className="overflow-x-auto focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-500"
+      tabIndex={0}
+      role="region"
+      aria-label={`${ariaLabel}, scrollable`}
+    >
     <table className="w-full min-w-max text-left text-xs" aria-label={ariaLabel}>
       <thead className="text-zinc-500 dark:text-zinc-400">
         <tr>
