@@ -201,7 +201,6 @@ fn render_spool_text(out: &ScheduleSpoolOutput) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
     use rocky_core::schedule::spool::{AcceptOutcome, WebhookKind, accept};
     use std::path::PathBuf;
 
@@ -324,31 +323,26 @@ mod tests {
     }
 
     #[test]
-    fn a_redelivered_id_that_already_ran_is_not_pending_work() {
-        // The state the tombstone check exists for: a delivery id that ran,
-        // then arrived again inside the 24h window. Acceptance writes a fresh
-        // pending file, and the tick DROPS it without running
-        // (`reconcile.rs`, the id-dedup authority). Reporting it as pending
-        // would promise a run that will never happen.
+    fn a_pending_file_beside_its_tombstone_is_not_pending_work() {
+        // The state the tombstone check exists for. `accept` fast-paths a
+        // consumed delivery id to `Duplicate` without writing, so this pair
+        // only arises from the race its own comment describes: accept sees no
+        // tombstone, a concurrent tick disposes, then accept writes the file.
+        // The reconciler drops such a file WITHOUT running it (the id-dedup
+        // authority, checked before every other consume gate), so reporting it
+        // as pending would promise a run that never happens.
         let (dir, config) = project();
         let path = spool_one(&dir, "orders", "delivery-1", "2026-09-10T10:00:00Z");
-        spool::dispose(&path, WebhookKind::Id).unwrap();
 
-        // Re-deliver the same id.
-        accept(
-            &rocky_dir(&dir),
-            "orders",
-            WebhookKind::Id,
-            "delivery-1",
-            "deadbeef",
-            Utc.with_ymd_and_hms(2026, 9, 10, 11, 0, 0).unwrap(),
-        )
-        .unwrap();
+        // The tombstone is the key file's name plus `.done`.
+        let mut name = path.file_name().unwrap().to_os_string();
+        name.push(".done");
+        std::fs::write(path.with_file_name(name), b"").unwrap();
 
         let out = compute_schedule_spool(&config).unwrap();
         assert!(
             out.pending.is_empty(),
-            "a duplicate the tick will drop is reported as pending work: {:?}",
+            "a demand the tick will drop is reported as pending work: {:?}",
             out.pending
         );
     }
