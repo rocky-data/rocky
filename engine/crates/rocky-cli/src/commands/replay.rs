@@ -2938,10 +2938,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["a", "b"]
         );
-        assert_eq!(
-            out.replayable,
-            out.replayable_count == out.model_count,
-            "`replayable` is the whole-run verdict"
+        // Nothing recorded an artifact for this run, so no model is
+        // replayable and the whole-run verdict is false. Asserted against
+        // the seeded state, not derived from another produced field.
+        assert_eq!(out.replayable_count, 0);
+        assert!(
+            !out.replayable,
+            "no artifacts, so the run is not replayable"
+        );
+        assert!(
+            out.models.iter().all(|m| m.verdict != "replayable"),
+            "{:?}",
+            out.models.iter().map(|m| &m.verdict).collect::<Vec<_>>()
         );
 
         let one = compute_replay_check(&path, "run-1", Some("b")).unwrap();

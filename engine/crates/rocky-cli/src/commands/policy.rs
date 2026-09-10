@@ -37,11 +37,10 @@ use crate::output::{
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Execute `rocky policy check`.
-///
-/// Resolves the effect the policy plane would yield for
-/// `(principal, capability, model)` and renders it as text (default) or
-/// JSON (`--output json`).
+/// The decision `rocky policy check` reports: the effect the policy plane
+/// would yield for `(principal, capability, model)`, with the matched rule,
+/// the reason and the model's attributes. Pure compute, no printing;
+/// [`run_policy_check`] renders it.
 pub fn compute_policy_check(
     config_path: &Path,
     models_dir: &Path,
@@ -145,13 +144,14 @@ pub fn run_policy_check(
     Ok(())
 }
 
-/// Execute `rocky policy test`.
+/// The report `rocky policy test` prints.
 ///
 /// Loads the project's `[policy]` block and its `[[policy.tests]]` scenarios,
 /// runs every scenario through [`policy::evaluate`], and reports the pass/fail
 /// verdict per scenario (actual vs expected effect, plus the deciding rule and
-/// reason on a failure). Returns an error — a non-zero exit for CI — when any
-/// scenario's resolved effect differs from its expectation.
+/// reason on a failure). A failing scenario is a row in the report, not an
+/// error: [`run_policy_test`] prints the report and then exits non-zero when
+/// `failed > 0`, so CI sees which scenario broke.
 ///
 /// A missing `rocky.toml`, an absent `[policy]` block, or zero scenarios are
 /// each treated as a hard error rather than a silent pass: a policy-test run

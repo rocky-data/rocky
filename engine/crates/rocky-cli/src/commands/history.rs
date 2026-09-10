@@ -196,9 +196,6 @@ pub fn history_runs_output_filtered(
     })
 }
 
-/// Build the model-scoped run-history output from the state store (the
-/// `rocky history --model <name>` path), augmenting with [`RollingStats`]
-/// when `rolling_stats` is set. Pure compute — no printing.
 /// One run by id, as `rocky history --run <id>` prints it: a
 /// [`HistoryOutput`] whose `runs` holds exactly that run. The same envelope
 /// as the list, so a consumer reads one shape whether it asked for fifty
@@ -218,6 +215,9 @@ pub fn history_run_output(state_path: &Path, run_id: &str, audit: bool) -> Resul
     })
 }
 
+/// Build the model-scoped run-history output from the state store (the
+/// `rocky history --model <name>` path), augmenting with [`RollingStats`]
+/// when `rolling_stats` is set. Pure compute — no printing.
 pub fn model_history_output(
     state_path: &Path,
     model_name: &str,

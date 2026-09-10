@@ -34,12 +34,6 @@ Show all recent run history:
 rocky history
 ```
 
-Show one run by id, with its audit trail:
-
-```bash
-rocky history --run run_20260401_143022 --audit --output json
-```
-
 ```json
 {
   "version": "1.6.0",
@@ -69,6 +63,12 @@ rocky history --run run_20260401_143022 --audit --output json
     }
   ]
 }
+```
+
+Show one run by id. The document has the list's shape with `count` set to `1`; add `--audit` for its governance trail:
+
+```bash
+rocky history --run run_20260401_143022 --audit --output json
 ```
 
 Show history for a specific model since a date. The `--model` variant returns a flat list of that model's executions:
