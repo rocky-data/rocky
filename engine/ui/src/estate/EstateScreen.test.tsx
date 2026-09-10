@@ -88,6 +88,37 @@ describe("EstateScreen", () => {
     expect(screen.getByText("No schedules configured")).toBeInTheDocument();
   });
 
+  it("keeps each panel's producer route in a tooltip, not on the page", async () => {
+    render(<EstateScreen loaders={loaders()} refreshMs={0} now={NOW} />);
+    await screen.findByRole("list", { name: "Models in the DAG" });
+
+    // The route answers "where does this come from" for the reader who asks,
+    // and costs nothing for the reader who does not. This is the idiom the
+    // governor tabs already use.
+    for (const [heading, route] of [
+      ["Project", "GET /api/v1/project"],
+      ["DAG", "GET /api/v1/dag"],
+      ["Runs", "GET /api/v1/runs"],
+      ["Schedule", "GET /api/v1/schedule"],
+    ]) {
+      const h = screen.getByRole("heading", { name: heading });
+      expect(h).toHaveAttribute("title", route);
+      // Navigating by heading still announces just the panel's name.
+      expect(h.textContent).toBe(heading);
+      // The route is not on the page as visible text. `hidden` is excluded
+      // explicitly: testing-library ignores only script and style by default,
+      // so the description element would otherwise match here.
+      expect(screen.queryByText(route, { ignore: "[hidden], script, style" })).toBeNull();
+      // ...but it is not hover-only either: a `title` is not in the tab order
+      // and screen readers treat it inconsistently. The description is
+      // `hidden`, so it is not announced a second time in reading order.
+      const describedBy = h.getAttribute("aria-describedby");
+      const description = describedBy ? document.getElementById(describedBy) : null;
+      expect(description?.textContent).toBe(route);
+      expect(description).toHaveAttribute("hidden");
+    }
+  });
+
   it("renders a hostile model name and SQL as text, never as markup", async () => {
     const hostile = '<img src=x onerror="alert(1)">';
     const dag: DagOutput = {

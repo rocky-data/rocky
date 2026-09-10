@@ -93,6 +93,36 @@ pub fn resolve_serve_config_path(config: &Path) -> Result<Option<&Path>> {
         )
     })
 }
+/// The resident scheduler's poll cadence: the flag, then the project's own
+/// `[schedule] poll_interval_seconds`, then the built-in default (#1620).
+///
+/// The key parsed and validated while nothing read it, so a project that set
+/// it got the built-in cadence and no warning. The reference page said the
+/// one-shot `rocky tick` did not consume it — true, and beside the point: the
+/// resident loop did not either.
+///
+/// Read once, not per tick. `spawn_scheduler` fixes the interval for the
+/// process's life (it clamps to `MIN_POLL_INTERVAL` and then sleeps on it), so
+/// re-reading would change nothing; making the cadence live under a running
+/// loop is a separate feature.
+///
+/// A config that does not load leaves the built-in default rather than
+/// refusing. That matches the tolerance the tick loop already applies — it
+/// re-reads the config every iteration and carries on when the read fails — so
+/// an unparseable config must not stop the server from starting. The config is
+/// reported through the ordinary serve path either way.
+fn resolved_poll_interval(
+    flag_seconds: Option<u64>,
+    config_path: &std::path::Path,
+) -> std::time::Duration {
+    if let Some(seconds) = flag_seconds {
+        return std::time::Duration::from_secs(seconds);
+    }
+    match rocky_core::config::load_rocky_config(config_path) {
+        Ok(config) => std::time::Duration::from_secs(config.schedule.poll_interval_seconds),
+        Err(_) => crate::commands::scheduler::DEFAULT_POLL_INTERVAL,
+    }
+}
 
 /// Execute `rocky serve`.
 ///
@@ -217,9 +247,7 @@ pub async fn run_serve(
     // Spawn the resident reconciler alongside the server, if requested.
     let scheduler_task = if scheduler {
         let sched_cfg = crate::commands::scheduler::SchedulerConfig {
-            poll_interval: poll_interval_seconds
-                .map(std::time::Duration::from_secs)
-                .unwrap_or(crate::commands::scheduler::DEFAULT_POLL_INTERVAL),
+            poll_interval: resolved_poll_interval(poll_interval_seconds, &resolved_config),
             drain_timeout: drain_timeout_seconds
                 .map(std::time::Duration::from_secs)
                 .unwrap_or(crate::commands::scheduler::DEFAULT_DRAIN_TIMEOUT),
@@ -829,6 +857,79 @@ mod serve_config_presence_tests {
             resolve_serve_config_path(&config).expect("a resolvable symlink binds"),
             Some(config.as_path()),
             "and it binds the path the operator typed, not the resolved target"
+        );
+    }
+}
+
+#[cfg(test)]
+mod poll_interval_tests {
+    use super::resolved_poll_interval;
+    use crate::commands::scheduler::DEFAULT_POLL_INTERVAL;
+    use std::time::Duration;
+
+    fn config_with(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[adapter]\ntype = \"duckdb\"\n\n\
+                 [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                 [pipeline.p.target]\nadapter = \"default\"\n{body}"
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    /// The whole point of #1620: a project that sets the key gets that cadence.
+    /// It parsed and validated while nothing read it, so the value was inert.
+    #[test]
+    fn the_projects_configured_cadence_is_used() {
+        let (_dir, path) = config_with("\n[schedule]\npoll_interval_seconds = 45\n");
+        assert_eq!(resolved_poll_interval(None, &path), Duration::from_secs(45));
+    }
+
+    /// The flag still wins, so the documented override keeps working.
+    #[test]
+    fn the_flag_overrides_the_configured_cadence() {
+        let (_dir, path) = config_with("\n[schedule]\npoll_interval_seconds = 45\n");
+        assert_eq!(
+            resolved_poll_interval(Some(7), &path),
+            Duration::from_secs(7)
+        );
+    }
+
+    /// A project that declares no `[schedule]` gets the built-in, unchanged.
+    #[test]
+    fn no_schedule_block_falls_back_to_the_default() {
+        let (_dir, path) = config_with("");
+        assert_eq!(resolved_poll_interval(None, &path), DEFAULT_POLL_INTERVAL);
+    }
+
+    /// A config that cannot be read must not stop the server from starting —
+    /// the same tolerance the tick loop applies when it re-reads per iteration.
+    /// Asserted for both a missing file and an unparseable one, because the
+    /// two take different paths through `load_rocky_config`.
+    #[test]
+    fn an_unreadable_config_leaves_the_default_rather_than_refusing() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let missing = dir.path().join("nope.toml");
+        assert_eq!(
+            resolved_poll_interval(None, &missing),
+            DEFAULT_POLL_INTERVAL
+        );
+
+        let broken = dir.path().join("broken.toml");
+        std::fs::write(&broken, "this is not = valid toml [[[").unwrap();
+        assert_eq!(resolved_poll_interval(None, &broken), DEFAULT_POLL_INTERVAL);
+
+        // And the flag still wins over an unreadable config, so an operator
+        // can always force a cadence.
+        assert_eq!(
+            resolved_poll_interval(Some(3), &broken),
+            Duration::from_secs(3)
         );
     }
 }
