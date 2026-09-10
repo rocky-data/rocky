@@ -1699,9 +1699,11 @@ enum Command {
         /// Watch for file changes and auto-recompile
         #[arg(long)]
         watch: bool,
-        /// Bearer token required by every API request (except
-        /// `/api/v1/health`). Falls back to the `ROCKY_SERVE_TOKEN` env
-        /// var when omitted. Required when `--host` is non-loopback.
+        /// Bearer token. When set, every request must carry it except the
+        /// exempt paths (`/api/v1/health`, and the HMAC-checked webhook
+        /// route); when unset, a loopback server asks no request for a
+        /// token. Falls back to the `ROCKY_SERVE_TOKEN` env var when
+        /// omitted. Required when `--host` is non-loopback, and with `--ui`.
         #[arg(long)]
         token: Option<String>,
         /// What `--token` may do. `full` (the default) reaches every route.
