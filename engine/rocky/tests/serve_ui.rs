@@ -9,9 +9,19 @@
 //! - The click path: which DAG node the model route can serve, and under
 //!   which of its two names. This one asks only the API, so it never skips.
 //!
-//! Both live in a build with the `ui` feature (the CI `ui` job builds
-//! `engine/ui/dist` first and runs `cargo test --features ui --test
-//! serve_ui`); a plain `cargo test` compiles an empty file here.
+//! Both live in a build with the `ui` feature; a plain `cargo test` compiles
+//! an empty file here. Locally:
+//!
+//! ```text
+//! cargo test --features ui --test serve_ui
+//! ```
+//!
+//! In CI the job that runs them is **`Test`**, through `cargo nextest run
+//! --all-features` (`engine-ci.yml`), which turns the feature on. That job
+//! never builds `engine/ui/dist`, so the page test above takes its early
+//! return there and only the click test does real work. The `Browser UI` job
+//! is node only and has no Rust toolchain; the release-build smoke does embed
+//! a real page, but it runs curl rather than this binary.
 
 #![cfg(feature = "ui")]
 
@@ -197,8 +207,8 @@ fn real_server_prints_the_token_address_and_serves_the_public_page() {
 /// its `label`, never under its `kind:`-prefixed `id`.
 ///
 /// This test needs no page, only the API, so it does **not** pass `--ui` and
-/// does **not** skip when `engine/ui/dist` is absent. It runs in CI's
-/// `--all-features` job and in the `ui` job alike.
+/// does **not** skip when `engine/ui/dist` is absent. That is what lets CI's
+/// `Test` job run it, since that job never builds the page.
 ///
 /// The match in [`servable`] is exhaustive on purpose. A new variant in
 /// `unified_dag.rs` fails this file to compile, which is the one mechanical
@@ -242,6 +252,14 @@ fn only_a_transformation_node_is_servable_and_only_under_its_label() {
     let server = Server(child);
     let _keep_alive = &server;
     wait_for_health(port);
+    // `/health` and `/dag` both answer before the project has compiled:
+    // `health` is an unconditional handler and `full_dag` gates only on
+    // `config_path`, which is set at construction. The model routes gate on
+    // `compile_result`, and `serve` merely sleeps 100ms for the compile it
+    // spawned. So without this latch a slow compile answers the first model
+    // request `503 engine_not_ready`, which is neither the 200 nor the 404
+    // this test asserts, and every assertion below fails on timing alone.
+    wait_for_compiled_models(port);
 
     let (status, _, body) = http_get(port, "/api/v1/dag", "");
     assert!(status.contains("200"), "{status}: {body}");
@@ -294,20 +312,41 @@ fn only_a_transformation_node_is_servable_and_only_under_its_label() {
         vec!["customer_orders", "raw_orders", "revenue_summary"],
         "the playground's three models, each under its bare label"
     );
-    // Without several kinds the loop above proves only one branch.
-    let expected: std::collections::BTreeSet<String> = [
-        "load",
-        "quality",
-        "seed",
-        "snapshot",
-        "source",
-        "test",
-        "transformation",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect();
-    assert_eq!(kinds_seen, expected, "the fixture project lost a kind");
+    // Without several kinds the loop above proves only one branch. The set is
+    // read from the fixture the SPA's own tests run against, not written out
+    // here, so the two cannot drift apart: a live server that stops emitting a
+    // kind the fixture carries, or starts emitting one it does not, fails here
+    // rather than leaving the SPA asserting against a stale capture.
+    assert_eq!(
+        kinds_seen,
+        kinds_in_ui_fixture(),
+        "the live DAG and engine/ui/src/test/fixtures/dag-mixed-kinds.json \
+         disagree about which node kinds exist; recapture the fixture (its \
+         README says how) or fix the project this test builds"
+    );
+}
+
+/// The node kinds in the capture the SPA's tests read.
+///
+/// The fixture is recorded by hand from a real `rocky serve` — no script
+/// regenerates it — so nothing but this comparison keeps it honest.
+fn kinds_in_ui_fixture() -> std::collections::BTreeSet<String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../ui/src/test/fixtures/dag-mixed-kinds.json");
+    let raw =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let dag: serde_json::Value = serde_json::from_str(&raw).expect("the fixture is JSON");
+    dag["nodes"]
+        .as_array()
+        .expect("the fixture has nodes")
+        .iter()
+        .map(|n| {
+            n["kind"]
+                .as_str()
+                .expect("every fixture node has a kind")
+                .to_string()
+        })
+        .collect()
 }
 
 /// Which node kinds `GET /api/v1/models/{label}` can answer.
@@ -427,6 +466,27 @@ fn percent_encode(segment: &str) -> String {
         }
     }
     out
+}
+
+/// Block until the compile the server spawned at start-up has landed.
+///
+/// `GET /api/v1/models` reads the same `compile_result` the per-model route
+/// reads, so a `200` here is the readiness the model assertions need. Before
+/// it lands the route answers `503 engine_not_ready`, which would fail an
+/// assertion that expects `200` or `404`.
+fn wait_for_compiled_models(port: u16) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let (status, _, _) = http_get(port, "/api/v1/models", "");
+        if status.contains("200") {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the project never compiled; /api/v1/models last said {status}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// Block until the server answers `/api/v1/health`, or fail the test.
