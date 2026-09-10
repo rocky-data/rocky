@@ -1016,4 +1016,37 @@ mod tests {
         assert_eq!(result.source_tables[0].name, "v2.orders");
         assert_eq!(result.source_tables[0].binding, TableBinding::Physical);
     }
+
+    /// The CTE name lives on the alias, and an explicit column list puts a
+    /// second thing there. The name must still bind, or the shadow silently
+    /// would not apply to this spelling.
+    ///
+    /// The other spelling worth naming is `WITH x AS MATERIALIZED (…)`, which
+    /// `DatabricksDialect` does not parse at all — so a model using it already
+    /// fails lineage extraction outright, long before binding is asked about.
+    /// That is pre-existing and unrelated to CTE scopes.
+    #[test]
+    fn an_explicit_column_list_still_binds_the_name() {
+        let result =
+            extract_lineage("WITH orders (id) AS (SELECT 1 AS id) SELECT id FROM orders").unwrap();
+
+        assert_eq!(
+            result.source_tables[0].binding,
+            TableBinding::Cte,
+            "the name is bound whatever else the clause carries"
+        );
+    }
+
+    /// A `WITH RECURSIVE` body names itself. The main body's read is still the
+    /// CTE, not a table.
+    #[test]
+    fn a_recursive_cte_binds_its_own_name() {
+        let result = extract_lineage(
+            "WITH RECURSIVE orders AS (SELECT 1 AS id UNION ALL SELECT id + 1 FROM orders \
+             WHERE id < 3) SELECT id FROM orders",
+        )
+        .unwrap();
+
+        assert_eq!(result.source_tables[0].binding, TableBinding::Cte);
+    }
 }
