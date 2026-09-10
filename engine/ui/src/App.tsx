@@ -121,6 +121,13 @@ export function EnginePanel({
           <span title={meta.capabilities.join(", ")}>
             {count} {count === 1 ? "capability" : "capabilities"}
           </span>
+          {/*
+            A `title` is a mouse affordance: it is not in the tab order and
+            screen-reader support for it is inconsistent. The names would
+            otherwise be reachable by hover alone, so they are also here, off
+            the page but in the accessibility tree.
+          */}
+          <span className="sr-only">: {meta.capabilities.join(", ")}</span>
         </p>
       );
     }

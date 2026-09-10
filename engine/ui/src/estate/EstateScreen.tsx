@@ -123,6 +123,14 @@ function Panel({ title, producer, children }: { title: string; producer: string;
       >
         {title}
       </h3>
+      {/*
+        A `title` is a mouse affordance: not in the tab order, and screen
+        readers treat it inconsistently. The route is also here, off the page
+        but in the accessibility tree, so it is not hover-only. It sits
+        OUTSIDE the heading so that navigating by heading still announces
+        "DAG" rather than "DAG GET /api/v1/dag".
+      */}
+      <p className="sr-only">Producer: {producer}</p>
       {children}
     </section>
   );

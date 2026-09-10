@@ -42,7 +42,18 @@ export function bootstrapToken(win: TokenWindow): string | null {
   return win.sessionStorage.getItem(TOKEN_STORAGE_KEY);
 }
 
-/** The token in force for this tab, or `null`. */
+/**
+ * The token in force for this tab, or `null`.
+ *
+ * An empty stored value is `null`, not a token. Two callers ask this question
+ * and they must not disagree: the shell decides whether to render a lane at
+ * all, and `apiGet` decides whether to send an `Authorization` header. `""` is
+ * falsy, so `apiGet` would send no header — a shell that read `""` as "have a
+ * token" would mount every lane and fetch without credentials, which is the
+ * wall of `401`s this gate exists to prevent. `tokenFromFragment` already
+ * refuses a zero-length token; this is the same rule on the way out.
+ */
 export function currentToken(storage: TokenWindow["sessionStorage"]): string | null {
-  return storage.getItem(TOKEN_STORAGE_KEY);
+  const token = storage.getItem(TOKEN_STORAGE_KEY);
+  return token !== null && token.length > 0 ? token : null;
 }

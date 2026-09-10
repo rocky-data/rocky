@@ -106,8 +106,9 @@ export function ProductList({ load }: { load: () => Promise<ProductListOutput> }
         <p className="text-sm text-zinc-600 dark:text-zinc-300">
           A product appears here once <code>products/&lt;name&gt;.toml</code> exists, or once the
           store holds a record for one. That file arrives one of two ways: you write it, or{" "}
-          <code>rocky fulfill</code> stages a candidate for you to approve. No{" "}
-          <code>rocky product</code> subcommand creates one — they read, verify, compile and
+          <code>rocky fulfill &lt;name&gt;</code> stages a candidate for you to approve, which needs
+          a <code>[fulfill.driver]</code> in <code>rocky.toml</code> and does nothing without one.
+          No <code>rocky product</code> subcommand creates one — they read, verify, compile and
           approve a spec that is already there.
         </p>
       ) : (

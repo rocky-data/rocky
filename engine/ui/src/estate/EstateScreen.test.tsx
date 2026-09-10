@@ -101,8 +101,15 @@ describe("EstateScreen", () => {
       ["Runs", "GET /api/v1/runs"],
       ["Schedule", "GET /api/v1/schedule"],
     ]) {
-      expect(screen.getByRole("heading", { name: heading })).toHaveAttribute("title", route);
+      const h = screen.getByRole("heading", { name: heading });
+      expect(h).toHaveAttribute("title", route);
+      // Navigating by heading still announces just the panel's name.
+      expect(h.textContent).toBe(heading);
+      // The route is not on the page as visible text...
       expect(screen.queryByText(route)).toBeNull();
+      // ...but it is not hover-only either: a `title` is not in the tab order
+      // and screen readers treat it inconsistently.
+      expect(screen.getByText(`Producer: ${route}`)).toHaveClass("sr-only");
     }
   });
 
