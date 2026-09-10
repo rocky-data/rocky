@@ -928,8 +928,8 @@ mod tests {
     /// the query never reads.
     #[test]
     fn a_cte_reference_is_not_a_table_read() {
-        let result = extract_lineage("WITH orders AS (SELECT 2 AS id) SELECT id FROM orders")
-            .unwrap();
+        let result =
+            extract_lineage("WITH orders AS (SELECT 2 AS id) SELECT id FROM orders").unwrap();
 
         assert_eq!(result.source_tables.len(), 1);
         assert_eq!(result.source_tables[0].name, "orders");

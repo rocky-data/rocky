@@ -759,7 +759,10 @@ mod tests {
     fn mutual_cte_names_do_not_close_a_cycle() {
         let models = vec![
             make_model("alpha", "WITH beta AS (SELECT 1 AS id) SELECT id FROM beta"),
-            make_model("beta", "WITH alpha AS (SELECT 2 AS id) SELECT id FROM alpha"),
+            make_model(
+                "beta",
+                "WITH alpha AS (SELECT 2 AS id) SELECT id FROM alpha",
+            ),
         ];
 
         let (dag_nodes, _lineage_cache, _diags) = resolve_dependencies(&models).unwrap();
