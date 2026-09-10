@@ -421,7 +421,11 @@ fn policy_test_prints_the_report_before_it_exits_non_zero() {
         policy_project(&format!("{POLICY_BASE}{FAILING_SCENARIO}"));
 
     let out = rocky(dir.path(), &["policy", "test", "--output", "json"]);
-    assert!(!out.status.success(), "a failing scenario must not exit 0");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a failing scenario exits 1, the CI gate code"
+    );
     let stdout = String::from_utf8(out.stdout).unwrap();
     let report = compute_policy_test(&config_path).unwrap();
     assert_eq!((report.total, report.passed, report.failed), (2, 1, 1));
@@ -431,9 +435,9 @@ fn policy_test_prints_the_report_before_it_exits_non_zero() {
         "the failing scenario is in the printed report: {stdout}"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("1 of 2 policy scenario(s) failed"),
-        "the exit reason is unchanged: {stderr}"
+    assert_eq!(
+        stderr, "Error: 1 of 2 policy scenario(s) failed\n",
+        "the exit reason is the whole of stderr, unchanged"
     );
 }
 
