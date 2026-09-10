@@ -201,6 +201,7 @@ fn render_spool_text(out: &ScheduleSpoolOutput) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use rocky_core::schedule::spool::{AcceptOutcome, WebhookKind, accept};
     use std::path::PathBuf;
 
@@ -306,7 +307,10 @@ mod tests {
 
     #[test]
     fn a_consumed_demand_is_not_pending() {
-        // `.done` is the 24h idempotency window for `kind = id`, not work.
+        // Disposal RENAMES the pending file to a `.done` tombstone, and
+        // `list_pending_files` already filters that suffix. So this pins the
+        // simple case only; the duplicate case below is the one the
+        // tombstone check itself decides.
         let (dir, config) = project();
         let path = spool_one(&dir, "orders", "delivery-1", "2026-09-10T10:00:00Z");
         spool::dispose(&path, WebhookKind::Id).unwrap();
@@ -315,6 +319,36 @@ mod tests {
         assert!(
             out.pending.is_empty(),
             "a disposed demand is still queued: {:?}",
+            out.pending
+        );
+    }
+
+    #[test]
+    fn a_redelivered_id_that_already_ran_is_not_pending_work() {
+        // The state the tombstone check exists for: a delivery id that ran,
+        // then arrived again inside the 24h window. Acceptance writes a fresh
+        // pending file, and the tick DROPS it without running
+        // (`reconcile.rs`, the id-dedup authority). Reporting it as pending
+        // would promise a run that will never happen.
+        let (dir, config) = project();
+        let path = spool_one(&dir, "orders", "delivery-1", "2026-09-10T10:00:00Z");
+        spool::dispose(&path, WebhookKind::Id).unwrap();
+
+        // Re-deliver the same id.
+        accept(
+            &rocky_dir(&dir),
+            "orders",
+            WebhookKind::Id,
+            "delivery-1",
+            "deadbeef",
+            Utc.with_ymd_and_hms(2026, 9, 10, 11, 0, 0).unwrap(),
+        )
+        .unwrap();
+
+        let out = compute_schedule_spool(&config).unwrap();
+        assert!(
+            out.pending.is_empty(),
+            "a duplicate the tick will drop is reported as pending work: {:?}",
             out.pending
         );
     }
