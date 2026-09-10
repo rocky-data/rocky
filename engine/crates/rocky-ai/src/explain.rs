@@ -77,26 +77,28 @@ pub async fn explain_model(
 /// surface the message to the user, who is expected to fix or remove
 /// the file before retrying.
 pub fn save_intent_to_config(model: &Model, intent: &str) -> Result<(), std::io::Error> {
+    // The loader's own derivation, not a second one that agrees with it for
+    // some extensions (#1779). Every site that READS a sidecar spells it
+    // `path.with_extension("toml")` — `project.rs:724` and `models.rs:1648`,
+    // `:1707`, `:1787`, `:1889` — so a writer that derives the path any other
+    // way can only agree by coincidence.
+    //
+    // It did not agree for `.rocky`. That arm appended instead of replacing,
+    // producing `flow.rocky.toml` while every loader looked for `flow.toml`,
+    // so `rocky ai-explain` on a `.rocky` model reported success and wrote a
+    // file nothing reads: `ai-sync` saw an un-annotated model, and re-running
+    // `ai-explain` regenerated from scratch rather than reading back its own
+    // output.
+    //
+    // Replacing the branch rather than fixing the `.rocky` case keeps the two
+    // derivations from drifting again. The old `else` was reached by EVERY
+    // non-`.sql` path, so a third model extension would have inherited the
+    // same defect silently.
+    //
     // Built on the path itself rather than on a rendered string (#1730): the
     // result is opened for writing, so a lossy round-trip would write to a
     // different file than the one the model came from.
-    //
-    // The `.sql` arm now uses `with_extension`, which is the derivation the
-    // loader itself uses (`project.rs:629`, `models.rs:1603`). The previous
-    // `replace(".sql", ".toml")` rewrote EVERY occurrence, so a model under a
-    // directory whose name contains `.sql` was redirected into a sibling tree.
-    //
-    // The two appending arms are preserved exactly as they were. The `.rocky`
-    // arm is wrong — it writes `flow.rocky.toml` while the loader reads
-    // `flow.toml` — but that is a separate defect with a user-visible output
-    // path, tracked on its own rather than folded into this change.
-    let toml_path = if model.file_path.extension().is_some_and(|e| e == "sql") {
-        model.file_path.with_extension("toml")
-    } else {
-        let mut appended = model.file_path.clone().into_os_string();
-        appended.push(".toml");
-        std::path::PathBuf::from(appended)
-    };
+    let toml_path = model.file_path.with_extension("toml");
 
     let path = toml_path.as_path();
 
@@ -221,6 +223,52 @@ mod save_intent_tests {
         assert!(content.contains("intent"));
         assert!(content.contains("some intent"));
         assert!(content.contains("test_model"));
+    }
+
+    /// A `.rocky` model's intent must land at `<stem>.toml` — the path every
+    /// loader derives — not at `<stem>.rocky.toml` (#1779).
+    ///
+    /// The old code appended for every non-`.sql` extension, so it wrote
+    /// `flow.rocky.toml` while `project.rs` and `models.rs` both read
+    /// `flow.toml`. `ai-explain` reported success and produced a file nothing
+    /// would ever load.
+    ///
+    /// The absence assertion is the load-bearing half: writing to the right
+    /// path while ALSO writing the wrong one would leave the stale file to be
+    /// found later and trusted.
+    #[test]
+    fn a_rocky_models_intent_lands_where_the_loader_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let rocky_path = dir.path().join("flow.rocky");
+        let model = make_model(rocky_path.to_string_lossy().to_string());
+
+        save_intent_to_config(&model, "the flow intent").unwrap();
+
+        let loader_path = dir.path().join("flow.toml");
+        let content = std::fs::read_to_string(&loader_path)
+            .unwrap_or_else(|e| panic!("expected the intent at {}: {e}", loader_path.display()));
+        assert!(content.contains("the flow intent"), "{content}");
+
+        assert!(
+            !dir.path().join("flow.rocky.toml").exists(),
+            "nothing reads `<stem>.rocky.toml`; writing one leaves an inert \
+             file that a later reader can mistake for the sidecar"
+        );
+    }
+
+    /// The derivation replaces the extension rather than appending, for a
+    /// model file that carries none. Pins the behaviour of the branch this
+    /// change removed, so a future re-introduction of an append arm fails.
+    #[test]
+    fn an_extensionless_model_path_still_gets_a_toml_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = dir.path().join("flow");
+        let model = make_model(bare.to_string_lossy().to_string());
+
+        save_intent_to_config(&model, "bare intent").unwrap();
+
+        let content = std::fs::read_to_string(dir.path().join("flow.toml")).unwrap();
+        assert!(content.contains("bare intent"), "{content}");
     }
 
     #[test]
