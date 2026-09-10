@@ -353,12 +353,11 @@ pub(crate) fn classify_model(
 /// re-executed from its recording alone (provenance present, embedded IR
 /// parses under the current engine, inputs ledger-resolvable) and flag
 /// static non-determinism. Nothing is executed; nothing is written.
-pub fn run_replay_check(
+pub fn compute_replay_check(
     state_path: &Path,
     target: &str,
     model_filter: Option<&str>,
-    json: bool,
-) -> Result<()> {
+) -> Result<ReplayCheckOutput> {
     let store = StateStore::open_read_only(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
@@ -383,23 +382,37 @@ pub fn run_replay_check(
     let replayable_count = models.iter().filter(|m| m.verdict == "replayable").count();
     let all_replayable = replayable_count == models.len();
 
+    Ok(ReplayCheckOutput {
+        version: VERSION.to_string(),
+        command: "replay --check".to_string(),
+        run_id: record.run_id.clone(),
+        status: status_str(&record.status).to_string(),
+        replayable: all_replayable,
+        model_count: models.len(),
+        replayable_count,
+        models,
+    })
+}
+
+/// `rocky replay --check`: [`compute_replay_check`], rendered as JSON or
+/// text. The JSON branch is the seam plus one `println!`.
+pub fn run_replay_check(
+    state_path: &Path,
+    target: &str,
+    model_filter: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let output = compute_replay_check(state_path, target, model_filter)?;
     if json {
-        let output = ReplayCheckOutput {
-            version: VERSION.to_string(),
-            command: "replay --check".to_string(),
-            run_id: record.run_id.clone(),
-            status: status_str(&record.status).to_string(),
-            replayable: all_replayable,
-            model_count: models.len(),
-            replayable_count,
-            models,
-        };
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        println!("run: {}", record.run_id);
-        println!("status: {}", status_str(&record.status));
-        println!("replayable: {}/{} models", replayable_count, models.len());
-        for m in &models {
+        println!("run: {}", output.run_id);
+        println!("status: {}", output.status);
+        println!(
+            "replayable: {}/{} models",
+            output.replayable_count, output.model_count
+        );
+        for m in &output.models {
             print!("  {}  {}", m.model_name, m.verdict);
             if m.nondeterministic {
                 print!("  [nondeterministic]");
@@ -2894,5 +2907,51 @@ mod tests {
             ))
             .await
             .expect("teardown DELETE");
+    }
+
+    /// The seam serves what the store recorded; `run_replay_check --output
+    /// json` is `compute_replay_check` plus one `println!`, so this pins the
+    /// producer both callers share.
+    #[test]
+    fn compute_replay_check_serves_the_recorded_run() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        {
+            let store = StateStore::open(&path).unwrap();
+            store
+                .record_run(&sample_run(
+                    "run-1",
+                    vec![("a", "success"), ("b", "success")],
+                ))
+                .unwrap();
+        }
+
+        let out = compute_replay_check(&path, "latest", None).unwrap();
+        assert_eq!(out.command, "replay --check");
+        assert_eq!(out.run_id, "run-1");
+        assert_eq!(out.status, "success");
+        assert_eq!(out.model_count, 2);
+        assert_eq!(
+            out.models
+                .iter()
+                .map(|m| m.model_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert_eq!(
+            out.replayable,
+            out.replayable_count == out.model_count,
+            "`replayable` is the whole-run verdict"
+        );
+
+        let one = compute_replay_check(&path, "run-1", Some("b")).unwrap();
+        assert_eq!(one.model_count, 1);
+        assert_eq!(one.models[0].model_name, "b");
+
+        let err = compute_replay_check(&path, "run-1", Some("zzz")).unwrap_err();
+        assert!(
+            err.to_string().contains("did not execute model 'zzz'"),
+            "{err}"
+        );
     }
 }

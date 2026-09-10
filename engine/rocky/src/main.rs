@@ -1884,6 +1884,11 @@ enum Command {
         /// this?" query. Conflicts with `--model`.
         #[arg(long, conflicts_with = "model")]
         recipe: Option<String>,
+        /// Show exactly one run by its id, in the same shape as the list
+        /// (`count` is 1). A run the store does not hold is an error.
+        /// Conflicts with `--model`, `--recipe` and `--since`.
+        #[arg(long, value_name = "RUN_ID", conflicts_with_all = ["model", "recipe", "since"])]
+        run: Option<String>,
         /// Only show runs since this date (ISO 8601 or YYYY-MM-DD)
         #[arg(long)]
         since: Option<String>,
@@ -4504,6 +4509,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         Command::History {
             model,
             recipe,
+            run,
             since,
             audit,
             rolling_stats,
@@ -4516,6 +4522,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             rolling_stats,
             window,
             recipe.as_deref(),
+            run.as_deref(),
             json,
         ),
         Command::Metrics {
