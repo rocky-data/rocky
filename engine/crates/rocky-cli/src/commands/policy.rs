@@ -36,8 +36,9 @@ use rocky_core::state_sync::StateSyncError;
 
 use crate::output::{
     PolicyAutonomyBudgetOutput, PolicyCheckOutput, PolicyFreezeEntry, PolicyFreezeInForce,
-    PolicyFreezeOutput, PolicyFreezeSources, PolicyModelAttributes, PolicyRuleEntry,
-    PolicyRuleScopeOutput, PolicyRulesOutput, PolicyTestOutput, PolicyTestResult, print_json,
+    PolicyFreezeOutput, PolicyFreezeSources, PolicyLedgerSource, PolicyMarkerSource,
+    PolicyModelAttributes, PolicyRuleEntry, PolicyRuleScopeOutput, PolicyRulesOutput,
+    PolicyTestOutput, PolicyTestResult, print_json,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -285,13 +286,14 @@ pub fn run_policy_test(config_path: &Path, json: bool) -> Result<()> {
 
 /// The decision ledger's part of `rocky policy show`.
 ///
-/// `source` is one of `"read"`, `"absent"` or `"local_mirror"`. Absent is
-/// proven, not assumed: a store path that is missing is absence, a store path
-/// that is there but cannot be read (a dangling link, an unreadable ancestor)
-/// is an error.
+/// `source` is `Read`, `Absent` or `LocalMirror` — never `NotConsulted`, which
+/// only [`policy_show_unconsulted_ledger`] produces. Absent is proven, not
+/// assumed: a store path that is missing is absence, a store path that is
+/// there but cannot be read (a dangling link, an unreadable ancestor) is an
+/// error.
 #[derive(Debug)]
 pub struct PolicyShowLedger {
-    pub source: &'static str,
+    pub source: PolicyLedgerSource,
     pub freezes: Vec<ActiveFreeze>,
 }
 
@@ -309,14 +311,14 @@ pub fn read_policy_show_ledger(
     remote_backend: bool,
 ) -> Result<PolicyShowLedger> {
     let read_label = if remote_backend {
-        "local_mirror"
+        PolicyLedgerSource::LocalMirror
     } else {
-        "read"
+        PolicyLedgerSource::Read
     };
     let absent_label = if remote_backend {
-        "local_mirror"
+        PolicyLedgerSource::LocalMirror
     } else {
-        "absent"
+        PolicyLedgerSource::Absent
     };
     // `metadata` follows links: a dangling link is NotFound here, and the
     // classifier then reports it present-but-unreadable. An open on that path
@@ -474,9 +476,9 @@ pub fn assemble_policy_show(
         })
         .collect();
     let markers_source = match &markers {
-        PolicyShowMarkers::NotConsulted => "not_consulted",
-        PolicyShowMarkers::NotConfigured => "not_configured",
-        PolicyShowMarkers::Read(_) => "read",
+        PolicyShowMarkers::NotConsulted => PolicyMarkerSource::NotConsulted,
+        PolicyShowMarkers::NotConfigured => PolicyMarkerSource::NotConfigured,
+        PolicyShowMarkers::Read(_) => PolicyMarkerSource::Read,
     };
     if let PolicyShowMarkers::Read(markers) = markers {
         freezes.extend(markers.into_iter().map(|m| PolicyFreezeInForce {
@@ -498,8 +500,8 @@ pub fn assemble_policy_show(
         rules,
         freezes,
         freeze_sources: PolicyFreezeSources {
-            ledger: ledger_source.to_string(),
-            markers: markers_source.to_string(),
+            ledger: ledger_source,
+            markers: markers_source,
         },
     }
 }
@@ -547,7 +549,7 @@ pub fn policy_show_remote_backend(state_cfg: &StateConfig) -> bool {
 /// document whose own `configured` field says nothing enforces.
 pub fn policy_show_unconsulted_ledger() -> PolicyShowLedger {
     PolicyShowLedger {
-        source: "not_consulted",
+        source: PolicyLedgerSource::NotConsulted,
         freezes: Vec::new(),
     }
 }
@@ -694,14 +696,23 @@ fn render_show_text<W: Write>(w: &mut W, out: &PolicyRulesOutput) -> io::Result<
     writeln!(
         w,
         "freeze sources: ledger {}, markers {}",
-        out.freeze_sources.ledger, out.freeze_sources.markers
+        serde_plain(&out.freeze_sources.ledger),
+        serde_plain(&out.freeze_sources.markers)
     )?;
-    if out.freeze_sources.ledger == "local_mirror" {
-        writeln!(
-            w,
-            "  note: [state] is a remote backend. The ledger above is the local mirror; the \
+    // Matched exhaustively, not compared: this note is the only place the text
+    // says the freeze list may be incomplete, and a new ledger source must not
+    // be able to skip it by default (#1909).
+    match out.freeze_sources.ledger {
+        PolicyLedgerSource::LocalMirror => {
+            writeln!(
+                w,
+                "  note: [state] is a remote backend. The ledger above is the local mirror; the \
 remote authority was not downloaded, so a freeze recorded by another pod may be missing."
-        )?;
+            )?;
+        }
+        PolicyLedgerSource::Read
+        | PolicyLedgerSource::Absent
+        | PolicyLedgerSource::NotConsulted => {}
     }
     Ok(())
 }
@@ -2136,8 +2147,8 @@ expect = \"allow\"
         assert_eq!(out.default_agent_effect, PolicyEffect::RequireReview);
         assert!(out.rules.is_empty());
         assert!(out.freezes.is_empty());
-        assert_eq!(out.freeze_sources.ledger, "not_consulted");
-        assert_eq!(out.freeze_sources.markers, "not_consulted");
+        assert_eq!(out.freeze_sources.ledger, PolicyLedgerSource::NotConsulted);
+        assert_eq!(out.freeze_sources.markers, PolicyMarkerSource::NotConsulted);
     }
 
     /// The rules come out in file order with their position as `id`, and a
@@ -2184,8 +2195,11 @@ expect = \"allow\"
         assert!(f.since.is_some());
         assert!(f.plan_id.is_some());
         assert!(f.freeze_id.is_none());
-        assert_eq!(out.freeze_sources.ledger, "read");
-        assert_eq!(out.freeze_sources.markers, "not_configured");
+        assert_eq!(out.freeze_sources.ledger, PolicyLedgerSource::Read);
+        assert_eq!(
+            out.freeze_sources.markers,
+            PolicyMarkerSource::NotConfigured
+        );
 
         // Lifting it takes it out of force: the report reads the ledger's
         // projection, not its raw rows.
@@ -2270,7 +2284,7 @@ expect = \"allow\"
         let policy = PolicyConfig::default_posture();
         let frozen_at = chrono::Utc::now();
         let ledger = PolicyShowLedger {
-            source: "read",
+            source: PolicyLedgerSource::Read,
             freezes: vec![ActiveFreeze {
                 principal: PolicyPrincipal::Agent,
                 scope: "model=fct_*".to_string(),
@@ -2292,7 +2306,7 @@ expect = \"allow\"
         }];
 
         let out = assemble_policy_show(Some(&policy), ledger, PolicyShowMarkers::Read(markers));
-        assert_eq!(out.freeze_sources.markers, "read");
+        assert_eq!(out.freeze_sources.markers, PolicyMarkerSource::Read);
         assert_eq!(out.freezes.len(), 2);
         assert_eq!(out.freezes[0].source, "ledger");
         assert_eq!(out.freezes[0].plan_id.as_deref(), Some("freeze-1"));
@@ -2392,11 +2406,16 @@ expect = \"allow\"
         let missing = dir.path().join("state.redb");
 
         let local = read_policy_show_ledger(&missing, false).unwrap();
-        assert_eq!(local.source, "absent", "a local backend proves absence");
+        assert_eq!(
+            local.source,
+            PolicyLedgerSource::Absent,
+            "a local backend proves absence"
+        );
 
         let remote = read_policy_show_ledger(&missing, true).unwrap();
         assert_eq!(
-            remote.source, "local_mirror",
+            remote.source,
+            PolicyLedgerSource::LocalMirror,
             "a remote backend never proves absence from the local file alone"
         );
         assert!(remote.freezes.is_empty());
@@ -2458,13 +2477,13 @@ expect = \"allow\"
             "a freeze the gate never reads is not in force: {:?}",
             out.freezes
         );
-        assert_eq!(out.freeze_sources.ledger, "not_consulted");
-        assert_eq!(out.freeze_sources.markers, "not_consulted");
+        assert_eq!(out.freeze_sources.ledger, PolicyLedgerSource::NotConsulted);
+        assert_eq!(out.freeze_sources.markers, PolicyMarkerSource::NotConsulted);
 
         // And with the block restored, the same store reports it in force.
         let back = compute_policy_show(&config, &state_path).await.unwrap();
         assert_eq!(back.freezes.len(), 1, "the freeze itself never moved");
-        assert_eq!(back.freeze_sources.ledger, "read");
+        assert_eq!(back.freeze_sources.ledger, PolicyLedgerSource::Read);
     }
 
     /// `verify_after` is a first-class rule field that decides whether a
@@ -2574,12 +2593,13 @@ expect = \"allow\"
         .unwrap();
 
         let local = read_policy_show_ledger(&state_path, false).unwrap();
-        assert_eq!(local.source, "read");
+        assert_eq!(local.source, PolicyLedgerSource::Read);
         assert_eq!(local.freezes.len(), 1);
 
         let mirrored = read_policy_show_ledger(&state_path, true).unwrap();
         assert_eq!(
-            mirrored.source, "local_mirror",
+            mirrored.source,
+            PolicyLedgerSource::LocalMirror,
             "a populated local store on a remote backend is still only a mirror"
         );
         assert_eq!(
@@ -2675,8 +2695,8 @@ expect = \"allow\"
                 freeze_id: Some("fz-1".to_string()),
             }],
             freeze_sources: PolicyFreezeSources {
-                ledger: "read".to_string(),
-                markers: "read".to_string(),
+                ledger: PolicyLedgerSource::Read,
+                markers: PolicyMarkerSource::Read,
             },
         }
     }
@@ -2749,8 +2769,8 @@ expect = \"allow\"
         plane.rules.clear();
         plane.freezes.clear();
         plane.freeze_sources = PolicyFreezeSources {
-            ledger: "local_mirror".to_string(),
-            markers: "read".to_string(),
+            ledger: PolicyLedgerSource::LocalMirror,
+            markers: PolicyMarkerSource::Read,
         };
 
         let rendered = show_text(&plane);
@@ -2784,8 +2804,8 @@ expect = \"allow\"
         plane.rules.clear();
         plane.freezes.clear();
         plane.freeze_sources = PolicyFreezeSources {
-            ledger: "not_consulted".to_string(),
-            markers: "not_consulted".to_string(),
+            ledger: PolicyLedgerSource::NotConsulted,
+            markers: PolicyMarkerSource::NotConsulted,
         };
 
         let rendered = show_text(&plane);

@@ -13050,12 +13050,20 @@
         "description": "Which freeze sources the report read.",
         "properties": {
           "ledger": {
-            "description": "How the decision ledger was read.\n\n- `\"read\"` — a local backend, read in full. - `\"absent\"` — a local backend with no state store yet. Proven absent, not assumed: a path that exists but cannot be read is an error. - `\"local_mirror\"` — a remote `[state]` backend. What was read is the local mirror, which may be stale or empty; the remote authority was NOT downloaded, because this is a read-only route and the download replaces the local ledger. A freeze recorded by another pod can be missing here while an apply, which does download first, still denies. - `\"not_consulted\"` — no `[policy]` block, so nothing is in force and the enforcement gate reads no ledger either.",
-            "type": "string"
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PolicyLedgerSource"
+              }
+            ],
+            "description": "How the decision ledger was read."
           },
           "markers": {
-            "description": "How the durable freeze markers were read.\n\n- `\"read\"` — the `[state]` backend has a durable object tier, read in full. Reads are NOT gated on `freeze_marker_writes`: that flag gates writes only, and an existing marker stays enforced after it is turned off, so a reader that honoured it would hide a live freeze. - `\"not_configured\"` — the backend keeps no durable object tier. - `\"not_consulted\"` — no `[policy]` block, as above.",
-            "type": "string"
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PolicyMarkerSource"
+              }
+            ],
+            "description": "How the durable freeze markers were read."
           }
         },
         "required": [
@@ -13063,6 +13071,65 @@
           "markers"
         ],
         "type": "object"
+      },
+      "PolicyLedgerSource": {
+        "description": "How the decision ledger was read for a policy report.\n\nAn enum rather than a string because a consumer BRANCHES on it: the text renderer prints the incomplete-freeze-list warning on `LocalMirror` alone. As a bare string the producer and that branch were joined by nothing — renaming the written value compiled fine and silently retired the warning, with the tests on both ends still green (#1909).\n\nThe wire form is unchanged: the same four snake_case strings.",
+        "oneOf": [
+          {
+            "description": "A local backend, read in full.",
+            "enum": [
+              "read"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "A local backend with no state store yet. Proven absent, not assumed: a path that exists but cannot be read is an error.",
+            "enum": [
+              "absent"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "A remote `[state]` backend. What was read is the local mirror, which may be stale or empty; the remote authority was NOT downloaded, because this is a read-only route and the download replaces the local ledger. A freeze recorded by another pod can be missing here while an apply, which does download first, still denies.",
+            "enum": [
+              "local_mirror"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "No `[policy]` block, so nothing is in force and the enforcement gate reads no ledger either.",
+            "enum": [
+              "not_consulted"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "PolicyMarkerSource": {
+        "description": "How the durable freeze markers were read for a policy report.\n\nA separate enum from [`PolicyLedgerSource`], not a shared one: the two answer different questions and only two of their values coincide. A shared enum would let a match on the ledger claim to handle `NotConfigured`, which a ledger read cannot produce.\n\nThe wire form is unchanged: the same three snake_case strings.",
+        "oneOf": [
+          {
+            "description": "The `[state]` backend has a durable object tier, read in full. Reads are NOT gated on `freeze_marker_writes`: that flag gates writes only, and an existing marker stays enforced after it is turned off, so a reader that honoured it would hide a live freeze.",
+            "enum": [
+              "read"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The backend keeps no durable object tier.",
+            "enum": [
+              "not_configured"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "No `[policy]` block, as above.",
+            "enum": [
+              "not_consulted"
+            ],
+            "type": "string"
+          }
+        ]
       },
       "PolicyModelAttributes": {
         "description": "The compiled attributes of the checked model, echoed back so the explain output is self-contained.",
