@@ -6,6 +6,30 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Name the binary under test ONCE, and export it.
+#
+# Ten POCs do not call bare `rocky`: they resolve a path themselves, and every
+# one of them prefers `engine/target/release/rocky` over PATH. A caller that
+# puts a DEBUG build on PATH — which is what a PR-time job would do (#1676) —
+# would silently exercise a stale release binary in those ten, or hard-fail
+# where a POC has no fallback. The suite would report on a binary nobody asked
+# it to test.
+#
+# `ROCKY_BIN` is the override those POCs consult first, so exporting it here
+# makes PATH and the path-resolving POCs agree by construction.
+#
+# Fail fast rather than let 101 POCs each discover the same missing binary:
+# one message that says what is wrong beats 101 that say a command was not
+# found.
+ROCKY_BIN="${ROCKY_BIN:-$(command -v rocky || true)}"
+if [ -z "$ROCKY_BIN" ]; then
+    echo "error: no rocky binary. Put one on PATH or set ROCKY_BIN." >&2
+    echo "  (cd engine && cargo build -p rocky) then add engine/target/debug to PATH" >&2
+    exit 1
+fi
+export ROCKY_BIN
+echo "Binary under test: $ROCKY_BIN"
+
 passed=0
 failed=0
 skipped=0
