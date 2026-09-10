@@ -399,25 +399,25 @@ fn webhook_secret_posture_named(name: &str) -> rocky_server::state::WebhookSecre
 ///
 /// Only two fieldless enum labels are taken; the `RockyConfig` is dropped here
 /// so nothing downstream can reach `AdapterConfig`'s unbounded `.extra` map.
-pub(crate) fn config_posture(
-    config_path: Option<&Path>,
-) -> (
-    Option<rocky_core::config::StateBackend>,
-    Option<rocky_core::config::ConcurrencyControl>,
-    rocky_server::state::ConfigStatus,
-) {
-    use rocky_server::state::ConfigStatus;
+pub(crate) fn config_posture(config_path: Option<&Path>) -> rocky_server::state::ConfigLabels {
+    use rocky_server::state::{ConfigLabels, ConfigStatus};
     // The same loader the recompile path uses (`ServerState::recompile`), so a
     // broken config means one thing in this process rather than one thing per
     // caller — the defect #1625 is about.
     match rocky_core::config::load_optional_project_config(config_path) {
-        Ok(Some(config)) => (
-            Some(config.state.backend),
-            Some(config.state.concurrency_control),
-            ConfigStatus::Loaded,
-        ),
-        Ok(None) => (None, None, ConfigStatus::Absent),
-        Err(_) => (None, None, ConfigStatus::Unreadable),
+        Ok(Some(config)) => ConfigLabels {
+            state_backend: Some(config.state.backend),
+            concurrency_control: Some(config.state.concurrency_control),
+            config_status: ConfigStatus::Loaded,
+        },
+        Ok(None) => ConfigLabels {
+            config_status: ConfigStatus::Absent,
+            ..ConfigLabels::default()
+        },
+        Err(_) => ConfigLabels {
+            config_status: ConfigStatus::Unreadable,
+            ..ConfigLabels::default()
+        },
     }
 }
 
@@ -603,7 +603,6 @@ fn build_serve_state(
     // primitives that are already in scope here, which is what keeps the
     // allowlist honest: there is no `RockyConfig` and no `Debug` on the path
     // from a config file to the response body.
-    let (state_backend, concurrency_control, config_status) = config_posture(config_path);
     let settings = rocky_server::state::SettingsSnapshot {
         // The SAME `String` the listener binds -- `serve` builds `ServeConfig`
         // first and lends this from it, so the reported host cannot drift from
@@ -614,9 +613,11 @@ fn build_serve_state(
         // above only reads the secret under `--scheduler`, and presence is
         // exactly what an operator needs before turning the scheduler on.
         webhook_secret: webhook_secret_posture(),
-        state_backend,
-        concurrency_control,
-        config_status,
+        // Left unresolved on purpose. Reading `rocky.toml` here would put a
+        // blocking full-file read on the path to `TcpListener::bind`, where
+        // there is none today, so a FIFO or a stalled mount would stop the
+        // server binding at all. The settings route resolves it on first ask.
+        config_labels: std::sync::OnceLock::new(),
     };
 
     Ok(rocky_server::state::ServerState::with_auth_and_webhook(
@@ -847,11 +848,11 @@ mod tests {
         let config = dir.path().join("rocky.toml");
         std::fs::write(&config, "this is not = [valid toml").unwrap();
 
-        let (backend, concurrency, status) = config_posture(Some(&config));
+        let labels = config_posture(Some(&config));
 
-        assert_eq!(status, ConfigStatus::Unreadable);
+        assert_eq!(labels.config_status, ConfigStatus::Unreadable);
         assert!(
-            backend.is_none() && concurrency.is_none(),
+            labels.state_backend.is_none() && labels.concurrency_control.is_none(),
             "an unparsable config must not yield a default that reads as configured"
         );
     }
@@ -864,10 +865,10 @@ mod tests {
         use rocky_server::state::ConfigStatus;
 
         let dir = tempfile::tempdir().unwrap();
-        let (backend, concurrency, status) = config_posture(Some(&dir.path().join("rocky.toml")));
+        let labels = config_posture(Some(&dir.path().join("rocky.toml")));
 
-        assert_eq!(status, ConfigStatus::Absent);
-        assert!(backend.is_none() && concurrency.is_none());
+        assert_eq!(labels.config_status, ConfigStatus::Absent);
+        assert!(labels.state_backend.is_none() && labels.concurrency_control.is_none());
     }
 
     /// A readable config yields the real labels.
@@ -888,11 +889,11 @@ mod tests {
         )
         .unwrap();
 
-        let (backend, concurrency, status) = config_posture(Some(&config));
+        let labels = config_posture(Some(&config));
 
-        assert_eq!(status, ConfigStatus::Loaded);
-        assert_eq!(backend, Some(StateBackend::S3));
-        assert_eq!(concurrency, Some(ConcurrencyControl::Cas));
+        assert_eq!(labels.config_status, ConfigStatus::Loaded);
+        assert_eq!(labels.state_backend, Some(StateBackend::S3));
+        assert_eq!(labels.concurrency_control, Some(ConcurrencyControl::Cas));
     }
 
     /// Neither set → loopback-only mode, exactly as before.
@@ -933,6 +934,46 @@ mod tests {
             env_var_fail_closed("ROCKY_TEST_DEFINITELY_UNSET_PROBE")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// **Red team, round 1.** The settings route must not put a file read on
+    /// the path to `TcpListener::bind`.
+    ///
+    /// `rocky serve` reads no config before binding today, so an eager
+    /// `rocky.toml` read for two report fields would newly let a FIFO or a
+    /// stalled mount stop the server binding at all. Loader ERRORS are
+    /// tolerated; a read that never returns is not something tolerance catches.
+    ///
+    /// So the labels stay unresolved until something asks for them. Asserting
+    /// on the cell is what makes that a property rather than an intention.
+    #[tokio::test]
+    async fn the_config_is_not_read_before_the_listener_binds() {
+        let models = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../rocky-compiler/tests/fixtures/simple_project/models");
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("rocky.toml");
+        std::fs::write(&config, "[adapter]\ntype = \"duckdb\"\n").unwrap();
+
+        let state = build_serve_state(
+            &models,
+            false,
+            None,
+            Some(&config),
+            "127.0.0.1",
+            Some("s3cret".to_string()),
+            None,
+            Vec::new(),
+            false,
+            Vec::new(),
+            false,
+            None,
+        )
+        .expect("builds");
+
+        assert!(
+            state.settings.config_labels.get().is_none(),
+            "build_serve_state read the config; that read now sits before the bind"
         );
     }
 
