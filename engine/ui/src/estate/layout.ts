@@ -66,6 +66,14 @@ export function layeredFlow(dag: DagOutput): Flow {
       id: node.id,
       type: "model",
       position: position(column, row, rows),
+      // The card's own size, stated rather than left to be measured. The
+      // minimap draws nothing for a node whose dimensions it does not know
+      // (`nodeHasDimensions`), and it never learns them here: the graph is
+      // controlled with no `onNodesChange`, so React Flow has nowhere to
+      // write a measurement back to. Both values are the ones `ModelNode`
+      // and `position()` already use, so nothing moves.
+      width: NODE_WIDTH,
+      height: NODE_HEIGHT,
       draggable: false,
       focusable: openable,
       selectable: openable,
