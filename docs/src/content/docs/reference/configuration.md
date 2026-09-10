@@ -570,7 +570,7 @@ Project-level defaults live in a top-level `[schedule]` block:
 ```toml
 [schedule]
 timezone = "UTC"          # default timezone for every pipeline's cron
-poll_interval_seconds = 15 # resident-loop cadence; not consumed by the one-shot `rocky tick`
+poll_interval_seconds = 15 # `rocky serve --scheduler` cadence; `--poll-interval-seconds` overrides it, and the one-shot `rocky tick` does not read it
 ```
 
 ---

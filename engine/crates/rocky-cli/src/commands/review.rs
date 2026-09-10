@@ -2658,11 +2658,14 @@ mod tests {
         let config_path = root.join("rocky.toml");
         std::fs::write(
             &config_path,
-            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\n\
              [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
              [pipeline.p.target.governance]\nauto_create_schemas = true\n\n\
              [pipeline.q]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
              [pipeline.q.target.governance]\nauto_create_schemas = true\n",
+                root.join("x.duckdb").display()
+            ),
         )
         .unwrap();
         let out = compute_review_queue(root, &config_path, &state_path, &models_dir)
@@ -2687,9 +2690,12 @@ mod tests {
         let config_path = root.join("rocky.toml");
         std::fs::write(
             &config_path,
-            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\n\
              [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
              [pipeline.p.target.governance]\nauto_create_schemas = true\n",
+                root.join("x.duckdb").display()
+            ),
         )
         .unwrap();
         config_path
@@ -2721,10 +2727,13 @@ mod tests {
         let config_path = root.join("rocky.toml");
         std::fs::write(
             &config_path,
-            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\n\
              [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
              [pipeline.p.target.governance]\nauto_create_schemas = true\n\n\
              [policy]\nversion = 1\ndefault_agent_effect = \"require_review\"\n",
+                root.join("x.duckdb").display()
+            ),
         )
         .unwrap();
 
@@ -2813,10 +2822,13 @@ mod tests {
         let config_path = root.join("rocky.toml");
         std::fs::write(
             &config_path,
-            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = '{}'\n\n\
              [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
              [pipeline.p.target.governance]\nauto_create_schemas = true\n\n\
              [policy]\nversion = 1\ndefault_agent_effect = \"require_review\"\n",
+                root.join("x.duckdb").display()
+            ),
         )
         .unwrap();
         touch_plan_file(root, "repl");

@@ -162,13 +162,20 @@ fn the_scaffold_refuses_to_compile_until_literal_escape_is_chosen_and_compiles_a
         return;
     }
     let stderr = String::from_utf8_lossy(&compiled.stderr);
+    // Both classes mean the same thing — the rlib set is not self-consistent —
+    // and both must be reported as the environment problem they are. Falling
+    // through to the scaffold message names `init_adapter.rs` as the cause
+    // with full confidence, which is how #1833 came to be filed against the
+    // template when the template was correct.
     assert!(
-        !is_crate_loading_failure(&stderr),
-        "rustc could not LOAD a dependency from {}. That is an environment \
-         problem, not a scaffold problem: the directory holds rlibs from more \
-         than one build and the newest-by-mtime pick is not self-consistent. \
-         Re-run after a full `cargo build --tests`, or clear the stale \
-         artifacts.\n--- rustc stderr ---\n{stderr}",
+        !is_crate_loading_failure(&stderr) && !is_duplicate_crate_failure(&stderr),
+        "rustc could not build against a self-consistent set of rlibs from {}. \
+         That is an environment problem, not a scaffold problem: the directory \
+         holds rlibs from more than one build — a second checkout sharing this \
+         target directory, or a build with a different feature set — and the \
+         newest-by-mtime pick takes one crate from each. Re-run after a full \
+         `cargo build --tests`, or clear the stale artifacts.\n\
+         --- rustc stderr ---\n{stderr}",
         deps.display(),
     );
     panic!(
@@ -228,6 +235,57 @@ fn is_crate_loading_failure(stderr: &str) -> bool {
     ["E0460", "E0461", "E0463", "E0464", "E0514"]
         .iter()
         .any(|code| stderr.contains(&format!("error[{code}]")))
+}
+
+/// rustc loaded TWO copies of one crate and the types from them do not unify.
+///
+/// This is the same inconsistent-`deps/` problem [`is_crate_loading_failure`]
+/// describes, arriving as a different error class. When one rlib is missing or
+/// unreadable rustc fails to LOAD it and emits E0463/E0464; when two are
+/// present and both load, nothing fails until a type from one meets a type
+/// from the other, which is an ordinary type error — **E0053** here, since the
+/// mismatch surfaces on a trait method's signature (#1833).
+///
+/// So the loading codes cannot catch it, and E0053 alone must not be treated
+/// as environmental: a scaffold that really does implement a `SqlDialect`
+/// method with the wrong signature emits E0053 too, and that is precisely the
+/// drift this test exists to catch. The two are separated by the shape of the
+/// message rather than the code.
+fn is_duplicate_crate_failure(stderr: &str) -> bool {
+    // rustc's own phrasing when two instances of one type meet: "expected
+    // `DateTime<Utc>`, found a different `DateTime<Utc>`". It says "a
+    // different" only for this situation.
+    if stderr.contains("found a different `") {
+        return true;
+    }
+    // The other spelling, when the two instances are reached by different
+    // paths: "expected `rocky_ir::ir::ColumnSelection`, found
+    // `ColumnSelection`". One type named twice, so the last path segment
+    // agrees while the paths do not. A template naming a genuinely wrong type
+    // produces two DIFFERENT last segments, which is why the comparison is on
+    // the segment and not on the whole path.
+    stderr.lines().any(|line| {
+        let Some((expected, found)) = expected_and_found(line) else {
+            return false;
+        };
+        expected != found && last_path_segment(expected) == last_path_segment(found)
+    })
+}
+
+/// The two backticked types out of a rustc `expected `X`, found `Y`` line.
+fn expected_and_found(line: &str) -> Option<(&str, &str)> {
+    let (_, rest) = line.split_once("expected `")?;
+    let (expected, rest) = rest.split_once('`')?;
+    let (_, rest) = rest.split_once("found `")?;
+    let (found, _) = rest.split_once('`')?;
+    Some((expected, found))
+}
+
+/// `rocky_ir::ir::ColumnSelection` -> `ColumnSelection`. Generic arguments are
+/// left alone: they carry the same ambiguity and comparing them whole is the
+/// conservative choice.
+fn last_path_segment(path: &str) -> &str {
+    path.rsplit("::").next().unwrap_or(path)
 }
 
 /// The directory holding this test binary — and every rlib the `rocky` binary
@@ -339,4 +397,74 @@ fn workspace_edition() -> &'static str {
             .expect("edition is a quoted string")
             .to_string()
     })
+}
+
+#[cfg(test)]
+mod classifier_tests {
+    use super::{is_crate_loading_failure, is_duplicate_crate_failure};
+
+    /// Real rustc output from a `deps/` holding two `chrono` rlibs — captured
+    /// from the failure #1833 reports, which this test binary produced against
+    /// a target directory shared with a second checkout.
+    const DUPLICATE_CHRONO: &str = "\
+error[E0053]: method `watermark_where` has an incompatible type for trait
+  --> /tmp/x/crates/rocky-probe/src/dialect.rs:96:25
+   |
+96 |         last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
+   |                         ^^^^^^ expected `DateTime<Utc>`, found a different `DateTime<Utc>`
+";
+
+    /// The other spelling, from the same run: one type reached by two paths.
+    const DUPLICATE_ROCKY_IR: &str = "\
+error[E0053]: method `select_clause` has an incompatible type for trait
+   |
+59 |         columns: &ColumnSelection,
+   |                  ^^^^^^^^^^^^^^^^ expected `rocky_ir::ir::ColumnSelection`, found `ColumnSelection`
+";
+
+    /// A GENUINE scaffold break: the template implements a method with the
+    /// wrong return type. Same error CODE as the two above, and it must NOT be
+    /// classified as an environment problem — this is the drift the whole test
+    /// exists to catch, and misclassifying it would report the suite as green
+    /// noise instead of a broken scaffold.
+    const REAL_SIGNATURE_DRIFT: &str = "\
+error[E0053]: method `literal_escape` has an incompatible type for trait
+   |
+42 |     fn literal_escape(&self) -> String {
+   |                                 ^^^^^^ expected `LiteralEscape`, found `String`
+";
+
+    #[test]
+    fn a_duplicate_crate_is_recognised_in_both_spellings() {
+        assert!(is_duplicate_crate_failure(DUPLICATE_CHRONO));
+        assert!(is_duplicate_crate_failure(DUPLICATE_ROCKY_IR));
+    }
+
+    #[test]
+    fn a_real_signature_drift_is_not_blamed_on_the_environment() {
+        assert!(
+            !is_duplicate_crate_failure(REAL_SIGNATURE_DRIFT),
+            "E0053 alone must not read as a duplicate-crate deps/: a scaffold \
+             that implements a trait method with the wrong type emits E0053 \
+             too, and that is the defect this test exists to catch"
+        );
+        assert!(!is_crate_loading_failure(REAL_SIGNATURE_DRIFT));
+    }
+
+    /// The loading codes keep their own arm — the two classes are separate
+    /// causes with one remedy, and neither detector should absorb the other.
+    #[test]
+    fn a_missing_rlib_is_still_a_loading_failure() {
+        let stderr = "error[E0463]: can't find crate for `rocky_ir`";
+        assert!(is_crate_loading_failure(stderr));
+        assert!(!is_duplicate_crate_failure(stderr));
+    }
+
+    /// A clean compile classifies as neither, so a passing run cannot be
+    /// diverted into the environment message.
+    #[test]
+    fn clean_output_classifies_as_neither() {
+        assert!(!is_crate_loading_failure(""));
+        assert!(!is_duplicate_crate_failure(""));
+    }
 }
