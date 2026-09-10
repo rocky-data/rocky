@@ -271,13 +271,7 @@ pub async fn run_serve(
         None
     };
 
-    let result = crate::api::serve(
-        state,
-        serve_config,
-        shutdown.clone(),
-        server_ready,
-    )
-    .await;
+    let result = crate::api::serve(state, serve_config, shutdown.clone(), server_ready).await;
 
     // The server has stopped (graceful shutdown, or a bind/runtime error). Ensure
     // the drain is raised so the scheduler stops evaluating, then wait for it to

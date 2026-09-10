@@ -5446,6 +5446,32 @@
           }
         ]
       },
+      "ConfigStatus": {
+        "description": "What happened when `rocky.toml` was read at server start.",
+        "oneOf": [
+          {
+            "description": "Read and parsed.",
+            "enum": [
+              "loaded"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "No `rocky.toml`. An ordinary fact about the project, not a failure.",
+            "enum": [
+              "absent"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Present, but could not be read or parsed. The server still started — `rocky serve` does not require a config — but the scheduler will skip every tick until it parses.",
+            "enum": [
+              "unreadable"
+            ],
+            "type": "string"
+          }
+        ]
+      },
       "ContainedModelOutput": {
         "description": "One model withheld from a run because an upstream failed (or was itself withheld) and failure-containment continued the disjoint subgraphs.\n\nThis is the blast radius of a failure — the run's `errors[]` name the root cause(s). A withheld model was **not built** this run: its target was left untouched (never rebuilt on a failed upstream's stale/missing output). This is model-graph containment, distinct from the quality pipeline's row-level `quarantine` surface.",
         "properties": {
@@ -19566,6 +19592,96 @@
         ],
         "type": "object"
       },
+      "SettingsOutput": {
+        "description": "The running server's posture, served by `GET /api/v1/settings`.\n\n**An allowlist, not a config dump.** Every field below is projected individually from a [`rocky_server::state::SettingsSnapshot`] of primitives taken when the process started. Nothing here is reached through `Debug` or serde of a `RockyConfig`: `AdapterConfig`'s `Debug` prints its `.extra` map, which is unbounded caller-supplied TOML, so a config that merely *passed through* this type would be a disclosure surface. Two fieldless enum labels are taken out of the config file and the config is dropped.\n\nNo secret appears, by construction — not the Bearer token, not `ROCKY_WEBHOOK_SECRET`. The token is reported as its name and scope; the webhook secret as whether it is usable.\n\n**API-only, deliberately.** There is no `rocky settings` verb, because this document describes *a server that is running* and a one-shot CLI invocation would have to invent one. [`ScheduleStatusOutput`] is the established precedent for a route with no CLI oracle.\n\n**Freshness.** Everything except `state_backend` and `concurrency_control` is fixed when the process starts and cannot change while it runs. Those two are read from `rocky.toml` at startup; the scheduler re-reads that file every tick, so a config edited afterwards is not reflected here.",
+        "properties": {
+          "allowed_hosts": {
+            "description": "Extra `Host` header values the UI guard accepts.\n\nThis is what is **enforced**, not what was typed: `--allowed-host` is only wired into a guard when `--ui` is on, so this is `[]` whenever `ui` is `false`. Reporting the raw flag list would claim a guard that is not running.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "allowed_origins": {
+            "description": "The CORS allowlist. Empty means same-origin only.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "bind_host": {
+            "description": "The host the listener is bound to, verbatim (`127.0.0.1`, `0.0.0.0`, …).\n\nThe same `String` `ServeConfig` binds — `serve` lends one value to both, so this cannot name a host the server is not actually on.",
+            "type": "string"
+          },
+          "concurrency_control": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConcurrencyControl"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`[state] concurrency_control` as read at server start. `null` on the same condition as `state_backend`."
+          },
+          "config_status": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ConfigStatus"
+              }
+            ],
+            "description": "What happened when `rocky.toml` was read at startup.\n\nCarried so a `null` backend is explainable: a project with no config and a project whose config is broken are different facts, and no other HTTP route distinguishes them today."
+          },
+          "scheduler": {
+            "description": "Whether a resident reconciler is running (`--scheduler`).",
+            "type": "boolean"
+          },
+          "state_backend": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StateBackend"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`[state] backend` as read at server start. `null` when there was no readable config — `config_status` says which."
+          },
+          "token": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TokenSettings"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The configured Bearer token, as its name and scope — never its value.\n\n`null` means **no token is configured**, which the server permits only on a loopback bind (`api::serve` refuses to bind a non-loopback host with no auth). That is the most exposure-relevant answer this route gives, so it is a distinguishable `null` rather than a token named \"none\"."
+          },
+          "ui": {
+            "description": "Whether the embedded browser UI is served at `/ui/` (`--ui`).",
+            "type": "boolean"
+          },
+          "webhook_secret": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/WebhookSecretStatus"
+              }
+            ],
+            "description": "Whether `ROCKY_WEBHOOK_SECRET` can sign a webhook.\n\nReported even when `scheduler` is `false`, which is the point: it tells an operator what will happen when they turn the scheduler on."
+          }
+        },
+        "required": [
+          "allowed_hosts",
+          "allowed_origins",
+          "bind_host",
+          "config_status",
+          "scheduler",
+          "ui",
+          "webhook_secret"
+        ],
+        "type": "object"
+      },
       "Severity": {
         "description": "Severity level of a diagnostic.\n\nSerialized in PascalCase (`\"Error\"`, `\"Warning\"`, `\"Info\"`) to stay compatible with existing dagster fixtures and the hand-written `Severity` StrEnum in `integrations/dagster/src/dagster_rocky/types.py`.",
         "enum": [
@@ -21441,6 +21557,47 @@
         ],
         "type": "string"
       },
+      "TokenScopeLabel": {
+        "description": "The spellings `--token-scope` accepts.",
+        "oneOf": [
+          {
+            "description": "Every route, mutating included.",
+            "enum": [
+              "full"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Safe HTTP methods only; anything else is refused `403`.",
+            "enum": [
+              "read-only"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "TokenSettings": {
+        "description": "The configured Bearer token, described without disclosing it.",
+        "properties": {
+          "name": {
+            "description": "Always `default`. `rocky serve` holds exactly one token; the name exists so a future multi-token server does not have to change this shape.",
+            "type": "string"
+          },
+          "scope": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/TokenScopeLabel"
+              }
+            ],
+            "description": "What the token may do."
+          }
+        },
+        "required": [
+          "name",
+          "scope"
+        ],
+        "type": "object"
+      },
       "TraceModelEntry": {
         "description": "One model execution entry inside [`TraceOutput`]. `start_offset_ms` is the wall-clock offset from the run start; `lane` identifies the concurrency lane for Gantt rendering (entries on the same lane never overlap in time).",
         "properties": {
@@ -22161,6 +22318,32 @@
           }
         ],
         "description": "Supports both single-webhook and multi-webhook syntax per event.\n\nSingle: `[hook.webhooks.on_pipeline_start]` Multiple: `[[hook.webhooks.on_pipeline_start]]`"
+      },
+      "WebhookSecretStatus": {
+        "description": "Whether `ROCKY_WEBHOOK_SECRET` can actually sign a webhook.\n\nNamed by operator consequence rather than by error kind — the question this answers is \"what happens if I turn the scheduler on?\".",
+        "oneOf": [
+          {
+            "description": "Set, non-blank, readable. Webhook requests must carry a signature.",
+            "enum": [
+              "present"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Not set. On a loopback bind the webhook accepts UNSIGNED requests; on a non-loopback bind the route answers `404`.",
+            "enum": [
+              "absent"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Set, but blank or not valid UTF-8. `--scheduler` will refuse to start — the startup gate rejects both.",
+            "enum": [
+              "set_but_unusable"
+            ],
+            "type": "string"
+          }
+        ]
       },
       "WorkspaceBindingConfig": {
         "additionalProperties": false,
@@ -24006,6 +24189,28 @@
         "summary": "Queued webhook demands",
         "tags": [
           "schedule"
+        ]
+      }
+    },
+    "/api/v1/settings": {
+      "get": {
+        "description": "How this server is bound and what it will accept: bind host, the CORS allowlist, the `Host` values the UI guard accepts, whether the scheduler and the UI are on, whether `ROCKY_WEBHOOK_SECRET` can sign a webhook, and the token's scope. An allowlist, not a config dump — no secret appears, and nothing is reached through serde of `RockyConfig`. `webhook_secret` is reported even with the scheduler off, which is the point: it says what will happen when you turn the scheduler on. `state_backend` and `concurrency_control` are read from `rocky.toml` when the server starts and are `null` when there was no readable config — `config_status` says which. Everything else is fixed for the life of the process.",
+        "operationId": "getSettings",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettingsOutput"
+                }
+              }
+            },
+            "description": "The running server's posture. Never fails: every value was resolved at startup."
+          }
+        },
+        "summary": "Server posture",
+        "tags": [
+          "meta"
         ]
       }
     }

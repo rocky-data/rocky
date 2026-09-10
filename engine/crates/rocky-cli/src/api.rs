@@ -5953,7 +5953,12 @@ mod tests {
         let (_dir, state) = project_with_three_secrets();
         let value = serde_json::to_value(settings_output(&state)).unwrap();
 
-        let mut fields: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut fields: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         fields.sort_unstable();
 
         assert_eq!(
@@ -6020,7 +6025,11 @@ mod tests {
         );
 
         let body = serde_json::to_string(&settings_output(&state)).unwrap();
-        for secret in ["BEARER_SECRET_ABC", "WEBHOOK_SECRET_DEF", "CONFIG_SECRET_XYZ"] {
+        for secret in [
+            "BEARER_SECRET_ABC",
+            "WEBHOOK_SECRET_DEF",
+            "CONFIG_SECRET_XYZ",
+        ] {
             assert!(
                 !body.contains(secret),
                 "the settings document disclosed {secret}: {body}"
