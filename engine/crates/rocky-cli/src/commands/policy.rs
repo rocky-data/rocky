@@ -17,6 +17,7 @@
 //! cannot silently open a hole.
 
 use std::collections::BTreeSet;
+use std::io::{self, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -557,7 +558,7 @@ pub async fn run_policy_show(config_path: &Path, state_path: &Path, json: bool) 
     if json {
         print_json(&output)?;
     } else {
-        render_show_text(&output);
+        render_show_text(&mut io::stdout().lock(), &output)?;
     }
     Ok(())
 }
@@ -619,33 +620,47 @@ fn freeze_principal_text(f: &PolicyFreezeInForce) -> String {
 }
 
 /// Render the policy plane as a compact human-readable block.
-fn render_show_text(out: &PolicyRulesOutput) {
+///
+/// Writes to a sink rather than calling `println!` so a test can assert the
+/// whole block. #1874 lost two lines this way in two review rounds — a
+/// freeze's audit `plan_id`, and the wording that separates an unreadable
+/// marker from a deliberate both-principal freeze — because the byte-parity
+/// test pins JSON and nothing read the text at all. Rendering into a
+/// `Vec<u8>` reaches the branches a binary test cannot set up cheaply: an
+/// unreadable marker, a `local_mirror` ledger, and a plane with no `[policy]`
+/// block.
+fn render_show_text<W: Write>(w: &mut W, out: &PolicyRulesOutput) -> io::Result<()> {
     if out.configured {
-        println!("policy: [policy] version {}", out.policy_version);
+        writeln!(w, "policy: [policy] version {}", out.policy_version)?;
     } else {
-        println!("policy: default posture (no [policy] block in rocky.toml)");
+        writeln!(
+            w,
+            "policy: default posture (no [policy] block in rocky.toml)"
+        )?;
     }
-    println!(
+    writeln!(
+        w,
         "default agent effect: {}",
         serde_plain(&out.default_agent_effect)
-    );
-    println!("rules: {}", out.rules.len());
+    )?;
+    writeln!(w, "rules: {}", out.rules.len())?;
     for rule in &out.rules {
-        print!(
+        write!(
+            w,
             "  #{}  {}  {}  {}  {}",
             rule.id,
             serde_plain(&rule.principal),
             serde_plain(&rule.capability),
             serde_plain(&rule.effect),
             scope_text(&rule.scope)
-        );
+        )?;
         if let Some(b) = &rule.autonomy_budget {
-            print!("  budget={}/{}", b.failures, b.window);
+            write!(w, "  budget={}/{}", b.failures, b.window)?;
         }
         if !rule.verify_after.is_empty() {
-            print!("  verify_after={}", rule.verify_after.join(","));
+            write!(w, "  verify_after={}", rule.verify_after.join(","))?;
         }
-        println!();
+        writeln!(w)?;
     }
     // "recorded" not "in force": with no `[policy]` block the gate returns
     // NotConfigured before it reads a freeze source, so the list would be a
@@ -656,35 +671,39 @@ fn render_show_text(out: &PolicyRulesOutput) {
     } else {
         "freezes in force (none: no [policy] block, so nothing is enforced)"
     };
-    println!("{}: {}", heading, out.freezes.len());
+    writeln!(w, "{}: {}", heading, out.freezes.len())?;
     for f in &out.freezes {
         let principal = freeze_principal_text(f);
         let since = f
             .since
             .map(|t| t.to_rfc3339())
             .unwrap_or_else(|| "-".to_string());
-        print!(
+        write!(
+            w,
             "  {}  {}  {}  since {}  reason: {}",
             f.source, principal, f.scope, since, f.reason
-        );
+        )?;
         if let Some(id) = &f.freeze_id {
-            print!("  id={id}");
+            write!(w, "  id={id}")?;
         }
         if let Some(plan) = &f.plan_id {
-            print!("  plan={plan}");
+            write!(w, "  plan={plan}")?;
         }
-        println!();
+        writeln!(w)?;
     }
-    println!(
+    writeln!(
+        w,
         "freeze sources: ledger {}, markers {}",
         out.freeze_sources.ledger, out.freeze_sources.markers
-    );
+    )?;
     if out.freeze_sources.ledger == "local_mirror" {
-        println!(
+        writeln!(
+            w,
             "  note: [state] is a remote backend. The ledger above is the local mirror; the \
 remote authority was not downloaded, so a freeze recorded by another pod may be missing."
-        );
+        )?;
     }
+    Ok(())
 }
 
 /// Render the scenario results as a compact pass/fail report.
@@ -2600,5 +2619,183 @@ expect = \"allow\"
             ..unreadable
         };
         assert_eq!(freeze_principal_text(&deliberate), "agent");
+    }
+
+    /// #1879. The text renderer, rendered.
+    fn show_text(out: &PolicyRulesOutput) -> String {
+        let mut buf = Vec::new();
+        render_show_text(&mut buf, out).expect("a Vec sink never fails");
+        String::from_utf8(buf).expect("the renderer writes UTF-8")
+    }
+
+    /// A plane with a `[policy]` block, one rule and one ledger freeze.
+    /// Every optional field is set, so a dropped one shows up as a missing
+    /// column rather than as an equal-but-shorter line.
+    fn populated_plane() -> PolicyRulesOutput {
+        PolicyRulesOutput {
+            version: "1".to_string(),
+            command: "policy_show".to_string(),
+            configured: true,
+            policy_version: 3,
+            default_agent_effect: PolicyEffect::RequireReview,
+            rules: vec![PolicyRuleEntry {
+                id: 0,
+                principal: PolicyPrincipal::Agent,
+                capability: PolicyCapability::Apply,
+                effect: PolicyEffect::Deny,
+                scope: PolicyRuleScopeOutput {
+                    any: false,
+                    models: vec!["orders".to_string()],
+                    tags: [("tier".to_string(), "gold".to_string())]
+                        .into_iter()
+                        .collect(),
+                    classifications: Vec::new(),
+                    exclude_classifications: Vec::new(),
+                    contracted: None,
+                    layer: None,
+                    max_downstreams: None,
+                },
+                verify_after: vec!["freshness".to_string(), "row_count".to_string()],
+                autonomy_budget: Some(PolicyAutonomyBudgetOutput {
+                    failures: 3,
+                    window: "24h".to_string(),
+                }),
+            }],
+            freezes: vec![PolicyFreezeInForce {
+                source: "ledger".to_string(),
+                principal: Some(PolicyPrincipal::Human),
+                scope: "any".to_string(),
+                reason: "incident 4412".to_string(),
+                since: Some(
+                    chrono::DateTime::parse_from_rfc3339("2026-09-01T12:00:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                ),
+                plan_id: Some("plan-9".to_string()),
+                freeze_id: Some("fz-1".to_string()),
+            }],
+            freeze_sources: PolicyFreezeSources {
+                ledger: "read".to_string(),
+                markers: "read".to_string(),
+            },
+        }
+    }
+
+    /// #1879. The whole block, asserted as bytes.
+    ///
+    /// Round one of the #1874 review found the text dropped a freeze's audit
+    /// `plan_id`. The byte-parity test pins JSON, so nothing noticed, and a
+    /// substring assertion would not have either — the line was present and
+    /// merely shorter. This compares the entire rendering, which is the only
+    /// assertion shape a dropped column cannot survive.
+    #[test]
+    fn the_whole_block_carries_every_authored_field() {
+        let rendered = show_text(&populated_plane());
+        assert_eq!(
+            rendered,
+            "policy: [policy] version 3\n\
+             default agent effect: require_review\n\
+             rules: 1\n\
+             \x20 #0  agent  apply  deny  models=orders tags.tier=gold  budget=3/24h  \
+             verify_after=freshness,row_count\n\
+             freezes in force: 1\n\
+             \x20 ledger  human  any  since 2026-09-01T12:00:00+00:00  reason: incident 4412  \
+             id=fz-1  plan=plan-9\n\
+             freeze sources: ledger read, markers read\n",
+        );
+    }
+
+    /// #1879 + round two of #1874. An unreadable marker widens to both
+    /// principals so it fails closed; the text must not present that as a
+    /// marker that deliberately froze both.
+    ///
+    /// [`an_unreadable_marker_does_not_read_as_a_deliberate_both_principal_freeze`]
+    /// pins the label. This pins that the renderer actually puts it on the
+    /// line — the two are separable, and only one of them was covered.
+    #[test]
+    fn an_unreadable_marker_says_so_in_the_rendered_block() {
+        let mut plane = populated_plane();
+        plane.rules.clear();
+        plane.freezes = vec![PolicyFreezeInForce {
+            source: "marker".to_string(),
+            principal: None,
+            scope: "any".to_string(),
+            reason: "unreadable freeze marker body (expected value at line 1)".to_string(),
+            since: None,
+            plan_id: None,
+            freeze_id: Some("marker-1".to_string()),
+        }];
+
+        let rendered = show_text(&plane);
+        assert_eq!(
+            rendered,
+            "policy: [policy] version 3\n\
+             default agent effect: require_review\n\
+             rules: 0\n\
+             freezes in force: 1\n\
+             \x20 marker  both (marker body unreadable)  any  since -  reason: unreadable \
+             freeze marker body (expected value at line 1)  id=marker-1\n\
+             freeze sources: ledger read, markers read\n",
+        );
+    }
+
+    /// #1879. A remote `[state]` backend makes the freeze list non-exhaustive,
+    /// and the note is the only place the text says so. It sits behind a
+    /// string comparison on `freeze_sources.ledger`, which no binary test
+    /// reaches without standing up a remote backend.
+    #[test]
+    fn a_local_mirror_ledger_renders_the_completeness_note() {
+        let mut plane = populated_plane();
+        plane.rules.clear();
+        plane.freezes.clear();
+        plane.freeze_sources = PolicyFreezeSources {
+            ledger: "local_mirror".to_string(),
+            markers: "read".to_string(),
+        };
+
+        let rendered = show_text(&plane);
+        assert_eq!(
+            rendered,
+            "policy: [policy] version 3\n\
+             default agent effect: require_review\n\
+             rules: 0\n\
+             freezes in force: 0\n\
+             freeze sources: ledger local_mirror, markers read\n\
+             \x20 note: [state] is a remote backend. The ledger above is the local mirror; \
+             the remote authority was not downloaded, so a freeze recorded by another pod \
+             may be missing.\n",
+        );
+
+        let read = show_text(&populated_plane());
+        assert!(
+            !read.contains("note:"),
+            "a fully-read ledger must not carry the incompleteness note: {read}"
+        );
+    }
+
+    /// #1879. With no `[policy]` block the gate answers `NotConfigured`
+    /// before it reads a freeze source, so a bare "freezes in force: 0" would
+    /// read as a plane that was checked and found clean. The heading says
+    /// nothing is enforced instead.
+    #[test]
+    fn a_plane_with_no_policy_block_says_nothing_is_enforced() {
+        let mut plane = populated_plane();
+        plane.configured = false;
+        plane.rules.clear();
+        plane.freezes.clear();
+        plane.freeze_sources = PolicyFreezeSources {
+            ledger: "not_consulted".to_string(),
+            markers: "not_consulted".to_string(),
+        };
+
+        let rendered = show_text(&plane);
+        assert_eq!(
+            rendered,
+            "policy: default posture (no [policy] block in rocky.toml)\n\
+             default agent effect: require_review\n\
+             rules: 0\n\
+             freezes in force (none: no [policy] block, so nothing is enforced): 0\n\
+             freeze sources: ledger not_consulted, markers not_consulted\n",
+        );
     }
 }
