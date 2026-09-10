@@ -1294,9 +1294,15 @@ fn route_table() -> Vec<Route> {
                 Resp {
                     status: "503",
                     description: "The one `rocky.toml` read this route needs is already in \
-                         flight, or did not finish inside its deadline. Every other value \
-                         was resolved at startup; only `state_backend` and \
-                         `concurrency_control` need the file. Retry.",
+                         flight. Only `state_backend` and `concurrency_control` need the \
+                         file; every other value was resolved at startup. Retry.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                Resp {
+                    status: "504",
+                    description: "That read did not finish inside its deadline — usually a \
+                         `rocky.toml` that will not return, so a retry is unlikely to \
+                         help. Distinct from `503`, which is ordinary contention.",
                     body: Body::Component("ErrorEnvelope"),
                 },
                 Resp {

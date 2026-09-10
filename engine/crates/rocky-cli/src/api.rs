@@ -2172,14 +2172,19 @@ const SETTINGS_CONFIG_READ_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// # Why this is not read at startup
 ///
 /// Every other field in the document is a flag or an env var. These come from a
-/// file, and nothing on the path to `TcpListener::bind` reads a file today —
-/// `build_serve_state` does env and path work only, and `serve` does a
-/// state-store sweep. (The initial compile does read the config, but it runs on
-/// its own spawned task and does not gate the listener.) Reading it eagerly in
-/// `build_serve_state` would put a blocking full-file read *on* that path, so a
-/// `rocky.toml` that is a FIFO or sits on a stalled mount would stop the server
-/// binding at all. Loader *errors* are already tolerated; a read that never
-/// returns is not something tolerance catches.
+/// file, and on a plain `rocky serve` nothing on the path to
+/// `TcpListener::bind` reads one: `build_serve_state` does env and path work
+/// only, and `serve` does a state-store sweep. (The initial compile reads the
+/// config, but on its own spawned task, so it does not gate the listener.)
+/// Reading it eagerly in `build_serve_state` would put a blocking full-file
+/// read *on* that path, so a `rocky.toml` that is a FIFO or sits on a stalled
+/// mount would stop the server binding at all. Loader *errors* are already
+/// tolerated; a read that never returns is not something tolerance catches.
+///
+/// The exception, which this does not fix and did not introduce: `--scheduler`
+/// without an explicit `--poll-interval` calls `resolved_poll_interval` before
+/// `api::serve`, and that loads the config synchronously. On that path a stuck
+/// `rocky.toml` already blocks the bind.
 ///
 /// # Why it is bounded
 ///
@@ -2238,20 +2243,25 @@ async fn resolve_config_labels(
         Ok(Ok(labels)) => Ok(labels),
         // A panicked read is a task failure, not a verdict about the config —
         // reporting it as `config_status: unreadable` would claim we read the
-        // file and found it bad.
-        Ok(Err(e)) => Err(ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            format!("the settings config read panicked: {e}"),
-            None,
-        )),
+        // file and found it bad. `internal_error` is the stable token for this.
+        Ok(Err(e)) => Err(ApiError::internal(format!(
+            "the settings config read panicked: {e}"
+        ))),
+        // OUR deadline, not contention — and deliberately not `engine_busy`
+        // with a `Retry-After`. A read that blew the deadline is usually a
+        // `rocky.toml` that will never return, so telling the caller to retry
+        // in five seconds promises something that cannot happen. Same split the
+        // sample route makes: contention is `503 engine_busy`, its own deadline
+        // is a `504` with no retry hint.
         Err(_) => Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "engine_busy",
-            "reading rocky.toml did not finish in time",
-            Some("check that rocky.toml is a regular file on responsive storage"),
-        )
-        .retry_after(5)),
+            StatusCode::GATEWAY_TIMEOUT,
+            "settings_config_timeout",
+            format!("reading rocky.toml did not finish within {SETTINGS_CONFIG_READ_TIMEOUT:?}"),
+            Some(
+                "check that rocky.toml is a regular file on responsive storage; \
+                 every other field on this route is unaffected",
+            ),
+        )),
     }
 }
 

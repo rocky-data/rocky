@@ -274,10 +274,12 @@ pub struct SettingsSnapshot {
     /// asked and then fixed for the life of the process.
     ///
     /// Deliberately not resolved in `build_serve_state`. Everything else here
-    /// is a flag or an env var, but these come from reading `rocky.toml`, and
-    /// nothing on the path to `TcpListener::bind` reads a file. (The initial
-    /// compile reads the config, but on its own spawned task, so it does not
-    /// gate the listener.) Doing the read eagerly would put a blocking
+    /// is a flag or an env var, but these come from reading `rocky.toml`, and on
+    /// a plain `rocky serve` nothing on the path to `TcpListener::bind` reads a
+    /// file. (The initial compile reads the config, but on its own spawned
+    /// task, so it does not gate the listener; and `--scheduler` without an
+    /// explicit poll interval already reads it before binding.) Doing the read
+    /// eagerly would put a blocking
     /// full-file read *on* that path, so a `rocky.toml` that is a FIFO or sits
     /// on a stalled mount would hang startup — a read-only settings route
     /// turning into the reason the server never binds. Ordinary loader errors

@@ -614,12 +614,13 @@ fn build_serve_state(
         // exactly what an operator needs before turning the scheduler on.
         webhook_secret: webhook_secret_posture(),
         // Left unresolved on purpose. Reading `rocky.toml` here would put a
-        // blocking full-file read on the path to `TcpListener::bind`, which
-        // reads no file today, so a FIFO or a stalled mount would stop the
-        // server binding at all. (The initial compile does read the config, but
-        // on its own spawned task, so it never gates the listener.) The
-        // settings route resolves it on first ask, under a permit and a
-        // deadline.
+        // blocking full-file read on the path to `TcpListener::bind`, which on
+        // a plain `rocky serve` reads no file, so a FIFO or a stalled mount
+        // would stop the server binding at all. (The initial compile reads the
+        // config on its own spawned task, so it never gates the listener;
+        // `--scheduler` without an explicit poll interval already reads it
+        // before binding.) The settings route resolves it on first ask, under a
+        // permit and a deadline.
         config_labels: std::sync::OnceLock::new(),
     };
 
@@ -942,8 +943,10 @@ mod tests {
 
     /// **Red team.** `build_serve_state` must not read `rocky.toml`.
     ///
-    /// It sits on the path to `TcpListener::bind`, and nothing on that path
-    /// reads a file today. An eager read for two report fields would let a
+    /// It sits on the path to `TcpListener::bind`, and on a plain `rocky serve`
+    /// nothing on that path reads a file. (`--scheduler` without an explicit
+    /// `--poll-interval` does, via `resolved_poll_interval` — inherited, and
+    /// not something this changes.) An eager read for two report fields would let a
     /// `rocky.toml` that is a FIFO or sits on a stalled mount stop the server
     /// binding at all. Loader ERRORS are tolerated; a read that never returns
     /// is not something tolerance catches.
