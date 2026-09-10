@@ -413,7 +413,22 @@ pub fn declarative_check_snapshot(
     models_dir: &Path,
     model: &str,
 ) -> Result<DeclarativeCheckSnapshot> {
-    let all_models = load_all_models(models_dir, None)?;
+    snapshot_from_loader(model, || load_all_models(models_dir, None))
+}
+
+/// [`declarative_check_snapshot`] with the load supplied.
+///
+/// The property this whole change is about — **one** load, not two — is the
+/// ABSENCE of a second call, and no test can observe an absence directly. So
+/// the load is a parameter: a test hands in a loader that answers differently
+/// each time it is called, and a second call becomes visible as a count and a
+/// digest that disagree. That is the defect, reproduced on demand.
+#[cfg(feature = "duckdb")]
+fn snapshot_from_loader(
+    model: &str,
+    mut load: impl FnMut() -> Result<Vec<rocky_core::models::Model>>,
+) -> Result<DeclarativeCheckSnapshot> {
+    let all_models = load()?;
     let found = all_models
         .iter()
         .find(|loaded| loaded.config.name == model)
@@ -1161,50 +1176,55 @@ mod tests {
     /// zero checks. Both internally consistent; the digest comparison green,
     /// because it was taken after the edit.
     ///
-    /// Exhibits the race rather than asserting the shape: the sidecar is
-    /// rewritten to zero checks between the two derivations the OLD code made,
-    /// and the assertion is that the snapshot's two halves still agree.
+    /// Exhibits the race rather than asserting the shape. The loader is a
+    /// parameter, and this one ANSWERS DIFFERENTLY on its second call — the
+    /// edit, landing exactly in the window. A single-load implementation
+    /// cannot see the second answer; a two-load one reports the first count
+    /// beside a digest of the second set, which is the bug.
     #[test]
-    fn the_count_and_the_digest_come_from_one_read() {
-        let (_tmp, models) = project("");
-
-        // What the old code did: count, then (after other work) digest.
-        let count_before = declarative_test_count(&models, "orders").expect("count");
-        assert_eq!(
-            count_before, 1,
-            "PRECONDITION: the project declares one check"
-        );
-
-        // The edit that lands in the window.
+    fn a_second_load_would_be_visible_and_there_is_not_one() {
+        let (_tmp, with_check) = project("");
+        let (_tmp2, without_check) = project("");
         std::fs::write(
-            models.join("orders.toml"),
+            without_check.join("orders.toml"),
             "name = \"orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
              [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"orders\"\n",
         )
         .expect("rewrite sidecar");
 
-        let digest_after = declarative_check_digest(&models, "orders").expect("digest");
-        let count_after = declarative_test_count(&models, "orders").expect("count");
+        // The two states the race straddles, and they must actually differ.
+        let before = declarative_test_count(&with_check, "orders").expect("count");
+        let after = declarative_test_count(&without_check, "orders").expect("count");
         assert_eq!(
-            count_after, 0,
-            "PRECONDITION: the edit really did remove the check, else the two \
-             derivations agree for a reason that is not the fix"
+            (before, after),
+            (1, 0),
+            "PRECONDITION: the edit changes the set"
+        );
+        let digest_after = declarative_check_digest(&without_check, "orders").expect("digest");
+
+        let mut calls = 0;
+        let snapshot = super::snapshot_from_loader("orders", || {
+            calls += 1;
+            // First call: the pre-edit directory. Every call after: post-edit.
+            let dir = if calls == 1 {
+                &with_check
+            } else {
+                &without_check
+            };
+            super::load_all_models(dir, None)
+        })
+        .expect("snapshot");
+
+        assert_eq!(
+            snapshot.count, 1,
+            "the count is the one the single load saw"
         );
         assert_ne!(
-            digest_after,
-            declarative_check_digest(&_tmp.path().join("nonexistent"), "orders")
-                .unwrap_or_default(),
-            "PRECONDITION: the post-edit digest is a real value"
-        );
-
-        // The snapshot cannot straddle the edit: whatever it reads, both
-        // halves read it. Taken now, it must describe the edited state.
-        let snapshot = super::declarative_check_snapshot(&models, "orders").expect("snapshot");
-        assert_eq!(snapshot.count, 0, "the count describes the set it pinned");
-        assert_eq!(
             snapshot.digest, digest_after,
-            "and the digest is the one that set produces"
+            "and the digest is NOT the post-edit set's — a second load here \
+             would pin a set the reported count does not describe"
         );
+        assert_eq!(calls, 1, "one load, which is the whole fix");
     }
 
     /// The other direction, and the one that makes the test above mean
