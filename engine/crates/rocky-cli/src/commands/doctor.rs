@@ -876,11 +876,7 @@ fn spool_check(config_path: &Path, suggestions: &mut Vec<String>) -> Option<Heal
     use rocky_core::schedule::spool;
 
     let start = Instant::now();
-    let rocky_dir = config_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-        .join(".rocky");
+    let rocky_dir = crate::commands::scheduler::rocky_dir_for_config(config_path);
     let dir = spool::spool_dir(&rocky_dir);
 
     // Does the spool exist at all? `read_dir` answers NotFound for both "never
@@ -978,11 +974,7 @@ fn scheduler_check(
     }
 
     let now = chrono::Utc::now();
-    let rocky_dir = config_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-        .join(".rocky");
+    let rocky_dir = crate::commands::scheduler::rocky_dir_for_config(config_path);
 
     let mut status = HealthStatus::Healthy;
     let mut messages: Vec<String> = Vec::new();
