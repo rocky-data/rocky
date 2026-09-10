@@ -14233,7 +14233,10 @@ pub(crate) enum AbortCause {
     FailFast,
     /// `[execution] error_rate_abort_pct` — too many of the completions so far
     /// failed. Both numbers are carried so the log says what tripped it.
-    ErrorRate { observed_pct: u32, threshold_pct: u32 },
+    ErrorRate {
+        observed_pct: u32,
+        threshold_pct: u32,
+    },
 }
 
 /// What the caller must do after a drain collected one completion.
