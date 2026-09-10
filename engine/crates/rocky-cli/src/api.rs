@@ -5971,6 +5971,14 @@ mod tests {
 
     // --- GET /api/v1/settings -------------------------------------------
 
+    /// The three secrets the containment tests configure, each paired with a
+    /// name to report INSTEAD of its value.
+    const SECRETS: [(&str, &str); 3] = [
+        ("the Bearer token", "BEARER_SECRET_ABC"),
+        ("the webhook secret", "WEBHOOK_SECRET_DEF"),
+        ("a credential from the config", "CONFIG_SECRET_XYZ"),
+    ];
+
     /// A project whose config carries a credential, plus a Bearer token and a
     /// webhook secret — three real secrets, in the three places a settings
     /// route could leak one from.
@@ -6206,14 +6214,10 @@ mod tests {
             let status = resp.status();
             let body = resp.text().await.unwrap();
 
-            for secret in [
-                "BEARER_SECRET_ABC",
-                "WEBHOOK_SECRET_DEF",
-                "CONFIG_SECRET_XYZ",
-            ] {
+            for (label, secret) in SECRETS {
                 assert!(
                     !body.contains(secret),
-                    "GET {path} answered {status} and disclosed {secret}:\n{body}"
+                    "GET {path} answered {status} and disclosed {label}"
                 );
             }
             checked += 1;
@@ -6320,14 +6324,14 @@ mod tests {
             crate::commands::serve::config_posture(state.config_path.as_deref()),
         ))
         .unwrap();
-        for secret in [
-            "BEARER_SECRET_ABC",
-            "WEBHOOK_SECRET_DEF",
-            "CONFIG_SECRET_XYZ",
-        ] {
+        // Named, never printed. The obvious spelling interpolates the secret
+        // AND the body into the failure message, so a containment test that
+        // fails writes the value into the log it exists to keep it out of.
+        // CodeQL flags it as cleartext logging, and is right to.
+        for (label, secret) in SECRETS {
             assert!(
                 !body.contains(secret),
-                "the settings document disclosed {secret}: {body}"
+                "the settings document disclosed {label}"
             );
         }
     }
