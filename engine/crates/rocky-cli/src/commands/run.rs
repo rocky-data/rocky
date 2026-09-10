@@ -1930,7 +1930,16 @@ fn copy_completeness(progress: &RunProgress) -> CopyCompleteness {
         .map(|t| t.table_key.as_str())
         .collect();
     let Some(planned) = progress.planned_tables.as_ref() else {
-        return if succeeded.len() < progress.total_tables {
+        // Counts ENTRIES, not distinct keys — the arithmetic that shipped.
+        // `succeeded.len()` would dedup, and the pre-v8 inline-header
+        // fallback (`get_run_progress` keeps the header's own `tables`) can
+        // still hand back a repeated `table_key`.
+        let copied = progress
+            .tables
+            .iter()
+            .filter(|t| t.status == rocky_core::state::TableStatus::Success)
+            .count();
+        return if copied < progress.total_tables {
             CopyCompleteness::Incomplete
         } else {
             CopyCompleteness::CompleteByCount
@@ -16263,13 +16272,14 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
+        let planned = [
+            "wh.staging_p1__acme.orders".to_string(),
+            "wh.staging_p1__acme.items".to_string(),
+        ];
         store
-            .init_run_progress("run-1", &planned_keys(2), Some(&scope))
+            .init_run_progress("run-1", &planned, Some(&scope))
             .unwrap();
-        for (index, key) in ["wh.staging_p1__acme.orders", "wh.staging_p1__acme.items"]
-            .iter()
-            .enumerate()
-        {
+        for (index, key) in planned.iter().enumerate() {
             store
                 .record_table_progress("run-1", &table_entry(index, key, TableStatus::Success))
                 .unwrap();
@@ -17322,6 +17332,20 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             "every planned table is recorded: {:?}",
             progress.tables
         );
+        assert_eq!(
+            progress
+                .tables
+                .iter()
+                .map(|t| t.table_key.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            progress
+                .planned_tables
+                .clone()
+                .unwrap()
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the recorded keys are the planned keys (#1674)"
+        );
         assert_eq!(progress.tables[0].table_key, "cat.staging.orders");
         assert_eq!(progress.tables[0].status, TableStatus::Success);
         assert_eq!(
@@ -17907,7 +17931,11 @@ auto_create_schemas = true
             );
             let store = StateStore::open(&state_path).unwrap();
             store
-                .init_run_progress("run-branch", &planned_keys(1), Some(&scope))
+                .init_run_progress(
+                    "run-branch",
+                    &["warehouse.branch__feature.orders".to_string()],
+                    Some(&scope),
+                )
                 .unwrap();
             store
                 .record_table_progress(
@@ -18066,7 +18094,11 @@ auto_create_schemas = true
             );
             let store = StateStore::open(&state_path).unwrap();
             store
-                .init_run_progress("run-crashed", &planned_keys(1), Some(&scope))
+                .init_run_progress(
+                    "run-crashed",
+                    &["warehouse.staging_p2__acme.orders".to_string()],
+                    Some(&scope),
+                )
                 .unwrap();
             store
                 .record_table_progress(
