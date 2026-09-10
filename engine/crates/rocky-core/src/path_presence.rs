@@ -17,7 +17,75 @@
 //! the never-created chain and stays absent; a dangling or unreadable one is
 //! not missing, it is broken, and the answer is a refusal.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// What one filesystem entry is, as far as this module needs to know.
+///
+/// Not [`std::fs::Metadata`]: that type has no public constructor, so a test
+/// double cannot produce one. Three variants is everything the classification
+/// below branches on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    /// A symlink, inspected without following it.
+    Symlink,
+    /// A directory.
+    Directory,
+    /// Anything else — a regular file, a socket, a device.
+    Other,
+}
+
+/// The four filesystem questions this module asks, behind a seam.
+///
+/// Every review of the path-probe class was read-only static tracing, because
+/// the states it exists for cannot be produced on a CI runner: an ancestor
+/// that denies search on a filesystem reporting it as `NotFound`, and an entry
+/// replaced between two probes. Both are now expressible against a scripted
+/// implementation (#1827).
+///
+/// The methods are deliberately one-to-one with a `std::fs` call, so
+/// [`RealFs`] is a transcription and the double cannot drift from it by
+/// modelling something the real one does not do.
+pub trait FsProbe {
+    /// [`std::fs::symlink_metadata`] — stats the entry itself, never the
+    /// target of a link.
+    fn entry_kind(&self, path: &Path) -> std::io::Result<EntryKind>;
+    /// [`std::fs::read_link`] — the immediate hop a link names.
+    fn read_link(&self, path: &Path) -> std::io::Result<PathBuf>;
+    /// Whether [`Path::canonicalize`] succeeds. The question is only ever
+    /// "does this resolve", so the resolved path is not returned.
+    fn resolves(&self, path: &Path) -> bool;
+    /// `symlink_metadata(dir/".")` — succeeds iff this process may look inside
+    /// `dir`. See [`searchable_or_present`] for why `dir/.` is the probe.
+    fn is_searchable(&self, dir: &Path) -> std::io::Result<()>;
+}
+
+/// The real filesystem. The only implementation outside tests.
+pub struct RealFs;
+
+impl FsProbe for RealFs {
+    fn entry_kind(&self, path: &Path) -> std::io::Result<EntryKind> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        Ok(if metadata.is_symlink() {
+            EntryKind::Symlink
+        } else if metadata.is_dir() {
+            EntryKind::Directory
+        } else {
+            EntryKind::Other
+        })
+    }
+
+    fn read_link(&self, path: &Path) -> std::io::Result<PathBuf> {
+        std::fs::read_link(path)
+    }
+
+    fn resolves(&self, path: &Path) -> bool {
+        path.canonicalize().is_ok()
+    }
+
+    fn is_searchable(&self, dir: &Path) -> std::io::Result<()> {
+        std::fs::symlink_metadata(dir.join(".")).map(|_| ())
+    }
+}
 
 /// What a `NotFound` from an operation on a path actually means.
 pub enum PathPresence {
@@ -60,6 +128,15 @@ pub enum PathPresence {
 /// The detail sentences are deliberately entry-neutral: the same helper backs
 /// a file read and a directory read, so nothing here says "file".
 pub fn classify_not_found(path: &Path) -> PathPresence {
+    classify_not_found_with(path, &RealFs)
+}
+
+/// [`classify_not_found`] against a supplied [`FsProbe`].
+///
+/// The whole classification runs on the seam, so a scripted probe can produce
+/// the states a CI runner cannot — including a different answer on a later
+/// call, which is how the replace-between-probes race becomes testable.
+pub fn classify_not_found_with(path: &Path, fs: &dyn FsProbe) -> PathPresence {
     // A trailing separator makes the OS resolve the last component AS A
     // DIRECTORY, so `symlink_metadata("models/")` follows the link it was
     // supposed to inspect and reports a dangling one as `NotFound` — the
@@ -67,12 +144,12 @@ pub fn classify_not_found(path: &Path) -> PathPresence {
     // drops the trailing separator (and any `.` segments) without touching
     // the filesystem, so the stat below lands on the entry itself.
     let path = path.components().as_path();
-    match std::fs::symlink_metadata(path) {
+    match fs.entry_kind(path) {
         // Nothing at this path itself. Whether that is ABSENCE depends on what
         // the path runs through — a dangling ancestor produces exactly this
         // `NotFound`, and it is not absence.
         Err(stat_error) if stat_error.kind() == std::io::ErrorKind::NotFound => {
-            classify_ancestors(path)
+            classify_ancestors(path, fs)
         }
         // The path could not even be stat-ed, so absence is unproven.
         // Refusing is the fail-closed answer.
@@ -83,8 +160,8 @@ pub fn classify_not_found(path: &Path) -> PathPresence {
         // `read_link` names the immediate hop — the link as written, which is
         // what the operator has to go fix — so the message says the target
         // cannot be RESOLVED rather than claiming that one name is missing.
-        Ok(metadata) if metadata.is_symlink() => PathPresence::Present {
-            detail: match std::fs::read_link(path) {
+        Ok(EntryKind::Symlink) => PathPresence::Present {
+            detail: match fs.read_link(path) {
                 Ok(target) => format!(
                     "it is a symlink to '{}', which cannot be resolved",
                     target.display()
@@ -97,7 +174,7 @@ pub fn classify_not_found(path: &Path) -> PathPresence {
         // An entry that is not a symlink is here, yet the read said it was
         // missing — it was replaced under us between the two calls. Not
         // absence either way.
-        Ok(_) => PathPresence::Present {
+        Ok(EntryKind::Directory | EntryKind::Other) => PathPresence::Present {
             detail: "an entry exists at this path, but reading it reported nothing there"
                 .to_string(),
         },
@@ -128,7 +205,7 @@ pub fn classify_not_found(path: &Path) -> PathPresence {
 /// reports `NotADirectory`, not `NotFound`, so a caller rarely reaches here
 /// with one. It is kept because "rarely" is not "never", and the fail-closed
 /// answer costs nothing.
-fn classify_ancestors(path: &Path) -> PathPresence {
+fn classify_ancestors(path: &Path, fs: &dyn FsProbe) -> PathPresence {
     let mut ancestor = path.parent();
     while let Some(dir) = ancestor {
         // `Path::parent("rocky.toml")` is `Some("")`, and a stat of `""` is
@@ -140,7 +217,7 @@ fn classify_ancestors(path: &Path) -> PathPresence {
         } else {
             dir
         };
-        match std::fs::symlink_metadata(dir) {
+        match fs.entry_kind(dir) {
             Err(stat_error) if stat_error.kind() == std::io::ErrorKind::NotFound => {
                 ancestor = dir.parent();
             }
@@ -152,12 +229,12 @@ fn classify_ancestors(path: &Path) -> PathPresence {
                     ),
                 };
             }
-            Ok(metadata) if metadata.is_symlink() => {
-                return if dir.canonicalize().is_ok() {
-                    searchable_or_present(dir)
+            Ok(EntryKind::Symlink) => {
+                return if fs.resolves(dir) {
+                    searchable_or_present(dir, fs)
                 } else {
                     PathPresence::Present {
-                        detail: match std::fs::read_link(dir) {
+                        detail: match fs.read_link(dir) {
                             Ok(target) => format!(
                                 "its ancestor directory '{}' is a symlink to '{}', which cannot \
                                  be resolved",
@@ -173,8 +250,8 @@ fn classify_ancestors(path: &Path) -> PathPresence {
                     }
                 };
             }
-            Ok(metadata) if metadata.is_dir() => return searchable_or_present(dir),
-            Ok(_) => {
+            Ok(EntryKind::Directory) => return searchable_or_present(dir, fs),
+            Ok(EntryKind::Other) => {
                 return PathPresence::Present {
                     detail: format!("its ancestor '{}' is not a directory", dir.display()),
                 };
@@ -201,9 +278,9 @@ fn classify_ancestors(path: &Path) -> PathPresence {
 /// `dir` before the check (Windows does) answers "searchable" for any
 /// directory that exists. There the masked case stays open; it is recorded
 /// here rather than claimed closed.
-fn searchable_or_present(dir: &Path) -> PathPresence {
-    match std::fs::symlink_metadata(dir.join(".")) {
-        Ok(_) => PathPresence::Absent,
+fn searchable_or_present(dir: &Path, fs: &dyn FsProbe) -> PathPresence {
+    match fs.is_searchable(dir) {
+        Ok(()) => PathPresence::Absent,
         Err(probe_error) => PathPresence::Present {
             detail: format!(
                 "its ancestor directory '{}' exists but cannot be searched: {probe_error}",
@@ -239,15 +316,23 @@ fn searchable_or_present(dir: &Path) -> PathPresence {
 /// (`rocky init` refuses to scaffold over it) — none folds it — which is what
 /// makes `true` the safe direction.
 pub fn entry_is_present(path: &Path) -> bool {
+    entry_is_present_with(path, &RealFs)
+}
+
+/// [`entry_is_present`] against a supplied [`FsProbe`] (#1827).
+pub fn entry_is_present_with(path: &Path, fs: &dyn FsProbe) -> bool {
     // No trailing-separator normalisation here, on purpose: a dangling link
     // spelled `models/` stats as `NotFound` and falls through to
     // `classify_not_found`, which normalises before it decides. Doing it
     // twice would let a reviewer believe this function guards something it
     // does not.
-    match std::fs::symlink_metadata(path) {
+    match fs.entry_kind(path) {
         Ok(_) => true,
         Err(stat_error) if stat_error.kind() == std::io::ErrorKind::NotFound => {
-            matches!(classify_not_found(path), PathPresence::Present { .. })
+            matches!(
+                classify_not_found_with(path, fs),
+                PathPresence::Present { .. }
+            )
         }
         Err(_) => true,
     }
@@ -335,7 +420,8 @@ mod classify_tests {
             // `searchable_or_present` relies on; it fails without search
             // permission on every Unix, and succeeds under root — a skip.
             let reproduced = std::fs::symlink_metadata("./.").is_err();
-            let verdict = super::classify_ancestors(std::path::Path::new("rocky.toml"));
+            let verdict =
+                super::classify_ancestors(std::path::Path::new("rocky.toml"), &super::RealFs);
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).ok();
             std::env::set_current_dir(home).ok();
             if !reproduced {
@@ -456,7 +542,7 @@ mod classify_tests {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
 
         let reproduced = std::fs::symlink_metadata(locked.join(".")).is_err();
-        let verdict = super::classify_ancestors(&leaf);
+        let verdict = super::classify_ancestors(&leaf, &super::RealFs);
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
 
         if !reproduced {
@@ -553,5 +639,329 @@ mod present_tests {
         let f = dir.path().join("orders.toml");
         std::fs::write(&f, "name = \"orders\"\n").unwrap();
         assert!(entry_is_present(&f));
+    }
+}
+
+/// The states a CI runner cannot produce, produced (#1827).
+///
+/// Every review of this class — four original lanes and nine rounds on #1822 —
+/// was read-only static tracing, and every one of them asked for this. The
+/// scripted probe below answers from a table the test writes, so a filesystem
+/// that masks `EACCES` as `NotFound`, and an entry that changes between two
+/// probes, are both ordinary test inputs.
+#[cfg(test)]
+mod scripted_probe_tests {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::io::{Error, ErrorKind};
+    use std::path::{Path, PathBuf};
+
+    use super::{EntryKind, FsProbe, PathPresence, classify_not_found_with, entry_is_present_with};
+
+    /// One entry's scripted answers. `None` for `kind` means the path is not
+    /// there — the `NotFound` the whole module exists to second-guess.
+    #[derive(Clone, Default)]
+    struct Entry {
+        kind: Option<EntryKind>,
+        link_target: Option<PathBuf>,
+        resolves: bool,
+        searchable: bool,
+        /// When set, `entry_kind` fails with this kind instead of answering.
+        stat_error: Option<ErrorKind>,
+    }
+
+    /// A filesystem the test writes out in full.
+    ///
+    /// `swap_after` is the instrument the round-nine review asked for and could
+    /// not build: after `entry_kind` has been asked about a path N times, the
+    /// answer changes. That is the walk-then-swap race, made deterministic.
+    #[derive(Default)]
+    struct ScriptedFs {
+        entries: HashMap<PathBuf, Entry>,
+        swap_after: RefCell<HashMap<PathBuf, (usize, Entry)>>,
+        seen: RefCell<HashMap<PathBuf, usize>>,
+    }
+
+    impl ScriptedFs {
+        fn with(mut self, path: &str, entry: Entry) -> Self {
+            self.entries.insert(PathBuf::from(path), entry);
+            self
+        }
+
+        /// After `path` has been stat-ed `after` times, it becomes `entry`.
+        fn swapping(self, path: &str, after: usize, entry: Entry) -> Self {
+            self.swap_after
+                .borrow_mut()
+                .insert(PathBuf::from(path), (after, entry));
+            self
+        }
+
+        fn lookup(&self, path: &Path) -> Entry {
+            let count = {
+                let mut seen = self.seen.borrow_mut();
+                let c = seen.entry(path.to_path_buf()).or_insert(0);
+                *c += 1;
+                *c
+            };
+            if let Some((after, replacement)) = self.swap_after.borrow().get(path)
+                && count > *after
+            {
+                return replacement.clone();
+            }
+            self.entries.get(path).cloned().unwrap_or_default()
+        }
+    }
+
+    impl FsProbe for ScriptedFs {
+        fn entry_kind(&self, path: &Path) -> std::io::Result<EntryKind> {
+            let entry = self.lookup(path);
+            if let Some(kind) = entry.stat_error {
+                return Err(Error::new(kind, "scripted"));
+            }
+            entry
+                .kind
+                .ok_or_else(|| Error::new(ErrorKind::NotFound, "scripted"))
+        }
+
+        fn read_link(&self, path: &Path) -> std::io::Result<PathBuf> {
+            self.lookup(path)
+                .link_target
+                .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "not a link"))
+        }
+
+        fn resolves(&self, path: &Path) -> bool {
+            self.lookup(path).resolves
+        }
+
+        fn is_searchable(&self, dir: &Path) -> std::io::Result<()> {
+            if self.lookup(dir).searchable {
+                Ok(())
+            } else {
+                Err(Error::new(ErrorKind::PermissionDenied, "scripted"))
+            }
+        }
+    }
+
+    fn detail(verdict: PathPresence) -> Option<String> {
+        match verdict {
+            PathPresence::Present { detail } => Some(detail),
+            PathPresence::Absent => None,
+        }
+    }
+
+    /// The shape the module's own doc records as the one it cannot close on a
+    /// real runner: a directory that EXISTS but denies search, on a filesystem
+    /// that reports the masked lookup as `NotFound` rather than
+    /// `PermissionDenied`.
+    ///
+    /// Without the `dir/.` probe this reads as honest absence, which is the
+    /// fail-open this module exists to replace.
+    #[test]
+    fn an_ancestor_that_denies_search_is_present_not_absent() {
+        let fs = ScriptedFs::default().with(
+            "/p/models",
+            Entry {
+                kind: Some(EntryKind::Directory),
+                searchable: false,
+                ..Entry::default()
+            },
+        );
+
+        let d = detail(classify_not_found_with(
+            Path::new("/p/models/orders.sql"),
+            &fs,
+        ))
+        .expect("a directory that cannot be searched does not prove absence");
+        assert!(
+            d.contains("/p/models") && d.contains("cannot be searched"),
+            "the detail names the directory and the reason: {d}"
+        );
+    }
+
+    /// The control for the test above. Same directory, same `NotFound` leaf —
+    /// searchable this time, so the answer must be `Absent`. Without this, an
+    /// implementation that refused everything would pass.
+    #[test]
+    fn a_searchable_ancestor_still_proves_absence() {
+        let fs = ScriptedFs::default().with(
+            "/p/models",
+            Entry {
+                kind: Some(EntryKind::Directory),
+                searchable: true,
+                ..Entry::default()
+            },
+        );
+
+        assert!(
+            detail(classify_not_found_with(
+                Path::new("/p/models/orders.sql"),
+                &fs
+            ))
+            .is_none(),
+            "a healthy directory with nothing in it IS absence"
+        );
+    }
+
+    /// **The gap the round-nine reviewer named verbatim**: *"There is no
+    /// deterministic hook testing replacement after the walk but before the
+    /// pre-check."*
+    ///
+    /// `classify_ancestors` stats the ancestor, sees a healthy directory, and
+    /// then asks `is_searchable` about it. Between those two calls the entry is
+    /// replaced. The module must not answer `Absent` on the strength of a stat
+    /// that is already stale.
+    ///
+    /// It does not, and now that is tested rather than argued. This is the
+    /// whole reason the seam exists — the swap is one call apart, so no real
+    /// filesystem can be driven into it on a CI runner.
+    #[test]
+    fn an_ancestor_replaced_after_the_walk_but_before_the_search_probe_refuses() {
+        let fs = ScriptedFs::default()
+            .with(
+                "/p/models",
+                Entry {
+                    kind: Some(EntryKind::Directory),
+                    searchable: true,
+                    ..Entry::default()
+                },
+            )
+            // Lookup 1 is the ancestor stat; lookup 2 is the search probe.
+            .swapping(
+                "/p/models",
+                1,
+                Entry {
+                    kind: Some(EntryKind::Symlink),
+                    link_target: Some(PathBuf::from("/gone")),
+                    resolves: false,
+                    searchable: false,
+                    ..Entry::default()
+                },
+            );
+
+        let d = detail(classify_not_found_with(
+            Path::new("/p/models/orders.sql"),
+            &fs,
+        ))
+        .expect("a stat that is already stale must not prove absence");
+        assert!(
+            d.contains("/p/models") && d.contains("cannot be searched"),
+            "the refusal comes from the probe that saw the NEW state: {d}"
+        );
+    }
+
+    /// The same swap one pass later, which is the ordinary TOCTOU shape: a
+    /// classification completes cleanly, the entry is replaced, and the next
+    /// classification sees the replacement.
+    ///
+    /// The precondition matters — without it, a swap landing early would make
+    /// the second assertion pass for the wrong reason, which is exactly what
+    /// happened while writing this.
+    #[test]
+    fn an_ancestor_replaced_between_two_classifications_refuses_the_second() {
+        let fs = ScriptedFs::default()
+            .with(
+                "/p/models",
+                Entry {
+                    kind: Some(EntryKind::Directory),
+                    searchable: true,
+                    ..Entry::default()
+                },
+            )
+            // Two lookups per pass (ancestor stat + search probe), so the
+            // first pass completes on the healthy entry.
+            .swapping(
+                "/p/models",
+                2,
+                Entry {
+                    kind: Some(EntryKind::Symlink),
+                    link_target: Some(PathBuf::from("/gone")),
+                    resolves: false,
+                    ..Entry::default()
+                },
+            );
+
+        assert!(
+            detail(classify_not_found_with(
+                Path::new("/p/models/orders.sql"),
+                &fs
+            ))
+            .is_none(),
+            "PRECONDITION: the first pass must see only the healthy entry, \
+             else the swap lands early and the assertion below proves nothing"
+        );
+
+        let d = detail(classify_not_found_with(
+            Path::new("/p/models/orders.sql"),
+            &fs,
+        ))
+        .expect("the replaced ancestor is a broken path, not an absent one");
+        assert!(
+            d.contains("/gone") && d.contains("cannot be resolved"),
+            "the detail names the link's target: {d}"
+        );
+    }
+
+    /// An ancestor that cannot be stat-ed for a reason other than `NotFound`
+    /// is unproven absence, and refusing is the fail-closed answer.
+    #[test]
+    fn an_unstatable_ancestor_is_present() {
+        let fs = ScriptedFs::default().with(
+            "/p/models",
+            Entry {
+                stat_error: Some(ErrorKind::PermissionDenied),
+                ..Entry::default()
+            },
+        );
+
+        let d = detail(classify_not_found_with(
+            Path::new("/p/models/orders.sql"),
+            &fs,
+        ))
+        .expect("a directory that cannot be inspected does not prove absence");
+        assert!(d.contains("could not be inspected"), "{d}");
+    }
+
+    /// A chain nobody ever created stays `Absent` — the walk passes THROUGH a
+    /// `NotFound` ancestor rather than stopping at it. This is the healthy
+    /// case, and the one an over-strict fix would break.
+    #[test]
+    fn a_never_created_chain_is_absent() {
+        let fs = ScriptedFs::default().with(
+            "/p",
+            Entry {
+                kind: Some(EntryKind::Directory),
+                searchable: true,
+                ..Entry::default()
+            },
+        );
+
+        assert!(
+            detail(classify_not_found_with(
+                Path::new("/p/models/orders.sql"),
+                &fs
+            ))
+            .is_none(),
+            "`/p/models` was never created, so nothing below it exists"
+        );
+    }
+
+    /// `entry_is_present` runs on the same seam, so the masked-search case
+    /// answers `true` there too — which is what makes the caller surface the
+    /// honest read error instead of taking its "there is none of this" branch.
+    #[test]
+    fn entry_is_present_follows_the_same_verdict() {
+        let fs = ScriptedFs::default().with(
+            "/p/models",
+            Entry {
+                kind: Some(EntryKind::Directory),
+                searchable: false,
+                ..Entry::default()
+            },
+        );
+
+        assert!(entry_is_present_with(
+            Path::new("/p/models/_defaults.toml"),
+            &fs
+        ));
     }
 }
