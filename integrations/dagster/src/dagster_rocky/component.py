@@ -3042,7 +3042,23 @@ def _emit_governance_events(
         try:
             compliance_output = rocky.compliance()
         except Exception as exc:  # noqa: BLE001
-            context.log.warning(f"rocky compliance failed, skipping compliance events: {exc}")
+            # A crashed scan is not a clean scan. `compliance_exception` is in
+            # PASS_BY_ABSENCE_CHECK_NAMES, so yielding nothing here would let
+            # the placeholder report `passed=True` — a green badge for a scan
+            # that never produced a verdict (#1790). Say so on every asset that
+            # declared the spec, which is every selected one.
+            context.log.warning(f"rocky compliance failed, reporting it on every asset: {exc}")
+            for key in sorted(selected_keys, key=lambda k: k.path):
+                yield dg.AssetCheckResult(
+                    asset_key=key,
+                    check_name=COMPLIANCE_CHECK_NAME,
+                    passed=False,
+                    severity=dg.AssetCheckSeverity.WARN,
+                    metadata={
+                        "status": "not_evaluated",
+                        "reason": f"rocky compliance failed: {exc}",
+                    },
+                )
         else:
             yield from compliance_check_results(compliance_output, key_resolver=resolver)
 
