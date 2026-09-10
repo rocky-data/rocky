@@ -9,15 +9,24 @@
 //!
 //! # Why this exists
 //!
-//! `extract_lineage` walks only the top-level `FROM`/`JOIN` relations and
-//! records non-`Table` table-factors as either the opaque `(subquery)` marker
-//! (for a derived table) or nothing at all (Pivot, Unpivot, Unnest, table
-//! functions, JSON tables, nested joins — its `_ => {}` arm). It also never
-//! descends into `WHERE`/`HAVING`/projection sub-queries or CTE bodies. So for
-//! anything but a plain single `SELECT` over bare tables, its source set can be
-//! **incomplete** — and an incomplete-but-non-empty (or empty) source set would
-//! let the gate skip a model whose true upstream actually moved. That is silent
-//! production staleness, the worst failure the gate exists to prevent.
+//! `extract_lineage`'s `source_tables` holds only the top-level `FROM`/`JOIN`
+//! relations, recording non-`Table` table-factors as either the opaque
+//! `(subquery)` marker (for a derived table) or nothing at all (Pivot, Unpivot,
+//! Unnest, table functions, JSON tables, nested joins — its `_ => {}` arm).
+//!
+//! Since #1867 it does descend into derived tables and `WITH` bodies, carrying
+//! what it finds on `LineageResult::nested_sources`. That is a **widening, not
+//! completeness**, and this gate must not be relaxed for it. Still not reached:
+//! a sub-query in `WHERE`, `HAVING`, `GROUP BY`, a qualifier or a function
+//! argument, and any body that is a set operation (`extract_query_lineage`
+//! returns `Err` for `SetExpr::SetOperation`, so a `UNION` CTE body is skipped
+//! entirely). Partial coverage that reads as complete is exactly the silent
+//! staleness this gate exists to prevent.
+//!
+//! So for anything but a plain single `SELECT` over bare tables, the source set
+//! can be **incomplete** — and an incomplete-but-non-empty (or empty) source set
+//! would let the gate skip a model whose true upstream actually moved. That is
+//! silent production staleness, the worst failure the gate exists to prevent.
 //!
 //! Rather than make `extract_lineage` recurse (it feeds dependency derivation
 //! and the lineage/Inspector surfaces, which have different needs), this check
