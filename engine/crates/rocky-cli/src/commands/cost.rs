@@ -559,7 +559,18 @@ mod tests {
     }
 
     fn sample_run(run_id: &str, models: Vec<ModelExecution>) -> RunRecord {
-        let started = Utc.with_ymd_and_hms(2026, 4, 21, 12, 0, 0).unwrap();
+        sample_run_at(
+            run_id,
+            Utc.with_ymd_and_hms(2026, 4, 21, 12, 0, 0).unwrap(),
+            models,
+        )
+    }
+
+    fn sample_run_at(
+        run_id: &str,
+        started: chrono::DateTime<Utc>,
+        models: Vec<ModelExecution>,
+    ) -> RunRecord {
         let finished = started + chrono::Duration::milliseconds(10_000);
         RunRecord {
             run_id: run_id.to_string(),
@@ -807,8 +818,9 @@ mod tests {
 
     /// The seam serves what the store recorded; `run_cost --output json` is
     /// `compute_cost` plus one `println!`, so this pins the producer both
-    /// callers share. A config that cannot be read degrades to no adapter,
-    /// as the module doc promises, rather than failing the rollup.
+    /// callers share. An absent config degrades to no adapter rather than
+    /// failing the rollup; a config that is there but does not parse is an
+    /// error, because a wrong price is worse than no price.
     #[test]
     fn compute_cost_reads_the_recorded_run() {
         let dir = TempDir::new().unwrap();
@@ -847,30 +859,43 @@ mod tests {
             err.to_string().contains("did not execute model 'zzz'"),
             "{err}"
         );
+
+        let broken_config = dir.path().join("broken.toml");
+        std::fs::write(&broken_config, "[adapter\ntype = ").unwrap();
+        let err = compute_cost(&path, &broken_config, "latest", None, None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed to load config"),
+            "a present config that does not parse is an error, not no adapter: {err:#}"
+        );
     }
 
+    /// `latest` is the run that STARTED last. The newer run sorts LAST by
+    /// id, and the store iterates in key order, so neither key order nor
+    /// table order can stand in for its timestamp: only a descending sort
+    /// on `started_at` picks it.
     #[test]
     fn resolve_latest_picks_most_recent() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.redb");
         let store = StateStore::open(&path).unwrap();
+        let noon = Utc.with_ymd_and_hms(2026, 4, 21, 12, 0, 0).unwrap();
         store
-            .record_run(&sample_run(
-                "old",
+            .record_run(&sample_run_at(
+                "z-newer",
+                noon + chrono::Duration::hours(1),
                 vec![sample_exec("m", "success", 1, None, None)],
             ))
             .unwrap();
-        // Brief gap so the second run's started_at actually sorts after.
-        std::thread::sleep(std::time::Duration::from_millis(5));
         store
-            .record_run(&sample_run(
-                "new",
+            .record_run(&sample_run_at(
+                "a-older",
+                noon,
                 vec![sample_exec("m", "success", 1, None, None)],
             ))
             .unwrap();
 
         let resolved = resolve(&store, "latest").unwrap();
-        assert_eq!(resolved.run_id, "new");
+        assert_eq!(resolved.run_id, "z-newer");
     }
 
     #[test]
