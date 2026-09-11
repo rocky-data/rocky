@@ -360,6 +360,19 @@ pub enum ConfigError {
          set it to 0 to disable anomaly detection"
     )]
     ChecksAnomalyThresholdNotFinite { pipeline: String, value: String },
+
+    /// A `metadata_columns[].value` is not one parseable SQL expression over
+    /// allowlisted scalar functions. The value is spliced raw into
+    /// `CAST({value} AS {type}) AS {name}` (#1874).
+    #[error(
+        "pipeline '{pipeline}': metadata_columns entry '{column}' has a value that cannot be \
+         used: {reason}"
+    )]
+    MetadataColumnValueRefused {
+        pipeline: String,
+        column: String,
+        reason: String,
+    },
 }
 
 /// Concurrency strategy for table processing.
@@ -3460,6 +3473,51 @@ pub fn validate_freeze_marker_writes(config: &RockyConfig) -> Vec<ConfigError> {
 /// with detection silently off; `inf` is never exceeded. Rejected here, at
 /// load, so the run never starts with detection off by accident. Zero and
 /// negative values are the documented off switch and stay accepted.
+/// Refuse a `metadata_columns[].value` that is not one parseable SQL
+/// expression calling only allowlisted scalar functions.
+///
+/// The value is spliced raw as `CAST({value} AS {type}) AS {name}` by every
+/// dialect's `select_clause`, behind only a statement-terminator scan.
+///
+/// Checked here, at config load, rather than at the three splice sites:
+/// `rocky-ir` has no dialect, so the check cannot live with the
+/// `MetadataColumn` constructor, and three dialect-side copies would drift.
+///
+/// The dialect is the one for the pipeline's TARGET adapter, since that is
+/// the warehouse the expression is sent to. An adapter this config does not
+/// declare is skipped — `validate_adapter_kinds` reports that — and an
+/// adapter type with no specific dialect falls back to generic.
+pub fn validate_metadata_columns(config: &RockyConfig) -> Vec<ConfigError> {
+    let mut errors = Vec::new();
+    for (pipeline_name, pipeline) in &config.pipelines {
+        let PipelineConfig::Replication(replication) = pipeline else {
+            continue;
+        };
+        if replication.metadata_columns.is_empty() {
+            continue;
+        }
+        let adapter_type = config
+            .adapters
+            .get(&replication.target.adapter)
+            .map_or("generic", |a| a.adapter_type.as_str());
+        let dialect = rocky_sql::check_expression::dialect_for(adapter_type);
+        for mc in &replication.metadata_columns {
+            if let Err(e) = rocky_sql::check_expression::validate_check_expression(
+                "metadata_columns[].value",
+                &mc.value,
+                dialect.as_ref(),
+            ) {
+                errors.push(ConfigError::MetadataColumnValueRefused {
+                    pipeline: pipeline_name.clone(),
+                    column: mc.name.clone(),
+                    reason: e.to_string(),
+                });
+            }
+        }
+    }
+    errors
+}
+
 pub fn validate_checks(config: &RockyConfig) -> Vec<ConfigError> {
     let mut errors = Vec::new();
     for (name, pipeline) in &config.pipelines {
@@ -6755,6 +6813,7 @@ const CONFIG_VALIDATORS: &[ConfigValidator] = &[
     validate_policy,
     validate_freeze_marker_writes,
     validate_checks,
+    validate_metadata_columns,
 ];
 
 /// The fail-fast validation chain shared by [`load_rocky_config`] and
@@ -10050,6 +10109,75 @@ severity = "warning"
         assert_eq!(
             q.checks.row_count.severity(),
             crate::tests::TestSeverity::Warning
+        );
+    }
+
+    /// A `metadata_columns[].value` is spliced raw into `CAST(... AS ...)`.
+    /// Only a parseable expression over allowlisted scalar functions is
+    /// accepted (#1874).
+    #[test]
+    fn a_metadata_column_value_off_the_function_allowlist_is_refused() {
+        let cfg_with = |value: &str| -> RockyConfig {
+            let toml_str = format!(
+                r#"
+[adapter.default]
+type = "duckdb"
+path = "/tmp/x.duckdb"
+
+[pipeline.bronze]
+type = "replication"
+metadata_columns = [
+    {{ name = "_loaded_by", type = "VARCHAR", value = "{value}" }}
+]
+
+[pipeline.bronze.source]
+catalog = "raw_catalog"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "raw__{{source}}"
+"#
+            );
+            toml::from_str(&toml_str).expect("the fixture must parse")
+        };
+
+        // Values an operator legitimately writes, including a template whose
+        // placeholder is resolved later from schema identifiers.
+        for ok in [
+            "NULL",
+            "'rocky'",
+            "CURRENT_TIMESTAMP",
+            "current_timestamp()",
+            "'{source}'",
+        ] {
+            let errors = validate_metadata_columns(&cfg_with(ok));
+            assert!(errors.is_empty(), "{ok} must be accepted: {errors:?}");
+        }
+
+        // An off-allowlist function. The name is ordinary on purpose: the rule
+        // is "not on the allowlist", not "looks dangerous".
+        let errors = validate_metadata_columns(&cfg_with("my_udf(1)"));
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ConfigError::MetadataColumnValueRefused { pipeline, column, .. }]
+                    if pipeline == "bronze" && column == "_loaded_by"
+            ),
+            "got {errors:?}"
+        );
+
+        // The registry runs it, so a bad value fails the LOAD, not just this
+        // function. That is the wire the fix depends on.
+        assert!(
+            CONFIG_VALIDATORS
+                .iter()
+                .any(|v| !v(&cfg_with("my_udf(1)")).is_empty()),
+            "validate_metadata_columns must be registered in CONFIG_VALIDATORS"
         );
     }
 
