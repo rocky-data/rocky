@@ -363,6 +363,10 @@ mod tests {
     #[test]
     fn a_placeholder_session_read_is_refused_on_every_dialect() {
         // Each entry is a dialect and a placeholder its parser produces.
+        // A precondition that `continue`s can empty the loop: if no dialect
+        // parsed a placeholder, every case would skip and the test would pass
+        // having asserted nothing. Counted and checked below.
+        let mut exercised = 0usize;
         for (dialect, expr) in [
             ("snowflake", "$foo"),
             ("snowflake", "$1"),
@@ -385,6 +389,7 @@ mod tests {
             if !matches!(v.value, Value::Placeholder(_)) {
                 continue;
             }
+            exercised += 1;
             let err = check_on(dialect, expr).expect_err(&format!(
                 "{dialect}: `{expr}` parses as a placeholder and must be refused"
             ));
@@ -393,6 +398,11 @@ mod tests {
                 "{dialect}: `{expr}` gave {err:?}"
             );
         }
+        assert!(
+            exercised >= 2,
+            "only {exercised} case(s) actually parsed as a placeholder — the \
+             skip-if-not-a-placeholder precondition has emptied this test"
+        );
     }
 
     /// A legitimate SCALAR key expression passes.
