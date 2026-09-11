@@ -119,6 +119,15 @@ describe("EstateScreen", () => {
     }
   });
 
+  it("gives the wide tables their own scroller, so the page body does not move", async () => {
+    // Measured before this: the widest cell pushed the whole page sideways at
+    // 320px, taking every panel above and below it. The scroller has to be on
+    // the table, not the page.
+    render(<EstateScreen loaders={loaders()} refreshMs={0} now={NOW} />);
+    const runs = await screen.findByRole("table", { name: "Runs" });
+    expect(runs.closest(".overflow-x-auto")).not.toBeNull();
+  });
+
   it("renders a hostile model name and SQL as text, never as markup", async () => {
     const hostile = '<img src=x onerror="alert(1)">';
     const dag: DagOutput = {
