@@ -5339,7 +5339,9 @@ impl RunOutput {
     /// A check the engine could not evaluate is a failure here, and always an
     /// ERROR one. Severity grades a MEASUREMENT: `severity = "warning"` means
     /// "a violation is advisory", never "a check I could not run is advisory"
-    /// (#1741). Only a check that RAN and failed reaches the warning bucket.
+    /// (#1741). A failure carrying `not_evaluated` is bucketed as an error
+    /// whatever its severity says; a failure without it is bucketed at its
+    /// declared severity.
     ///
     /// ```text
     ///   passed   not_evaluated   declared     bucket
@@ -5351,9 +5353,11 @@ impl RunOutput {
     /// ```
     ///
     /// Two locks hold row one. Every `*_not_evaluated` constructor in
-    /// `rocky_core::checks` hard-codes `Error` (pinned exhaustively by
-    /// `not_evaluated_constructors_fail_and_round_trip_through_json`), and the
-    /// `not_evaluated` arm below reads the field directly. The second lock is
+    /// `rocky_core::checks` hard-codes `Error`;
+    /// `not_evaluated_constructors_fail_and_round_trip_through_json` asserts
+    /// that for the seven it lists BY HAND, so an eighth constructor would not
+    /// fail it automatically. The `not_evaluated` arm below reads the field
+    /// directly and does not depend on that list. The second lock is
     /// there because the first one is not enough on its own: #1871 overwrote
     /// that severity AFTER construction at two call sites in `commands/run.rs`,
     /// and this function — reading severity alone — let the run through.

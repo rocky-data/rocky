@@ -471,12 +471,15 @@ fn merge_replication_compile_and_copy_errors(output: &mut RunOutput, table_error
 /// never read the flag, so a pipeline that copied violating data exited 0
 /// (#1598). This is the missing read, not a new policy.
 ///
-/// Error severity only, so a `severity = "warning"` check stays advisory and
-/// `fail_on_error = false` keeps every check advisory — neither may change a
-/// status or an exit code. A check the engine could NOT evaluate counts as a
-/// failure at its own severity: every `*_not_evaluated` constructor sets
-/// `passed: false` (#1602 / #1595), so a broken check gates exactly as a
-/// violated one does instead of reading as clean.
+/// Error severity only, so a MEASURED `severity = "warning"` check stays
+/// advisory and `fail_on_error = false` keeps every check advisory — neither
+/// may change a status or an exit code.
+///
+/// A check the engine could NOT evaluate is not advisory at all. It sets
+/// `passed: false` (#1602 / #1595) and reaches the error bucket whatever its
+/// severity says (#1741), so a broken check gates exactly as a violated one
+/// does instead of reading as clean. See
+/// [`RunOutput::check_failures_by_severity`] for the bucketing rule itself.
 fn replication_check_gate_failed(
     output: &RunOutput,
     checks: &rocky_core::config::ChecksConfig,
@@ -7021,10 +7024,9 @@ async fn run_batched_checks(
                 // measurement: an operator writing `warning` means "a row
                 // count that does not match is advisory", not "a row count I
                 // could not obtain is advisory". `row_count_not_evaluated`
-                // chooses `Error` and `check_failures_by_severity` buckets on
-                // severity alone, so overwriting it here is what decides
-                // whether the run gates. Same guard the freshness and
-                // null-rate sites use.
+                // chooses `Error`; overwriting that here is what sent an
+                // unrunnable check to the warning bucket. Same guard the
+                // freshness and null-rate sites use.
                 if check.not_evaluated.is_none() {
                     check.severity = pipeline.checks.row_count.severity();
                 }
@@ -34120,9 +34122,7 @@ table = "fct_events"
     /// #1871 regressed the row-count arm of the same invariant the null-rate
     /// test above pins: a check the engine COULD NOT RUN is never advisory.
     ///
-    /// `row_count_not_evaluated` chooses `TestSeverity::Error`, and
-    /// `check_failures_by_severity` buckets on severity alone, so the gate's
-    /// correctness rests entirely on that choice surviving. The site
+    /// `row_count_not_evaluated` chooses `TestSeverity::Error`. The site
     /// overwrote it with the configured severity for BOTH arms, so
     /// `severity = "warning"` downgraded a row-count query that failed and
     /// the run exited 0 with `status: "Success"`. 1.73.0 always gated it.
