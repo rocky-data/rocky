@@ -42,11 +42,19 @@
 //! echo of the requested path. Anything config-derived reaches the browser
 //! through the JSON API, which this filter covers.
 //!
+//! ## Redact BEFORE you truncate
+//!
+//! A rule for every site that shortens a string which can reach a response.
+//! This filter matches WHOLE values, so a cut that lands mid-value leaves a
+//! prefix it cannot see, and a partial credential ships. `truncate_error` in
+//! `commands::resilience` follows the rule; [`redact_truncated_tail`] is the
+//! backstop for records an older binary already wrote.
+//!
 //! ## Fail closed
 //!
-//! A body that cannot be read or is not UTF-8 is replaced by the
-//! `secret_redaction_unavailable` envelope rather than forwarded. The filter
-//! refuses on doubt, not only on a match.
+//! A body that cannot be read, is not UTF-8, or no longer parses as JSON after
+//! replacement is answered with the `secret_redaction_unavailable` envelope
+//! rather than forwarded. The filter refuses on doubt, not only on a match.
 
 use axum::body::Body;
 use axum::extract::Request;
@@ -117,6 +125,92 @@ pub fn redact(text: &str) -> String {
     out
 }
 
+/// The shortest truncated tail that is rewritten.
+///
+/// Distinct from [`secret_registry::SECRET_LENGTH_FLOOR`] and deliberately so:
+/// the floor decides which VALUES are secret; this decides how much of a known
+/// secret may survive a cut. Anchored at the truncation sentinel, a short
+/// minimum over-redacts rarely, so the worst case is 3 leaked bytes instead of
+/// 7.
+const MIN_TRUNCATED_TAIL: usize = 4;
+
+/// The marker [`crate::commands::resilience`] appends when it shortens an
+/// error. Its presence is what makes a tail interpretable as a cut rather than
+/// as ordinary prose.
+const TRUNCATION_SENTINEL: char = '…';
+
+/// Rewrite a secret PREFIX left behind by a truncation that happened before
+/// [`redact`] ran.
+///
+/// Records written by an older binary hold `…`-terminated errors that were cut
+/// mid-value, and [`redact`] cannot match them because it searches for whole
+/// values. This reads the bytes immediately before the sentinel — a cut we
+/// made ourselves — and asks whether they are the start of a registered value.
+///
+/// Deliberately NOT a general fragment search. Looking for pieces of secrets
+/// anywhere in prose cannot distinguish a fragment from ordinary text; this is
+/// anchored, so a false positive needs a string that both ends in the sentinel
+/// and whose tail begins a registered value.
+pub fn redact_truncated_tail(text: &str) -> String {
+    if !text.contains(TRUNCATION_SENTINEL) {
+        return text.to_string();
+    }
+    let pairs = secret_registry::substitutions();
+    let segments: Vec<&str> = text.split(TRUNCATION_SENTINEL).collect();
+    let last = segments.len() - 1;
+    let mut out = String::with_capacity(text.len());
+    for (i, segment) in segments.iter().enumerate() {
+        if i > 0 {
+            out.push(TRUNCATION_SENTINEL);
+        }
+        out.push_str(segment);
+        // Only a segment FOLLOWED by the sentinel ends at a cut. The final
+        // segment is ordinary trailing text — `truncate_detail` writes
+        // `…  [evidence truncated at N bytes]`, so examining its tail would
+        // over-redact every string that merely contains a sentinel.
+        if i == last {
+            continue;
+        }
+        // The tail of THIS segment is what the sentinel cut. Longest first, so
+        // a longer surviving prefix wins over a shorter one.
+        let Some((value, replacement)) = longest_tail_prefix(segment, &pairs) else {
+            continue;
+        };
+        let keep = out.len() - value.len();
+        out.truncate(keep);
+        out.push_str(replacement);
+    }
+    out
+}
+
+/// The longest tail of `segment` that begins some registered value, at least
+/// [`MIN_TRUNCATED_TAIL`] bytes.
+fn longest_tail_prefix<'a>(
+    segment: &str,
+    pairs: &'a [(String, String)],
+) -> Option<(String, &'a str)> {
+    let mut best: Option<(String, &str)> = None;
+    for (value, replacement) in pairs {
+        // A whole value is `redact`'s job, so the tail must be a STRICT
+        // prefix — hence `value.len() - 1`. But it may be the whole segment:
+        // the cut can land anywhere, including right where the value began.
+        // Subtracting from the MIN instead would miss exactly that case.
+        let max = (value.len() - 1).min(segment.len());
+        let mut take = max;
+        while take >= MIN_TRUNCATED_TAIL {
+            if segment.is_char_boundary(segment.len() - take)
+                && segment.ends_with(&value[..take])
+                && best.as_ref().is_none_or(|(b, _)| take > b.len())
+            {
+                best = Some((value[..take].to_string(), replacement.as_str()));
+                break;
+            }
+            take -= 1;
+        }
+    }
+    best
+}
+
 /// The middleware. Applied last in [`crate::api::router`], so it is outermost.
 pub async fn redact_response_secrets(request: Request, next: Next) -> Response {
     let response = next.run(request).await;
@@ -143,7 +237,21 @@ pub async fn redact_response_secrets(request: Request, next: Next) -> Response {
         return redaction_unavailable();
     };
 
-    let redacted = redact(text);
+    let redacted = redact_truncated_tail(&redact(text));
+
+    // `redact` is a TEXT replacement and knows nothing about JSON structure,
+    // so a registered value in a non-string position — a numeric field fed
+    // from `${VAR}` — becomes `{"account_id":${ACCOUNT_ID}}`, which is not
+    // JSON. The body parsed on the way in, so if it does not parse now the
+    // replacement broke it. Refuse rather than ship something unparseable.
+    //
+    // Not fixed by walking the parsed value instead: `PrettyJson` emits
+    // `to_string_pretty` and the API's byte-parity tests compare those bytes
+    // against the CLI's, so re-serializing risks key order and whitespace.
+    if serde_json::from_str::<serde_json::Value>(&redacted).is_err() {
+        return redaction_unavailable();
+    }
+
     // The body length changes whenever a replacement lands, and a stale
     // content-length makes the response unparseable to the client.
     parts.headers.remove(header::CONTENT_LENGTH);
@@ -248,6 +356,60 @@ mod tests {
         register_substitution("ROCKY_FILTER_SHORTVAL", "abc");
         let out = redact(r#"{"message":"abc is shown"}"#);
         assert!(out.contains("abc is shown"), "{out}");
+    }
+
+    /// #1897. A fragment left by a truncation that happened BEFORE the
+    /// redaction — i.e. a record an older binary wrote — is rewritten.
+    /// `redact` cannot match it, because it searches for whole values.
+    #[test]
+    fn a_truncated_prefix_before_the_sentinel_is_rewritten() {
+        let secret = "FILTER-PREFIX-8e26660e-THE-REST-IS-CUT";
+        register_substitution("ROCKY_FILTER_PREFIX", secret);
+
+        // Exactly what an older binary stored: the value cut mid-way, then
+        // the sentinel.
+        let stored = format!("{}…", &secret[..20]);
+        assert!(
+            !stored.contains(secret),
+            "PRECONDITION: the whole value must NOT be present, or this test \
+             is only exercising `redact`"
+        );
+
+        let out = redact_truncated_tail(&stored);
+        assert!(
+            !out.contains(&secret[..20]),
+            "the surviving prefix must be gone: {out}"
+        );
+        assert!(out.contains("${ROCKY_FILTER_PREFIX}"), "{out}");
+    }
+
+    /// The final segment is ordinary trailing text, not a cut. This is the
+    /// shape `truncate_detail` writes — `… [evidence truncated at N bytes]` —
+    /// and examining its tail would over-redact any string that merely
+    /// contains a sentinel.
+    #[test]
+    fn text_after_the_last_sentinel_is_not_treated_as_a_cut() {
+        let secret = "FILTER-TRAILING-8e26660e-VALUE";
+        register_substitution("ROCKY_FILTER_TRAILING", secret);
+
+        // The tail here IS a prefix of the registered value, but it is not
+        // followed by a sentinel, so it is not a cut.
+        let stored = format!("something…{}", &secret[..12]);
+        let out = redact_truncated_tail(&stored);
+        assert_eq!(
+            out, stored,
+            "trailing text after the last sentinel must be left alone"
+        );
+    }
+
+    /// A tail shorter than the minimum is left alone: below it, a
+    /// coincidental match is likelier than a real cut.
+    #[test]
+    fn a_tail_shorter_than_the_minimum_is_left_alone() {
+        let secret = "FILTER-SHORTTAIL-8e26660e";
+        register_substitution("ROCKY_FILTER_SHORTTAIL", secret);
+        let stored = format!("{}…", &secret[..MIN_TRUNCATED_TAIL - 1]);
+        assert_eq!(redact_truncated_tail(&stored), stored);
     }
 
     #[test]
