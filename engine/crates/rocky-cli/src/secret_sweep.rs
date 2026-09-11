@@ -64,6 +64,21 @@ const PROBE_SHORT_VAR: &str = "ROCKY_PROBE_SHORT";
 /// The sweep RECORDS what happens here and asserts nothing either way: drain
 /// owns the ruling, and this case exists so the chosen behaviour gets pinned
 /// rather than discovered later.
+/// A value that lands in a NUMERIC JSON position. `redact()` is a text
+/// replacement over the whole body, so rewriting `1234567890` to
+/// `${ROCKY_PROBE_NUMERIC}` produces `{"max_downstreams":${...}}` — not valid
+/// JSON. The ruling (drain, 2026-09-11) is that the response is then REFUSED
+/// with `secret_redaction_unavailable`, deterministically and at the response
+/// level, never partially rendered.
+///
+/// `policy.rules[].scope.max_downstreams` is `Option<u64>` on both sides
+/// (`config.rs:3128`, `policy.rs:454`) and renders on `GET /api/v1/policy`, a
+/// route this sweep already drives. Unquoted in TOML it is a valid integer, so
+/// the value really does arrive in a numeric position — a field the schema
+/// typed as a string would arrive quoted and could not corrupt anything.
+const PROBE_NUMERIC: &str = "12345678901";
+const PROBE_NUMERIC_VAR: &str = "ROCKY_PROBE_NUMERIC";
+
 const PROBE_COLLIDE: &str = "analytics";
 const PROBE_COLLIDE_VAR: &str = "ROCKY_PROBE_CATALOG";
 const COLLIDING_MODEL: &str = "analytics_orders";
@@ -147,10 +162,13 @@ enum Fixture {
     /// `${ROCKY_PROBE_CATALOG}` resolves to `analytics`, and the project has a
     /// model named `analytics_orders`. Recorded, not asserted.
     CollisionWithModelName,
+    /// The value lands in a numeric JSON position, where a text replacement
+    /// cannot produce valid JSON. The response must be REFUSED whole.
+    NumericPosition,
 }
 
 impl Fixture {
-    fn all() -> [Fixture; 9] {
+    fn all() -> [Fixture; 10] {
         [
             Fixture::Valid,
             Fixture::InvalidPolicyWindow,
@@ -161,6 +179,7 @@ impl Fixture {
             Fixture::UnknownKeyInGroup,
             Fixture::ShortValueShown,
             Fixture::CollisionWithModelName,
+            Fixture::NumericPosition,
         ]
     }
 
@@ -175,6 +194,7 @@ impl Fixture {
             Fixture::UnknownKeyInGroup => "unknown_key_in_group",
             Fixture::ShortValueShown => "short_value_shown",
             Fixture::CollisionWithModelName => "collision_with_model_name",
+            Fixture::NumericPosition => "numeric_position",
         }
     }
 
@@ -183,6 +203,7 @@ impl Fixture {
         match self {
             Fixture::ShortValueShown => Expect::Shown,
             Fixture::CollisionWithModelName => Expect::ReplacedByName,
+            Fixture::NumericPosition => Expect::Absent,
             _ => Expect::Absent,
         }
     }
@@ -192,6 +213,7 @@ impl Fixture {
         match self {
             Fixture::ShortValueShown => PROBE_SHORT,
             Fixture::CollisionWithModelName => PROBE_COLLIDE,
+            Fixture::NumericPosition => PROBE_NUMERIC,
             _ => PROBE,
         }
     }
@@ -201,6 +223,7 @@ impl Fixture {
         match self {
             Fixture::ShortValueShown => PROBE_SHORT_VAR,
             Fixture::CollisionWithModelName => PROBE_COLLIDE_VAR,
+            Fixture::NumericPosition => PROBE_NUMERIC_VAR,
             _ => PROBE_VAR,
         }
     }
@@ -259,6 +282,21 @@ capability = "apply"
 scope = {{ any = true }}
 effect = "allow"
 autonomy_budget = {{ failures = 2, window = "${{{var}}}" }}
+"#
+        ),
+        // Unquoted, so it is a TOML integer and arrives in a NUMERIC position.
+        Fixture::NumericPosition => format!(
+            r#"
+[policy]
+version = 1
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+effect = "allow"
+
+[policy.rules.scope]
+max_downstreams = ${{{var}}}
 "#
         ),
         // `principal` is an enum (`human` or `agent`) and `capability` is
@@ -444,6 +482,7 @@ fn assert_substituted(config_path: &Path, fixture: Fixture) {
         | Fixture::UnknownKeyInGroup
         | Fixture::ShortValueShown
         | Fixture::CollisionWithModelName
+        | Fixture::NumericPosition
         | Fixture::BrokenDefaults
         | Fixture::BrokenGroup
         | Fixture::BrokenTestDefinitions => {
@@ -533,6 +572,7 @@ async fn no_serve_route_renders_a_resolved_secret() {
         std::env::set_var(PROBE_VAR, PROBE);
         std::env::set_var(PROBE_SHORT_VAR, PROBE_SHORT);
         std::env::set_var(PROBE_COLLIDE_VAR, PROBE_COLLIDE);
+        std::env::set_var(PROBE_NUMERIC_VAR, PROBE_NUMERIC);
     }
     bare_probe_is_not_valid_toml();
     assert_probe_is_redactable();
@@ -544,6 +584,8 @@ async fn no_serve_route_renders_a_resolved_secret() {
     let mut shown_somewhere: Vec<String> = Vec::new();
     // Responses where the replacement token stands in for the collided value.
     let mut name_shown: Vec<String> = Vec::new();
+    // Responses refused whole because redaction could not produce valid JSON.
+    let mut refusals: Vec<String> = Vec::new();
     let mut swept: BTreeSet<String> = BTreeSet::new();
     let client = reqwest::Client::new();
 
@@ -589,6 +631,10 @@ async fn no_serve_route_renders_a_resolved_secret() {
             let body = resp.text().await.unwrap_or_default();
 
             let probe = fixture.probe();
+            if fixture == Fixture::NumericPosition && body.contains("secret_redaction_unavailable")
+            {
+                refusals.push(format!("  {entry} -> {status}"));
+            }
             if fixture.expectation() == Expect::ReplacedByName
                 && body.contains(&format!("${{{PROBE_COLLIDE_VAR}}}"))
             {
@@ -651,6 +697,43 @@ async fn no_serve_route_renders_a_resolved_secret() {
             ))
             .collect::<Vec<_>>()
             .join("\n")
+    );
+
+    // What this sweep does NOT reach, printed every run. A loud gap is worth
+    // more than a quiet pass, and the shape of this one is known:
+    // fragment recovery is anchored on the `…` sentinel `truncate_error`
+    // appends, so it only sees cuts that announce themselves.
+    println!(
+        "\nNOT COVERED: a truncation with no `…` sentinel would leave a fragment\n\
+         \x20            this sweep cannot see. One known site; others unproven.\n\
+         NOT COVERED: GET /api/v1/jobs/{{id}} is driven with a synthetic id, so no\n\
+         \x20            job output exists to leak. Untested, not clean.\n\
+         NOT COVERED: every fixture builds a fresh store, so nothing written\n\
+         \x20            before a restart is ever read back."
+    );
+
+    // The numeric position. A registered value in a non-string slot makes the
+    // text replacement produce invalid JSON, so the response is refused WHOLE
+    // rather than partially rendered — response level, not field level, so
+    // everything else that response carried is gone with it. Asserting the
+    // envelope specifically, not merely "well-formed": a body that stayed
+    // valid JSON would mean the corruption never arose and the fixture proved
+    // nothing.
+    println!(
+        "\nrefused whole ({PROBE_NUMERIC_VAR} in a numeric position):\n{}",
+        if refusals.is_empty() {
+            "  (nowhere)".to_string()
+        } else {
+            refusals.join("\n")
+        }
+    );
+    assert!(
+        !refusals.is_empty(),
+        "{PROBE_NUMERIC_VAR} resolves to {PROBE_NUMERIC} in \
+         policy.rules[].scope.max_downstreams, a u64 that renders as a JSON \
+         NUMBER on GET /api/v1/policy. Replacing it with ${{{PROBE_NUMERIC_VAR}}} \
+         cannot produce valid JSON, so the response must be refused with \
+         secret_redaction_unavailable — and no response carried that envelope."
     );
 
     // The collision's second half. The first half — that the value is gone —
