@@ -2,7 +2,7 @@
 title: Run Rocky on Kubernetes
 description: "A Helm chart for self-hosting Rocky: one replica, replaced in place, on a persistent volume. What the chart refuses, and why each refusal exists."
 sidebar:
-  order: 7
+  order: 5.7
 ---
 
 The repository ships a Helm chart at [`deploy/helm/rocky/`](https://github.com/rocky-data/rocky/tree/main/deploy/helm/rocky). It is community-supported: an example to start from, not a supported deployment. It encodes the [deployment contract](/advanced/deployment-contract/) and refuses the settings that break it.
