@@ -41,7 +41,10 @@ const MIN_ZOOM = 0.1;
  * need 0.0965 at that width.
  *
  * This is passed per fit — to `fitViewOptions`, to `fitView()` and to the
- * Controls — so it never becomes the floor for a hand on the canvas.
+ * Controls — so it is not itself the floor for a hand on the canvas. It can
+ * still end up being one: a graph deep enough to fit at this clamp makes
+ * `floorFor` adopt it, which is the point. What it never does is lower the
+ * floor for a graph that fits above it.
  */
 const FIT = { minZoom: 0.02 } as const;
 
@@ -87,9 +90,13 @@ export function layoutIdentity(nodes: readonly ModelFlowNode[]): string {
  *   width. Nothing refitted, and the floor stayed where the shallow graph put
  *   it — which brought the zoom snap back by another route.
  *
- * Every fit reports its zoom, because the interaction floor follows it. The
- * nodes carry their own dimensions (`layout.ts`), so a fit straight after a
- * graph change does not have to wait to measure anything.
+ * Every fit reports its zoom, because the interaction floor follows it.
+ *
+ * A fit requested right after a graph change does not resolve immediately:
+ * React Flow queues it until its own observer has measured the new nodes.
+ * That is why the zoom is read in the promise continuation rather than on the
+ * next line. (The dimensions `layout.ts` declares are what let the minimap
+ * draw a node; they do not skip that measurement pass.)
  *
  * Width only, not height: the height is fixed, and re-fitting on every height
  * change would fight a scroll. A refit discards a manual pan or zoom, which is
@@ -142,11 +149,14 @@ function RefitOnChange({
 }
 
 /**
- * The stock controls, with the fit button reporting what it did.
+ * The stock controls, with the fit button reporting what it actually did.
  *
- * `onFitView` runs after the control's own `fitView`, so the zoom is settled
- * by then. Without this the button could fit below the floor and leave the
- * floor behind, which is the snap coming back by a third route.
+ * `onFitView` runs after the control's own `fitView` call, but that call only
+ * QUEUES the transform, so the callback still sees the zoom from before the
+ * fit. Reading it there recorded the old value — pressing Fit while zoomed in
+ * raised the floor and the queued fit then dropped below it, which is the
+ * snap coming back by a third route. So this runs its own awaited fit and
+ * reads after that.
  */
 function FittingControls({ onFitted }: { onFitted: (zoom: number) => void }) {
   const { fitView, getZoom } = useReactFlow();
