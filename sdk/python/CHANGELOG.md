@@ -17,7 +17,7 @@ Pairs with engine 1.74.0.
 
 - **`parse_rocky_output()` routes three new commands:** `product_list`, `product_journal` and `state-schedule-spool`. The `RockyOutput` union includes the three models, and the schema-parity test maps each to its schema file.
 
-- **`RunResult` gains `check_gate_failed` and `verify_after_failed`.** Both are on the hand-written model that `run()` returns and on the generated `RunOutput`. Both default to `False`, and the engine leaves each out of the JSON when it is `false`.
+- **`RunResult` gains `check_gate_failed` and `verify_after_failed`.** Both are on the hand-written model that `run()` returns and on the generated `RunOutput`. On `RunResult` both default to `False`; on the generated `RunOutput` both default to `None`. The engine leaves each out of the JSON when it is `false`.
   - `check_gate_failed` is `True` when an error-severity check failed and the pipeline's `fail_on_error` gate is on. It is a gate, not a tally. Count `check_results` for the number of failed checks. A resumed run can inherit it from the run it resumed, with clean `check_results` of its own. (#1671, #1734)
   - `verify_after_failed` is `True` when the run auto-applied additive schema drift and the post-apply `verify_after` gate did not confirm it. It is a separate verdict: `check_gate_failed` can be `False` while this one is `True`. (#1749)
 

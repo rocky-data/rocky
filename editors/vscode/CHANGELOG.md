@@ -28,7 +28,7 @@ Pairs with engine 1.74.0.
 - **Regenerated TypeScript bindings for engine 1.74.0.** For a TypeScript consumer:
   - `RunOutput` gains optional `check_gate_failed` and `verify_after_failed` (#1671, #1734, #1749).
   - `not_evaluated` moves from the cross-source overlap variant to the base `CheckResult`, so it applies to every check kind (#1652, #1706).
-  - `ReviewQueueEntry` gains `models: string[]`, which is **required**, and an optional `preview_model` (#1828).
+  - `ReviewQueueEntry` gains `models: string[]`, which is **required**, and an optional `preview_model` (#1828). **On upgrade:** a TypeScript object literal typed as `ReviewQueueEntry` must now supply `models`, or it stops type-checking.
   - `AuditOutput` gains an optional `product` (`AuditProductScope`) (#1685).
   - `TestOutput` gains an optional `diagnostics` (#1661). `AiContractOutput` gains optional `unverified_types` and `unmatched_columns` (#1660). `BriefOutput` gains an optional `config_error` (#1755).
   - Doc comments change for the tick skip reason `spool_unreadable` (#1752), `FulfillOutput.state` (#1539) and `ContractResult.warnings` (#1643).

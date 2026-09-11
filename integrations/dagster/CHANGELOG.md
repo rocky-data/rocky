@@ -23,7 +23,7 @@ Pairs with engine 1.74.0 and `rocky-sdk` 0.15.0.
 
 ### Fixed
 
-- **A check-gated Rocky run no longer finishes as a green Dagster step when no failing asset check explains it.** Since #1671 the engine fails a run on its error-severity checks and sets `check_gate_failed`. `RockyClient.run` passes `allow_partial=True`, so that run came back as a parsed result, not an error. Nothing in this package read the flag. So a gated run could finish green, for example when the failing check's asset was outside the step's selection. A `cross_source_overlap` verdict lands on one sibling, chosen by materialization order, so a partial selection can miss it.
+- **In the default `streaming` mode, a check-gated Rocky run on source assets no longer finishes as a green Dagster step when no failing asset check explains it.** Since #1671 the engine fails a run on its error-severity checks and sets `check_gate_failed`. `RockyClient.run` passes `allow_partial=True`, so that run came back as a parsed result, not an error. Nothing in this package read the flag. So a gated run could finish green, for example when the failing check's asset was outside the step's selection. A `cross_source_overlap` verdict lands on one sibling, chosen by materialization order, so a partial selection can miss it.
 
   Now, in the default `streaming` mode:
   - The step log carries an error line when `check_gate_failed` is set.
