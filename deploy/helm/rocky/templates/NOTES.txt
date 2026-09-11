@@ -1,0 +1,54 @@
+Rocky is installed as {{ include "rocky.fullname" . }}.
+
+  image      {{ include "rocky.image" . }}
+  volume     {{ include "rocky.claimName" . }} ({{ .Values.persistence.accessMode }}, class {{ .Values.persistence.storageClassName | default "<existing claim>" }})
+  scheduler  {{ .Values.scheduling.mode }}
+  browser UI {{ if .Values.serve.ui.enabled }}on, token scope {{ .Values.serve.ui.tokenScope }}{{ else }}off{{ end }}
+
+{{ if not .Values.serve.ui.enabled -}}
+The UI is off. `rocky serve --ui` and `--allowed-host` shipped after
+engine-v1.73.0, which is this chart's appVersion. Raise image.tag to a release
+that carries them, then set serve.ui.enabled=true.
+{{- end }}
+
+1. Put a project on the volume. The chart does not deliver one.
+
+   The image mounts it at /data, so /data/rocky.toml and /data/models/ must
+   exist. The state store is written to /data/models/.rocky-state.redb and the
+   scheduler's files to /data/.rocky/.
+
+     kubectl cp ./my-project \
+       "$(kubectl get pod -l app.kubernetes.io/instance={{ .Release.Name }} -o name | cut -d/ -f2):/data"
+
+   Or set initContainers to clone it from your repository.
+
+2. Reach it.
+
+{{- if .Values.ingress.enabled }}
+
+     http{{ if .Values.ingress.tls }}s{{ end }}://{{ .Values.ingress.host }}{{ .Values.ingress.path }}
+
+   Only that host works. The server is started with --allowed-host
+   {{ .Values.ingress.host }}, and a request carrying any other Host is
+   refused 421.
+{{- else }}
+
+     kubectl port-forward svc/{{ include "rocky.fullname" . }} 8080:{{ .Values.service.port }}
+     # http://localhost:8080/
+{{- end }}
+
+3. The token is in the Secret you named, {{ .Values.existingSecret.name }}, under
+   the key {{ .Values.existingSecret.tokenKey }}. This chart never printed it and
+   never held it.
+
+     kubectl get secret {{ .Values.existingSecret.name }} -o jsonpath='{.data.{{ .Values.existingSecret.tokenKey }}}' | base64 -d
+
+Two things to know before you rely on this:
+
+  - /api/v1/health, which both probes use, is shallow. It answers as soon as
+    the listener is bound. It does not prove the project compiled or that the
+    scheduler is running.
+
+  - This chart is community-supported, like the Compose example in
+    deploy/rocky/. It encodes the deployment contract; it is not a supported
+    deployment.

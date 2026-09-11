@@ -1,0 +1,179 @@
+# Rocky, self-hosted on Kubernetes.
+#
+# Community-supported, like the Compose example in deploy/rocky/. It encodes the
+# deployment contract; it is not a supported deployment.
+#
+# The one rule, from docs/advanced/deployment-contract/:
+#   "One scheduler per project, one replica, replaced in place, on a persistent
+#    volume."
+# This chart refuses every setting that breaks it.
+
+image:
+  repository: ghcr.io/rocky-data/rocky
+  # Empty means "use the chart's appVersion". Set a tag to pin one yourself.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# The contract allows exactly one. Any other value is refused, by the schema and
+# again by a template that prints the contract's own sentence.
+replicaCount: 1
+
+# Recreate, never RollingUpdate: a rolling update runs two pods at once, and two
+# schedulers are two independent cursors over one set of pipelines.
+strategy: Recreate
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ---------------------------------------------------------------------------
+# The project: rocky.toml and models/, on the volume.
+# ---------------------------------------------------------------------------
+# The image mounts the project at /data. Nothing else in the image is written to.
+# The state store is <project>/models/.rocky-state.redb and the scheduler's files
+# are under <project>/.rocky/, so both live on the volume by construction.
+#
+# The chart does NOT deliver your project. Pick one:
+#   - pre-populate the volume (kubectl cp, or a Job), then leave initContainers
+#     empty; or
+#   - add an init container here that clones it from git into /data.
+# The guide shows both.
+persistence:
+  # REQUIRED. Never inherited from the cluster default: the contract's locking
+  # claims hold on block storage, and flock on NFS or other network storage is
+  # unprobed. Name a block-backed class deliberately.
+  storageClassName: ""
+  size: 8Gi
+  accessMode: ReadWriteOnce
+  # Use a claim you already made instead of letting the chart create one.
+  existingClaim: ""
+
+initContainers: []
+
+# ---------------------------------------------------------------------------
+# Serve
+# ---------------------------------------------------------------------------
+serve:
+  # The browser UI. Needs an engine release carrying `--ui` and `--allowed-host`
+  # — later than 1.73.0. Raise image.tag with it.
+  ui:
+    enabled: false
+    # `--token-scope read-only` is refused 403 on any method that is not GET,
+    # HEAD or OPTIONS. It is the token to hand a browser.
+    tokenScope: read-only
+  # CORS allowlist. Only needed when the page origin differs from the Ingress
+  # host. Repeat entries as a list.
+  allowedOrigins: []
+  # Extra Host values to accept beyond the Ingress host, for another proxy in
+  # front. The Ingress host is added automatically when ingress.enabled is true.
+  extraAllowedHosts: []
+
+# ---------------------------------------------------------------------------
+# Scheduling — ONE value, never two schedulers.
+# ---------------------------------------------------------------------------
+# resident  the loop inside `rocky serve --scheduler`
+# cron      a CronJob running `rocky tick` on the same volume
+# disabled  neither
+#
+# `cron` and `resident` together are two independent cursors over one set of
+# pipelines, and both fire what is due. The advisory flock on .rocky/tick.lock
+# does NOT make that safe: it is contention avoidance, not the correctness
+# boundary (rocky-core/src/schedule/lock.rs).
+scheduling:
+  mode: disabled
+  resident:
+    pollIntervalSeconds: 15
+    # Seconds a running scheduled child may keep going after a shutdown signal.
+    # Read terminationGracePeriodSeconds below before you raise this.
+    drainTimeoutSeconds: 60
+  cron:
+    schedule: "*/15 * * * *"
+    # Forbid, never Allow: a second tick is a second scheduler.
+    concurrencyPolicy: Forbid
+
+# ---------------------------------------------------------------------------
+# Secrets — referenced, never created.
+# ---------------------------------------------------------------------------
+# This chart accepts no secret VALUE. It renders secretKeyRef names and keys
+# only, so no secret can appear in `helm template` output, in the release state,
+# or in a shell transcript. Create the Secret yourself:
+#
+#   kubectl create secret generic rocky-serve \
+#     --from-literal=token="$(openssl rand -hex 32)"
+#
+# REQUIRED whenever the server binds a non-loopback host, which it always does
+# in a pod.
+existingSecret:
+  name: ""
+  tokenKey: token
+  # Only read when scheduling.mode is resident and serve.ui.enabled is true:
+  # the webhook route must not be reachable with the read-only browser token.
+  webhookSecretKey: ""
+
+# ---------------------------------------------------------------------------
+# Networking
+# ---------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 8080
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  # The host the page is reached by. It is passed to the server as
+  # --allowed-host, so a request carrying any other Host is refused 421.
+  host: ""
+  path: /
+  pathType: Prefix
+  # Publish an Ingress with the UI off. --allowed-host is passed only with
+  # --ui, so the server then accepts any Host that reaches it. The bearer token
+  # still gates every route. Say it on purpose or not at all.
+  acknowledgeNoHostCheck: false
+  tls: []
+
+# ---------------------------------------------------------------------------
+# Pod
+# ---------------------------------------------------------------------------
+# MUST exceed scheduling.resident.drainTimeoutSeconds + 60.
+#
+# On shutdown Rocky waits the drain timeout, then sends the child SIGTERM, then
+# allows a further fixed 60 s (KILL_GRACE, rocky-core/src/schedule/spawn.rs:182)
+# before SIGKILL. With the 60 s default drain the worst case is 120 s. A shorter
+# grace lets Kubernetes SIGKILL the pod while a warehouse write is still going.
+terminationGracePeriodSeconds: 125
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 1Gi
+
+# Probes hit /api/v1/health, which is exempt from both the bearer token and the
+# host guard.
+#
+# It is a SHALLOW check. It answers "ok" as soon as the listener is bound, which
+# happens after the startup sweep ATTEMPT. It does not prove the sweep
+# succeeded, that the project compiled, that the state store is readable, or
+# that the scheduler is making progress. Thresholds are conservative on purpose:
+# a failed liveness probe restarts the pod, and a restart mid-run is the loss
+# window the contract describes.
+probes:
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  liveness:
+    initialDelaySeconds: 30
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 6
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+extraEnv: []

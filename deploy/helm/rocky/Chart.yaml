@@ -1,0 +1,27 @@
+apiVersion: v2
+name: rocky
+description: Rocky — a typed-program layer above the warehouse. One replica, replaced in place, on a persistent volume.
+type: application
+
+# The chart version moves with the chart. `appVersion` names the engine release
+# the default image tag pulls.
+#
+# `appVersion` is 1.73.0 because that is the newest published engine release
+# (`gh release list --repo rocky-data/rocky`). Every default in this chart is
+# therefore installable today.
+#
+# `rocky serve --ui` and `--allowed-host` shipped AFTER 1.73.0 (rocky #1687,
+# 2026-09-05; the tag is 2026-09-04). So `ui.enabled` defaults to false. Turn it
+# on and raise `image.tag` together, once an engine release carries the flags.
+version: 0.1.0
+appVersion: "1.73.0"
+
+home: https://rocky-data.github.io
+sources:
+  - https://github.com/rocky-data/rocky
+maintainers:
+  - name: rocky-data
+keywords:
+  - data
+  - warehouse
+  - sql
