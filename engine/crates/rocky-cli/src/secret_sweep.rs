@@ -69,20 +69,30 @@ enum Fixture {
     /// `autonomy_budget.window` resolves to the secret and fails validation.
     /// `ConfigError::PolicyBudgetInvalidWindow` interpolates `{window:?}`.
     InvalidPolicyWindow,
-    /// A model's TOML frontmatter is valid before substitution and broken
-    /// after. `ModelError::ParseFrontmatter` interpolates the raw toml error.
-    BrokenFrontmatter,
+    /// `models/_defaults.toml` is valid before substitution and broken after.
+    /// `load_dir_defaults` substitutes, then parses (`models.rs:691,706`), so
+    /// `ModelError::ParseFrontmatter` carries a toml error whose span holds
+    /// the resolved value.
+    BrokenDefaults,
+    /// The same shape one directory down: `models/groups/*.toml`, through
+    /// `load_groups_from_dir` (`models.rs:803`).
+    BrokenGroup,
+    /// The same shape again: `models/test_definitions.toml`, through
+    /// `load_test_definitions_from_dir` (`models.rs:881`).
+    BrokenTestDefinitions,
     /// The resolved value is bare where TOML needs a quoted string, so the
     /// config parse itself fails with the value inside the reported span.
     BrokenConfigParse,
 }
 
 impl Fixture {
-    fn all() -> [Fixture; 4] {
+    fn all() -> [Fixture; 6] {
         [
             Fixture::Valid,
             Fixture::InvalidPolicyWindow,
-            Fixture::BrokenFrontmatter,
+            Fixture::BrokenDefaults,
+            Fixture::BrokenGroup,
+            Fixture::BrokenTestDefinitions,
             Fixture::BrokenConfigParse,
         ]
     }
@@ -91,10 +101,24 @@ impl Fixture {
         match self {
             Fixture::Valid => "valid",
             Fixture::InvalidPolicyWindow => "invalid_policy_window",
-            Fixture::BrokenFrontmatter => "broken_frontmatter",
+            Fixture::BrokenDefaults => "broken_defaults",
+            Fixture::BrokenGroup => "broken_group",
+            Fixture::BrokenTestDefinitions => "broken_test_definitions",
             Fixture::BrokenConfigParse => "broken_config_parse",
         }
     }
+}
+
+/// A bare `${VAR}` is valid TOML on the page and invalid once it resolves —
+/// but only if the resolved text is not itself a TOML scalar. A probe of `1`
+/// or `true` would parse, the file would load, and the fixture would prove
+/// nothing while looking like it had.
+fn bare_probe_is_not_valid_toml() {
+    assert!(
+        toml::from_str::<toml::Value>(&format!("k = {PROBE}")).is_err(),
+        "the probe parses as bare TOML, so an 'unquoted' fixture would load \
+         cleanly and every broken_* case would be vacuous"
+    );
 }
 
 /// Write a project whose fields reference the probe variable.
@@ -165,29 +189,78 @@ tag_prefix = "${{{PROBE_VAR}}}"
     let config_path = dir.join("rocky.toml");
     std::fs::write(&config_path, config).unwrap();
 
-    std::fs::write(
-        models.join("_defaults.toml"),
-        format!("owner = \"${{{PROBE_VAR}}}\"\n"),
-    )
-    .unwrap();
-
-    let frontmatter = if fixture == Fixture::BrokenFrontmatter {
-        format!("owner = ${{{PROBE_VAR}}}")
+    // `_defaults.toml`, `groups/*.toml` and `test_definitions.toml` each
+    // substitute and THEN parse, so an unquoted reference is valid on the
+    // page and invalid once resolved — with the resolved text inside the toml
+    // error's span. Quoted, the same field just carries the value.
+    //
+    // `target.schema` is a real defaults key: an unknown key would be dropped
+    // silently, because `RawModelConfig` has no `deny_unknown_fields`, and the
+    // fixture would prove nothing.
+    let defaults = if fixture == Fixture::BrokenDefaults {
+        format!("[target]\nschema = ${{{PROBE_VAR}}}\n")
     } else {
-        format!("owner = \"${{{PROBE_VAR}}}\"")
+        format!("[target]\nschema = \"${{{PROBE_VAR}}}\"\n")
     };
-    std::fs::write(
-        models.join("probe_model.sql"),
-        format!("---\n{frontmatter}\n---\nselect 1 as id\n"),
-    )
-    .unwrap();
+    std::fs::write(models.join("_defaults.toml"), defaults).unwrap();
+
+    if fixture == Fixture::BrokenGroup {
+        std::fs::create_dir_all(models.join("groups")).unwrap();
+        std::fs::write(
+            models.join("groups").join("probe_group.toml"),
+            format!("name = ${{{PROBE_VAR}}}\n"),
+        )
+        .unwrap();
+    }
+
+    if fixture == Fixture::BrokenTestDefinitions {
+        std::fs::write(
+            models.join("test_definitions.toml"),
+            format!("[probe_test]\nsql = ${{{PROBE_VAR}}}\n"),
+        )
+        .unwrap();
+    }
+
+    std::fs::write(models.join("probe_model.sql"), "select 1 as id\n").unwrap();
     std::fs::write(
         models.join("probe_model.toml"),
-        format!("description = \"${{{PROBE_VAR}}}\"\n"),
+        format!("name = \"probe_model\"\ndescription = \"${{{PROBE_VAR}}}\"\n"),
     )
     .unwrap();
 
     config_path
+}
+
+/// Each broken_* fixture must really break the loader it targets.
+///
+/// Without this, "no secret appeared" and "no error happened" are the same
+/// observation, and a fixture that silently loaded would read as a clean
+/// sweep. This asserts the parse FAILED, at the site the fixture names.
+fn assert_site_is_exercised(models_dir: &Path, fixture: Fixture) {
+    use rocky_core::models::{
+        load_dir_defaults, load_groups_from_dir, load_test_definitions_from_dir,
+    };
+
+    let failed = match fixture {
+        Fixture::BrokenDefaults => load_dir_defaults(&models_dir.join("_defaults.toml")).err(),
+        Fixture::BrokenGroup => load_groups_from_dir(models_dir).err(),
+        Fixture::BrokenTestDefinitions => load_test_definitions_from_dir(models_dir).err(),
+        _ => return,
+    };
+
+    let err = failed.unwrap_or_else(|| {
+        panic!(
+            "{}: the loader accepted the fixture, so this site was never \
+             exercised — 'no leak' here would mean nothing",
+            fixture.name()
+        )
+    });
+    assert!(
+        matches!(err, rocky_core::models::ModelError::ParseFrontmatter { .. }),
+        "{}: expected a ParseFrontmatter failure at the site this fixture \
+         targets, got {err:?}",
+        fixture.name()
+    );
 }
 
 /// Prove the substitution really happened before any response is read.
@@ -217,9 +290,15 @@ fn assert_substituted(config_path: &Path, fixture: Fixture) {
 
     let loaded = rocky_core::config::load_rocky_config(config_path);
     match fixture {
-        // These two must LOAD. The resolved value must then be findable in
-        // what the loader produced — that is the substitution, proved.
-        Fixture::Valid | Fixture::BrokenFrontmatter => {
+        // These must LOAD. The resolved value must then be findable in what
+        // the loader produced — that is the substitution, proved. The
+        // broken_* model-side fixtures break a MODEL file, not rocky.toml, so
+        // the config half still has to load; `assert_site_is_exercised`
+        // proves the model half really broke.
+        Fixture::Valid
+        | Fixture::BrokenDefaults
+        | Fixture::BrokenGroup
+        | Fixture::BrokenTestDefinitions => {
             let cfg = loaded.unwrap_or_else(|e| {
                 panic!(
                     "{}: the config must load, or the sweep proves nothing: {e:#}",
@@ -303,6 +382,7 @@ async fn no_serve_route_renders_a_resolved_secret() {
     // and never removed. A concurrent reader in this binary sees either unset
     // or this exact value; neither makes another test's assertion wrong.
     unsafe { std::env::set_var(PROBE_VAR, PROBE) };
+    bare_probe_is_not_valid_toml();
 
     let declared = crate::api::api_v1_routes();
     let mut leaks: Vec<Leak> = Vec::new();
@@ -315,6 +395,7 @@ async fn no_serve_route_renders_a_resolved_secret() {
         assert_substituted(&config_path, fixture);
 
         let models_dir = dir.path().join("models");
+        assert_site_is_exercised(&models_dir, fixture);
         let state_path = models_dir.join(rocky_core::state::STATE_FILE_NAME);
         drop(rocky_core::state::StateStore::open(&state_path).unwrap());
 
