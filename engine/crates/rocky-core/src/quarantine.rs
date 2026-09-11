@@ -337,9 +337,27 @@ fn lower_valid_predicate(
             // and start another statement. The predicate is spliced twice into
             // the quarantine CTAS (error-label column + WHERE), so the
             // balanced-quote rule matters here too.
-            validation::reject_statement_terminator(
-                &format!("quarantine assertion '{label}' `expression`"),
+            let context = format!("quarantine assertion '{label}' `expression`");
+            validation::reject_statement_terminator(&context, expression)?;
+            // The terminator check stops a predicate ENDING the statement. It
+            // does not stop one that stays inside the expression and still
+            // reaches further than the model under test: a subquery reads any
+            // table the run's credentials can see, and a content-reading
+            // function (DuckDB `read_text`, Snowflake `GETVARIABLE`, a
+            // BigQuery remote function) sits in scalar position and reads
+            // whatever it is pointed at.
+            //
+            // #1820 closed that on the CHECKS path (`tests.rs`, before the
+            // `NOT (...)` splice). This predicate is spliced TWICE into a CTAS
+            // that runs with warehouse credentials, so it needs the same gate
+            // — parse under the target dialect, then allowlist the functions.
+            // Same validator, same dialect mapping, so the two paths cannot
+            // drift into disagreeing about what is allowed.
+            let sql_dialect = rocky_sql::check_expression::dialect_for(dialect.name());
+            rocky_sql::check_expression::validate_check_expression(
+                &context,
                 expression,
+                sql_dialect.as_ref(),
             )?;
             // Wrap in COALESCE so NULL expressions count as passing — matches
             // the existing `WHERE NOT (expression)` semantic.
@@ -1171,6 +1189,75 @@ mod unit_tests {
         let msg = err.to_string();
         assert!(msg.contains("statement terminator"), "{msg}");
         assert!(msg.contains("`expression`"), "{msg}");
+    }
+
+    /// A quarantine `expression` runs inside the quarantine CTAS, with
+    /// warehouse credentials. #1820 gave the CHECKS path a parse-and-allowlist
+    /// gate (`validate_check_expression`, called at `tests.rs` before the
+    /// `NOT (...)` splice) so a predicate cannot call a content-reading
+    /// function. Quarantine spliced the same user SQL twice with only the
+    /// terminator check, so the same predicate was still reachable here.
+    ///
+    /// A function off the allowlist sits in scalar position and is refused by
+    /// name — the content boundary #1524 asked for.
+    #[test]
+    fn quarantine_expression_refuses_a_disallowed_function() {
+        let cfg = split_config();
+        let assertions = vec![assertion(
+            None,
+            TestType::Expression {
+                expression: "read_text('/etc/passwd') IS NOT NULL".into(),
+            },
+            None,
+            TestSeverity::Error,
+        )];
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("read_text"),
+            "the refusal must NAME the function an operator has to remove: {msg}"
+        );
+    }
+
+    /// A subquery reaches any table the run's credentials can see, which is a
+    /// wider surface than the model under test. Refused for the same reason
+    /// the checks path refuses it.
+    #[test]
+    fn quarantine_expression_refuses_a_subquery() {
+        let cfg = split_config();
+        let assertions = vec![assertion(
+            None,
+            TestType::Expression {
+                expression: "customer_id IN (SELECT id FROM secrets)".into(),
+            },
+            None,
+            TestSeverity::Error,
+        )];
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("subquery"),
+            "the refusal must say a subquery is the problem: {msg}"
+        );
+    }
+
+    /// The gate must not refuse ordinary predicates. Without this, the two
+    /// refusals above would also pass on a change that refused everything.
+    #[test]
+    fn quarantine_expression_still_accepts_an_ordinary_predicate() {
+        let cfg = split_config();
+        let assertions = vec![assertion(
+            None,
+            TestType::Expression {
+                expression: "total >= 0 AND status <> 'void'".into(),
+            },
+            None,
+            TestSeverity::Error,
+        )];
+        compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            .expect("an ordinary predicate must still compile");
     }
 
     #[test]
