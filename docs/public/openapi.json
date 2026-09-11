@@ -12659,6 +12659,24 @@
         ],
         "type": "object"
       },
+      "PolicyAutonomyBudgetOutput": {
+        "description": "A rule's autonomy budget: `failures` within `window` degrade its effect.",
+        "properties": {
+          "failures": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "window": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "failures",
+          "window"
+        ],
+        "type": "object"
+      },
       "PolicyCapability": {
         "description": "The class of action a policy rule governs.\n\n`read` is always allowed (short-circuit). The mutating verbs (`propose` … `quarantine`) name coarse operations; `schema_change.additive`, `schema_change.breaking`, and `value_change` are *refinements* of the apply/promote verbs — a rule naming a bare verb (`apply`/`promote`) matches those refinements too, but a rule naming a refinement matches only that exact refinement.",
         "oneOf": [
@@ -12926,6 +12944,61 @@
         ],
         "type": "object"
       },
+      "PolicyFreezeInForce": {
+        "description": "One freeze in force.",
+        "properties": {
+          "freeze_id": {
+            "description": "The marker's id.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "plan_id": {
+            "description": "The ledger decision's plan id.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "principal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PolicyPrincipal"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The frozen principal. Absent ONLY on a marker whose body could not be read: the loader widens such a marker to scope `any` and to both principals so it fails closed. It is not a marker that deliberately froze both, and a reader must not present it as one — the `reason` says the body was unreadable."
+          },
+          "reason": {
+            "type": "string"
+          },
+          "scope": {
+            "description": "The scope selector as given to `rocky policy freeze`; `any` is every model.",
+            "type": "string"
+          },
+          "since": {
+            "description": "When the freeze was recorded, when the source recorded it.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "description": "`\"ledger\"` (a `rocky policy freeze` decision) or `\"marker\"` (a durable freeze marker in the remote object tier).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason",
+          "scope",
+          "source"
+        ],
+        "type": "object"
+      },
       "PolicyFreezeOutput": {
         "description": "JSON output for `rocky policy freeze` / `rocky policy unfreeze` — the kill switch.\n\nA freeze records a decision entry per matched principal into the existing policy-decision ledger; at the enforcement seam an active freeze forces `deny`. `unfreeze` records a superseding entry that lifts it. No config file is rewritten and no new table is created.",
         "properties": {
@@ -12972,6 +13045,91 @@
           "version"
         ],
         "type": "object"
+      },
+      "PolicyFreezeSources": {
+        "description": "Which freeze sources the report read.",
+        "properties": {
+          "ledger": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PolicyLedgerSource"
+              }
+            ],
+            "description": "How the decision ledger was read."
+          },
+          "markers": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PolicyMarkerSource"
+              }
+            ],
+            "description": "How the durable freeze markers were read."
+          }
+        },
+        "required": [
+          "ledger",
+          "markers"
+        ],
+        "type": "object"
+      },
+      "PolicyLedgerSource": {
+        "description": "How the decision ledger was read for a policy report.\n\nAn enum rather than a string because a consumer BRANCHES on it: the text renderer prints the incomplete-freeze-list warning on `LocalMirror` alone. As a bare string the producer and that branch were joined by nothing — renaming the written value compiled fine and silently retired the warning, with the tests on both ends still green (#1909).\n\nThe wire form is unchanged: the same four snake_case strings.",
+        "oneOf": [
+          {
+            "description": "A local backend, read in full.",
+            "enum": [
+              "read"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "A local backend with no state store yet. Proven absent, not assumed: a path that exists but cannot be read is an error.",
+            "enum": [
+              "absent"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "A remote `[state]` backend. What was read is the local mirror, which may be stale or empty; the remote authority was NOT downloaded, because this is a read-only route and the download replaces the local ledger. A freeze recorded by another pod can be missing here while an apply, which does download first, still denies.",
+            "enum": [
+              "local_mirror"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "No `[policy]` block, so nothing is in force and the enforcement gate reads no ledger either.",
+            "enum": [
+              "not_consulted"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "PolicyMarkerSource": {
+        "description": "How the durable freeze markers were read for a policy report.\n\nA separate enum from [`PolicyLedgerSource`], not a shared one: the two answer different questions and only two of their values coincide. A shared enum would let a match on the ledger claim to handle `NotConfigured`, which a ledger read cannot produce.\n\nThe wire form is unchanged: the same three snake_case strings.",
+        "oneOf": [
+          {
+            "description": "The `[state]` backend has a durable object tier, read in full. Reads are NOT gated on `freeze_marker_writes`: that flag gates writes only, and an existing marker stays enforced after it is turned off, so a reader that honoured it would hide a live freeze.",
+            "enum": [
+              "read"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The backend keeps no durable object tier.",
+            "enum": [
+              "not_configured"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "No `[policy]` block, as above.",
+            "enum": [
+              "not_consulted"
+            ],
+            "type": "string"
+          }
+        ]
       },
       "PolicyModelAttributes": {
         "description": "The compiled attributes of the checked model, echoed back so the explain output is self-contained.",
@@ -13113,6 +13271,173 @@
           "capability",
           "effect",
           "principal"
+        ],
+        "type": "object"
+      },
+      "PolicyRuleEntry": {
+        "description": "One `[[policy.rules]]` entry.",
+        "properties": {
+          "autonomy_budget": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PolicyAutonomyBudgetOutput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The rolling failure ceiling that degrades this rule's effect."
+          },
+          "capability": {
+            "$ref": "#/components/schemas/PolicyCapability"
+          },
+          "effect": {
+            "$ref": "#/components/schemas/PolicyEffect"
+          },
+          "id": {
+            "description": "Zero-based position in `[[policy.rules]]`; the `matched_rule` that `rocky policy check` reports.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "principal": {
+            "$ref": "#/components/schemas/PolicyPrincipal"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/PolicyRuleScopeOutput"
+          },
+          "verify_after": {
+            "description": "Post-apply verification: the named checks that must pass after a mutation this rule governs. A failing or absent named check halts the apply. Two rules that differ only here govern differently, so the document carries it; without it a reader cannot tell them apart.\n\nA rule's `conditions` is deliberately NOT carried. The engine parses it and never evaluates it, its shape is unbounded, and `${VAR}` in a config string is resolved before parsing — so an authored condition can hold a resolved secret that no key-based redaction could find. It decides nothing, so nothing is lost by leaving it out.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "capability",
+          "effect",
+          "id",
+          "principal",
+          "scope"
+        ],
+        "type": "object"
+      },
+      "PolicyRuleScopeOutput": {
+        "description": "What a rule matches. Every field is as authored; an empty list or `None` means the field does not narrow the rule.",
+        "properties": {
+          "any": {
+            "type": "boolean"
+          },
+          "classifications": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "contracted": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "exclude_classifications": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "layer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_downstreams": {
+            "description": "The blast-radius ceiling: the rule matches only a model with at most this many downstreams.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "models": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tags": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "any",
+          "classifications",
+          "exclude_classifications",
+          "models",
+          "tags"
+        ],
+        "type": "object"
+      },
+      "PolicyRulesOutput": {
+        "description": "JSON output for `rocky policy show`, and the body of `GET /api/v1/policy`: the policy plane as configured and as it stands.\n\nThe rules carry their position in `[[policy.rules]]` as `id`, the only identity a rule has today and the number `rocky policy check` reports as `matched_rule`.\n\n`freezes` is every freeze in force **that this reader could see**, from the decision ledger and the durable freeze markers, and `freeze_sources` says what it saw. That qualifier is load-bearing and is not a hedge:\n\n- `not_consulted` on both means no `[policy]` block, so the enforcement gate answers before it reads a freeze source and nothing is in force. - `local_mirror` on the ledger means a remote `[state]` backend, where the authority is remote and this read-only producer will not download it. A freeze recorded by another pod can be absent from `freezes` while an apply, which downloads first, still denies. Only when the ledger reads `read` or `absent` is the list exhaustive.\n\nA source that exists but cannot be read is an error, never an empty list: an empty list would say \"nothing is frozen\" for a plane whose freezes could not be read at all.",
+        "properties": {
+          "command": {
+            "description": "Always `\"policy_show\"`.",
+            "type": "string"
+          },
+          "configured": {
+            "description": "Whether `rocky.toml` carries a `[policy]` block. `false` is the default posture: no rules, `default_agent_effect` as the engine defaults it.",
+            "type": "boolean"
+          },
+          "default_agent_effect": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PolicyEffect"
+              }
+            ],
+            "description": "The effect an agent gets when no rule matches."
+          },
+          "freeze_sources": {
+            "$ref": "#/components/schemas/PolicyFreezeSources"
+          },
+          "freezes": {
+            "description": "The freezes in force that this reader could see, ledger entries first, then markers. Read `freeze_sources` before treating it as exhaustive: a `local_mirror` ledger read may be missing another pod's freeze.",
+            "items": {
+              "$ref": "#/components/schemas/PolicyFreezeInForce"
+            },
+            "type": "array"
+          },
+          "policy_version": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "rules": {
+            "description": "The rules in file order.",
+            "items": {
+              "$ref": "#/components/schemas/PolicyRuleEntry"
+            },
+            "type": "array"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "configured",
+          "default_agent_effect",
+          "freeze_sources",
+          "freezes",
+          "policy_version",
+          "rules",
+          "version"
         ],
         "type": "object"
       },
@@ -18766,6 +19091,52 @@
         },
         "type": "object"
       },
+      "ScheduleSpoolOutput": {
+        "description": "JSON output for `rocky state schedule spool`, mirrored by `GET /api/v1/schedule/spool`.\n\nThe webhook spool is the queue of demands accepted by the ingress but not yet consumed by a tick. [`ScheduleStatusOutput`] is blind to it: that snapshot reports *claims*, which exist only once a tick has picked a demand up, so a demand sitting here appears nowhere in `GET /api/v1/schedule`. This output is the missing half — what has been accepted and is still waiting.\n\n**Pending only.** Consumed demands are excluded: `.done` tombstones are the 24h idempotency window for `kind = id`, not outstanding work. Already quarantined files are excluded from `pending` too and counted in `counts.corrupt`.\n\n**Fail-closed on an unreadable spool.** A spool directory that is present but cannot be read is an error, never an empty list. That distinction is the whole bug class behind #1710/#1752/#1731: a present-but-unreadable spool that read as empty let every wrapper see a healthy tick while the webhook demand source was silently not firing. An *absent* spool is different and is fine — it means no webhook has ever been accepted here.",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "counts": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SpoolCounts"
+              }
+            ],
+            "description": "Roll-up counts over this listing."
+          },
+          "pending": {
+            "description": "Outstanding demands, oldest first, tie-broken by `demand_uid` so the order is total. Empty when nothing is queued.\n\nThis is arrival order, which is **not** the order a tick consumes them in: a spool file is named for the blake3 of its `(pipeline, kind, token)` dedup tuple, so the tick's sorted-by-filename walk is deterministic but unrelated to time. Arrival order is what an operator triaging a stuck queue needs.",
+            "items": {
+              "$ref": "#/components/schemas/SpoolPendingEntry"
+            },
+            "type": "array"
+          },
+          "skipped": {
+            "description": "Entries that could not be reported, with the reason for each. Never silently dropped — a demand this command cannot read is still a demand blocking the queue, and staying quiet about it is the #1731 failure one level up.",
+            "items": {
+              "$ref": "#/components/schemas/SpoolSkippedEntry"
+            },
+            "type": "array"
+          },
+          "spool_path": {
+            "description": "The spool directory this listing was read from (`<project>/.rocky/pending-demands`).\n\nSurfaced for the same reason [`ScheduleHoldOutput`] names its state file: a `serve --scheduler` rooted at a different project has a different spool, and reading the wrong one must not look like an empty queue.",
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "counts",
+          "pending",
+          "skipped",
+          "spool_path",
+          "version"
+        ],
+        "type": "object"
+      },
       "ScheduleStatusCounts": {
         "description": "Roll-up counts over the reported pipelines.",
         "properties": {
@@ -19721,6 +20092,97 @@
         },
         "required": [
           "product"
+        ],
+        "type": "object"
+      },
+      "SpoolCounts": {
+        "description": "Roll-up counts over a spool listing.",
+        "properties": {
+          "corrupt": {
+            "description": "Files already quarantined as corrupt by a previous tick. These are not in `pending` or `skipped` — the queue has set them aside — but a non-zero count means demands were accepted and never ran.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "pending": {
+            "description": "Outstanding demands reported in `pending`.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "skipped": {
+            "description": "Entries in `skipped`.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "corrupt",
+          "pending",
+          "skipped"
+        ],
+        "type": "object"
+      },
+      "SpoolPendingEntry": {
+        "description": "One demand accepted by the webhook ingress and not yet consumed.",
+        "properties": {
+          "body_hash": {
+            "description": "blake3 hex of the raw request body.",
+            "type": "string"
+          },
+          "demand_uid": {
+            "description": "The uid minted at acceptance. This is the claim-key discriminator and the join key to a claim in [`ScheduleStatusOutput`] once a tick picks the demand up.",
+            "type": "string"
+          },
+          "kind": {
+            "description": "`id` or `body` — which dedup discipline the demand was accepted under.",
+            "type": "string"
+          },
+          "pipeline": {
+            "description": "The target pipeline. Validated against the config before acceptance, so this always names a pipeline that existed when the demand arrived.",
+            "type": "string"
+          },
+          "received_at": {
+            "description": "When the ingress accepted the demand.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "token": {
+            "description": "The raw dedup token.\n\nFor `kind = id` this is **caller-supplied text**, taken verbatim from the delivery header and never interpreted by the engine; for `kind = body` it is a copy of `body_hash`. Present because it is the dedup key an operator needs when a webhook appears stuck.\n\nBecause a caller controls it, a consumer must render it as inert text. The browser UI does: React escapes by default and no production component uses `dangerouslySetInnerHTML` (`engine/ui/src/components.tsx`), with the pattern in `SamplePanel.test.tsx` pinning a hostile string as text and never as an element.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "body_hash",
+          "demand_uid",
+          "kind",
+          "pipeline",
+          "received_at",
+          "token"
+        ],
+        "type": "object"
+      },
+      "SpoolSkippedEntry": {
+        "description": "A spool entry this listing could not report, and why.",
+        "properties": {
+          "detail": {
+            "description": "The underlying detail, for an operator deciding what to do with the file.",
+            "type": "string"
+          },
+          "file": {
+            "description": "The file name within the spool directory. Only the name, not the full path, which `spool_path` already carries.",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why it was skipped: `unreadable` (the file could not be read), `malformed` (its JSON did not parse), or `bad_timestamp` (its `received_at` is not a valid RFC3339 instant).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "detail",
+          "file",
+          "reason"
         ],
         "type": "object"
       },
@@ -23058,6 +23520,48 @@
         ]
       }
     },
+    "/api/v1/policy": {
+      "get": {
+        "description": "The `[policy]` rules in file order with their positional ids (the `matched_rule` that `policy check` reports), the default agent effect, and the freezes in force that this read could see, from the decision ledger and the durable freeze markers. Read `freeze_sources` before treating the list as exhaustive: `not_consulted` means no `[policy]` block, so nothing is enforced; `local_mirror` means a remote `[state]` backend whose authoritative ledger this read-only route does not download, so another pod's freeze can be missing while an apply still denies. A missing `rocky.toml` is the default posture. A source that exists but cannot be read is a `500`, never an empty list. The same bytes as `rocky policy show --output json`.",
+        "operationId": "getPolicy",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyRulesOutput"
+                }
+              }
+            },
+            "description": "The policy plane as configured and as it stands."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The bound `rocky.toml` could not be parsed, or the decision ledger or the freeze markers could not be read."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "The policy plane",
+        "tags": [
+          "policy"
+        ]
+      }
+    },
     "/api/v1/products": {
       "get": {
         "description": "Every product the project knows, sorted by name: the `products/*.toml` specs plus every name the state store holds a fulfillment or approval record for, so a product whose spec file was deleted still lists with `spec_present = false`. The same bytes as `rocky product list --output json` run from the project root against the same state store. Reads `products/` under the directory of the bound `rocky.toml` and the store `--state-path` names (or the default under the models directory). The store is opened read-only: a store at the current schema version is never written, an older one is migrated forward as every read does, a newer one is refused.",
@@ -23525,6 +24029,48 @@
           }
         },
         "summary": "Scheduler status",
+        "tags": [
+          "schedule"
+        ]
+      }
+    },
+    "/api/v1/schedule/spool": {
+      "get": {
+        "description": "The webhook demands accepted by the ingress and not yet consumed by a tick. `GET /api/v1/schedule` reports claims, which exist only once a tick has picked a demand up — so a demand queued here appears nowhere there. Read this when a webhook was delivered and its pipeline never ran. Consumed demands are excluded: `.done` tombstones are the 24h idempotency window for `kind = id`, not outstanding work. An entry that cannot be read is reported in `skipped` rather than dropped, and `counts.corrupt` reports files a previous tick quarantined. `token` is caller-supplied text for `kind = id` and must be rendered as inert text.",
+        "operationId": "getScheduleSpool",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleSpoolOutput"
+                }
+              }
+            },
+            "description": "The queued demands. An absent spool answers 200 with an empty `pending` — no webhook has ever been accepted here."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The spool directory is present but could not be read. Never conflated with an empty queue."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The engine has no compile result yet, or the state store is locked by a running job (retryable)."
+          }
+        },
+        "summary": "Queued webhook demands",
         "tags": [
           "schedule"
         ]

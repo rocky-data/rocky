@@ -163,9 +163,17 @@ def check_metadata(check: CheckResult) -> dict[str, dg.MetadataValue]:
 
     # Not evaluated — applies to EVERY check kind, not just cross-source
     # overlap: a refused SQL fragment, a failed query, a keyless table and a
-    # misconfigured key all land here. While it is set the check is reported
-    # as failed and the numeric fields above are placeholders, not readings,
-    # so the reason must be visible next to them.
+    # misconfigured key all land here. Whenever it is set the numeric fields
+    # above are placeholders, not readings, so the reason must be visible next
+    # to them.
+    #
+    # It does NOT imply the check is reported as failed. Almost every
+    # `*_not_evaluated` constructor sets `passed: false`, but
+    # `cross_source_overlap_not_applicable` passes (#1706): the configuration
+    # does not apply to the group, which is not a failure. So a green check
+    # can carry `overlap_count: 0` as a placeholder, and green-plus-zero reads
+    # as "measured, found nothing" — the distinction #1709 exists to draw.
+    # Relabelling the placeholders when this is set is #1728.
     if check.not_evaluated is not None:
         metadata["not_evaluated"] = dg.MetadataValue.text(check.not_evaluated)
 

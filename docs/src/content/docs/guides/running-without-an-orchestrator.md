@@ -454,7 +454,8 @@ It is the same reconciler as `rocky tick`. Same `[schedule]` declarations, same 
 You can read the scheduler's state over HTTP:
 
 ```
-GET /api/v1/schedule
+GET /api/v1/schedule           # what is scheduled and in flight
+GET /api/v1/schedule/spool     # webhook demands accepted but not yet run
 ```
 
 It reports every scheduled pipeline: its `cron`/`after`/`freshness` configuration, when it last evaluated and last fired, its next expected fire, any active backoff, and the claims currently in flight. It also reports the tick-lock state. Two things need reading correctly.
@@ -528,6 +529,14 @@ freshness = true        # backstop: re-runs if it goes stale, even if a webhook 
 ```
 
 A webhook-triggered run records `trigger: "webhook"` in `rocky history`, distinct from the `schedule` trigger a cron, `after`, or freshness run records. It also appears under `GET /api/v1/schedule`'s in-flight claims while it runs. A demand whose pipeline was removed from config after it was accepted is finalized without ever running, and logged loudly rather than left pending forever.
+
+**Between acceptance and the next tick, a demand is in neither place.** `GET /api/v1/schedule` reports claims, and a claim exists only once a tick has picked the demand up. So a webhook that returned `202` and has not run yet appears in no claim and no history row. To see that queue:
+
+```
+GET /api/v1/schedule/spool          # or: rocky state schedule spool
+```
+
+It lists what the ingress accepted and no tick has consumed, with the `token` you can match against your provider's delivery log. Read it when a delivery succeeded on your provider's side and the pipeline never ran. A spool that is present but unreadable is reported as an error rather than an empty queue — "nothing is waiting" and "we cannot tell" are different answers.
 
 ### One scheduler instance per project
 

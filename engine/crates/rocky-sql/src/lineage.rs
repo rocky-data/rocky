@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -102,6 +102,43 @@ pub struct LineageResult {
     /// the pre-existing behaviour for such caches, not a new risk.
     #[serde(default)]
     pub unresolved_projections: usize,
+    /// Table names read INSIDE a derived table or a `WITH` body, lower-cased,
+    /// with `WITH`-bound names already removed (#1867).
+    ///
+    /// [`Self::source_tables`] holds only the top-level `FROM`/`JOIN`
+    /// relations, so a read of a model from inside `(SELECT … FROM m)` or
+    /// `WITH x AS (SELECT … FROM m)` was invisible to every consumer and no
+    /// scheduler ordered the reader after `m`. This carries those reads.
+    ///
+    /// Deliberately a separate field rather than more `source_tables` entries:
+    /// those feed alias resolution and `SELECT *` expansion, which are about
+    /// what the query's own `FROM` clause names. A nested read is a dependency,
+    /// not a relation the outer query can select from.
+    ///
+    /// **Best-effort, not complete.** It covers derived tables and `WITH`
+    /// bodies. It does not cover a sub-query in `WHERE`, `HAVING`, `GROUP BY`,
+    /// a qualifier or a function argument. `crate::lineage_complete` is the
+    /// only correct answer to "is this set exhaustive", and it stays exactly as
+    /// strict — do not read a non-empty value here as completeness.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested_sources: Vec<String>,
+}
+
+/// What a name in a `FROM`/`JOIN` position actually refers to.
+///
+/// A `WITH` clause binds names that look exactly like table reads, so the name
+/// alone cannot tell the two apart. A consumer deriving dependencies must not
+/// treat a CTE as a read: a CTE named after a model would invent an edge to
+/// it, and two models with mutual local CTE names would close a cycle that
+/// does not exist (#1892).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TableBinding {
+    /// A real read of a table, view or other physical relation.
+    #[default]
+    Physical,
+    /// A reference to a name bound by an enclosing `WITH` clause. Local to the
+    /// query — it names no object outside it.
+    Cte,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +147,14 @@ pub struct TableReference {
     pub name: String,
     /// Alias if any.
     pub alias: Option<String>,
+    /// Whether this name is a real relation or a `WITH`-bound CTE (#1892).
+    ///
+    /// `#[serde(default)]` so a `LineageResult` cached by an older build
+    /// deserializes as [`TableBinding::Physical`] — the value every reference
+    /// carried before CTE scopes were tracked, so an old cache keeps its old
+    /// meaning rather than failing to load.
+    #[serde(default)]
+    pub binding: TableBinding,
     /// Output column names of a derived table (subquery in the `FROM` clause),
     /// when they can be determined statically — i.e. the subquery does not
     /// itself project a `SELECT *`. `None` for plain table references and for
@@ -139,15 +184,21 @@ pub struct TableReference {
 /// intersected with known model names to produce implicit dependencies
 /// without requiring explicit `depends_on` declarations in sidecar TOMLs.
 ///
-/// Subqueries return the alias `(subquery)` which callers should filter
-/// out (it can't match a model name).
+/// The `(subquery)` marker never appears: a derived table contributes the
+/// names read INSIDE it (`LineageResult::nested_sources`, #1867) rather than a
+/// placeholder the caller has to filter.
+///
+/// Names bound by a `WITH` clause are dropped: a CTE is local to the query and
+/// names no object a consumer could depend on or schedule against (#1892).
 pub fn referenced_tables(sql: &str) -> Result<Vec<String>, String> {
     let result = extract_lineage(sql)?;
     let mut names: Vec<String> = result
         .source_tables
         .iter()
+        .filter(|t| t.binding == TableBinding::Physical)
         .map(|t| t.name.to_lowercase())
         .filter(|n| n != "(subquery)")
+        .chain(result.nested_sources.iter().cloned())
         .collect();
     names.sort();
     names.dedup();
@@ -165,15 +216,93 @@ pub fn extract_lineage(sql: &str) -> Result<LineageResult, String> {
     let stmt = statements.first().ok_or_else(|| "empty SQL".to_string())?;
 
     match stmt {
-        Statement::Query(query) => extract_query_lineage(query),
+        Statement::Query(query) => extract_query_lineage(query, &CteScope::new()),
         _ => Err("lineage extraction only supports SELECT statements".to_string()),
     }
 }
 
-fn extract_query_lineage(query: &Query) -> Result<LineageResult, String> {
+/// The CTE names visible at a point in the walk, folded to lower case.
+///
+/// SQL scoping nests inward: a name bound by an outer query's `WITH` is
+/// visible inside that query's subqueries, so the set is passed down. It never
+/// travels back up — a CTE bound inside a subquery is invisible outside it.
+type CteScope = HashSet<String>;
+
+/// Every name `query`'s own `WITH` clause binds, added to those already
+/// visible. This is the set the query's MAIN BODY sees: all of them.
+///
+/// The bodies need a narrower set — see [`walk_cte_bodies`].
+fn bind_cte_names(query: &Query, outer: &CteScope) -> CteScope {
+    let mut scope = outer.clone();
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            scope.insert(cte.alias.name.value.to_lowercase());
+        }
+    }
+    scope
+}
+
+/// The real table names read inside `query`'s own `WITH` bodies, in clause
+/// order, with `WITH`-bound names removed.
+///
+/// **Binding is incremental, and that is the whole point.** Inside CTE *i*,
+/// only CTEs 1..*i*-1 are visible — plus *i* itself when the clause is
+/// `RECURSIVE`, because a recursive CTE names itself. Binding the whole clause
+/// up front would read a real table in an earlier body as a reference to a
+/// later CTE and silently drop its edge:
+///
+/// ```sql
+/// WITH a AS (SELECT * FROM orders),   -- a real read of model `orders`
+///      orders AS (SELECT 1)            -- the CTE, defined AFTER
+/// SELECT * FROM a
+/// ```
+fn walk_cte_bodies(query: &Query, outer: &CteScope) -> Vec<String> {
+    let Some(with) = &query.with else {
+        return Vec::new();
+    };
+    let mut visible = outer.clone();
+    let mut found = Vec::new();
+    for cte in &with.cte_tables {
+        let own_name = cte.alias.name.value.to_lowercase();
+        let mut body_scope = visible.clone();
+        if with.recursive {
+            body_scope.insert(own_name.clone());
+        }
+        if let Ok(inner) = extract_query_lineage(&cte.query, &body_scope) {
+            collect_nested(&inner, &mut found);
+        }
+        visible.insert(own_name);
+    }
+    found
+}
+
+/// Fold one inner query's reads into a nested-source list.
+///
+/// Takes NAMES only. An inner query's `has_star` and `unresolved_projections`
+/// describe the inner projection, and merging them into the outer result would
+/// claim the outer model's own column set is unresolved when it is not.
+fn collect_nested(inner: &LineageResult, out: &mut Vec<String>) {
+    for t in &inner.source_tables {
+        if t.binding == TableBinding::Physical && t.name != "(subquery)" {
+            out.push(t.name.to_lowercase());
+        }
+    }
+    out.extend(inner.nested_sources.iter().cloned());
+}
+
+fn extract_query_lineage(query: &Query, outer_ctes: &CteScope) -> Result<LineageResult, String> {
+    let ctes = bind_cte_names(query, outer_ctes);
+    let mut nested_sources = walk_cte_bodies(query, outer_ctes);
     match query.body.as_ref() {
         SetExpr::Select(select) => {
-            let source_tables = extract_tables(&select.from);
+            // A derived table's own reads come back alongside the relations.
+            // The `(subquery)` entry stays in `source_tables` — alias
+            // resolution and star expansion still need it — but it names no
+            // object, so the names inside it are what a consumer depends on.
+            let (source_tables, derived_reads) = extract_tables(&select.from, &ctes);
+            nested_sources.extend(derived_reads);
+            nested_sources.sort();
+            nested_sources.dedup();
             let alias_map = build_alias_map(&source_tables);
             let (columns, has_star, unresolved_projections) =
                 extract_select_columns(&select.projection, &alias_map, &source_tables);
@@ -183,32 +312,60 @@ fn extract_query_lineage(query: &Query) -> Result<LineageResult, String> {
                 columns,
                 has_star,
                 unresolved_projections,
+                nested_sources,
             })
         }
-        SetExpr::Query(inner) => extract_query_lineage(inner),
+        SetExpr::Query(inner) => {
+            let mut result = extract_query_lineage(inner, &ctes)?;
+            nested_sources.append(&mut result.nested_sources);
+            nested_sources.sort();
+            nested_sources.dedup();
+            result.nested_sources = nested_sources;
+            Ok(result)
+        }
         _ => Err("unsupported query type for lineage".to_string()),
     }
 }
 
-fn extract_tables(from: &[TableWithJoins]) -> Vec<TableReference> {
+/// The relations named in `from`, plus the table names read INSIDE any derived
+/// table there (#1867). The two are returned separately because they answer
+/// different questions: the first is what the query can select from, the second
+/// is what it depends on.
+fn extract_tables(from: &[TableWithJoins], ctes: &CteScope) -> (Vec<TableReference>, Vec<String>) {
     let mut tables = Vec::new();
+    let mut nested = Vec::new();
 
     for table_with_joins in from {
-        extract_table_factor(&table_with_joins.relation, &mut tables);
+        extract_table_factor(&table_with_joins.relation, ctes, &mut tables, &mut nested);
         for join in &table_with_joins.joins {
-            extract_table_factor(&join.relation, &mut tables);
+            extract_table_factor(&join.relation, ctes, &mut tables, &mut nested);
         }
     }
 
-    tables
+    (tables, nested)
 }
 
-fn extract_table_factor(factor: &TableFactor, tables: &mut Vec<TableReference>) {
+fn extract_table_factor(
+    factor: &TableFactor,
+    ctes: &CteScope,
+    tables: &mut Vec<TableReference>,
+    nested: &mut Vec<String>,
+) {
     match factor {
         TableFactor::Table { name, alias, .. } => {
+            let name = name.to_string();
+            // A CTE reference is always a single unqualified name, so a
+            // multi-part read can never be one — checking the whole spelling
+            // is what keeps `v2.orders` from being shadowed by a CTE `orders`.
+            let binding = if ctes.contains(&name.to_lowercase()) {
+                TableBinding::Cte
+            } else {
+                TableBinding::Physical
+            };
             tables.push(TableReference {
-                name: name.to_string(),
+                name,
                 alias: alias.as_ref().map(|a| a.name.value.clone()),
+                binding,
                 derived_columns: None,
                 derived_sources: Vec::new(),
             });
@@ -224,7 +381,13 @@ fn extract_table_factor(factor: &TableFactor, tables: &mut Vec<TableReference>) 
             // inner `SELECT *` (or a nested derived table that doesn't expand)
             // leaves `has_star = true` with no individual columns, in which
             // case we fall back to `None`.
-            let inner = extract_query_lineage(subquery).ok();
+            let inner = extract_query_lineage(subquery, ctes).ok();
+            // The inner query's own reads are this model's dependencies. Taken
+            // as NAMES only — the inner `has_star` describes the inner
+            // projection, not the outer model's column set (#1867).
+            if let Some(inner) = inner.as_ref() {
+                collect_nested(inner, nested);
+            }
             let derived_columns = inner.as_ref().and_then(|inner| {
                 if inner.has_star || inner.columns.is_empty() {
                     None
@@ -253,6 +416,7 @@ fn extract_table_factor(factor: &TableFactor, tables: &mut Vec<TableReference>) 
             tables.push(TableReference {
                 name: "(subquery)".to_string(),
                 alias: Some(a.name.value.clone()),
+                binding: TableBinding::Physical,
                 derived_columns,
                 derived_sources,
             });
@@ -855,5 +1019,251 @@ mod tests {
         assert_eq!(avg.source_table, None);
         // The sourced column still resolves normally.
         assert!(by_name.contains_key("customer_id"));
+    }
+
+    /// #1892: a `WITH`-bound name looks exactly like a table read, and a
+    /// consumer that cannot tell them apart derives an edge to a model that
+    /// the query never reads.
+    #[test]
+    fn a_cte_reference_is_not_a_table_read() {
+        let result =
+            extract_lineage("WITH orders AS (SELECT 2 AS id) SELECT id FROM orders").unwrap();
+
+        assert_eq!(result.source_tables.len(), 1);
+        assert_eq!(result.source_tables[0].name, "orders");
+        assert_eq!(result.source_tables[0].binding, TableBinding::Cte);
+
+        assert!(
+            referenced_tables("WITH orders AS (SELECT 2 AS id) SELECT id FROM orders")
+                .unwrap()
+                .is_empty(),
+            "a CTE names no object outside the query, so nothing can depend on it"
+        );
+    }
+
+    /// The other half of the same rule, and the one that keeps the fix from
+    /// suppressing real edges: the SAME spelling with no `WITH` clause is an
+    /// ordinary read and must stay one.
+    #[test]
+    fn the_same_name_without_a_with_clause_is_still_a_table_read() {
+        let result = extract_lineage("SELECT id FROM orders").unwrap();
+
+        assert_eq!(result.source_tables[0].binding, TableBinding::Physical);
+        assert_eq!(
+            referenced_tables("SELECT id FROM orders").unwrap(),
+            vec!["orders".to_string()]
+        );
+    }
+
+    /// A query may bind one CTE and read a real table in the same `FROM`.
+    /// Only the bound name is shadowed.
+    #[test]
+    fn only_the_bound_name_is_shadowed() {
+        let result =
+            extract_lineage("WITH c AS (SELECT 1 AS id) SELECT c.id FROM c JOIN orders USING (id)")
+                .unwrap();
+
+        let by_name: HashMap<&str, TableBinding> = result
+            .source_tables
+            .iter()
+            .map(|t| (t.name.as_str(), t.binding))
+            .collect();
+        assert_eq!(by_name["c"], TableBinding::Cte);
+        assert_eq!(by_name["orders"], TableBinding::Physical);
+    }
+
+    /// CTE names fold case, as SQL identifiers do. Without the fold, a project
+    /// writing `WITH Orders AS (…) … FROM orders` would keep the false edge.
+    #[test]
+    fn a_cte_name_shadows_across_case() {
+        let result =
+            extract_lineage("WITH Orders AS (SELECT 1 AS id) SELECT id FROM ORDERS").unwrap();
+
+        assert_eq!(result.source_tables[0].binding, TableBinding::Cte);
+    }
+
+    /// Scope nests inward: a name bound by the outer query is visible inside
+    /// that query's derived tables, so the inner read is shadowed too.
+    #[test]
+    fn an_outer_cte_shadows_inside_a_derived_table() {
+        let result = extract_lineage(
+            "WITH orders AS (SELECT 1 AS id) \
+             SELECT id FROM (SELECT id FROM orders) AS s",
+        )
+        .unwrap();
+
+        assert!(
+            referenced_tables(
+                "WITH orders AS (SELECT 1 AS id) SELECT id FROM (SELECT id FROM orders) AS s"
+            )
+            .unwrap()
+            .is_empty(),
+            "the inner read is the outer CTE, not a table: {:?}",
+            result.source_tables
+        );
+    }
+
+    /// A CTE reference is always a single unqualified name, so a qualified
+    /// read must not be shadowed by a CTE that shares its last part. Checking
+    /// the whole spelling rather than the stem is what buys this.
+    #[test]
+    fn a_qualified_read_is_not_shadowed_by_a_same_stem_cte() {
+        let result =
+            extract_lineage("WITH orders AS (SELECT 1 AS id) SELECT id FROM v2.orders").unwrap();
+
+        assert_eq!(result.source_tables[0].name, "v2.orders");
+        assert_eq!(result.source_tables[0].binding, TableBinding::Physical);
+    }
+
+    /// The CTE name lives on the alias, and an explicit column list puts a
+    /// second thing there. The name must still bind, or the shadow silently
+    /// would not apply to this spelling.
+    ///
+    /// The other spelling worth naming is `WITH x AS MATERIALIZED (…)`, which
+    /// `DatabricksDialect` does not parse at all — so a model using it already
+    /// fails lineage extraction outright, long before binding is asked about.
+    /// That is pre-existing and unrelated to CTE scopes.
+    #[test]
+    fn an_explicit_column_list_still_binds_the_name() {
+        let result =
+            extract_lineage("WITH orders (id) AS (SELECT 1 AS id) SELECT id FROM orders").unwrap();
+
+        assert_eq!(
+            result.source_tables[0].binding,
+            TableBinding::Cte,
+            "the name is bound whatever else the clause carries"
+        );
+    }
+
+    /// A `WITH RECURSIVE` body names itself. The main body's read is still the
+    /// CTE, not a table.
+    #[test]
+    fn a_recursive_cte_binds_its_own_name() {
+        let result = extract_lineage(
+            "WITH RECURSIVE orders AS (SELECT 1 AS id UNION ALL SELECT id + 1 FROM orders \
+             WHERE id < 3) SELECT id FROM orders",
+        )
+        .unwrap();
+
+        assert_eq!(result.source_tables[0].binding, TableBinding::Cte);
+    }
+
+    /// #1867: a read inside a derived table is a dependency. It used to reach
+    /// no consumer at all — `source_tables` held the literal `(subquery)` and
+    /// nothing looked inside it — so no scheduler ordered the reader after its
+    /// producer.
+    #[test]
+    fn a_subquery_read_surfaces_as_a_dependency() {
+        let sql = "SELECT id FROM (SELECT id FROM orders) AS s";
+        let result = extract_lineage(sql).unwrap();
+
+        assert_eq!(result.source_tables[0].name, "(subquery)");
+        assert_eq!(result.nested_sources, vec!["orders".to_string()]);
+        assert_eq!(
+            referenced_tables(sql).unwrap(),
+            vec!["orders".to_string()],
+            "the marker is gone and the real read is there"
+        );
+    }
+
+    /// The same for a `WITH` body. The CTE's own name stays out — it names no
+    /// object outside the query (#1892).
+    #[test]
+    fn a_cte_body_read_surfaces_but_the_cte_name_does_not() {
+        let sql = "WITH c AS (SELECT id FROM orders) SELECT id FROM c";
+
+        assert_eq!(referenced_tables(sql).unwrap(), vec!["orders".to_string()]);
+    }
+
+    /// The rule the incremental binding exists for. `orders` inside `a`'s body
+    /// is a REAL table: a non-recursive CTE only sees the CTEs declared before
+    /// it, so the `orders` CTE declared afterwards does not shadow it.
+    ///
+    /// Binding the whole clause up front would classify that read as a CTE
+    /// reference and drop the edge — silently, and only for this ordering.
+    #[test]
+    fn a_cte_declared_after_a_body_does_not_shadow_that_bodys_read() {
+        let sql = "WITH a AS (SELECT id FROM orders), \
+                   orders AS (SELECT 1 AS id) \
+                   SELECT id FROM a";
+
+        assert_eq!(
+            referenced_tables(sql).unwrap(),
+            vec!["orders".to_string()],
+            "the read in `a` predates the `orders` CTE, so it is the table"
+        );
+    }
+
+    /// And the other ordering, which must give the opposite answer: declared
+    /// FIRST, the CTE does shadow the read.
+    #[test]
+    fn a_cte_declared_before_a_body_does_shadow_that_bodys_read() {
+        let sql = "WITH orders AS (SELECT 1 AS id), \
+                   a AS (SELECT id FROM orders) \
+                   SELECT id FROM a";
+
+        assert!(
+            referenced_tables(sql).unwrap().is_empty(),
+            "the read in `a` is the CTE above it, not a table"
+        );
+    }
+
+    /// A `WITH RECURSIVE` body names itself, so its self-read is not a table.
+    #[test]
+    fn a_recursive_body_does_not_read_itself_as_a_table() {
+        let sql = "WITH RECURSIVE walk AS (SELECT id FROM walk) SELECT id FROM walk";
+
+        assert!(
+            referenced_tables(sql).unwrap().is_empty(),
+            "the recursive CTE is not a table"
+        );
+    }
+
+    /// A limitation, pinned so it is a known gap rather than a surprise: a CTE
+    /// body that is a SET OPERATION contributes nothing.
+    ///
+    /// `extract_query_lineage` handles `SetExpr::Select` and `SetExpr::Query`
+    /// and returns `Err` for `SetExpr::SetOperation`, so `walk_cte_bodies`
+    /// skips such a body entirely. `UNION ALL` inside a recursive CTE is the
+    /// ordinary spelling of one, so #1867's fix does not reach it.
+    ///
+    /// This test exists because the recursive test above was originally
+    /// written with a `UNION ALL` body and PASSED VACUOUSLY — the CTE name was
+    /// absent because nothing was walked, not because self-binding worked.
+    #[test]
+    fn a_set_operation_cte_body_contributes_no_reads() {
+        let sql = "WITH walk AS ( \
+                     SELECT id FROM seed \
+                     UNION ALL \
+                     SELECT id FROM other \
+                   ) SELECT id FROM walk";
+
+        assert!(
+            referenced_tables(sql).unwrap().is_empty(),
+            "known gap: a set-operation body is not walked, so `seed` and \
+             `other` derive no edge"
+        );
+    }
+
+    /// Reads two levels down still surface — the walk recurses rather than
+    /// looking one level.
+    #[test]
+    fn a_read_two_levels_down_still_surfaces() {
+        let sql = "SELECT id FROM (SELECT id FROM (SELECT id FROM orders) AS inner_q) AS outer_q";
+
+        assert_eq!(referenced_tables(sql).unwrap(), vec!["orders".to_string()]);
+    }
+
+    /// The inner query's OWN projection facts must not become the outer
+    /// model's. An inner `SELECT *` says nothing about whether the outer
+    /// model's column set is known, and merging it would make every model with
+    /// a `SELECT *` subquery look unresolved.
+    #[test]
+    fn an_inner_star_does_not_make_the_outer_projection_unresolved() {
+        let result = extract_lineage("SELECT id FROM (SELECT * FROM orders) AS s").unwrap();
+
+        assert!(!result.has_star, "the OUTER projection names its column");
+        assert_eq!(result.unresolved_projections, 0);
+        assert_eq!(result.nested_sources, vec!["orders".to_string()]);
     }
 }

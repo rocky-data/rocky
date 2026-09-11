@@ -48,6 +48,12 @@ pub use crate::commands::test::declarative_test_count;
 // and nothing is about to run.
 #[cfg(feature = "duckdb")]
 pub use crate::commands::test::declarative_check_digest;
+// The count and the digest from ONE load. Calling the two entry points above
+// separately makes them two reads at two times, so an edit between them lets
+// the bundle report a deferred check it never pinned (#1804). The verify
+// bundle needs both, so it takes this.
+#[cfg(feature = "duckdb")]
+pub use crate::commands::test::{DeclarativeCheckSnapshot, declarative_check_snapshot};
 // The digest's SCHEME predicate. A persisted digest is opaque, so the
 // loop cannot tell "the checks moved" from "this binary hashes a
 // different preimage than the build that pinned this" without asking.

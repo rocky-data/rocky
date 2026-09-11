@@ -33,6 +33,13 @@ mkdir -p "$HERE/expected"
 # Resolve to an ABSOLUTE path now, before we cd into the throwaway repo.
 find_rocky() {
     local d="$HERE"
+    # An explicit ROCKY_BIN wins over every guess below: it is how the POC
+    # harness names the binary under test, and a walk that prefers a release
+    # build would otherwise exercise a stale one (#1676).
+    if [ -n "${ROCKY_BIN:-}" ]; then
+        echo "$ROCKY_BIN"
+        return 0
+    fi
     while [ "$d" != "/" ]; do
         if [ -f "$d/engine/Cargo.toml" ]; then
             for cand in "$d/engine/target/release/rocky" "$d/engine/target/debug/rocky"; do

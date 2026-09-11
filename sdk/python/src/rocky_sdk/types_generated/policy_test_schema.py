@@ -16,7 +16,7 @@ class PolicyCapability(StrEnum):
     read = "read"
 
 
-class PolicyCapability51(StrEnum):
+class PolicyCapability64(StrEnum):
     """
     Draft a plan for later review.
     """
@@ -24,7 +24,7 @@ class PolicyCapability51(StrEnum):
     propose = "propose"
 
 
-class PolicyCapability52(StrEnum):
+class PolicyCapability65(StrEnum):
     """
     Apply a plan against the warehouse.
     """
@@ -32,7 +32,7 @@ class PolicyCapability52(StrEnum):
     apply = "apply"
 
 
-class PolicyCapability53(StrEnum):
+class PolicyCapability66(StrEnum):
     """
     Promote a branch / environment.
     """
@@ -40,7 +40,7 @@ class PolicyCapability53(StrEnum):
     promote = "promote"
 
 
-class PolicyCapability54(StrEnum):
+class PolicyCapability67(StrEnum):
     """
     Backfill historical partitions.
     """
@@ -48,7 +48,7 @@ class PolicyCapability54(StrEnum):
     backfill = "backfill"
 
 
-class PolicyCapability55(StrEnum):
+class PolicyCapability68(StrEnum):
     """
     Garbage-collect / reclaim storage.
     """
@@ -56,7 +56,7 @@ class PolicyCapability55(StrEnum):
     gc = "gc"
 
 
-class PolicyCapability56(StrEnum):
+class PolicyCapability69(StrEnum):
     """
     Restore a gc-evicted artifact from its tombstone (*attempts* a rebuild, then verifies hash-exact — supported only for a recipe that reads no recorded upstreams; a multi-input recipe is refused).
     """
@@ -64,7 +64,7 @@ class PolicyCapability56(StrEnum):
     restore = "restore"
 
 
-class PolicyCapability57(StrEnum):
+class PolicyCapability70(StrEnum):
     """
     Retry a failed run.
     """
@@ -72,7 +72,7 @@ class PolicyCapability57(StrEnum):
     retry = "retry"
 
 
-class PolicyCapability58(StrEnum):
+class PolicyCapability71(StrEnum):
     """
     Quarantine a partition / model.
     """
@@ -80,7 +80,7 @@ class PolicyCapability58(StrEnum):
     quarantine = "quarantine"
 
 
-class PolicyCapability59(StrEnum):
+class PolicyCapability72(StrEnum):
     """
     An additive schema change (refinement of apply/promote).
     """
@@ -88,7 +88,7 @@ class PolicyCapability59(StrEnum):
     schema_change_additive = "schema_change.additive"
 
 
-class PolicyCapability60(StrEnum):
+class PolicyCapability73(StrEnum):
     """
     A breaking schema change (refinement of apply/promote).
     """
@@ -96,7 +96,7 @@ class PolicyCapability60(StrEnum):
     schema_change_breaking = "schema_change.breaking"
 
 
-class PolicyCapability61(StrEnum):
+class PolicyCapability74(StrEnum):
     """
     A value-only data change (refinement of apply/promote).
     """
@@ -112,7 +112,7 @@ class PolicyEffect(StrEnum):
     allow = "allow"
 
 
-class PolicyEffect19(StrEnum):
+class PolicyEffect22(StrEnum):
     """
     Permit only after human review. The safe default posture.
     """
@@ -120,7 +120,7 @@ class PolicyEffect19(StrEnum):
     require_review = "require_review"
 
 
-class PolicyEffect20(StrEnum):
+class PolicyEffect23(StrEnum):
     """
     Refuse the action. A hard override — no `allow` overturns it.
     """
@@ -136,7 +136,7 @@ class PolicyPrincipal(StrEnum):
     human = "human"
 
 
-class PolicyPrincipal13(StrEnum):
+class PolicyPrincipal15(StrEnum):
     """
     A non-human caller (AI agent / automation).
     """
@@ -149,28 +149,28 @@ class PolicyTestResult(BaseModel):
     The outcome of one `[[policy.tests]]` scenario.
     """
 
-    actual: PolicyEffect | PolicyEffect19 | PolicyEffect20
+    actual: PolicyEffect | PolicyEffect22 | PolicyEffect23
     """
     The effect the evaluator actually resolved.
     """
     capability: (
         PolicyCapability
-        | PolicyCapability51
-        | PolicyCapability52
-        | PolicyCapability53
-        | PolicyCapability54
-        | PolicyCapability55
-        | PolicyCapability56
-        | PolicyCapability57
-        | PolicyCapability58
-        | PolicyCapability59
-        | PolicyCapability60
-        | PolicyCapability61
+        | PolicyCapability64
+        | PolicyCapability65
+        | PolicyCapability66
+        | PolicyCapability67
+        | PolicyCapability68
+        | PolicyCapability69
+        | PolicyCapability70
+        | PolicyCapability71
+        | PolicyCapability72
+        | PolicyCapability73
+        | PolicyCapability74
     )
     """
     The capability that was checked.
     """
-    expected: PolicyEffect | PolicyEffect19 | PolicyEffect20
+    expected: PolicyEffect | PolicyEffect22 | PolicyEffect23
     """
     The effect the scenario expected.
     """
@@ -190,7 +190,7 @@ class PolicyTestResult(BaseModel):
     """
     `true` when the resolved effect equalled `expected`.
     """
-    principal: PolicyPrincipal | PolicyPrincipal13
+    principal: PolicyPrincipal | PolicyPrincipal15
     """
     The principal that was checked.
     """

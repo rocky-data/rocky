@@ -28,13 +28,14 @@ use crate::output::{
     GcApplyOutput, GcPlanOutput, GcReportOutput, HealthOutput, HistoryOutput, HooksListOutput,
     HooksTestOutput, ImportDbtOutput, JobStatus, LineageDiffOutput, LineageOutput, LoadOutput,
     MetaOutput, MetricsOutput, ModelDetailOutput, ModelHistoryOutput, ModelListOutput,
-    OptimizeOutput, PlanOutput, PolicyCheckOutput, PolicyFreezeOutput, PolicyTestOutput,
-    PreviewCostOutput, PreviewCreateOutput, PreviewDiffOutput, PreviewRowsOutput, ProfileOutput,
-    ProfileStorageOutput, PromotePlan, RecipeHistoryOutput, ReplayCheckOutput, ReplayExecuteOutput,
-    ReplayOutput, RestoreApplyOutput, RestorePlanOutput, RetentionStatusOutput,
-    RetentionSweepOutput, ReviewOutput, ReviewQueueOutput, ReviewStatusOutput, RunOutput,
-    ScheduleHoldOutput, ScheduleStatusOutput, SeedOutput, StateOutput, TestAdapterOutput,
-    TestOutput, TickOutput, TraceOutput, ValidateMigrationOutput, ValidateOutput,
+    OptimizeOutput, PlanOutput, PolicyCheckOutput, PolicyFreezeOutput, PolicyRulesOutput,
+    PolicyTestOutput, PreviewCostOutput, PreviewCreateOutput, PreviewDiffOutput, PreviewRowsOutput,
+    ProfileOutput, ProfileStorageOutput, PromotePlan, RecipeHistoryOutput, ReplayCheckOutput,
+    ReplayExecuteOutput, ReplayOutput, RestoreApplyOutput, RestorePlanOutput,
+    RetentionStatusOutput, RetentionSweepOutput, ReviewOutput, ReviewQueueOutput,
+    ReviewStatusOutput, RunOutput, ScheduleHoldOutput, ScheduleSpoolOutput, ScheduleStatusOutput,
+    SeedOutput, StateOutput, TestAdapterOutput, TestOutput, TickOutput, TraceOutput,
+    ValidateMigrationOutput, ValidateOutput,
 };
 
 /// Top-level command output types currently covered by schemars.
@@ -76,6 +77,7 @@ pub(crate) fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         // need generated bindings for the payload.
         entry::<ScheduleHoldOutput>("state_schedule_hold"),
         entry::<ScheduleStatusOutput>("schedule_status"),
+        entry::<ScheduleSpoolOutput>("schedule_spool"),
         // HTTP-only: the five estate routes (`/health`, `/models`,
         // `/models/{name}`, `/dag/layers`, `/dag/status`) have no CLI verb;
         // their payloads are typed here so a UI and the OpenAPI document
@@ -160,6 +162,7 @@ pub(crate) fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<crate::output::FulfillOutput>("fulfill"),
         entry::<PolicyTestOutput>("policy_test"),
         entry::<PolicyFreezeOutput>("policy_freeze"),
+        entry::<PolicyRulesOutput>("policy_show"),
         entry::<AuditOutput>("audit"),
         entry::<AuditForOutput>("audit_for"),
         entry::<AuditScorecardOutput>("audit_scorecard"),

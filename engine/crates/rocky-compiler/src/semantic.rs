@@ -365,8 +365,29 @@ pub fn build_semantic_graph(
             for table_ref in &lineage_result.source_tables {
                 let table_name = &table_ref.name;
                 let table_name_arc: Arc<str> = Arc::from(table_name.as_str());
-                // Check if it's a model
-                if let Some(upstream_schema) = models.get(table_name.as_str()) {
+                // A star takes a model's columns only when the reader actually
+                // DEPENDS on that model (#1631). The map lookup alone binds by
+                // NAME, independently of the DAG edge, so a `SELECT * FROM
+                // customers` took model `customers`'s columns even when the
+                // read resolves to some other physical object — and it
+                // consulted the model map before `source_schemas`, so a
+                // genuinely external table could be typed with a model's
+                // columns.
+                //
+                // The edge is the compiler's own answer to "does this read
+                // reach that model", derived once in `resolve_dependencies`
+                // and carried on `dag_nodes[].depends_on`. Asking it here
+                // means the star cannot bind where the graph does not.
+                //
+                // Falling through reaches `source_schemas` below, which is the
+                // right answer for an external table of the same name.
+                let reader_depends_on_it = upstream_map
+                    .get(model_name.as_str())
+                    .is_some_and(|deps| deps.iter().any(|dep| dep == table_name));
+                if let Some(upstream_schema) = models
+                    .get(table_name.as_str())
+                    .filter(|_| reader_depends_on_it)
+                {
                     for col in &upstream_schema.columns {
                         if output_names.insert(col.name.clone()) {
                             let col_arc: Arc<str> = Arc::from(col.name.as_str());
@@ -662,6 +683,146 @@ mod tests {
         assert!(b_col_names.contains(&"id"));
         assert!(b_col_names.contains(&"name"));
         assert!(b_col_names.contains(&"email"));
+    }
+
+    /// A star does not take a model's columns when no DAG edge reaches it
+    /// (#1631), and `source_schemas` answers instead.
+    ///
+    /// The shape is a model whose NAME carries a dot, which is legal
+    /// (`rocky-core/src/models.rs`, `test_filename_with_dot_in_stem`). A
+    /// 2-part read is classified external by `classify_table_ref`, so no edge
+    /// is derived — while the model map lookup on the same string HITS. That
+    /// is the only way the direct branch reaches a model the reader does not
+    /// depend on, which is why the test is built this way rather than with an
+    /// ordinary bare read.
+    ///
+    /// Verified fix-sensitive with `scripts/mutation-check.sh`: reverting the
+    /// gate makes this fail. An earlier version of this test used a 3-part
+    /// read, whose `table_ref.name` is the whole dotted string, so the model
+    /// lookup missed either way and the test guarded nothing.
+    #[test]
+    fn a_star_prefers_the_source_schema_when_no_edge_reaches_the_model() {
+        let models = vec![
+            make_model(
+                "a2.fct_orders",
+                "SELECT id, model_only_col FROM source.raw.o",
+            ),
+            make_model("zreader", "SELECT * FROM a2.fct_orders"),
+        ];
+
+        let mut source_schemas = HashMap::new();
+        source_schemas.insert(
+            "a2.fct_orders".to_string(),
+            vec![ColumnInfo {
+                name: "source_only_col".to_string(),
+                data_type: "STRING".to_string(),
+                nullable: true,
+            }],
+        );
+
+        let project = Project::from_models(models).unwrap();
+        let reader_deps = project
+            .dag_nodes
+            .iter()
+            .find(|n| n.name == "zreader")
+            .map(|n| n.depends_on.clone())
+            .unwrap_or_default();
+        assert!(
+            !reader_deps.iter().any(|d| d == "a2.fct_orders"),
+            "precondition: the 2-part read must derive no edge, else this test \
+             proves nothing about binding on the edge; got {reader_deps:?}"
+        );
+
+        let graph = build_semantic_graph(&project, &source_schemas).unwrap();
+        let reader = graph.model_schema("zreader").unwrap();
+        let names: Vec<&str> = reader.columns.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains(&"source_only_col"),
+            "the external table's own columns must win: {names:?}"
+        );
+        assert!(
+            !names.contains(&"model_only_col"),
+            "a model no edge reaches must not supply its columns: {names:?}"
+        );
+    }
+
+    /// #1892's consequence here, stated as a test rather than left implicit.
+    ///
+    /// Removing the invented CTE edge removes the thing `reader_depends_on_it`
+    /// above consults, so a `SELECT *` over a CTE named after a model stops
+    /// taking that model's columns. It falls through to `source_schemas`,
+    /// which is the same fall-through an external table of that name gets.
+    ///
+    /// This is a behaviour change, and it replaces a WRONG answer rather than
+    /// a right one: the CTE's own columns are what the query returns, and the
+    /// model's columns were never that. Resolving the star to the CTE body is
+    /// the further fix, and it needs `lineage.rs` to carry those columns —
+    /// #1867's half of the work.
+    #[test]
+    fn a_star_over_a_cte_no_longer_takes_the_shadowed_models_columns() {
+        let models = vec![
+            make_model("orders", "SELECT id, model_only_col FROM source.raw.o"),
+            make_model(
+                "zreader",
+                "WITH orders AS (SELECT 1 AS cte_only_col) SELECT * FROM orders",
+            ),
+        ];
+
+        let project = Project::from_models(models).unwrap();
+        let reader_deps = project
+            .dag_nodes
+            .iter()
+            .find(|n| n.name == "zreader")
+            .map(|n| n.depends_on.clone())
+            .unwrap_or_default();
+        assert!(
+            reader_deps.is_empty(),
+            "the CTE shadows the model, so no edge is derived: {reader_deps:?}"
+        );
+
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let reader = graph.model_schema("zreader").unwrap();
+        let names: Vec<&str> = reader.columns.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            !names.contains(&"model_only_col"),
+            "the shadowed model's columns are not what the query returns: {names:?}"
+        );
+    }
+
+    /// The expansion must not depend on which model the topological walk
+    /// reaches first.
+    ///
+    /// DAG roots are walked alphabetically (`rocky-ir/src/dag.rs`, a min-heap),
+    /// so a name-keyed lookup gives different answers for the same project
+    /// depending on how the models sort. Binding on the edge removes that:
+    /// both orderings must agree.
+    #[test]
+    fn star_expansion_does_not_depend_on_alphabetical_order() {
+        let expand = |upstream: &str, reader: &str| {
+            let models = vec![
+                make_model(upstream, "SELECT id, name FROM source.raw.users"),
+                make_model(reader, &format!("SELECT * FROM {upstream}")),
+            ];
+            let project = Project::from_models(models).unwrap();
+            let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+            let mut names: Vec<String> = graph
+                .model_schema(reader)
+                .unwrap()
+                .columns
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
+            names.sort();
+            names
+        };
+
+        // `aaa` sorts before `zzz`, so the reader is walked first in one case
+        // and second in the other.
+        assert_eq!(
+            expand("aaa_upstream", "zzz_reader"),
+            expand("zzz_upstream", "aaa_reader"),
+            "the same project must expand the same columns whichever model sorts first"
+        );
     }
 
     #[test]

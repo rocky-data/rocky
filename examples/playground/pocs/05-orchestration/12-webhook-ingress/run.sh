@@ -55,12 +55,16 @@ BODY='{"event":"orders.synced"}'
 SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $NF}')
 
 echo "==> signed POST /api/v1/hooks/trigger/hello"
-CODE=$(curl -sS -o resp.json -w '%{http_code}' -X POST \
+# Under expected/, not the POC root: the .gitignore covers generated files
+# there, and a bare resp.json left a suite run with an untracked file in the
+# checkout (#1676).
+mkdir -p expected
+CODE=$(curl -sS -o expected/resp.json -w '%{http_code}' -X POST \
   "${BASE}/api/v1/hooks/trigger/hello" \
   -H "X-Rocky-Signature: ${SIG}" \
   -H "X-Rocky-Delivery: poc-evt-1" \
   --data-binary "$BODY")
-echo "    → HTTP ${CODE}: $(cat resp.json)"
+echo "    → HTTP ${CODE}: $(cat expected/resp.json)"
 if [[ "$CODE" != "202" ]]; then echo "FAIL: expected 202"; exit 1; fi
 
 echo "==> unsigned POST must be rejected"

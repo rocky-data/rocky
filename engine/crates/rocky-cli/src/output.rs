@@ -6017,6 +6017,142 @@ pub struct ScheduleStatusCounts {
     pub config_errors: usize,
 }
 
+// ---------------------------------------------------------------------------
+
+/// JSON output for `rocky state schedule spool`, mirrored by
+/// `GET /api/v1/schedule/spool`.
+///
+/// The webhook spool is the queue of demands accepted by the ingress but not
+/// yet consumed by a tick. [`ScheduleStatusOutput`] is blind to it: that
+/// snapshot reports *claims*, which exist only once a tick has picked a demand
+/// up, so a demand sitting here appears nowhere in `GET /api/v1/schedule`.
+/// This output is the missing half — what has been accepted and is still
+/// waiting.
+///
+/// **Pending only.** Consumed demands are excluded: `.done` tombstones are the
+/// 24h idempotency window for `kind = id`, not outstanding work. Already
+/// quarantined files are excluded from `pending` too and counted in
+/// `counts.corrupt`.
+///
+/// **Fail-closed on an unreadable spool.** A spool directory that is present
+/// but cannot be read is an error, never an empty list. That distinction is
+/// the whole bug class behind #1710/#1752/#1731: a present-but-unreadable
+/// spool that read as empty let every wrapper see a healthy tick while the
+/// webhook demand source was silently not firing. An *absent* spool is
+/// different and is fine — it means no webhook has ever been accepted here.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ScheduleSpoolOutput {
+    pub version: String,
+    pub command: String,
+    /// The spool directory this listing was read from
+    /// (`<project>/.rocky/pending-demands`).
+    ///
+    /// Surfaced for the same reason [`ScheduleHoldOutput`] names its state
+    /// file: a `serve --scheduler` rooted at a different project has a
+    /// different spool, and reading the wrong one must not look like an empty
+    /// queue.
+    pub spool_path: String,
+    /// Outstanding demands, oldest first, tie-broken by `demand_uid` so the
+    /// order is total. Empty when nothing is queued.
+    ///
+    /// This is arrival order, which is **not** the order a tick consumes them
+    /// in: a spool file is named for the blake3 of its `(pipeline, kind,
+    /// token)` dedup tuple, so the tick's sorted-by-filename walk is
+    /// deterministic but unrelated to time. Arrival order is what an operator
+    /// triaging a stuck queue needs.
+    pub pending: Vec<SpoolPendingEntry>,
+    /// Entries that could not be reported, with the reason for each. Never
+    /// silently dropped — a demand this command cannot read is still a demand
+    /// blocking the queue, and staying quiet about it is the #1731 failure one
+    /// level up.
+    pub skipped: Vec<SpoolSkippedEntry>,
+    /// Roll-up counts over this listing.
+    pub counts: SpoolCounts,
+}
+
+impl ScheduleSpoolOutput {
+    /// Assemble the document, deriving `counts` from the lists so the two can
+    /// never disagree.
+    pub fn new(
+        spool_path: String,
+        pending: Vec<SpoolPendingEntry>,
+        skipped: Vec<SpoolSkippedEntry>,
+        corrupt: usize,
+    ) -> Self {
+        ScheduleSpoolOutput {
+            version: VERSION.to_string(),
+            command: "state-schedule-spool".to_string(),
+            spool_path,
+            counts: SpoolCounts {
+                pending: pending.len(),
+                skipped: skipped.len(),
+                corrupt,
+            },
+            pending,
+            skipped,
+        }
+    }
+}
+
+/// One demand accepted by the webhook ingress and not yet consumed.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SpoolPendingEntry {
+    /// The uid minted at acceptance. This is the claim-key discriminator and
+    /// the join key to a claim in [`ScheduleStatusOutput`] once a tick picks
+    /// the demand up.
+    pub demand_uid: String,
+    /// The target pipeline. Validated against the config before acceptance,
+    /// so this always names a pipeline that existed when the demand arrived.
+    pub pipeline: String,
+    /// `id` or `body` — which dedup discipline the demand was accepted under.
+    pub kind: String,
+    /// The raw dedup token.
+    ///
+    /// For `kind = id` this is **caller-supplied text**, taken verbatim from
+    /// the delivery header and never interpreted by the engine; for
+    /// `kind = body` it is a copy of `body_hash`. Present because it is the
+    /// dedup key an operator needs when a webhook appears stuck.
+    ///
+    /// Because a caller controls it, a consumer must render it as inert text.
+    /// The browser UI does: React escapes by default and no production
+    /// component uses `dangerouslySetInnerHTML` (`engine/ui/src/components.tsx`),
+    /// with the pattern in `SamplePanel.test.tsx` pinning a hostile string as
+    /// text and never as an element.
+    pub token: String,
+    /// When the ingress accepted the demand.
+    pub received_at: DateTime<Utc>,
+    /// blake3 hex of the raw request body.
+    pub body_hash: String,
+}
+
+/// A spool entry this listing could not report, and why.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SpoolSkippedEntry {
+    /// The file name within the spool directory. Only the name, not the full
+    /// path, which `spool_path` already carries.
+    pub file: String,
+    /// Why it was skipped: `unreadable` (the file could not be read),
+    /// `malformed` (its JSON did not parse), or `bad_timestamp` (its
+    /// `received_at` is not a valid RFC3339 instant).
+    pub reason: String,
+    /// The underlying detail, for an operator deciding what to do with the
+    /// file.
+    pub detail: String,
+}
+
+/// Roll-up counts over a spool listing.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SpoolCounts {
+    /// Outstanding demands reported in `pending`.
+    pub pending: usize,
+    /// Entries in `skipped`.
+    pub skipped: usize,
+    /// Files already quarantined as corrupt by a previous tick. These are not
+    /// in `pending` or `skipped` — the queue has set them aside — but a
+    /// non-zero count means demands were accepted and never ran.
+    pub corrupt: usize,
+}
+
 /// When set, [`print_json`] emits compact (single-line) JSON instead of
 /// pretty-printed. Used by `rocky run --watch` to honour its
 /// newline-delimited-stream contract: each iteration's `RunOutput` lands
@@ -7849,6 +7985,187 @@ pub struct PolicyFreezeEntry {
     pub plan_id: String,
     /// Human-readable description of the freeze/unfreeze.
     pub reason: String,
+}
+
+/// JSON output for `rocky policy show`, and the body of `GET /api/v1/policy`:
+/// the policy plane as configured and as it stands.
+///
+/// The rules carry their position in `[[policy.rules]]` as `id`, the only
+/// identity a rule has today and the number `rocky policy check` reports as
+/// `matched_rule`.
+///
+/// `freezes` is every freeze in force **that this reader could see**, from the
+/// decision ledger and the durable freeze markers, and `freeze_sources` says
+/// what it saw. That qualifier is load-bearing and is not a hedge:
+///
+/// - `not_consulted` on both means no `[policy]` block, so the enforcement
+///   gate answers before it reads a freeze source and nothing is in force.
+/// - `local_mirror` on the ledger means a remote `[state]` backend, where the
+///   authority is remote and this read-only producer will not download it.
+///   A freeze recorded by another pod can be absent from `freezes` while an
+///   apply, which downloads first, still denies. Only when the ledger reads
+///   `read` or `absent` is the list exhaustive.
+///
+/// A source that exists but cannot be read is an error, never an empty list:
+/// an empty list would say "nothing is frozen" for a plane whose freezes could
+/// not be read at all.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyRulesOutput {
+    pub version: String,
+    /// Always `"policy_show"`.
+    pub command: String,
+    /// Whether `rocky.toml` carries a `[policy]` block. `false` is the default
+    /// posture: no rules, `default_agent_effect` as the engine defaults it.
+    pub configured: bool,
+    pub policy_version: u32,
+    /// The effect an agent gets when no rule matches.
+    pub default_agent_effect: rocky_core::config::PolicyEffect,
+    /// The rules in file order.
+    pub rules: Vec<PolicyRuleEntry>,
+    /// The freezes in force that this reader could see, ledger entries first,
+    /// then markers. Read `freeze_sources` before treating it as exhaustive:
+    /// a `local_mirror` ledger read may be missing another pod's freeze.
+    pub freezes: Vec<PolicyFreezeInForce>,
+    pub freeze_sources: PolicyFreezeSources,
+}
+
+/// One `[[policy.rules]]` entry.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyRuleEntry {
+    /// Zero-based position in `[[policy.rules]]`; the `matched_rule` that
+    /// `rocky policy check` reports.
+    pub id: usize,
+    pub principal: rocky_core::config::PolicyPrincipal,
+    pub capability: rocky_core::config::PolicyCapability,
+    pub effect: rocky_core::config::PolicyEffect,
+    pub scope: PolicyRuleScopeOutput,
+    /// Post-apply verification: the named checks that must pass after a
+    /// mutation this rule governs. A failing or absent named check halts the
+    /// apply. Two rules that differ only here govern differently, so the
+    /// document carries it; without it a reader cannot tell them apart.
+    ///
+    /// A rule's `conditions` is deliberately NOT carried. The engine parses it
+    /// and never evaluates it, its shape is unbounded, and `${VAR}` in a config
+    /// string is resolved before parsing — so an authored condition can hold a
+    /// resolved secret that no key-based redaction could find. It decides
+    /// nothing, so nothing is lost by leaving it out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verify_after: Vec<String>,
+    /// The rolling failure ceiling that degrades this rule's effect.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub autonomy_budget: Option<PolicyAutonomyBudgetOutput>,
+}
+
+/// What a rule matches. Every field is as authored; an empty list or `None`
+/// means the field does not narrow the rule.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyRuleScopeOutput {
+    pub any: bool,
+    pub models: Vec<String>,
+    pub tags: BTreeMap<String, String>,
+    pub classifications: Vec<String>,
+    pub exclude_classifications: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contracted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+    /// The blast-radius ceiling: the rule matches only a model with at most
+    /// this many downstreams.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_downstreams: Option<u64>,
+}
+
+/// A rule's autonomy budget: `failures` within `window` degrade its effect.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyAutonomyBudgetOutput {
+    pub failures: u64,
+    pub window: String,
+}
+
+/// One freeze in force.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyFreezeInForce {
+    /// `"ledger"` (a `rocky policy freeze` decision) or `"marker"` (a durable
+    /// freeze marker in the remote object tier).
+    pub source: String,
+    /// The frozen principal. Absent ONLY on a marker whose body could not be
+    /// read: the loader widens such a marker to scope `any` and to both
+    /// principals so it fails closed. It is not a marker that deliberately
+    /// froze both, and a reader must not present it as one — the `reason` says
+    /// the body was unreadable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal: Option<rocky_core::config::PolicyPrincipal>,
+    /// The scope selector as given to `rocky policy freeze`; `any` is every model.
+    pub scope: String,
+    pub reason: String,
+    /// When the freeze was recorded, when the source recorded it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<DateTime<Utc>>,
+    /// The ledger decision's plan id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    /// The marker's id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freeze_id: Option<String>,
+}
+
+/// Which freeze sources the report read.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyFreezeSources {
+    /// How the decision ledger was read.
+    pub ledger: PolicyLedgerSource,
+    /// How the durable freeze markers were read.
+    pub markers: PolicyMarkerSource,
+}
+
+/// How the decision ledger was read for a policy report.
+///
+/// An enum rather than a string because a consumer BRANCHES on it: the text
+/// renderer prints the incomplete-freeze-list warning on `LocalMirror` alone.
+/// As a bare string the producer and that branch were joined by nothing —
+/// renaming the written value compiled fine and silently retired the warning,
+/// with the tests on both ends still green (#1909).
+///
+/// The wire form is unchanged: the same four snake_case strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyLedgerSource {
+    /// A local backend, read in full.
+    Read,
+    /// A local backend with no state store yet. Proven absent, not assumed: a
+    /// path that exists but cannot be read is an error.
+    Absent,
+    /// A remote `[state]` backend. What was read is the local mirror, which
+    /// may be stale or empty; the remote authority was NOT downloaded, because
+    /// this is a read-only route and the download replaces the local ledger. A
+    /// freeze recorded by another pod can be missing here while an apply,
+    /// which does download first, still denies.
+    LocalMirror,
+    /// No `[policy]` block, so nothing is in force and the enforcement gate
+    /// reads no ledger either.
+    NotConsulted,
+}
+
+/// How the durable freeze markers were read for a policy report.
+///
+/// A separate enum from [`PolicyLedgerSource`], not a shared one: the two
+/// answer different questions and only two of their values coincide. A shared
+/// enum would let a match on the ledger claim to handle `NotConfigured`, which
+/// a ledger read cannot produce.
+///
+/// The wire form is unchanged: the same three snake_case strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyMarkerSource {
+    /// The `[state]` backend has a durable object tier, read in full. Reads
+    /// are NOT gated on `freeze_marker_writes`: that flag gates writes only,
+    /// and an existing marker stays enforced after it is turned off, so a
+    /// reader that honoured it would hide a live freeze.
+    Read,
+    /// The backend keeps no durable object tier.
+    NotConfigured,
+    /// No `[policy]` block, as above.
+    NotConsulted,
 }
 
 /// JSON output for `rocky audit` — the agent-policy decision ledger.
@@ -10742,6 +11059,57 @@ pub struct JobStatus {
     /// shape is the `run` / `plan` / `apply` schema selected by
     /// [`kind`](Self::kind).
     pub result: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod policy_freeze_source_tests {
+    //! #1909. The two source fields became enums so a consumer that BRANCHES
+    //! on them cannot be silently detached from the producer. The claim that
+    //! bought is "the wire form does not move" — and nothing else pins it.
+    //!
+    //! These are the exact strings the fields carried as `String`, and they
+    //! are what the exported schema, the generated Pydantic models and the
+    //! generated TypeScript all enumerate. A renamed variant, an added one, or
+    //! a lost `#[serde(rename_all = "snake_case")]` changes the bytes on
+    //! `GET /api/v1/policy` for every existing client.
+    use super::*;
+
+    fn wire<T: Serialize>(value: &T) -> String {
+        serde_json::to_value(value)
+            .expect("serializes")
+            .as_str()
+            .expect("a unit variant is a JSON string")
+            .to_string()
+    }
+
+    #[test]
+    fn every_ledger_source_keeps_the_string_it_had() {
+        assert_eq!(wire(&PolicyLedgerSource::Read), "read");
+        assert_eq!(wire(&PolicyLedgerSource::Absent), "absent");
+        assert_eq!(wire(&PolicyLedgerSource::LocalMirror), "local_mirror");
+        assert_eq!(wire(&PolicyLedgerSource::NotConsulted), "not_consulted");
+    }
+
+    #[test]
+    fn every_marker_source_keeps_the_string_it_had() {
+        assert_eq!(wire(&PolicyMarkerSource::Read), "read");
+        assert_eq!(wire(&PolicyMarkerSource::NotConfigured), "not_configured");
+        assert_eq!(wire(&PolicyMarkerSource::NotConsulted), "not_consulted");
+    }
+
+    /// The whole struct, so a field rename is caught too — the enums pin the
+    /// values, this pins the keys they sit under.
+    #[test]
+    fn the_freeze_sources_object_is_byte_identical_to_the_string_version() {
+        let sources = PolicyFreezeSources {
+            ledger: PolicyLedgerSource::LocalMirror,
+            markers: PolicyMarkerSource::NotConfigured,
+        };
+        assert_eq!(
+            serde_json::to_string(&sources).expect("serializes"),
+            r#"{"ledger":"local_mirror","markers":"not_configured"}"#,
+        );
+    }
 }
 
 #[cfg(test)]

@@ -164,6 +164,40 @@ pub struct Interrupted;
 /// "use --resume … to retry" with nothing said about the checks. A resume
 /// re-copies the failed table and rebuilds its check inputs only from what it
 /// copies, so it re-runs none of the checks that gated the run.
+/// Whether a finished run's [`rocky_core::state::RunRecord`] reached the
+/// state store.
+///
+/// A caller that still holds the run's remote-state session decides
+/// finalize-versus-abandon on this (#1836). Finalizing publishes the local
+/// ledger; doing that when the record is missing hands every other pod an
+/// AUTHORITATIVE history with this run absent from it, which is worse than
+/// the stale history abandoning leaves them, because a stale history is not
+/// wrong about this run — it simply has not heard of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordCustody {
+    /// The record is in the store. A held session must FINALIZE so the record
+    /// rides the terminal upload.
+    Persisted,
+    /// The record is NOT in the store — [`persist_run_record`] logged a failed
+    /// write, or there was no store to write to. A held session must ABANDON.
+    ///
+    /// The no-store half never coincides with a live session: the arm that
+    /// passes `None` is the lazy no-op transformation run, which acquires no
+    /// session either.
+    Lost,
+}
+
+impl RecordCustody {
+    /// `true` when [`persist_run_record`] reported the record landed.
+    pub fn from_persisted(persisted: bool) -> Self {
+        if persisted {
+            RecordCustody::Persisted
+        } else {
+            RecordCustody::Lost
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PartialFailure {
     pub count: usize,
@@ -171,6 +205,12 @@ pub struct PartialFailure {
     /// Whether the same run ALSO failed its check gate. Changes the advice,
     /// never the exit code — both shapes are exit 2.
     pub check_gate_failed: bool,
+    /// Whether this run's record is persisted (#1836). Read by
+    /// [`session_disposition`]; never changes the exit code, which stays 2
+    /// either way — the run failed the same amount, and downgrading it to the
+    /// generic exit 1 would tell an orchestrator "hard failure" about a run
+    /// that is still resumable.
+    pub custody: RecordCustody,
 }
 
 impl std::fmt::Display for PartialFailure {
@@ -208,6 +248,9 @@ impl std::error::Error for PartialFailure {}
 pub struct RunFailed {
     pub count: usize,
     pub run_id: String,
+    /// Whether this run's record is persisted (#1836). Read by
+    /// [`session_disposition`]; the exit code is 1 either way.
+    pub custody: RecordCustody,
 }
 
 /// Sentinel error signalling that a quality run completed its terminal state
@@ -286,6 +329,39 @@ impl std::fmt::Display for CheckGateFailure {
 
 impl std::error::Error for CheckGateFailure {}
 
+/// What a caller still holding a run's remote-state session must do with it
+/// when the dispatch came back `Err`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionDisposition {
+    /// The run reached its terminal state writes and its record is persisted.
+    /// Upload: the record and any committed state ride the terminal upload.
+    Finalize,
+    /// Either the error is a pre-terminal hard exit, or the run's record never
+    /// landed. Upload nothing.
+    Abandon,
+}
+
+/// Decide [`SessionDisposition`] for a failed dispatch (#1816, #1836).
+///
+/// The typed post-terminal sentinels are the dispatcher's only evidence that a
+/// record exists to upload. Before #1836 the TYPE alone decided, and the type
+/// came back whether or not [`persist_run_record`] had succeeded — so a failed
+/// write was logged, swallowed, and then published as an authoritative ledger
+/// with the run missing from it.
+///
+/// The custody the sentinel now carries is what decides. Every other error is
+/// a pre-terminal hard exit and abandons, as before.
+pub(crate) fn session_disposition(error: &anyhow::Error) -> SessionDisposition {
+    let custody = error
+        .downcast_ref::<RunFailed>()
+        .map(|e| e.custody)
+        .or_else(|| error.downcast_ref::<PartialFailure>().map(|e| e.custody));
+    match custody {
+        Some(RecordCustody::Persisted) => SessionDisposition::Finalize,
+        Some(RecordCustody::Lost) | None => SessionDisposition::Abandon,
+    }
+}
+
 /// Map a finalized [`RunOutput`]'s derived status onto the CLI exit-code
 /// contract for the transformation / model-only execution paths.
 ///
@@ -300,7 +376,14 @@ impl std::error::Error for CheckGateFailure {}
 /// JSON consumer reads regardless of exit code. This is what makes a
 /// compile-failed model a first-class run failure instead of a silently
 /// skipped no-op that still reported `status: "Success"`, exit 0.
-pub(crate) fn run_status_exit_result(output: &RunOutput, run_id: &str) -> Result<()> {
+pub(crate) fn run_status_exit_result(
+    output: &RunOutput,
+    run_id: &str,
+    // Whether this run's record landed (#1836). The sentinel carries it so a
+    // caller still holding the remote-state session decides on the FACT rather
+    // than on the error type, which says nothing about the write.
+    custody: RecordCustody,
+) -> Result<()> {
     match output.derive_run_status() {
         rocky_core::state::RunStatus::PartialFailure => Err(PartialFailure {
             count: output.tables_failed,
@@ -310,11 +393,13 @@ pub(crate) fn run_status_exit_result(output: &RunOutput, run_id: &str) -> Result
             // (#1720). `false` on the transformation / model-only paths, which
             // never stamp the gate — those messages are unchanged.
             check_gate_failed: output.check_gate_failed,
+            custody,
         }
         .into()),
         rocky_core::state::RunStatus::Failure => Err(RunFailed {
             count: output.tables_failed,
             run_id: run_id.to_string(),
+            custody,
         }
         .into()),
         _ => Ok(()),
@@ -473,6 +558,22 @@ pub(crate) fn refuse_on_scheduling_warnings(strict: bool, warnings: &[String]) -
     )
 }
 
+/// The checkpoint identity of a planned table: `catalog.schema.table` of its
+/// TARGET.
+///
+/// Every site that writes a [`rocky_core::state::TableProgress`], the resume
+/// filter that reads one back, and the planned set stamped on the checkpoint
+/// all call this. The set comparison in `ensure_the_resume_would_do_work`
+/// only means anything while the plan and the recordings are spelled the same
+/// way, so they are spelled in exactly one place — a divergence has to be an
+/// edit here rather than a silent drift between six `format!`s.
+fn table_key(task: &TableTask) -> String {
+    format!(
+        "{}.{}.{}",
+        task.target_catalog, task.target_schema, task.target_table_name
+    )
+}
+
 fn copy_endpoints(task: &TableTask) -> (TableRef, TableRef) {
     (
         TableRef {
@@ -557,7 +658,15 @@ struct TableTask {
     /// the resulting `MaterializationOutput` so the persisted
     /// `ModelExecution` records a tenant for `rocky cost --by tenant`.
     tenant: Option<String>,
-    check_column_match: bool,
+    /// The configured severity when the column-match check is on, `None` when
+    /// it is off (#1666).
+    ///
+    /// A bool here meant the severity had nowhere to travel, so
+    /// `check_column_match` hard-coded `Error` and a pipeline's
+    /// `severity = "warning"` parsed and was discarded. Carrying the severity
+    /// in place of the flag makes "off" and "on, at this severity" one value
+    /// that cannot disagree with itself.
+    column_match: Option<rocky_core::tests::TestSeverity>,
     check_row_count: bool,
     check_freshness: bool,
     /// Column names to exclude from column_match check (metadata columns added by Rocky).
@@ -864,10 +973,16 @@ pub(crate) static FAIL_RECORD_WRITE_FOR_TEST: std::sync::Mutex<Option<String>> =
 /// is persisted, upload it" should check this before returning that type:
 /// finalizing on a record that is not there publishes a ledger without the
 /// run, and a fresh pod then reads an authoritative history with the failure
-/// missing. `run_quality` checks it before its `QualityGateFailure` (#1816);
-/// the transformation, snapshot and load arms do not yet, and their typed
-/// sentinels carry the same exposure (#1836). Nothing forces the check — a
-/// `bool` can be dropped — which is the shape #1836 is about.
+/// missing. `run_quality` checks it before its `QualityGateFailure` (#1816),
+/// and every caller of [`run_status_exit_result`] now threads it onto the
+/// sentinel as a [`RecordCustody`] so [`session_disposition`] decides on the
+/// fact rather than on the error type (#1836).
+///
+/// A SUCCESSFUL run whose record write failed still finalizes and still exits
+/// 0. That is deliberate, not an oversight: its session also carries the run's
+/// other state writes, and abandoning to punish a lost record would discard
+/// those too. Making that run non-zero changes `rocky run`'s exit contract and
+/// is #1836's open half.
 pub(crate) fn persist_run_record(
     state_store: Option<&StateStore>,
     output: &RunOutput,
@@ -1869,6 +1984,65 @@ fn ensure_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> 
     }
 }
 
+/// Whether a checkpoint proves that every table its run planned was copied.
+///
+/// Three answers, not two, because the pre-v30 shape is genuinely a third one:
+/// a checkpoint written before [`RunProgress::planned_tables`] existed cannot
+/// prove anything about the SET, only about the count. The caller treats it
+/// the same as `Complete` — that is what shipped — but it is a separate
+/// answer so the weaker evidence is visible rather than laundered by a `bool`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyCompleteness {
+    /// Every planned key is present and `Success`.
+    Complete,
+    /// A planned key is missing or not `Success` — real copy work remains.
+    Incomplete,
+    /// No planned set on the checkpoint (pre-v30), and the count of `Success`
+    /// entries reaches `total_tables`.
+    CompleteByCount,
+}
+
+/// Decide [`CopyCompleteness`] for a checkpoint.
+///
+/// With a planned set this is a set comparison: every planned key must have a
+/// `Success` entry. A recorded key that is NOT in the plan contributes
+/// nothing — which is the whole point, because that is the shape a count got
+/// wrong (#1674).
+///
+/// Without one — a checkpoint written before schema v30 — the count is the
+/// only answer available, and it is the answer that shipped. It comes back as
+/// [`CopyCompleteness::CompleteByCount`] so the call site can see which
+/// evidence it acted on.
+fn copy_completeness(progress: &RunProgress) -> CopyCompleteness {
+    let succeeded: std::collections::HashSet<&str> = progress
+        .tables
+        .iter()
+        .filter(|t| t.status == rocky_core::state::TableStatus::Success)
+        .map(|t| t.table_key.as_str())
+        .collect();
+    let Some(planned) = progress.planned_tables.as_ref() else {
+        // Counts ENTRIES, not distinct keys — the arithmetic that shipped.
+        // `succeeded.len()` would dedup, and the pre-v8 inline-header
+        // fallback (`get_run_progress` keeps the header's own `tables`) can
+        // still hand back a repeated `table_key`.
+        let copied = progress
+            .tables
+            .iter()
+            .filter(|t| t.status == rocky_core::state::TableStatus::Success)
+            .count();
+        return if copied < progress.total_tables {
+            CopyCompleteness::Incomplete
+        } else {
+            CopyCompleteness::CompleteByCount
+        };
+    };
+    if planned.iter().all(|key| succeeded.contains(key.as_str())) {
+        CopyCompleteness::Complete
+    } else {
+        CopyCompleteness::Incomplete
+    }
+}
+
 /// Refuse a *failed* run that left no copy work behind (#1598).
 ///
 /// The two failure statuses stay resumable because a failed run usually has
@@ -1912,32 +2086,29 @@ fn ensure_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> 
 /// those failed entries are the compile failures, the failed copies, and the
 /// post-apply custody failures. A check failure adds none.
 ///
-/// `total_tables` is what the recorded run planned to copy *after* its own
+/// The planned set is what the recorded run planned to copy *after* its own
 /// resume filtering, not the pipeline's whole table set. So a resume of a
 /// resume — run N-1 copied 3 of 5, run N copied its remaining 2 — reads as
-/// complete and is refused even though 3 tables would be re-copied. That is
-/// the conservative direction: the refusal is loud and says to re-run, while
-/// admitting it would risk the silent exit-0 this gate exists to stop.
+/// complete and is refused even though 3 tables would be re-copied. Recording
+/// identities does not fix that on its own, because the resumed run's plan is
+/// genuinely smaller; it is tracked separately on #1674. The refusal stays the
+/// conservative direction: it is loud and says to re-run, while admitting it
+/// would risk the silent exit-0 this gate exists to stop.
 ///
-/// # The invariant this refusal depends on, stated
+/// # How "every planned table copied" is decided
 ///
-/// "Every planned table copied" is decided by comparing a count of `Success`
-/// entries against `total_tables`. A count can only stand in for the planned
-/// SET while every recorded key comes from the invocation's own plan. That
-/// producer invariant holds today and is enforced entirely by the callers:
-/// `init_run_progress` is called once per run with `tables_to_process.len()`,
-/// both `record_table_progress` sites iterate that same `tables_to_process`,
-/// entries are keyed `{run_id}|{table_key}` so a table cannot be counted twice,
-/// and DAG sub-runs mint their own run ids rather than sharing a checkpoint.
+/// By [`copy_completeness`], from the planned SET the checkpoint carries
+/// (`RunProgress::planned_tables`, schema v30, #1674) — not from a count. A
+/// count could only stand in for the set while every recorded key came from
+/// the invocation's own plan, and nothing enforced that. A checkpoint holding
+/// `Success(a)` and `Success(x)` against a plan of `{a, b}` has the right
+/// count and the wrong set, so the count said "complete" and refused a resume
+/// that still owed `b`.
 ///
-/// This function cannot check any of that, and no arithmetic on counts can
-/// recover it: a checkpoint holding `Success(a)` and `Success(x)` against a
-/// plan of `{a, b}` has the right count and the wrong set, and would be refused
-/// although `b` still needs copying. Proving completeness properly needs the
-/// planned table identities on the checkpoint, which is a `RunProgress` shape
-/// change and so out of scope here. **If you add a `record_table_progress` call
-/// site, it must record a table from `tables_to_process` or this gate becomes
-/// wrong.**
+/// A pre-v30 checkpoint has no planned set and falls back to the count, which
+/// is exactly what shipped before. That is
+/// [`CopyCompleteness::CompleteByCount`], kept a distinct answer rather than
+/// folded into `Complete` so the weaker evidence stays visible here.
 ///
 /// The non-`Success` guard below narrows the exposure rather than removing it.
 /// It is what makes every mixed-state checkpoint resumable regardless of the
@@ -1970,13 +2141,9 @@ fn ensure_the_resume_would_do_work(
     {
         return Ok(());
     }
-    let copied = progress
-        .tables
-        .iter()
-        .filter(|t| t.status == rocky_core::state::TableStatus::Success)
-        .count();
-    if copied < progress.total_tables {
-        return Ok(());
+    match copy_completeness(progress) {
+        CopyCompleteness::Incomplete => return Ok(()),
+        CopyCompleteness::Complete | CopyCompleteness::CompleteByCount => {}
     }
     // The checks gated this run and no copy work remains (#1720). A resume
     // rebuilds its check inputs only from the tables it copies, so it would
@@ -2681,7 +2848,7 @@ pub async fn run(
             None,
         );
         let audit = audit_to_record(&audit_ctx);
-        persist_run_record(
+        let custody = RecordCustody::from_persisted(persist_run_record(
             state_store.as_ref(),
             &output,
             &run_id,
@@ -2690,7 +2857,7 @@ pub async fn run(
             &audit,
             // Model-only run — no single pipeline to attribute.
             None,
-        );
+        ));
         finalize_idempotency(
             &mut idempotency_ctx,
             state_store.as_ref(),
@@ -2728,7 +2895,7 @@ pub async fn run(
         // compile is recorded in `output.errors` / `tables_failed` by
         // `execute_models`; propagate the non-zero exit so it doesn't
         // report exit 0 with a JSON payload that says the model failed.
-        return run_status_exit_result(&output, &run_id);
+        return run_status_exit_result(&output, &run_id, custody);
     }
 
     let (pipeline_name, pipeline_config) =
@@ -3042,29 +3209,39 @@ pub async fn run(
                     return Ok(());
                 }
                 Err(e) => {
-                    // A typed run-status failure (`RunFailed` / the
-                    // `PartialFailure` sentinel) means `run_transformation`
-                    // completed its terminal state writes — the recorded
-                    // errors and the `RunRecord` are already persisted — so
-                    // the session must FINALIZE: the Failure record and any
-                    // committed models' state ride the terminal upload. A
+                    // `session_disposition` decides. A typed run-status
+                    // failure (`RunFailed` / the `PartialFailure` sentinel)
+                    // means `run_transformation` completed its terminal state
+                    // writes, so the session FINALIZES: the Failure record and
+                    // any committed models' state ride the terminal upload. A
                     // freeze-fence withhold or a failed model is a partial
                     // failure, never state loss (docs/adr/ADR-CONCURRENCY.md
                     // D3); abandoning here stranded the persisted record
-                    // locally, invisible to every other pod. Every other
-                    // error is a pre-terminal hard exit: abandon, never
+                    // locally, invisible to every other pod.
+                    //
+                    // But the type alone said nothing about whether the record
+                    // actually landed (#1836), and `persist_run_record` is
+                    // best-effort. So the sentinel carries its
+                    // `RecordCustody`, and a `Lost` one abandons with every
+                    // other error — a pre-terminal hard exit: abandon, never
                     // upload (the `?` this replaces would have leaked the
                     // session past this arm's return).
                     if let Some(session) = tx_session {
-                        if e.is::<RunFailed>() || e.is::<PartialFailure>() {
-                            session.finalize().await.context(
-                                "the run's recorded failure state could not be persisted to \
-                                 the remote [state] backend",
-                            )?;
-                        } else {
-                            session
-                                .abandon("transformation exited before terminal state writes")
-                                .await;
+                        match session_disposition(&e) {
+                            SessionDisposition::Finalize => {
+                                session.finalize().await.context(
+                                    "the run's recorded failure state could not be persisted \
+                                     to the remote [state] backend",
+                                )?;
+                            }
+                            SessionDisposition::Abandon => {
+                                session
+                                    .abandon(
+                                        "transformation exited before terminal state writes, \
+                                         or its run record did not land",
+                                    )
+                                    .await;
+                            }
                         }
                     }
                     return Err(e);
@@ -4446,7 +4623,11 @@ pub async fn run(
                         .get("tenant")
                         .and_then(|v| v.as_str())
                         .map(str::to_string),
-                    check_column_match: pipeline.checks.column_match.enabled(),
+                    column_match: pipeline
+                        .checks
+                        .column_match
+                        .enabled()
+                        .then(|| pipeline.checks.column_match.severity()),
                     check_row_count: pipeline.checks.row_count.enabled(),
                     check_freshness: pipeline.checks.freshness.is_some(),
                     column_match_exclude: pipeline
@@ -4567,13 +4748,7 @@ pub async fn run(
 
     let original_count = tables_to_process.len();
     if !completed_keys.is_empty() {
-        tables_to_process.retain(|task| {
-            let key = format!(
-                "{}.{}.{}",
-                task.target_catalog, task.target_schema, task.target_table_name
-            );
-            !completed_keys.contains(&key)
-        });
+        tables_to_process.retain(|task| !completed_keys.contains(&table_key(task)));
         let skipped = original_count - tables_to_process.len();
         output.tables_skipped = skipped;
         info!(
@@ -4585,9 +4760,11 @@ pub async fn run(
 
     // Initialize run progress tracking, stamped with this invocation's
     // pipeline scope so a later resume can prove the checkpoint is its own
-    // (#1549).
+    // (#1549), and with the table keys it plans to copy so a later resume can
+    // prove completeness as a set rather than a count (#1674).
+    let planned_table_keys: Vec<String> = tables_to_process.iter().map(table_key).collect();
     state_store
-        .init_run_progress(&run_id, tables_to_process.len(), Some(&resume_scope))
+        .init_run_progress(&run_id, &planned_table_keys, Some(&resume_scope))
         .context("failed to initialize run progress")?;
 
     // --- Process tables concurrently ---
@@ -4827,8 +5004,17 @@ pub async fn run(
         });
     }
 
+    // Set when an inline drain hits `fail_fast` or the error-rate threshold.
+    // The drain cannot abort the loop it runs inside, so it returns the cause
+    // and the abort happens here (#1724).
+    let mut drain_abort: Option<AbortCause> = None;
+    let abort_policy = AbortPolicy {
+        fail_fast,
+        error_rate_abort_pct,
+    };
+
     for (idx, task) in tables_to_process.iter().enumerate() {
-        if interrupted || freeze_withheld.is_some() {
+        if interrupted || freeze_withheld.is_some() || drain_abort.is_some() {
             break;
         }
 
@@ -4838,7 +5024,7 @@ pub async fn run(
         // spawning and collection, enabling the AIMD feedback loop.
         if throttle.is_some() {
             while let Some(completed) = join_set.try_join_next() {
-                process_completed_result(
+                let decision = process_completed_result(
                     completed,
                     &tables_to_process,
                     &throttle,
@@ -4864,8 +5050,30 @@ pub async fn run(
                     &shared_state,
                     &shared_run_id,
                     &mut total_completed,
+                    &abort_policy,
                 )
                 .await;
+                if let DrainDecision::AbortRemaining(cause) = decision {
+                    match cause {
+                        AbortCause::FailFast => {
+                            warn!("fail_fast: a table failed, aborting remaining tables")
+                        }
+                        AbortCause::ErrorRate {
+                            observed_pct,
+                            threshold_pct,
+                        } => warn!(
+                            error_rate = observed_pct,
+                            threshold = threshold_pct,
+                            "error rate exceeded threshold, aborting remaining tables"
+                        ),
+                    }
+                    join_set.abort_all();
+                    drain_abort = Some(cause);
+                    break;
+                }
+            }
+            if drain_abort.is_some() {
+                break;
             }
         }
 
@@ -4924,6 +5132,13 @@ pub async fn run(
     // hard-exit watcher and flips `interrupted = true`; tasks already in
     // flight keep running and their results are still collected below.
     loop {
+        // An inline drain already aborted every remaining task. Joining them
+        // would collect one cancellation per table as a fresh "task failed"
+        // error — noise the final drain's own abort path avoids by breaking
+        // rather than draining (#1724).
+        if drain_abort.is_some() {
+            break;
+        }
         let result = tokio::select! {
             res = join_set.join_next() => match res {
                 Some(r) => r,
@@ -5053,11 +5268,7 @@ pub async fn run(
                 // Checkpoint: record failed table progress
                 {
                     let task = tables_to_process.get(idx);
-                    let table_key = task
-                        .map(|t| {
-                            format!("{}.{}.{}", t.target_catalog, t.target_schema, t.target_table_name)
-                        })
-                        .unwrap_or_default();
+                    let table_key = task.map(table_key).unwrap_or_default();
 
                     // §P2.6 per-table emit: materialize_error.
                     let _ = hook_registry
@@ -5207,10 +5418,7 @@ pub async fn run(
 
         {
             for (idx, task) in tables_to_process.iter().enumerate() {
-                let key = format!(
-                    "{}.{}.{}",
-                    task.target_catalog, task.target_schema, task.target_table_name
-                );
+                let key = table_key(task);
                 if !settled.contains(&key) {
                     let mut asset_key = task.asset_key_prefix.clone();
                     asset_key.push(task.target_table_name.clone());
@@ -5922,7 +6130,12 @@ pub async fn run(
     // `rocky trace`, and `rocky cost` have real data to read.
     // Record-store failures never fail the command — the user's run
     // succeeded, bookkeeping can't be allowed to flip the exit code.
-    persist_run_record(
+    // Carried to the sentinels below (#1836). On this path the session has
+    // already finalized by the time they are returned, so the custody is
+    // informational rather than load-bearing — but a sentinel that claims a
+    // record exists when it does not is the defect, and it must not be
+    // reintroduced by a future caller that reads it.
+    let record_custody = RecordCustody::from_persisted(persist_run_record(
         state_store.as_ref(),
         &output,
         &run_id,
@@ -5930,7 +6143,7 @@ pub async fn run(
         &config_hash,
         &audit,
         Some(pipeline_name),
-    );
+    ));
 
     // Post-apply `verify_after` gate for any additive drift this run
     // auto-applied. Writes an allow/deny verification custody row per healed
@@ -5973,7 +6186,14 @@ pub async fn run(
         output.verify_after_failed = true;
         // Re-persist so `rocky history` records a Failure (status is derived
         // from the now-failed tallies), and finalize idempotency as failed.
-        persist_run_record(
+        // Deliberately not folded into `record_custody`: this branch returns
+        // `verify_after_result`, an untyped error, and finalizes below no
+        // matter what — so no sentinel reads a custody from here. The finalize
+        // is not unconditional by accident either: the session also carries
+        // the verify-after CUSTODY ROW written just above, and abandoning to
+        // punish a lost run record would discard that row too. Same trade as
+        // the successful-run half of #1836.
+        let _ = persist_run_record(
             state_store.as_ref(),
             &output,
             &run_id,
@@ -6163,6 +6383,7 @@ pub async fn run(
                 count,
                 run_id: run_id.clone(),
                 check_gate_failed: gated,
+                custody: record_custody,
             }
             .into());
         }
@@ -6196,7 +6417,7 @@ pub async fn run(
             .fire(&HookContext::pipeline_error(&run_id, pipeline_name, &msg))
             .await;
         let _ = hook_registry.wait_async_webhooks().await;
-        return run_status_exit_result(&output, &run_id);
+        return run_status_exit_result(&output, &run_id, record_custody);
     }
 
     // Check gate. Separate from both branches above on purpose: a failed
@@ -6757,7 +6978,7 @@ async fn run_batched_checks(
                 .map(|(s, _)| s.full_name());
 
             if let Some(src_key) = src_ref {
-                let check = match (source_map.get(src_key), target_map.get(target_key)) {
+                let mut check = match (source_map.get(src_key), target_map.get(target_key)) {
                     (Some(&src_count), Some(&tgt_count)) => {
                         checks::check_row_count(src_count, tgt_count)
                     }
@@ -6791,6 +7012,12 @@ async fn run_batched_checks(
                         checks::row_count_not_evaluated(reason)
                     }
                 };
+                // The configured severity, not the constructor's default
+                // (#1666). `check_row_count` hard-codes `Error`, so
+                // `severity = "warning"` on a replication pipeline parsed and
+                // was discarded — the operator's own escape hatch did nothing.
+                // Same shape the freshness check already uses below.
+                check.severity = pipeline.checks.row_count.severity();
                 let entry =
                     pending_checks
                         .entry(target_key.clone())
@@ -9062,7 +9289,7 @@ pub(crate) async fn execute_backfill_set(
 
         let audit_ctx = AuditContext::detect(None, None);
         let audit = audit_to_record(&audit_ctx);
-        persist_run_record(
+        let custody = RecordCustody::from_persisted(persist_run_record(
             state_store.as_ref(),
             &output,
             &run_id,
@@ -9071,14 +9298,14 @@ pub(crate) async fn execute_backfill_set(
             &audit,
             // A backfill spans a model set, not a single pipeline.
             None,
-        );
+        ));
 
         output.status = output.derive_run_status();
         if output_json {
             print_json(&output)?;
         }
         budget_result?;
-        run_status_exit_result(&output, &run_id)
+        run_status_exit_result(&output, &run_id, custody)
     }
     .await;
 
@@ -11090,8 +11317,45 @@ where
     // poisoned key resolves to `None`, so `compute_consumer_baseline` records no
     // column baseline for that read and the gate builds. Mirrors the
     // case-folding-collision guard in `compute_consumer_baseline`.
+    let models: Vec<(&str, &rocky_core::models::TargetConfig)> = models.into_iter().collect();
+
     let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut poisoned: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // A bare read is ambiguous when two models write a table of that NAME in
+    // different schemas, even though neither claims the other's key (#1632).
+    //
+    //     orders  [target] cat.s1.orders   claims the bare key "orders"
+    //     other   [target] cat.s2.orders   claims "other" only
+    //
+    // Both write a physical `orders`. Which one a bare `FROM orders` reads
+    // depends on the connection's search path, which Rocky does not observe —
+    // so the key-collision guard below never fires and the consumer is bound
+    // to `cat.s1.orders`'s column hashes. If `cat.s2.orders` changes while
+    // `cat.s1.orders` does not, the consumer SKIPs on stale input.
+    //
+    // Poison on the folded TABLE component rather than on the claimed key,
+    // which is what makes this case visible at all. Same rule the
+    // case-collision poisoning already uses, applied one component down.
+    //
+    // Ephemeral models are NOT excluded, though they materialize nothing. This
+    // pass sees names and targets, not strategies, and the direction of the
+    // error decides it: over-poisoning costs a rebuild, under-poisoning costs
+    // a SKIP on stale data. Fail closed.
+    let mut targets_by_table: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for (_, t) in &models {
+        targets_by_table
+            .entry(rocky_core::physical_edges::fold_identifier(&t.table))
+            .or_default()
+            .insert(format!("{}.{}.{}", t.catalog, t.schema, t.table).to_lowercase());
+    }
+    for (table, targets) in &targets_by_table {
+        if targets.len() > 1 {
+            poisoned.insert(table.clone());
+        }
+    }
+
     for (name, t) in models {
         let target_full = format!("{}.{}.{}", t.catalog, t.schema, t.table);
         // The bare-NAME key RESOLVES only when the model's configured target
@@ -12966,10 +13230,7 @@ async fn checkpoint_planned_table(
         run_id,
         rocky_core::state::TableProgress {
             index,
-            table_key: format!(
-                "{}.{}.{}",
-                task.target_catalog, task.target_schema, task.target_table_name
-            ),
+            table_key: table_key(task),
             asset_key,
             status,
             error: None,
@@ -13548,18 +13809,21 @@ async fn process_table(
     // detection, the pre-drop decision and merge-column resolution all have to
     // keep reading the pre-copy state.
     let mut probe_rate_limited = false;
-    let column_match_check = if task.check_column_match {
+    let column_match_check = if let Some(column_match_severity) = task.column_match {
         let (source_probe, target_probe) = tokio::join!(
             probe_columns_after_copy(warehouse, &source_table),
             probe_columns_after_copy(warehouse, &target_table),
         );
-        let (check, rate_limited) = post_copy_column_match(
+        let (mut check, rate_limited) = post_copy_column_match(
             &source_table,
             &target_table,
             source_probe,
             target_probe,
             &task.column_match_exclude,
         );
+        // The configured severity, not `check_column_match`'s hard-coded
+        // `Error` (#1666).
+        check.severity = column_match_severity;
         probe_rate_limited = rate_limited;
         Some(check)
     } else {
@@ -13596,7 +13860,7 @@ async fn process_table(
         None
     };
 
-    let target_table_full_name = target_table.full_name();
+    let target_table_full_name = table_key(task);
 
     // Record the source change-marker captured at the prune decision point
     // (not a post-copy re-read): if the source advanced mid-copy the recorded
@@ -13951,6 +14215,45 @@ async fn collect_materialized_table(
 
 /// Processes a single completed task result during the spawn loop's inline
 /// drain pass (adaptive concurrency only). This avoids duplicating the
+/// The two `[execution]` settings that can stop a run before its last table.
+///
+/// Carried as its own struct rather than threading the whole pipeline config:
+/// these are the only two fields an inline drain's decision depends on, and a
+/// wider struct would let a later edit reach settings this path has no business
+/// reading.
+pub(crate) struct AbortPolicy {
+    pub fail_fast: bool,
+    pub error_rate_abort_pct: u32,
+}
+
+/// Why a drain asked its caller to stop the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AbortCause {
+    /// `[execution] fail_fast` — the first failed table ends the run.
+    FailFast,
+    /// `[execution] error_rate_abort_pct` — too many of the completions so far
+    /// failed. Both numbers are carried so the log says what tripped it.
+    ErrorRate {
+        observed_pct: u32,
+        threshold_pct: u32,
+    },
+}
+
+/// What the caller must do after a drain collected one completion.
+///
+/// The inline drain runs INSIDE the spawn loop and does not own the `JoinSet`
+/// the caller is still feeding, so it cannot abort that loop itself. Returning
+/// the decision is what lets `fail_fast` and `error_rate_abort_pct` act from
+/// this path at all (#1724) — acting here would abort a set the caller is
+/// still adding to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrainDecision {
+    /// Nothing about this completion stops the run.
+    Continue,
+    /// Stop spawning and abort every table still in flight.
+    AbortRemaining(AbortCause),
+}
+
 /// result-handling logic from the main collection loop for results that
 /// arrive while we're still spawning tasks.
 ///
@@ -13958,14 +14261,19 @@ async fn collect_materialized_table(
 /// place a `TableResult` is consumed (#1718). The other three arms — pruned,
 /// failed and panicked — stay here: they are not a `TableResult`.
 ///
-/// The failed arm now matches the final drain on the two things an operator
-/// sees: the warehouse auth framing on `TableErrorOutput.error`, and the
-/// `materialize_error` hook (#1724). Two differences remain, and they are
-/// structural rather than oversights — an inline drain inside the spawn loop
-/// cannot break that loop, so neither `fail_fast`'s `abort_all` nor the
-/// `error_rate_abort_pct` check can act from here. Closing those means
-/// returning a decision to the caller instead of acting, which is a different
-/// change; it is tracked on #1724.
+/// The failed arm matches the final drain on the two things an operator sees:
+/// the warehouse auth framing on `TableErrorOutput.error`, and the
+/// `materialize_error` hook (#1724, first half).
+///
+/// The remaining two differences were structural — an inline drain inside the
+/// spawn loop cannot break that loop — so it returns a [`DrainDecision`]
+/// instead of acting, and the caller aborts. `fail_fast` and
+/// `error_rate_abort_pct` are therefore live on this path too, which under the
+/// default `ConcurrencyMode::Adaptive` is the path most tables take.
+///
+/// The order matches the final drain exactly: `fail_fast` is asked first and
+/// wins, then the error rate is checked on every completion — not only on a
+/// failed one, because a success moves the denominator.
 #[allow(clippy::too_many_arguments)]
 async fn process_completed_result(
     result: Result<(usize, Result<TableOutcome, anyhow::Error>), tokio::task::JoinError>,
@@ -13979,8 +14287,10 @@ async fn process_completed_result(
     shared_state: &Arc<StateStore>,
     shared_run_id: &str,
     total_completed: &mut usize,
-) {
+    policy: &AbortPolicy,
+) -> DrainDecision {
     *total_completed += 1;
+    let mut failed = false;
 
     match result {
         Ok((idx, Ok(TableOutcome::Pruned(pruned)))) => {
@@ -14033,17 +14343,15 @@ async fn process_completed_result(
                     rocky_core::state::TableStatus::Skipped,
                 )
                 .await;
-                return;
+                // A missing source table is a skip, not a failure: it enters no
+                // error and must not move the rate. The final drain's own
+                // `continue` past its rate check is the behaviour mirrored here.
+                return DrainDecision::Continue;
             }
 
             let table_key = tables_to_process
                 .get(idx)
-                .map(|t| {
-                    format!(
-                        "{}.{}.{}",
-                        t.target_catalog, t.target_schema, t.target_table_name
-                    )
-                })
+                .map(table_key)
                 .unwrap_or_default();
 
             // Frame common warehouse auth failures (403/401) into an actionable
@@ -14112,6 +14420,7 @@ async fn process_completed_result(
                 failure_kind,
                 cooldown_seconds,
             });
+            failed = true;
         }
         Err(e) => {
             let msg = format!("task failed: {e}");
@@ -14140,8 +14449,25 @@ async fn process_completed_result(
                 failure_kind: FailureKind::Unknown,
                 cooldown_seconds: None,
             });
+            failed = true;
         }
     }
+
+    if failed && policy.fail_fast {
+        return DrainDecision::AbortRemaining(AbortCause::FailFast);
+    }
+    // Same guards as the final drain: the threshold is opt-in, and a rate over
+    // fewer than four completions is too noisy to act on.
+    if policy.error_rate_abort_pct > 0 && *total_completed >= 4 {
+        let observed_pct = (table_errors.len() as f64 / *total_completed as f64 * 100.0) as u32;
+        if observed_pct >= policy.error_rate_abort_pct {
+            return DrainDecision::AbortRemaining(AbortCause::ErrorRate {
+                observed_pct,
+                threshold_pct: policy.error_rate_abort_pct,
+            });
+        }
+    }
+    DrainDecision::Continue
 }
 
 /// Returns `true` if the error message indicates a warehouse rate limit.
@@ -14570,6 +14896,212 @@ max_retries = 0
         assert!(
             record.check_gate_failed,
             "and it carries the gate the run failed on"
+        );
+    }
+
+    /// Drive a FAILING transformation run on pod A, through `run()`'s
+    /// dispatcher so the transformation arm's session decision really runs.
+    ///
+    /// The models dir holds one model that reads a table which does not exist,
+    /// so `execute_models` records a failure, nothing is built, and
+    /// `derive_run_status()` is `Failure` — the shape that returns `RunFailed`.
+    #[cfg(feature = "duckdb")]
+    fn run_failing_transformation_on_pod_a(
+        rt: &tokio::runtime::Runtime,
+        harness: &rocky_core::test_harness::CrossPodHarness,
+        project: &std::path::Path,
+        run_id: &str,
+    ) -> anyhow::Result<super::RunTermination> {
+        let models = project.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(
+            models.join("broken.sql"),
+            "SELECT * FROM no_such_source_table\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("broken.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )
+        .unwrap();
+
+        let config_path = project.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = '{}'
+
+[pipeline.tx]
+type = "transformation"
+models = '{}'
+
+[pipeline.tx.target]
+adapter = "default"
+
+[state]
+backend = "s3"
+s3_bucket = "test"
+on_upload_failure = "fail"
+
+[state.retry]
+max_retries = 0
+"#,
+                project.join("tx.duckdb").display(),
+                models.join("**").display(),
+            ),
+        )
+        .unwrap();
+
+        rt.block_on(async {
+            let loaded = std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+            );
+            super::run(
+                &config_path,
+                loaded,
+                None,
+                None,
+                &harness.pod_a.state_path,
+                None,
+                true,
+                None,
+                false,
+                None,
+                false,
+                None,
+                &PartitionRunOptions::default(),
+                None,
+                None,
+                None,
+                None,
+                &DeferOptions::default(),
+                &SkipRunOptions::default(),
+                &rocky_core::run_vars::RunVars::new(),
+                Some(run_id),
+                None,
+                false,
+                None,
+            )
+            .await
+        })
+    }
+
+    /// #1836. The transformation arm finalized on the TYPE of the error, and
+    /// the type came back whether or not `persist_run_record` had succeeded.
+    /// So a failed run whose record write failed uploaded a ledger that does
+    /// not contain the run, and a fresh pod read an AUTHORITATIVE history with
+    /// the failure missing — worse than the stale history abandoning leaves,
+    /// because stale is not wrong about this run, it simply has not heard of
+    /// it.
+    ///
+    /// The sentinel now carries its `RecordCustody`, `session_disposition`
+    /// reads it, and a `Lost` record abandons. The exit code is unchanged.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn a_failed_transformation_whose_record_did_not_land_is_not_uploaded_as_if_it_had() {
+        use rocky_core::state::StateStore;
+        use rocky_core::test_harness::CrossPodHarness;
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let project = tempfile::tempdir().unwrap();
+        let run_id = "transformation-record-write-failed";
+        let rt = remote_state_test_runtime();
+
+        *super::FAIL_RECORD_WRITE_FOR_TEST.lock().unwrap() = Some(run_id.to_string());
+        let outcome = run_failing_transformation_on_pod_a(&rt, &harness, project.path(), run_id);
+        *super::FAIL_RECORD_WRITE_FOR_TEST.lock().unwrap() = None;
+
+        let err = outcome.expect_err("the broken model still fails the run");
+        let custody = err
+            .downcast_ref::<super::RunFailed>()
+            .map(|e| e.custody)
+            .or_else(|| {
+                err.downcast_ref::<super::PartialFailure>()
+                    .map(|e| e.custody)
+            })
+            .expect("the run failed with a post-terminal sentinel");
+        assert_eq!(
+            custody,
+            super::RecordCustody::Lost,
+            "the sentinel must report the record it did NOT write: {err:#}"
+        );
+
+        // Pod A has no record: the injected write failure held.
+        let local = StateStore::open(&harness.pod_a.state_path).unwrap();
+        assert!(
+            local.get_run(run_id).unwrap().is_none(),
+            "precondition: the injected write failure held"
+        );
+
+        // Nothing was uploaded. Pod B finds no remote object at all, rather
+        // than an authoritative ledger with the run missing from it.
+        let authority = rt
+            .block_on(harness.download(&harness.pod_b))
+            .expect("pod B's download itself succeeds");
+        assert!(
+            matches!(
+                authority,
+                rocky_core::state_sync::StateAuthority::FreshStart
+            ),
+            "the session must abandon, not publish a ledger without the run: {authority:?}"
+        );
+    }
+
+    /// The negative control. The SAME failing run with its record write
+    /// working must still FINALIZE — that is #1816's fix, and "always abandon"
+    /// would undo it, stranding a persisted failure record in the pod-local
+    /// file where no other pod ever sees it.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn a_failed_transformation_whose_record_landed_still_rides_the_terminal_upload() {
+        use rocky_core::state::{RunStatus, StateStore};
+        use rocky_core::test_harness::CrossPodHarness;
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let project = tempfile::tempdir().unwrap();
+        let run_id = "transformation-record-landed";
+        let rt = remote_state_test_runtime();
+
+        let outcome = run_failing_transformation_on_pod_a(&rt, &harness, project.path(), run_id);
+        outcome.expect_err("the broken model still fails the run");
+
+        // Pod A wrote the record.
+        {
+            let local = StateStore::open(&harness.pod_a.state_path).unwrap();
+            let record = local
+                .get_run(run_id)
+                .unwrap()
+                .expect("the failed run is persisted locally");
+            assert!(
+                matches!(
+                    record.status,
+                    RunStatus::Failure | RunStatus::PartialFailure
+                ),
+                "{:?}",
+                record.status
+            );
+        }
+
+        // And pod B, a fresh process elsewhere, sees it: the session finalized.
+        let authority = rt
+            .block_on(harness.download(&harness.pod_b))
+            .expect("pod B downloads the shared state");
+        assert!(
+            matches!(
+                authority,
+                rocky_core::state_sync::StateAuthority::Authoritative
+            ),
+            "pod B found a remote object to download: {authority:?}"
+        );
+        let remote = harness.open_store(&harness.pod_b);
+        assert!(
+            remote.get_run(run_id).unwrap().is_some(),
+            "the failed run rode the terminal upload; abandoning would strand it locally"
         );
     }
 
@@ -15430,7 +15962,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
         store
-            .init_run_progress("run-empty", 0, Some(&scope))
+            .init_run_progress("run-empty", &planned_keys(0), Some(&scope))
             .unwrap();
 
         let explicit = resolve_resume_progress(&store, Some("run-empty"), false, &scope)
@@ -15464,7 +15996,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         store
-            .init_run_progress("run-p2", 1, Some(&test_resume_scope("p2")))
+            .init_run_progress("run-p2", &planned_keys(1), Some(&test_resume_scope("p2")))
             .unwrap();
 
         let err = resolve_resume_progress(&store, Some("run-p2"), false, &test_resume_scope("p1"))
@@ -15486,7 +16018,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
     fn resume_refuses_a_scopeless_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
-        store.init_run_progress("run-legacy", 1, None).unwrap();
+        store
+            .init_run_progress("run-legacy", &planned_keys(1), None)
+            .unwrap();
 
         let scope = test_resume_scope("p1");
         for (resume_run_id, resume_latest) in [(Some("run-legacy"), false), (None, true)] {
@@ -15507,7 +16041,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         store
-            .init_run_progress("run-p2", 1, Some(&test_resume_scope("p2")))
+            .init_run_progress("run-p2", &planned_keys(1), Some(&test_resume_scope("p2")))
             .unwrap();
 
         let err = resolve_resume_progress(&store, None, true, &test_resume_scope("p1"))
@@ -15526,7 +16060,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
-        store.init_run_progress("run-1", 1, Some(&scope)).unwrap();
+        store
+            .init_run_progress("run-1", &planned_keys(1), Some(&scope))
+            .unwrap();
 
         // Both entry points, because a run id names the same checkpoint
         // either way. `--resume <id>` skipped this gate entirely until
@@ -15566,7 +16102,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
-        store.init_run_progress("run-1", 1, Some(&scope)).unwrap();
+        store
+            .init_run_progress("run-1", &planned_keys(1), Some(&scope))
+            .unwrap();
 
         let entry_points = [(None, true), (Some("run-1"), false)];
 
@@ -15614,6 +16152,16 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         store.record_run(&record).unwrap();
     }
 
+    /// The `count` table keys [`complete_tables`] records, in plan order — the
+    /// planned set a run with those tables stamps on its checkpoint (#1674).
+    /// Kept beside `complete_tables` on purpose: a test whose plan and whose
+    /// recordings are spelled differently proves nothing about the gate.
+    fn planned_keys(count: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| format!("wh.staging_p1__acme.t{index}"))
+            .collect()
+    }
+
     /// Mark `count` of the checkpoint's tables copied.
     fn complete_tables(store: &StateStore, run_id: &str, count: usize) {
         for index in 0..count {
@@ -15643,7 +16191,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
-        store.init_run_progress("run-1", 2, Some(&scope)).unwrap();
+        store
+            .init_run_progress("run-1", &planned_keys(2), Some(&scope))
+            .unwrap();
         complete_tables(&store, "run-1", 2);
 
         for status in ["PartialFailure", "Failure"] {
@@ -15676,7 +16226,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
-        store.init_run_progress("run-1", 2, Some(&scope)).unwrap();
+        store
+            .init_run_progress("run-1", &planned_keys(2), Some(&scope))
+            .unwrap();
         complete_tables(&store, "run-1", 2);
         seed_run_record_with_a_failed_model(&store, "run-1", "PartialFailure");
 
@@ -15729,7 +16281,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
-        store.init_run_progress("run-1", 2, Some(&scope)).unwrap();
+        store
+            .init_run_progress("run-1", &planned_keys(2), Some(&scope))
+            .unwrap();
         complete_tables(&store, "run-1", 2);
 
         for status in ["PartialFailure", "Failure"] {
@@ -15748,6 +16302,174 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         }
     }
 
+    /// #1674, the defect the count could not see. The checkpoint plans
+    /// `{t0, t1}`, records `Success` for `t0` and for a table that is NOT in
+    /// the plan, and the run was gated by its checks.
+    ///
+    /// ```text
+    ///   planned  {wh.staging_p1__acme.t0, wh.staging_p1__acme.t1}
+    ///   Success  {wh.staging_p1__acme.t0, wh.other.stray}
+    ///
+    ///   count  2 >= 2          -> "complete" -> refuse   <- wrong: t1 unread
+    ///   set    t1 not copied   -> incomplete -> resume    <- right
+    /// ```
+    ///
+    /// The count refuses a resume that still owes `t1`. The set admits it.
+    /// This is the ONLY test that separates the two, so it is the one the
+    /// mutation check reverts.
+    #[test]
+    fn a_checkpoint_whose_successes_are_not_its_planned_set_still_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        let planned = planned_keys(2);
+        store
+            .init_run_progress("run-1", &planned, Some(&scope))
+            .unwrap();
+        for (index, key) in [planned[0].as_str(), "wh.other.stray"].iter().enumerate() {
+            store
+                .record_table_progress(
+                    "run-1",
+                    &table_entry(index, key, rocky_core::state::TableStatus::Success),
+                )
+                .unwrap();
+        }
+        seed_gated_run_record(&store, "run-1", "PartialFailure");
+
+        for (resume_run_id, resume_latest) in [(None, true), (Some("run-1"), false)] {
+            let progress = resolve_resume_progress(&store, resume_run_id, resume_latest, &scope)
+                .expect("a planned table that was never copied must stay resumable")
+                .expect("the checkpoint resolves");
+            assert_eq!(progress.run_id, "run-1");
+        }
+    }
+
+    /// The negative control for the test above, and the reason "always
+    /// incomplete" is not a fix. Same plan, same gate — but every planned key
+    /// really did succeed, so the refusal must still fire. Without this,
+    /// deleting the comparison entirely would satisfy the test above.
+    #[test]
+    fn a_checkpoint_whose_planned_set_all_succeeded_is_still_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        store
+            .init_run_progress("run-1", &planned_keys(2), Some(&scope))
+            .unwrap();
+        complete_tables(&store, "run-1", 2);
+        seed_gated_run_record(&store, "run-1", "PartialFailure");
+
+        let err = resolve_resume_progress(&store, None, true, &scope)
+            .expect_err("a fully-copied gated run must still refuse");
+        assert!(
+            format!("{err:#}").contains("gated by its checks"),
+            "unexpected refusal: {err:#}"
+        );
+    }
+
+    /// A pre-v30 checkpoint carries no planned set, and the gate falls back to
+    /// the count — the behaviour that shipped. Written against the stored
+    /// bytes rather than through `init_run_progress`, because this build's
+    /// writer always stamps the set and so cannot produce the old shape.
+    #[test]
+    fn a_planless_checkpoint_is_still_decided_by_the_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        store
+            .init_run_progress("run-1", &planned_keys(2), Some(&scope))
+            .unwrap();
+        complete_tables(&store, "run-1", 2);
+        seed_gated_run_record(&store, "run-1", "PartialFailure");
+
+        let stored = store.get_run_progress("run-1").unwrap().unwrap();
+        assert!(
+            stored.planned_tables.is_some(),
+            "this build must stamp the planned set"
+        );
+        let planless = rocky_core::state::RunProgress {
+            planned_tables: None,
+            ..stored
+        };
+        assert_eq!(
+            super::copy_completeness(&planless),
+            super::CopyCompleteness::CompleteByCount,
+            "without a plan the count is the only evidence, and it says complete"
+        );
+    }
+
+    /// The three answers, stated directly on the decision rather than through
+    /// the whole resume path. A key recorded outside the plan contributes
+    /// nothing — that is the fix in one line.
+    #[test]
+    fn copy_completeness_reads_the_set_not_the_count() {
+        use rocky_core::state::TableStatus;
+
+        let progress = |planned: Option<Vec<&str>>, recorded: Vec<(&str, TableStatus)>| {
+            rocky_core::state::RunProgress {
+                run_id: "run-1".to_string(),
+                started_at: Utc::now(),
+                total_tables: planned.as_ref().map(Vec::len).unwrap_or(2),
+                tables: recorded
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (key, status))| table_entry(index, key, status))
+                    .collect(),
+                scope: None,
+                planned_tables: planned.map(|keys| keys.into_iter().map(str::to_string).collect()),
+            }
+        };
+
+        assert_eq!(
+            super::copy_completeness(&progress(
+                Some(vec!["c.s.a", "c.s.b"]),
+                vec![
+                    ("c.s.a", TableStatus::Success),
+                    ("c.s.b", TableStatus::Success)
+                ],
+            )),
+            super::CopyCompleteness::Complete
+        );
+        assert_eq!(
+            super::copy_completeness(&progress(
+                Some(vec!["c.s.a", "c.s.b"]),
+                vec![
+                    ("c.s.a", TableStatus::Success),
+                    ("c.s.x", TableStatus::Success)
+                ],
+            )),
+            super::CopyCompleteness::Incomplete,
+            "a key outside the plan must not stand in for a planned one"
+        );
+        assert_eq!(
+            super::copy_completeness(&progress(
+                Some(vec!["c.s.a", "c.s.b"]),
+                vec![
+                    ("c.s.a", TableStatus::Success),
+                    ("c.s.b", TableStatus::Failed)
+                ],
+            )),
+            super::CopyCompleteness::Incomplete,
+            "a planned key that did not succeed is not copied"
+        );
+        assert_eq!(
+            super::copy_completeness(&progress(
+                None,
+                vec![
+                    ("c.s.a", TableStatus::Success),
+                    ("c.s.x", TableStatus::Success)
+                ],
+            )),
+            super::CopyCompleteness::CompleteByCount,
+            "with no plan the count is all there is"
+        );
+        assert_eq!(
+            super::copy_completeness(&progress(None, vec![("c.s.a", TableStatus::Success)])),
+            super::CopyCompleteness::Incomplete,
+            "the count still catches the tables it can"
+        );
+    }
+
     /// The narrowing conjunct for the refusal above: a gated run with copy
     /// work left is still admitted, because a resume of it does real work.
     /// What keeps THAT honest is the carry-forward, not a refusal — see
@@ -15758,7 +16480,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
-        store.init_run_progress("run-1", 3, Some(&scope)).unwrap();
+        store
+            .init_run_progress("run-1", &planned_keys(3), Some(&scope))
+            .unwrap();
         complete_tables(&store, "run-1", 2);
         seed_gated_run_record(&store, "run-1", "PartialFailure");
 
@@ -15784,7 +16508,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
-        store.init_run_progress("run-1", 3, Some(&scope)).unwrap();
+        store
+            .init_run_progress("run-1", &planned_keys(3), Some(&scope))
+            .unwrap();
         complete_tables(&store, "run-1", 2);
         seed_run_record(&store, "run-1", "PartialFailure");
 
@@ -15809,7 +16535,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
-        store.init_run_progress("run-1", 3, Some(&scope)).unwrap();
+        store
+            .init_run_progress("run-1", &planned_keys(3), Some(&scope))
+            .unwrap();
         complete_tables(&store, "run-1", 2);
         // `seed_run_record` builds the record from a JSON object with no
         // `check_gate_failed` key — the v24 blob shape.
@@ -15828,7 +16556,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
-        store.init_run_progress("run-1", 2, Some(&scope)).unwrap();
+        store
+            .init_run_progress("run-1", &planned_keys(2), Some(&scope))
+            .unwrap();
         complete_tables(&store, "run-1", 1);
         seed_run_record(&store, "run-1", "PartialFailure");
 
@@ -15852,7 +16582,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             let dir = tempfile::tempdir().unwrap();
             let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
             let scope = test_resume_scope("p1");
-            store.init_run_progress("run-1", 2, Some(&scope)).unwrap();
+            store
+                .init_run_progress("run-1", &planned_keys(2), Some(&scope))
+                .unwrap();
             complete_tables(&store, "run-1", 1);
             store
                 .record_table_progress("run-1", &table_entry(1, "wh.staging_p1__acme.t1", status))
@@ -15892,7 +16624,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             let scope = test_resume_scope("p1");
             // Two copied tables against a post-filter plan of ONE, plus an
             // unfinished third: a count alone would read this as complete.
-            store.init_run_progress("run-1", 1, Some(&scope)).unwrap();
+            store
+                .init_run_progress("run-1", &planned_keys(1), Some(&scope))
+                .unwrap();
             complete_tables(&store, "run-1", 2);
             store
                 .record_table_progress("run-1", &table_entry(2, "wh.staging_p1__acme.t2", trailing))
@@ -15913,7 +16647,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
-        store.init_run_progress("run-0", 0, Some(&scope)).unwrap();
+        store
+            .init_run_progress("run-0", &planned_keys(0), Some(&scope))
+            .unwrap();
         seed_run_record(&store, "run-0", "Failure");
         let progress = resolve_resume_progress(&store, Some("run-0"), false, &scope)
             .unwrap()
@@ -15936,7 +16672,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let scope = test_resume_scope("p1");
         // Run N was itself a resume: it planned only the 2 tables run N-1
         // left behind, and copied both.
-        store.init_run_progress("run-2", 2, Some(&scope)).unwrap();
+        store
+            .init_run_progress("run-2", &planned_keys(2), Some(&scope))
+            .unwrap();
         complete_tables(&store, "run-2", 2);
         seed_run_record(&store, "run-2", "PartialFailure");
 
@@ -15959,11 +16697,14 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
-        store.init_run_progress("run-1", 2, Some(&scope)).unwrap();
-        for (index, key) in ["wh.staging_p1__acme.orders", "wh.staging_p1__acme.items"]
-            .iter()
-            .enumerate()
-        {
+        let planned = [
+            "wh.staging_p1__acme.orders".to_string(),
+            "wh.staging_p1__acme.items".to_string(),
+        ];
+        store
+            .init_run_progress("run-1", &planned, Some(&scope))
+            .unwrap();
+        for (index, key) in planned.iter().enumerate() {
             store
                 .record_table_progress("run-1", &table_entry(index, key, TableStatus::Success))
                 .unwrap();
@@ -16040,7 +16781,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         store
-            .init_run_progress("run-forged", 1, Some(&forged))
+            .init_run_progress("run-forged", &planned_keys(1), Some(&forged))
             .unwrap();
 
         let err = resolve_resume_progress(&store, Some("run-forged"), false, &genuine)
@@ -16098,7 +16839,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
 
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
-        store.init_run_progress("run-a", 1, Some(&scope_a)).unwrap();
+        store
+            .init_run_progress("run-a", &planned_keys(1), Some(&scope_a))
+            .unwrap();
 
         let err = resolve_resume_progress(&store, Some("run-a"), false, &scope_b)
             .expect_err("another gateway path's checkpoint must not resume");
@@ -16140,7 +16883,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
 
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
-        store.init_run_progress("run-a", 1, Some(&scope_a)).unwrap();
+        store
+            .init_run_progress("run-a", &planned_keys(1), Some(&scope_a))
+            .unwrap();
         let err = resolve_resume_progress(&store, Some("run-a"), false, &scope_b)
             .expect_err("another route's checkpoint must not resume");
 
@@ -16291,7 +17036,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         store
-            .init_run_progress("run-underscore", 1, Some(&underscore))
+            .init_run_progress("run-underscore", &planned_keys(1), Some(&underscore))
             .unwrap();
 
         let err = resolve_resume_progress(&store, Some("run-underscore"), false, &dashes)
@@ -16359,7 +17104,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         store
-            .init_run_progress("run-underscore", 1, Some(&underscore))
+            .init_run_progress("run-underscore", &planned_keys(1), Some(&underscore))
             .unwrap();
 
         let err = resolve_resume_progress(&store, Some("run-underscore"), false, &dashes)
@@ -16422,7 +17167,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             let dir = tempfile::tempdir().unwrap();
             let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
             store
-                .init_run_progress("run-written", 1, Some(&written))
+                .init_run_progress("run-written", &planned_keys(1), Some(&written))
                 .unwrap();
             resolve_resume_progress(&store, Some("run-written"), false, &edited)
                 .unwrap_or_else(|err| panic!("'{schema_template}' must still resume: {err:#}"))
@@ -16519,7 +17264,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         store
-            .init_run_progress("run-written", 1, Some(&written))
+            .init_run_progress("run-written", &planned_keys(1), Some(&written))
             .unwrap();
         resolve_resume_progress(&store, Some("run-written"), false, &edited)
             .expect("the bypassed separator must still resume")
@@ -16550,7 +17295,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         store
-            .init_run_progress("run-catalog", 1, Some(&catalog_written))
+            .init_run_progress("run-catalog", &planned_keys(1), Some(&catalog_written))
             .unwrap();
         let err = resolve_resume_progress(&store, Some("run-catalog"), false, &catalog_edited)
             .expect_err("another catalog separator's checkpoint must not resume");
@@ -16658,7 +17403,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         store
-            .init_run_progress("run-written", 1, Some(&written))
+            .init_run_progress("run-written", &planned_keys(1), Some(&written))
             .unwrap();
         resolve_resume_progress(&store, Some("run-written"), false, &edited)
             .expect("a bypassed template edit must still resume")
@@ -16684,7 +17429,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         store
-            .init_run_progress("run-plain", 1, Some(&plain_written))
+            .init_run_progress("run-plain", &planned_keys(1), Some(&plain_written))
             .unwrap();
         let err = resolve_resume_progress(&store, Some("run-plain"), false, &plain_edited)
             .expect_err("another schema template's checkpoint must not resume");
@@ -16805,7 +17550,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         store
-            .init_run_progress("run-written", 1, Some(&written))
+            .init_run_progress("run-written", &planned_keys(1), Some(&written))
             .unwrap();
         let err = resolve_resume_progress(&store, Some("run-written"), false, &edited)
             .expect_err("an edited source separator must not resume");
@@ -16834,7 +17579,9 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             target: None,
             ..scope.clone()
         };
-        store.init_run_progress("run-flat", 1, Some(&flat)).unwrap();
+        store
+            .init_run_progress("run-flat", &planned_keys(1), Some(&flat))
+            .unwrap();
 
         let err = resolve_resume_progress(&store, Some("run-flat"), false, &scope)
             .expect_err("a scope without a structured target must not resume");
@@ -16873,7 +17620,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
             let scope = test_resume_scope("p1");
             store
-                .init_run_progress("run-1", planned, Some(&scope))
+                .init_run_progress("run-1", &planned_keys(planned), Some(&scope))
                 .unwrap();
             for (index, status) in recorded.iter().enumerate() {
                 let key = format!("wh.staging_p1__acme.t{index}");
@@ -16903,7 +17650,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             target_table_name: name.into(),
             asset_key_prefix: vec!["test".into()],
             tenant: None,
-            check_column_match: false,
+            column_match: None,
             check_row_count: false,
             check_freshness: false,
             column_match_exclude: vec![],
@@ -16929,7 +17676,11 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let store = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
         let tasks = vec![planned_task("orders"), planned_task("items")];
         store
-            .init_run_progress("run-1", tasks.len(), Some(&test_resume_scope("p1")))
+            .init_run_progress(
+                "run-1",
+                &tasks.iter().map(table_key).collect::<Vec<_>>(),
+                Some(&test_resume_scope("p1")),
+            )
             .unwrap();
 
         let semaphore = Semaphore::new(1);
@@ -16990,6 +17741,10 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                 &store,
                 "run-1",
                 &mut total_completed,
+                &AbortPolicy {
+                    fail_fast: false,
+                    error_rate_abort_pct: 0,
+                },
             )
             .await;
         }
@@ -17005,6 +17760,20 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             progress.total_tables,
             "every planned table is recorded: {:?}",
             progress.tables
+        );
+        assert_eq!(
+            progress
+                .tables
+                .iter()
+                .map(|t| t.table_key.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            progress
+                .planned_tables
+                .clone()
+                .unwrap()
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the recorded keys are the planned keys (#1674)"
         );
         assert_eq!(progress.tables[0].table_key, "cat.staging.orders");
         assert_eq!(progress.tables[0].status, TableStatus::Success);
@@ -17442,7 +18211,11 @@ auto_create_schemas = true
         // left a table behind is the shape this test is about, and it stays
         // resumable. The refusal has its own coverage in
         // `resume_refuses_a_complete_checkpoint_whose_failure_was_not_a_copy_or_a_model`.
-        for (run_record_status, planned_tables) in [(None, 2), (Some("Failure"), 2)] {
+        let planned_tables = [
+            "warehouse.staging_p2__acme.orders".to_string(),
+            "warehouse.staging_p2__acme.items".to_string(),
+        ];
+        for run_record_status in [None, Some("Failure")] {
             let dir = tempfile::tempdir().unwrap();
             let (config_path, state_path, db_path) = write_two_pipeline_project(
                 dir.path(),
@@ -17484,7 +18257,7 @@ auto_create_schemas = true
                 );
                 let store = StateStore::open(&state_path).unwrap();
                 store
-                    .init_run_progress("run-seeded", planned_tables, Some(&scope))
+                    .init_run_progress("run-seeded", &planned_tables, Some(&scope))
                     .unwrap();
                 store
                     .record_table_progress(
@@ -17587,7 +18360,11 @@ auto_create_schemas = true
             );
             let store = StateStore::open(&state_path).unwrap();
             store
-                .init_run_progress("run-branch", 1, Some(&scope))
+                .init_run_progress(
+                    "run-branch",
+                    &["warehouse.branch__feature.orders".to_string()],
+                    Some(&scope),
+                )
                 .unwrap();
             store
                 .record_table_progress(
@@ -17746,7 +18523,11 @@ auto_create_schemas = true
             );
             let store = StateStore::open(&state_path).unwrap();
             store
-                .init_run_progress("run-crashed", 1, Some(&scope))
+                .init_run_progress(
+                    "run-crashed",
+                    &["warehouse.staging_p2__acme.orders".to_string()],
+                    Some(&scope),
+                )
                 .unwrap();
             store
                 .record_table_progress(
@@ -20356,7 +21137,7 @@ merge_keys = ["id"]
             target_table_name: "orders_rocky_shadow".into(),
             asset_key_prefix: vec!["test".into()],
             tenant: None,
-            check_column_match: false,
+            column_match: None,
             check_row_count: false,
             check_freshness: false,
             column_match_exclude: vec![],
@@ -20417,7 +21198,7 @@ merge_keys = ["id"]
             target_table_name: "orders_rocky_shadow".into(),
             asset_key_prefix: vec!["test".into()],
             tenant: None,
-            check_column_match: false,
+            column_match: None,
             check_row_count: false,
             check_freshness: false,
             column_match_exclude: vec![],
@@ -20538,7 +21319,7 @@ timestamp_column = "ts"
             target_table_name: "events".into(),
             asset_key_prefix: vec!["test".into()],
             tenant: None,
-            check_column_match: false,
+            column_match: None,
             check_row_count: false,
             check_freshness: false,
             column_match_exclude: vec![],
@@ -21272,7 +22053,7 @@ timestamp_column = "ts"
             target_table_name: "events".into(),
             asset_key_prefix: vec!["test".into()],
             tenant: None,
-            check_column_match: false,
+            column_match: None,
             check_row_count: false,
             check_freshness: false,
             column_match_exclude: vec![],
@@ -21352,7 +22133,7 @@ timestamp_column = "ts"
             target_table_name: "events".into(),
             asset_key_prefix: vec!["test".into()],
             tenant: None,
-            check_column_match: true,
+            column_match: Some(rocky_core::tests::TestSeverity::Error),
             check_row_count: false,
             check_freshness: false,
             column_match_exclude,
@@ -21431,6 +22212,70 @@ timestamp_column = "ts"
             check.passed && missing.is_empty() && extra.is_empty(),
             "the copy created the target from the source, so the column sets \
              match by construction; got missing={missing:?} extra={extra:?}"
+        );
+    }
+
+    /// #1666, the severity half. A pipeline that marks `column_match`
+    /// advisory gets an advisory check.
+    ///
+    /// `check_column_match` hard-codes `TestSeverity::Error`, and the task
+    /// used to carry a bare bool, so `severity = "warning"` had nowhere to
+    /// travel: it parsed, validated, and was discarded. The operator's own
+    /// documented escape hatch did nothing on the replication path.
+    ///
+    /// Both severities are asserted from the same helper. Asserting only the
+    /// warning case would pass against code that hard-coded `Warning`
+    /// instead, which is the same defect facing the other way.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn column_match_carries_the_configured_severity() {
+        use rocky_core::state::StateStore;
+        use rocky_core::tests::TestSeverity;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        async fn severity_of(configured: TestSeverity) -> TestSeverity {
+            let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+            adapter
+                .execute_statement("CREATE SCHEMA IF NOT EXISTS src")
+                .await
+                .unwrap();
+            adapter
+                .execute_statement("CREATE SCHEMA IF NOT EXISTS tgt")
+                .await
+                .unwrap();
+            adapter
+                .execute_statement("CREATE TABLE src.events AS SELECT 1 AS id")
+                .await
+                .unwrap();
+
+            let dir = tempfile::tempdir().unwrap();
+            let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+            let pipeline = parse_pipeline(r#"strategy = "full_refresh""#);
+            let mut task = column_match_task(vec![], vec![]);
+            task.column_match = Some(configured);
+
+            let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+                .await
+                .expect("the first run must copy the table");
+            let TableOutcome::Materialized(result) = outcome else {
+                panic!("table should be materialized");
+            };
+            result
+                .column_match_check
+                .expect("the task enables column_match")
+                .severity
+        }
+
+        assert_eq!(
+            severity_of(TestSeverity::Warning).await,
+            TestSeverity::Warning,
+            "an advisory column_match must not report as an error"
+        );
+        assert_eq!(
+            severity_of(TestSeverity::Error).await,
+            TestSeverity::Error,
+            "an error-severity column_match must still report as an error"
         );
     }
 
@@ -22025,7 +22870,11 @@ timestamp_column = "ts"
         let hook_registry = HookRegistry::from_config(&Default::default());
         let tasks = vec![task.clone()];
         state
-            .init_run_progress("run-1", tasks.len(), Some(&test_resume_scope("p1")))
+            .init_run_progress(
+                "run-1",
+                &tasks.iter().map(table_key).collect::<Vec<_>>(),
+                Some(&test_resume_scope("p1")),
+            )
             .unwrap();
         process_completed_result(
             Ok((0, Ok(TableOutcome::Materialized(result)))),
@@ -22053,6 +22902,10 @@ timestamp_column = "ts"
             &state,
             "run-1",
             &mut total_completed,
+            &AbortPolicy {
+                fail_fast: false,
+                error_rate_abort_pct: 0,
+            },
         )
         .await;
 
@@ -22149,7 +23002,7 @@ timestamp_column = "ts"
             target_table_name: "events".into(),
             asset_key_prefix: vec!["test".into()],
             tenant: None,
-            check_column_match: false,
+            column_match: None,
             check_row_count: false,
             check_freshness: false,
             column_match_exclude: vec![],
@@ -22569,13 +23422,14 @@ backend = "local"
         // Clean run → Ok.
         let mut ok = RunOutput::new(String::new(), 0, 1);
         ok.tables_copied = 1;
-        assert!(super::run_status_exit_result(&ok, "r").is_ok());
+        assert!(super::run_status_exit_result(&ok, "r", super::RecordCustody::Persisted).is_ok());
 
         // Some progress + a failure → PartialFailure sentinel (exit 2).
         let mut partial = RunOutput::new(String::new(), 0, 1);
         partial.tables_copied = 1;
         partial.tables_failed = 1;
-        let err = super::run_status_exit_result(&partial, "r").unwrap_err();
+        let err = super::run_status_exit_result(&partial, "r", super::RecordCustody::Persisted)
+            .unwrap_err();
         assert!(
             err.downcast_ref::<PartialFailure>().is_some(),
             "PartialFailure must map to the exit-2 sentinel, got: {err:#}"
@@ -22584,8 +23438,97 @@ backend = "local"
         // No progress + a failure → a plain error (exit 1).
         let mut total = RunOutput::new(String::new(), 0, 1);
         total.tables_failed = 1;
-        let err = super::run_status_exit_result(&total, "r").unwrap_err();
+        let err = super::run_status_exit_result(&total, "r", super::RecordCustody::Persisted)
+            .unwrap_err();
         assert!(err.downcast_ref::<PartialFailure>().is_none());
+    }
+
+    /// #1836. The sentinel is the only evidence a caller holding the run's
+    /// remote-state session has that a record exists to upload, and before
+    /// this the TYPE alone decided. `persist_run_record` is best-effort, so
+    /// the type came back whether or not the write succeeded — and finalizing
+    /// then published an authoritative ledger with the run missing from it.
+    ///
+    /// ```text
+    ///   error                            disposition
+    ///   RunFailed      { Persisted }  ->  Finalize
+    ///   RunFailed      { Lost }       ->  Abandon
+    ///   PartialFailure { Persisted }  ->  Finalize
+    ///   PartialFailure { Lost }       ->  Abandon
+    ///   anything else                 ->  Abandon   (pre-terminal hard exit)
+    /// ```
+    ///
+    /// The exit CODE is unchanged in every row: a `Lost` partial failure is
+    /// still the exit-2 sentinel, because the run failed the same amount and
+    /// telling an orchestrator "hard failure" about a resumable run to signal
+    /// a bookkeeping problem would be a worse lie than the one being fixed.
+    #[test]
+    fn session_disposition_reads_the_record_custody_not_the_error_type() {
+        use super::{PartialFailure, RecordCustody, RunFailed, SessionDisposition};
+
+        let run_failed = |custody| {
+            anyhow::Error::from(RunFailed {
+                count: 1,
+                run_id: "r".to_string(),
+                custody,
+            })
+        };
+        let partial = |custody| {
+            anyhow::Error::from(PartialFailure {
+                count: 1,
+                run_id: "r".to_string(),
+                check_gate_failed: false,
+                custody,
+            })
+        };
+
+        assert_eq!(
+            super::session_disposition(&run_failed(RecordCustody::Persisted)),
+            SessionDisposition::Finalize
+        );
+        assert_eq!(
+            super::session_disposition(&run_failed(RecordCustody::Lost)),
+            SessionDisposition::Abandon,
+            "a record that never landed must not be published as if it had"
+        );
+        assert_eq!(
+            super::session_disposition(&partial(RecordCustody::Persisted)),
+            SessionDisposition::Finalize
+        );
+        assert_eq!(
+            super::session_disposition(&partial(RecordCustody::Lost)),
+            SessionDisposition::Abandon
+        );
+        assert_eq!(
+            super::session_disposition(&anyhow::anyhow!("adapter auth failed")),
+            SessionDisposition::Abandon,
+            "a pre-terminal hard exit has no record to upload"
+        );
+    }
+
+    /// The negative control for the test above: "always abandon" is not a
+    /// fix. A typed post-terminal failure whose record DID land must still
+    /// finalize — abandoning there is the #1816 bug in reverse, stranding a
+    /// persisted failure record in the pod-local file where no other pod sees
+    /// it.
+    ///
+    /// And the exit contract does not move: both custodies keep their type,
+    /// so `main.rs` maps a `Lost` partial failure to exit 2 exactly as it
+    /// maps a `Persisted` one.
+    #[test]
+    fn a_lost_record_changes_the_disposition_and_never_the_exit_code() {
+        use super::{PartialFailure, RecordCustody};
+
+        let mut partial = RunOutput::new(String::new(), 0, 1);
+        partial.tables_copied = 1;
+        partial.tables_failed = 1;
+        for custody in [RecordCustody::Persisted, RecordCustody::Lost] {
+            let err = super::run_status_exit_result(&partial, "r", custody).unwrap_err();
+            let sentinel = err
+                .downcast_ref::<PartialFailure>()
+                .expect("the exit-2 sentinel survives a lost record");
+            assert_eq!(sentinel.custody, custody);
+        }
     }
 
     /// Build a parallel-copy `TableError` for the merge tests below.
@@ -22919,7 +23862,9 @@ backend = "local"
             "the severity-resolved verdict must reach the record"
         );
         store.record_run(&first_record).unwrap();
-        store.init_run_progress("run-1", 3, None).unwrap();
+        store
+            .init_run_progress("run-1", &planned_keys(3), None)
+            .unwrap();
         let progress = store.get_run_progress("run-1").unwrap().unwrap();
 
         // --- the resume: it copies the one table that failed, and nothing
@@ -22960,7 +23905,9 @@ backend = "local"
         );
         assert!(!matches!(resumed_record.status, RunStatus::Success));
         store.record_run(&resumed_record).unwrap();
-        store.init_run_progress("run-2", 1, None).unwrap();
+        store
+            .init_run_progress("run-2", &planned_keys(1), None)
+            .unwrap();
         let progress2 = store.get_run_progress("run-2").unwrap().unwrap();
         assert_eq!(
             super::inherited_check_gate(&store, Some(&progress2)).as_deref(),
@@ -23028,7 +23975,9 @@ backend = "local"
             "precondition: the synthetic entry is what admits the resume today"
         );
         store.record_run(&record).unwrap();
-        store.init_run_progress("run-1", 1, None).unwrap();
+        store
+            .init_run_progress("run-1", &["wh.raw.orders".to_string()], None)
+            .unwrap();
         store
             .record_table_progress(
                 "run-1",
@@ -23099,7 +24048,9 @@ backend = "local"
         );
         assert!(first_record.verify_after_failed);
         store.record_run(&first_record).unwrap();
-        store.init_run_progress("run-1", 3, None).unwrap();
+        store
+            .init_run_progress("run-1", &planned_keys(3), None)
+            .unwrap();
         let progress = store.get_run_progress("run-1").unwrap().unwrap();
 
         // The resume copies the one failed table. It auto-applies no drift, so
@@ -23132,7 +24083,9 @@ backend = "local"
             "the standing verdict must survive onto the resumed run's own record"
         );
         store.record_run(&resumed_record).unwrap();
-        store.init_run_progress("run-2", 1, None).unwrap();
+        store
+            .init_run_progress("run-2", &planned_keys(1), None)
+            .unwrap();
         let progress2 = store.get_run_progress("run-2").unwrap().unwrap();
         assert_eq!(
             super::inherited_verify_after(&store, Some(&progress2)).as_deref(),
@@ -23364,6 +24317,7 @@ backend = "local"
             count: 1,
             run_id: "run-1".to_string(),
             check_gate_failed: false,
+            custody: super::RecordCustody::Persisted,
         }
         .to_string();
         assert_eq!(
@@ -23376,6 +24330,7 @@ backend = "local"
             count: 1,
             run_id: "run-1".to_string(),
             check_gate_failed: true,
+            custody: super::RecordCustody::Persisted,
         }
         .to_string();
         assert!(
@@ -25619,8 +26574,9 @@ backend = "local"
     #[test]
     fn content_addressed_dispatch_ir_is_typed() {
         let content = "---toml\nname = \"ca_events\"\n\n[strategy]\ntype = \"content_addressed\"\nstorage_prefix = \"s3://bucket/ca_events\"\n\n[target]\ncatalog = \"analytics\"\nschema = \"marts\"\ntable = \"ca_events\"\n---\n\nSELECT 1 AS id, 'a' AS name\n";
-        let model = rocky_core::models::parse_model_inline(content, "ca_events.sql", None)
-            .expect("parse content-addressed model");
+        let model =
+            rocky_core::models::parse_model_inline(content, Path::new("ca_events.sql"), None)
+                .expect("parse content-addressed model");
         assert!(
             model.to_model_ir().skip_hash().is_none(),
             "bare to_model_ir() has no typed columns — the regression shape"
@@ -27422,22 +28378,34 @@ auto_create_schemas = true
         );
     }
 
-    /// GUARANTEE-BOUNDARY parity (intentional, not a latent bug): for a read
-    /// Rocky cannot statically resolve — a CTE / anything `lineage_is_provably_
-    /// complete` rejects, i.e. an "uncertain" model — containment behaves
-    /// *identically* to a normal fail-fast run. Under `--parallel 2` a same-layer
-    /// uncertain reader of a failed producer materializes on stale data in BOTH
-    /// modes; that is a pre-existing property of parallel fail-fast, not a
-    /// containment regression.
+    /// Containment ⊆ fail-fast, on a CTE read — and **the boundary moved**
+    /// under it (#1867).
     ///
-    /// This test locks the achievable invariant — **containment never
-    /// materializes anything fail-fast wouldn't** (containment ⊆ fail-fast) — by
-    /// running the same project twice under `--parallel 2`, once with
-    /// `contain_failures = false` and once `= true`, and asserting identical
-    /// materialization sets. It will catch a future change that either
-    /// over-contains (would false-fail healthy CTE projects) or regresses below
-    /// fail-fast. Declaring the dependency via `ref()` lifts the read into the
-    /// resolved, guaranteed set (covered by the resolved-read tests above).
+    /// The invariant this test locks is unchanged: run the same project twice
+    /// under `--parallel 2`, once with `contain_failures = false` and once
+    /// `= true`, and the materialization sets must be identical. It catches a
+    /// change that either over-contains (false-failing healthy CTE projects) or
+    /// regresses below fail-fast.
+    ///
+    /// What changed is the fixture's outcome, and it changed for the better.
+    /// This used to assert that `rollup` **builds** in both modes, on the
+    /// reasoning that its CTE read of the failed producer's target was
+    /// unenumerable, so nothing could order the two and a same-layer reader
+    /// materialized on stale data. That was the documented best-effort
+    /// boundary. Since #1867 the read inside a `WITH` body reaches
+    /// `referenced_tables`, so `derive_physical_edges` matches it against
+    /// `stage_orders`'s target `(main, orders_current)` and
+    /// `augment_physical_read_edges` puts the two in different layers. The
+    /// producer fails, so `rollup` is now withheld — in both modes.
+    ///
+    /// So the assertion is inverted deliberately: `rollup` must NOT build. That
+    /// is exactly the failure #1867 describes (a reader running before its
+    /// producer and reading stale data), and the old assertion pinned it as
+    /// acceptable because nothing could see the read.
+    ///
+    /// Declaring the dependency via `ref()` still lifts the read into the
+    /// resolved, guaranteed set (covered by the resolved-read tests above);
+    /// that path is unchanged and remains the hard guarantee.
     #[cfg(feature = "duckdb")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn containment_matches_fail_fast_for_same_layer_uncertain_read() {
@@ -27467,18 +28435,24 @@ auto_create_schemas = true
         assert_eq!(
             mat_set(&out_ff),
             mat_set(&out_ct),
-            "containment must not materialize anything fail-fast wouldn't for a same-layer \
-             uncertain (CTE) read — the achievable containment ⊆ fail-fast invariant"
+            "containment must not materialize anything fail-fast wouldn't for a CTE read — \
+             the achievable containment ⊆ fail-fast invariant"
         );
         assert!(
-            mat_set(&out_ct).contains("rollup"),
-            "the unenumerable (CTE) reader builds in BOTH modes — the documented best-effort \
-             boundary (declare the dep via ref() for a hard guarantee)"
+            !mat_set(&out_ct).contains("rollup"),
+            "the CTE reader must NOT build on the failed producer's stale target: the read \
+             inside the WITH body is visible since #1867, so the physical-edge derivation \
+             orders the two and the producer's failure withholds the reader; got {:?}",
+            mat_set(&out_ct)
         );
+        // The reader is now withheld for a reason containment can NAME, where
+        // before it was built and the staleness was invisible. Whether that
+        // shows up on `contained` is containment's own bookkeeping; what this
+        // pins is that it is not silently materialized.
         assert!(
-            out_ct.contained.is_empty(),
-            "a same-layer uncertain read is fail-fast parity, NOT over-contained: {:?}",
-            out_ct.contained
+            !mat_set(&out_ff).contains("rollup"),
+            "fail-fast withholds it too, so the two modes agree for the same reason: {:?}",
+            mat_set(&out_ff)
         );
     }
 
@@ -29741,6 +30715,66 @@ auto_create_schemas = true
         assert_eq!(
             map.get("cat2.marts.orders"),
             Some(&"cat2.marts.orders".to_string())
+        );
+    }
+
+    /// #1632: two models write a table of the same NAME in different schemas,
+    /// and only one of them claims the bare key. The key must still be
+    /// poisoned.
+    ///
+    /// ```text
+    /// orders  [target] cat.s1.orders   name == table, so it claims "orders"
+    /// other   [target] cat.s2.orders   name != table, claims nothing
+    /// ```
+    ///
+    /// Both write a physical `orders`. Which one a bare `FROM orders` reads
+    /// depends on the connection's search path, which Rocky does not observe.
+    /// Before this, the two never claimed the same key so the collision guard
+    /// never fired, and a consumer was bound to `cat.s1.orders`'s hashes — so
+    /// a change to `cat.s2.orders` alone let it SKIP on stale input.
+    #[test]
+    fn reuse_bare_key_is_poisoned_when_a_sibling_writes_the_same_table_name() {
+        let claimant = target_cfg("cat", "s1", "orders");
+        let sibling = target_cfg("cat", "s2", "orders");
+        let map = build_reuse_target_by_model([("orders", &claimant), ("other", &sibling)]);
+
+        assert!(
+            !map.contains_key("orders"),
+            "a bare `FROM orders` is ambiguous between cat.s1.orders and \
+             cat.s2.orders, so the key must resolve to nothing: {map:?}"
+        );
+        // The unambiguous 3-part identities are untouched — poisoning is
+        // scoped to the bare namespace, not to the models themselves.
+        assert_eq!(
+            map.get("cat.s1.orders"),
+            Some(&"cat.s1.orders".to_string()),
+            "{map:?}"
+        );
+        assert_eq!(
+            map.get("cat.s2.orders"),
+            Some(&"cat.s2.orders".to_string()),
+            "{map:?}"
+        );
+    }
+
+    /// The poison is scoped: a model whose target table name is unique still
+    /// resolves its bare key. Without this, the fix above could be implemented
+    /// by poisoning every bare key and every test here would still pass.
+    #[test]
+    fn reuse_bare_key_still_resolves_when_the_table_name_is_unique() {
+        let orders = target_cfg("cat", "s1", "orders");
+        let customers = target_cfg("cat", "s2", "customers");
+        let map = build_reuse_target_by_model([("orders", &orders), ("customers", &customers)]);
+
+        assert_eq!(
+            map.get("orders"),
+            Some(&"cat.s1.orders".to_string()),
+            "no sibling writes `orders`, so the bare read is unambiguous: {map:?}"
+        );
+        assert_eq!(
+            map.get("customers"),
+            Some(&"cat.s2.customers".to_string()),
+            "{map:?}"
         );
     }
 
@@ -34914,6 +35948,142 @@ timestamp_column = "ts"
         }
     }
 
+    /// #1724: the inline drain returns the abort decision instead of acting,
+    /// so `fail_fast` finally reaches the path that collects most tables under
+    /// the default `ConcurrencyMode::Adaptive`.
+    ///
+    /// Four cases in one, because what matters is that each setting fires on
+    /// exactly its own trigger — a decision that always aborts would satisfy
+    /// any single case.
+    #[tokio::test]
+    async fn the_inline_drain_returns_the_abort_decision_for_both_settings() {
+        async fn decide(
+            outcome: Result<(usize, Result<TableOutcome, anyhow::Error>), tokio::task::JoinError>,
+            policy: &AbortPolicy,
+            prior_errors: usize,
+            prior_completed: usize,
+        ) -> DrainDecision {
+            let dir = tempfile::tempdir().unwrap();
+            let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+            let hook_registry = HookRegistry::from_config(&Default::default());
+            let tasks = vec![column_match_task(vec![], vec![])];
+            state
+                .init_run_progress(
+                    "run-1",
+                    &tasks.iter().map(table_key).collect::<Vec<_>>(),
+                    Some(&test_resume_scope("p1")),
+                )
+                .unwrap();
+
+            let semaphore = Semaphore::new(8);
+            let mut semaphore_capacity = 8;
+            let mut output = RunOutput::new(String::new(), 0, 1);
+            let mut pending_checks = HashMap::new();
+            let (mut source_refs, mut target_refs, mut freshness_refs) =
+                (Vec::new(), Vec::new(), Vec::new());
+            let mut batch_asset_keys = Vec::new();
+            let mut assertion_targets = Vec::new();
+            let (mut deferred_tags, mut deferred_watermarks) = (Vec::new(), Vec::new());
+            // Stand in for the failures already collected this run: the rate is
+            // errors over completions, so both sides have to be primed.
+            let mut table_errors: Vec<TableError> = (0..prior_errors)
+                .map(|_| TableError {
+                    asset_key: vec![],
+                    error: "earlier failure".to_string(),
+                    task_index: None,
+                    failure_kind: FailureKind::Unknown,
+                    cooldown_seconds: None,
+                })
+                .collect();
+            let mut total_completed = prior_completed;
+
+            process_completed_result(
+                outcome,
+                &tasks,
+                &None,
+                &semaphore,
+                &mut semaphore_capacity,
+                &mut MaterializedSinks {
+                    output: &mut output,
+                    pending_checks: &mut pending_checks,
+                    source_batch_refs: &mut source_refs,
+                    target_batch_refs: &mut target_refs,
+                    freshness_batch_refs: &mut freshness_refs,
+                    batch_asset_keys: &mut batch_asset_keys,
+                    assertion_targets: &mut assertion_targets,
+                    deferred_tags: &mut deferred_tags,
+                    deferred_watermarks: &mut deferred_watermarks,
+                },
+                &TableHookContext {
+                    registry: &hook_registry,
+                    run_id: "run-1",
+                    pipeline_name: "p1",
+                },
+                &mut table_errors,
+                &state,
+                "run-1",
+                &mut total_completed,
+                policy,
+            )
+            .await
+        }
+
+        let fail_fast = AbortPolicy {
+            fail_fast: true,
+            error_rate_abort_pct: 0,
+        };
+        let rate_50 = AbortPolicy {
+            fail_fast: false,
+            error_rate_abort_pct: 50,
+        };
+        let failure = || Ok((0usize, Err(anyhow::anyhow!("the warehouse said no"))));
+
+        assert_eq!(
+            decide(failure(), &fail_fast, 0, 0).await,
+            DrainDecision::AbortRemaining(AbortCause::FailFast),
+            "a failed table under fail_fast must stop the run from this path too",
+        );
+
+        // The success arm is the guard against a decision that always aborts.
+        assert_eq!(
+            decide(
+                Ok((
+                    0,
+                    Ok(TableOutcome::Pruned(PrunedTable {
+                        asset_key: vec!["t".into()],
+                        source_schema: "raw".into(),
+                        table_name: "orders".into(),
+                    })),
+                )),
+                &fail_fast,
+                0,
+                0,
+            )
+            .await,
+            DrainDecision::Continue,
+            "fail_fast reacts to a failure, not to every completion",
+        );
+
+        // Three prior errors + this one over four completions = 100%.
+        assert_eq!(
+            decide(failure(), &rate_50, 3, 3).await,
+            DrainDecision::AbortRemaining(AbortCause::ErrorRate {
+                observed_pct: 100,
+                threshold_pct: 50,
+            }),
+            "the error-rate abort must see the inline drain's completions",
+        );
+
+        // The same failure below the four-completion floor must NOT abort —
+        // that guard is what keeps one early failure from ending a large run,
+        // and it is the half a decision that always aborts would break.
+        assert_eq!(
+            decide(failure(), &rate_50, 1, 1).await,
+            DrainDecision::Continue,
+            "under four completions the rate is too noisy to act on",
+        );
+    }
+
     /// #1724. The inline drain's ERROR arm must match the final drain on the
     /// two things an operator sees: the warehouse-auth framing, and the
     /// `materialize_error` hook.
@@ -34947,7 +36117,11 @@ timestamp_column = "ts"
         let task = column_match_task(vec![], vec![]);
         let tasks = vec![task.clone()];
         state
-            .init_run_progress("run-1", tasks.len(), Some(&test_resume_scope("p1")))
+            .init_run_progress(
+                "run-1",
+                &tasks.iter().map(table_key).collect::<Vec<_>>(),
+                Some(&test_resume_scope("p1")),
+            )
             .unwrap();
 
         let table_key = format!(
@@ -35010,6 +36184,10 @@ timestamp_column = "ts"
             &state,
             "run-1",
             &mut total_completed,
+            &AbortPolicy {
+                fail_fast: false,
+                error_rate_abort_pct: 0,
+            },
         )
         .await;
 
@@ -35053,7 +36231,11 @@ timestamp_column = "ts"
 
         let tasks = vec![planned_task("events")];
         state
-            .init_run_progress("run-1", tasks.len(), Some(&test_resume_scope("p1")))
+            .init_run_progress(
+                "run-1",
+                &tasks.iter().map(table_key).collect::<Vec<_>>(),
+                Some(&test_resume_scope("p1")),
+            )
             .unwrap();
 
         let semaphore = Semaphore::new(1);
@@ -35079,6 +36261,10 @@ timestamp_column = "ts"
             &state,
             "run-1",
             &mut total_completed,
+            &AbortPolicy {
+                fail_fast: false,
+                error_rate_abort_pct: 0,
+            },
         )
         .await;
 
@@ -35131,7 +36317,11 @@ timestamp_column = "ts"
 
         let tasks = [planned_task("a"), planned_task("events")];
         state
-            .init_run_progress("run-1", tasks.len(), Some(&test_resume_scope("p1")))
+            .init_run_progress(
+                "run-1",
+                &tasks.iter().map(table_key).collect::<Vec<_>>(),
+                Some(&test_resume_scope("p1")),
+            )
             .unwrap();
 
         let hook_registry = HookRegistry::from_config(&Default::default());

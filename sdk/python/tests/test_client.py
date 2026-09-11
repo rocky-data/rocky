@@ -1342,3 +1342,51 @@ def test_unknown_engine_version_warns_rather_than_blocking():
     ):
         client.dag(models_dir=None)
     assert warn.called, "a skipped version gate must be logged"
+
+
+SPOOL_OUTPUT = json.dumps(
+    {
+        "version": "1.73.0",
+        "command": "state-schedule-spool",
+        "spool_path": "/srv/analytics/.rocky/pending-demands",
+        "pending": [
+            {
+                "demand_uid": "4f1c",
+                "pipeline": "orders",
+                "kind": "id",
+                "token": "8a72-delivery",
+                "received_at": "2026-09-10T10:00:00Z",
+                "body_hash": "deadbeef",
+            }
+        ],
+        "skipped": [],
+        "counts": {"pending": 1, "skipped": 0, "corrupt": 0},
+    }
+)
+
+
+def test_schedule_spool_argv():
+    """The read takes no arguments and forwards no ``--models``.
+
+    The spool is anchored to the project root via the config, not to the models
+    directory, so threading ``--models`` here would be noise the CLI ignores.
+    """
+    client = _client(models_dir="custom-models")
+    with patch.object(client, "run_cli", return_value=SPOOL_OUTPUT) as run_cli:
+        result = client.schedule_spool()
+    run_cli.assert_called_once_with(["state", "schedule", "spool"])
+    assert result.counts.pending == 1
+    assert result.pending[0].pipeline == "orders"
+
+
+def test_schedule_spool_parses_the_typed_document():
+    """The client returns the typed model, not a dict.
+
+    `received_at` arriving as a datetime is the point of the engine parsing the
+    stored string rather than passing it through.
+    """
+    client = _client()
+    with patch.object(client, "run_cli", return_value=SPOOL_OUTPUT):
+        result = client.schedule_spool()
+    assert result.pending[0].received_at.year == 2026
+    assert result.spool_path.endswith("pending-demands")

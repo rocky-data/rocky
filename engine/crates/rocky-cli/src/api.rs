@@ -95,19 +95,23 @@ use crate::commands::review::{
 };
 use crate::commands::{BriefSince, compute_brief};
 use crate::commands::{
+    PolicyShowMarkers, assemble_policy_show, load_policy_show_markers, policy_show_config,
+    policy_show_remote_backend, policy_show_unconsulted_ledger, read_policy_show_ledger,
+};
+use crate::commands::{
     ScheduleStatusError, column_lineage_output, compile_output, dag_output, history_runs_output,
     lineage_output, metrics_output, model_history_output, schedule_status_output, schemas_hash,
 };
 use crate::output::{
-    AuditForOutput, AuditOutput, AuditScorecardOutput, BriefOutput, ProjectOutput, ReviewOutput,
-    ReviewQueueOutput, ReviewStatusOutput, ScorecardDimension,
+    AuditForOutput, AuditOutput, AuditScorecardOutput, BriefOutput, PolicyRulesOutput,
+    ProjectOutput, ReviewOutput, ReviewQueueOutput, ReviewStatusOutput, ScorecardDimension,
 };
 use crate::output::{
     ColumnLineageOutput, CompileOutput, DagExecutionOutput, DagLayersOutput, DagNodeResultOutput,
     DagNodeStatusOutput, DagOutput, DagStatusOutput, ErrorEnvelope, HealthOutput, HistoryOutput,
     JobKind, JobState, JobStatus, LineageOutput, MetaOutput, MetricsOutput, ModelColumnOutput,
-    ModelDetailOutput, ModelHistoryOutput, ModelListEntry, ModelListOutput, ScheduleStatusOutput,
-    TypedColumnOutput, cap_model_sql,
+    ModelDetailOutput, ModelHistoryOutput, ModelListEntry, ModelListOutput, ScheduleSpoolOutput,
+    ScheduleStatusOutput, TypedColumnOutput, cap_model_sql,
 };
 
 /// Bind config for [`serve`].
@@ -180,6 +184,8 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/jobs/apply", post(submit_apply))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/schedule", get(schedule_status))
+        .route("/api/v1/schedule/spool", get(schedule_spool))
+        .route("/api/v1/policy", get(policy_show))
         .route("/api/v1/products", get(list_products))
         .route("/api/v1/products/{name}", get(get_product))
         .route("/api/v1/products/{name}/journal", get(product_journal))
@@ -808,6 +814,8 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "POST /api/v1/jobs/apply",
         "GET /api/v1/jobs/{id}",
         "GET /api/v1/schedule",
+        "GET /api/v1/schedule/spool",
+        "GET /api/v1/policy",
         "GET /api/v1/products",
         "GET /api/v1/products/{name}",
         "GET /api/v1/products/{name}/journal",
@@ -842,6 +850,7 @@ fn capabilities() -> Vec<String> {
         "error_envelope",
         "jobs",
         "schedule",
+        "policy",
         "webhooks",
         "estate",
         "products",
@@ -2108,6 +2117,97 @@ async fn schedule_status(
     .await?
     .map_err(|e| map_schedule_err(e, running_job_id))?;
     Ok(PrettyJson(output))
+}
+
+/// `GET /api/v1/schedule/spool`: the webhook demands accepted but not yet
+/// consumed — the same bytes as `rocky state schedule spool --output json`.
+///
+/// [`schedule_status`] reports claims, which exist only once a tick has picked
+/// a demand up, so a queued demand appears nowhere in `GET /api/v1/schedule`.
+/// This is the other half.
+///
+/// Fail-closed: a spool directory that is present but unreadable is a `500`,
+/// never an empty list. An absent spool is `200` with nothing pending — no
+/// webhook has ever been accepted for this project.
+///
+/// Takes no state-store permit. The spool is plain files under `.rocky`, so
+/// this read never touches redb and cannot be blocked by a running job; the
+/// filesystem work runs on a blocking thread.
+async fn schedule_spool(
+    State(state): State<Arc<ServerState>>,
+) -> Result<PrettyJson<ScheduleSpoolOutput>, ApiError> {
+    let Some(config_path) = state.config_path.clone() else {
+        return Err(ApiError::engine_not_ready());
+    };
+
+    let output =
+        tokio::task::spawn_blocking(move || crate::commands::compute_schedule_spool(&config_path))
+            .await
+            .map_err(|e| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    format!("the spool read panicked: {e}"),
+                    None,
+                )
+            })?
+            .map_err(|e| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "spool_unreadable",
+                    e.to_string(),
+                    Some(
+                        "inspect the spool directory's permissions — queued webhook \
+                 demands cannot be counted while it is unreadable",
+                    ),
+                )
+            })?;
+
+    Ok(PrettyJson(output))
+}
+
+/// `GET /api/v1/policy`: the policy plane, the same bytes as
+/// `rocky policy show --output json`.
+///
+/// Three reads, each fail-closed: `rocky.toml` (a file that does not parse is
+/// `500 config_invalid`; a missing one is the default posture), the decision
+/// ledger under the store permit, and the durable freeze markers when
+/// `[state]` keeps them. A source that exists but cannot be read is a `500`,
+/// never an empty list.
+async fn policy_show(
+    State(state): State<Arc<ServerState>>,
+) -> Result<PrettyJson<PolicyRulesOutput>, ApiError> {
+    let Some(config_path) = state.config_path.clone() else {
+        return Err(ApiError::engine_not_ready());
+    };
+    let (policy, state_cfg) = policy_show_config(&config_path)
+        .map_err(|e| ApiError::config_invalid(&format!("{e:#}")))?;
+    // With no `[policy]` block the enforcement gate returns NotConfigured
+    // before it reads a freeze source. The route reads neither too, so it
+    // cannot list a freeze the engine would not honour. Same branch the CLI
+    // takes in `compute_policy_show`, so the two cannot answer differently.
+    let (ledger, markers) = if policy.is_some() {
+        let state_path = state_path_for(&state);
+        let remote = policy_show_remote_backend(&state_cfg);
+        let running_job_id = state.mutation_permit.running_job();
+        let ledger = store_read(&state, move || read_policy_show_ledger(&state_path, remote))
+            .await?
+            .map_err(|e| map_state_err(e, running_job_id))?;
+        let markers = load_policy_show_markers(&state_cfg)
+            .await
+            .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+        (ledger, markers)
+    } else {
+        (
+            policy_show_unconsulted_ledger(),
+            PolicyShowMarkers::NotConsulted,
+        )
+    };
+    Ok(PrettyJson(assemble_policy_show(
+        policy.as_ref(),
+        ledger,
+        markers,
+    )))
 }
 
 // --- Webhook ingress (POST /api/v1/hooks/trigger/{pipeline}) ---
@@ -5703,6 +5803,216 @@ mod tests {
         assert_eq!(api.counts.scheduled, reference.counts.scheduled);
         assert_eq!(api.pipelines.len(), reference.pipelines.len());
         assert_eq!(api.pipelines[0].cron, reference.pipelines[0].cron);
+    }
+
+    /// The route returns the producer's document, whole. Unlike
+    /// `schedule_status`, this output carries no `now`, so every byte is
+    /// comparable — a handler that reshaped, filtered or fabricated any part
+    /// of it fails here.
+    #[tokio::test]
+    async fn schedule_spool_matches_the_backing_output() {
+        let (dir, config_path, state) = scheduled_project();
+        let rocky_dir = dir.path().join(".rocky");
+
+        // Two queued demands and one file that will not parse, so the
+        // comparison covers `pending`, `skipped` and `counts` at once.
+        for (token, at) in [
+            ("delivery-2", "2026-09-10T11:00:00Z"),
+            ("delivery-1", "2026-09-10T10:00:00Z"),
+        ] {
+            rocky_core::schedule::spool::accept(
+                &rocky_dir,
+                "sales",
+                rocky_core::schedule::spool::WebhookKind::Id,
+                token,
+                "deadbeef",
+                chrono::DateTime::parse_from_rfc3339(at)
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            )
+            .unwrap();
+        }
+        std::fs::write(rocky_dir.join("pending-demands/notjson"), b"{ not json").unwrap();
+
+        let base = spawn_router(state).await;
+        let resp = get_retrying_on_busy(&format!("{base}/api/v1/schedule/spool")).await;
+        assert_eq!(resp.status(), 200);
+        // Raw bytes, not a parsed value: `PrettyJson` is `to_string_pretty`
+        // plus a newline, so the response is byte-comparable with the
+        // producer's own serialisation. Comparing parsed values would accept a
+        // route that reordered or reformatted the document.
+        let api = resp.text().await.unwrap();
+
+        let reference = crate::commands::compute_schedule_spool(&config_path).unwrap();
+        let reference_bytes = serde_json::to_string_pretty(&reference).unwrap() + "\n";
+
+        assert_eq!(
+            api, reference_bytes,
+            "the route did not return the producer's bytes"
+        );
+        assert_eq!(reference.counts.pending, 2);
+        assert_eq!(reference.counts.skipped, 1);
+    }
+
+    /// An unreadable spool is `500 spool_unreadable`, never `200` with an
+    /// empty queue. The producer fails closed; this pins that the route does
+    /// not undo it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn schedule_spool_reports_an_unreadable_spool_as_500() {
+        let (dir, _config_path, state) = scheduled_project();
+        let rocky_dir = dir.path().join(".rocky");
+        std::fs::create_dir_all(&rocky_dir).unwrap();
+        // Present (a dangling symlink), but impossible to enumerate.
+        std::os::unix::fs::symlink(
+            dir.path().join("nowhere"),
+            rocky_dir.join("pending-demands"),
+        )
+        .unwrap();
+
+        let base = spawn_router(state).await;
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/api/v1/schedule/spool"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            500,
+            "an unreadable spool must not answer 200"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], "spool_unreadable");
+    }
+
+    const POLICY_PROJECT_CONFIG: &str = "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+         [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+         [pipeline.p.target.governance]\nauto_create_schemas = true\n\n\
+         [policy]\nversion = 1\ndefault_agent_effect = \"require_review\"\n\n\
+         [[policy.rules]]\nprincipal = \"agent\"\ncapability = \"apply\"\n\
+         scope = { contracted = true }\neffect = \"deny\"\n";
+
+    /// A project with a `[policy]` block and one freeze recorded through the
+    /// real `rocky policy freeze` path.
+    fn policy_project(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
+        let root = dir.join("project");
+        let models_dir = root.join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let config_path = root.join("rocky.toml");
+        std::fs::write(&config_path, POLICY_PROJECT_CONFIG).unwrap();
+        let state_path = dir.join("state.redb");
+        crate::commands::run_policy_freeze(
+            &config_path,
+            &state_path,
+            Some(rocky_core::config::PolicyPrincipal::Agent),
+            Some("model=fct_*".to_string()),
+            Some("incident 42".to_string()),
+            false,
+            true,
+        )
+        .unwrap();
+        (models_dir, config_path, state_path)
+    }
+
+    /// `GET /api/v1/policy` answers with the CLI's bytes: the rule with its
+    /// position, the default posture, the freeze in force, and which sources
+    /// were read.
+    #[tokio::test]
+    async fn policy_show_matches_the_cli_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (models_dir, config_path, state_path) = policy_project(dir.path());
+        let state = pinned_server(models_dir, Some(config_path.clone()), &state_path);
+        let base = spawn_router(state).await;
+
+        let resp = get_retrying_on_busy(&format!("{base}/api/v1/policy")).await;
+        assert_eq!(resp.status(), 200);
+        let body = resp.text().await.unwrap();
+        assert_eq!(
+            body,
+            reference_bytes(
+                &crate::commands::compute_policy_show(&config_path, &state_path)
+                    .await
+                    .unwrap()
+            )
+        );
+        assert!(body.contains("\"source\": \"ledger\""), "{body}");
+        assert!(body.contains("incident 42"), "{body}");
+        assert!(body.contains("\"id\": 0"), "{body}");
+    }
+
+    /// The same byte parity on the OTHER branch: a project with no `[policy]`
+    /// block, where neither freeze source is consulted.
+    ///
+    /// That branch is written twice, once in `compute_policy_show` and once in
+    /// this route, because the route reads the ledger under the store permit.
+    /// Two copies can drift, and the configured-branch parity test above would
+    /// not notice. This is the test that would.
+    #[tokio::test]
+    async fn policy_show_matches_the_cli_bytes_without_a_policy_block() {
+        let dir = tempfile::tempdir().unwrap();
+        // A freeze is recorded FIRST, against a config that has a [policy]
+        // block, then the block is removed. So the ledger genuinely holds a
+        // freeze that neither caller may report as in force.
+        let (models_dir, config_path, state_path) = policy_project(dir.path());
+        let no_policy = POLICY_PROJECT_CONFIG
+            .split("[policy]")
+            .next()
+            .expect("the fixture has a [policy] block to cut at")
+            .to_string();
+        std::fs::write(&config_path, &no_policy).unwrap();
+
+        let state = pinned_server(models_dir, Some(config_path.clone()), &state_path);
+        let base = spawn_router(state).await;
+
+        let resp = get_retrying_on_busy(&format!("{base}/api/v1/policy")).await;
+        assert_eq!(resp.status(), 200);
+        let body = resp.text().await.unwrap();
+        assert_eq!(
+            body,
+            reference_bytes(
+                &crate::commands::compute_policy_show(&config_path, &state_path)
+                    .await
+                    .unwrap()
+            )
+        );
+        assert!(
+            body.contains("\"not_consulted\""),
+            "neither source is consulted without a [policy] block: {body}"
+        );
+        assert!(
+            !body.contains("incident 42"),
+            "the recorded freeze must not be reported in force: {body}"
+        );
+    }
+
+    /// A state store path that is there but cannot be read is a `500`, never
+    /// a `200` with no freezes: an empty list would claim nothing is frozen
+    /// for a plane whose freezes could not be read at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn policy_show_refuses_an_unreadable_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let models_dir = root.join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let config_path = root.join("rocky.toml");
+        std::fs::write(&config_path, POLICY_PROJECT_CONFIG).unwrap();
+        let state_path = dir.path().join("state.redb");
+        std::os::unix::fs::symlink(dir.path().join("gone.redb"), &state_path).unwrap();
+        let state = pinned_server(models_dir, Some(config_path), &state_path);
+        let base = spawn_router(state).await;
+
+        let resp = get_retrying_on_busy(&format!("{base}/api/v1/policy")).await;
+        assert_eq!(resp.status(), 500);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("cannot be read"),
+            "{body}"
+        );
     }
 
     /// A `rocky.toml` the engine cannot parse is a `500 config_invalid`, never a

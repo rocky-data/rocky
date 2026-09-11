@@ -6,7 +6,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
 # Clean state from previous runs
-rm -rf .rocky-state.redb .rocky-state.redb.lock models/.rocky-state.redb models/.rocky-state.redb.lock poc.duckdb expected
+# NOT `rm -rf expected`: that directory holds a TRACKED .gitkeep, and
+# removing it leaves the checkout dirty after a suite run (#1676). Clear the
+# generated files instead.
+rm -rf .rocky-state.redb .rocky-state.redb.lock models/.rocky-state.redb models/.rocky-state.redb.lock poc.duckdb
+rm -f expected/*.json expected/*.txt
 mkdir -p expected
 
 echo "=== validate ==="

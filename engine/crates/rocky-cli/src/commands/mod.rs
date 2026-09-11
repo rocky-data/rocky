@@ -70,6 +70,7 @@ mod run_content_addressed;
 mod run_dag_exec;
 mod run_local;
 mod run_watch;
+pub mod schedule_spool;
 pub mod schedule_status;
 pub mod scheduler;
 mod seed;
@@ -162,7 +163,10 @@ pub use plan::{
 };
 pub use playground::{run_playground, run_playground_with_template};
 pub use policy::{
-    compute_policy_check, compute_policy_test, run_policy_check, run_policy_freeze, run_policy_test,
+    PolicyShowLedger, PolicyShowMarkers, assemble_policy_show, compute_policy_check,
+    compute_policy_show, compute_policy_test, load_policy_show_markers, policy_show_config,
+    policy_show_remote_backend, policy_show_unconsulted_ledger, read_policy_show_ledger,
+    run_policy_check, run_policy_freeze, run_policy_show, run_policy_test,
 };
 pub use preview::{
     PreviewDiffAlgorithmSelector, run_preview_cost, run_preview_create, run_preview_diff,
@@ -187,6 +191,7 @@ pub use review::{
     compute_review, compute_review_queue, compute_review_status, plan_is_reviewable, run_review,
     run_review_queue, run_review_status,
 };
+pub use schedule_spool::{ScheduleSpoolError, compute_schedule_spool, state_schedule_spool};
 pub use schedule_status::{ScheduleStatusError, schedule_status_output};
 // Re-exported so the `rocky` bin can build a clap ValueEnum for
 // `--target-dialect` without taking a direct dep on rocky-sql.

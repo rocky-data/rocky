@@ -62,6 +62,7 @@ fn naive_record_table_progress(db: &Database, run_id: &str, progress: &TableProg
                 total_tables: 0,
                 tables: Vec::new(),
                 scope: None,
+                planned_tables: None,
             },
         }
     };
@@ -104,7 +105,8 @@ fn bench_record_table_progress(c: &mut Criterion) {
             b.iter_batched(
                 temp_store,
                 |(store, _dir)| {
-                    store.init_run_progress("run-001", n, None).unwrap();
+                    let planned: Vec<String> = (0..n).map(|i| format!("cat.schema.t{i}")).collect();
+                    store.init_run_progress("run-001", &planned, None).unwrap();
                     for i in 0..n {
                         store
                             .record_table_progress("run-001", &sample_progress(i))

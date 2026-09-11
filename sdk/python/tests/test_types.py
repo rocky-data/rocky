@@ -11,7 +11,13 @@ import pytest
 from rocky_sdk import CiResult, CompileResult, DiscoverResult, TestResult, parse_rocky_output
 from rocky_sdk.client import _parse_rocky_json, _parse_run_or_apply
 from rocky_sdk.exceptions import RockyOutputParseError
-from rocky_sdk.types import CheckResult, GcApplyOutput, RestoreApplyOutput, RunResult
+from rocky_sdk.types import (
+    CheckResult,
+    GcApplyOutput,
+    RestoreApplyOutput,
+    RunResult,
+    ScheduleSpoolOutput,
+)
 
 DISCOVER_JSON = '{"version": "1.0.0", "command": "discover", "sources": []}'
 
@@ -466,3 +472,41 @@ def test_parse_rocky_output_dispatches_product_journal():
     assert [row.seq for row in result.rows] == [1, 2]
     assert result.rows[1].from_state == "spec_approved"
     assert result.rows[1].plan_id == "b" * 64
+
+
+SPOOL_JSON = json.dumps(
+    {
+        "version": "1.0.0",
+        "command": "state-schedule-spool",
+        "spool_path": "/srv/analytics/.rocky/pending-demands",
+        "pending": [
+            {
+                "demand_uid": "4f1c",
+                "pipeline": "orders",
+                "kind": "id",
+                "token": "8a72-delivery",
+                "received_at": "2026-09-10T10:00:00Z",
+                "body_hash": "deadbeef",
+            }
+        ],
+        "skipped": [{"file": "notjson", "reason": "malformed", "detail": "expected value"}],
+        "counts": {"pending": 1, "skipped": 1, "corrupt": 2},
+    }
+)
+
+
+def test_parse_rocky_output_dispatches_schedule_spool():
+    """The spool document routes to its generated model.
+
+    Without the dispatch entry this reached the unknown-command error, so an
+    SDK caller could not read a command the CLI emits.
+    """
+    result = parse_rocky_output(SPOOL_JSON)
+    assert isinstance(result, ScheduleSpoolOutput)
+    assert result.counts.pending == 1
+    assert result.counts.corrupt == 2
+    assert result.pending[0].pipeline == "orders"
+    # `received_at` is typed, not passed through as a string -- that is the
+    # reason the engine parses it rather than carrying the stored text.
+    assert result.pending[0].received_at.year == 2026
+    assert result.skipped[0].reason == "malformed"

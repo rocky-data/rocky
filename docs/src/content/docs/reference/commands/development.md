@@ -237,7 +237,22 @@ read-only token
 
 The check reads the HTTP method, not a list of paths, so a route added later with a mutating method is refused the moment it exists. Two limits are worth knowing: the check classifies the METHOD, not the handler, so a `GET` that mutates would pass; and it only covers routes registered inside the authenticated router, not one added after that layer. Two things it does not touch: `GET /api/v1/health` stays open, and the webhook route `POST /api/v1/hooks/trigger/{pipeline}` keeps its own HMAC check.
 
-The second one has an edge. With `--scheduler`, on a loopback bind, and no `ROCKY_WEBHOOK_SECRET`, the webhook route accepts an unsigned `POST` and queues work for the scheduler. No token is involved, so a read-only token does not stop it. Set `ROCKY_WEBHOOK_SECRET` whenever a browser or an untrusted process can reach the server.
+The webhook exemption has three more clauses, and they are stated here rather than left to be assembled from three sections.
+
+**On a loopback bind with `--scheduler` and no `ROCKY_WEBHOOK_SECRET`, the route accepts an unsigned `POST`** and queues work for the scheduler. No token is involved, so a read-only token does not stop it. This is the dev-convenience path.
+
+**On a non-loopback bind with no secret, the route is refused outright** — `404 webhook_disabled`, not accepted-unsigned. So the unsigned path cannot be reached from the network by binding wider; widening the bind closes it rather than exposing it.
+
+**`rocky serve --ui --scheduler` refuses to start without `ROCKY_WEBHOOK_SECRET`.** A browser can reach the webhook route, so the combination that would let page script queue unsigned work is rejected at startup rather than served.
+
+```text
+--scheduler, no ROCKY_WEBHOOK_SECRET:
+  loopback bind          → unsigned POST ACCEPTED   (dev convenience)
+  non-loopback bind      → 404 webhook_disabled     (refused, not unsigned)
+  loopback bind + --ui   → refuses to START
+```
+
+Set `ROCKY_WEBHOOK_SECRET` whenever a browser or an untrusted process can reach the server.
 
 CORS is empty-by-default. Browser apps must declare every allowed origin via `--allowed-origin <ORIGIN>`. Permitted methods: `GET`, `POST`, `OPTIONS`. Permitted headers: `Authorization`, `Content-Type`. CORS authenticates nothing: it decides what a browser may read from a response, and it answers `OPTIONS` before the token check runs.
 
