@@ -60,6 +60,25 @@ export type {
   ScheduleThrottleKind,
   TickLockState,
 } from "./schedule_status";
+export type {
+  ScheduleSpoolOutput,
+  SpoolCounts,
+  SpoolPendingEntry,
+  SpoolSkippedEntry,
+} from "./schedule_spool";
+export type {
+  PolicyRulesOutput,
+  PolicyAutonomyBudgetOutput,
+  PolicyRuleScopeOutput,
+  PolicyRuleEntry,
+  PolicyFreezeInForce,
+  PolicyFreezeSources,
+  PolicyLedgerSource,
+  PolicyMarkerSource,
+  PolicyEffect,
+  PolicyPrincipal,
+  PolicyCapability,
+} from "./policy_show";
 
 // serve HTTP API — the five estate routes (typed, no CLI counterpart)
 export type { HealthOutput } from "./health";
