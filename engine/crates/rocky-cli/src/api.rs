@@ -235,7 +235,10 @@ pub fn router(state: Arc<ServerState>) -> Router {
             rocky_server::auth::require_known_host,
         ))
         // A body over the limit is refused by the extractors with a bare
-        // `413`; this rewrites it into the envelope. Every mode, every route.
+        // `413`; this rewrites it into the envelope. Every mode, but only
+        // routes whose handler reads a body: `DefaultBodyLimit` is enforced
+        // by the body extractors, so a handler with none (`health`) is not
+        // limited here.
         .layer(middleware::map_response(
             crate::ui::envelope_payload_too_large,
         ))
