@@ -242,6 +242,15 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(
             crate::ui::MAX_REQUEST_BODY_BYTES,
         ))
+        // OUTERMOST, and it must stay last: on the response path a layer runs
+        // after everything applied before it, so this sees the 413 envelope,
+        // the 421 host refusal, the 401, the 404/405 fallbacks and every
+        // handler that builds its own Response — including `trigger_compile`,
+        // which hand-builds a body carrying `config_error`. A filter installed
+        // at a responder type would miss those while looking correct (#1897).
+        .layer(middleware::from_fn(
+            crate::secret_filter::redact_response_secrets,
+        ))
 }
 
 /// Start the HTTP server.

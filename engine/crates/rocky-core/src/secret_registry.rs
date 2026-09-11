@@ -110,7 +110,9 @@ pub fn register_substitution(name: &str, value: &str) {
     // with no cross-field invariant — so a poisoned lock is recovered rather
     // than propagated. Treating poison as "refuse every response" would let
     // one unrelated panicking thread take the server's output down.
-    let mut map = SUBSTITUTED.write().unwrap_or_else(|e| e.into_inner());
+    let mut map = SUBSTITUTED
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     map.entry(value.to_string())
         .or_insert_with(|| format!("${{{name}}}"));
 }
@@ -121,7 +123,9 @@ pub fn register_substitution(name: &str, value: &str) {
 /// first: replacing the shorter one first leaves a fragment of the longer
 /// secret behind, which is a leak the redactor itself would have created.
 pub fn substitutions() -> Vec<(String, String)> {
-    let map = SUBSTITUTED.read().unwrap_or_else(|e| e.into_inner());
+    let map = SUBSTITUTED
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut pairs: Vec<(String, String)> = map
         .iter()
         .map(|(value, replacement)| (value.clone(), replacement.clone()))
@@ -137,7 +141,7 @@ pub fn substitutions() -> Vec<(String, String)> {
 pub fn is_empty() -> bool {
     SUBSTITUTED
         .read()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .is_empty()
 }
 
