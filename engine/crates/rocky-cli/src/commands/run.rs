@@ -7098,10 +7098,13 @@ async fn run_batched_checks(
         // exactly the silent gap this change closes for row counts. A batch
         // leg that FAILS does record a reason per table (#1655); a leg that
         // answered and left a table out records none, so iterating the
-        // results is the only way to notice that one. A returned `None` is an empty
-        // table and still emits no check: `MAX(ts)` over no rows is NULL
-        // because there is no row to be fresh, which is not the same as a
-        // query that could not answer.
+        // results is the only way to notice that one.
+        //
+        // `None` emits no check. That is right for an empty table and wrong
+        // for everything else `None` carries: a non-empty table whose `ts` is
+        // all NULL reaches the same NULL `MAX(ts)`, as does a missing cell, a
+        // non-string cell and an unparseable string. `MAX` alone cannot
+        // separate them — that needs `COUNT(*)` (#1929).
         let measured = freshness_batch_refs.iter().filter_map(|tref| {
             let key = tref.full_name();
             match freshness_results.iter().find(|fr| fr.table == *tref) {
@@ -34381,9 +34384,11 @@ table = "fct_events"
     /// `a_table_the_batch_row_count_left_out_is_not_evaluated`, whose reason
     /// text says "returned no readable count", never "failed".)
     ///
-    /// This pins the EMPTY case only. `max_timestamp: None` also carries
-    /// "the cell was unreadable", which reaches the same arm and emits no
-    /// check either — a fail-open tracked as #1929.
+    /// `None` does NOT mean the table is empty. `MAX(ts)` is NULL over no
+    /// rows AND over rows whose `ts` is all NULL, and the query returns no
+    /// `COUNT(*)` to tell them apart. `None` also carries a missing cell, a
+    /// non-string cell and an unparseable string. Every one of those emits no
+    /// check (#1929).
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn a_batched_freshness_leg_that_answers_null_emits_no_check() {
