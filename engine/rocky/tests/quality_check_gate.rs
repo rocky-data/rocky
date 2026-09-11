@@ -440,7 +440,7 @@ expression = "read_text('/etc/passwd') IS NOT NULL"
         .expect("check_results")
         .iter()
         .flat_map(|t| t["checks"].as_array().expect("checks").iter())
-        .find(|c| c["name"] == "quarantine")
+        .find(|c| c["name"] == "quarantine:compile")
         .unwrap_or_else(|| panic!("no quarantine check on the wire: {out}"));
     assert_eq!(
         quarantine_check["passed"],
@@ -496,7 +496,7 @@ expression = "id >= 0"
     let out = json(&run);
     let names = failed_checks(&out);
     assert!(
-        !names.iter().any(|n| n == "quarantine"),
+        !names.iter().any(|n| n.starts_with("quarantine")),
         "an ordinary predicate must not be refused: {out}"
     );
 

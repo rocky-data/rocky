@@ -787,8 +787,14 @@ pub async fn run_quality(
                             );
                             output.check_results.push(TableCheckOutput {
                                 asset_key: asset_key.clone(),
+                                // Namespaced with a colon so it cannot
+                                // collide with an assertion's name on this
+                                // asset. Dagster's `emit_check_results` has
+                                // no dedup, and a duplicate
+                                // (asset_key, check_name) raises "returned an
+                                // output multiple times".
                                 checks: vec![rocky_core::checks::quarantine_not_evaluated(
-                                    "quarantine",
+                                    "quarantine:compile",
                                     e.to_string(),
                                 )],
                             });
