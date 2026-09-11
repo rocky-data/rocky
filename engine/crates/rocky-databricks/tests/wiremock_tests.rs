@@ -2495,8 +2495,8 @@ async fn an_unreadable_freshness_timestamp_is_omitted_and_a_null_is_kept() {
         "a readable timestamp must still be measured: {named:?}"
     );
 
-    // Every unreadable shape must be ABSENT, so run.rs reports it
-    // not evaluated instead of silently emitting nothing.
+    // These three must be ABSENT, so run.rs reports them not evaluated
+    // instead of silently emitting nothing.
     for table in ["unparsable", "nonstring", "shortrow"] {
         assert!(
             !named.iter().any(|(t, _)| *t == table),
