@@ -8125,8 +8125,11 @@ pub struct PolicyRuleEntry {
     pub autonomy_budget: Option<PolicyAutonomyBudgetOutput>,
 }
 
-/// What a rule matches. Every field is as authored; an empty list or `None`
-/// means the field does not narrow the rule.
+/// A rule's scope as authored. An empty list or `None` means the field does
+/// not narrow the rule.
+///
+/// Every field here is a matching predicate EXCEPT `max_downstreams`, which is
+/// evaluated after the rule matches.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PolicyRuleScopeOutput {
     pub any: bool,
@@ -8138,8 +8141,10 @@ pub struct PolicyRuleScopeOutput {
     pub contracted: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub layer: Option<String>,
-    /// The blast-radius ceiling: the rule matches only a model with at most
-    /// this many downstreams.
+    /// The blast-radius ceiling, applied AFTER the rule matches: an `allow`
+    /// degrades to `require_review` when the target's transitive downstream
+    /// count exceeds this, or cannot be computed. `deny` and `require_review`
+    /// rules are unaffected, and the rule still matches either way.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_downstreams: Option<u64>,
 }
