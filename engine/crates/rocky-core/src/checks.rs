@@ -1061,6 +1061,30 @@ mod tests {
         assert!(msg.contains("cross_source_overlap `key_expr`"), "{msg}");
     }
 
+    /// The same content boundary as every other user expression spliced into
+    /// generated SQL. The terminator check above stops a key ENDING the
+    /// statement; it does not stop one that stays inside the expression and
+    /// still reads a file, a secret or session state.
+    ///
+    /// This site had NO test until the mutation check found it: removing the
+    /// validator call left every cross-source test passing.
+    #[test]
+    fn test_cross_source_overlap_key_expr_refuses_a_disallowed_function() {
+        let siblings = vec![sibling("s1", "t"), sibling("s2", "t")];
+        let err = generate_cross_source_overlap_sql(
+            &siblings,
+            &["read_text('/etc/passwd')".into()],
+            &dialect(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("read_text"), "must name the function: {msg}");
+        assert!(
+            msg.contains("cross_source_overlap `key_expr`"),
+            "must name the field: {msg}"
+        );
+    }
+
     #[test]
     fn test_cross_source_overlap_key_expr_accepts_quoted_literals() {
         // The shipped POC key: quoted `'|'` separator, balanced, no terminator.
