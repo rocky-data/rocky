@@ -2916,7 +2916,7 @@ mod tests {
         let base = spawn_router(pinned_server(dir.path().join("models"), None, &state_path)).await;
 
         let response = reqwest::Client::new()
-            .head(format!("{base}/api/v1/health"))
+            .head(format!("{base}/api/v1/meta"))
             .send()
             .await
             .expect("request");
