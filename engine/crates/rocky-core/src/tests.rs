@@ -442,13 +442,17 @@ fn generate_test_sql_inner(
     // on a kind that later returns its own error (e.g. `regex_match` without a
     // dialect) still reports the injection rather than the other failure.
     if let Some(f) = filter {
-        validation::reject_statement_terminator(
-            &format!(
-                "{} test `filter` on {table}",
-                test_type_kind(&test.test_type)
-            ),
-            f,
-        )?;
+        let context = format!(
+            "{} test `filter` on {table}",
+            test_type_kind(&test.test_type)
+        );
+        validation::reject_statement_terminator(&context, f)?;
+        // Same boundary as `expression`. A filter is spliced into the same
+        // generated statement and executed with the same credentials, so a
+        // disallowed function or a subquery reaches just as far from here.
+        let sql_dialect =
+            rocky_sql::check_expression::dialect_for(dialect.map_or("generic", |d| d.name()));
+        rocky_sql::check_expression::validate_check_expression(&context, f, sql_dialect.as_ref())?;
     }
 
     match &test.test_type {
@@ -618,9 +622,19 @@ fn generate_test_sql_inner(
             // The expression is spliced TWICE into one statement, so an
             // unbalanced quote could pair across the two copies — see
             // `reject_statement_terminator`, which refuses that too.
-            validation::reject_statement_terminator(
-                &format!("unique_expr test `key_expr` on {table}"),
+            let context = format!("unique_expr test `key_expr` on {table}");
+            validation::reject_statement_terminator(&context, key_expr)?;
+            // A key expression is a SCALAR, not a boolean, and this validator
+            // does not require booleanness — it parses one expression and
+            // judges the nodes. So the same boundary applies without refusing
+            // legitimate keys like `lower(email)`; see
+            // `a_legitimate_scalar_key_expression_passes`.
+            let sql_dialect =
+                rocky_sql::check_expression::dialect_for(dialect.map_or("generic", |d| d.name()));
+            rocky_sql::check_expression::validate_check_expression(
+                &context,
                 key_expr,
+                sql_dialect.as_ref(),
             )?;
             let where_clause = filter.map(|f| format!(" WHERE ({f})")).unwrap_or_default();
             Ok(format!(
@@ -787,6 +801,69 @@ mod unit_tests {
     use super::*;
 
     // ----- TOML deserialization -----
+
+    /// The checks `filter` reaches the same generated statement as the
+    /// `expression` it filters, so it gets the same boundary. #1820 guarded
+    /// the expression and left the filter on the terminator-only check.
+    #[test]
+    fn a_check_filter_refuses_a_disallowed_function() {
+        let decl = TestDecl {
+            test_type: TestType::NotNull,
+            column: Some("name".into()),
+            severity: TestSeverity::Error,
+            filter: Some("read_text('/etc/passwd') IS NOT NULL".into()),
+        };
+        let err = generate_test_sql(&decl, "wh.main.orders").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("read_text"), "must name the function: {msg}");
+        assert!(msg.contains("`filter`"), "must name the field: {msg}");
+    }
+
+    /// A `key_expr` is a SCALAR and goes through the same validator. The
+    /// control below proves a legitimate key still passes, so this is a
+    /// boundary rather than a blanket refusal.
+    #[test]
+    fn a_unique_expr_key_refuses_a_disallowed_function() {
+        let decl = TestDecl {
+            test_type: TestType::UniqueExpr {
+                key_expr: "read_text('/etc/passwd')".into(),
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let err = generate_test_sql(&decl, "wh.main.orders").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("read_text"), "must name the function: {msg}");
+        assert!(msg.contains("`key_expr`"), "must name the field: {msg}");
+    }
+
+    /// The control: a legitimate scalar key still generates SQL. Without it,
+    /// the refusal above would also pass on a change that refused every key.
+    #[test]
+    fn a_unique_expr_key_still_accepts_a_legitimate_scalar() {
+        let decl = TestDecl {
+            test_type: TestType::UniqueExpr {
+                key_expr: "lower(email)".into(),
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        generate_test_sql(&decl, "wh.main.orders").expect("a legitimate key must still compile");
+    }
+
+    /// The control for the filter: an ordinary one still generates SQL.
+    #[test]
+    fn a_check_filter_still_accepts_an_ordinary_predicate() {
+        let decl = TestDecl {
+            test_type: TestType::NotNull,
+            column: Some("name".into()),
+            severity: TestSeverity::Error,
+            filter: Some("status <> 'void'".into()),
+        };
+        generate_test_sql(&decl, "wh.main.orders").expect("an ordinary filter must still compile");
+    }
 
     #[test]
     fn test_not_null_deser() {

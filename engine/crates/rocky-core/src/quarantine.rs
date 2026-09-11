@@ -151,7 +151,7 @@ pub fn compile_quarantine_sql(
             &label,
             dialect,
         )?;
-        let valid_pred = wrap_filter(&assertion.test.filter, &base_pred, &label)?;
+        let valid_pred = wrap_filter(&assertion.test.filter, &base_pred, &label, dialect)?;
         labeled.push(LabeledPredicate { label, valid_pred });
     }
 
@@ -451,12 +451,20 @@ fn wrap_filter(
     filter: &Option<String>,
     base_pred: &str,
     label: &str,
+    dialect: &dyn SqlDialect,
 ) -> Result<String, QuarantineError> {
     match filter.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(f) => {
-            validation::reject_statement_terminator(
-                &format!("quarantine assertion '{label}' `filter`"),
+            let context = format!("quarantine assertion '{label}' `filter`");
+            validation::reject_statement_terminator(&context, f)?;
+            // The filter is spliced into the same CTAS as the predicate, so it
+            // reaches exactly as far. Guarding only `expression` would close
+            // one door and leave an identical one beside it.
+            let sql_dialect = rocky_sql::check_expression::dialect_for(dialect.name());
+            rocky_sql::check_expression::validate_check_expression(
+                &context,
                 f,
+                sql_dialect.as_ref(),
             )?;
             Ok(format!(
                 "(CASE WHEN ({f}) THEN ({base_pred}) ELSE TRUE END)"
@@ -1258,6 +1266,38 @@ mod unit_tests {
         )];
         compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
             .expect("an ordinary predicate must still compile");
+    }
+
+    /// The `filter` reaches the same CTAS as the predicate, so it gets the
+    /// same boundary. Guarding only `expression` would close one door and
+    /// leave an identical one beside it — which is what the independent review
+    /// of #1922 found.
+    #[test]
+    fn quarantine_filter_refuses_a_disallowed_function() {
+        let cfg = split_config();
+        let assertions = vec![assertion_with_filter(
+            TestType::NotNull,
+            Some("customer_id"),
+            Some("read_text('/etc/passwd') IS NOT NULL"),
+        )];
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("read_text"), "must name the function: {msg}");
+        assert!(msg.contains("`filter`"), "must name the field: {msg}");
+    }
+
+    /// The control: an ordinary filter still compiles.
+    #[test]
+    fn quarantine_filter_still_accepts_an_ordinary_predicate() {
+        let cfg = split_config();
+        let assertions = vec![assertion_with_filter(
+            TestType::NotNull,
+            Some("customer_id"),
+            Some("status <> 'void'"),
+        )];
+        compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            .expect("an ordinary filter must still compile");
     }
 
     #[test]

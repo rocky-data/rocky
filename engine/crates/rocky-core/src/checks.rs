@@ -277,7 +277,13 @@ pub fn generate_cross_source_overlap_sql(
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
     for k in key_exprs {
-        rocky_sql::validation::reject_statement_terminator("cross_source_overlap `key_expr`", k)?;
+        let context = "cross_source_overlap `key_expr`";
+        rocky_sql::validation::reject_statement_terminator(context, k)?;
+        // The same boundary as every other user expression spliced into a
+        // generated statement. Scalar rather than boolean, which this
+        // validator does not care about.
+        let sql_dialect = rocky_sql::check_expression::dialect_for(dialect.name());
+        rocky_sql::check_expression::validate_check_expression(context, k, sql_dialect.as_ref())?;
     }
     let key_list = key_exprs.join(", ");
     let not_null = key_exprs

@@ -395,6 +395,29 @@ mod tests {
         }
     }
 
+    /// A legitimate SCALAR key expression passes.
+    ///
+    /// `key_expr` on `unique_expr` and `cross_source_overlap` is a SCALAR, not
+    /// a boolean, and it goes through this same validator. Nothing here
+    /// requires booleanness — it parses one expression and judges the nodes —
+    /// but a validator sized only for boolean predicates would refuse every
+    /// valid key, so the shapes a key author actually reaches for are pinned.
+    #[test]
+    fn a_legitimate_scalar_key_expression_passes() {
+        for expr in [
+            "lower(email)",
+            "coalesce(tenant_id, 'none')",
+            "concat(region, '-', lower(source))",
+            "date_trunc('day', created_at)",
+            "md5(concat(customer_id, order_id))",
+            "CAST(order_id AS VARCHAR)",
+            "customer_id",
+        ] {
+            check(expr)
+                .unwrap_or_else(|e| panic!("a valid key must not be refused: {expr} -> {e:?}"));
+        }
+    }
+
     /// A placeholder INSIDE a larger expression is refused too: the walker
     /// descends, so it is not only the top-level node that is judged.
     #[test]
