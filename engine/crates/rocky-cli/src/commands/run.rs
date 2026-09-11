@@ -7100,11 +7100,8 @@ async fn run_batched_checks(
         // answered and left a table out records none, so iterating the
         // results is the only way to notice that one.
         //
-        // `None` emits no check. That is right for an empty table and wrong
-        // for everything else `None` carries: a non-empty table whose `ts` is
-        // all NULL reaches the same NULL `MAX(ts)`, as does a missing cell, a
-        // non-string cell and an unparseable string. `MAX` alone cannot
-        // separate them — that needs `COUNT(*)` (#1929).
+        // `None` emits no check. That is correct for an empty table and wrong
+        // for the other states that reach the same `None` (#1929).
         let measured = freshness_batch_refs.iter().filter_map(|tref| {
             let key = tref.full_name();
             match freshness_results.iter().find(|fr| fr.table == *tref) {
