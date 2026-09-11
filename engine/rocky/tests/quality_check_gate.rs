@@ -108,6 +108,56 @@ fn seed(dir: &Path, extra: &str) {
     fs::write(dir.join("rocky.toml"), config(extra)).expect("write config");
 }
 
+
+/// A quality pipeline whose assertions all PASS on the seeded row, so the only
+/// thing that can fail the run is what `extra` adds.
+///
+/// The shared [`config`] fixture violates two assertions on purpose, which
+/// makes it useless for attributing an exit code: a run against it exits 1
+/// whatever quarantine does. The independent review of #1922 caught exactly
+/// that in the first version of the test below.
+fn clean_config(extra: &str) -> String {
+    format!(
+        r#"
+[adapter]
+type = "duckdb"
+path = "fixture.duckdb"
+
+[pipeline.dq]
+type = "quality"
+
+[pipeline.dq.target]
+adapter = "default"
+
+[[pipeline.dq.tables]]
+catalog = "fixture"
+schema = "main"
+table = "orders"
+
+[pipeline.dq.checks]
+enabled = true
+row_count = true
+{extra}
+
+[[pipeline.dq.checks.assertions]]
+table = "orders"
+type = "not_null"
+column = "name"
+"#
+    )
+}
+
+/// One row that PASSES every assertion `clean_config` declares: a non-null
+/// name. So a non-zero exit can only come from what the test adds.
+fn seed_clean_db(dir: &Path) {
+    let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
+    conn.execute_batch(
+        "CREATE TABLE main.orders AS SELECT 1 AS id, 'ada' AS name, 'shipped' AS status;",
+    )
+    .expect("seed table");
+    drop(conn);
+}
+
 fn rocky(dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_rocky"))
         .args(["--output", "json"])
@@ -386,28 +436,98 @@ fn the_text_summary_counts_zero_tables_for_an_empty_expansion() {
     );
 }
 
-/// A quarantine predicate the validator refuses does not vanish into a log
-/// line: it trips the check gate.
+/// A quarantine compile failure trips the check gate, and the exit code is
+/// ATTRIBUTABLE TO IT ALONE.
 ///
-/// Before this, `run_local` warned and skipped, so a refused predicate meant
-/// the rows quarantine existed to catch flowed on with nothing in `RunOutput`
-/// saying the split had not happened. A quarantine that did not run is not a
-/// quarantine that found nothing.
+/// The failure here is quarantine-only: an invalid `suffix_valid` makes
+/// `suffixed_table_name` refuse the derived identifier. No assertion is
+/// involved, every declared check passes, so the only thing that can make this
+/// run exit non-zero is the quarantine refusal.
 ///
-/// End to end through the real binary, because the defect was in what reached
-/// the WIRE. The unit tests in `rocky-core::quarantine` prove the predicate is
-/// refused; only this one proves the refusal reaches the exit code and the
-/// JSON.
+/// That matters because the obvious fixture does NOT prove this. A refused
+/// quarantine EXPRESSION is also an assertion — quarantine lowers
+/// error-severity assertions — so the assertion path refuses the same text and
+/// the run would exit 1 with or without the gate change. The independent
+/// review of #1922 caught that in the first version of this test, and the
+/// co-firing case is pinned separately below.
+///
+/// Before the gate change, `run_local` warned and skipped: the table was never
+/// split and nothing in `RunOutput` said so.
 #[test]
-fn a_refused_quarantine_predicate_trips_the_gate() {
+fn a_quarantine_compile_failure_trips_the_gate_on_its_own() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
-    seed_db(dir);
+    seed_clean_db(dir);
+    fs::write(
+        dir.join("rocky.toml"),
+        clean_config(
+            r#"
+[pipeline.dq.checks.quarantine]
+enabled = true
+suffix_valid = "not a valid identifier"
+"#,
+        ),
+    )
+    .expect("write config");
+
+    let run = rocky(dir, &["run"]);
+    let out = json(&run);
+
+    // The precondition that makes the exit code mean something.
+    let other_failures: Vec<String> = failed_checks(&out)
+        .into_iter()
+        .filter(|n| !n.starts_with("quarantine"))
+        .collect();
+    assert!(
+        other_failures.is_empty(),
+        "precondition: every non-quarantine check must pass, or the exit code \
+         is not attributable to quarantine: {other_failures:?} in {out}"
+    );
+
+    assert_eq!(
+        run.status.code(),
+        Some(1),
+        "a quarantine compile failure must fail the run, not warn and \
+         continue; stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(out["check_gate_failed"], serde_json::json!(true), "{out}");
+
+    let check = out["check_results"]
+        .as_array()
+        .expect("check_results")
+        .iter()
+        .flat_map(|t| t["checks"].as_array().expect("checks").iter())
+        .find(|c| c["name"] == "quarantine:compile")
+        .unwrap_or_else(|| panic!("no quarantine check on the wire: {out}"));
+    assert_eq!(check["passed"], serde_json::json!(false), "{out}");
+    assert!(
+        check["not_evaluated"].as_str().is_some(),
+        "the reason must be carried, not dropped: {out}"
+    );
+}
+
+/// A refused quarantine EXPRESSION is refused twice, on both paths, and both
+/// refusals reach the wire.
+///
+/// This is not redundancy to remove: the two carry different reasons. The
+/// assertion path says the check could not be generated; the quarantine path
+/// says the split did not happen. An operator needs the second to know their
+/// rows were not separated.
+///
+/// The exit code is deliberately NOT asserted as attributable here — the
+/// assertion refusal alone would produce it. What is asserted is that the
+/// quarantine-specific result exists beside it.
+#[test]
+fn a_refused_quarantine_expression_is_refused_on_both_paths() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    seed_clean_db(dir);
     // `read_text` is off the allowlist: a content-reading function in scalar
     // position, spliced into a CTAS that runs with warehouse credentials.
     fs::write(
         dir.join("rocky.toml"),
-        config(
+        clean_config(
             r#"
 [pipeline.dq.checks.quarantine]
 enabled = true
@@ -423,33 +543,27 @@ expression = "read_text('/etc/passwd') IS NOT NULL"
 
     let run = rocky(dir, &["run"]);
     let out = json(&run);
+    let names = failed_checks(&out);
 
-    assert_eq!(
-        run.status.code(),
-        Some(1),
-        "a refused quarantine predicate must fail the run, not warn and \
-         continue; stderr: {}",
-        String::from_utf8_lossy(&run.stderr)
+    assert!(
+        names.iter().any(|n| n.starts_with("expression")),
+        "the assertion path must refuse it: {names:?} in {out}"
     );
-    assert_eq!(out["check_gate_failed"], serde_json::json!(true), "{out}");
+    assert!(
+        names.iter().any(|n| n == "quarantine:compile"),
+        "the quarantine path must refuse it too, with its own reason: {names:?} in {out}"
+    );
 
-    // The refusal must be ON THE WIRE and must name what to fix. A gate that
-    // trips for some other reason would satisfy the exit code alone.
     let quarantine_check = out["check_results"]
         .as_array()
         .expect("check_results")
         .iter()
         .flat_map(|t| t["checks"].as_array().expect("checks").iter())
         .find(|c| c["name"] == "quarantine:compile")
-        .unwrap_or_else(|| panic!("no quarantine check on the wire: {out}"));
-    assert_eq!(
-        quarantine_check["passed"],
-        serde_json::json!(false),
-        "{out}"
-    );
+        .expect("asserted above");
     let reason = quarantine_check["not_evaluated"]
         .as_str()
-        .unwrap_or_else(|| panic!("the reason must be carried, not dropped: {out}"));
+        .unwrap_or_else(|| panic!("the reason must be carried: {out}"));
     assert!(
         reason.contains("read_text"),
         "the reason must name the function to remove: {reason}"
@@ -475,10 +589,10 @@ expression = "read_text('/etc/passwd') IS NOT NULL"
 fn an_ordinary_quarantine_predicate_still_splits() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
-    seed_db(dir);
+    seed_clean_db(dir);
     fs::write(
         dir.join("rocky.toml"),
-        config(
+        clean_config(
             r#"
 [pipeline.dq.checks.quarantine]
 enabled = true
