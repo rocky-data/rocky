@@ -73,7 +73,18 @@ This is why the rule says persistent volume. The state backend does not change i
 
 A rolling update runs the old pod and the new pod at the same time, on separate volumes or on one. On one volume it is the overlap above, one winner per tick, with the new pod contending until the old one drains. On separate volumes it is two schedulers for the length of the rollout. Neither is the rule. Use `Recreate`: stop the old pod, let it drain, start the new one on the same volume.
 
-The drain: `SIGTERM` makes `rocky serve` stop accepting connections, finish in-flight requests, and wait for a running scheduled child up to `--drain-timeout-seconds` (default 60). The pod's `terminationGracePeriodSeconds`, or the container's stop grace, must sit above that number, or the child is killed mid-run and its occurrence is recorded as a failure.
+The drain: `SIGTERM` makes `rocky serve` stop accepting connections, finish in-flight requests, and wait for a running scheduled child up to `--drain-timeout-seconds` (default 60).
+
+A child that is still running when the drain runs out is not killed at once. The server sends it `SIGTERM`, then waits a further fixed 60 seconds before `SIGKILL`. So the worst case is the drain plus 60, not the drain.
+
+```
+  SIGTERM ──▶ drain the child ──▶ SIGTERM the child ──▶ SIGKILL
+              --drain-timeout-seconds   60s, fixed
+              default 60                not configurable
+              └────────────── worst case 120s ──────────────┘
+```
+
+**The pod's `terminationGracePeriodSeconds`, or the container's stop grace, must exceed `--drain-timeout-seconds` plus 60.** With the defaults that is more than 120 seconds. A grace inside that window lets the supervisor `SIGKILL` the pod while the child is still writing, and the occurrence is recorded as a failure.
 
 Closing the tiered-backend seams tracked as issue 1242 does not make a rolling update safe. The double fire lives in the scheduler tables that never sync, not in the sync.
 
@@ -106,7 +117,7 @@ The persistent volume is required on every row. The backend chooses the blast ra
 ## What the engine does not promise
 
 - A webhook demand claimed by a reconciler that then dies, whose child also dies before recording a run, is lost. At most once.
-- A scheduled run killed by a stop grace shorter than the drain is recorded as a failure, not retried.
+- A scheduled run killed by a stop grace shorter than the drain plus 60 seconds is recorded as a failure, not retried.
 - Two schedulers on two volumes both run. No backend prevents it; `cas` only makes the second one fail at the end.
 - `flock` on network storage is unprobed.
 
