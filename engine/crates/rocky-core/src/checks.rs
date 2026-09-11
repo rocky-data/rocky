@@ -387,6 +387,30 @@ pub fn cross_source_overlap_not_applicable(
     }
 }
 
+/// Builds a `CheckResult` for a quarantine plan the engine could not compile.
+///
+/// **Fails, at error severity**, so the check gate trips and the run exits
+/// non-zero. A refused quarantine predicate used to warn and skip, which meant
+/// the rows quarantine existed to catch flowed on with nothing in `RunOutput`
+/// saying the split had not happened. A quarantine that did not run is not a
+/// quarantine that found nothing.
+///
+/// `not_evaluated` carries the validator's reason, so the operator is told
+/// which assertion to fix rather than that something unnamed went wrong.
+pub fn quarantine_not_evaluated(name: impl Into<String>, reason: impl Into<String>) -> CheckResult {
+    CheckResult {
+        name: name.into(),
+        passed: false,
+        severity: TestSeverity::Error,
+        not_evaluated: Some(reason.into()),
+        details: CheckDetails::Assertion {
+            kind: "quarantine".to_string(),
+            column: None,
+            failing_rows: 0,
+        },
+    }
+}
+
 /// Compares source and target row counts.
 pub fn check_row_count(source_count: u64, target_count: u64) -> CheckResult {
     CheckResult {

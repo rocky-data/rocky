@@ -385,3 +385,129 @@ fn the_text_summary_counts_zero_tables_for_an_empty_expansion() {
         "the summary says nothing was checked and why: {text}"
     );
 }
+
+/// A quarantine predicate the validator refuses does not vanish into a log
+/// line: it trips the check gate.
+///
+/// Before this, `run_local` warned and skipped, so a refused predicate meant
+/// the rows quarantine existed to catch flowed on with nothing in `RunOutput`
+/// saying the split had not happened. A quarantine that did not run is not a
+/// quarantine that found nothing.
+///
+/// End to end through the real binary, because the defect was in what reached
+/// the WIRE. The unit tests in `rocky-core::quarantine` prove the predicate is
+/// refused; only this one proves the refusal reaches the exit code and the
+/// JSON.
+#[test]
+fn a_refused_quarantine_predicate_trips_the_gate() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    seed_db(dir);
+    // `read_text` is off the allowlist: a content-reading function in scalar
+    // position, spliced into a CTAS that runs with warehouse credentials.
+    fs::write(
+        dir.join("rocky.toml"),
+        config(
+            r#"
+[pipeline.dq.checks.quarantine]
+enabled = true
+
+[[pipeline.dq.checks.assertions]]
+table = "orders"
+type = "expression"
+expression = "read_text('/etc/passwd') IS NOT NULL"
+"#,
+        ),
+    )
+    .expect("write config");
+
+    let run = rocky(dir, &["run"]);
+    let out = json(&run);
+
+    assert_eq!(
+        run.status.code(),
+        Some(1),
+        "a refused quarantine predicate must fail the run, not warn and \
+         continue; stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(out["check_gate_failed"], serde_json::json!(true), "{out}");
+
+    // The refusal must be ON THE WIRE and must name what to fix. A gate that
+    // trips for some other reason would satisfy the exit code alone.
+    let quarantine_check = out["check_results"]
+        .as_array()
+        .expect("check_results")
+        .iter()
+        .flat_map(|t| t["checks"].as_array().expect("checks").iter())
+        .find(|c| c["name"] == "quarantine")
+        .unwrap_or_else(|| panic!("no quarantine check on the wire: {out}"));
+    assert_eq!(
+        quarantine_check["passed"],
+        serde_json::json!(false),
+        "{out}"
+    );
+    let reason = quarantine_check["not_evaluated"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the reason must be carried, not dropped: {out}"));
+    assert!(
+        reason.contains("read_text"),
+        "the reason must name the function to remove: {reason}"
+    );
+
+    // The split did not happen, which is the point of failing the run.
+    let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
+    let split_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM information_schema.tables \
+             WHERE table_name = 'orders__valid'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("query");
+    assert_eq!(split_exists, 0, "no quarantine statement may have run");
+}
+
+/// The control: an ordinary predicate still compiles and still splits.
+/// Without this, the test above would also pass on a change that refused
+/// every quarantine expression.
+#[test]
+fn an_ordinary_quarantine_predicate_still_splits() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    seed_db(dir);
+    fs::write(
+        dir.join("rocky.toml"),
+        config(
+            r#"
+[pipeline.dq.checks.quarantine]
+enabled = true
+
+[[pipeline.dq.checks.assertions]]
+table = "orders"
+type = "expression"
+expression = "id >= 0"
+"#,
+        ),
+    )
+    .expect("write config");
+
+    let run = rocky(dir, &["run"]);
+    let out = json(&run);
+    let names = failed_checks(&out);
+    assert!(
+        !names.iter().any(|n| n == "quarantine"),
+        "an ordinary predicate must not be refused: {out}"
+    );
+
+    let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
+    let split_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM information_schema.tables \
+             WHERE table_name = 'orders__valid'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("query");
+    assert_eq!(split_exists, 1, "the split must still happen: {out}");
+}
