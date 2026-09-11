@@ -2411,3 +2411,97 @@ async fn an_unreadable_batched_row_count_cell_is_omitted_from_the_results() {
     // truncation and does not shift the ones that follow it.
     assert_eq!(named, vec![("before", 11), ("after", 22)], "{named:?}");
 }
+
+/// #1929. An unreadable freshness timestamp must become an ABSENT result, so
+/// `run.rs` reports the table not evaluated and the gate trips. It used to
+/// become `max_timestamp: None`, which the consumer reads as "empty table,
+/// emit no check" — so the check silently vanished.
+///
+/// A genuine SQL NULL is the control: it must STILL be returned with `None`,
+/// because an empty table really has no freshness to measure. A fix that
+/// omits both would pass the unreadable half and break the empty half.
+///
+/// Drives `batch_freshness`, which crosses both collapse points: the cell read
+/// in `batch.rs` and the timestamp parse in `adapter.rs`.
+#[tokio::test]
+async fn an_unreadable_freshness_timestamp_is_omitted_and_a_null_is_kept() {
+    use std::sync::Arc;
+
+    use rocky_core::traits::BatchCheckAdapter;
+    use rocky_databricks::adapter::DatabricksBatchCheckAdapter;
+    use rocky_ir::TableRef;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-freshness",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": {
+                "schema": {
+                    "columns": [
+                        {"name": "c", "type_name": "STRING", "position": 0},
+                        {"name": "s", "type_name": "STRING", "position": 1},
+                        {"name": "t", "type_name": "STRING", "position": 2},
+                        {"name": "ts", "type_name": "STRING", "position": 3}
+                    ]
+                },
+                "total_row_count": 5
+            },
+            "result": {
+                "data_array": [
+                    ["cat", "sch", "good",       "2026-09-11 10:00:00"],
+                    ["cat", "sch", "empty",      null],
+                    ["cat", "sch", "unparsable", "yesterday"],
+                    ["cat", "sch", "nonstring",  12345],
+                    ["cat", "sch", "shortrow"]
+                ]
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let tref = |table: &str| TableRef {
+        catalog: "cat".into(),
+        schema: "sch".into(),
+        table: table.into(),
+    };
+    let tables: Vec<TableRef> = ["good", "empty", "unparsable", "nonstring", "shortrow"]
+        .iter()
+        .map(|t| tref(t))
+        .collect();
+
+    let adapter = DatabricksBatchCheckAdapter::new(Arc::new(test_connector(&server)));
+    let results = adapter
+        .batch_freshness(&tables, "ts")
+        .await
+        .expect("a readable response is not an error");
+
+    let named: Vec<(&str, bool)> = results
+        .iter()
+        .map(|r| (r.table.table.as_str(), r.max_timestamp.is_some()))
+        .collect();
+
+    // The control: a genuine SQL NULL is an empty table and must still be
+    // RETURNED, carrying `None`, so no check is emitted for it.
+    assert!(
+        named.contains(&("empty", false)),
+        "a genuine NULL is an empty table and must still be returned: {named:?}"
+    );
+
+    // The measured one survives untouched.
+    assert!(
+        named.contains(&("good", true)),
+        "a readable timestamp must still be measured: {named:?}"
+    );
+
+    // Every unreadable shape must be ABSENT, so run.rs reports it
+    // not evaluated instead of silently emitting nothing.
+    for table in ["unparsable", "nonstring", "shortrow"] {
+        assert!(
+            !named.iter().any(|(t, _)| *t == table),
+            "{table}: an unreadable timestamp must not be returned as None, \
+             which reads as an empty table: {named:?}"
+        );
+    }
+}
