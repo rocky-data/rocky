@@ -975,3 +975,165 @@ async fn a_truncated_attempt_error_ships_no_fragment_of_a_secret() {
          Something else on this route is rendering the state record."
     );
 }
+
+// ---------------------------------------------------------------------------
+// Jobs: what a persisted job result may carry back
+// ---------------------------------------------------------------------------
+
+/// The version below which a record is not trusted to have been redacted.
+/// Mirrors `MIN_TRUSTED_REDACTION_VERSION`, which does not exist yet — the
+/// records below are built as JSON, so the key is simply ignored until the
+/// field lands and starts populating. Forward-compatible by the same property
+/// `PersistedJob`'s own doc relies on: every field defaults.
+const MIN_TRUSTED_REDACTION_VERSION: u32 = 1;
+
+/// Build a persisted job carrying the probe in both `result` and `error`.
+///
+/// JSON rather than a struct literal so `redaction_version` can be set before
+/// the field exists: an unknown key is ignored today and populates the moment
+/// `PersistedJob` gains it. No stub, no waiting, and the test is red for the
+/// right reason in between.
+fn planted_job(job_id: &str, redaction_version: Option<u32>, payload: &str) -> serde_json::Value {
+    let mut job = serde_json::json!({
+        "job_id": job_id,
+        "kind": "run",
+        "state": "failed",
+        "submitted_at": "2026-09-11T00:00:00Z",
+        "started_at": "2026-09-11T00:00:00Z",
+        "finished_at": "2026-09-11T00:00:05Z",
+        "principal": "probe",
+        "error": format!("the run failed: {payload}"),
+        "result": {
+            "version": "1.73.0",
+            "command": "run",
+            "materializations": [{ "model": "probe_model", "detail": payload }]
+        }
+    });
+    if let Some(v) = redaction_version {
+        job["redaction_version"] = serde_json::json!(v);
+    }
+    job
+}
+
+/// A persisted job must not hand back a resolved secret, and a record written
+/// before the redaction existed must hand back no payload at all.
+///
+/// Four records, covering both sides of the legacy comparison. Planting only
+/// the absent case would leave the `< MIN_TRUSTED` half untested while the
+/// test passed — the same half-covered branch that made the first frontmatter
+/// fixture prove nothing.
+///
+///     None      legacy    the real pre-fix shape
+///     Some(0)   legacy    below the floor; absent-only would miss it
+///     Some(1)   trusted   current
+///     Some(999) trusted   written by a NEWER engine
+///
+/// `Some(999)` is trusted on purpose: versions are monotonically
+/// non-decreasing in strictness, so a newer engine redacted at least as hard,
+/// and refusing its records would make a downgrade lose data that is not at
+/// risk. That rule is a contract, not an observation — a future rule that
+/// SHOWS more needs a different mechanism, not a higher number.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_persisted_job_hands_back_no_secret_and_no_legacy_payload() {
+    // SAFETY: a constant, set before the server is built. See the sweep above.
+    unsafe { std::env::set_var(PROBE_VAR, PROBE) };
+
+    let dir = tempfile::tempdir().unwrap();
+    let models_dir = dir.path().join("models");
+    std::fs::create_dir_all(&models_dir).unwrap();
+    let state_path = models_dir.join(rocky_core::state::STATE_FILE_NAME);
+
+    // A whole value, and a value cut by the truncation sentinel. The second is
+    // the shape a filter searching for WHOLE values cannot see.
+    let whole = PROBE.to_string();
+    let fragment = format!("{}…", &PROBE[..PROBE.len() - 6]);
+
+    let planted = [
+        ("job-legacy-none", None, &whole),
+        ("job-legacy-zero", Some(0), &whole),
+        ("job-trusted-one", Some(1), &whole),
+        ("job-trusted-future", Some(999), &whole),
+        ("job-legacy-fragment", None, &fragment),
+    ];
+
+    {
+        let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+        for (id, version, payload) in &planted {
+            let job: rocky_core::state::PersistedJob =
+                serde_json::from_value(planted_job(id, *version, payload))
+                    .expect("the record shape is the producer's");
+            store.record_job(&job).expect("persisted");
+        }
+    }
+
+    // A SECOND open, so every read below crosses a restart: the store is
+    // reopened and the server is built from scratch, exactly as a restarted
+    // sidecar would find it.
+    let state = ServerState::with_auth(
+        models_dir,
+        None,
+        None,
+        None,
+        Vec::new(),
+        Some(state_path.clone()),
+    );
+    let base = spawn(state).await;
+    let client = reqwest::Client::new();
+
+    for (id, version, payload) in &planted {
+        let resp = client
+            .get(format!("{base}/api/v1/jobs/{id}"))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{id} did not answer: {e}"));
+        assert_eq!(
+            resp.status(),
+            200,
+            "{id}: the planted record must survive the restart and be readable"
+        );
+        let body = resp.text().await.unwrap();
+
+        // Positive control: the record really came back. Without it, a 404 or
+        // an empty body would satisfy every absence assertion below.
+        assert!(
+            body.contains(id),
+            "{id}: the response does not name the job, so nothing below proves \
+             anything: {body:.300}"
+        );
+        assert!(
+            body.contains("\"state\""),
+            "{id}: lifecycle metadata must always come back: {body:.300}"
+        );
+
+        let legacy = version.is_none_or(|v| v < MIN_TRUSTED_REDACTION_VERSION);
+        if legacy {
+            // Hugo's ruling: a record written before the redaction existed
+            // returns lifecycle metadata only. `error` is refused, not shown.
+            assert!(
+                !body.contains("\"result\""),
+                "{id}: redaction_version {version:?} is legacy, so `result` must \
+                 be omitted — its contents were never scrubbed: {body:.300}"
+            );
+            assert!(
+                !body.contains("\"error\""),
+                "{id}: redaction_version {version:?} is legacy, so `error` must \
+                 be omitted rather than shown: {body:.300}"
+            );
+        }
+
+        // Whatever the version, no secret and no fragment of one may come back.
+        assert!(
+            !body.contains(PROBE),
+            "{id}: the resolved value of {PROBE_VAR} came back on \
+             GET /api/v1/jobs/{{id}}: {}",
+            excerpt_of(&body, PROBE)
+        );
+        let survived = longest_surviving_prefix(&body, PROBE);
+        assert!(
+            survived < MAX_SURVIVING_FRAGMENT,
+            "{id}: {survived} bytes of the resolved value came back. A \
+             whole-value filter cannot see a truncated one — the tail it needs \
+             is the part that was cut off. Payload was {payload:.60}"
+        );
+    }
+}
