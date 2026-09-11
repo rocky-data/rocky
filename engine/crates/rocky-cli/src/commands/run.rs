@@ -7016,8 +7016,18 @@ async fn run_batched_checks(
                 // (#1666). `check_row_count` hard-codes `Error`, so
                 // `severity = "warning"` on a replication pipeline parsed and
                 // was discarded — the operator's own escape hatch did nothing.
-                // Same shape the freshness check already uses below.
-                check.severity = pipeline.checks.row_count.severity();
+                //
+                // Only for a check that RAN (#1871). Severity grades a
+                // measurement: an operator writing `warning` means "a row
+                // count that does not match is advisory", not "a row count I
+                // could not obtain is advisory". `row_count_not_evaluated`
+                // chooses `Error` and `check_failures_by_severity` buckets on
+                // severity alone, so overwriting it here is what decides
+                // whether the run gates. Same guard the freshness and
+                // null-rate sites use.
+                if check.not_evaluated.is_none() {
+                    check.severity = pipeline.checks.row_count.severity();
+                }
                 let entry =
                     pending_checks
                         .entry(target_key.clone())
@@ -13822,8 +13832,13 @@ async fn process_table(
             &task.column_match_exclude,
         );
         // The configured severity, not `check_column_match`'s hard-coded
-        // `Error` (#1666).
-        check.severity = column_match_severity;
+        // `Error` (#1666) — and only for a check that RAN (#1871). A column
+        // probe that failed is `column_match_not_evaluated`, which chooses
+        // `Error`; downgrading that to the configured `warning` cleared the
+        // gate on a run that had compared nothing.
+        if check.not_evaluated.is_none() {
+            check.severity = column_match_severity;
+        }
         probe_rate_limited = rate_limited;
         Some(check)
     } else {
@@ -33985,6 +34000,52 @@ table = "fct_events"
         assert!(
             gated,
             "an unevaluated null-rate check gates: {checks:?}",
+            checks = pending.get(&fx.target_key()).map(|p| &p.checks)
+        );
+        assert!(matches!(
+            status,
+            rocky_core::state::RunStatus::PartialFailure
+        ));
+        assert_eq!(
+            result.severity,
+            rocky_core::tests::TestSeverity::Error,
+            "a check the engine could not evaluate keeps its own severity: {result:?}"
+        );
+    }
+
+    /// #1871 regressed the row-count arm of the same invariant the null-rate
+    /// test above pins: a check the engine COULD NOT RUN is never advisory.
+    ///
+    /// `row_count_not_evaluated` chooses `TestSeverity::Error`, and
+    /// `check_failures_by_severity` buckets on severity alone, so the gate's
+    /// correctness rests entirely on that choice surviving. The site
+    /// overwrote it with the configured severity for BOTH arms, so
+    /// `severity = "warning"` downgraded a row-count query that failed and
+    /// the run exited 0 with `status: "Success"`. 1.73.0 always gated it.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_failed_row_count_query_gates_even_when_the_configured_severity_is_warning() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new("row_count = { enabled = true, severity = \"warning\" }");
+
+        let failing = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT COUNT(*) FROM tgt.orders",
+            reply: Intercept::Fail("injected row-count failure"),
+        };
+        let (pending, _) = fx.run(&failing, None, None).await;
+
+        let result = the_result(&pending, &fx.target_key(), "row_count");
+        assert!(
+            result.not_evaluated.is_some(),
+            "the row count must be unevaluated for this test to mean anything: {result:?}"
+        );
+        // The gate first: it is the user-visible consequence, so a regression
+        // prints the exit code it changed rather than a field.
+        let (gated, status) = run_status_for(&fx, &pending);
+        assert!(
+            gated,
+            "an unevaluated row count gates: {checks:?}",
             checks = pending.get(&fx.target_key()).map(|p| &p.checks)
         );
         assert!(matches!(
