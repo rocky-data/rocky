@@ -2854,6 +2854,100 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// #1897. The secret filter must be the LAST layer `router()` applies.
+    ///
+    /// On the response path a tower layer runs after everything applied
+    /// before it, so "last applied" is what makes the filter outermost —
+    /// and outermost is the whole claim. A layer added after it would see
+    /// the response *after* filtering and could reintroduce anything, and a
+    /// filter moved earlier would stop covering the 413 envelope, the 421
+    /// host refusal, the auth failures and the fallbacks.
+    ///
+    /// Scanned from the source for the same reason
+    /// [`router_registers_no_undeclared_route`] is: there is no runtime API
+    /// that reports a tower stack's order, and the invariant is about the
+    /// code someone will edit.
+    #[test]
+    fn the_secret_filter_is_the_outermost_layer() {
+        let source = include_str!("api.rs");
+        let start = source
+            .find("pub fn router(state: Arc<ServerState>) -> Router {")
+            .expect("router() must be findable by its exact signature");
+        let body = &source[start..];
+        let end = body.find("\n}\n").expect("router() must end at column 0");
+        let body: String = body[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let filter = "crate::secret_filter::redact_response_secrets";
+        let at = body
+            .rfind(filter)
+            .expect("router() must apply the secret filter");
+        let last_layer = body
+            .rfind(".layer(")
+            .expect("router() must apply at least one layer");
+
+        assert!(
+            at > last_layer,
+            "the secret filter must be inside the LAST `.layer(` call in \
+             router(). A layer applied after it wraps OUTSIDE it on the \
+             response path, so its output would never be filtered."
+        );
+    }
+
+    /// #1897. The filter covers a handler that does not use `PrettyJson`.
+    ///
+    /// `trigger_compile` hand-builds its body with axum's `Json` and inserts
+    /// `config_error` verbatim — the resolved-value leak path. This is the
+    /// route a filter installed at the `PrettyJson` responder would have
+    /// missed while looking correct, so it is pinned end to end through the
+    /// real router rather than by calling `redact` directly.
+    #[tokio::test]
+    async fn a_hand_built_response_body_is_filtered_too() {
+        let secret = "OUTERMOST-PROBE-SECRET-8e26660e";
+        rocky_core::secret_registry::register_substitution("ROCKY_OUTERMOST_PROBE", secret);
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("rocky.toml");
+        // Valid TOML before substitution, broken after: the parse error then
+        // echoes the line with the RESOLVED value in it.
+        std::fs::write(
+            &config,
+            format!("[adapter]\ntype = \"duckdb\"\npath = {secret}\n"),
+        )
+        .unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = spawn_router(pinned_server(
+            dir.path().join("models"),
+            Some(config),
+            &state_path,
+        ))
+        .await;
+
+        let body = reqwest::Client::new()
+            .post(format!("{base}/api/v1/compile"))
+            .send()
+            .await
+            .expect("request")
+            .text()
+            .await
+            .expect("body");
+
+        assert!(
+            !body.contains(secret),
+            "POST /api/v1/compile hand-builds its body with axum::Json, so it \
+             bypasses PrettyJson entirely. The resolved value must still be \
+             gone: {body}"
+        );
+        assert!(
+            body.contains("${ROCKY_OUTERMOST_PROBE}"),
+            "and the variable must be named, or the operator cannot tell what \
+             failed: {body}"
+        );
+    }
+
     /// Reference bytes for a canonical output: exactly what
     /// `crate::output::print_json` emits by default (pretty + trailing `\n`).
     fn reference_bytes<T: Serialize>(output: &T) -> String {
