@@ -2897,6 +2897,40 @@ mod tests {
         );
     }
 
+    /// #1897, Codex D. Axum answers HEAD on every `get(...)` route and
+    /// strips the body inside the router, so the outermost filter received an
+    /// empty body carrying a JSON content type. Parsing `""` failed, and the
+    /// fail-closed branch manufactured a `500` — wrong status, wrong body and
+    /// wrong length on every HEAD as soon as anything was registered.
+    ///
+    /// A body with no bytes cannot carry a value, so it passes through.
+    #[tokio::test]
+    async fn a_head_request_is_not_turned_into_a_manufactured_error() {
+        rocky_core::secret_registry::register_substitution(
+            "ROCKY_HEAD_PROBE",
+            "HEAD-PROBE-VALUE-8e26660e",
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = spawn_router(pinned_server(dir.path().join("models"), None, &state_path)).await;
+
+        let response = reqwest::Client::new()
+            .head(format!("{base}/api/v1/health"))
+            .send()
+            .await
+            .expect("request");
+
+        assert!(
+            response.status().is_success(),
+            "HEAD must answer as the GET would, not with a manufactured \
+             error: {}",
+            response.status()
+        );
+        let body = response.text().await.expect("body");
+        assert!(body.is_empty(), "a HEAD response carries no body: {body:?}");
+    }
+
     /// #1897. The filter covers a handler that does not use `PrettyJson`.
     ///
     /// `trigger_compile` hand-builds its body with axum's `Json` and inserts
