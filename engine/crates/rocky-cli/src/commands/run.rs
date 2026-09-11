@@ -6718,7 +6718,7 @@ async fn run_batched_checks(
     // path names the one table whose own query failed, the batch path names
     // every table the failed leg was handed (#1655). A table that a leg
     // answered WITHOUT leaving a row for is not recorded — there is no reason
-    // to give, and it is reported as "returned no result for this table".
+    // to give, and it is reported as "returned no readable count for this table".
     let mut source_count_failures: HashMap<String, String> = HashMap::new();
     let mut target_count_failures: HashMap<String, String> = HashMap::new();
     // In table order, so the emitted results are deterministic.
@@ -6992,7 +6992,7 @@ async fn run_batched_checks(
                         let missing_side = |label: &str, reason: Option<&String>| match reason {
                             Some(reason) => format!("{label}: {reason}"),
                             None => format!(
-                                "{label}: the batch row count query returned no result for this table"
+                                "{label}: the batch row count query returned no readable count for this table"
                             ),
                         };
                         let mut parts = Vec::new();
@@ -33890,8 +33890,8 @@ table = "fct_events"
         assert_eq!(
             result.not_evaluated.as_deref(),
             Some(
-                "source: the batch row count query returned no result for this table; \
-                 target: the batch row count query returned no result for this table"
+                "source: the batch row count query returned no readable count for this table; \
+                 target: the batch row count query returned no readable count for this table"
             ),
             "{result:?}"
         );
