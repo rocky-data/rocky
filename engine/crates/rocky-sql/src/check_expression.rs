@@ -40,7 +40,7 @@
 
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{Expr, ObjectNamePart, Query, TableFactor, Visit, Visitor};
+use sqlparser::ast::{Expr, ObjectNamePart, Query, TableFactor, Value, Visit, Visitor};
 use sqlparser::dialect::{
     BigQueryDialect, DatabricksDialect, Dialect, DuckDbDialect, GenericDialect, SnowflakeDialect,
 };
@@ -308,6 +308,27 @@ impl Visitor for Walker<'_> {
                     function: ident.value.clone(),
                 })
             }
+            // A placeholder — Snowflake `$name` / `$1`, or any dialect's bind
+            // marker. Rocky never binds parameters into these expressions:
+            // they are spliced as TEXT, so nothing here is ever filled in by a
+            // driver. What reaches the warehouse instead is a session-variable
+            // read, resolved at execution time out of state this validator
+            // cannot see — the same class as `getvariable(..)` and
+            // `current_user`, which are already refused, but spelled so it is
+            // neither a function nor an identifier.
+            //
+            // Refusing every placeholder is deliberate and fail-closed: a
+            // stray `?` in a spliced predicate is a defect whatever it meant.
+            Expr::Value(value) if matches!(value.value, Value::Placeholder(_)) => {
+                let name = match &value.value {
+                    Value::Placeholder(p) => p.clone(),
+                    _ => unreachable!("guarded by the match arm"),
+                };
+                ControlFlow::Break(ValidationError::ExpressionFunctionNotAllowed {
+                    context: self.context.to_string(),
+                    function: name,
+                })
+            }
             _ => ControlFlow::Continue(()),
         }
     }
@@ -325,6 +346,73 @@ mod tests {
 
     fn check_on(dialect: &str, expression: &str) -> Result<(), ValidationError> {
         validate_check_expression(CTX, expression, dialect_for(dialect).as_ref())
+    }
+
+    /// A session-variable read spelled as a placeholder is refused, on every
+    /// dialect that parses one.
+    ///
+    /// Snowflake `$name` / `$1` is neither a function, a query, a lambda, nor
+    /// an identifier, so every arm of the walker used to pass it through and
+    /// the whole expression validated clean. `getvariable('x')` and
+    /// `identifier($foo)` were already refused — the same read, spelled as a
+    /// function. This closes the spelling that was not.
+    ///
+    /// Rocky splices these expressions as TEXT and never binds a parameter, so
+    /// a placeholder can never be something we supply. Refusing all of them is
+    /// fail-closed on purpose.
+    #[test]
+    fn a_placeholder_session_read_is_refused_on_every_dialect() {
+        // Each entry is a dialect and a placeholder its parser produces.
+        for (dialect, expr) in [
+            ("snowflake", "$foo"),
+            ("snowflake", "$1"),
+            ("generic", "$1"),
+            ("duckdb", "$1"),
+            ("bigquery", "?"),
+            ("databricks", "$1"),
+        ] {
+            let parsed = {
+                let d = dialect_for(dialect);
+                let mut parser = Parser::new(d.as_ref()).try_with_sql(expr).unwrap();
+                parser.parse_expr()
+            };
+            // Precondition: this dialect really does parse it as a
+            // placeholder. A dialect that rejects it outright proves nothing
+            // about the walker, and the case would pass vacuously.
+            let Ok(Expr::Value(v)) = &parsed else {
+                continue;
+            };
+            if !matches!(v.value, Value::Placeholder(_)) {
+                continue;
+            }
+            let err = check_on(dialect, expr).expect_err(&format!(
+                "{dialect}: `{expr}` parses as a placeholder and must be refused"
+            ));
+            assert!(
+                matches!(err, ValidationError::ExpressionFunctionNotAllowed { .. }),
+                "{dialect}: `{expr}` gave {err:?}"
+            );
+        }
+    }
+
+    /// A placeholder INSIDE a larger expression is refused too: the walker
+    /// descends, so it is not only the top-level node that is judged.
+    #[test]
+    fn a_nested_placeholder_is_refused() {
+        check_on("snowflake", "customer_id = $tenant")
+            .expect_err("a placeholder in a comparison is still a session read");
+        check_on("snowflake", "coalesce(name, $fallback) IS NOT NULL")
+            .expect_err("a placeholder inside an allowed function is still a session read");
+    }
+
+    /// The control: an ordinary literal comparison is untouched. Without it,
+    /// the refusals above would also pass on a guard that refused every value
+    /// node.
+    #[test]
+    fn an_ordinary_literal_is_not_a_placeholder() {
+        check_on("snowflake", "status = 'shipped'").expect("a string literal is fine");
+        check_on("snowflake", "total >= 0").expect("a number literal is fine");
+        check_on("snowflake", "name IS NOT NULL").expect("a bare column is fine");
     }
 
     /// Every `expression` check in the tree at the time of writing, plus the
