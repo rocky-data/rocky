@@ -7,7 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Pairs with engine 1.74.0 and `rocky-sdk` 0.15.0.
+
+### Added
+
+- **`RockyResource` gains `product_list()`, `product_journal()` and `schedule_spool()`.** Each delegates to the `RockyClient` method of the same name and returns its typed result: `ProductListOutput`, `ProductJournalOutput` or `ScheduleSpoolOutput`. A client error is raised as a `dagster.Failure`. `schedule_spool()` lets a sensor tell an idle queue from demands piling up. `GET /api/v1/schedule` shows only the demands a tick has already claimed. (#1677, #1686, #1899)
+
+  They need engine 1.74.0. None of the three verbs is in engine 1.73.0, and the SDK's `MIN_ROCKY_VERSION = "1.34.0"` check does not catch this. Against an older binary the call fails at the CLI.
+
+### Changed
+
+- **The `rocky-sdk` floor rises from `>=0.13.0` to `>=0.15.0`. An older SDK stops `dagster_rocky` from importing at all.** `resource.py` imports `ProductJournalOutput`, `ProductListOutput` and `ScheduleSpoolOutput` by name at module level, and `dagster_rocky/__init__.py` imports `resource.py`. None of the three exists in `rocky-sdk` 0.14.0. So with 0.14.0 installed, plain `import dagster_rocky` raises `ImportError`. The component also reads `RunResult.check_gate_failed`, which 0.14.0 does not have. Upgrade `rocky-sdk` in the same step.
+
+- Regenerated test fixtures for engine 1.74.0. The state-store schema is v30, and the `doctor` fixtures report `state schema v30 matches this binary`. The `compile`, `ci`, `contracts/compile` and `test` fixtures carry the reworded `I003` suggestion. `test` and `lineage/test` carry the new top-level `diagnostics` list.
+
 ### Fixed
+
+- **A check-gated Rocky run no longer finishes as a green Dagster step when no failing asset check explains it.** Since #1671 the engine fails a run on its error-severity checks and sets `check_gate_failed`. `RockyClient.run` passes `allow_partial=True`, so that run came back as a parsed result, not an error. Nothing in this package read the flag. So a gated run could finish green, for example when the failing check's asset was outside the step's selection. A `cross_source_overlap` verdict lands on one sibling, chosen by materialization order, so a partial selection can miss it.
+
+  Now, in the default `streaming` mode:
+  - The step log carries an error line when `check_gate_failed` is set.
+  - A failing check on an asset outside the selection is logged as a warning that names it. Before, it was dropped without a word.
+  - After it yields every result, the step raises `dagster.Failure` if the gate stands and no failing asset check was yielded. The message lists the failing checks it could not report, or says that none reached the step.
+
+  The backstop stays quiet when a failing asset check is visible, so an ordinary failed check is not reported twice. It also fires on a resumed run that inherited a standing gate, whose own `check_results` are clean. Transformation-model assets get the error line but not the backstop. `pipes` mode is unchanged by this fix. (#1753)
+
+- **A declared check the engine did not produce no longer reports as passed.** In `streaming` mode, the placeholder pass reported such a check as `passed=True` on any materialized table. Its metadata said "not produced by rocky", but the badge showed a pass. Now a missing *measurement* reports `passed=False` at `WARN`. This covers `row_count`, `column_match`, `freshness` when it is declared, and configured checks surfaced with `surface_configured_checks: true`. Group checks such as `cross_source_overlap` are handled earlier and are unaffected. The two *event* checks, `row_count_anomaly` and `compliance_exception`, still pass when the engine sends nothing, because the engine emits them only when it has something to report. An unmaterialized table keeps its "table not materialized" placeholder, unchanged.
+
+  **This turns some green badges into warnings.** `row_count` and `column_match` are declared on every asset, and both can be switched off in `rocky.toml`. A table whose run did not produce them now shows a warning instead of a pass. `rocky discover` does not expose those two toggles, so Dagster cannot tell "switched off" from "not measured". (#1782)
+
+- **A compliance scan that crashed now reports "not evaluated", not passed.** With `surface_compliance: true`, a `rocky compliance` failure was logged and swallowed. Nothing was reported for `compliance_exception`, so in `streaming` mode the placeholder reported it green: for an event check, the engine sending nothing reads as clean. Now each selected asset gets a `compliance_exception` result with `passed=False` at `WARN`. Its metadata carries `status: not_evaluated`, and the failure goes in `reason`. This applies in both execution modes. The materialization still succeeds: a failed governance read degrades a check, it does not fail the run. (#1896)
+
+  `row_count_anomaly` has the same shape and is not fixed. When the engine's anomaly detector does not run, for example with `row_count = false`, the check still reports green. #1790 stays open for it.
 
 - **A check result Rocky produced but the component never declared no longer fails the step in `pipes` mode, and no longer vanishes in `streaming` mode.** The two paths did different things with the same input. `streaming` dropped the result without a word. `pipes` handed it to Dagster, which raised `DagsterInvariantViolationError` — "Received unexpected AssetCheckResult" — and failed the whole step. Adding `[checks.freshness]` to `rocky.toml` without refreshing the component state was enough to reach it.
 
@@ -15,7 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A failed `cross_source_overlap` check is now visible in Dagster.** It reached nobody before. Two rules cancelled it out: the component excluded `cross_source_overlap` from its declared check specs, and the emit side dropped any result whose check was not declared. An operator saw the run degrade with no named check to explain it.
 
-  The check is now declared, and it is declared only on assets whose Rocky source type its name targets — the engine's projection is keyed by table name alone, so `cross_source_overlap:duckdb.orders` used to be a candidate for a `postgres.orders` asset too. `cross_source_overlap` is a *group* check: the engine evaluates it once per sibling group and reports the verdict on the sibling it copied first, which is not knowable when the specs are built. The siblings that did not carry this run's verdict report **nothing** for that check, plus one INFO line naming the sibling that did. A check that never ran must not read green — and it must not read amber either, which on a three-sibling group would be two permanent warning failures on every run. Dagster already has a state for this: a declared check with no evaluation stays `PLANNED` for the run and resolves to `SKIPPED` once the run finishes without failing. **Note what that means for asset health, which the first version of this entry got wrong:** a `SKIPPED` latest check does not leave the badge blank — `AssetCheckHealthState` falls back to the last *completed* record, so the previous run's verdict is presented as current health. A sibling that once carried a failing overlap therefore stays degraded on every run it is not the carrier, including after the overlap is fixed, because a clean run writes a completed record only on the new carrier and the carrier is materialization order. Tracked as #1728.
+  The check is now declared, and it is declared only on assets whose Rocky source type its name targets — the engine's projection is keyed by table name alone, so `cross_source_overlap:duckdb.orders` used to be a candidate for a `postgres.orders` asset too. `cross_source_overlap` is a *group* check: the engine evaluates it once per sibling group and reports the verdict on the sibling it copied first, which is not knowable when the specs are built. The siblings that did not carry this run's verdict report **nothing** for that check, plus one INFO line naming the sibling that did. A check that never ran must not read green — and it must not read amber either, which on a three-sibling group would be two permanent warning failures on every run. Dagster already has a state for this: a declared check with no evaluation stays `PLANNED` for the run and resolves to `SKIPPED` once the run finishes without failing. **Note what that means for asset health, which the first version of this entry got wrong:** a `SKIPPED` latest check does not leave the badge blank — `AssetCheckHealthState` falls back to the last *completed* record, so the previous run's verdict is presented as current health. A sibling that once carried a failing overlap therefore stays degraded on every run it is not the carrier, including after the overlap is fixed, because a clean run writes a completed record only on the new carrier and the carrier is materialization order. #1728 tracked this and is now closed; the behaviour described here is unchanged.
 
   The check's own numbers now reach the UI too: `overlap_count`, `contributing_tables` and a sample of the overlapping keys. So does `not_evaluated` — the reason the engine gives when it declines to run a check, on every check kind, which is the difference between "no overlap" and "never measured". Needs `surface_configured_checks: true` on the component. (#1669)
 
@@ -25,7 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   **Refresh the state whenever you change `[checks]`.** The component's state key is the config path, not the file's contents, so editing `rocky.toml` does not refresh the cache. If you REMOVE `[checks.freshness]` and do not refresh, the spec stays declared and the check keeps reporting the same false green. Gating on the discover projection cannot close that half.
 
-  `row_count` and `column_match` can also be switched off in `rocky.toml` and have the same false green. They are not fixed here: `rocky discover` exposes no toggle for them, so Dagster cannot tell they were switched off. That needs an engine change. (#1645)
+  `row_count` and `column_match` can also be switched off in `rocky.toml`. `rocky discover` exposes no toggle for them, so Dagster cannot tell they were switched off; that needs an engine change. Until then, #1782 reports a table whose run did not produce them as a warning, not a false green. (#1645)
 
 - **A contract whose model the compiler did not find no longer reports green.** `rocky compile` emits `W011` when a `.contract.toml` names a model the project does not contain, and it emits that *instead of* validating, so none of the `E010`-`E014` violation codes can follow. Dagster mapped neither, and an unmapped code was dropped, so every declared contract check for that model passed. The usual way in is a rename: the contract file still names `orders`, a source table is still called `orders` so the check specs are declared, and the compiled project has no such model. Each declared check now fails at `WARN` and carries `rocky/contract_model_not_found`, matching how a missing compile result is reported. (#1644)
 

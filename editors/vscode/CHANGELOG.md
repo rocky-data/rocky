@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Pairs with engine 1.74.0.
+
+### Added
+
+- **The generated-types barrel now re-exports the command-output types it was missing.** `src/types/generated/index.ts` is maintained by hand; codegen does not rewrite it. It was missing 68 command-output types, among them `ApplyOutput`, `DagOutput`, `CostOutput`, `AuditOutput` and `ValidateOutput` (#1875). It was also missing four from this cycle: `PolicyRulesOutput`, `PolicyAutonomyBudgetOutput`, `PolicyRuleScopeOutput` and `ScheduleSpoolOutput` (#1916). A TypeScript consumer can now import them from the barrel. A unit test, `generatedBarrelCompleteness.test.ts`, fails when a generated output type is missing from the barrel. It runs under `npm run test:unit`. No CI workflow runs that script yet.
+
+- **Generated TypeScript types for the new engine outputs.** New modules under `src/types/generated/`:
+  - `product_list` (#1677) and `product_journal` (#1686)
+  - `schedule_spool` (#1899)
+  - `policy_show` (#1874, #1913)
+  - `snapshot` and `docs` (#1759)
+  - `list_pipelines`, `list_adapters`, `list_models` and `list_sources` (#1810)
+  - the `rocky serve` API shapes `health`, `model_list`, `model_detail`, `dag_layers` and `dag_status` (#1665), and `project` (#1690, #1849)
+
+  Each is exported from the barrel. Nothing in the extension reads them yet. This release adds no command, view, menu item or setting.
+
+### Changed
+
+- **Regenerated TypeScript bindings for engine 1.74.0.** For a TypeScript consumer:
+  - `RunOutput` gains optional `check_gate_failed` and `verify_after_failed` (#1671, #1734, #1749).
+  - `not_evaluated` moves from the cross-source overlap variant to the base `CheckResult`, so it applies to every check kind (#1652, #1706).
+  - `ReviewQueueEntry` gains `models: string[]`, which is **required**, and an optional `preview_model` (#1828).
+  - `AuditOutput` gains an optional `product` (`AuditProductScope`) (#1685).
+  - `TestOutput` gains an optional `diagnostics` (#1661). `AiContractOutput` gains optional `unverified_types` and `unmatched_columns` (#1660). `BriefOutput` gains an optional `config_error` (#1755).
+  - Doc comments change for the tick skip reason `spool_unreadable` (#1752), `FulfillOutput.state` (#1539) and `ContractResult.warnings` (#1643).
+
+- **The bundled `rocky.toml` schema's hover text is corrected.** `anomaly_threshold_pct` now says that `0` disables detection, that a negative value does too, and that a non-finite value is refused when the config loads (#1793, #1832). `[fulfill] briefs_dir` lists `data-repair.md` among the overrides (#1539). A contract column's `type` now says an unrecognised declared type is reported as a warning and not compared, and an unrecognised landed type refuses the load (#1805). `src/types/generated/rocky_project.ts` carries the same doc comments.
+
+- **Dependencies.**
+  - `vscode-languageclient` 10.1.0 → 10.1.1 is the extension's one production dependency, so it ships. Its protocol packages move with it in the lockfile: `vscode-languageserver-protocol` 3.18.3, `vscode-jsonrpc` 9.0.2 and `vscode-languageserver-types` 3.18.3 (#1771).
+  - `@xyflow/react` 12.11.5 → 12.11.6 is a dev dependency, but the Inspector and Devtools webview panels import it and esbuild bundles it into them, so it ships too (#1771).
+  - Dev only: `mocha` 11 → 12 (#1772), `vitest` 4 → 5 (#1773), `js-yaml` 4.3.1 → 4.3.2 (#1824), `typescript-eslint` 8.69, `@types/node` 26.4.1 and `@types/react-dom` 19.2.7 (#1771).
+
 ## [1.40.0] — 2026-09-03
 
 Pairs with engine 1.73.0.
