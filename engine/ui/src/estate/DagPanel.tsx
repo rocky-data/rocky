@@ -41,10 +41,10 @@ const MIN_ZOOM = 0.1;
  * need 0.0965 at that width.
  *
  * This is passed per fit — to `fitViewOptions`, to `fitView()` and to the
- * Controls — so it is not itself the floor for a hand on the canvas. It can
- * still end up being one: a graph deep enough to fit at this clamp makes
- * `floorFor` adopt it, which is the point. What it never does is lower the
- * floor for a graph that fits above it.
+ * Controls — so it is not read directly as the floor for a hand on the
+ * canvas. It reaches that floor indirectly, and by design: any fit below
+ * `MIN_ZOOM` makes `floorFor` lower the interaction floor to the fitted
+ * zoom, and a fit that reaches this clamp makes that floor `0.02`.
  */
 const FIT = { minZoom: 0.02 } as const;
 
