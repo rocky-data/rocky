@@ -307,10 +307,31 @@ pub async fn execute_batch_freshness(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let max_timestamp = row
-                .get(3)
-                .and_then(|v| v.as_str())
-                .map(std::string::ToString::to_string);
+            // A genuine SQL NULL keeps the row with `None` — an empty table
+            // has no freshness to measure. A missing or non-string cell is
+            // UNREADABLE and omits the row, so the caller reports the table
+            // not evaluated instead of reading `None` as "empty" (#1929).
+            let max_timestamp = match row.get(3) {
+                Some(v) if v.is_null() => None,
+                Some(v) => match v.as_str() {
+                    Some(s) => Some(s.to_string()),
+                    None => {
+                        tracing::warn!(
+                            table = format!("{catalog}.{schema}.{table}"),
+                            cell = ?v,
+                            "freshness timestamp cell was not a string — reporting the table as not evaluated"
+                        );
+                        continue;
+                    }
+                },
+                None => {
+                    tracing::warn!(
+                        table = format!("{catalog}.{schema}.{table}"),
+                        "freshness row carried no timestamp cell — reporting the table as not evaluated"
+                    );
+                    continue;
+                }
+            };
 
             results.push(FreshnessResult {
                 catalog,

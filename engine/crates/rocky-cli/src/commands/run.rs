@@ -7115,13 +7115,13 @@ async fn run_batched_checks(
                 None if !freshness_failures.iter().any(|(k, _)| *k == key) => {
                     warn!(
                         table = key.as_str(),
-                        "the batch freshness query returned no result for this table — reporting it as not evaluated"
+                        "the batch freshness query returned no readable timestamp for this table — reporting it as not evaluated"
                     );
                     Some((
                         key,
                         checks::freshness_not_evaluated(
                             freshness_cfg.threshold_seconds,
-                            "the batch freshness query returned no result for this table",
+                            "the batch freshness query returned no readable timestamp for this table",
                         ),
                     ))
                 }
@@ -34228,7 +34228,7 @@ table = "fct_events"
         assert!(!result.passed, "{result:?}");
         assert_eq!(
             result.not_evaluated.as_deref(),
-            Some("the batch freshness query returned no result for this table"),
+            Some("the batch freshness query returned no readable timestamp for this table"),
             "{result:?}"
         );
     }
