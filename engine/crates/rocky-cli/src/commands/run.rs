@@ -6718,7 +6718,7 @@ async fn run_batched_checks(
     // path names the one table whose own query failed, the batch path names
     // every table the failed leg was handed (#1655). A table that a leg
     // answered WITHOUT leaving a row for is not recorded — there is no reason
-    // to give, and it is reported as "returned no result for this table".
+    // to give, and it is reported as "returned no readable count for this table".
     let mut source_count_failures: HashMap<String, String> = HashMap::new();
     let mut target_count_failures: HashMap<String, String> = HashMap::new();
     // In table order, so the emitted results are deterministic.
@@ -6992,7 +6992,7 @@ async fn run_batched_checks(
                         let missing_side = |label: &str, reason: Option<&String>| match reason {
                             Some(reason) => format!("{label}: {reason}"),
                             None => format!(
-                                "{label}: the batch row count query returned no result for this table"
+                                "{label}: the batch row count query returned no readable count for this table"
                             ),
                         };
                         let mut parts = Vec::new();
@@ -7098,10 +7098,10 @@ async fn run_batched_checks(
         // exactly the silent gap this change closes for row counts. A batch
         // leg that FAILS does record a reason per table (#1655); a leg that
         // answered and left a table out records none, so iterating the
-        // results is the only way to notice that one. A returned `None` is an empty
-        // table and still emits no check: `MAX(ts)` over no rows is NULL
-        // because there is no row to be fresh, which is not the same as a
-        // query that could not answer.
+        // results is the only way to notice that one.
+        //
+        // `None` emits no check. That is correct for an empty table and wrong
+        // for the other states that reach the same `None` (#1929).
         let measured = freshness_batch_refs.iter().filter_map(|tref| {
             let key = tref.full_name();
             match freshness_results.iter().find(|fr| fr.table == *tref) {
@@ -33890,8 +33890,8 @@ table = "fct_events"
         assert_eq!(
             result.not_evaluated.as_deref(),
             Some(
-                "source: the batch row count query returned no result for this table; \
-                 target: the batch row count query returned no result for this table"
+                "source: the batch row count query returned no readable count for this table; \
+                 target: the batch row count query returned no readable count for this table"
             ),
             "{result:?}"
         );
@@ -34379,7 +34379,13 @@ table = "fct_events"
     /// reported failure. (The row-count analogue — a leg that answers but
     /// leaves a table out — is pinned by
     /// `a_table_the_batch_row_count_left_out_is_not_evaluated`, whose reason
-    /// text says "returned no result", never "failed".)
+    /// text says "returned no readable count", never "failed".)
+    ///
+    /// `None` does NOT mean the table is empty. `MAX(ts)` is NULL over no
+    /// rows AND over rows whose `ts` is all NULL, and the query returns no
+    /// `COUNT(*)` to tell them apart. `None` also carries a missing cell, a
+    /// non-string cell and an unparseable string. Every one of those emits no
+    /// check (#1929).
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn a_batched_freshness_leg_that_answers_null_emits_no_check() {

@@ -2347,3 +2347,67 @@ async fn breaker_trip_without_recovery_timeout_emits_none_cooldown() {
         }
     }
 }
+
+/// #1926, through the production path. The unit test beside
+/// `parse_row_count_rows` cannot see the call site, so it stays green if the
+/// guard is reverted inside `execute_batch_row_counts`. This one does not.
+///
+/// Three tables, one readable count each — except `bad`, whose count cell is
+/// a JSON null. `bad` must be ABSENT from the results, not present with 0,
+/// and the other two must be unaffected by its removal.
+#[tokio::test]
+async fn an_unreadable_batched_row_count_cell_is_omitted_from_the_results() {
+    use rocky_databricks::batch::{BatchTableRef, execute_batch_row_counts};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-rowcount",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": {
+                "schema": {
+                    "columns": [
+                        {"name": "c", "type_name": "STRING", "position": 0},
+                        {"name": "s", "type_name": "STRING", "position": 1},
+                        {"name": "t", "type_name": "STRING", "position": 2},
+                        {"name": "cnt", "type_name": "LONG", "position": 3}
+                    ]
+                },
+                "total_row_count": 3
+            },
+            "result": {
+                "data_array": [
+                    ["cat", "sch", "before", 11],
+                    ["cat", "sch", "bad", null],
+                    ["cat", "sch", "after", 22]
+                ]
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let tref = |table: &str| BatchTableRef {
+        catalog: "cat".into(),
+        schema: "sch".into(),
+        table: table.into(),
+    };
+    let tables = vec![tref("before"), tref("bad"), tref("after")];
+
+    let results = execute_batch_row_counts(&test_connector(&server), &tables)
+        .await
+        .expect("a readable response is not an error");
+
+    let named: Vec<(&str, u64)> = results
+        .iter()
+        .map(|r| (r.table.as_str(), r.count))
+        .collect();
+
+    assert!(
+        !named.iter().any(|(t, _)| *t == "bad"),
+        "an unreadable count must not reach the caller as a measured row: {named:?}"
+    );
+    // The rows on either side are untouched, so the omission is not a
+    // truncation and does not shift the ones that follow it.
+    assert_eq!(named, vec![("before", 11), ("after", 22)], "{named:?}");
+}
