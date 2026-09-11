@@ -712,11 +712,17 @@ mod tests {
         );
     }
 
-    /// The decoded view. An escaped variable NAME is not the value in the
-    /// wire bytes, but it is once a client parses the JSON — which is the
-    /// form that actually reaches a reader.
+    /// A value whose wire representation is ESCAPED is still detected.
+    ///
+    /// Note what this does NOT prove. The rescan also walks the JSON-decoded
+    /// strings, and I could not construct a case where that view fires and
+    /// the wire scan misses — `escaped_forms` already generates the escaped
+    /// representations, so the wire pass subsumes it for every producer in
+    /// this codebase. The decoded view is kept as defence against an escaping
+    /// this code does not generate, and it is deliberately NOT claimed as a
+    /// tested path: removing it leaves every test green.
     #[test]
-    fn a_surviving_value_is_detected_after_json_decoding() {
+    fn a_value_escaped_on_the_wire_is_still_detected() {
         let secret = "RESCAN-DECODED-8e26660e";
         register_substitution("ROCKY_RESCAN_DECODED", secret);
 
