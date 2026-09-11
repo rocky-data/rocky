@@ -43,7 +43,16 @@ that carries them, then set serve.ui.enabled=true.
 
      kubectl get secret {{ .Values.existingSecret.name }} -o jsonpath='{.data.{{ .Values.existingSecret.tokenKey }}}' | base64 -d
 
-Two things to know before you rely on this:
+Three things to know before you rely on this:
+
+{{- if not .Values.persistence.existingClaim }}
+
+  - The claim {{ include "rocky.claimName" . }} is annotated
+    helm.sh/resource-policy: keep. `helm uninstall` leaves it behind, so your
+    project and its run history survive. Installing again under this release
+    name ADOPTS that same claim, with whatever was already on it. To start
+    clean, delete the claim yourself.
+{{- end }}
 
   - /api/v1/health, which both probes use, is shallow. It answers as soon as
     the listener is bound. It does not prove the project compiled or that the

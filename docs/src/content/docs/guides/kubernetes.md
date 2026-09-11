@@ -137,6 +137,23 @@ With the UI on, the Ingress host is passed as `--allowed-host` and a request car
 
 `helm upgrade` replaces the pod in place on the same claim. The volume carries the run history, the watermarks and the scheduler's cursors, so they survive the replacement. The PVC the chart creates is annotated `helm.sh/resource-policy: keep`, so uninstalling the release does not delete your project or its history.
 
+:::caution[A reinstall adopts the old volume]
+That annotation cuts both ways. `helm uninstall` leaves the claim behind, so installing again with the same release name in the same namespace **adopts it**, with the previous project and the previous state store still on it.
+
+That is usually what you want — it is why the annotation is there. It is a surprise when you meant to start clean. To start clean, delete the claim yourself:
+
+```bash
+helm uninstall rocky -n rocky
+kubectl delete pvc rocky -n rocky     # the run history goes with it
+```
+
+Check what is there before you reinstall:
+
+```bash
+kubectl get pvc -n rocky
+```
+:::
+
 Rolling back across a state-schema change follows the same rules as any other deployment. The [deployment contract](/advanced/deployment-contract/) and the [image guide](/guides/run-the-image/) cover what the engine does and does not promise.
 
 ## Related pages
