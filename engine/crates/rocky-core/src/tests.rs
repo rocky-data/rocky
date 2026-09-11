@@ -811,11 +811,11 @@ mod unit_tests {
             test_type: TestType::NotNull,
             column: Some("name".into()),
             severity: TestSeverity::Error,
-            filter: Some("read_text('/etc/passwd') IS NOT NULL".into()),
+            filter: Some("my_udf(name) IS NOT NULL".into()),
         };
         let err = generate_test_sql(&decl, "wh.main.orders").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("read_text"), "must name the function: {msg}");
+        assert!(msg.contains("my_udf"), "must name the function: {msg}");
         assert!(msg.contains("`filter`"), "must name the field: {msg}");
     }
 
@@ -826,7 +826,7 @@ mod unit_tests {
     fn a_unique_expr_key_refuses_a_disallowed_function() {
         let decl = TestDecl {
             test_type: TestType::UniqueExpr {
-                key_expr: "read_text('/etc/passwd')".into(),
+                key_expr: "my_udf(id)".into(),
             },
             column: None,
             severity: TestSeverity::Error,
@@ -834,7 +834,7 @@ mod unit_tests {
         };
         let err = generate_test_sql(&decl, "wh.main.orders").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("read_text"), "must name the function: {msg}");
+        assert!(msg.contains("my_udf"), "must name the function: {msg}");
         assert!(msg.contains("`key_expr`"), "must name the field: {msg}");
     }
 

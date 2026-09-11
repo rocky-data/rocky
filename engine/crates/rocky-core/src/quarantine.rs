@@ -1214,7 +1214,7 @@ mod unit_tests {
         let assertions = vec![assertion(
             None,
             TestType::Expression {
-                expression: "read_text('/etc/passwd') IS NOT NULL".into(),
+                expression: "my_udf(id) IS NOT NULL".into(),
             },
             None,
             TestSeverity::Error,
@@ -1223,7 +1223,7 @@ mod unit_tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("read_text"),
+            msg.contains("my_udf"),
             "the refusal must NAME the function an operator has to remove: {msg}"
         );
     }
@@ -1237,7 +1237,7 @@ mod unit_tests {
         let assertions = vec![assertion(
             None,
             TestType::Expression {
-                expression: "customer_id IN (SELECT id FROM secrets)".into(),
+                expression: "customer_id IN (SELECT 1)".into(),
             },
             None,
             TestSeverity::Error,
@@ -1278,12 +1278,12 @@ mod unit_tests {
         let assertions = vec![assertion_with_filter(
             TestType::NotNull,
             Some("customer_id"),
-            Some("read_text('/etc/passwd') IS NOT NULL"),
+            Some("my_udf(id) IS NOT NULL"),
         )];
         let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("read_text"), "must name the function: {msg}");
+        assert!(msg.contains("my_udf"), "must name the function: {msg}");
         assert!(msg.contains("`filter`"), "must name the field: {msg}");
     }
 

@@ -1071,14 +1071,10 @@ mod tests {
     #[test]
     fn test_cross_source_overlap_key_expr_refuses_a_disallowed_function() {
         let siblings = vec![sibling("s1", "t"), sibling("s2", "t")];
-        let err = generate_cross_source_overlap_sql(
-            &siblings,
-            &["read_text('/etc/passwd')".into()],
-            &dialect(),
-        )
-        .unwrap_err();
+        let err = generate_cross_source_overlap_sql(&siblings, &["my_udf(a)".into()], &dialect())
+            .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("read_text"), "must name the function: {msg}");
+        assert!(msg.contains("my_udf"), "must name the function: {msg}");
         assert!(
             msg.contains("cross_source_overlap `key_expr`"),
             "must name the field: {msg}"

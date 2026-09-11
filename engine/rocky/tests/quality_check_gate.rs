@@ -108,7 +108,6 @@ fn seed(dir: &Path, extra: &str) {
     fs::write(dir.join("rocky.toml"), config(extra)).expect("write config");
 }
 
-
 /// A quality pipeline whose assertions all PASS on the seeded row, so the only
 /// thing that can fail the run is what `extra` adds.
 ///
@@ -523,8 +522,9 @@ fn a_refused_quarantine_expression_is_refused_on_both_paths() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
     seed_clean_db(dir);
-    // `read_text` is off the allowlist: a content-reading function in scalar
-    // position, spliced into a CTAS that runs with warehouse credentials.
+    // `my_udf` is off the allowlist: an unknown scalar function spliced into
+    // a CTAS that runs with warehouse credentials. Any name outside
+    // CHECK_EXPRESSION_FUNCTIONS takes the same path.
     fs::write(
         dir.join("rocky.toml"),
         clean_config(
@@ -535,7 +535,7 @@ enabled = true
 [[pipeline.dq.checks.assertions]]
 table = "orders"
 type = "expression"
-expression = "read_text('/etc/passwd') IS NOT NULL"
+expression = "my_udf(id) IS NOT NULL"
 "#,
         ),
     )
@@ -565,7 +565,7 @@ expression = "read_text('/etc/passwd') IS NOT NULL"
         .as_str()
         .unwrap_or_else(|| panic!("the reason must be carried: {out}"));
     assert!(
-        reason.contains("read_text"),
+        reason.contains("my_udf"),
         "the reason must name the function to remove: {reason}"
     );
 
