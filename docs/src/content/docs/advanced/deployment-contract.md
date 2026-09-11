@@ -123,7 +123,7 @@ The persistent volume is required on every row. The backend chooses the blast ra
 
 ## Related pages
 
-- [Run the Container Image](/guides/run-the-image/): the image, `docker run`, and the minikube example that follows this contract.
+- [Run the Container Image](/guides/run-the-image/): the image, `docker run`, and the Compose example that follows this contract.
 - [State management](/concepts/state-management/#remote-state-persistence): the backends and the sync lifecycle.
 - [Configuration](/reference/configuration/#concurrent-writers): `concurrency_control`, `on_schema_mismatch`, `catchup`.
 - [Failure modes](/advanced/failure-modes/): what a failed run looks like from the outside.

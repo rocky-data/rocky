@@ -1,11 +1,11 @@
 ---
 title: Run the Container Image
-description: "Run Rocky from the container image that ships with every engine release: docker run, the volume, the token, the health probe, the drain, upgrades, and a minikube example."
+description: "Run Rocky from the container image that ships with every engine release: docker run, the volume, the token, the health probe, the drain, upgrades, and a Compose example."
 sidebar:
   order: 5.6
 ---
 
-Every engine release publishes one container image, `ghcr.io/rocky-data/rocky`. The image holds the release's own `rocky` binary and nothing else. This guide shows you how to run it with `docker run`, what to mount, how to probe it, how to stop it, and how to upgrade it. A minikube example closes the page. Kubernetes is not a supported target; the example is a starting point, not a contract.
+Every engine release publishes one container image, `ghcr.io/rocky-data/rocky`. The image holds the release's own `rocky` binary and nothing else. This guide shows you how to run it with `docker run`, what to mount, how to probe it, how to stop it, and how to upgrade it. A Compose example and a build recipe close the page.
 
 ## What the image is
 
@@ -98,7 +98,7 @@ The state store is written under `/data/models`, so the next run picks up the wa
 curl -fsS http://127.0.0.1:8080/api/v1/health
 ```
 
-The image carries no `HEALTHCHECK` instruction, and you cannot add one: a Docker health check runs inside the container, and the image has no shell or HTTP client. The same limit applies to a Compose `healthcheck`. A Kubernetes `httpGet` probe comes from the kubelet, outside the container, so it works; the example below uses it. The health route answers whatever `Host` the probe sends, so `--ui` needs no `--allowed-host` for a probe; every other route holds the rule.
+The image carries no `HEALTHCHECK` instruction, and you cannot add one: a Docker health check runs inside the container, and the image has no shell or HTTP client. The same limit applies to a Compose `healthcheck`. A Kubernetes `httpGet` probe comes from the kubelet, outside the container, so it works. The health route answers whatever `Host` the probe sends, so `--ui` needs no `--allowed-host` for a probe; every other route holds the rule.
 
 ## Stop and drain
 
@@ -124,7 +124,7 @@ docker run --stop-timeout 125 ...
 
 `serve --scheduler` runs every pipeline's `[schedule]` in-process, like `rocky tick` on a cron. Two rules:
 
-- **One instance per project directory.** Two containers with `--scheduler` on one mount would both run what is due. Run one replica, and replace it in place rather than side by side; the example below sets `replicas: 1` and `strategy: Recreate` for that reason.
+- **One instance per project directory.** Two containers with `--scheduler` on one mount would both run what is due. Run one replica, and replace it in place rather than side by side. In Kubernetes terms that is `replicas: 1` and `strategy: Recreate`.
 - **`--ui` with `--scheduler` needs `ROCKY_WEBHOOK_SECRET`**, so the scheduler's webhook route cannot be reached with the read-only browser token.
 
 ## Verify what you pull
@@ -148,92 +148,6 @@ Rolling back is running the previous tag. When the upgrade crossed a state-schem
 ## A Compose example
 
 The repository ships [`deploy/rocky/`](https://github.com/rocky-data/rocky/tree/main/deploy/rocky): one `compose.yaml` that runs the image as a long-lived process with the UI and the scheduler, an `.env.example` for the two secrets, and a README that walks the three steps to start it. It encodes the rules on this page, one line each: the pinned tag, the loopback port, the volume, the drain grace, one replica. It is community-supported: an example to start from, not a supported deployment.
-
-## A minikube example
-
-This is an example, not a supported deployment. It follows the rules above: one replica, replaced in place, on a persistent volume, with the health probe from the kubelet and a stop grace above the drain plus 60.
-
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: rocky-serve
-stringData:
-  token: replace-me-with-openssl-rand-hex-32
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: rocky-data
-spec:
-  accessModes: [ReadWriteOnce]
-  resources:
-    requests:
-      storage: 1Gi
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: rocky
-spec:
-  replicas: 1
-  strategy:
-    type: Recreate
-  selector:
-    matchLabels:
-      app: rocky
-  template:
-    metadata:
-      labels:
-        app: rocky
-    spec:
-      # Above --drain-timeout-seconds (default 60) plus the fixed 60 s the
-      # server allows the child after its own SIGTERM. 90 is not enough.
-      terminationGracePeriodSeconds: 125
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 65532
-        fsGroup: 65532
-      containers:
-        - name: rocky
-          image: ghcr.io/rocky-data/rocky:1.74.0
-          args: ["serve", "--host", "0.0.0.0", "--ui", "--token-scope", "read-only"]
-          env:
-            - name: ROCKY_SERVE_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: rocky-serve
-                  key: token
-          ports:
-            - containerPort: 8080
-          readinessProbe:
-            httpGet:
-              path: /api/v1/health
-              port: 8080
-          livenessProbe:
-            httpGet:
-              path: /api/v1/health
-              port: 8080
-            periodSeconds: 30
-          volumeMounts:
-            - name: data
-              mountPath: /data
-      volumes:
-        - name: data
-          persistentVolumeClaim:
-            claimName: rocky-data
-```
-
-Copy a project into the volume, then reach the UI through a port-forward, which presents the `localhost` host the server allows:
-
-```bash
-kubectl apply -f rocky.yaml
-kubectl cp ./my-project "$(kubectl get pod -l app=rocky -o name | cut -d/ -f2):/data"
-kubectl port-forward deploy/rocky 8080:8080
-# open http://localhost:8080/ui/#token=<the secret's token>
-```
-
-`fsGroup: 65532` makes the volume writable by the server's user. The pod has one container and one replica because the scheduler, and the state store, allow one writer per project.
 
 ## Build the image yourself
 
