@@ -42,7 +42,7 @@ Open that address. The token travels in the URL fragment, which never reaches th
 | `ROCKY_WEBHOOK_SECRET` | `--ui --scheduler` refuses to start without it. The scheduler's webhook route authenticates with this secret, not with the bearer token. |
 | `ports: 127.0.0.1:8080:8080` | Loopback only. The server terminates no TLS and knows no users; put your own gateway in front before publishing wider, and add `--allowed-host <name>` to the command for any name the UI is reached by. |
 | `volumes: ./project:/data` | The project and, under `models/`, the state store. One mount carries both. |
-| `stop_grace_period: 90s` | `docker compose stop` sends `SIGTERM`; the server drains requests and a running scheduled child (up to `--drain-timeout-seconds`, default 60). The grace stays above that. |
+| `stop_grace_period: 125s` | `docker compose stop` sends `SIGTERM`; the server drains requests and a running scheduled child (up to `--drain-timeout-seconds`, default 60). A child still running then gets its own `SIGTERM` and a further fixed 60 s before `SIGKILL`, so the grace must exceed the drain **plus 60**. |
 | `deploy.replicas: 1` | One scheduler per project. Two instances on one volume would both run what is due. Never `--scale rocky=2`; run one service per project. |
 
 There is no `healthcheck`. A Compose health check runs inside the container, and the image has no shell or HTTP client. Probe from the host instead:
@@ -75,7 +75,7 @@ The run and the server share the state store on the volume, so the server's next
 
 ```bash
 docker compose logs -f rocky       # JSON lines on stderr, the UI address on stdout
-docker compose stop                # SIGTERM, then the drain, inside the 90 s grace
+docker compose stop                # SIGTERM, then the drain, inside the 125 s grace
 docker compose down                # also removes the container; the volume is your directory, untouched
 ```
 
