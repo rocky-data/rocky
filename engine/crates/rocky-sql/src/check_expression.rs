@@ -153,8 +153,41 @@ pub const CHECK_EXPRESSION_FUNCTIONS: &[&str] = &[
     // hashing (pure functions of their input)
     "hash",
     "md5",
+    "sha1",
+    "sha2",
     "sha256",
+    // encoding (pure)
+    "hex",
+    "to_hex",
+    "encode",
+    "decode",
+    // date formatting (pure). A grouping key very often buckets a timestamp
+    // by a formatted string.
+    "to_char",
+    "date_format",
+    "format_date",
+    // string shaping (pure)
+    "translate",
+    "initcap",
+    "ascii",
+    "chr",
+    "normalize",
+    "array_to_string",
+    "json_extract",
 ];
+
+/// Names deliberately NOT on the list, and why. Kept next to it so the next
+/// person does not "fix" an omission that is a decision.
+///
+/// | name | why not |
+/// |---|---|
+/// | `string_agg`, and aggregates generally | an aggregate is not a per-row value. A grouping key that aggregates is a defect, and a predicate cannot aggregate at all |
+/// | `uuid`, `random` | not deterministic. A non-deterministic grouping key groups nothing; refusing it is the point |
+/// | `collate` | a clause, not a scalar function |
+///
+/// These are exclusions by SEMANTICS, not by the read-boundary the rest of
+/// the list is about — they are pure, and still wrong here.
+const _NOT_ALLOWED_ON_PURPOSE: () = ();
 
 /// Niladic session-identity functions that SQL lets you write WITHOUT
 /// parentheses, lowercase.
@@ -403,6 +436,48 @@ mod tests {
             "only {exercised} case(s) actually parsed as a placeholder — the \
              skip-if-not-a-placeholder precondition has emptied this test"
         );
+    }
+
+    /// The allowlist was sized for boolean PREDICATES. Since the same
+    /// validator now guards `key_expr`, it has to admit what a real grouping
+    /// key uses — and a false refusal there breaks a working project, which
+    /// is the one direction where over-tightening costs users.
+    ///
+    /// Measured rather than assumed: each of these was refused before the
+    /// list was extended.
+    #[test]
+    fn the_allowlist_admits_what_a_real_key_expression_uses() {
+        for expr in [
+            "sha1(a)",
+            "sha2(a, 256)",
+            "hex(a)",
+            "to_hex(a)",
+            "encode(a, 'hex')",
+            "decode(a, 'hex')",
+            "to_char(t, 'YYYY')",
+            "date_format(t, 'y')",
+            "format_date('%Y', t)",
+            "translate(a, 'x', 'y')",
+            "initcap(a)",
+            "ascii(a)",
+            "chr(a)",
+            "normalize(a)",
+            "array_to_string(a, ',')",
+            "json_extract(a, '$.k')",
+        ] {
+            check(expr).unwrap_or_else(|e| panic!("a real key shape is refused: {expr} -> {e:?}"));
+        }
+    }
+
+    /// The exclusions are decisions, not omissions, so they are pinned too.
+    /// Without this, "extend the allowlist" would eventually swallow them.
+    #[test]
+    fn the_allowlist_still_refuses_what_it_should() {
+        // An aggregate is not a per-row value.
+        check("string_agg(a, ',')").expect_err("an aggregate is not a key");
+        // A non-deterministic key groups nothing.
+        check("uuid()").expect_err("uuid is not deterministic");
+        check("random()").expect_err("random is not deterministic");
     }
 
     /// A legitimate SCALAR key expression passes.

@@ -335,6 +335,18 @@ pub enum ConfigError {
          duration — use a `<N>d` / `<N>h` span (e.g. \"7d\", \"24h\")"
     )]
     PolicyBudgetInvalidWindow { rule_index: usize, window: String },
+    #[error(
+        "[checks] assertion name {name:?} on table {table:?} is reserved: it \
+         collides with the engine's own {reserved:?} result. Dagster maps \
+         every non-alphanumeric character to `_`, so {name:?} and \
+         {reserved:?} become the same check and one would be lost. Rename \
+         the assertion."
+    )]
+    ReservedAssertionName {
+        table: String,
+        name: String,
+        reserved: String,
+    },
 
     #[error(
         "[policy] rules[{rule_index}] autonomy_budget.failures = 0 is invalid — a budget must \
@@ -3460,6 +3472,28 @@ pub fn validate_freeze_marker_writes(config: &RockyConfig) -> Vec<ConfigError> {
 /// with detection silently off; `inf` is never exceeded. Rejected here, at
 /// load, so the run never starts with detection off by accident. Zero and
 /// negative values are the documented off switch and stay accepted.
+/// `CheckResult.name`s the engine emits itself, which a user assertion may
+/// not take.
+///
+/// Dagster maps every character outside `[A-Za-z0-9_]` to `_`
+/// (`sanitize_check_name`), then keys results by
+/// `(asset_key, sanitized_name)` with no dedup — so two results that sanitize
+/// alike are one check, and one of them is lost. Reserving the engine's own
+/// names is cheaper than detecting the collision after it has eaten a result.
+///
+/// Compared AFTER the same sanitization, so `quarantine:compile`,
+/// `quarantine_compile` and `quarantine.compile` are all refused — checking
+/// the raw string would miss the spellings that collide only once mapped.
+const RESERVED_CHECK_NAMES: &[&str] = &["quarantine:compile"];
+
+/// Lowercase, with every non-alphanumeric character mapped to `_` — the same
+/// shape `dagster_rocky.contracts.sanitize_check_name` produces.
+fn sanitized_check_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
 pub fn validate_checks(config: &RockyConfig) -> Vec<ConfigError> {
     let mut errors = Vec::new();
     for (name, pipeline) in &config.pipelines {
@@ -3469,6 +3503,22 @@ pub fn validate_checks(config: &RockyConfig) -> Vec<ConfigError> {
                 pipeline: name.clone(),
                 value: threshold.to_string(),
             });
+        }
+        for assertion in &pipeline.checks().assertions {
+            let Some(declared) = assertion.name.as_deref() else {
+                continue;
+            };
+            let sanitized = sanitized_check_name(declared);
+            if let Some(reserved) = RESERVED_CHECK_NAMES
+                .iter()
+                .find(|r| sanitized_check_name(r) == sanitized)
+            {
+                errors.push(ConfigError::ReservedAssertionName {
+                    table: assertion.table.clone(),
+                    name: declared.to_string(),
+                    reserved: (*reserved).to_string(),
+                });
+            }
         }
     }
     errors
@@ -8506,6 +8556,89 @@ autonomy_budget = { failures = 0, window = "7d" }
                 [ConfigError::PolicyBudgetZeroFailures { rule_index: 0 }]
             ),
             "got {errors:?}"
+        );
+    }
+
+    /// The engine emits a `quarantine:compile` check of its own. A user
+    /// assertion may not take that name, in ANY spelling that sanitizes to
+    /// the same thing.
+    ///
+    /// Dagster maps every non-alphanumeric character to `_` and then keys by
+    /// `(asset_key, sanitized_name)` with no dedup, so `quarantine:compile`
+    /// and `quarantine_compile` are one check and one result is lost.
+    /// Comparing the raw strings would catch only the first spelling.
+    #[test]
+    fn a_reserved_assertion_name_is_refused_in_every_spelling() {
+        for spelling in [
+            "quarantine:compile",
+            "quarantine_compile",
+            "quarantine.compile",
+        ] {
+            let cfg = parse(&format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.dq]
+type = "quality"
+
+[pipeline.dq.target]
+adapter = "default"
+
+[[pipeline.dq.checks.assertions]]
+table = "orders"
+name = "{spelling}"
+type = "not_null"
+column = "id"
+"#
+            ));
+            let errors = validate_checks(&cfg);
+            assert!(
+                errors.iter().any(|e| matches!(
+                    e,
+                    ConfigError::ReservedAssertionName { name, .. } if name == spelling
+                )),
+                "{spelling} must be refused: {errors:?}"
+            );
+        }
+    }
+
+    /// The control: an ordinary assertion name is untouched, and an assertion
+    /// with NO explicit name is untouched. Without this, the refusal above
+    /// would also pass on a change that rejected every assertion.
+    #[test]
+    fn an_ordinary_assertion_name_is_not_reserved() {
+        let cfg = parse(
+            r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.dq]
+type = "quality"
+
+[pipeline.dq.target]
+adapter = "default"
+
+[[pipeline.dq.checks.assertions]]
+table = "orders"
+name = "orders_id_present"
+type = "not_null"
+column = "id"
+
+[[pipeline.dq.checks.assertions]]
+table = "orders"
+type = "not_null"
+column = "name"
+"#,
+        );
+        let errors = validate_checks(&cfg);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ConfigError::ReservedAssertionName { .. })),
+            "an ordinary name must pass: {errors:?}"
         );
     }
 
