@@ -2418,8 +2418,8 @@ async fn an_unreadable_batched_row_count_cell_is_omitted_from_the_results() {
 /// emit no check" — so the check silently vanished.
 ///
 /// A genuine SQL NULL is the control: it must STILL be returned with `None`,
-/// because an empty table really has no freshness to measure. A fix that
-/// omits both would pass the unreadable half and break the empty half.
+/// because a table with no maximum to read has no freshness to measure. A fix
+/// that omits both would pass the unreadable half and break that one.
 ///
 /// Drives `batch_freshness`, which crosses both collapse points: the cell read
 /// in `batch.rs` and the timestamp parse in `adapter.rs`.
@@ -2482,11 +2482,12 @@ async fn an_unreadable_freshness_timestamp_is_omitted_and_a_null_is_kept() {
         .map(|r| (r.table.table.as_str(), r.max_timestamp.is_some()))
         .collect();
 
-    // The control: a genuine SQL NULL is an empty table and must still be
-    // RETURNED, carrying `None`, so no check is emitted for it.
+    // The control: a genuine SQL NULL must still be RETURNED carrying `None`,
+    // so no check is emitted. Correct for an empty table; a non-empty table
+    // whose `ts` is all NULL reaches the same NULL (#1930).
     assert!(
         named.contains(&("empty", false)),
-        "a genuine NULL is an empty table and must still be returned: {named:?}"
+        "a genuine NULL must still be returned: {named:?}"
     );
 
     // The measured one survives untouched.
