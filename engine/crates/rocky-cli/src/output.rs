@@ -5336,13 +5336,30 @@ impl RunOutput {
     /// Failed checks across every table result, bucketed as
     /// `(error_severity, warning_severity)`.
     ///
-    /// A check the engine could not evaluate is a failure here: every
-    /// `*_not_evaluated` constructor in `rocky_core::checks` sets
-    /// `passed: false`, so it lands in its own severity's bucket rather than
-    /// vanishing from the tally. Severity is the check's own — a
-    /// `not_evaluated` assertion declared `severity = "warning"` counts as a
-    /// warning, because a check the user made advisory does not become
-    /// gating by failing to run.
+    /// A check the engine could not evaluate is a failure here, and always an
+    /// ERROR one. Severity grades a MEASUREMENT: `severity = "warning"` means
+    /// "a violation is advisory", never "a check I could not run is advisory"
+    /// (#1741). Only a check that RAN and failed reaches the warning bucket.
+    ///
+    /// ```text
+    ///   passed   not_evaluated   declared     bucket
+    ///   false    Some(reason)    warning  ->  error     <- never advisory
+    ///   false    Some(reason)    error    ->  error
+    ///   false    None            warning  ->  warning
+    ///   false    None            error    ->  error
+    ///   true     -               -        ->  neither
+    /// ```
+    ///
+    /// Two locks hold row one. Every `*_not_evaluated` constructor in
+    /// `rocky_core::checks` hard-codes `Error` (pinned exhaustively by
+    /// `not_evaluated_constructors_fail_and_round_trip_through_json`), and the
+    /// `not_evaluated` arm below reads the field directly. The second lock is
+    /// there because the first one is not enough on its own: #1871 overwrote
+    /// that severity AFTER construction at two call sites in `commands/run.rs`,
+    /// and this function — reading severity alone — let the run through.
+    ///
+    /// Pinned by `check_failures_by_severity_buckets_every_unevaluated_check_as_an_error`
+    /// and `the_gate_buckets_an_unevaluated_failure_as_an_error_whatever_its_severity`.
     ///
     /// Shared by the replication gate (`commands/run.rs`) and the quality
     /// runner (`commands/run_local.rs`) so both bucket identically.
@@ -5353,6 +5370,13 @@ impl RunOutput {
         for table in &self.check_results {
             for check in &table.checks {
                 if check.passed {
+                    continue;
+                }
+                // Read before severity, not after: this is the whole point of
+                // the second lock. A result whose severity was overwritten
+                // after construction still gates (#1871).
+                if check.not_evaluated.is_some() {
+                    error += 1;
                     continue;
                 }
                 match check.severity {
@@ -7064,6 +7088,43 @@ mod run_record_tests {
             ],
         ));
         assert_eq!(out.check_failures_by_severity(), (2, 1));
+    }
+
+    /// The same rule, asserted where the site guards cannot mask it (#1871).
+    ///
+    /// The test above builds its unevaluated checks from the constructors, so
+    /// it passes whether the gate reads `not_evaluated` or only the `Error`
+    /// those constructors chose. It proves the CONSTRUCTORS are right, not the
+    /// gate. This one hand-builds the state no constructor can produce —
+    /// `not_evaluated` set AND `Warning` — which is exactly what #1871
+    /// produced by overwriting severity after construction.
+    ///
+    /// So this is the only test that fails when the gate's `not_evaluated`
+    /// arm is removed. Delete that arm and the count below is `(0, 1)`: the
+    /// run reports one warning, the gate reads zero errors, and a replication
+    /// run that measured nothing exits 0 with `status: "Success"`.
+    #[test]
+    fn the_gate_buckets_an_unevaluated_failure_as_an_error_whatever_its_severity() {
+        use rocky_core::tests::TestSeverity;
+
+        // The #1871 shape, built the way #1871 built it.
+        let mut downgraded =
+            rocky_core::checks::row_count_not_evaluated("the row count query failed");
+        downgraded.severity = TestSeverity::Warning;
+        assert!(
+            downgraded.not_evaluated.is_some() && !downgraded.passed,
+            "the fixture must carry the unevaluated shape: {downgraded:?}"
+        );
+
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.check_results
+            .push(checks_for("orders", vec![downgraded]));
+
+        assert_eq!(
+            out.check_failures_by_severity(),
+            (1, 0),
+            "a check that did not run gates however its severity was written"
+        );
     }
 
     /// The whole point of the gate being a separate field: the persisted
