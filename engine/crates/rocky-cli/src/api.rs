@@ -6148,9 +6148,13 @@ mod tests {
     ///   request 1   -> parks in read_to_string on the FIFO, holding the permit
     ///   request 2   -> 503 engine_busy, at once (not queued behind it)
     ///   request 1   -> 504 settings_config_timeout after the deadline
-    ///   write+close -> the parked read completes and releases the lane
+    ///   writer @7s -> the parked read completes and releases the lane
     ///   request 3   -> 200, the route recovers
     /// ```
+    ///
+    /// The writer is unconditional and starts before the first assertion, so a
+    /// failing run still unblocks the read and the test FAILS rather than
+    /// hanging.
     ///
     /// Unix-only: it needs a FIFO. The repo already guards filesystem-shape
     /// tests this way.
@@ -6173,6 +6177,28 @@ mod tests {
                 .success(),
             "could not create the FIFO this test needs"
         );
+
+        // THE FIFO MUST ALWAYS BE UNBLOCKED, including on a failed assertion.
+        //
+        // `spawn_blocking` cannot be cancelled, and dropping a tokio runtime
+        // waits for its blocking tasks. So a panic while request 1 is parked in
+        // `read_to_string` leaves that task blocked forever and the test BINARY
+        // hangs instead of failing — which is how the first version of this
+        // test sat stuck for eight hours under a mutation rather than reporting
+        // the mutation.
+        //
+        // An unconditional writer, started before anything that can panic,
+        // removes that: whatever the test does, the read completes and the
+        // runtime can drop. It writes after the deadline below has elapsed, so
+        // it does not shorten the timeout it is there to let us observe.
+        let writer_path = fifo.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(7));
+            // Opening a FIFO for write blocks until a reader is present; the
+            // parked read IS that reader. If it already finished, this errors
+            // rather than blocking the process, and either way we ignore it.
+            let _ = std::fs::write(&writer_path, "[adapter]\ntype = \"duckdb\"\n");
+        });
 
         // No token configured, so the requests below need no header.
         let state = ServerState::with_auth_and_webhook(
@@ -6236,18 +6262,16 @@ mod tests {
             "the parked caller must time out rather than hang forever"
         );
 
-        // Unblock the parked read; it completes, caches, and frees the lane.
-        std::fs::write(&fifo, "[adapter]\ntype = \"duckdb\"\n").unwrap();
-
-        // RECOVERY: the route works again once the read returns.
+        // RECOVERY: once the writer above unblocks the read, it completes,
+        // caches, frees the lane, and the route works again.
         let mut recovered = 0;
-        for _ in 0..400 {
+        for _ in 0..600 {
             let status = client.get(&url).send().await.unwrap().status();
             if status == 200 {
                 recovered = 200;
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         assert_eq!(
             recovered, 200,
