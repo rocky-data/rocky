@@ -111,8 +111,12 @@ use crate::output::{
     DagNodeStatusOutput, DagOutput, DagStatusOutput, ErrorEnvelope, HealthOutput, HistoryOutput,
     JobKind, JobState, JobStatus, LineageOutput, MetaOutput, MetricsOutput, ModelColumnOutput,
     ModelDetailOutput, ModelHistoryOutput, ModelListEntry, ModelListOutput, ScheduleSpoolOutput,
-    ScheduleStatusOutput, TypedColumnOutput, cap_model_sql,
+    ScheduleStatusOutput, SettingsOutput, TokenScopeLabel, TokenSettings, TypedColumnOutput,
+    WebhookSecretStatus, cap_model_sql,
 };
+
+use crate::output::ConfigStatus;
+use rocky_server::auth::TokenScope;
 
 /// Bind config for [`serve`].
 ///
@@ -185,6 +189,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/schedule", get(schedule_status))
         .route("/api/v1/schedule/spool", get(schedule_spool))
+        .route("/api/v1/settings", get(settings))
         .route("/api/v1/policy", get(policy_show))
         .route("/api/v1/products", get(list_products))
         .route("/api/v1/products/{name}", get(get_product))
@@ -815,6 +820,7 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "GET /api/v1/jobs/{id}",
         "GET /api/v1/schedule",
         "GET /api/v1/schedule/spool",
+        "GET /api/v1/settings",
         "GET /api/v1/policy",
         "GET /api/v1/products",
         "GET /api/v1/products/{name}",
@@ -2117,6 +2123,176 @@ async fn schedule_status(
     .await?
     .map_err(|e| map_schedule_err(e, running_job_id))?;
     Ok(PrettyJson(output))
+}
+
+/// `GET /api/v1/settings`: the running server's posture — how it is bound, what
+/// it will accept, and whether the pieces an operator is about to turn on are
+/// configured.
+///
+/// **The allowlist lives in [`settings_output`]**, which builds the document
+/// field by field from primitives. Nothing here serialises a `RockyConfig`, so
+/// no adapter `.extra` map and no resolved `${VAR}` can reach the response.
+/// `settings_never_discloses_a_configured_secret` greps every route's body for
+/// three real secrets, and `settings_reports_exactly_the_allowlisted_fields`
+/// fails when a field is *added* — an allowlist, not a denylist.
+///
+/// Almost every value was resolved at startup and cannot fail here. The two
+/// `[state]` labels are the exception: they need one `rocky.toml` read, which
+/// is why this route can answer `503 engine_busy` (that read is already in
+/// flight, or missed its deadline) or `500` (it panicked). See
+/// [`resolve_config_labels`].
+async fn settings(
+    State(state): State<Arc<ServerState>>,
+) -> Result<PrettyJson<SettingsOutput>, ApiError> {
+    let labels = resolve_config_labels(&state).await?;
+    Ok(PrettyJson(settings_output(&state, labels)))
+}
+
+/// How long the one `rocky.toml` read behind this route may take before the
+/// caller is told to retry. Generous for a local file; the point is that it
+/// ends, not that it is tight.
+const SETTINGS_CONFIG_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The `[state]` labels, read from `rocky.toml` once and then fixed.
+///
+/// # Why this is not read at startup
+///
+/// Every other field in the document is a flag or an env var. These come from a
+/// file, and on a plain `rocky serve` nothing on the path to
+/// `TcpListener::bind` reads one: `build_serve_state` does env and path work
+/// only, and `serve` does a state-store sweep. (The initial compile reads the
+/// config, but on its own spawned task, so it does not gate the listener.)
+/// Reading it eagerly in `build_serve_state` would put a blocking full-file
+/// read *on* that path, so a `rocky.toml` that is a FIFO or sits on a stalled
+/// mount would stop the server binding at all. Loader *errors* are already
+/// tolerated; a read that never returns is not something tolerance catches.
+///
+/// The exception, which this does not fix and did not introduce: `--scheduler`
+/// without an explicit `--poll-interval` calls `resolved_poll_interval` before
+/// `api::serve`, and that loads the config synchronously. On that path a stuck
+/// `rocky.toml` already blocks the bind.
+///
+/// # Why it is bounded
+///
+/// Moving the read here must not simply move the hang. `spawn_blocking` cannot
+/// be cancelled, so a stuck read holds its worker for the life of the process,
+/// and `OnceLock::get_or_init` makes every concurrent caller wait on the one
+/// initializer. Unbounded, enough authenticated requests would starve unrelated
+/// `spawn_blocking` work — the state-store reads especially.
+///
+/// So it takes the same shape as the sample route: one permit, refused
+/// immediately rather than queued, and a deadline. The permit travels into the
+/// blocking stage so a read that outlives the deadline keeps the lane until it
+/// returns (#1816). At most one worker can ever be stuck on this.
+///
+/// Once the cell is set every later caller takes the fast path and touches
+/// neither the permit nor the disk.
+async fn resolve_config_labels(
+    state: &Arc<ServerState>,
+) -> Result<rocky_server::state::ConfigLabels, ApiError> {
+    if let Some(labels) = state.settings.config_labels.get() {
+        return Ok(*labels);
+    }
+
+    let Ok(permit) = Arc::clone(&state.settings_reads).try_acquire_owned() else {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "engine_busy",
+            "another settings read is in flight",
+            Some("retry in a moment; rocky.toml is read once per server"),
+        )
+        .retry_after(5));
+    };
+
+    let for_read = state.clone();
+    let read = tokio::task::spawn_blocking(move || {
+        // Held for the life of the read, not just the spawn. Dropping this
+        // early is exactly the mutation that removes the bound, so
+        // `the_permit_is_held_for_the_whole_read` pins it.
+        let _permit = permit;
+
+        *for_read
+            .settings
+            .config_labels
+            .get_or_init(|| crate::commands::serve::config_posture(for_read.config_path.as_deref()))
+    });
+
+    match tokio::time::timeout(SETTINGS_CONFIG_READ_TIMEOUT, read).await {
+        Ok(Ok(labels)) => Ok(labels),
+        // A panicked read is a task failure, not a verdict about the config —
+        // reporting it as `config_status: unreadable` would claim we read the
+        // file and found it bad. `internal_error` is the stable token for this.
+        Ok(Err(e)) => Err(ApiError::internal(format!(
+            "the settings config read panicked: {e}"
+        ))),
+        // OUR deadline, not contention — and deliberately not `engine_busy`
+        // with a `Retry-After`. A read that blew the deadline is usually a
+        // `rocky.toml` that will never return, so telling the caller to retry
+        // in five seconds promises something that cannot happen. Same split the
+        // sample route makes: contention is `503 engine_busy`, its own deadline
+        // is a `504` with no retry hint.
+        Err(_) => Err(ApiError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "settings_config_timeout",
+            format!("reading rocky.toml did not finish within {SETTINGS_CONFIG_READ_TIMEOUT:?}"),
+            Some(
+                "check that rocky.toml is a regular file on responsive storage; \
+                 every other field on this route is unaffected",
+            ),
+        )),
+    }
+}
+
+/// Project [`ServerState`] onto the settings document.
+///
+/// Split out of the handler so a test can cross the SAME mapping production
+/// serves — the lesson `build_serve_state` records one level up. This function
+/// IS the allowlist: every field is named here, and each `match` is exhaustive,
+/// so a new posture variant fails to compile rather than serialising silently.
+pub(crate) fn settings_output(
+    state: &ServerState,
+    labels: rocky_server::state::ConfigLabels,
+) -> SettingsOutput {
+    use rocky_server::state::{ConfigStatus as SnapStatus, WebhookSecret};
+
+    let snapshot = &state.settings;
+    SettingsOutput {
+        bind_host: snapshot.bind_host.clone(),
+        // What the guard ENFORCES. `--allowed-host` is only wired into a guard
+        // under `--ui`, so with no UI there is no list -- reporting the flags
+        // anyway would claim a check that is not running.
+        allowed_hosts: state
+            .ui
+            .as_ref()
+            .map(|ui| ui.allowed_hosts.clone())
+            .unwrap_or_default(),
+        // The ENFORCED allowlist, not the typed one: `build_cors_layer` drops
+        // an origin that is not a valid header value, so the raw list can name
+        // an origin the browser will never be granted.
+        allowed_origins: rocky_server::auth::enforced_cors_origins(&state.allowed_origins),
+        scheduler: snapshot.scheduler,
+        ui: state.ui.is_some(),
+        webhook_secret: match snapshot.webhook_secret {
+            WebhookSecret::Present => WebhookSecretStatus::Present,
+            WebhookSecret::Absent => WebhookSecretStatus::Absent,
+            WebhookSecret::SetButUnusable => WebhookSecretStatus::SetButUnusable,
+        },
+        // `.secret` is deliberately not read. Only the scope crosses.
+        token: state.auth.as_ref().map(|token| TokenSettings {
+            name: "default".to_string(),
+            scope: match token.scope {
+                TokenScope::Full => TokenScopeLabel::Full,
+                TokenScope::ReadOnly => TokenScopeLabel::ReadOnly,
+            },
+        }),
+        state_backend: labels.state_backend,
+        concurrency_control: labels.concurrency_control,
+        config_status: match labels.config_status {
+            SnapStatus::Loaded => ConfigStatus::Loaded,
+            SnapStatus::Absent => ConfigStatus::Absent,
+            SnapStatus::Unreadable => ConfigStatus::Unreadable,
+        },
+    }
 }
 
 /// `GET /api/v1/schedule/spool`: the webhook demands accepted but not yet
@@ -4510,6 +4686,10 @@ mod tests {
                 allowed_hosts: allowed_hosts.iter().map(ToString::to_string).collect(),
                 assets: Arc::new(InMemoryAssets(files)),
             }),
+            rocky_server::state::SettingsSnapshot {
+                bind_host: "127.0.0.1".to_string(),
+                ..Default::default()
+            },
         )
     }
 
@@ -5803,6 +5983,550 @@ mod tests {
         assert_eq!(api.counts.scheduled, reference.counts.scheduled);
         assert_eq!(api.pipelines.len(), reference.pipelines.len());
         assert_eq!(api.pipelines[0].cron, reference.pipelines[0].cron);
+    }
+
+    // --- GET /api/v1/settings -------------------------------------------
+
+    /// The three secrets the containment tests configure, each paired with a
+    /// name to report INSTEAD of its value.
+    const SECRETS: [(&str, &str); 3] = [
+        ("the Bearer token", "BEARER_SECRET_ABC"),
+        ("the webhook secret", "WEBHOOK_SECRET_DEF"),
+        ("a credential from the config", "CONFIG_SECRET_XYZ"),
+    ];
+
+    /// A project whose config carries a credential, plus a Bearer token and a
+    /// webhook secret — three real secrets, in the three places a settings
+    /// route could leak one from.
+    fn project_with_three_secrets() -> (tempfile::TempDir, Arc<ServerState>) {
+        use rocky_server::auth::{ServeToken, TokenScope};
+
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("m.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("m.toml"),
+            "name = \"m\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"test.duckdb\"\n\n\
+             [pipeline.sales]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.sales.target]\nadapter = \"default\"\n\n\
+             [state]\nbackend = \"valkey\"\n\
+             valkey_url = \"redis://user:CONFIG_SECRET_XYZ@localhost:6379\"\n",
+        )
+        .unwrap();
+
+        let state = ServerState::with_auth_and_webhook(
+            models_dir,
+            false,
+            None,
+            Some(config_path),
+            Some(ServeToken {
+                secret: "BEARER_SECRET_ABC".to_string(),
+                scope: TokenScope::ReadOnly,
+            }),
+            // One origin CORS can install and one it cannot. The invalid one is
+            // what makes `allowed_origins` load-bearing: with a valid-only list
+            // the raw and the enforced list are identical, so no assertion on
+            // this fixture could tell a correct projection from a raw one.
+            vec![
+                "https://example.test".to_string(),
+                "https://in\nvalid.test".to_string(),
+            ],
+            None,
+            Some(rocky_server::webhook_ingress::WebhookIngress {
+                secret: Some("WEBHOOK_SECRET_DEF".to_string()),
+                bind_is_loopback: true,
+                rocky_dir: dir.path().join(".rocky"),
+                rate_limiter: rocky_server::webhook_ingress::WebhookRateLimiter::new(10.0),
+            }),
+            None,
+            rocky_server::state::SettingsSnapshot {
+                bind_host: "127.0.0.1".to_string(),
+                scheduler: true,
+                webhook_secret: rocky_server::state::WebhookSecret::Present,
+                // Left unresolved, exactly as `build_serve_state` leaves it;
+                // each test projects with the labels it wants.
+                config_labels: std::sync::OnceLock::new(),
+            },
+        );
+        (dir, state)
+    }
+
+    /// **Red team, round 2.** The one `rocky.toml` read behind this route is
+    /// admission-controlled, so a stuck file cannot occupy blocking workers
+    /// without bound.
+    ///
+    /// `spawn_blocking` cannot be cancelled and `OnceLock::get_or_init` makes
+    /// every concurrent caller wait on the one initializer, so without a permit
+    /// each concurrent request would hold another worker forever and starve
+    /// unrelated blocking work — the state-store reads especially.
+    ///
+    /// Holding the permit stands in for a read that has not finished.
+    #[tokio::test]
+    async fn a_settings_read_already_in_flight_is_refused_not_queued() {
+        let (_dir, state) = project_with_three_secrets();
+        assert!(
+            state.settings.config_labels.get().is_none(),
+            "the fixture must start unresolved or this exercises the fast path"
+        );
+
+        // Stand in for a read still running.
+        let _held = Arc::clone(&state.settings_reads)
+            .try_acquire_owned()
+            .expect("the lane starts free");
+
+        let base = spawn_router(state).await;
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/api/v1/settings"))
+            .header("Authorization", "Bearer BEARER_SECRET_ABC")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            503,
+            "a second read must be refused immediately, not queued behind the first"
+        );
+        assert!(resp.headers().contains_key("retry-after"));
+    }
+
+    /// The other half: once the labels are resolved, later callers take the
+    /// fast path and touch neither the permit nor the disk.
+    ///
+    /// Without this, the refusal above could be satisfied by a route that is
+    /// permanently broken after one slow read.
+    #[tokio::test]
+    async fn a_resolved_settings_read_needs_no_permit() {
+        let (_dir, state) = project_with_three_secrets();
+        // Resolve once, the way the first request would.
+        let Ok(_) = resolve_config_labels(&state).await else {
+            panic!("the first read must resolve");
+        };
+        assert!(state.settings.config_labels.get().is_some());
+
+        // The lane is now irrelevant: hold it and the route still answers.
+        let _held = Arc::clone(&state.settings_reads)
+            .try_acquire_owned()
+            .expect("the lane is free again once the read finished");
+
+        let base = spawn_router(state).await;
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/api/v1/settings"))
+            .header("Authorization", "Bearer BEARER_SECRET_ABC")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            200,
+            "a resolved read must not queue behind the admission lane"
+        );
+    }
+
+    /// **Red team, round 3.** The whole lifecycle of the bounded config read,
+    /// driven by the hazard it exists for: a `rocky.toml` that is a FIFO, so
+    /// `read_to_string` genuinely never returns until this test lets it.
+    ///
+    /// The earlier admission tests could not see any of this. Holding the
+    /// permit from outside shows that a held permit refuses a second caller; it
+    /// does not show the production path holds one for the read's DURATION.
+    /// Dropping the permit inside the blocking closure leaves those tests
+    /// passing while every concurrent request goes back to occupying its own
+    /// blocking worker — the entire bound, silently gone.
+    ///
+    /// ```text
+    ///   request 1   -> parks in read_to_string on the FIFO, holding the permit
+    ///   request 2   -> 503 engine_busy, at once (not queued behind it)
+    ///   request 1   -> 504 settings_config_timeout after the deadline
+    ///   write+close -> the parked read completes and releases the lane
+    ///   request 3   -> 200, the route recovers
+    /// ```
+    ///
+    /// Unix-only: it needs a FIFO. The repo already guards filesystem-shape
+    /// tests this way.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stuck_config_read_is_bounded_refused_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+
+        // A `rocky.toml` that is a FIFO: `read_to_string` blocks until someone
+        // writes and closes it. This is the hazard the bound exists for, not a
+        // stand-in for it.
+        let fifo = dir.path().join("rocky.toml");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("mkfifo runs")
+                .success(),
+            "could not create the FIFO this test needs"
+        );
+
+        // No token configured, so the requests below need no header.
+        let state = ServerState::with_auth_and_webhook(
+            models_dir,
+            false,
+            None,
+            Some(fifo.clone()),
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            rocky_server::state::SettingsSnapshot {
+                bind_host: "127.0.0.1".to_string(),
+                ..Default::default()
+            },
+        );
+        assert!(state.settings.config_labels.get().is_none());
+
+        let base = spawn_router(state.clone()).await;
+        let client = reqwest::Client::new();
+        let url = format!("{base}/api/v1/settings");
+
+        // Request 1 parks inside the read, holding the permit.
+        let first = tokio::spawn({
+            let client = client.clone();
+            let url = url.clone();
+            async move { client.get(url).send().await.unwrap().status() }
+        });
+
+        // Wait for it to actually take the lane.
+        let mut taken = false;
+        for _ in 0..400 {
+            if Arc::clone(&state.settings_reads)
+                .try_acquire_owned()
+                .is_err()
+            {
+                taken = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(taken, "the read never took the admission lane");
+
+        // THE BOUND: a second caller is refused at once, not queued behind a
+        // read that may never return.
+        let second = client.get(&url).send().await.unwrap();
+        assert_eq!(
+            second.status(),
+            503,
+            "a second read must be refused, not queued"
+        );
+        assert!(second.headers().contains_key("retry-after"));
+
+        // The first caller gets its own deadline back -- 504, and deliberately
+        // NOT 503 with a retry hint, because this read will not finish on its
+        // own.
+        assert_eq!(
+            first.await.unwrap(),
+            504,
+            "the parked caller must time out rather than hang forever"
+        );
+
+        // Unblock the parked read; it completes, caches, and frees the lane.
+        std::fs::write(&fifo, "[adapter]\ntype = \"duckdb\"\n").unwrap();
+
+        // RECOVERY: the route works again once the read returns.
+        let mut recovered = 0;
+        for _ in 0..400 {
+            let status = client.get(&url).send().await.unwrap().status();
+            if status == 200 {
+                recovered = 200;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            recovered, 200,
+            "the route must recover once the stuck read finally returns"
+        );
+    }
+
+    /// **Red team, round 1.** `build_cors_layer` drops an origin that is not a
+    /// valid header value, so the raw `--allowed-origin` list and the list CORS
+    /// enforces are not the same thing. Reporting the raw one would name an
+    /// origin the browser is never granted — the same defect `allowed_hosts`
+    /// already avoids, in the field next to it.
+    ///
+    /// Both now come from one derivation (`auth::accepted_origins`), so this
+    /// pins the report to the layer rather than to a second copy of the filter.
+    #[tokio::test]
+    async fn allowed_origins_report_what_cors_enforces() {
+        use rocky_server::auth::enforced_cors_origins;
+
+        // A bare newline cannot be a header value, so CORS silently drops it.
+        let typed = vec![
+            "https://good.test".to_string(),
+            "https://bad\n.test".to_string(),
+        ];
+        assert_eq!(
+            enforced_cors_origins(&typed),
+            ["https://good.test"],
+            "the enforced list must exclude what the layer could not install"
+        );
+
+        let (_dir, state) = project_with_three_secrets();
+        let output = settings_output(
+            &state,
+            crate::commands::serve::config_posture(state.config_path.as_deref()),
+        );
+        // The fixture configures one installable origin and one that is not.
+        // The valid one survives (so the filter does not simply empty the
+        // field) and the invalid one is absent (so the route is not echoing
+        // what was typed).
+        assert_eq!(output.allowed_origins, ["https://example.test"]);
+        assert_eq!(
+            enforced_cors_origins(&state.allowed_origins).len(),
+            state.allowed_origins.len() - 1,
+            "the fixture must hold exactly one origin CORS cannot install, or \
+             the raw and enforced lists are identical and this proves nothing"
+        );
+    }
+
+    /// **The containment contract, across every safe route.**
+    ///
+    /// `settings_never_discloses_a_configured_secret` proves one route is
+    /// clean. The claim a token holder actually cares about is broader: nothing
+    /// I can GET hands back a secret. So this walks the live route table with
+    /// three real secrets configured and greps every response body.
+    ///
+    /// Non-200s are grepped, not skipped. An error envelope that echoes a
+    /// config value back is the classic leak site, and a route that 404s on
+    /// this fixture still proves its error path is clean.
+    ///
+    /// Safe methods only. The mutating routes would submit real jobs, and a
+    /// containment test must not run a pipeline to make its point.
+    ///
+    /// **What it proves, precisely.** That every GET the route table declares
+    /// answers without echoing a secret. It walks `api_v1_routes()`, and
+    /// `paths_match_live_router_routes` is what pins that table to the live
+    /// router — neither test proves router coverage alone. Many routes answer
+    /// 4xx on this fixture; those bodies are still grepped, because an error
+    /// envelope that echoes a config value is the classic leak site. It is not
+    /// a claim that every SUCCESS path was exercised.
+    #[tokio::test]
+    async fn no_safe_route_discloses_a_configured_secret() {
+        let (_dir, state) = project_with_three_secrets();
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+
+        let mut checked = 0;
+        for route in api_v1_routes() {
+            let Some(path) = route.strip_prefix("GET ") else {
+                continue;
+            };
+            // Placeholders get values that exist in this fixture where one
+            // does, and arbitrary ones otherwise -- a 404's body is still a
+            // body worth grepping.
+            let path = path
+                .replace("{name}", "m")
+                // A real plan-id SHAPE (64 lower-case hex). `p1` would be
+                // rejected by `is_plan_id` and 404 without the handler ever
+                // touching disk, so the review routes would contribute only a
+                // rejection body.
+                .replace("{plan_id}", &"a".repeat(64))
+                .replace("{id}", "1")
+                .replace("{subject}", "s1")
+                .replace("{column}", "id")
+                .replace("{pipeline}", "sales");
+
+            let resp = client
+                .get(format!("{base}{path}"))
+                .header("Authorization", "Bearer BEARER_SECRET_ABC")
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("{path} did not answer: {e}"));
+            let status = resp.status();
+            let body = resp.text().await.unwrap();
+
+            for (label, secret) in SECRETS {
+                assert!(
+                    !body.contains(secret),
+                    "GET {path} answered {status} and disclosed {label}"
+                );
+            }
+            checked += 1;
+        }
+
+        // Without this the loop could cover nothing and still pass -- the
+        // failure mode that makes a containment test look green while proving
+        // nothing.
+        assert!(
+            checked >= 20,
+            "only {checked} routes were exercised; the walk is not covering the router"
+        );
+    }
+
+    /// **The allowlist.** Asserts the document's field list against a literal,
+    /// so ADDING a field fails this test — a denylist would only catch fields
+    /// someone already thought were dangerous.
+    ///
+    /// This is the half the secret grep cannot do: a grep passes for a field
+    /// that happens to be empty in the fixture and populated in production.
+    /// Same lesson as #1874's `conditions`.
+    #[tokio::test]
+    async fn settings_reports_exactly_the_allowlisted_fields() {
+        let (_dir, state) = project_with_three_secrets();
+        let value = serde_json::to_value(settings_output(
+            &state,
+            crate::commands::serve::config_posture(state.config_path.as_deref()),
+        ))
+        .unwrap();
+
+        let mut fields: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+
+        assert_eq!(
+            fields,
+            [
+                "allowed_hosts",
+                "allowed_origins",
+                "bind_host",
+                "concurrency_control",
+                "config_status",
+                "scheduler",
+                "state_backend",
+                "token",
+                "ui",
+                "webhook_secret",
+            ],
+            "the settings document grew or lost a field. This is an ALLOWLIST: \
+             a new field must be a deliberate act, reviewed for what it \
+             discloses, not something that arrives because a struct changed."
+        );
+
+        // The nested token object is part of the same allowlist.
+        let mut token_fields: Vec<&str> = value["token"]
+            .as_object()
+            .expect("the fixture configures a token")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        token_fields.sort_unstable();
+        assert_eq!(token_fields, ["name", "scope"]);
+    }
+
+    /// Three configured secrets, none of which may appear in the body.
+    ///
+    /// The fixture is asserted to actually HOLD each secret first. Without that
+    /// the grep is worthless: it would pass just as happily against a state
+    /// where nothing was configured, which is the failure mode that makes a
+    /// containment test look green while proving nothing.
+    #[tokio::test]
+    async fn settings_never_discloses_a_configured_secret() {
+        let (_dir, state) = project_with_three_secrets();
+
+        // The fixture really does carry all three.
+        assert_eq!(
+            state.auth.as_ref().unwrap().secret,
+            "BEARER_SECRET_ABC",
+            "the fixture must hold a real Bearer secret or the grep proves nothing"
+        );
+        assert_eq!(
+            state.webhook.as_ref().unwrap().secret.as_deref(),
+            Some("WEBHOOK_SECRET_DEF"),
+            "the fixture must hold a real webhook secret"
+        );
+        let config = rocky_core::config::load_optional_project_config(state.config_path.as_deref())
+            .expect("fixture config parses")
+            .expect("fixture has a config");
+        assert!(
+            config
+                .state
+                .valkey_url
+                .as_ref()
+                .is_some_and(|url| url.expose().contains("CONFIG_SECRET_XYZ")),
+            "the fixture must hold a real credential inside the config"
+        );
+
+        let body = serde_json::to_string(&settings_output(
+            &state,
+            crate::commands::serve::config_posture(state.config_path.as_deref()),
+        ))
+        .unwrap();
+        // Named, never printed. The obvious spelling interpolates the secret
+        // AND the body into the failure message, so a containment test that
+        // fails writes the value into the log it exists to keep it out of.
+        // CodeQL flags it as cleartext logging, and is right to.
+        for (label, secret) in SECRETS {
+            assert!(
+                !body.contains(secret),
+                "the settings document disclosed {label}"
+            );
+        }
+    }
+
+    /// `--allowed-host` only becomes a guard under `--ui`. Reporting the flag
+    /// list without the UI would name a check that is not running.
+    #[tokio::test]
+    async fn allowed_hosts_report_the_guard_not_the_flags() {
+        let (_dir, state) = project_with_three_secrets();
+        let output = settings_output(
+            &state,
+            crate::commands::serve::config_posture(state.config_path.as_deref()),
+        );
+
+        assert!(!output.ui, "this fixture has no UI");
+        assert!(
+            output.allowed_hosts.is_empty(),
+            "with no UI there is no host guard, so there is no list to report"
+        );
+        // The CORS allowlist is a different mechanism and does apply.
+        assert_eq!(output.allowed_origins, ["https://example.test"]);
+    }
+
+    /// No token configured is the single most exposure-relevant answer this
+    /// route gives, so it is a distinguishable `null` rather than a token
+    /// named "none" that a careless reader would take for a configured one.
+    #[tokio::test]
+    async fn no_configured_token_is_null_not_a_named_token() {
+        let (_dir, _config_path, state) = scheduled_project();
+        let value = serde_json::to_value(settings_output(
+            &state,
+            crate::commands::serve::config_posture(state.config_path.as_deref()),
+        ))
+        .unwrap();
+
+        assert!(state.auth.is_none(), "this fixture configures no token");
+        assert!(value["token"].is_null(), "{value}");
+    }
+
+    /// The route returns the projection's bytes.
+    ///
+    /// There is no CLI oracle to compare against — `/settings` describes a
+    /// server that is running, which a one-shot CLI invocation would have to
+    /// invent — so this pins the route to the mapping instead, byte for byte.
+    #[tokio::test]
+    async fn settings_route_returns_the_projections_bytes() {
+        let (_dir, _config_path, state) = scheduled_project();
+        let reference = reference_bytes(&settings_output(
+            &state,
+            crate::commands::serve::config_posture(state.config_path.as_deref()),
+        ));
+
+        let base = spawn_router(state).await;
+        let resp = get_retrying_on_busy(&format!("{base}/api/v1/settings")).await;
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), reference);
     }
 
     /// The route returns the producer's document, whole. Unlike
@@ -7636,6 +8360,11 @@ adapter = "db"
             None,
             Some(ingress),
             None,
+            rocky_server::state::SettingsSnapshot {
+                bind_host: "127.0.0.1".to_string(),
+                scheduler: true,
+                ..Default::default()
+            },
         );
         (state, dir)
     }
