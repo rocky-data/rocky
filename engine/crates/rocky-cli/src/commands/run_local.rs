@@ -2698,7 +2698,8 @@ auto_create_schemas = true
     ///   query OK, cell unreadable
     ///     before -> count 0, passed false, not_evaluated None, Warning
     ///               -> warning bucket -> gate clear -> exit 0
-    ///     after  -> row_count_not_evaluated -> Error -> gate trips
+    ///     after  -> row_count_not_evaluated -> Error -> error bucket
+    ///               -> gates, under the default `fail_on_error = true`
     /// ```
     ///
     /// This is the same class as #1871 but NOT reachable from it, and the gate
@@ -2706,10 +2707,15 @@ auto_create_schemas = true
     /// `not_evaluated: None`, so the gate never sees an unevaluated check.
     /// The fix has to be here, at the producer.
     ///
-    /// `cell_as_u64` is the shared reader every other count in the engine uses.
+    /// `cell_as_u64` is the shared reader the other CHECK counts go through —
+    /// replication row counts, null-rate, custom checks, assertions and
+    /// `compare`. It is not universal: `count_rows`, which reports quarantine
+    /// row counts, still has its own parser.
+    ///
     /// The hand-rolled chain it replaces also missed an integral JSON float, so
     /// an adapter returning `5.0` reported the table as EMPTY. That case is
-    /// asserted below too.
+    /// asserted below, along with the fractional and out-of-range floats that
+    /// `cell_as_u64` itself used to accept (#1923).
     #[test]
     fn a_quality_row_count_that_cannot_be_read_is_not_a_measured_zero() {
         use rocky_core::checks::CheckDetails;
@@ -2723,7 +2729,10 @@ auto_create_schemas = true
             })
         };
 
-        // Three shapes of "the query answered, but not with a count".
+        // Shapes of "the query answered, but not with a count". The last two
+        // are the ones `cell_as_u64` itself used to accept: it truncated a
+        // fraction and saturated an out-of-range float, so both arrived here
+        // wearing `Some` as a fabricated row count (#1923).
         for (label, rows) in [
             ("no rows", vec![]),
             ("no cell in the row", vec![vec![]]),
@@ -2731,6 +2740,8 @@ auto_create_schemas = true
                 "a cell that is not a number",
                 vec![vec![serde_json::json!("n/a")]],
             ),
+            ("a fraction", vec![vec![serde_json::json!(5.5)]]),
+            ("an out-of-range float", vec![vec![serde_json::json!(1e30)]]),
         ] {
             let check = super::quality_row_count_check(ok(rows), TestSeverity::Warning);
             assert!(!check.passed, "{label}: {check:?}");
