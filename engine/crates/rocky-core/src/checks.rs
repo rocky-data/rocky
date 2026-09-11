@@ -182,7 +182,7 @@ pub fn cell_as_u64(cell: Option<&serde_json::Value>) -> Option<u64> {
                     // rejects a value the cast would saturate. `u64::MAX` is
                     // not exactly representable as an `f64`, so the bound is
                     // written as a strict `<` against 2^64.
-                    (f.fract() == 0.0 && f >= 0.0 && f < 18_446_744_073_709_551_616.0)
+                    (f.fract() == 0.0 && (0.0..18_446_744_073_709_551_616.0).contains(&f))
                         .then_some(f as u64)
                 })
             })
