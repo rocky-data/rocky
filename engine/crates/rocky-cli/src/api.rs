@@ -2897,13 +2897,19 @@ mod tests {
         );
     }
 
-    /// #1897, Codex D. Axum answers HEAD on every `get(...)` route and
-    /// strips the body inside the router, so the outermost filter received an
-    /// empty body carrying a JSON content type. Parsing `""` failed, and the
-    /// fail-closed branch manufactured a `500` — wrong status, wrong body and
-    /// wrong length on every HEAD as soon as anything was registered.
+    /// #1897. A reported defect — HEAD requests turned into manufactured
+    /// `500`s — **did not reproduce**, and this is the test that says so.
     ///
-    /// A body with no bytes cannot carry a value, so it passes through.
+    /// The claim was that axum strips the HEAD body inside the router, leaving
+    /// the outermost filter to parse `""` and fail closed. It strips at the
+    /// top-level `RouteFuture`, outside the layer stack, so the filter sees
+    /// the full body and answers normally. With the guard reverted this test
+    /// still passes, which is why the guard is documented as precautionary
+    /// rather than as a fix.
+    ///
+    /// Only the STATUS is asserted. `reqwest` strips a HEAD response body
+    /// client-side, so asserting the body is empty would say nothing about
+    /// what the server sent.
     #[tokio::test]
     async fn a_head_request_is_not_turned_into_a_manufactured_error() {
         rocky_core::secret_registry::register_substitution(
@@ -2939,8 +2945,6 @@ mod tests {
              error: {}",
             response.status()
         );
-        let body = response.text().await.expect("body");
-        assert!(body.is_empty(), "a HEAD response carries no body: {body:?}");
     }
 
     /// #1897. The filter covers a handler that does not use `PrettyJson`.

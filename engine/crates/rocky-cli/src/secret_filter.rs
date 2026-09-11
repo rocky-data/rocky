@@ -191,10 +191,19 @@ pub fn redact(text: &str) -> String {
                     end: start + form.len(),
                     replacement: safe_replacement(replacement, &pairs),
                 });
-                // Advance by one byte, not by the match length: overlapping
-                // occurrences of the SAME form must all be found, and the
-                // merge below is what collapses them.
+                // Advance past this match's first CHARACTER, not its first
+                // byte. Overlapping occurrences of the same form must all be
+                // found — the merge below collapses them — but `start + 1`
+                // lands inside a multi-byte character whenever a value begins
+                // with one, and the next `text[from..]` panics.
+                //
+                // Third instance of this class in this change. Byte arithmetic
+                // on a `&str` needs a boundary check every time, and a
+                // registered value is arbitrary UTF-8 from the environment.
                 from = start + 1;
+                while from < text.len() && !text.is_char_boundary(from) {
+                    from += 1;
+                }
                 if from >= text.len() {
                     break;
                 }
@@ -241,6 +250,81 @@ pub fn redact(text: &str) -> String {
     }
     out.push_str(&text[cursor..]);
     out
+}
+
+/// Whether any registered value survives in a finished body.
+///
+/// **The backstop, and the reason there is one.** Every place that GENERATES a
+/// replacement is a chance to emit something that still carries a value: a
+/// neutral token that is itself a registered value, a variable name that
+/// contains one, a name whose escaped form decodes to one, or a path that
+/// forgets to call [`safe_replacement`] at all. Each of those was a separate
+/// reported defect, and patching them one at a time closes only the ones
+/// somebody found.
+///
+/// So the finished body is checked rather than trusted. If a value survives,
+/// the caller refuses the response — which holds no matter how a replacement
+/// was produced, including by code written after this.
+///
+/// Checked in two forms, because a value can be present in the bytes without
+/// being present in the text a client reads, and vice versa:
+///
+/// - the **wire form**, as the bytes about to be sent;
+/// - every **JSON string value**, decoded, which is what an escaped name
+///   decodes back to.
+///
+/// Read-only: the body is parsed to inspect it and never re-serialized, so
+/// the byte-parity between this API and the CLI is untouched.
+pub fn any_value_survives(body: &str) -> bool {
+    let pairs = secret_registry::substitutions();
+    if pairs.is_empty() {
+        return false;
+    }
+
+    let survives_in = |text: &str| {
+        pairs.iter().any(|(value, _)| {
+            escaped_forms(value)
+                .iter()
+                .any(|form| text.contains(form.as_str()))
+        })
+    };
+
+    if survives_in(body) {
+        return true;
+    }
+
+    // The decoded view. `${ROCKY_A\"B}` is not the value `A"B` in the wire
+    // bytes, but it is once a client parses the JSON.
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) else {
+        // Unparseable here means the caller is about to refuse anyway.
+        return false;
+    };
+    let mut found = false;
+    walk_strings(&parsed, &mut |text| {
+        if !found && survives_in(text) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Visit every string in a JSON document, including object keys.
+fn walk_strings(value: &serde_json::Value, visit: &mut impl FnMut(&str)) {
+    match value {
+        serde_json::Value::String(text) => visit(text),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                walk_strings(item, visit);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, item) in map {
+                visit(key);
+                walk_strings(item, visit);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
 }
 
 /// The shortest truncated tail that is rewritten.
@@ -296,7 +380,10 @@ pub fn redact_truncated_tail(text: &str) -> String {
         };
         let keep = out.len() - value.len();
         out.truncate(keep);
-        out.push_str(replacement);
+        // Through the same generator as `redact`, so a name that carries a
+        // value cannot be emitted here either. Two replacement paths meant
+        // two chances to be wrong; there is one now.
+        out.push_str(&safe_replacement(replacement, &pairs));
     }
     out
 }
@@ -336,11 +423,13 @@ fn longest_tail_prefix<'a>(
 
 /// The middleware. Applied last in [`crate::api::router`], so it is outermost.
 pub async fn redact_response_secrets(request: Request, next: Next) -> Response {
-    // Axum answers HEAD on every `get(...)` route and strips the body inside
-    // the router, so this layer sees an empty body with a JSON content type.
-    // Parsing "" fails, and the fail-closed branch would manufacture a 500 —
-    // wrong status, wrong body and wrong length on every HEAD as soon as
-    // anything is registered. A body with no bytes carries no value.
+    // PRECAUTIONARY, and it does not currently fire. Axum 0.8.9 answers HEAD
+    // on every `get(...)` route but strips the body at the top-level
+    // `RouteFuture`, OUTSIDE this layer — so the filter sees the full body and
+    // the empty-body path is never reached on HEAD. A reported defect claiming
+    // otherwise did not reproduce (`a_head_request_is_not_turned_into_a_
+    // manufactured_error`). Kept in case a future axum moves the stripping
+    // inward; not mutation-checked, because there is no failure to pin.
     let is_head = request.method() == axum::http::Method::HEAD;
     let response = next.run(request).await;
     if is_head {
@@ -363,8 +452,9 @@ pub async fn redact_response_secrets(request: Request, next: Next) -> Response {
         // so it is not forwarded.
         Err(_) => return redaction_unavailable(),
     };
-    // An empty body is not a failure to read one: 204, 304 and a stripped
-    // response all reach here with nothing to scan.
+    // An empty body is not a failure to read one. No current route produces
+    // an empty-bodied JSON response, so this is precautionary too — but it is
+    // one comparison, and the alternative is a 500 manufactured from nothing.
     if bytes.is_empty() {
         return Response::from_parts(parts, Body::from(bytes));
     }
@@ -386,6 +476,14 @@ pub async fn redact_response_secrets(request: Request, next: Next) -> Response {
     // `to_string_pretty` and the API's byte-parity tests compare those bytes
     // against the CLI's, so re-serializing risks key order and whitespace.
     if serde_json::from_str::<serde_json::Value>(&redacted).is_err() {
+        return redaction_unavailable();
+    }
+
+    // Fail closed on the finished body. Everything above is replacement
+    // GENERATION, and each generator is a chance to emit something that still
+    // carries a value. This is the check that does not depend on any of them
+    // being right.
+    if any_value_survives(&redacted) {
         return redaction_unavailable();
     }
 
@@ -568,6 +666,67 @@ mod tests {
         let out = redact(r#"{"m":"ABCDEFGH12345678XYZ"}"#);
         assert!(!out.contains("5678XYZ"), "B's tail survived: {out}");
         assert!(!out.contains("ABCDEFGH"), "A survived: {out}");
+        // Absence alone would pass for a filter that ate the whole body, so
+        // pin what it produced as well.
+        assert!(
+            out.contains("${ROCKY_OVERLAP_A}") && out.contains("${ROCKY_OVERLAP_B}"),
+            "an overlap must name BOTH variables, not silently drop one: {out}"
+        );
+        serde_json::from_str::<serde_json::Value>(&out)
+            .unwrap_or_else(|e| panic!("overlap redaction produced invalid JSON ({e}): {out}"));
+    }
+
+    /// Codex, delta pass. The occurrence scan advanced `from = start + 1` and
+    /// then sliced `text[from..]`. A value that BEGINS with a multi-byte
+    /// character puts that index inside the character, and the next slice
+    /// panics.
+    ///
+    /// The earlier multi-byte test only drove `redact_truncated_tail`, so it
+    /// could not see this. This one goes through `redact`.
+    #[test]
+    fn a_value_starting_with_a_multibyte_character_does_not_panic() {
+        let secret = "éABCDEFGH-8e26660e";
+        assert!(
+            !secret.is_char_boundary(1),
+            "PRECONDITION: byte 1 is inside é"
+        );
+        register_substitution("ROCKY_MULTIBYTE_LEAD", secret);
+
+        let out = redact(&format!(r#"{{"m":"{secret} and again {secret}"}}"#));
+        assert!(!out.contains(secret), "the value survived: {out}");
+        assert!(out.contains("${ROCKY_MULTIBYTE_LEAD}"), "{out}");
+    }
+
+    /// Codex, delta pass. The backstop: a finished body that still carries a
+    /// registered value is refused, however the replacement was generated.
+    #[test]
+    fn a_surviving_value_is_detected_in_the_wire_form() {
+        register_substitution("ROCKY_RESCAN_WIRE", "RESCAN-WIRE-8e26660e");
+        assert!(
+            any_value_survives(r#"{"m":"RESCAN-WIRE-8e26660e"}"#),
+            "a value present in the bytes must be detected"
+        );
+        assert!(
+            !any_value_survives(r#"{"m":"nothing here"}"#),
+            "a clean body must not be refused"
+        );
+    }
+
+    /// The decoded view. An escaped variable NAME is not the value in the
+    /// wire bytes, but it is once a client parses the JSON — which is the
+    /// form that actually reaches a reader.
+    #[test]
+    fn a_surviving_value_is_detected_after_json_decoding() {
+        let secret = "RESCAN-DECODED-8e26660e";
+        register_substitution("ROCKY_RESCAN_DECODED", secret);
+
+        // The value is not contiguous in the wire bytes — it is split by an
+        // escape — but `serde_json` decodes it back.
+        let body = serde_json::to_string(&serde_json::json!({ "m": secret })).expect("serializes");
+        assert!(
+            any_value_survives(&body),
+            "a value recoverable by decoding must be detected: {body}"
+        );
     }
 
     /// Codex C2. A value ending in a backslash: the raw form consumed the
@@ -607,6 +766,12 @@ mod tests {
             out.contains("${ROCKY_DOUBLE_ESCAPE}"),
             "the doubly-escaped form was not matched: {out}"
         );
+        assert!(
+            !any_value_survives(&out),
+            "the backstop must agree the value is gone: {out}"
+        );
+        serde_json::from_str::<serde_json::Value>(&out)
+            .unwrap_or_else(|e| panic!("produced invalid JSON ({e}): {out}"));
     }
 
     /// Codex C4. A replacement can itself contain a registered value when a
