@@ -182,7 +182,7 @@ impl Fixture {
     fn expectation(self) -> Expect {
         match self {
             Fixture::ShortValueShown => Expect::Shown,
-            Fixture::CollisionWithModelName => Expect::Recorded,
+            Fixture::CollisionWithModelName => Expect::ReplacedByName,
             _ => Expect::Absent,
         }
     }
@@ -214,9 +214,15 @@ enum Expect {
     /// A match is REQUIRED: the value is below the floor and the rule says to
     /// show it. Its absence would mean over-redaction.
     Shown,
-    /// Neither. Print what happened and assert nothing — drain owns the
-    /// ruling, and this case exists so the answer gets pinned once it is made.
-    Recorded,
+    /// Two assertions, not one. The value must be GONE, and the variable's
+    /// NAME must stand in its place.
+    ///
+    /// A filter that replaced with `***` would satisfy the first and fail the
+    /// second, and the second is what keeps the output usable: `${VAR}_orders`
+    /// tells an operator which model failed, `[REDACTED]_orders` does not.
+    /// The variable name is not a secret — `format_env_var_hint` already
+    /// prints names in config diagnostics, and the ruling is about values.
+    ReplacedByName,
 }
 
 /// A bare `${VAR}` is valid TOML on the page and invalid once it resolves —
@@ -536,8 +542,8 @@ async fn no_serve_route_renders_a_resolved_secret() {
     // Routes where the BELOW-FLOOR value really was shown. Empty means it was
     // redacted everywhere, which is over-redaction.
     let mut shown_somewhere: Vec<String> = Vec::new();
-    // The collision case's observations. Printed, never asserted.
-    let mut collisions: Vec<String> = Vec::new();
+    // Responses where the replacement token stands in for the collided value.
+    let mut name_shown: Vec<String> = Vec::new();
     let mut swept: BTreeSet<String> = BTreeSet::new();
     let client = reqwest::Client::new();
 
@@ -583,6 +589,11 @@ async fn no_serve_route_renders_a_resolved_secret() {
             let body = resp.text().await.unwrap_or_default();
 
             let probe = fixture.probe();
+            if fixture.expectation() == Expect::ReplacedByName
+                && body.contains(&format!("${{{PROBE_COLLIDE_VAR}}}"))
+            {
+                name_shown.push(format!("  {entry} -> {status}"));
+            }
             for (where_, hay) in [("headers", &headers), ("body", &body)] {
                 let found = hay.contains(probe);
                 match (fixture.expectation(), found) {
@@ -605,19 +616,17 @@ async fn no_serve_route_renders_a_resolved_secret() {
                         status,
                         where_
                     )),
-                    // Recorded, never asserted. drain owns the ruling.
-                    (Expect::Recorded, _) => {
-                        if where_ == "body" {
-                            collisions.push(format!(
-                                "  [{}] {} -> {}  value {}",
-                                fixture.name(),
-                                entry,
-                                status,
-                                if found { "PRESENT" } else { "absent" }
-                            ));
-                        }
-                    }
-                    (Expect::Absent, false) | (Expect::Shown, false) => {}
+                    // The value must be gone here too.
+                    (Expect::ReplacedByName, true) => leaks.push(Leak {
+                        fixture: fixture.name(),
+                        entry: entry.clone(),
+                        status,
+                        where_,
+                        excerpt: excerpt_of(hay, probe),
+                    }),
+                    (Expect::Absent, false)
+                    | (Expect::Shown, false)
+                    | (Expect::ReplacedByName, false) => {}
                 }
             }
         }
@@ -628,32 +637,6 @@ async fn no_serve_route_renders_a_resolved_secret() {
     assert_eq!(
         expected, swept,
         "the sweep did not drive every declared route"
-    );
-
-    if !collisions.is_empty() {
-        // Deliberately not an assertion. The model `analytics_orders` contains
-        // the resolved value of ${ROCKY_PROBE_CATALOG}, so a blind substring
-        // redaction would eat the model name. drain decides what should
-        // happen; this records what DOES happen so the answer can be pinned.
-        println!(
-            "\ncollision observations ({} = {PROBE_COLLIDE}, model {COLLIDING_MODEL}):\n{}",
-            PROBE_COLLIDE_VAR,
-            collisions.join("\n")
-        );
-    }
-
-    // The floor, pinned from the other side. A value below it must be shown
-    // SOMEWHERE — not everywhere, since most routes render no config at all.
-    // If it appears nowhere, redaction has swallowed values the rule says to
-    // keep, and every "absent" assertion above would pass without proving
-    // that anything is redacted.
-    assert!(
-        !shown_somewhere.is_empty(),
-        "the {}-byte value of {PROBE_SHORT_VAR} is BELOW the \
-         {REDACTION_FLOOR_BYTES}-byte floor, so the rule says to show it — and \
-         it appeared in NO response. That is over-redaction, and it would make \
-         every absence assertion in this sweep pass without proving anything.",
-        PROBE_SHORT.len()
     );
 
     assert!(
@@ -668,6 +651,54 @@ async fn no_serve_route_renders_a_resolved_secret() {
             ))
             .collect::<Vec<_>>()
             .join("\n")
+    );
+
+    // The collision's second half. The first half — that the value is gone —
+    // is asserted with every other leak below.
+    //
+    // `analytics` is a legitimate substring of the model `analytics_orders`,
+    // so redaction by value necessarily mangles the model name. Ruled
+    // acceptable on 2026-09-11 BECAUSE the replacement names the variable:
+    // `${ROCKY_PROBE_CATALOG}_orders` still tells an operator which model
+    // failed. A filter replacing with `***` would pass the absence assertion
+    // and fail this one.
+    //
+    // Set-level on purpose: most routes render no config, so requiring the
+    // token on every route would assert a coincidence rather than the rule.
+    println!(
+        "\nreplacement token seen on:\n{}",
+        if name_shown.is_empty() {
+            "  (nowhere)".to_string()
+        } else {
+            name_shown.join("\n")
+        }
+    );
+    assert!(
+        !name_shown.is_empty(),
+        "the resolved value of {PROBE_COLLIDE_VAR} collides with the model name \
+         {COLLIDING_MODEL}, so redaction must mangle it — but the replacement \
+         must NAME the variable, and ${{{PROBE_COLLIDE_VAR}}} appeared in no \
+         response. An opaque token leaves an operator unable to tell which \
+         model failed."
+    );
+
+    // The floor, pinned from the other side. A value below it must be shown
+    // SOMEWHERE — not everywhere, since most routes render no config at all.
+    //
+    // DO NOT "TIGHTEN" THIS to every route. The first draft did, and reported
+    // 67 failures against routes like /health that render no config and never
+    // could have shown the value. A route that legitimately contains nothing
+    // is not evidence the floor stopped working.
+    // If it appears nowhere, redaction has swallowed values the rule says to
+    // keep, and every "absent" assertion above would pass without proving
+    // that anything is redacted.
+    assert!(
+        !shown_somewhere.is_empty(),
+        "the {}-byte value of {PROBE_SHORT_VAR} is BELOW the \
+         {REDACTION_FLOOR_BYTES}-byte floor, so the rule says to show it — and \
+         it appeared in NO response. That is over-redaction, and it would make \
+         every absence assertion in this sweep pass without proving anything.",
+        PROBE_SHORT.len()
     );
 }
 
