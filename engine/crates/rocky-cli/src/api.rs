@@ -7154,16 +7154,24 @@ mod tests {
         );
     }
 
-    /// **Bar item 1, router→table direction.** No mutating route may be
+    /// **Bar item 1, router→table direction.** No route of ANY method may be
     /// registered on `router()` without appearing in `api_v1_routes()` — the
     /// table the test above enumerates.
+    ///
+    /// This guard counted only `post`/`put`/`patch`/`delete` until 2026-09-11.
+    /// A `GET` added to `router()` and not to `api_v1_routes()` therefore
+    /// failed nothing: not here, not in the declared→served probe above (which
+    /// only walks what is already declared), and not in the OpenAPI drift test
+    /// (which compares its paths table to the same declared array). Three
+    /// guards, one blind spot, and `GET` is the read surface — the methods
+    /// that render config, policy and model state back to a caller. It now
+    /// counts every method.
     ///
     /// This is a **source-text guard, not a programmatic enumeration**: axum's
     /// `Router` has no public route iterator, so the honest thing to say is
     /// that this reads `router()`'s own source and counts. It fails when a new
-    /// `post`/`put`/`patch`/`delete` registration lands without a matching
-    /// declared entry, which is exactly "a new non-safe-method route appeared
-    /// without being considered".
+    /// registration of any method lands without a matching declared entry,
+    /// which is exactly "a new route appeared without being considered".
     ///
     /// It is deliberately count-based rather than a path parser: rustfmt is
     /// free to reflow `.route("...", post(handler))` across lines, which would
@@ -7175,16 +7183,18 @@ mod tests {
     /// reaches. It counts text, so it can be defeated by a helper function
     /// that returns a `post(...)` router from outside `router()`, and it can
     /// miscount if an identifier such as `post_process(` appears in the body.
-    /// It classifies methods, not effects, so a mutating `GET` reads as safe.
-    /// Two named holes ARE closed: comment lines are stripped before counting,
-    /// and the declaration table is asserted duplicate-free below — without
-    /// that, a repeated declared entry could balance an undeclared
-    /// registration and the counts would agree while a route went unprobed.
+    /// It classifies methods, not effects, so a mutating `GET` still reads as
+    /// a `GET` — that is a naming question, not a coverage one, now that every
+    /// method is counted. Two named holes ARE closed: comment lines are
+    /// stripped before counting, and the declaration table is asserted
+    /// duplicate-free below — without that, a repeated declared entry could
+    /// balance an undeclared registration and the counts would agree while a
+    /// route went unprobed.
     ///
     /// The real enforcement is `rocky_server::auth`, which never reads this
     /// table or this file.
     #[test]
-    fn router_registers_no_undeclared_mutating_route() {
+    fn router_registers_no_undeclared_route() {
         let source = include_str!("api.rs");
         let start = source
             .find("pub fn router(state: Arc<ServerState>) -> Router {")
@@ -7263,7 +7273,7 @@ mod tests {
              safe methods only"
         );
 
-        let registered: usize = ["post(", "put(", "patch(", "delete("]
+        let registered: usize = ["get(", "post(", "put(", "patch(", "delete("]
             .iter()
             .map(|verb| body.matches(verb).count())
             .sum();
@@ -7277,18 +7287,34 @@ mod tests {
             unique.len(),
             all.len(),
             "api_v1_routes() must not repeat an entry — a duplicate would let \
-             an undeclared mutating route hide inside the count"
+             an undeclared route hide inside the count"
         );
 
-        // `declared_mutating_routes()` drops the webhook route, which IS a
-        // registered `post(`, so add it back for the comparison.
-        let declared = declared_mutating_routes().len() + 1;
+        let declared = all.len();
         assert_eq!(
             registered, declared,
-            "router() registers {registered} non-safe-method route(s) but \
-             api_v1_routes() declares {declared}. A mutating route that is not \
-             declared is one the read-scope test never probes — add it to \
-             api_v1_routes()."
+            "router() registers {registered} route(s) but api_v1_routes() \
+             declares {declared}. An undeclared route is one no probe reaches: \
+             not the read-scope test, not the OpenAPI drift test, and not the \
+             secret sweep — every one of them walks api_v1_routes(). Add it."
+        );
+
+        // The mutating half keeps its own arithmetic. The all-method count
+        // above would still balance if a `post(` were swapped for a `get(`
+        // on the same path, and that swap changes what the read-scoped token
+        // may reach.
+        let registered_mutating: usize = ["post(", "put(", "patch(", "delete("]
+            .iter()
+            .map(|verb| body.matches(verb).count())
+            .sum();
+        // `declared_mutating_routes()` drops the webhook route, which IS a
+        // registered `post(`, so add it back for the comparison.
+        let declared_mutating = declared_mutating_routes().len() + 1;
+        assert_eq!(
+            registered_mutating, declared_mutating,
+            "router() registers {registered_mutating} non-safe-method route(s) \
+             but api_v1_routes() declares {declared_mutating}. A mutating route \
+             that is not declared is one the read-scope test never probes."
         );
     }
 

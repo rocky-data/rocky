@@ -18,3 +18,7 @@ pub mod ui;
 /// `cfg(test)` arm in [`registry::AdapterRegistry::from_config`].
 #[cfg(test)]
 pub(crate) mod testing;
+
+/// The `${VAR}` leak sweep over every declared `rocky serve` route. Test-only.
+#[cfg(test)]
+mod secret_sweep;
