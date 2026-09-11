@@ -97,31 +97,149 @@ fn is_json(response: &Response) -> bool {
         })
 }
 
+/// The escaped forms of a value that can appear in a response body.
+///
+/// **Two levels, and that is a stated limit rather than a closed class.**
+/// A value can be escaped more than once on its way to the wire: a
+/// `ConfigError` variant `Debug`-escapes its field (`config.rs:333`), and the
+/// response then JSON-serializes that diagnostic. A secret containing a
+/// backslash therefore arrives doubly escaped, and a search for the raw and
+/// singly-escaped forms walks straight past it.
+///
+/// These four forms cover the raw value and every combination of those two
+/// layers. A third escaping layer, if one is ever introduced, would pass —
+/// which is why this is documented as a depth rather than as "escaping is
+/// handled".
+fn escaped_forms(value: &str) -> Vec<String> {
+    let json = |v: &str| {
+        serde_json::to_string(v)
+            .ok()
+            .map(|q| q.trim_matches('"').to_string())
+            .unwrap_or_default()
+    };
+    let debug = format!("{value:?}");
+    let debug = debug.trim_matches('"').to_string();
+
+    let mut forms = vec![value.to_string(), json(value), debug.clone(), json(&debug)];
+    forms.retain(|f| !f.is_empty());
+    forms.sort();
+    forms.dedup();
+    forms
+}
+
+/// What is emitted when a variable NAME would itself disclose a value.
+///
+/// The ordinary replacement is `${NAME}`, which is useful because it tells an
+/// operator which variable to look up. But a NAME can contain another
+/// registered value — `ROCKY_<some other secret>` — and emitting it would
+/// disclose that value in the act of hiding this one. Rare, and cheap to
+/// close: fall back to a token that names nothing.
+const NEUTRAL_REPLACEMENT: &str = "${REDACTED}";
+
+/// The replacement to emit for a match, with the name dropped when the name
+/// itself carries a registered value (#1897, Codex C4).
+fn safe_replacement(replacement: &str, pairs: &[(String, String)]) -> String {
+    if pairs
+        .iter()
+        .any(|(value, _)| replacement.contains(value.as_str()))
+    {
+        return NEUTRAL_REPLACEMENT.to_string();
+    }
+    replacement.to_string()
+}
+
+/// One matched span of one registered value.
+struct Span {
+    start: usize,
+    end: usize,
+    replacement: String,
+}
+
 /// Rewrite every registered value in `text` to its `${NAME}`.
 ///
-/// Each value is replaced in two forms: raw, and as `serde_json` would escape
-/// it inside a string. The escaped pass is what catches a secret containing a
-/// quote, a backslash or a newline — serde writes `a"b` as `a\"b`, which a raw
-/// search would walk straight past.
+/// **One pass over merged spans, not a sequence of replacements.** Replacing
+/// values one at a time is wrong in three separate ways, all reported against
+/// the earlier implementation:
 ///
-/// Longest value first. Replacing a shorter value that is contained in a
-/// longer one first would leave the longer one's tail behind — a leak the
-/// filter itself created.
+/// ```text
+/// overlap        A=ABCDEFGH1234, B=12345678XYZ, body ABCDEFGH12345678XYZ
+///                replacing A first destroys B's prefix -> 7 bytes of B ship
+/// reintroduction a replacement ${NAME} can itself contain a value whose
+///                pass has already run
+/// escaping       a raw match can consume a value plus the escape slash that
+///                followed it, leaving invalid JSON
+/// ```
+///
+/// Collecting every match of every form as a span, merging overlaps, and
+/// rewriting each merged span once fixes all three. Overlapping secrets are
+/// replaced as a UNIT, so an overlap over-redacts rather than leaking the
+/// part that was not covered.
 pub fn redact(text: &str) -> String {
-    let mut out = text.to_string();
-    for (value, replacement) in secret_registry::substitutions() {
-        out = out.replace(&value, &replacement);
+    let pairs = secret_registry::substitutions();
+    if pairs.is_empty() {
+        return text.to_string();
+    }
 
-        // `to_string` on a &str yields a quoted JSON string; the interior is
-        // the escaped form that actually appears in a serialized body.
-        let escaped_value = serde_json::to_string(&value).unwrap_or_default();
-        let escaped_value = escaped_value.trim_matches('"');
-        if !escaped_value.is_empty() && escaped_value != value {
-            let escaped_replacement = serde_json::to_string(&replacement).unwrap_or_default();
-            let escaped_replacement = escaped_replacement.trim_matches('"').to_string();
-            out = out.replace(escaped_value, &escaped_replacement);
+    let mut spans: Vec<Span> = Vec::new();
+    for (value, replacement) in &pairs {
+        for form in escaped_forms(value) {
+            let mut from = 0;
+            while let Some(found) = text[from..].find(&form) {
+                let start = from + found;
+                spans.push(Span {
+                    start,
+                    end: start + form.len(),
+                    replacement: safe_replacement(replacement, &pairs),
+                });
+                // Advance by one byte, not by the match length: overlapping
+                // occurrences of the SAME form must all be found, and the
+                // merge below is what collapses them.
+                from = start + 1;
+                if from >= text.len() {
+                    break;
+                }
+            }
         }
     }
+    if spans.is_empty() {
+        return text.to_string();
+    }
+
+    spans.sort_by_key(|s| (s.start, std::cmp::Reverse(s.end)));
+
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    let mut i = 0usize;
+    while i < spans.len() {
+        let mut end = spans[i].end;
+        let start = spans[i].start;
+        // Every replacement whose span touches this run, in first-seen order,
+        // so an overlap names both variables rather than silently dropping
+        // one.
+        let mut names: Vec<String> = vec![spans[i].replacement.clone()];
+        let mut j = i + 1;
+        while j < spans.len() && spans[j].start < end {
+            if spans[j].end > end {
+                end = spans[j].end;
+            }
+            if !names.contains(&spans[j].replacement) {
+                names.push(spans[j].replacement.clone());
+            }
+            j += 1;
+        }
+        if start >= cursor {
+            out.push_str(&text[cursor..start]);
+            out.push_str(&names.concat());
+            cursor = end;
+        } else if end > cursor {
+            // A run that began inside an already-rewritten region: keep the
+            // tail covered rather than re-emitting the raw bytes.
+            out.push_str(&names.concat());
+            cursor = end;
+        }
+        i = j;
+    }
+    out.push_str(&text[cursor..]);
     out
 }
 
@@ -198,7 +316,12 @@ fn longest_tail_prefix<'a>(
         let max = (value.len() - 1).min(segment.len());
         let mut take = max;
         while take >= MIN_TRUNCATED_TAIL {
-            if segment.is_char_boundary(segment.len() - take)
+            // BOTH sides need a boundary check. `value[..take]` panics inside
+            // a multi-byte character just as surely as slicing the segment
+            // does — the same defect this filter fixes in `truncate_error`,
+            // reintroduced here in the checking code (#1897).
+            if value.is_char_boundary(take)
+                && segment.is_char_boundary(segment.len() - take)
                 && segment.ends_with(&value[..take])
                 && best.as_ref().is_none_or(|(b, _)| take > b.len())
             {
@@ -213,7 +336,16 @@ fn longest_tail_prefix<'a>(
 
 /// The middleware. Applied last in [`crate::api::router`], so it is outermost.
 pub async fn redact_response_secrets(request: Request, next: Next) -> Response {
+    // Axum answers HEAD on every `get(...)` route and strips the body inside
+    // the router, so this layer sees an empty body with a JSON content type.
+    // Parsing "" fails, and the fail-closed branch would manufacture a 500 —
+    // wrong status, wrong body and wrong length on every HEAD as soon as
+    // anything is registered. A body with no bytes carries no value.
+    let is_head = request.method() == axum::http::Method::HEAD;
     let response = next.run(request).await;
+    if is_head {
+        return response;
+    }
 
     // Nothing was ever expanded from the environment: there is nothing this
     // filter could match, so skip the buffering entirely.
@@ -231,6 +363,11 @@ pub async fn redact_response_secrets(request: Request, next: Next) -> Response {
         // so it is not forwarded.
         Err(_) => return redaction_unavailable(),
     };
+    // An empty body is not a failure to read one: 204, 304 and a stripped
+    // response all reach here with nothing to scan.
+    if bytes.is_empty() {
+        return Response::from_parts(parts, Body::from(bytes));
+    }
     let Ok(text) = std::str::from_utf8(&bytes) else {
         // A JSON body is UTF-8 by definition; one that is not cannot be
         // scanned, and guessing is not an option here.
@@ -410,6 +547,96 @@ mod tests {
         register_substitution("ROCKY_FILTER_SHORTTAIL", secret);
         let stored = format!("{}…", &secret[..MIN_TRUNCATED_TAIL - 1]);
         assert_eq!(redact_truncated_tail(&stored), stored);
+    }
+
+    /// Codex C3, its exact example. Two registered values that OVERLAP
+    /// without either containing the other.
+    ///
+    /// Sequential replacement redacted `A` and resumed after it, destroying
+    /// `B`'s prefix and shipping its last seven bytes. Longest-first ordering
+    /// does not help — the leak is not a sequencing artefact. Merging the
+    /// spans and replacing them as a unit is what fixes it, and it errs
+    /// toward over-redaction.
+    #[test]
+    fn two_overlapping_values_leave_neither_partially_exposed() {
+        let a = "ABCDEFGH1234";
+        let b = "12345678XYZ";
+        assert!(!a.contains(b) && !b.contains(a), "PRECONDITION: not nested");
+        register_substitution("ROCKY_OVERLAP_A", a);
+        register_substitution("ROCKY_OVERLAP_B", b);
+
+        let out = redact(r#"{"m":"ABCDEFGH12345678XYZ"}"#);
+        assert!(!out.contains("5678XYZ"), "B's tail survived: {out}");
+        assert!(!out.contains("ABCDEFGH"), "A survived: {out}");
+    }
+
+    /// Codex C2. A value ending in a backslash: the raw form consumed the
+    /// value plus the escape slash that followed it, leaving a dangling
+    /// quote and invalid JSON — which the validity check then turned into a
+    /// 500 on an otherwise fine response.
+    #[test]
+    fn a_value_ending_in_a_backslash_leaves_valid_json() {
+        let secret = "ABCDEFGH\\";
+        register_substitution("ROCKY_TRAILING_SLASH", secret);
+
+        let body =
+            serde_json::to_string(&serde_json::json!({ "message": secret })).expect("serializes");
+        let out = redact(&body);
+
+        assert!(!out.contains(secret), "the value survived: {out}");
+        serde_json::from_str::<serde_json::Value>(&out)
+            .unwrap_or_else(|e| panic!("redaction produced invalid JSON ({e}): {out}"));
+    }
+
+    /// Codex C1. A value escaped TWICE on its way to the wire: a
+    /// `ConfigError` variant `Debug`-escapes its field, and the response then
+    /// JSON-serializes that diagnostic. A search for the raw and singly
+    /// escaped forms walks past the result.
+    #[test]
+    fn a_doubly_escaped_value_is_still_caught() {
+        let secret = "ABCD\\EFGH-8e26660e";
+        register_substitution("ROCKY_DOUBLE_ESCAPE", secret);
+
+        // Exactly the shape: Debug first, then JSON.
+        let diagnostic = format!("invalid window {secret:?}");
+        let body = serde_json::to_string(&serde_json::json!({ "message": diagnostic }))
+            .expect("serializes");
+
+        let out = redact(&body);
+        assert!(
+            out.contains("${ROCKY_DOUBLE_ESCAPE}"),
+            "the doubly-escaped form was not matched: {out}"
+        );
+    }
+
+    /// Codex C4. A replacement can itself contain a registered value when a
+    /// VARIABLE NAME equals another value. With sequential passes the later
+    /// replacement reintroduced a value whose pass had already run; one pass
+    /// over merged spans never re-scans emitted text.
+    #[test]
+    fn a_replacement_cannot_reintroduce_an_already_scanned_value() {
+        let first = "ABCDEFGHIJ-c4";
+        register_substitution("ROCKY_C4_FIRST", first);
+        // A variable whose NAME contains the other value.
+        register_substitution(&format!("ROCKY_{first}"), "ZZZZZZZZ-c4");
+
+        let out = redact(r#"{"m":"ZZZZZZZZ-c4"}"#);
+        assert!(
+            !out.contains(first),
+            "the replacement reintroduced an already-scanned value: {out}"
+        );
+    }
+
+    /// Codex C5. `longest_tail_prefix` sliced `value[..take]` without
+    /// checking the VALUE's char boundary — a panic, not a leak, and the
+    /// same defect this filter fixes in `truncate_error`.
+    #[test]
+    fn a_multibyte_value_does_not_panic_the_tail_search() {
+        register_substitution("ROCKY_C5_MULTIBYTE", "abcdéXYZ-8e26660e");
+        // An ASCII tail that matches nothing: the loop must walk the whole
+        // range and return, crossing the multi-byte boundary on the way.
+        let out = redact_truncated_tail("some unrelated ascii tail…");
+        assert_eq!(out, "some unrelated ascii tail…");
     }
 
     #[test]
