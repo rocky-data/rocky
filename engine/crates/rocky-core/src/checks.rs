@@ -170,8 +170,9 @@ pub fn null_rate_check_name(column: &str) -> String {
 /// used to check only `is_finite` and `>= 0.0`, and `f as u64` in Rust
 /// truncates toward zero and SATURATES at the bounds — so `5.5` was returned
 /// as a measured `5`, `0.5` as a measured `0`, and `1e30` as `u64::MAX`. Every
-/// caller reads this as a row count and treats `None` as "could not evaluate",
-/// so a fabricated `Some` is the one failure this function must not produce.
+/// caller treats `None` as "could not evaluate" — these are row counts, null
+/// and sample counts, custom-check counts and assertion counts — so a
+/// fabricated `Some` is the one failure this function must not produce.
 pub fn cell_as_u64(cell: Option<&serde_json::Value>) -> Option<u64> {
     cell.and_then(|v| {
         v.as_u64()

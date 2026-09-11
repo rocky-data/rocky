@@ -5336,12 +5336,16 @@ impl RunOutput {
     /// Failed checks across every table result, bucketed as
     /// `(error_severity, warning_severity)`.
     ///
-    /// A check the engine could not evaluate is a failure here, and always an
-    /// ERROR one. Severity grades a MEASUREMENT: `severity = "warning"` means
-    /// "a violation is advisory", never "a check I could not run is advisory"
-    /// (#1741). A failure carrying `not_evaluated` is bucketed as an error
-    /// whatever its severity says; a failure without it is bucketed at its
-    /// declared severity.
+    /// Severity grades a MEASUREMENT: `severity = "warning"` means "a violation
+    /// is advisory", not "a check I could not run is advisory" (#1741). A
+    /// FAILURE carrying `not_evaluated` is bucketed as an error whatever its
+    /// severity says; a failure without it is bucketed at its declared
+    /// severity.
+    ///
+    /// `not_evaluated` on its own is not a failure. A passing check is skipped
+    /// before severity is read at all, which is what keeps
+    /// `cross_source_overlap_not_applicable` — a reason carried with
+    /// `passed: true` — out of both buckets.
     ///
     /// ```text
     ///   passed   not_evaluated   declared     bucket
@@ -7103,8 +7107,8 @@ mod run_record_tests {
     /// `not_evaluated` set AND `Warning` — which is exactly what #1871
     /// produced by overwriting severity after construction.
     ///
-    /// So this is the only test that fails when the gate's `not_evaluated`
-    /// arm is removed. Delete that arm and the count below is `(0, 1)`: the
+    /// So this test is what fails when the gate's `not_evaluated` arm is
+    /// removed. Delete that arm and the count below is `(0, 1)`: the
     /// run reports one warning, the gate reads zero errors, and a replication
     /// run that measured nothing exits 0 with `status: "Success"`.
     #[test]
