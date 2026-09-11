@@ -22161,6 +22161,78 @@ timestamp_column = "ts"
         }
     }
 
+    /// A warehouse that copies normally and then refuses to describe the
+    /// TARGET — the post-copy probe failure `post_copy_column_match` turns into
+    /// `column_match_not_evaluated`.
+    ///
+    /// Shared by the two tests that need that failure. It used to live inside
+    /// one of them; a second copy is how the three materialized-table call
+    /// sites drifted in #1718.
+    #[cfg(feature = "duckdb")]
+    struct FailPostCopyDescribe<'a> {
+        inner: &'a rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+        copied: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[async_trait::async_trait]
+    impl rocky_core::traits::WarehouseAdapter for FailPostCopyDescribe<'_> {
+        fn dialect(&self) -> &dyn rocky_core::traits::SqlDialect {
+            self.inner.dialect()
+        }
+
+        async fn execute_statement(&self, sql: &str) -> rocky_core::traits::AdapterResult<()> {
+            self.inner.execute_statement(sql).await
+        }
+
+        async fn execute_query(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::QueryResult> {
+            self.inner.execute_query(sql).await
+        }
+
+        async fn describe_table(
+            &self,
+            table: &rocky_ir::TableRef,
+        ) -> rocky_core::traits::AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+            use std::sync::atomic::Ordering;
+            if table.schema == "tgt" && self.copied.load(Ordering::SeqCst) {
+                return Err(rocky_core::traits::AdapterError::msg(
+                    "injected post-copy probe failure",
+                ));
+            }
+            self.inner.describe_table(table).await
+        }
+
+        async fn execute_statement_with_stats(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::ExecutionStats> {
+            use std::sync::atomic::Ordering;
+            let stats = self.inner.execute_statement_with_stats(sql).await?;
+            self.copied.store(true, Ordering::SeqCst);
+            Ok(stats)
+        }
+    }
+
+    /// `src.events` seeded with two rows, plus the empty `tgt` schema the copy
+    /// writes into. Both column_match probe-failure tests start here.
+    #[cfg(feature = "duckdb")]
+    async fn seeded_src_events() -> rocky_duckdb::adapter::DuckDbWarehouseAdapter {
+        use rocky_core::traits::WarehouseAdapter;
+        let inner = rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (event_id INTEGER, user_id INTEGER)",
+            "INSERT INTO src.events VALUES (1, 7), (2, 8)",
+        ] {
+            inner.execute_statement(sql).await.unwrap();
+        }
+        inner
+    }
+
     /// The `(missing, extra)` a `column_match` result reports, sorted so the
     /// assertion does not depend on set iteration order.
     #[cfg(feature = "duckdb")]
@@ -22508,63 +22580,9 @@ timestamp_column = "ts"
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn column_match_records_a_reason_when_the_post_copy_probe_fails() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        use async_trait::async_trait;
         use rocky_core::state::StateStore;
-        use rocky_core::traits::{
-            AdapterError, AdapterResult, ExecutionStats, QueryResult, SqlDialect, WarehouseAdapter,
-        };
-        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
-        struct FailPostCopyDescribe<'a> {
-            inner: &'a DuckDbWarehouseAdapter,
-            copied: AtomicBool,
-        }
-
-        #[async_trait]
-        impl WarehouseAdapter for FailPostCopyDescribe<'_> {
-            fn dialect(&self) -> &dyn SqlDialect {
-                self.inner.dialect()
-            }
-
-            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
-                self.inner.execute_statement(sql).await
-            }
-
-            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
-                self.inner.execute_query(sql).await
-            }
-
-            async fn describe_table(
-                &self,
-                table: &rocky_ir::TableRef,
-            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
-                if table.schema == "tgt" && self.copied.load(Ordering::SeqCst) {
-                    return Err(AdapterError::msg("injected post-copy probe failure"));
-                }
-                self.inner.describe_table(table).await
-            }
-
-            async fn execute_statement_with_stats(
-                &self,
-                sql: &str,
-            ) -> AdapterResult<ExecutionStats> {
-                let stats = self.inner.execute_statement_with_stats(sql).await?;
-                self.copied.store(true, Ordering::SeqCst);
-                Ok(stats)
-            }
-        }
-
-        let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
-        for sql in [
-            "CREATE SCHEMA src",
-            "CREATE SCHEMA tgt",
-            "CREATE TABLE src.events (event_id INTEGER, user_id INTEGER)",
-            "INSERT INTO src.events VALUES (1, 7), (2, 8)",
-        ] {
-            inner.execute_statement(sql).await.unwrap();
-        }
+        let inner = seeded_src_events().await;
 
         let dir = tempfile::tempdir().unwrap();
         let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
@@ -22573,7 +22591,7 @@ timestamp_column = "ts"
 
         let adapter = FailPostCopyDescribe {
             inner: &inner,
-            copied: AtomicBool::new(false),
+            copied: std::sync::atomic::AtomicBool::new(false),
         };
         let outcome = process_table(&adapter, &state, &pipeline, &task, false)
             .await
@@ -22599,6 +22617,92 @@ timestamp_column = "ts"
             "unexpected reason: {reason}"
         );
         assert!(!check.passed, "an unevaluated check never passes");
+    }
+
+    /// #1871's column_match half, and the last of the four replication check
+    /// sites. FAILS before the guard at `process_table`: the probe failure is
+    /// reported as a `warning`, the gate reads zero errors, and a run that
+    /// compared no columns at all exits 0 with `status: "Success"`.
+    ///
+    /// ```text
+    ///   copy succeeds -> post-copy probe of tgt FAILS
+    ///     -> column_match_not_evaluated  (severity Error, by construction)
+    ///     -> site writes the configured `warning` over it   <- the defect
+    ///     -> gate counts a warning, not an error
+    ///     -> Success
+    /// ```
+    ///
+    /// `column_match_carries_the_configured_severity` pins the other half:
+    /// a probe that ANSWERS still reports at the configured severity. Both
+    /// must hold, and asserting only this one would pass against code that
+    /// ignored the configured severity entirely — which is #1666 again.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_failed_column_match_probe_gates_even_when_the_configured_severity_is_warning() {
+        use rocky_core::state::StateStore;
+        use rocky_core::tests::TestSeverity;
+
+        let inner = seeded_src_events().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        // The `[checks]` table is declared, not defaulted: see `gate_for`.
+        // `column_match = true` is what a replication pipeline writes to turn
+        // this check on, and `severity` is the escape hatch under test — the
+        // task carries the resolved value, so it is set below.
+        let pipeline = parse_pipeline(
+            "strategy = \"full_refresh\"\n\n[pipeline.bronze.checks]\ncolumn_match = true\n",
+        );
+        assert!(
+            pipeline.checks.fail_on_error,
+            "the fixture must run under the default gate"
+        );
+        let mut task = column_match_task(vec![], vec![]);
+        task.column_match = Some(TestSeverity::Warning);
+
+        let adapter = FailPostCopyDescribe {
+            inner: &inner,
+            copied: std::sync::atomic::AtomicBool::new(false),
+        };
+        let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+            .await
+            .expect("a failed metadata read must not fail a table that copied");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+
+        let check = result
+            .column_match_check
+            .clone()
+            .expect("the task enables column_match");
+        assert!(
+            check.not_evaluated.is_some(),
+            "the probe must have failed for this test to mean anything: {check:?}"
+        );
+
+        // The gate first: it is the user-visible consequence, so a regression
+        // prints the exit code it changed rather than a field.
+        let pending = HashMap::from([(
+            result.target_full_name.clone(),
+            PendingCheck {
+                asset_key: result.asset_key.clone(),
+                checks: vec![check.clone()],
+            },
+        )]);
+        let (gated, status) = gate_for(&pending, &pipeline.checks);
+        assert!(
+            gated,
+            "a column_match that compared nothing gates: {check:?}"
+        );
+        assert!(matches!(
+            status,
+            rocky_core::state::RunStatus::PartialFailure
+        ));
+        assert_eq!(
+            check.severity,
+            TestSeverity::Error,
+            "a check the engine could not evaluate keeps its own severity: {check:?}"
+        );
     }
 
     /// The other side of the same read. The source is probed after the copy
@@ -35144,24 +35248,46 @@ value = "'{source}'"
         fx: &BatchedCheckFixture,
         pending: &HashMap<String, PendingCheck>,
     ) -> (bool, rocky_core::state::RunStatus) {
-        let mut out = crate::output::RunOutput::new(String::new(), 0, 1);
-        out.tables_copied = 1;
-        for (table, bag) in pending {
-            out.check_results.push(crate::output::TableCheckOutput {
-                asset_key: vec![table.clone()],
-                checks: bag.checks.clone(),
-            });
-        }
         // The FIXTURE's own checks config, which is what the runner reads at
         // `output.check_gate_failed = replication_check_gate_failed(&output,
         // &pipeline.checks)`. Reparsing a different config here would let this
-        // helper answer a question the runner never asks. `fail_on_error`
-        // defaults to `true`, so this is the default gate.
+        // helper answer a question the runner never asks.
+        gate_for(pending, &fx.pipeline.checks)
+    }
+
+    /// The same verdict for a check bag that did not come from
+    /// `BatchedCheckFixture` — `column_match` is produced per table, not in
+    /// the batch phase, so it has no fixture to hang off.
+    ///
+    /// Builds the bag the way run.rs:5741 builds it, field for field, so the
+    /// gate reads the shape production hands it. What is NOT re-proved here is
+    /// that `column_match` reaches `pending_checks` at all; that wire is
+    /// pinned by `a_retried_table_contributes_its_column_match_and_freshness`
+    /// and by the inline-drain test beside it.
+    #[cfg(feature = "duckdb")]
+    fn gate_for(
+        pending: &HashMap<String, PendingCheck>,
+        checks: &rocky_core::config::ChecksConfig,
+    ) -> (bool, rocky_core::state::RunStatus) {
+        // Every caller is asking about the DEFAULT gate, so a config with the
+        // gate switched off would make any of them pass for a reason it never
+        // states. `ChecksConfig` derives `Default`, which ignores
+        // `#[serde(default = "default_fail_on_error")]` — so a pipeline whose
+        // TOML omits `[checks]` entirely arrives here with `fail_on_error`
+        // FALSE, and this assertion is what says so out loud.
         assert!(
-            fx.pipeline.checks.fail_on_error,
-            "these tests are about the DEFAULT gate; fail_on_error must be on"
+            checks.fail_on_error,
+            "these tests are about the default gate; fail_on_error must be on"
         );
-        out.check_gate_failed = super::replication_check_gate_failed(&out, &fx.pipeline.checks);
+        let mut out = crate::output::RunOutput::new(String::new(), 0, 1);
+        out.tables_copied = 1;
+        for bag in pending.values() {
+            out.check_results.push(crate::output::TableCheckOutput {
+                asset_key: bag.asset_key.clone(),
+                checks: bag.checks.clone(),
+            });
+        }
+        out.check_gate_failed = super::replication_check_gate_failed(&out, checks);
         out.status = out.derive_run_status();
         (out.check_gate_failed, out.status)
     }
