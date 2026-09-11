@@ -2915,6 +2915,18 @@ mod tests {
         let state_path = dir.path().join("state.redb");
         let base = spawn_router(pinned_server(dir.path().join("models"), None, &state_path)).await;
 
+        // PRECONDITIONS, asserted rather than assumed. Codex reported this
+        // defect as firing "whenever a secret has been registered", and the
+        // filter returns early on an empty registry — so a green result with
+        // an empty registry would be vacuous. `spawn_router` builds the fully
+        // composed `router(state)`, with the filter as its last layer
+        // (pinned by `the_secret_filter_is_the_outermost_layer`).
+        assert!(
+            !rocky_core::secret_registry::is_empty(),
+            "PRECONDITION: the registry must be non-empty, or the filter \
+             returns before it can see this response"
+        );
+
         let response = reqwest::Client::new()
             .head(format!("{base}/api/v1/meta"))
             .send()
