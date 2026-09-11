@@ -61,9 +61,10 @@ const PROBE_SHORT_VAR: &str = "ROCKY_PROBE_SHORT";
 /// model called `analytics_orders`. A redaction done by blind substring
 /// replacement would eat the model name too.
 ///
-/// The sweep RECORDS what happens here and asserts nothing either way: drain
-/// owns the ruling, and this case exists so the chosen behaviour gets pinned
-/// rather than discovered later.
+/// Ruled on 2026-09-11: the value is redacted like any other, and the
+/// replacement names the variable, so `${ROCKY_PROBE_CATALOG}_orders` still
+/// tells an operator which model failed.
+///
 /// A value that lands in a NUMERIC JSON position. `redact()` is a text
 /// replacement over the whole body, so rewriting `1234567890` to
 /// `${ROCKY_PROBE_NUMERIC}` produces `{"max_downstreams":${...}}` — not valid
@@ -705,7 +706,8 @@ async fn no_serve_route_renders_a_resolved_secret() {
     // appends, so it only sees cuts that announce themselves.
     println!(
         "\nNOT COVERED: a truncation with no `…` sentinel would leave a fragment\n\
-         \x20            this sweep cannot see. One known site; others unproven.\n\
+         \x20            this sweep cannot see. TWO known sites, both marked and\n\
+         \x20            both covered; others unproven.\n\
          NOT COVERED: GET /api/v1/jobs/{{id}} is driven with a synthetic id, so no\n\
          \x20            job output exists to leak. Untested, not clean.\n\
          NOT COVERED: every fixture builds a fresh store, so nothing written\n\
@@ -810,5 +812,166 @@ fn the_sweep_covers_the_route_that_bypasses_the_canonical_renderer() {
     assert!(
         declared.iter().any(|e| e == "POST /api/v1/compile"),
         "POST /api/v1/compile is not declared, so the sweep never drives it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Truncation: the fragment a cut leaves behind
+// ---------------------------------------------------------------------------
+
+/// How much of a known secret may survive a cut. Deliberately a DIFFERENT
+/// number from the 8-byte floor: the floor decides which values are secret,
+/// this decides how much of one may remain after truncation.
+const MAX_SURVIVING_FRAGMENT: usize = 4;
+
+/// The variable name is deliberately long. `${NAME}` is inserted by redaction
+/// and then cut by truncation, so the placeholder's length depends on the
+/// NAME, not on the secret — and operators really do write
+/// `ROCKY_SNOWFLAKE_PRIVATE_KEY_PASSPHRASE`, not `T`.
+const PROBE_LONGNAME_VAR: &str = "ROCKY_PROBE_SNOWFLAKE_PRIVATE_KEY_PASSPHRASE";
+
+/// The longest prefix of `probe` that appears in `hay`, or 0.
+///
+/// A whole-value search cannot see a truncated secret: the tail is gone, so
+/// there is no whole value to find. This looks for what a cut actually leaves.
+fn longest_surviving_prefix(hay: &str, probe: &str) -> usize {
+    (MAX_SURVIVING_FRAGMENT..=probe.len())
+        .rev()
+        .find(|&n| hay.contains(&probe[..n]))
+        .unwrap_or(0)
+}
+
+/// A truncated attempt error must not ship a fragment of a resolved secret.
+///
+/// `truncate_error` (`commands/resilience.rs`) cuts at a byte boundary and
+/// appends `…`. A value straddling the cut ships as a PREFIX, and a filter
+/// that searches for whole values matches nothing — the tail it needs is the
+/// part that was cut off.
+///
+/// The record persisted here is shaped as an OLDER binary would have written
+/// it: the raw fragment, unredacted. That is deliberate. A binary with the fix
+/// redacts before truncating and never writes this, so the only way a fragment
+/// reaches the wire is from a record already on disk — which is exactly the
+/// case a read-path filter has to handle.
+///
+/// The probe is repeated at staggered offsets rather than placed at a computed
+/// position. `MAX_ATTEMPT_ERROR_LEN` is private, and hardcoding its value
+/// would stop straddling the moment someone tunes it — passing while proving
+/// nothing, which is the failure this whole sweep exists to avoid.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_truncated_attempt_error_ships_no_fragment_of_a_secret() {
+    // SAFETY: a constant, set before the server is built. See the sweep above.
+    unsafe { std::env::set_var(PROBE_VAR, PROBE) };
+
+    let dir = tempfile::tempdir().unwrap();
+    let models_dir = dir.path().join("models");
+    std::fs::create_dir_all(&models_dir).unwrap();
+    let state_path = models_dir.join(rocky_core::state::STATE_FILE_NAME);
+
+    // A cut somewhere in this string bisects one of the repeats, whatever the
+    // limit is. Whole occurrences before the cut are ordinary leaks the
+    // value-level filter already handles; the straddled one is the point.
+    let mut long = String::new();
+    while long.len() < 4000 {
+        long.push_str("filler-");
+        long.push_str(PROBE);
+    }
+    // Shaped like the producer's output: a cut, then the sentinel.
+    let truncated = format!("{}…", &long[..600]);
+    assert!(
+        truncated.contains(&PROBE[..MAX_SURVIVING_FRAGMENT]),
+        "the fixture must actually straddle a repeat, or it proves nothing"
+    );
+
+    let run = serde_json::json!({
+        "run_id": "run-truncation-probe",
+        "started_at": "2026-09-11T00:00:00Z",
+        "finished_at": "2026-09-11T00:00:01Z",
+        "status": "Failure",
+        "trigger": "Manual",
+        "config_hash": "h",
+        "models_executed": [{
+            "model_name": "probe_model",
+            "started_at": "2026-09-11T00:00:00Z",
+            "finished_at": "2026-09-11T00:00:01Z",
+            "duration_ms": 1000,
+            "rows_affected": null,
+            "status": "failed",
+            "sql_hash": "h",
+            "attempts": [{
+                "attempt": 1,
+                "outcome": "failed",
+                "failure_class": "transient",
+                "error": truncated,
+                "duration_ms": 1000
+            }]
+        }]
+    });
+    let run: rocky_core::state::RunRecord =
+        serde_json::from_value(run).expect("the record shape is the producer's");
+
+    {
+        let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+        store.record_run(&run).expect("persisted");
+    }
+
+    let state = ServerState::with_auth(
+        models_dir,
+        None,
+        None,
+        None,
+        Vec::new(),
+        Some(state_path.clone()),
+    );
+    let base = spawn(state).await;
+    let body = reqwest::get(format!("{base}/api/v1/runs"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    // Positive control: the record really is on the wire.
+    assert!(
+        body.contains("run-truncation-probe"),
+        "the persisted run is not in the response, so this proves nothing: {body:.400}"
+    );
+
+    // THE ATTEMPT TRAIL DOES NOT REACH THIS ROUTE, and that is the finding
+    // this test pins rather than a leak.
+    //
+    // `GET /api/v1/runs` answers `HistoryOutput` -> `RunHistoryRecord` ->
+    // `RunModelRecord`, and that last struct carries exactly model_name,
+    // duration_ms, rows_affected, status and recipe_identity
+    // (`output.rs:2487-2497`). No `attempts`, no `error`. So a truncated
+    // attempt error cannot ship here however long it is.
+    //
+    // The trail reaches the wire by a different road:
+    //
+    //     AttemptRecord.error
+    //       -> MaterializationOutput.attempts   (output.rs:1061, on RunOutput)
+    //       -> `rocky run --output json` stdout
+    //       -> captured as PersistedJob.result
+    //       -> GET /api/v1/jobs/{id}
+    //
+    // which is the jobs surface, not the history surface. The fragment
+    // fixture therefore belongs on the job-result path, and is owed there.
+    //
+    // Asserting the absence here KEEPS THIS HONEST: without it the test would
+    // pass because the data never arrives, and read as proof that a filter
+    // handled it. If `attempts` is ever added to `RunModelRecord`, this fails
+    // and the fragment assertion below becomes live and meaningful.
+    assert!(
+        !body.contains('…'),
+        "GET /api/v1/runs now carries a truncation sentinel, so the attempt \
+         trail has reached this route. The fragment assertion below is now \
+         live: make it the real check and delete this guard."
+    );
+    let survived = longest_surviving_prefix(&body, PROBE);
+    assert_eq!(
+        survived, 0,
+        "GET /api/v1/runs carried {survived} bytes of the resolved value of \
+         {PROBE_VAR}, which its response structs have no field to hold. \
+         Something else on this route is rendering the state record."
     );
 }
