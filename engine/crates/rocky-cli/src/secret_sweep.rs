@@ -46,6 +46,60 @@ const PROBE: &str = "ROCKYPROBE-c7f1a93e5d2b4806-LEAKED-SECRET-VALUE";
 /// The variable every fixture field references.
 const PROBE_VAR: &str = "ROCKY_PROBE_SECRET";
 
+/// The floor Hugo ruled on 2026-09-11: a resolved value of 8 bytes or more is
+/// redacted everywhere; a shorter one is shown.
+const REDACTION_FLOOR_BYTES: usize = 8;
+
+/// A value BELOW the floor, which must be SHOWN. It pins the rule from the
+/// other side: without it, a later change could redact everything and every
+/// "absent" assertion would still pass.
+const PROBE_SHORT: &str = "ab7";
+const PROBE_SHORT_VAR: &str = "ROCKY_PROBE_SHORT";
+
+/// A resolved value that is also a legitimate substring of a model's name.
+/// `${ROCKY_PROBE_CATALOG}` resolves to `analytics`, and the project contains a
+/// model called `analytics_orders`. A redaction done by blind substring
+/// replacement would eat the model name too.
+///
+/// The sweep RECORDS what happens here and asserts nothing either way: drain
+/// owns the ruling, and this case exists so the chosen behaviour gets pinned
+/// rather than discovered later.
+const PROBE_COLLIDE: &str = "analytics";
+const PROBE_COLLIDE_VAR: &str = "ROCKY_PROBE_CATALOG";
+const COLLIDING_MODEL: &str = "analytics_orders";
+
+/// Every probe meant to be redacted must clear the floor, and must really be
+/// in the value before redaction.
+///
+/// Without the first half, a post-fix sweep goes green for the wrong reason:
+/// the rule says "show a short value", so the grep finds nothing and the test
+/// reads as proof of redaction. Without the second half, a fixture that never
+/// carried the value sweeps clean too.
+fn assert_probe_is_redactable() {
+    assert!(
+        PROBE.len() >= REDACTION_FLOOR_BYTES,
+        "the probe is {} bytes, below the {REDACTION_FLOOR_BYTES}-byte floor: \
+         the rule would SHOW it, and every 'absent' assertion below would pass \
+         without redaction happening at all",
+        PROBE.len()
+    );
+    assert!(
+        PROBE_SHORT.len() < REDACTION_FLOOR_BYTES,
+        "the short probe is {} bytes, at or above the floor, so it would be \
+         redacted and could not pin the 'shown' half of the rule",
+        PROBE_SHORT.len()
+    );
+    assert!(
+        PROBE_COLLIDE.len() >= REDACTION_FLOOR_BYTES,
+        "the collision probe must clear the floor, or nothing would try to \
+         redact it and the collision could not arise"
+    );
+    assert!(
+        COLLIDING_MODEL.contains(PROBE_COLLIDE),
+        "the collision case needs the model name to CONTAIN the resolved value"
+    );
+}
+
 /// Substitute the `{param}` placeholders so a declared path can be requested.
 ///
 /// Mirrors `probe_url` in `api.rs`'s own probes. The test below asserts no
@@ -83,10 +137,20 @@ enum Fixture {
     /// The resolved value is bare where TOML needs a quoted string, so the
     /// config parse itself fails with the value inside the reported span.
     BrokenConfigParse,
+    /// A leak needs no syntax error. `GroupConfig` DOES reject unknown fields,
+    /// and the toml error echoes the whole offending line — quotes and value
+    /// included. A filter keyed to parse failures would walk past this one.
+    UnknownKeyInGroup,
+    /// The short value, which the rule says to SHOW. Asserted present, not
+    /// absent. This is the deliberate exception to the sweep's contract.
+    ShortValueShown,
+    /// `${ROCKY_PROBE_CATALOG}` resolves to `analytics`, and the project has a
+    /// model named `analytics_orders`. Recorded, not asserted.
+    CollisionWithModelName,
 }
 
 impl Fixture {
-    fn all() -> [Fixture; 6] {
+    fn all() -> [Fixture; 9] {
         [
             Fixture::Valid,
             Fixture::InvalidPolicyWindow,
@@ -94,6 +158,9 @@ impl Fixture {
             Fixture::BrokenGroup,
             Fixture::BrokenTestDefinitions,
             Fixture::BrokenConfigParse,
+            Fixture::UnknownKeyInGroup,
+            Fixture::ShortValueShown,
+            Fixture::CollisionWithModelName,
         ]
     }
 
@@ -105,8 +172,51 @@ impl Fixture {
             Fixture::BrokenGroup => "broken_group",
             Fixture::BrokenTestDefinitions => "broken_test_definitions",
             Fixture::BrokenConfigParse => "broken_config_parse",
+            Fixture::UnknownKeyInGroup => "unknown_key_in_group",
+            Fixture::ShortValueShown => "short_value_shown",
+            Fixture::CollisionWithModelName => "collision_with_model_name",
         }
     }
+
+    /// What the sweep does with a match for this fixture.
+    fn expectation(self) -> Expect {
+        match self {
+            Fixture::ShortValueShown => Expect::Shown,
+            Fixture::CollisionWithModelName => Expect::Recorded,
+            _ => Expect::Absent,
+        }
+    }
+
+    /// The value this fixture puts into the project.
+    fn probe(self) -> &'static str {
+        match self {
+            Fixture::ShortValueShown => PROBE_SHORT,
+            Fixture::CollisionWithModelName => PROBE_COLLIDE,
+            _ => PROBE,
+        }
+    }
+
+    /// The variable that carries it.
+    fn var(self) -> &'static str {
+        match self {
+            Fixture::ShortValueShown => PROBE_SHORT_VAR,
+            Fixture::CollisionWithModelName => PROBE_COLLIDE_VAR,
+            _ => PROBE_VAR,
+        }
+    }
+}
+
+/// What a match means for a given fixture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expect {
+    /// A match is a leak. The contract.
+    Absent,
+    /// A match is REQUIRED: the value is below the floor and the rule says to
+    /// show it. Its absence would mean over-redaction.
+    Shown,
+    /// Neither. Print what happened and assert nothing — drain owns the
+    /// ruling, and this case exists so the answer gets pinned once it is made.
+    Recorded,
 }
 
 /// A bare `${VAR}` is valid TOML on the page and invalid once it resolves —
@@ -127,6 +237,7 @@ fn bare_probe_is_not_valid_toml() {
 /// adapter, the pipeline, governance, the policy rules, `_defaults.toml`, a
 /// model sidecar and a model's frontmatter — not only `rocky.toml`.
 fn write_fixture(dir: &Path, fixture: Fixture) -> PathBuf {
+    let var = fixture.var();
     let models = dir.join("models");
     std::fs::create_dir_all(&models).unwrap();
 
@@ -141,13 +252,12 @@ principal = "agent"
 capability = "apply"
 scope = {{ any = true }}
 effect = "allow"
-autonomy_budget = {{ failures = 2, window = "${{{PROBE_VAR}}}" }}
+autonomy_budget = {{ failures = 2, window = "${{{var}}}" }}
 "#
         ),
         // `principal` is an enum (`human` or `agent`) and `capability` is
-        // closed, so neither can carry the probe. `scope.models` is a free
-        // list of patterns a rule matches on, and `GET /api/v1/policy`
-        // renders the scope back, so that is where the value goes.
+        // closed, so neither can carry a probe. `scope.models` is a free list
+        // of patterns, and `GET /api/v1/policy` renders the scope back.
         _ => format!(
             r#"
 [policy]
@@ -156,7 +266,7 @@ version = 1
 [[policy.rules]]
 principal = "agent"
 capability = "apply"
-scope = {{ models = ["${{{PROBE_VAR}}}"] }}
+scope = {{ models = ["${{{var}}}"] }}
 effect = "allow"
 "#
         ),
@@ -164,7 +274,7 @@ effect = "allow"
 
     // Valid TOML before substitution, broken after: the value lands unquoted.
     let adapter_path = if fixture == Fixture::BrokenConfigParse {
-        format!("path = ${{{PROBE_VAR}}}")
+        format!("path = ${{{var}}}")
     } else {
         format!("path = \"{}\"", dir.join("probe.duckdb").display())
     };
@@ -178,11 +288,11 @@ type = "duckdb"
 [pipeline.probe]
 type = "transformation"
 models = "models/**"
-description = "${{{PROBE_VAR}}}"
+description = "${{{var}}}"
 
 [pipeline.probe.target.governance]
 auto_create_schemas = true
-tag_prefix = "${{{PROBE_VAR}}}"
+tag_prefix = "${{{var}}}"
 {policy}
 "#
     );
@@ -190,17 +300,17 @@ tag_prefix = "${{{PROBE_VAR}}}"
     std::fs::write(&config_path, config).unwrap();
 
     // `_defaults.toml`, `groups/*.toml` and `test_definitions.toml` each
-    // substitute and THEN parse, so an unquoted reference is valid on the
-    // page and invalid once resolved — with the resolved text inside the toml
+    // substitute and THEN parse, so an unquoted reference is valid on the page
+    // and invalid once resolved — with the resolved text inside the toml
     // error's span. Quoted, the same field just carries the value.
     //
     // `target.schema` is a real defaults key: an unknown key would be dropped
     // silently, because `RawModelConfig` has no `deny_unknown_fields`, and the
     // fixture would prove nothing.
     let defaults = if fixture == Fixture::BrokenDefaults {
-        format!("[target]\nschema = ${{{PROBE_VAR}}}\n")
+        format!("[target]\nschema = ${{{var}}}\n")
     } else {
-        format!("[target]\nschema = \"${{{PROBE_VAR}}}\"\n")
+        format!("[target]\nschema = \"${{{var}}}\"\n")
     };
     std::fs::write(models.join("_defaults.toml"), defaults).unwrap();
 
@@ -208,7 +318,20 @@ tag_prefix = "${{{PROBE_VAR}}}"
         std::fs::create_dir_all(models.join("groups")).unwrap();
         std::fs::write(
             models.join("groups").join("probe_group.toml"),
-            format!("name = ${{{PROBE_VAR}}}\n"),
+            format!("name = ${{{var}}}\n"),
+        )
+        .unwrap();
+    }
+
+    // The same file, QUOTED and therefore valid TOML — but `name` is not a
+    // `GroupConfig` field, and that struct DOES reject unknown fields. The
+    // resulting error echoes the whole source line, value included. A leak
+    // needs no syntax error.
+    if fixture == Fixture::UnknownKeyInGroup {
+        std::fs::create_dir_all(models.join("groups")).unwrap();
+        std::fs::write(
+            models.join("groups").join("probe_group.toml"),
+            format!("name = \"${{{var}}}\"\n"),
         )
         .unwrap();
     }
@@ -216,7 +339,7 @@ tag_prefix = "${{{PROBE_VAR}}}"
     if fixture == Fixture::BrokenTestDefinitions {
         std::fs::write(
             models.join("test_definitions.toml"),
-            format!("[probe_test]\nsql = ${{{PROBE_VAR}}}\n"),
+            format!("[probe_test]\nsql = ${{{var}}}\n"),
         )
         .unwrap();
     }
@@ -224,9 +347,24 @@ tag_prefix = "${{{PROBE_VAR}}}"
     std::fs::write(models.join("probe_model.sql"), "select 1 as id\n").unwrap();
     std::fs::write(
         models.join("probe_model.toml"),
-        format!("name = \"probe_model\"\ndescription = \"${{{PROBE_VAR}}}\"\n"),
+        format!("name = \"probe_model\"\ndescription = \"${{{var}}}\"\n"),
     )
     .unwrap();
+
+    // The collision: a model whose NAME contains the resolved value. A blind
+    // substring redaction would eat the name along with the secret.
+    if fixture == Fixture::CollisionWithModelName {
+        std::fs::write(
+            models.join(format!("{COLLIDING_MODEL}.sql")),
+            "select 1 as id\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join(format!("{COLLIDING_MODEL}.toml")),
+            format!("name = \"{COLLIDING_MODEL}\"\n"),
+        )
+        .unwrap();
+    }
 
     config_path
 }
@@ -269,22 +407,23 @@ fn assert_site_is_exercised(models_dir: &Path, fixture: Fixture) {
 /// renamed key, a typo, a variable the loader never expanded — sweeps clean
 /// and proves nothing at all.
 fn assert_substituted(config_path: &Path, fixture: Fixture) {
+    let (probe, var) = (fixture.probe(), fixture.var());
     let raw = std::fs::read_to_string(config_path).unwrap();
     assert!(
-        raw.contains(&format!("${{{PROBE_VAR}}}")),
-        "{}: the fixture on disk must reference the variable, or the sweep is vacuous",
+        raw.contains(&format!("${{{var}}}")),
+        "{}: the fixture on disk must reference {var}, or the sweep is vacuous",
         fixture.name()
     );
     assert!(
-        !raw.contains(PROBE),
+        !raw.contains(probe),
         "{}: the fixture on disk must NOT contain the resolved value — the whole \
          point is that substitution is what puts it there",
         fixture.name()
     );
     assert_eq!(
-        std::env::var(PROBE_VAR).as_deref(),
-        Ok(PROBE),
-        "{}: the variable is unset in this process, so nothing can substitute",
+        std::env::var(var).as_deref(),
+        Ok(probe),
+        "{}: {var} is unset in this process, so nothing can substitute",
         fixture.name()
     );
 
@@ -296,6 +435,9 @@ fn assert_substituted(config_path: &Path, fixture: Fixture) {
         // the config half still has to load; `assert_site_is_exercised`
         // proves the model half really broke.
         Fixture::Valid
+        | Fixture::UnknownKeyInGroup
+        | Fixture::ShortValueShown
+        | Fixture::CollisionWithModelName
         | Fixture::BrokenDefaults
         | Fixture::BrokenGroup
         | Fixture::BrokenTestDefinitions => {
@@ -306,7 +448,7 @@ fn assert_substituted(config_path: &Path, fixture: Fixture) {
                 )
             });
             assert!(
-                format!("{cfg:?}").contains(PROBE),
+                format!("{cfg:?}").contains(probe),
                 "{}: the loaded config does not carry the resolved value, so the \
                  substitution this sweep is about never happened",
                 fixture.name()
@@ -334,7 +476,7 @@ fn assert_substituted(config_path: &Path, fixture: Fixture) {
                 .err()
                 .unwrap_or_else(|| panic!("{}: this fixture must fail the parse", fixture.name()));
             assert!(
-                format!("{err:#}").contains(PROBE_VAR),
+                format!("{err:#}").contains(var),
                 "{}: the failure must at least name the variable, or this \
                  fixture is failing for some other reason",
                 fixture.name()
@@ -365,11 +507,11 @@ struct Leak {
 
 /// The text around the first match, so a failure names the field instead of
 /// dumping a whole body.
-fn excerpt(haystack: &str) -> String {
-    match haystack.find(PROBE) {
+fn excerpt_of(haystack: &str, probe: &str) -> String {
+    match haystack.find(probe) {
         Some(i) => {
             let from = i.saturating_sub(90);
-            let to = (i + PROBE.len() + 90).min(haystack.len());
+            let to = (i + probe.len() + 90).min(haystack.len());
             haystack[from..to].replace('\n', " ")
         }
         None => String::new(),
@@ -381,11 +523,21 @@ async fn no_serve_route_renders_a_resolved_secret() {
     // SAFETY: the value is a constant set once, before any server is built,
     // and never removed. A concurrent reader in this binary sees either unset
     // or this exact value; neither makes another test's assertion wrong.
-    unsafe { std::env::set_var(PROBE_VAR, PROBE) };
+    unsafe {
+        std::env::set_var(PROBE_VAR, PROBE);
+        std::env::set_var(PROBE_SHORT_VAR, PROBE_SHORT);
+        std::env::set_var(PROBE_COLLIDE_VAR, PROBE_COLLIDE);
+    }
     bare_probe_is_not_valid_toml();
+    assert_probe_is_redactable();
 
     let declared = crate::api::api_v1_routes();
     let mut leaks: Vec<Leak> = Vec::new();
+    // Routes where the BELOW-FLOOR value really was shown. Empty means it was
+    // redacted everywhere, which is over-redaction.
+    let mut shown_somewhere: Vec<String> = Vec::new();
+    // The collision case's observations. Printed, never asserted.
+    let mut collisions: Vec<String> = Vec::new();
     let mut swept: BTreeSet<String> = BTreeSet::new();
     let client = reqwest::Client::new();
 
@@ -430,15 +582,42 @@ async fn no_serve_route_renders_a_resolved_secret() {
             let headers = format!("{:?}", resp.headers());
             let body = resp.text().await.unwrap_or_default();
 
+            let probe = fixture.probe();
             for (where_, hay) in [("headers", &headers), ("body", &body)] {
-                if hay.contains(PROBE) {
-                    leaks.push(Leak {
+                let found = hay.contains(probe);
+                match (fixture.expectation(), found) {
+                    // The contract: a match is a leak.
+                    (Expect::Absent, true) => leaks.push(Leak {
                         fixture: fixture.name(),
                         entry: entry.clone(),
                         status,
                         where_,
-                        excerpt: excerpt(hay),
-                    });
+                        excerpt: excerpt_of(hay, probe),
+                    }),
+                    // Below the floor, so the rule says SHOW it. Recorded
+                    // per route; the assertion is made once, after the loop,
+                    // against the WHOLE set. Demanding it in every response
+                    // would be wrong — /health has no config in it to show.
+                    (Expect::Shown, true) => shown_somewhere.push(format!(
+                        "  [{}] {} -> {} ({})",
+                        fixture.name(),
+                        entry,
+                        status,
+                        where_
+                    )),
+                    // Recorded, never asserted. drain owns the ruling.
+                    (Expect::Recorded, _) => {
+                        if where_ == "body" {
+                            collisions.push(format!(
+                                "  [{}] {} -> {}  value {}",
+                                fixture.name(),
+                                entry,
+                                status,
+                                if found { "PRESENT" } else { "absent" }
+                            ));
+                        }
+                    }
+                    (Expect::Absent, false) | (Expect::Shown, false) => {}
                 }
             }
         }
@@ -449,6 +628,32 @@ async fn no_serve_route_renders_a_resolved_secret() {
     assert_eq!(
         expected, swept,
         "the sweep did not drive every declared route"
+    );
+
+    if !collisions.is_empty() {
+        // Deliberately not an assertion. The model `analytics_orders` contains
+        // the resolved value of ${ROCKY_PROBE_CATALOG}, so a blind substring
+        // redaction would eat the model name. drain decides what should
+        // happen; this records what DOES happen so the answer can be pinned.
+        println!(
+            "\ncollision observations ({} = {PROBE_COLLIDE}, model {COLLIDING_MODEL}):\n{}",
+            PROBE_COLLIDE_VAR,
+            collisions.join("\n")
+        );
+    }
+
+    // The floor, pinned from the other side. A value below it must be shown
+    // SOMEWHERE — not everywhere, since most routes render no config at all.
+    // If it appears nowhere, redaction has swallowed values the rule says to
+    // keep, and every "absent" assertion above would pass without proving
+    // that anything is redacted.
+    assert!(
+        !shown_somewhere.is_empty(),
+        "the {}-byte value of {PROBE_SHORT_VAR} is BELOW the \
+         {REDACTION_FLOOR_BYTES}-byte floor, so the rule says to show it — and \
+         it appeared in NO response. That is over-redaction, and it would make \
+         every absence assertion in this sweep pass without proving anything.",
+        PROBE_SHORT.len()
     );
 
     assert!(
