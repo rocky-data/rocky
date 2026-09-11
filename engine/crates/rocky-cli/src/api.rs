@@ -6161,14 +6161,26 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_stuck_config_read_is_bounded_refused_and_recovers() {
-        let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
+        // `keep()`, so the directory OUTLIVES A PANIC.
+        //
+        // With an ordinary `TempDir`, a failed assertion drops it during
+        // unwinding and deletes the FIFO. The writer below then writes to a
+        // path that no longer exists, silently, and the parked reader blocks
+        // forever on a deleted FIFO — so the test hangs at exactly the moment
+        // it is trying to report a failure. That is what happened: the first
+        // version of this test detected its mutation correctly and then hung
+        // for eight hours instead of saying so.
+        //
+        // A leaked temp directory on a failing run is the right trade against a
+        // stuck job. The success path removes it at the end.
+        let root = tempfile::tempdir().unwrap().keep();
+        let models_dir = root.join("models");
         std::fs::create_dir_all(&models_dir).unwrap();
 
         // A `rocky.toml` that is a FIFO: `read_to_string` blocks until someone
         // writes and closes it. This is the hazard the bound exists for, not a
         // stand-in for it.
-        let fifo = dir.path().join("rocky.toml");
+        let fifo = root.join("rocky.toml");
         assert!(
             std::process::Command::new("mkfifo")
                 .arg(&fifo)
@@ -6197,6 +6209,8 @@ mod tests {
             // Opening a FIFO for write blocks until a reader is present; the
             // parked read IS that reader. If it already finished, this errors
             // rather than blocking the process, and either way we ignore it.
+            // This only works because `root` is kept: a deleted FIFO would make
+            // this a silent no-op and strand the reader.
             let _ = std::fs::write(&writer_path, "[adapter]\ntype = \"duckdb\"\n");
         });
 
@@ -6277,6 +6291,10 @@ mod tests {
             recovered, 200,
             "the route must recover once the stuck read finally returns"
         );
+
+        // Reached only when every assertion above passed; a failing run leaves
+        // the directory behind on purpose.
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **Red team, round 1.** `build_cors_layer` drops an origin that is not a
