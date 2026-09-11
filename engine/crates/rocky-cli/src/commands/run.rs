@@ -475,16 +475,10 @@ fn merge_replication_compile_and_copy_errors(output: &mut RunOutput, table_error
 /// advisory and `fail_on_error = false` keeps every check advisory — neither
 /// may change a status or an exit code.
 ///
-/// A check the engine could not evaluate and therefore FAILED is not advisory
-/// at all: it reaches the error bucket whatever its severity says (#1741), so
-/// a broken check gates exactly as a violated one does instead of reading as
-/// clean. The `*_not_evaluated` constructors set `passed: false` for that
-/// reason (#1602 / #1595).
-///
-/// `not_evaluated` alone does not mean failed. `cross_source_overlap_not_applicable`
-/// carries a reason with `passed: true` — a group the FR says is not
-/// applicable, which must NOT gate — and the bucketer skips it because it
-/// passed. See [`RunOutput::check_failures_by_severity`] for the rule itself.
+/// A FAILED check carrying `not_evaluated` reaches the error bucket whatever
+/// its severity says, so it gates like an error-severity violation (#1741 /
+/// #1602 / #1595). `not_evaluated` with `passed: true` is not a failure and
+/// reaches neither bucket. See [`RunOutput::check_failures_by_severity`].
 fn replication_check_gate_failed(
     output: &RunOutput,
     checks: &rocky_core::config::ChecksConfig,

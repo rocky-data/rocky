@@ -166,23 +166,16 @@ pub fn null_rate_check_name(column: &str) -> String {
 /// caller decides whether that is a skip, an error, or a default, rather than a
 /// silent `0` masking a parse failure as a real count.
 ///
-/// The float branch checks integrality and range before casting (#1923). It
-/// used to check only `is_finite` and `>= 0.0`, and `f as u64` in Rust
-/// truncates toward zero and SATURATES at the bounds — so `5.5` was returned
-/// as a measured `5`, `0.5` as a measured `0`, and `1e30` as `u64::MAX`. Every
-/// caller treats `None` as "could not evaluate" — these are row counts, null
-/// and sample counts, custom-check counts and assertion counts — so a
-/// fabricated `Some` is the one failure this function must not produce.
+/// A float is accepted only when it is integral and in `[0, 2^64)` (#1923).
 pub fn cell_as_u64(cell: Option<&serde_json::Value>) -> Option<u64> {
     cell.and_then(|v| {
         v.as_u64()
             .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
             .or_else(|| {
                 v.as_f64().filter(|f| f.is_finite()).and_then(|f| {
-                    // `fract() == 0.0` rejects a fraction; the range check
-                    // rejects a value the cast would saturate. `u64::MAX` is
-                    // not exactly representable as an `f64`, so the bound is
-                    // written as a strict `<` against 2^64.
+                    // 2^64 exclusive: `u64::MAX` has no exact `f64`. The cast
+                    // is eager (clippy refuses `then` here) and saturating, so
+                    // it runs on a rejected value and the result is dropped.
                     (f.fract() == 0.0 && (0.0..18_446_744_073_709_551_616.0).contains(&f))
                         .then_some(f as u64)
                 })
@@ -688,25 +681,35 @@ mod tests {
         assert_eq!(cell_as_u64(Some(&json!(-1.0))), None);
         assert_eq!(cell_as_u64(Some(&serde_json::Value::Null)), None);
 
-        // A FRACTION is not a count. `f as u64` truncates, so 5.5 used to be
-        // returned as a measured 5 and 0.5 as a measured 0 — a fabricated
-        // count wearing `Some`, which is the one thing this function exists to
-        // prevent. Found reviewing #1923.
+        // A float must be integral and in `[0, 2^64)` (#1923).
         assert_eq!(cell_as_u64(Some(&json!(5.5))), None);
         assert_eq!(cell_as_u64(Some(&json!(0.5))), None);
-
-        // OUT OF RANGE is not a count either. A float-to-int `as` cast
-        // saturates rather than wrapping, so 1e30 came back as u64::MAX —
-        // the largest possible row count, from a cell that held no usable
-        // number.
         assert_eq!(cell_as_u64(Some(&json!(1e30))), None);
-
-        // Still accepted, because these ARE integers: the boundary itself,
-        // and a float that happens to be whole.
         assert_eq!(cell_as_u64(Some(&json!(0.0))), Some(0));
+        assert_eq!(cell_as_u64(Some(&json!(-0.0))), Some(0));
         assert_eq!(
             cell_as_u64(Some(&json!(9007199254740992.0))),
             Some(9007199254740992)
+        );
+
+        // The bound itself. 2^64 is the first REJECTED value and
+        // 2^64 - 2048 the last accepted one. An inclusive bound would admit
+        // 2^64 and cast it to `u64::MAX`, and no other assertion here would
+        // notice.
+        assert_eq!(
+            cell_as_u64(Some(&json!(18_446_744_073_709_551_616.0_f64))),
+            None
+        );
+        assert_eq!(
+            cell_as_u64(Some(&json!(18_446_744_073_709_549_568.0_f64))),
+            Some(18_446_744_073_709_549_568)
+        );
+
+        // `u64::MAX` is reachable only as an integer or a string.
+        assert_eq!(cell_as_u64(Some(&json!(u64::MAX))), Some(u64::MAX));
+        assert_eq!(
+            cell_as_u64(Some(&json!("18446744073709551615"))),
+            Some(u64::MAX)
         );
     }
 

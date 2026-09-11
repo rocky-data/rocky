@@ -2707,15 +2707,9 @@ auto_create_schemas = true
     /// `not_evaluated: None`, so the gate never sees an unevaluated check.
     /// The fix has to be here, at the producer.
     ///
-    /// `cell_as_u64` is the shared reader the other CHECK counts go through —
-    /// replication row counts, null-rate, custom checks, assertions and
-    /// `compare`. It is not universal: `count_rows`, which reports quarantine
-    /// row counts, still has its own parser.
-    ///
-    /// The hand-rolled chain it replaces also missed an integral JSON float, so
-    /// an adapter returning `5.0` reported the table as EMPTY. That case is
-    /// asserted below, along with the fractional and out-of-range floats that
-    /// `cell_as_u64` itself used to accept (#1923).
+    /// Reads the cell with `cell_as_u64`, so an integral float counts and a
+    /// fraction or out-of-range float does not (#1923). The Databricks BATCH
+    /// row-count path parses its own cell and is not covered by this (#1926).
     #[test]
     fn a_quality_row_count_that_cannot_be_read_is_not_a_measured_zero() {
         use rocky_core::checks::CheckDetails;
