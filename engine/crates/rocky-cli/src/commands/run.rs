@@ -34379,7 +34379,11 @@ table = "fct_events"
     /// reported failure. (The row-count analogue — a leg that answers but
     /// leaves a table out — is pinned by
     /// `a_table_the_batch_row_count_left_out_is_not_evaluated`, whose reason
-    /// text says "returned no result", never "failed".)
+    /// text says "returned no readable count", never "failed".)
+    ///
+    /// This pins the EMPTY case only. `max_timestamp: None` also carries
+    /// "the cell was unreadable", which reaches the same arm and emits no
+    /// check either — a fail-open tracked as #1929.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn a_batched_freshness_leg_that_answers_null_emits_no_check() {

@@ -191,7 +191,8 @@ pub async fn execute_batch_row_counts(
 /// Parse the `(catalog, schema, table, count)` rows of a batched row-count
 /// query. A row whose count cell does not read as a non-negative integer is
 /// OMITTED, so the caller reports the table as not evaluated rather than as a
-/// measured zero (#1926).
+/// measured zero (#1926). The reason goes to the log: the trait returns only
+/// results (#1928).
 fn parse_row_count_rows(rows: &[Vec<serde_json::Value>]) -> Vec<RowCountResult> {
     let mut results = Vec::with_capacity(rows.len());
     for row in rows {
