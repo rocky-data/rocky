@@ -107,10 +107,18 @@ The image carries no `HEALTHCHECK` instruction, and you cannot add one: a Docker
 Docker waits 10 seconds by default, then sends `SIGKILL`. A scheduled run can need longer. Set the grace on the container:
 
 ```bash
-docker run --stop-timeout 90 ...
+docker run --stop-timeout 125 ...
 ```
 
-In Kubernetes the same knob is `terminationGracePeriodSeconds`. `--drain-timeout-seconds` (default 60) caps how long the server waits for the child; keep the container's grace above it.
+125, not 90. `--drain-timeout-seconds` (default 60) caps how long the server waits for the child. A child still running when that runs out gets its own `SIGTERM` and a **further fixed 60 seconds** before `SIGKILL`, so the worst case is the drain plus 60.
+
+```
+  drain the child   --drain-timeout-seconds, default 60
+  then SIGTERM it   a further 60s, fixed, not configurable
+  worst case        120s with the defaults
+```
+
+**Set the grace above `--drain-timeout-seconds` + 60.** In Kubernetes the same knob is `terminationGracePeriodSeconds`. A shorter grace kills the child mid-write and records its occurrence as a failure.
 
 ## Run the scheduler
 
@@ -143,7 +151,7 @@ The repository ships [`deploy/rocky/`](https://github.com/rocky-data/rocky/tree/
 
 ## A minikube example
 
-This is an example, not a supported deployment. It follows the rules above: one replica, replaced in place, on a persistent volume, with the health probe from the kubelet and a drain grace above the server's own.
+This is an example, not a supported deployment. It follows the rules above: one replica, replaced in place, on a persistent volume, with the health probe from the kubelet and a stop grace above the drain plus 60.
 
 ```yaml
 apiVersion: v1
@@ -179,7 +187,9 @@ spec:
       labels:
         app: rocky
     spec:
-      terminationGracePeriodSeconds: 90
+      # Above --drain-timeout-seconds (default 60) plus the fixed 60 s the
+      # server allows the child after its own SIGTERM. 90 is not enough.
+      terminationGracePeriodSeconds: 125
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

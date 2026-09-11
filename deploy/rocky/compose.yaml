@@ -54,8 +54,13 @@ services:
 
     # `docker compose stop` sends SIGTERM and the server drains: in-flight
     # requests, then a running scheduled child (up to the server's
-    # --drain-timeout-seconds, default 60). Keep this above that.
-    stop_grace_period: 90s
+    # --drain-timeout-seconds, default 60).
+    #
+    # A child still running when the drain runs out gets its own SIGTERM and a
+    # FURTHER FIXED 60 s before SIGKILL. So the floor is the drain plus 60,
+    # which is 120 s with the defaults. 90 s was short enough to kill a child
+    # mid-write.
+    stop_grace_period: 125s
 
     restart: unless-stopped
 
