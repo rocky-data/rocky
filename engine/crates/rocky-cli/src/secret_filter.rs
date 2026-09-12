@@ -75,12 +75,28 @@ const MAX_SCANNED_BODY_BYTES: usize = 64 * 1024 * 1024;
 ///
 /// Deliberately fixed text: it must not echo anything about the body it
 /// refused, since that body is the thing suspected of carrying a secret.
+///
+/// **Last resort: if this envelope ITSELF carries a registered value, the
+/// bare status is sent with no body at all.** An operator's value can collide
+/// with this fixed text — `secret_redaction_unavailable` is a registerable
+/// string — and this response is built by the outermost layer, so nothing
+/// scans it afterwards.
+///
+/// Not solved by refusing to register colliding values. That would mean one
+/// rare collision leaves a real secret unregistered, and therefore unredacted
+/// in EVERY response for the life of the process — fail-open, on the one
+/// mechanism whose job is to fail closed. An empty body cannot leak, and
+/// there is no third level to recurse into.
 fn redaction_unavailable() -> Response {
     let body = serde_json::json!({
         "code": "secret_redaction_unavailable",
         "message": "the response could not be checked for resolved environment values, so it was withheld",
         "remediation_hint": "retry; if this persists, check the server log for the response that could not be read",
     });
+    let rendered = serde_json::to_string(&body).unwrap_or_default();
+    if rendered.is_empty() || any_value_survives(&rendered) {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
     (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(body)).into_response()
 }
 
@@ -182,15 +198,37 @@ pub fn redact(text: &str) -> String {
 
     let mut spans: Vec<Span> = Vec::new();
     for (value, replacement) in &pairs {
+        let replacement = safe_replacement(replacement, &pairs);
         for form in escaped_forms(value) {
             let mut from = 0;
+            // The open run of this form, collapsed as it is found.
+            //
+            // Advancing one character at a time finds every overlapping
+            // occurrence, which is needed — but RETAINING each one is what
+            // made a repeated-character value catastrophic: `AAAAAAAA` in a
+            // 60 MiB run of `A` produced ~62.9M spans, about 2.3 GiB, inside
+            // a 64 MiB body cap. The cap bounds the body, not the number of
+            // matches derived from it.
+            //
+            // Matches of one form arrive in increasing order, so an
+            // overlapping one extends the open run instead of adding a span.
+            // A run of `A` collapses to a single span whatever its length.
+            let mut run: Option<(usize, usize)> = None;
             while let Some(found) = text[from..].find(&form) {
                 let start = from + found;
-                spans.push(Span {
-                    start,
-                    end: start + form.len(),
-                    replacement: safe_replacement(replacement, &pairs),
-                });
+                let end = start + form.len();
+                run = match run {
+                    Some((s, e)) if start <= e => Some((s, e.max(end))),
+                    Some((s, e)) => {
+                        spans.push(Span {
+                            start: s,
+                            end: e,
+                            replacement: replacement.clone(),
+                        });
+                        Some((start, end))
+                    }
+                    None => Some((start, end)),
+                };
                 // Advance past this match's first CHARACTER, not its first
                 // byte. Overlapping occurrences of the same form must all be
                 // found — the merge below collapses them — but `start + 1`
@@ -207,6 +245,13 @@ pub fn redact(text: &str) -> String {
                 if from >= text.len() {
                     break;
                 }
+            }
+            if let Some((s, e)) = run {
+                spans.push(Span {
+                    start: s,
+                    end: e,
+                    replacement: replacement.clone(),
+                });
             }
         }
     }
@@ -266,12 +311,22 @@ pub fn redact(text: &str) -> String {
 /// the caller refuses the response — which holds no matter how a replacement
 /// was produced, including by code written after this.
 ///
-/// Checked in two forms, because a value can be present in the bytes without
-/// being present in the text a client reads, and vice versa:
+/// Checked in two forms, and **the decoded half is load-bearing** — I
+/// believed it redundant and was wrong:
 ///
 /// - the **wire form**, as the bytes about to be sent;
-/// - every **JSON string value**, decoded, which is what an escaped name
-///   decodes back to.
+/// - every **JSON string value**, decoded.
+///
+/// The case that settles it: a value `ABCDEFGH/` in a body
+/// `{"m":"ABCDEFGH\/"}`. JSON permits `\/` as an escape for `/`, but neither
+/// `serde_json` nor Rust `Debug` ever GENERATES it, so every form
+/// [`escaped_forms`] produces collapses to the unescaped value and none of
+/// them is in the wire bytes. Decoding recovers it.
+///
+/// The reasoning that missed it is worth recording: I checked which escapes
+/// our SERIALIZER emits and concluded no other form could appear. But this
+/// filter reads bodies, and a body may contain any escape the JSON SPEC
+/// allows. Generalising from the writer to the reader is the error.
 ///
 /// Read-only: the body is parsed to inspect it and never re-serialized, so
 /// the byte-parity between this API and the CLI is untouched.
@@ -281,13 +336,16 @@ pub fn any_value_survives(body: &str) -> bool {
         return false;
     }
 
-    let survives_in = |text: &str| {
-        pairs.iter().any(|(value, _)| {
-            escaped_forms(value)
-                .iter()
-                .any(|form| text.contains(form.as_str()))
-        })
-    };
+    // Built ONCE. Rebuilding per decoded string turned a 300 KiB body with
+    // 100,000 strings and a 1,000-entry registry into ~100M `escaped_forms`
+    // calls, each allocating four owned strings — a CPU and allocator denial
+    // of service on an ordinary-looking response.
+    let forms: Vec<String> = pairs
+        .iter()
+        .flat_map(|(value, _)| escaped_forms(value))
+        .collect();
+
+    let survives_in = |text: &str| forms.iter().any(|form| text.contains(form.as_str()));
 
     if survives_in(body) {
         return true;
@@ -395,7 +453,19 @@ fn longest_tail_prefix<'a>(
     pairs: &'a [(String, String)],
 ) -> Option<(String, &'a str)> {
     let mut best: Option<(String, &str)> = None;
-    for (value, replacement) in pairs {
+    // Every FORM of the value, not just the raw one. A pre-filter truncation
+    // stored `ABCD\"EFGH…`, whose tail is a prefix of the value's ESCAPED
+    // form; comparing only raw prefixes left the decoded `ABCD"EFGH` on the
+    // wire, contradicting this helper's whole purpose.
+    let pairs: Vec<(String, &str)> = pairs
+        .iter()
+        .flat_map(|(value, replacement)| {
+            escaped_forms(value)
+                .into_iter()
+                .map(move |form| (form, replacement.as_str()))
+        })
+        .collect();
+    for (value, replacement) in &pairs {
         // A whole value is `redact`'s job, so the tail must be a STRICT
         // prefix — hence `value.len() - 1`. But it may be the whole segment:
         // the cut can land anywhere, including right where the value began.
@@ -412,7 +482,7 @@ fn longest_tail_prefix<'a>(
                 && segment.ends_with(&value[..take])
                 && best.as_ref().is_none_or(|(b, _)| take > b.len())
             {
-                best = Some((value[..take].to_string(), replacement.as_str()));
+                best = Some((value[..take].to_string(), replacement));
                 break;
             }
             take -= 1;
@@ -808,6 +878,101 @@ mod tests {
         // range and return, crossing the multi-byte boundary on the way.
         let out = redact_truncated_tail("some unrelated ascii tail…");
         assert_eq!(out, "some unrelated ascii tail…");
+    }
+
+    /// Codex A. **The decoded view is load-bearing, and I claimed it was
+    /// redundant.** This is the construction I could not find.
+    ///
+    /// JSON permits `\/` as an escape for `/`, but neither `serde_json` nor
+    /// Rust `Debug` ever generates it — so every form `escaped_forms`
+    /// produces collapses to the unescaped value, and none of them appears in
+    /// these wire bytes. Only decoding recovers it.
+    ///
+    /// Deleting the decoded traversal must make this fail.
+    #[test]
+    fn a_value_reachable_only_by_decoding_is_detected() {
+        let secret = "ABCDEFGH/";
+        register_substitution("ROCKY_SOLIDUS", secret);
+
+        // `\/` is a legal JSON escape for `/`. We never emit it; a body may
+        // still contain it.
+        let body = r#"{"m":"ABCDEFGH\/"}"#;
+        assert!(
+            !body.contains(secret),
+            "PRECONDITION: the raw value must be ABSENT from the wire bytes, \
+             or the wire scan would catch it and this proves nothing: {body}"
+        );
+
+        assert!(
+            any_value_survives(body),
+            "a value recoverable only by JSON decoding must be detected"
+        );
+    }
+
+    /// Codex C. A pre-filter truncation stored the value's ESCAPED form, so
+    /// the surviving tail is a prefix of that form rather than of the raw
+    /// value. Comparing only raw prefixes left the decoded value on the wire,
+    /// which is the opposite of this helper's purpose.
+    #[test]
+    fn a_truncated_prefix_of_an_escaped_form_is_rewritten() {
+        let secret = "ABCD\"EFGH-REST-8e26660e";
+        register_substitution("ROCKY_ESCAPED_TAIL", secret);
+
+        // What an older binary stored: the JSON-escaped value, cut, then the
+        // sentinel.
+        let escaped = serde_json::to_string(secret).expect("serializes");
+        let escaped = escaped.trim_matches('"');
+        let stored = format!("{}…", &escaped[..12]);
+
+        let out = redact_truncated_tail(&stored);
+        assert!(
+            out.contains("${ROCKY_ESCAPED_TAIL}"),
+            "an escaped truncated prefix must be rewritten: {out}"
+        );
+    }
+
+    /// Codex B. The refusal envelope is fixed text, but an operator's value
+    /// can BE that text — and this response is built by the outermost layer,
+    /// so nothing scans it afterwards. The last resort is a bare status with
+    /// no body, which cannot leak and cannot recurse.
+    ///
+    /// Not a registration denylist: refusing to register a colliding value
+    /// would leave a real secret unredacted everywhere for the life of the
+    /// process.
+    #[tokio::test]
+    async fn a_refusal_that_would_carry_a_value_is_sent_with_no_body() {
+        register_substitution("ROCKY_ENVELOPE_COLLIDE", "secret_redaction_unavailable");
+
+        let response = redaction_unavailable();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // The envelope names the code verbatim, so with that string
+        // registered the body must be dropped entirely.
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("a bare status has a readable body");
+        assert!(
+            bytes.is_empty(),
+            "the refusal must carry no body when its own text would leak: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    /// Codex E. A repeated-character value produced one span per offset —
+    /// ~62.9M spans for a 60 MiB run, inside a 64 MiB body cap. Overlapping
+    /// matches of the same form now collapse as they are found.
+    ///
+    /// Asserted through the OUTPUT rather than a span count: a run collapses
+    /// to a single replacement, which is the observable consequence.
+    #[test]
+    fn a_repeated_character_run_collapses_to_one_replacement() {
+        register_substitution("ROCKY_RUN", "AAAAAAAA");
+        let out = redact(&format!(r#"{{"m":"{}"}}"#, "A".repeat(64)));
+        assert_eq!(
+            out.matches("${ROCKY_RUN}").count(),
+            1,
+            "a run of one character must collapse to a single span: {out}"
+        );
+        assert!(!out.contains("AAAAAAAA"), "the run survived: {out}");
     }
 
     #[test]
