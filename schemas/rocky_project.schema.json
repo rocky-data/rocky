@@ -1683,12 +1683,12 @@
             }
           ],
           "default": {
-            "anomaly_threshold_pct": 0.0,
+            "anomaly_threshold_pct": 50.0,
             "assertions": [],
             "column_match": false,
             "custom": [],
             "enabled": false,
-            "fail_on_error": false,
+            "fail_on_error": true,
             "freshness": null,
             "null_rate": null,
             "quarantine": null,
@@ -3162,12 +3162,12 @@
             }
           ],
           "default": {
-            "anomaly_threshold_pct": 0.0,
+            "anomaly_threshold_pct": 50.0,
             "assertions": [],
             "column_match": false,
             "custom": [],
             "enabled": false,
-            "fail_on_error": false,
+            "fail_on_error": true,
             "freshness": null,
             "null_rate": null,
             "quarantine": null,
@@ -3696,12 +3696,12 @@
             }
           ],
           "default": {
-            "anomaly_threshold_pct": 0.0,
+            "anomaly_threshold_pct": 50.0,
             "assertions": [],
             "column_match": false,
             "custom": [],
             "enabled": false,
-            "fail_on_error": false,
+            "fail_on_error": true,
             "freshness": null,
             "null_rate": null,
             "quarantine": null,
@@ -4294,12 +4294,12 @@
             }
           ],
           "default": {
-            "anomaly_threshold_pct": 0.0,
+            "anomaly_threshold_pct": 50.0,
             "assertions": [],
             "column_match": false,
             "custom": [],
             "enabled": false,
-            "fail_on_error": false,
+            "fail_on_error": true,
             "freshness": null,
             "null_rate": null,
             "quarantine": null,

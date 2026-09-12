@@ -1234,16 +1234,22 @@ pub struct MetadataColumnConfig {
 }
 
 /// Data quality checks configuration (row count, column match, freshness, null rate, custom).
-///
-/// `Default` is implemented by hand, NOT derived. A derived `Default` cannot
-/// see `#[serde(default = "...")]`, so it returned the Rust zero value for
-/// every field — and because the `checks` field on each pipeline is
-/// `#[serde(default)]`, an ABSENT `[checks]` table went through that derive
-/// while an EMPTY one went through the field attributes. The two disagreed:
-/// absent gave `fail_on_error = false`, empty gave `true`. Every other config
-/// struct carrying field defaults already implements `Default` by hand; see
-/// `manual_default_matches_serde_default_for_every_config_with_field_defaults`
-/// (#1924).
+//
+// `Default` is implemented by hand below, NOT derived, and the distinction is
+// load-bearing. A derived `Default` cannot see `#[serde(default = "...")]`, so
+// it returned the Rust zero value for every field — and because the `checks`
+// field on each pipeline is `#[serde(default)]`, an ABSENT `[checks]` table
+// went through that derive while an EMPTY one went through the field
+// attributes. The two disagreed: absent gave `fail_on_error = false`, empty
+// gave `true` (#1924).
+//
+// This is a plain comment, not a doc comment, on purpose: `JsonSchema` exports
+// the doc comment into `schemas/rocky_project.schema.json`, and from there into
+// the vscode interface and the SDK docstring. A config author reading a tooltip
+// has no use for a note about Rust derive macros.
+//
+// The parity guard is
+// `manual_default_matches_serde_default_for_every_config_with_field_defaults`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChecksConfig {
