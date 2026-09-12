@@ -17,6 +17,7 @@ use std::collections::HashSet;
 
 use thiserror::Error;
 
+use rocky_sql::check_expression::ExpressionUse;
 use rocky_sql::validation::{self, ValidationError};
 
 use crate::config::{QualityAssertion, QuarantineConfig, QuarantineMode};
@@ -141,6 +142,16 @@ pub fn compile_quarantine_sql(
     let quarantine_table =
         dialect.format_table_ref(&table_ref.catalog, &table_ref.schema, &quarantine_name)?;
 
+    // Only `split` emits two statements (the quarantine CTAS and the valid
+    // CTAS below), so only `split` can have two evaluations of one predicate
+    // disagree. `drop` and `tag` emit exactly one statement each, where a
+    // clock function is as legitimate as it is in an ordinary check —
+    // refusing it there would be a false refusal that breaks working configs.
+    let expression_use = match config.mode {
+        QuarantineMode::Split => ExpressionUse::ReevaluatedPredicate,
+        QuarantineMode::Drop | QuarantineMode::Tag => ExpressionUse::SinglePredicate,
+    };
+
     let mut names: HashSet<String> = HashSet::new();
     let mut labeled: Vec<LabeledPredicate> = Vec::with_capacity(quarantinable.len());
     for assertion in &quarantinable {
@@ -150,8 +161,15 @@ pub fn compile_quarantine_sql(
             &assertion.test.column,
             &label,
             dialect,
+            expression_use,
         )?;
-        let valid_pred = wrap_filter(&assertion.test.filter, &base_pred, &label)?;
+        let valid_pred = wrap_filter(
+            &assertion.test.filter,
+            &base_pred,
+            &label,
+            dialect,
+            expression_use,
+        )?;
         labeled.push(LabeledPredicate { label, valid_pred });
     }
 
@@ -301,11 +319,45 @@ fn synthesize_label(test_type: &TestType, column: Option<&str>) -> String {
 ///
 /// The returned predicate is total — it evaluates to `TRUE` or `FALSE`,
 /// never NULL — so the top-level `AND` and `NOT` cannot propagate NULL.
+/// Refuse an assertion kind whose GENERATED predicate reads a clock, in the
+/// one mode where the predicate is evaluated twice.
+///
+/// `not_in_future` lowers to `col <= <current_timestamp>` and
+/// `older_than_n_days` to a `<current_date>` comparison. Neither passes
+/// through [`rocky_sql::check_expression::validate_check_expression`],
+/// because that gate is for user-written fragments — so the engine was
+/// refusing a user's `created_at <= now()` in split mode while generating
+/// the same predicate itself for `not_in_future`.
+///
+/// In split the predicate is spliced into the quarantine CTAS and again into
+/// the valid CTAS. A row whose timestamp falls between the two executions is
+/// invalid in the first and valid in the second, landing in BOTH outputs —
+/// `older_than_n_days` has the equivalent midnight boundary.
+///
+/// `drop` and `tag` emit one statement, so both kinds stay available there.
+/// That is the whole point of refusing on the MODE rather than on the kind.
+fn reject_generated_clock_in_split(
+    expression_use: ExpressionUse,
+    label: &str,
+    kind: &str,
+) -> Result<(), QuarantineError> {
+    if matches!(expression_use, ExpressionUse::ReevaluatedPredicate) {
+        return Err(QuarantineError::Validation(
+            ValidationError::ExpressionFunctionNotAllowed {
+                context: format!("quarantine assertion '{label}' ({kind}) with mode = \"split\""),
+                function: "the generated clock comparison".to_string(),
+            },
+        ));
+    }
+    Ok(())
+}
+
 fn lower_valid_predicate(
     test_type: &TestType,
     column: &Option<String>,
     label: &str,
     dialect: &dyn SqlDialect,
+    expression_use: ExpressionUse,
 ) -> Result<String, QuarantineError> {
     match test_type {
         TestType::NotNull => {
@@ -337,9 +389,31 @@ fn lower_valid_predicate(
             // and start another statement. The predicate is spliced twice into
             // the quarantine CTAS (error-label column + WHERE), so the
             // balanced-quote rule matters here too.
-            validation::reject_statement_terminator(
-                &format!("quarantine assertion '{label}' `expression`"),
+            let context = format!("quarantine assertion '{label}' `expression`");
+            validation::reject_statement_terminator(&context, expression)?;
+            // The terminator check stops a predicate ENDING the statement. It
+            // does not stop one that stays inside the expression and still
+            // reaches further than the model under test: a subquery reads any
+            // table the run's credentials can see, and a content-reading
+            // function (DuckDB `read_text`, Snowflake `GETVARIABLE`, a
+            // BigQuery remote function) sits in scalar position and reads
+            // whatever it is pointed at.
+            //
+            // #1820 closed that on the CHECKS path (`tests.rs`, before the
+            // `NOT (...)` splice). This predicate is spliced TWICE into a CTAS
+            // that runs with warehouse credentials, so it needs the same gate
+            // — parse under the target dialect, then allowlist the functions.
+            // Same validator, same dialect mapping, so the two paths cannot
+            // drift into disagreeing about what is allowed.
+            let sql_dialect = rocky_sql::check_expression::dialect_for(dialect.name());
+            rocky_sql::check_expression::validate_check_expression(
+                &context,
                 expression,
+                sql_dialect.as_ref(),
+                // Spliced into the quarantine CTAS AND the valid-table CTAS
+                // that follows it, so two evaluations can disagree and put
+                // one row in both outputs.
+                expression_use,
             )?;
             // Wrap in COALESCE so NULL expressions count as passing — matches
             // the existing `WHERE NOT (expression)` semantic.
@@ -379,6 +453,7 @@ fn lower_valid_predicate(
         TestType::NotInFuture => {
             let col = required_column(column, label)?;
             validation::validate_identifier(col)?;
+            reject_generated_clock_in_split(expression_use, label, "not_in_future")?;
             let now = dialect.current_timestamp_expr();
             // NULL-permissive: (col IS NULL OR col <= <now>)
             Ok(format!("({col} IS NULL OR {col} <= {now})"))
@@ -386,6 +461,7 @@ fn lower_valid_predicate(
         TestType::OlderThanNDays { days } => {
             let col = required_column(column, label)?;
             validation::validate_identifier(col)?;
+            reject_generated_clock_in_split(expression_use, label, "older_than_n_days")?;
             if *days == 0 {
                 return Err(QuarantineError::InvalidInRangeBound { value: "0".into() });
             }
@@ -433,12 +509,22 @@ fn wrap_filter(
     filter: &Option<String>,
     base_pred: &str,
     label: &str,
+    dialect: &dyn SqlDialect,
+    expression_use: ExpressionUse,
 ) -> Result<String, QuarantineError> {
     match filter.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(f) => {
-            validation::reject_statement_terminator(
-                &format!("quarantine assertion '{label}' `filter`"),
+            let context = format!("quarantine assertion '{label}' `filter`");
+            validation::reject_statement_terminator(&context, f)?;
+            // The filter is spliced into the same CTAS as the predicate, so it
+            // reaches exactly as far. Guarding only `expression` would close
+            // one door and leave an identical one beside it.
+            let sql_dialect = rocky_sql::check_expression::dialect_for(dialect.name());
+            rocky_sql::check_expression::validate_check_expression(
+                &context,
                 f,
+                sql_dialect.as_ref(),
+                expression_use,
             )?;
             Ok(format!(
                 "(CASE WHEN ({f}) THEN ({base_pred}) ELSE TRUE END)"
@@ -811,6 +897,150 @@ mod unit_tests {
         assert!(valid_sql.contains("status IS NULL OR status IN ('pending')"));
     }
 
+    /// A clock function is refused in `split` and ACCEPTED in `drop` and
+    /// `tag`.
+    ///
+    /// `split` emits two statements, so one predicate is evaluated twice and
+    /// a boundary row can be called invalid by the first and valid by the
+    /// second — landing in both outputs. `drop` and `tag` emit ONE statement
+    /// each, where the same expression is as legitimate as it is in an
+    /// ordinary check.
+    ///
+    /// The first version of this change refused all three modes. That was a
+    /// FALSE REFUSAL: it broke working `drop` and `tag` configs to close a
+    /// bug that only exists in `split`.
+    #[test]
+    fn a_clock_predicate_is_refused_only_in_split_mode() {
+        let volatile = vec![assertion(
+            None,
+            TestType::Expression {
+                expression: "created_at <= now()".to_string(),
+            },
+            None,
+            TestSeverity::Error,
+        )];
+
+        let split =
+            compile_quarantine_sql(&volatile, "orders", &table(), &TestDialect, &split_config());
+        assert!(
+            split.is_err(),
+            "split evaluates the predicate twice, so a clock function must be refused"
+        );
+
+        for mode in [QuarantineMode::Drop, QuarantineMode::Tag] {
+            let cfg = QuarantineConfig {
+                mode,
+                ..split_config()
+            };
+            compile_quarantine_sql(&volatile, "orders", &table(), &TestDialect, &cfg)
+                .unwrap_or_else(|e| {
+                    panic!("{mode:?} emits one statement; a clock function is legal there: {e:?}")
+                })
+                .expect("a quarantinable assertion produces a plan");
+        }
+    }
+
+    /// The engine's OWN generated clock predicates take the same rule.
+    ///
+    /// `not_in_future` lowers to `col <= <current_timestamp>` and
+    /// `older_than_n_days` to a `<current_date>` comparison, neither of which
+    /// passes through the expression validator — that gate only sees
+    /// user-written fragments. So split mode was refusing a user's
+    /// `created_at <= now()` while generating the identical predicate itself.
+    #[test]
+    fn a_generated_clock_predicate_is_refused_only_in_split_mode() {
+        for test_type in [TestType::NotInFuture, TestType::OlderThanNDays { days: 7 }] {
+            let assertions = vec![assertion(
+                None,
+                test_type.clone(),
+                Some("created_at"),
+                TestSeverity::Error,
+            )];
+
+            assert!(
+                compile_quarantine_sql(
+                    &assertions,
+                    "orders",
+                    &table(),
+                    &TestDialect,
+                    &split_config()
+                )
+                .is_err(),
+                "{test_type:?} reads a clock and split evaluates it twice"
+            );
+
+            for mode in [QuarantineMode::Drop, QuarantineMode::Tag] {
+                let cfg = QuarantineConfig {
+                    mode,
+                    ..split_config()
+                };
+                compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+                    .unwrap_or_else(|e| {
+                        panic!("{mode:?} emits one statement, so {test_type:?} is legal: {e:?}")
+                    })
+                    .expect("a quarantinable assertion produces a plan");
+            }
+        }
+    }
+
+    /// Control: a kind with no clock in its generated predicate is accepted
+    /// in every mode, including split.
+    ///
+    /// Without this, a validator that refused every assertion in split would
+    /// pass the test above.
+    #[test]
+    fn a_clockless_generated_predicate_is_accepted_in_every_mode() {
+        let assertions = vec![assertion(
+            None,
+            TestType::NotNull,
+            Some("customer_id"),
+            TestSeverity::Error,
+        )];
+        for mode in [
+            QuarantineMode::Split,
+            QuarantineMode::Drop,
+            QuarantineMode::Tag,
+        ] {
+            let cfg = QuarantineConfig {
+                mode,
+                ..split_config()
+            };
+            compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+                .unwrap_or_else(|e| panic!("not_null reads no clock; {mode:?} must accept: {e:?}"))
+                .expect("a quarantinable assertion produces a plan");
+        }
+    }
+
+    /// The same split, for a `filter` rather than the predicate body — the
+    /// filter reaches exactly as far and takes the same mode.
+    #[test]
+    fn a_clock_filter_is_refused_only_in_split_mode() {
+        let mut a = assertion(
+            None,
+            TestType::NotNull,
+            Some("customer_id"),
+            TestSeverity::Error,
+        );
+        a.test.filter = Some("created_at <= now()".to_string());
+        let volatile = vec![a];
+
+        assert!(
+            compile_quarantine_sql(&volatile, "orders", &table(), &TestDialect, &split_config())
+                .is_err(),
+            "a clock filter is re-evaluated in split mode too"
+        );
+
+        for mode in [QuarantineMode::Drop, QuarantineMode::Tag] {
+            let cfg = QuarantineConfig {
+                mode,
+                ..split_config()
+            };
+            compile_quarantine_sql(&volatile, "orders", &table(), &TestDialect, &cfg)
+                .unwrap_or_else(|e| panic!("{mode:?} must accept a clock filter: {e:?}"))
+                .expect("a quarantinable assertion produces a plan");
+        }
+    }
+
     #[test]
     fn drop_mode_emits_only_valid_ctas() {
         let cfg = QuarantineConfig {
@@ -1171,6 +1401,240 @@ mod unit_tests {
         let msg = err.to_string();
         assert!(msg.contains("statement terminator"), "{msg}");
         assert!(msg.contains("`expression`"), "{msg}");
+    }
+
+    /// A quarantine `expression` runs inside the quarantine CTAS, with
+    /// warehouse credentials. #1820 gave the CHECKS path a parse-and-allowlist
+    /// gate (`validate_check_expression`, called at `tests.rs` before the
+    /// `NOT (...)` splice) so a predicate cannot call a content-reading
+    /// function. Quarantine spliced the same user SQL twice with only the
+    /// terminator check, so the same predicate was still reachable here.
+    ///
+    /// A function off the allowlist sits in scalar position and is refused by
+    /// name — the content boundary #1524 asked for.
+    #[test]
+    fn quarantine_expression_refuses_a_disallowed_function() {
+        let cfg = split_config();
+        let assertions = vec![assertion(
+            None,
+            TestType::Expression {
+                expression: "my_udf(id) IS NOT NULL".into(),
+            },
+            None,
+            TestSeverity::Error,
+        )];
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("my_udf"),
+            "the refusal must NAME the function an operator has to remove: {msg}"
+        );
+    }
+
+    /// A subquery reaches any table the run's credentials can see, which is a
+    /// wider surface than the model under test. Refused for the same reason
+    /// the checks path refuses it.
+    #[test]
+    fn quarantine_expression_refuses_a_subquery() {
+        let cfg = split_config();
+        let assertions = vec![assertion(
+            None,
+            TestType::Expression {
+                expression: "customer_id IN (SELECT 1)".into(),
+            },
+            None,
+            TestSeverity::Error,
+        )];
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("subquery"),
+            "the refusal must say a subquery is the problem: {msg}"
+        );
+    }
+
+    /// The gate must not refuse ordinary predicates. Without this, the two
+    /// refusals above would also pass on a change that refused everything.
+    #[test]
+    fn quarantine_expression_still_accepts_an_ordinary_predicate() {
+        let cfg = split_config();
+        let assertions = vec![assertion(
+            None,
+            TestType::Expression {
+                expression: "total >= 0 AND status <> 'void'".into(),
+            },
+            None,
+            TestSeverity::Error,
+        )];
+        compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            .expect("an ordinary predicate must still compile");
+    }
+
+    /// A dialect identical to `TestDialect` in every respect EXCEPT its
+    /// name, so a test using both isolates the name as the only variable.
+    struct SnowflakeNamed;
+
+    impl SqlDialect for SnowflakeNamed {
+        fn name(&self) -> &'static str {
+            "snowflake"
+        }
+        fn literal_escape(&self) -> crate::traits::LiteralEscape {
+            TestDialect.literal_escape()
+        }
+        fn format_table_ref(&self, c: &str, s: &str, t: &str) -> AdapterResult<String> {
+            TestDialect.format_table_ref(c, s, t)
+        }
+        fn create_table_as(&self, target: &str, select_sql: &str) -> String {
+            TestDialect.create_table_as(target, select_sql)
+        }
+        fn insert_into(&self, a: &str, b: &str) -> String {
+            TestDialect.insert_into(a, b)
+        }
+        fn merge_into(
+            &self,
+            a: &str,
+            b: &str,
+            c: &[std::sync::Arc<str>],
+            d: &ColumnSelection,
+        ) -> AdapterResult<String> {
+            TestDialect.merge_into(a, b, c, d)
+        }
+        fn select_clause(
+            &self,
+            a: &ColumnSelection,
+            b: &[MetadataColumn],
+        ) -> AdapterResult<String> {
+            TestDialect.select_clause(a, b)
+        }
+        fn watermark_where(
+            &self,
+            a: &str,
+            b: Option<&chrono::DateTime<chrono::Utc>>,
+        ) -> AdapterResult<String> {
+            TestDialect.watermark_where(a, b)
+        }
+        fn describe_table_sql(&self, t: &str) -> String {
+            TestDialect.describe_table_sql(t)
+        }
+        fn drop_table_sql(&self, t: &str) -> String {
+            TestDialect.drop_table_sql(t)
+        }
+        fn create_catalog_sql(&self, a: &str) -> Option<AdapterResult<String>> {
+            TestDialect.create_catalog_sql(a)
+        }
+        fn create_schema_sql(&self, a: &str, b: &str) -> Option<AdapterResult<String>> {
+            TestDialect.create_schema_sql(a, b)
+        }
+        fn tablesample_clause(&self, a: u32) -> Option<String> {
+            TestDialect.tablesample_clause(a)
+        }
+        fn insert_overwrite_partition(
+            &self,
+            a: &str,
+            b: &str,
+            c: &str,
+        ) -> AdapterResult<Vec<String>> {
+            TestDialect.insert_overwrite_partition(a, b, c)
+        }
+    }
+
+    /// The call site really threads ITS dialect through to the parser.
+    ///
+    /// Every other test here uses `TestDialect`, which does not override
+    /// `name()`, so it takes the trait default `"unknown"` and
+    /// `dialect_for` hands back `GenericDialect`. That means none of them
+    /// could catch a call site that passed the WRONG dialect — they would
+    /// all parse generically and agree.
+    ///
+    /// `a->'k'` is the discriminator: `GenericDialect` parses it,
+    /// `SnowflakeDialect` does not. So the same expression at the same call
+    /// site must be accepted under one and refused under the other, and that
+    /// difference can only come from the name being threaded.
+    #[test]
+    fn the_call_site_threads_its_own_dialect_to_the_parser() {
+        // Everything but `name()` delegates to TestDialect, so the ONLY
+        // difference between the two runs below is the dialect name.
+
+        let cfg = split_config();
+        let assertions = || {
+            vec![assertion(
+                None,
+                TestType::Expression {
+                    expression: "(a->'k') IS NOT NULL".into(),
+                },
+                None,
+                TestSeverity::Error,
+            )]
+        };
+
+        // TestDialect -> name() defaults to "unknown" -> GenericDialect, which
+        // parses the operator.
+        compile_quarantine_sql(&assertions(), "orders", &table(), &TestDialect, &cfg)
+            .expect("the generic parser accepts this operator");
+
+        // The same expression, same call site, a dialect NAMED snowflake.
+        // Refused under snowflake, where `->` is the LAMBDA arrow rather than
+        // a JSON operator — so the same text parses to a different AST and
+        // the walker refuses it. The reason does not matter here; the
+        // DIFFERENCE does, and it can only come from the name being threaded.
+        compile_quarantine_sql(&assertions(), "orders", &table(), &SnowflakeNamed, &cfg)
+            .expect_err("the snowflake parser must not accept this operator");
+    }
+
+    /// The same proof for the quarantine FILTER route.
+    ///
+    /// The expression route has its own version above. Four of the five new
+    /// call sites were covered only by tests using the default-named test
+    /// dialect, so replacing their dialect argument with generic would have
+    /// left everything green — the review's finding 4.
+    #[test]
+    fn the_filter_route_threads_its_own_dialect_to_the_parser() {
+        let cfg = split_config();
+        let assertions = || {
+            vec![assertion_with_filter(
+                TestType::NotNull,
+                Some("customer_id"),
+                Some("(a->'k') IS NOT NULL"),
+            )]
+        };
+        compile_quarantine_sql(&assertions(), "orders", &table(), &TestDialect, &cfg)
+            .expect("the generic parser accepts this operator");
+        compile_quarantine_sql(&assertions(), "orders", &table(), &SnowflakeNamed, &cfg)
+            .expect_err("the snowflake parser must not accept it");
+    }
+
+    /// The `filter` reaches the same CTAS as the predicate, so it gets the
+    /// same boundary. Guarding only `expression` would close one door and
+    /// leave an identical one beside it — which is what the independent review
+    /// of #1922 found.
+    #[test]
+    fn quarantine_filter_refuses_a_disallowed_function() {
+        let cfg = split_config();
+        let assertions = vec![assertion_with_filter(
+            TestType::NotNull,
+            Some("customer_id"),
+            Some("my_udf(id) IS NOT NULL"),
+        )];
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("my_udf"), "must name the function: {msg}");
+        assert!(msg.contains("`filter`"), "must name the field: {msg}");
+    }
+
+    /// The control: an ordinary filter still compiles.
+    #[test]
+    fn quarantine_filter_still_accepts_an_ordinary_predicate() {
+        let cfg = split_config();
+        let assertions = vec![assertion_with_filter(
+            TestType::NotNull,
+            Some("customer_id"),
+            Some("status <> 'void'"),
+        )];
+        compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            .expect("an ordinary filter must still compile");
     }
 
     #[test]

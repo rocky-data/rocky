@@ -442,12 +442,21 @@ fn generate_test_sql_inner(
     // on a kind that later returns its own error (e.g. `regex_match` without a
     // dialect) still reports the injection rather than the other failure.
     if let Some(f) = filter {
-        validation::reject_statement_terminator(
-            &format!(
-                "{} test `filter` on {table}",
-                test_type_kind(&test.test_type)
-            ),
+        let context = format!(
+            "{} test `filter` on {table}",
+            test_type_kind(&test.test_type)
+        );
+        validation::reject_statement_terminator(&context, f)?;
+        // Same boundary as `expression`. A filter is spliced into the same
+        // generated statement and executed with the same credentials, so a
+        // disallowed function or a subquery reaches just as far from here.
+        let sql_dialect =
+            rocky_sql::check_expression::dialect_for(dialect.map_or("generic", |d| d.name()));
+        rocky_sql::check_expression::validate_check_expression(
+            &context,
             f,
+            sql_dialect.as_ref(),
+            rocky_sql::check_expression::ExpressionUse::SinglePredicate,
         )?;
     }
 
@@ -533,6 +542,9 @@ fn generate_test_sql_inner(
                 &context,
                 expression,
                 sql_dialect.as_ref(),
+                // Evaluated once, in one statement: a time function here is
+                // a legitimate freshness-shaped check.
+                rocky_sql::check_expression::ExpressionUse::SinglePredicate,
             )?;
             Ok(format!(
                 "SELECT COUNT(*) FROM {table} WHERE {}NOT ({expression})",
@@ -618,9 +630,22 @@ fn generate_test_sql_inner(
             // The expression is spliced TWICE into one statement, so an
             // unbalanced quote could pair across the two copies — see
             // `reject_statement_terminator`, which refuses that too.
-            validation::reject_statement_terminator(
-                &format!("unique_expr test `key_expr` on {table}"),
+            let context = format!("unique_expr test `key_expr` on {table}");
+            validation::reject_statement_terminator(&context, key_expr)?;
+            // A key expression is a SCALAR, not a boolean, and this validator
+            // does not require booleanness — it parses one expression and
+            // judges the nodes. So the same boundary applies without refusing
+            // legitimate keys like `lower(email)`; see
+            // `a_legitimate_scalar_key_expression_passes`.
+            let sql_dialect =
+                rocky_sql::check_expression::dialect_for(dialect.map_or("generic", |d| d.name()));
+            rocky_sql::check_expression::validate_check_expression(
+                &context,
                 key_expr,
+                sql_dialect.as_ref(),
+                // A grouping key: a value that changes between evaluations
+                // is not a key.
+                rocky_sql::check_expression::ExpressionUse::GroupingKey,
             )?;
             let where_clause = filter.map(|f| format!(" WHERE ({f})")).unwrap_or_default();
             Ok(format!(
@@ -787,6 +812,183 @@ mod unit_tests {
     use super::*;
 
     // ----- TOML deserialization -----
+
+    struct SnowflakeNamed;
+    impl crate::traits::SqlDialect for SnowflakeNamed {
+        fn name(&self) -> &'static str {
+            "snowflake"
+        }
+        fn literal_escape(&self) -> crate::traits::LiteralEscape {
+            crate::traits::LiteralEscape::Standard
+        }
+        fn format_table_ref(
+            &self,
+            c: &str,
+            s: &str,
+            t: &str,
+        ) -> crate::traits::AdapterResult<String> {
+            rocky_sql::validation::format_table_ref(c, s, t)
+                .map_err(crate::traits::AdapterError::new)
+        }
+        fn create_table_as(&self, target: &str, select_sql: &str) -> String {
+            format!("CREATE OR REPLACE TABLE {target} AS\n{select_sql}")
+        }
+        fn insert_into(&self, _: &str, _: &str) -> String {
+            unimplemented!()
+        }
+        fn merge_into(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[std::sync::Arc<str>],
+            _: &rocky_ir::ColumnSelection,
+        ) -> crate::traits::AdapterResult<String> {
+            unimplemented!()
+        }
+        fn select_clause(
+            &self,
+            _: &rocky_ir::ColumnSelection,
+            _: &[rocky_ir::MetadataColumn],
+        ) -> crate::traits::AdapterResult<String> {
+            unimplemented!()
+        }
+        fn watermark_where(
+            &self,
+            _: &str,
+            _: Option<&chrono::DateTime<chrono::Utc>>,
+        ) -> crate::traits::AdapterResult<String> {
+            unimplemented!()
+        }
+        fn describe_table_sql(&self, t: &str) -> String {
+            format!("DESCRIBE TABLE {t}")
+        }
+        fn drop_table_sql(&self, t: &str) -> String {
+            format!("DROP TABLE IF EXISTS {t}")
+        }
+        fn create_catalog_sql(&self, _: &str) -> Option<crate::traits::AdapterResult<String>> {
+            None
+        }
+        fn create_schema_sql(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Option<crate::traits::AdapterResult<String>> {
+            None
+        }
+        fn tablesample_clause(&self, _: u32) -> Option<String> {
+            None
+        }
+        fn insert_overwrite_partition(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> crate::traits::AdapterResult<Vec<String>> {
+            unimplemented!()
+        }
+    }
+
+    /// Both tests.rs routes really thread THEIR dialect.
+    ///
+    /// These two hold an `Option<&dyn SqlDialect>` and fall back to
+    /// `"generic"` when it is `None`, so a test that passes `None` — as every
+    /// other test here does — cannot tell a correct call site from one that
+    /// hardcoded generic. `a->'k'` separates them: generic parses it as an
+    /// operator, snowflake parses `->` as the lambda arrow and refuses it.
+    #[test]
+    fn the_tests_rs_routes_thread_their_own_dialect() {
+        // The checks `filter` route.
+        let filtered = |f: &str| TestDecl {
+            test_type: TestType::NotNull,
+            column: Some("name".into()),
+            severity: TestSeverity::Error,
+            filter: Some(f.into()),
+        };
+        // No dialect -> the "generic" default, which parses the operator.
+        generate_test_sql(&filtered("(a->'k') IS NOT NULL"), "wh.main.orders")
+            .expect("generic accepts the operator");
+        generate_test_sql_with_dialect(
+            &filtered("(a->'k') IS NOT NULL"),
+            "wh.main.orders",
+            &SnowflakeNamed,
+        )
+        .expect_err("snowflake must not accept it");
+
+        // The `unique_expr` `key_expr` route.
+        let keyed = |k: &str| TestDecl {
+            test_type: TestType::UniqueExpr { key_expr: k.into() },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        generate_test_sql(&keyed("(a->'k')"), "wh.main.orders")
+            .expect("generic accepts the operator");
+        generate_test_sql_with_dialect(&keyed("(a->'k')"), "wh.main.orders", &SnowflakeNamed)
+            .expect_err("snowflake must not accept it");
+    }
+
+    /// The checks `filter` reaches the same generated statement as the
+    /// `expression` it filters, so it gets the same boundary. #1820 guarded
+    /// the expression and left the filter on the terminator-only check.
+    #[test]
+    fn a_check_filter_refuses_a_disallowed_function() {
+        let decl = TestDecl {
+            test_type: TestType::NotNull,
+            column: Some("name".into()),
+            severity: TestSeverity::Error,
+            filter: Some("my_udf(name) IS NOT NULL".into()),
+        };
+        let err = generate_test_sql(&decl, "wh.main.orders").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("my_udf"), "must name the function: {msg}");
+        assert!(msg.contains("`filter`"), "must name the field: {msg}");
+    }
+
+    /// A `key_expr` is a SCALAR and goes through the same validator. The
+    /// control below proves a legitimate key still passes, so this is a
+    /// boundary rather than a blanket refusal.
+    #[test]
+    fn a_unique_expr_key_refuses_a_disallowed_function() {
+        let decl = TestDecl {
+            test_type: TestType::UniqueExpr {
+                key_expr: "my_udf(id)".into(),
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let err = generate_test_sql(&decl, "wh.main.orders").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("my_udf"), "must name the function: {msg}");
+        assert!(msg.contains("`key_expr`"), "must name the field: {msg}");
+    }
+
+    /// The control: a legitimate scalar key still generates SQL. Without it,
+    /// the refusal above would also pass on a change that refused every key.
+    #[test]
+    fn a_unique_expr_key_still_accepts_a_legitimate_scalar() {
+        let decl = TestDecl {
+            test_type: TestType::UniqueExpr {
+                key_expr: "lower(email)".into(),
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        generate_test_sql(&decl, "wh.main.orders").expect("a legitimate key must still compile");
+    }
+
+    /// The control for the filter: an ordinary one still generates SQL.
+    #[test]
+    fn a_check_filter_still_accepts_an_ordinary_predicate() {
+        let decl = TestDecl {
+            test_type: TestType::NotNull,
+            column: Some("name".into()),
+            severity: TestSeverity::Error,
+            filter: Some("status <> 'void'".into()),
+        };
+        generate_test_sql(&decl, "wh.main.orders").expect("an ordinary filter must still compile");
+    }
 
     #[test]
     fn test_not_null_deser() {
@@ -1200,7 +1402,8 @@ target = { catalog = "c", schema = "s", table = "t" }
             rocky_sql::check_expression::validate_check_expression(
                 "ctx",
                 "read_text('/etc/passwd') IS NULL",
-                duck.as_ref()
+                duck.as_ref(),
+                rocky_sql::check_expression::ExpressionUse::SinglePredicate,
             )
             .is_err()
         );

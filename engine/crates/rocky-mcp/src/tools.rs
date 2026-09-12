@@ -7449,6 +7449,11 @@ fn validate_check_spec_expressions(spec: &str) -> Result<(), Json<ToolError>> {
             &context,
             expression,
             dialect.as_ref(),
+            // `draft_check` writes an `expression` test, which is evaluated
+            // once in one statement — the same position as the checks path
+            // this mirrors. A drafted key or quarantine predicate would need
+            // a different mode; neither is reachable from this tool.
+            rocky_sql::check_expression::ExpressionUse::SinglePredicate,
         )
         .map_err(|err| {
             ToolError::invalid_argument(

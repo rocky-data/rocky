@@ -283,7 +283,18 @@ pub fn generate_cross_source_overlap_sql(
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
     for k in key_exprs {
-        rocky_sql::validation::reject_statement_terminator("cross_source_overlap `key_expr`", k)?;
+        let context = "cross_source_overlap `key_expr`";
+        rocky_sql::validation::reject_statement_terminator(context, k)?;
+        // The same boundary as every other user expression spliced into a
+        // generated statement. Scalar rather than boolean, which this
+        // validator does not care about.
+        let sql_dialect = rocky_sql::check_expression::dialect_for(dialect.name());
+        rocky_sql::check_expression::validate_check_expression(
+            context,
+            k,
+            sql_dialect.as_ref(),
+            rocky_sql::check_expression::ExpressionUse::GroupingKey,
+        )?;
     }
     let key_list = key_exprs.join(", ");
     let not_null = key_exprs
@@ -389,6 +400,30 @@ pub fn cross_source_overlap_not_applicable(
             overlap_count: 0,
             contributing_tables,
             sample: Vec::new(),
+        },
+    }
+}
+
+/// Builds a `CheckResult` for a quarantine plan the engine could not compile.
+///
+/// **Fails, at error severity**, so the check gate trips and the run exits
+/// non-zero. A refused quarantine predicate used to warn and skip, which meant
+/// the rows quarantine existed to catch flowed on with nothing in `RunOutput`
+/// saying the split had not happened. A quarantine that did not run is not a
+/// quarantine that found nothing.
+///
+/// `not_evaluated` carries the validator's reason, so the operator is told
+/// which assertion to fix rather than that something unnamed went wrong.
+pub fn quarantine_not_evaluated(name: impl Into<String>, reason: impl Into<String>) -> CheckResult {
+    CheckResult {
+        name: name.into(),
+        passed: false,
+        severity: TestSeverity::Error,
+        not_evaluated: Some(reason.into()),
+        details: CheckDetails::Assertion {
+            kind: "quarantine".to_string(),
+            column: None,
+            failing_rows: 0,
         },
     }
 }
@@ -1066,6 +1101,116 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("statement terminator"), "{msg}");
         assert!(msg.contains("cross_source_overlap `key_expr`"), "{msg}");
+    }
+
+    struct SnowflakeNamed;
+    impl SqlDialect for SnowflakeNamed {
+        fn name(&self) -> &'static str {
+            "snowflake"
+        }
+        fn literal_escape(&self) -> crate::traits::LiteralEscape {
+            TestDialect.literal_escape()
+        }
+        fn format_table_ref(
+            &self,
+            c: &str,
+            s: &str,
+            t: &str,
+        ) -> crate::traits::AdapterResult<String> {
+            TestDialect.format_table_ref(c, s, t)
+        }
+        fn create_table_as(&self, a: &str, b: &str) -> String {
+            TestDialect.create_table_as(a, b)
+        }
+        fn insert_into(&self, a: &str, b: &str) -> String {
+            TestDialect.insert_into(a, b)
+        }
+        fn merge_into(
+            &self,
+            a: &str,
+            b: &str,
+            c: &[std::sync::Arc<str>],
+            d: &rocky_ir::ColumnSelection,
+        ) -> crate::traits::AdapterResult<String> {
+            TestDialect.merge_into(a, b, c, d)
+        }
+        fn select_clause(
+            &self,
+            a: &rocky_ir::ColumnSelection,
+            b: &[rocky_ir::MetadataColumn],
+        ) -> crate::traits::AdapterResult<String> {
+            TestDialect.select_clause(a, b)
+        }
+        fn watermark_where(
+            &self,
+            a: &str,
+            b: Option<&chrono::DateTime<chrono::Utc>>,
+        ) -> crate::traits::AdapterResult<String> {
+            TestDialect.watermark_where(a, b)
+        }
+        fn describe_table_sql(&self, t: &str) -> String {
+            TestDialect.describe_table_sql(t)
+        }
+        fn drop_table_sql(&self, t: &str) -> String {
+            TestDialect.drop_table_sql(t)
+        }
+        fn create_catalog_sql(&self, a: &str) -> Option<crate::traits::AdapterResult<String>> {
+            TestDialect.create_catalog_sql(a)
+        }
+        fn create_schema_sql(
+            &self,
+            a: &str,
+            b: &str,
+        ) -> Option<crate::traits::AdapterResult<String>> {
+            TestDialect.create_schema_sql(a, b)
+        }
+        fn tablesample_clause(&self, a: u32) -> Option<String> {
+            TestDialect.tablesample_clause(a)
+        }
+        fn insert_overwrite_partition(
+            &self,
+            a: &str,
+            b: &str,
+            c: &str,
+        ) -> crate::traits::AdapterResult<Vec<String>> {
+            TestDialect.insert_overwrite_partition(a, b, c)
+        }
+    }
+
+    /// The cross-source key route really threads ITS dialect.
+    ///
+    /// Every other test here passes `TestDialect`, whose `name()` takes the
+    /// trait default `"unknown"` and therefore parses generically — so none
+    /// of them could tell a correct call site from one that hardcoded
+    /// generic. `a->'k'` separates the two: generic parses it as an operator,
+    /// snowflake parses `->` as the lambda arrow and refuses it.
+    #[test]
+    fn the_cross_source_key_route_threads_its_own_dialect() {
+        let siblings = vec![sibling("s1", "t"), sibling("s2", "t")];
+        generate_cross_source_overlap_sql(&siblings, &["(a->'k')".into()], &dialect())
+            .expect("generic accepts the operator");
+        generate_cross_source_overlap_sql(&siblings, &["(a->'k')".into()], &SnowflakeNamed)
+            .expect_err("snowflake must not accept it");
+    }
+
+    /// The same content boundary as every other user expression spliced into
+    /// generated SQL. The terminator check above stops a key ENDING the
+    /// statement; it does not stop one that stays inside the expression and
+    /// still reads a file, a secret or session state.
+    ///
+    /// This site had NO test until the mutation check found it: removing the
+    /// validator call left every cross-source test passing.
+    #[test]
+    fn test_cross_source_overlap_key_expr_refuses_a_disallowed_function() {
+        let siblings = vec![sibling("s1", "t"), sibling("s2", "t")];
+        let err = generate_cross_source_overlap_sql(&siblings, &["my_udf(a)".into()], &dialect())
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("my_udf"), "must name the function: {msg}");
+        assert!(
+            msg.contains("cross_source_overlap `key_expr`"),
+            "must name the field: {msg}"
+        );
     }
 
     #[test]
