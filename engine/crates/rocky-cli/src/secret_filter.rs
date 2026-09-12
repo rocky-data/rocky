@@ -1048,10 +1048,13 @@ mod tests {
         // result cannot see this — without the seam the fix is unguardable.
         let spans = discover_spans(&body, &secret_registry::substitutions());
         let run_spans = spans.iter().filter(|s| s.end - s.start >= 8).count();
-        assert!(
-            run_spans <= 2,
-            "a 64-character run produced {run_spans} spans; retaining every \
-             overlapping offset is what reached ~62.9M spans on a large body"
+        assert_eq!(
+            run_spans, 1,
+            "a 64-character run must collapse to exactly one span; retaining \
+             every overlapping offset is what reached ~62.9M spans on a large \
+             body. All four forms of an all-ASCII value dedupe to one, so one \
+             form over one contiguous run is one span — there is no boundary \
+             effect to leave slack for."
         );
 
         let out = redact(&body);
