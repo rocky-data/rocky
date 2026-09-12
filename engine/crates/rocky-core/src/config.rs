@@ -362,8 +362,8 @@ pub enum ConfigError {
     ChecksAnomalyThresholdNotFinite { pipeline: String, value: String },
 
     /// A `metadata_columns[].value` is not one parseable SQL expression over
-    /// allowlisted scalar functions. The value is spliced raw into
-    /// `CAST({value} AS {type}) AS {name}` (#1874).
+    /// allowlisted scalar functions. The value is spliced raw into the
+    /// SELECT by each dialect's `select_clause` (#1874).
     #[error(
         "pipeline '{pipeline}': metadata_columns entry '{column}' has a value that cannot be \
          used: {reason}"
@@ -3476,8 +3476,10 @@ pub fn validate_freeze_marker_writes(config: &RockyConfig) -> Vec<ConfigError> {
 /// Refuse a `metadata_columns[].value` that is not one parseable SQL
 /// expression calling only allowlisted scalar functions.
 ///
-/// The value is spliced raw as `CAST({value} AS {type}) AS {name}` by every
-/// dialect's `select_clause`, behind only a statement-terminator scan.
+/// The value is spliced raw into the SELECT by each dialect's
+/// `select_clause`, behind only a statement-terminator scan. Five dialects
+/// render it, and not identically — Snowflake uses `value::TYPE` where the
+/// others use `CAST(value AS TYPE)`.
 ///
 /// Checked here, at config load, rather than at the three splice sites:
 /// `rocky-ir` has no dialect, so the check cannot live with the
