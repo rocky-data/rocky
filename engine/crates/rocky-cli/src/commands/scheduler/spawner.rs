@@ -99,6 +99,42 @@ fn finish_scheduler_job(mut record: PersistedJob, exit_code: i32) -> PersistedJo
     record
 }
 
+#[async_trait]
+impl Spawner for JobsModelSpawner {
+    async fn run(&self, request: &SpawnRequest) -> RunOutcome {
+        let started = chrono::Utc::now().to_rfc3339();
+        // The job id IS the submission id: `GET /api/v1/jobs/{submission_id}`
+        // and the run's `run_history` entry share one key.
+        let mut record = PersistedJob {
+            job_id: request.submission_id.clone(),
+            kind: "run".to_string(),
+            state: job_state_str(JobState::Running).to_string(),
+            submitted_at: started.clone(),
+            started_at: Some(started),
+            finished_at: None,
+            principal: Some(SCHEDULER_PRINCIPAL.to_string()),
+            error: None,
+            result: None,
+            // The SECOND writer of a job record. Without this stamp every
+            // scheduler-run job would read as pre-redaction forever, and
+            // `GET /api/v1/jobs/{id}` would withhold its error for a record
+            // this binary wrote (#1897).
+            redaction_version: Some(rocky_core::state::CURRENT_REDACTION_VERSION),
+        };
+        // Record `running` BEFORE spawning so a crash mid-run still reports honest
+        // status on restart. The reconciler has already released the state store
+        // (it closes around every spawn), so this open never self-contends.
+        self.record(record.clone()).await;
+
+        let outcome = self.inner.run(request).await;
+
+        record = finish_scheduler_job(record, outcome.exit_code);
+        self.record(record).await;
+
+        outcome
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,41 +189,5 @@ mod tests {
         assert!(!done.redaction_is_legacy());
         assert_eq!(done.error, None);
         assert_eq!(done.state, "succeeded");
-    }
-}
-
-#[async_trait]
-impl Spawner for JobsModelSpawner {
-    async fn run(&self, request: &SpawnRequest) -> RunOutcome {
-        let started = chrono::Utc::now().to_rfc3339();
-        // The job id IS the submission id: `GET /api/v1/jobs/{submission_id}`
-        // and the run's `run_history` entry share one key.
-        let mut record = PersistedJob {
-            job_id: request.submission_id.clone(),
-            kind: "run".to_string(),
-            state: job_state_str(JobState::Running).to_string(),
-            submitted_at: started.clone(),
-            started_at: Some(started),
-            finished_at: None,
-            principal: Some(SCHEDULER_PRINCIPAL.to_string()),
-            error: None,
-            result: None,
-            // The SECOND writer of a job record. Without this stamp every
-            // scheduler-run job would read as pre-redaction forever, and
-            // `GET /api/v1/jobs/{id}` would withhold its error for a record
-            // this binary wrote (#1897).
-            redaction_version: Some(rocky_core::state::CURRENT_REDACTION_VERSION),
-        };
-        // Record `running` BEFORE spawning so a crash mid-run still reports honest
-        // status on restart. The reconciler has already released the state store
-        // (it closes around every spawn), so this open never self-contends.
-        self.record(record.clone()).await;
-
-        let outcome = self.inner.run(request).await;
-
-        record = finish_scheduler_job(record, outcome.exit_code);
-        self.record(record).await;
-
-        outcome
     }
 }
