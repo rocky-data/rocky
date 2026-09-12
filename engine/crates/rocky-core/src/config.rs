@@ -2438,10 +2438,15 @@ fn substitute_env_vars_inner(input: &str) -> EnvExpansion {
         if let Some(sep_pos) = expr.find(":-") {
             let var_name = &expr[..sep_pos];
             let default_value = &expr[sep_pos + 2..];
-            let value = std::env::var(var_name)
-                .ok()
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| default_value.to_string());
+            let from_env = std::env::var(var_name).ok().filter(|v| !v.is_empty());
+            // Registered only when it came from the ENVIRONMENT. The literal
+            // in `${VAR:-default}` is written in the config in cleartext, so
+            // anyone who can read the file can already read it; redacting it
+            // would mangle diagnostics for no secrecy gain (#1897).
+            if let Some(value) = &from_env {
+                crate::secret_registry::register_substitution(var_name, value);
+            }
+            let value = from_env.unwrap_or_else(|| default_value.to_string());
             result.push_str(&value);
             substitutions.push(EnvVarSubstitution {
                 name: var_name.to_string(),
@@ -2450,6 +2455,7 @@ fn substitute_env_vars_inner(input: &str) -> EnvExpansion {
         } else {
             match std::env::var(expr) {
                 Ok(value) => {
+                    crate::secret_registry::register_substitution(expr, &value);
                     result.push_str(&value);
                     substitutions.push(EnvVarSubstitution {
                         name: expr.to_string(),
