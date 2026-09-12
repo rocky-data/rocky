@@ -274,6 +274,18 @@ pub enum ConfigError {
     SchemaPatternReservedComponent { pipeline: String, component: String },
 
     #[error(
+        "pipeline '{pipeline}' {field} is {separator:?}, which is outside the allowed set \
+         [A-Za-z0-9_.-]. A separator is spliced into generated SQL between the parts of a \
+         multi-valued component, so it may not contain a character that ends a string literal \
+         or begins new SQL."
+    )]
+    UnsafeSeparator {
+        pipeline: String,
+        field: String,
+        separator: String,
+    },
+
+    #[error(
         "[adapter.{adapter}.cache] backend = \"{backend}\" requires `{field}` — set the field \
          under [adapter.{adapter}.cache] or change `backend`"
     )]
@@ -6318,6 +6330,66 @@ pub fn validate_schema_pattern_reserved_components(config: &RockyConfig) -> Vec<
     errors
 }
 
+/// Refuse a separator outside `[A-Za-z0-9_.-]` (#1934).
+///
+/// A separator joins the parts of a multi-valued component, and the joined
+/// text is spliced into generated SQL. Three config fields reach that splice:
+///
+/// ```text
+/// source.schema_pattern.separator   the default
+/// target.separator                  overrides it for the target templates
+/// {name:SEP} inside a template      overrides both, for that placeholder
+/// ```
+///
+/// [`crate::schema::separator_is_safe`] is the rule; this only finds the
+/// strings. The same rule runs again at the splice, because a config built in
+/// code never passes through here.
+pub fn validate_separators(config: &RockyConfig) -> Vec<ConfigError> {
+    let mut errors = Vec::new();
+    for (pipeline_name, pipeline) in &config.pipelines {
+        let PipelineConfig::Replication(replication) = pipeline else {
+            continue;
+        };
+        let mut check = |field: &str, separator: &str| {
+            if !crate::schema::separator_is_safe(separator) {
+                errors.push(ConfigError::UnsafeSeparator {
+                    pipeline: pipeline_name.clone(),
+                    field: field.to_string(),
+                    separator: separator.to_string(),
+                });
+            }
+        };
+        check(
+            "source.schema_pattern.separator",
+            &replication.source.schema_pattern.separator,
+        );
+        if let Some(sep) = &replication.target.separator {
+            check("target.separator", sep);
+        }
+        let templates = [
+            (
+                "target.catalog_template",
+                &replication.target.catalog_template,
+            ),
+            (
+                "target.schema_template",
+                &replication.target.schema_template,
+            ),
+        ];
+        for (field, template) in templates {
+            for sep in crate::schema::inline_separators(template) {
+                check(field, &sep);
+            }
+        }
+        for mc in &replication.metadata_columns {
+            for sep in crate::schema::inline_separators(&mc.value) {
+                check("metadata_columns[].value", &sep);
+            }
+        }
+    }
+    errors
+}
+
 /// Does this adapter actively serve `role`?
 ///
 /// An adapter block actively serves a role when:
@@ -6809,6 +6881,7 @@ const CONFIG_VALIDATORS: &[ConfigValidator] = &[
     validate_adapter_kinds,
     validate_replication_strategies,
     validate_schema_pattern_reserved_components,
+    validate_separators,
     validate_replication_overrides,
     validate_fivetran_cache,
     validate_fivetran_resilience,
@@ -10111,6 +10184,98 @@ severity = "warning"
         assert_eq!(
             q.checks.row_count.severity(),
             crate::tests::TestSeverity::Warning
+        );
+    }
+
+    /// All three separator sources are refused at config load, so `rocky
+    /// validate` names the field instead of the operator finding out mid-run
+    /// (#1934).
+    #[test]
+    fn a_separator_outside_the_allowed_set_is_refused_at_config_load() {
+        let cfg =
+            |sep: &str, target_sep: &str, schema_template: &str, value: &str| -> RockyConfig {
+                let toml_str = format!(
+                    r#"
+[adapter.default]
+type = "duckdb"
+path = "/tmp/x.duckdb"
+
+[pipeline.bronze]
+type = "replication"
+metadata_columns = [
+    {{ name = "_regions", type = "VARCHAR", value = "{value}" }}
+]
+
+[pipeline.bronze.source]
+catalog = "raw_catalog"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "{sep}"
+components = ["tenant", "regions...", "source"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "{schema_template}"
+separator = "{target_sep}"
+"#
+                );
+                toml::from_str(&toml_str).expect("the fixture must parse")
+            };
+
+        // Controls: the separators this repo and its docs actually use.
+        for sep in ["__", "_", "-", "."] {
+            let errors = validate_separators(&cfg(sep, sep, "raw__{regions}", "'{regions}'"));
+            assert!(errors.is_empty(), "{sep:?} must be accepted: {errors:?}");
+        }
+
+        // Source 1: the pattern separator.
+        let errors = validate_separators(&cfg("'", "__", "raw__{regions}", "'{regions}'"));
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ConfigError::UnsafeSeparator { field, separator, .. }]
+                    if field == "source.schema_pattern.separator" && separator == "'"
+            ),
+            "got {errors:?}"
+        );
+
+        // Source 2: the target separator.
+        let errors = validate_separators(&cfg("__", " | ", "raw__{regions}", "'{regions}'"));
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ConfigError::UnsafeSeparator { field, separator, .. }]
+                    if field == "target.separator" && separator == " | "
+            ),
+            "got {errors:?}"
+        );
+
+        // Source 3: an inline pin, in each template that can carry one.
+        let errors = validate_separators(&cfg("__", "__", "raw__{regions:'}", "'{regions}'"));
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ConfigError::UnsafeSeparator { field, .. }] if field == "target.schema_template"
+            ),
+            "got {errors:?}"
+        );
+        let errors = validate_separators(&cfg("__", "__", "raw__{regions}", "'{regions: }'"));
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ConfigError::UnsafeSeparator { field, separator, .. }]
+                    if field == "metadata_columns[].value" && separator == " "
+            ),
+            "got {errors:?}"
+        );
+
+        // The registry runs it, so a bad separator fails the LOAD.
+        assert!(
+            CONFIG_VALIDATORS
+                .iter()
+                .any(|v| !v(&cfg("'", "__", "raw__{regions}", "'{regions}'")).is_empty()),
+            "validate_separators must be registered in CONFIG_VALIDATORS"
         );
     }
 

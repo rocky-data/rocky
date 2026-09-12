@@ -405,6 +405,23 @@ impl SchemaPattern {
     }
 }
 
+/// Every separator pinned inline as `{name:SEP}` in `template`.
+///
+/// Walks the template with the same parser that renders it, so the two cannot
+/// drift. Used by config-load validation (#1934).
+pub fn inline_separators(template: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    render_placeholders(template, |_name, sep, _out| {
+        if let Some(sep) = sep {
+            found.push(sep.to_string());
+        }
+        // Leave the placeholder alone: this walk reads the template, it does
+        // not render it.
+        false
+    });
+    found
+}
+
 /// Walks `template` the way a name is rendered from it, so every reader of
 /// the placeholder grammar shares one implementation.
 ///
