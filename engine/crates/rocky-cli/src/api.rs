@@ -2417,7 +2417,54 @@ pub(crate) fn job_state_str(state: JobState) -> &'static str {
 /// Build the API presentation type from the durable record. Unknown persisted
 /// `kind`/`state` strings (only reachable from a malformed record) fall back to
 /// safe defaults rather than failing the read.
+/// Strip resolved `${VAR}` values from a job's terminal outcome, before it is
+/// cached or written (#1897).
+///
+/// A pure function on purpose. The alternative is scrubbing inside the spawn
+/// path, and nothing in `cargo test -p rocky-cli --lib` can reach that: the
+/// subprocess is `current_exe`, which is the test harness. Here the seam is
+/// callable directly, so the behaviour is pinned by unit test rather than by
+/// an end-to-end run nobody can drive.
+///
+/// It is also the chokepoint rather than one caller: the spawn path is the only
+/// writer today, and a second one would otherwise be unscrubbed.
+///
+/// `result` is the child's stdout verbatim — a whole `RunOutput` carrying
+/// targets, model names and attempt trails. It is rewritten as text and
+/// re-parsed; if the rewrite breaks the JSON (a registered value in a
+/// non-string position), the payload is REPLACED rather than stored, because
+/// an unparseable blob on disk is worse than a named absence.
+pub(crate) fn scrub_job_outcome(
+    result: Option<serde_json::Value>,
+    error: Option<String>,
+) -> (Option<serde_json::Value>, Option<String>, u32) {
+    let scrub = |text: &str| {
+        crate::secret_filter::redact_truncated_tail(&crate::secret_filter::redact(text))
+    };
+
+    let result = result.map(|value| {
+        let Ok(text) = serde_json::to_string(&value) else {
+            return serde_json::json!({ "redaction": "result_unserializable" });
+        };
+        match serde_json::from_str::<serde_json::Value>(&scrub(&text)) {
+            Ok(scrubbed) => scrubbed,
+            Err(_) => {
+                serde_json::json!({ "redaction": "result_withheld_unparseable_after_redaction" })
+            }
+        }
+    });
+    let error = error.map(|text| scrub(&text));
+
+    (result, error, rocky_core::state::CURRENT_REDACTION_VERSION)
+}
+
 fn job_status_from(job: PersistedJob) -> JobStatus {
+    // A record written before the scrub existed may hold an unredacted result
+    // or error, and nothing distinguishes a safe legacy string from one
+    // carrying a resolved value. Lifecycle fields still answer — a poller
+    // waiting for a terminal state is not left hanging — but the two payload
+    // fields are withheld (#1897).
+    let legacy = job.redaction_is_legacy();
     JobStatus {
         kind: JobKind::parse(&job.kind).unwrap_or(JobKind::Run),
         state: JobState::parse(&job.state).unwrap_or(JobState::Failed),
@@ -2426,8 +2473,8 @@ fn job_status_from(job: PersistedJob) -> JobStatus {
         started_at: job.started_at,
         finished_at: job.finished_at,
         principal: job.principal,
-        error: job.error,
-        result: job.result,
+        error: if legacy { None } else { job.error },
+        result: if legacy { None } else { job.result },
     }
 }
 
@@ -2599,6 +2646,8 @@ async fn submit_job(
         principal,
         error: None,
         result: None,
+        // Stamped at creation; the terminal write re-stamps after scrubbing.
+        redaction_version: Some(rocky_core::state::CURRENT_REDACTION_VERSION),
     };
 
     let state_path = state_path_for(&state);
@@ -2639,8 +2688,13 @@ async fn submit_job(
         let mut done = record;
         done.state = job_state_str(final_state).to_string();
         done.finished_at = Some(chrono::Utc::now().to_rfc3339());
+        // Before the cache and before the write, so neither holds a resolved
+        // value even briefly, and a reader that races the persist sees the
+        // same bytes a restart would (#1897).
+        let (result, error, version) = scrub_job_outcome(result, error);
         done.result = result;
         done.error = error;
+        done.redaction_version = Some(version);
         task_state.jobs.upsert(done.clone()).await;
         if let Err(e) = persist_job(&task_state, state_path, done.clone()).await {
             tracing::warn!(error = %e, job_id = %done.job_id,
@@ -2998,6 +3052,118 @@ mod tests {
              failed. Body length: {} bytes",
             body.len()
         );
+    }
+
+    /// #1897 PR2. The child's stdout is scrubbed before it is cached or
+    /// written, so neither the in-memory record nor the durable one holds a
+    /// resolved value.
+    #[test]
+    fn a_job_result_is_scrubbed_before_it_is_stored() {
+        let secret = "JOBSCRUB-PROBE-8e26660e-VALUE";
+        rocky_core::secret_registry::register_substitution("ROCKY_JOBSCRUB", secret);
+
+        let child_stdout = serde_json::json!({
+            "version": "1",
+            "command": "run",
+            "materializations": [{ "target": format!("{secret}.marts.orders") }],
+        });
+        let (result, error, version) =
+            scrub_job_outcome(Some(child_stdout), Some(format!("failed at {secret}")));
+
+        let rendered = serde_json::to_string(&result.expect("a result")).expect("serializes");
+        assert!(
+            !rendered.contains(secret),
+            "the stored result still holds it: {rendered}"
+        );
+        assert!(rendered.contains("${ROCKY_JOBSCRUB}"), "{rendered}");
+
+        let error = error.expect("an error");
+        assert!(
+            !error.contains(secret),
+            "the stored error still holds it: {error}"
+        );
+        assert_eq!(version, rocky_core::state::CURRENT_REDACTION_VERSION);
+    }
+
+    /// A result the rewrite would break is REPLACED, not stored. An
+    /// unparseable blob on disk is worse than a named absence, and it would
+    /// fail every later read rather than this one write.
+    #[test]
+    fn a_result_that_cannot_survive_the_rewrite_is_withheld_not_corrupted() {
+        // 10 digits: above the floor, and it lands in a NUMERIC position.
+        let numeric = "1234509876";
+        rocky_core::secret_registry::register_substitution("ROCKY_JOBSCRUB_NUM", numeric);
+
+        let child_stdout = serde_json::json!({ "max_downstreams": 1234509876u64 });
+        let (result, _, _) = scrub_job_outcome(Some(child_stdout), None);
+
+        let result = result.expect("a result");
+        assert_eq!(
+            result["redaction"], "result_withheld_unparseable_after_redaction",
+            "a rewrite that breaks the JSON must withhold, not store: {result}"
+        );
+    }
+
+    /// #1897 PR2. A record written before the scrub existed serves its
+    /// lifecycle fields and withholds both payload fields — nothing
+    /// distinguishes a safe legacy string from one carrying a resolved value.
+    ///
+    /// Legacy is ABSENT **or** BELOW the floor. Pinning both means the
+    /// comparison is live from the start, instead of the first tightening
+    /// needing a second marker.
+    #[test]
+    fn a_legacy_job_record_serves_status_and_withholds_its_payload() {
+        let base = PersistedJob {
+            job_id: "job-legacy".to_string(),
+            kind: "run".to_string(),
+            state: "failed".to_string(),
+            submitted_at: "2026-09-11T00:00:00Z".to_string(),
+            started_at: Some("2026-09-11T00:00:01Z".to_string()),
+            finished_at: Some("2026-09-11T00:00:02Z".to_string()),
+            principal: Some("someone".to_string()),
+            error: Some("PRE-FIX-ERROR-TEXT".to_string()),
+            result: Some(serde_json::json!({ "pre": "fix" })),
+            redaction_version: None,
+        };
+
+        for version in [None, Some(0)] {
+            let job = PersistedJob {
+                redaction_version: version,
+                ..base.clone()
+            };
+            let status = job_status_from(job);
+            assert!(
+                status.result.is_none(),
+                "legacy {version:?} served a result"
+            );
+            assert!(status.error.is_none(), "legacy {version:?} served an error");
+            // The lifecycle half still answers, so a poller waiting for a
+            // terminal state is not left hanging.
+            assert_eq!(status.job_id, "job-legacy");
+            assert!(status.finished_at.is_some());
+        }
+
+        // At or above the floor, INCLUDING a version this binary does not know:
+        // the monotonic-strictness contract says a newer rule redacts at least
+        // as hard, so refusing it would lose data that is not at risk.
+        for version in [
+            Some(rocky_core::state::MIN_TRUSTED_REDACTION_VERSION),
+            Some(999),
+        ] {
+            let job = PersistedJob {
+                redaction_version: version,
+                ..base.clone()
+            };
+            let status = job_status_from(job);
+            assert!(
+                status.result.is_some(),
+                "trusted {version:?} withheld a result"
+            );
+            assert!(
+                status.error.is_some(),
+                "trusted {version:?} withheld an error"
+            );
+        }
     }
 
     /// Reference bytes for a canonical output: exactly what
@@ -6624,6 +6790,11 @@ mod tests {
             principal: None,
             error: None,
             result: None,
+            // A fixture for lifecycle tests, so it is stamped current: an
+            // unstamped one would read as pre-redaction and have its payload
+            // withheld, which is a different behaviour than these tests mean
+            // to exercise.
+            redaction_version: Some(rocky_core::state::CURRENT_REDACTION_VERSION),
         }
     }
 

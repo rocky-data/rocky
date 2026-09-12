@@ -79,6 +79,11 @@ impl Spawner for JobsModelSpawner {
             principal: Some(SCHEDULER_PRINCIPAL.to_string()),
             error: None,
             result: None,
+            // The SECOND writer of a job record. Without this stamp every
+            // scheduler-run job would read as pre-redaction forever, and
+            // `GET /api/v1/jobs/{id}` would withhold its error for a record
+            // this binary wrote (#1897).
+            redaction_version: Some(rocky_core::state::CURRENT_REDACTION_VERSION),
         };
         // Record `running` BEFORE spawning so a crash mid-run still reports honest
         // status on restart. The reconciler has already released the state store
@@ -99,7 +104,13 @@ impl Spawner for JobsModelSpawner {
         };
         record.state = job_state_str(state).to_string();
         record.finished_at = Some(chrono::Utc::now().to_rfc3339());
+        // Through the same seam as the API's spawn path. This message is a
+        // fixed template with an exit code, so nothing can be in it today —
+        // routed anyway, because "this particular string is safe" is an
+        // argument that stops being true when someone edits the string.
+        let (_, error, version) = crate::api::scrub_job_outcome(None, error);
         record.error = error;
+        record.redaction_version = Some(version);
         self.record(record).await;
 
         outcome

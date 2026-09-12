@@ -335,6 +335,7 @@ mod tests {
             principal: None,
             error: None,
             result: None,
+            redaction_version: Some(rocky_core::state::CURRENT_REDACTION_VERSION),
         }
     }
 

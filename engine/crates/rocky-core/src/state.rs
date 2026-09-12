@@ -3118,9 +3118,57 @@ pub struct PersistedJob {
     #[serde(default)]
     pub error: Option<String>,
     /// The canonical `RunOutput` / `PlanOutput` / `ApplyOutput` the underlying
-    /// `rocky <kind>` subprocess emitted, embedded verbatim, once terminal.
+    /// `rocky <kind>` subprocess emitted, once terminal.
+    ///
+    /// Scrubbed of resolved `${VAR}` values before it is written — see
+    /// [`PersistedJob::redaction_version`]. A record whose version is absent
+    /// or below the trusted floor was written before that scrub existed and
+    /// is served without this field.
     #[serde(default)]
     pub result: Option<serde_json::Value>,
+    /// Which redaction rule was applied to `result` and `error` when this
+    /// record was written. Absent on every record written before the rule
+    /// existed, which is exactly the legacy signal — no migration needed,
+    /// because every field on this struct already defaults.
+    ///
+    /// An integer rather than a bool: a bool cannot say "redacted under an
+    /// older, weaker rule", and the rule is expected to tighten when CLI
+    /// output and logs come into scope.
+    ///
+    /// **Contract, and a future version may only be introduced under it:**
+    /// redaction versions are monotonically non-decreasing in strictness. A
+    /// version may only be introduced for a rule at least as strict as every
+    /// version below it. A future rule that shows MORE needs a different
+    /// mechanism, not a higher number here. Without that rule
+    /// `>= MIN_TRUSTED_REDACTION_VERSION` would be trusting an assumption
+    /// nothing enforces.
+    #[serde(default)]
+    pub redaction_version: Option<u32>,
+}
+
+/// The redaction rule applied to a job record written by this binary.
+pub const CURRENT_REDACTION_VERSION: u32 = 1;
+
+/// The oldest rule whose output is still served.
+///
+/// A record at or above this is trusted, INCLUDING a version this binary does
+/// not recognise: under the monotonic-strictness contract on
+/// [`PersistedJob::redaction_version`] a newer rule redacts at least as hard,
+/// and refusing its records would make a downgrade lose data that is not at
+/// risk.
+pub const MIN_TRUSTED_REDACTION_VERSION: u32 = 1;
+
+impl PersistedJob {
+    /// Whether this record predates the redaction rule, so its `result` and
+    /// `error` must not be served.
+    ///
+    /// Absent OR below the floor — not absent alone. Defining it as a
+    /// comparison from the start means the mechanism already works the first
+    /// time the rule tightens, instead of needing a second marker then.
+    pub fn redaction_is_legacy(&self) -> bool {
+        self.redaction_version
+            .is_none_or(|v| v < MIN_TRUSTED_REDACTION_VERSION)
+    }
 }
 
 impl PersistedJob {
@@ -13746,6 +13794,7 @@ mod tests {
             principal: Some("ci@example.com".to_string()),
             error: None,
             result: None,
+            redaction_version: Some(CURRENT_REDACTION_VERSION),
         }
     }
 
