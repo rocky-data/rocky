@@ -45,7 +45,7 @@ schema_template = "staging__{regions}__{source}"
 | Field | Description |
 |---|---|
 | `prefix` | String prefix to strip before parsing. Schemas that don't start with this prefix are skipped. |
-| `separator` | Delimiter between components. |
+| `separator` | Delimiter between components. Letters, digits, `_`, `.` and `-` only. |
 | `components` | Ordered list of named components to extract from the schema name. |
 
 ## Component types
@@ -174,7 +174,7 @@ Grammar:
 | Form | Behavior |
 |---|---|
 | `{name}` | Bare form — multi-valued components join with the caller-supplied default separator. |
-| `{name:SEP}` | Explicit form — multi-valued components join with the literal string `SEP` (may be empty, single-, or multi-character). The closing `}` terminates `SEP`, so a literal `}` cannot appear inside it. |
+| `{name:SEP}` | Explicit form — multi-valued components join with the literal string `SEP` (may be empty, single-, or multi-character). Letters, digits, `_`, `.` and `-` only. The closing `}` terminates `SEP`, so a literal `}` cannot appear inside it. |
 
 Rocky ignores `:SEP` when `name` resolves to a single-valued component. You can therefore switch a component from single to variadic without updating every template.
 

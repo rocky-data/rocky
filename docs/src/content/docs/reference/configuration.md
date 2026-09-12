@@ -243,7 +243,7 @@ Teach Rocky to read structure out of your source schema names. It can then route
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `prefix` | string | Yes | Prefix that identifies managed schemas (e.g., `"src__"`). |
-| `separator` | string | Yes | Separator between components (e.g., `"__"`). |
+| `separator` | string | Yes | Separator between components (e.g., `"__"`). Letters, digits, `_`, `.` and `-` only. |
 | `components` | list of strings | Yes | Ordered list of component names. A trailing `"..."` marks a component as multi-valued. |
 
 ```toml
