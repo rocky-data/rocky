@@ -672,14 +672,16 @@ pub(crate) async fn discover_branch_targets_for_plan(
 
     let planned = discover_branch_targets(config_path, record, filter, pipeline_name).await?;
 
-    Ok(planned
+    planned
         .into_iter()
-        .map(|p| PlannedPromoteWithSql {
-            target: p.prod.full_name(),
-            source: p.branch_source.full_name(),
-            statement: build_promote_sql(dialect, &p.prod, &p.branch_source),
+        .map(|p| {
+            Ok(PlannedPromoteWithSql {
+                target: p.prod.full_name(),
+                source: p.branch_source.full_name(),
+                statement: build_promote_sql(dialect, &p.prod, &p.branch_source)?,
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Run the approval gate for a branch, updating `audit` and returning
@@ -987,21 +989,47 @@ fn build_promote_sql(
     dialect: &dyn rocky_core::traits::SqlDialect,
     prod: &TargetRef,
     branch_source: &TargetRef,
-) -> String {
-    format!(
+) -> Result<String> {
+    Ok(format!(
         "CREATE OR REPLACE TABLE {} AS SELECT * FROM {}",
-        quote_fqn(dialect, prod),
-        quote_fqn(dialect, branch_source),
-    )
+        quote_fqn(dialect, prod)?,
+        quote_fqn(dialect, branch_source)?,
+    ))
 }
 
-fn quote_fqn(dialect: &dyn rocky_core::traits::SqlDialect, target: &TargetRef) -> String {
-    format!(
+fn quote_fqn(dialect: &dyn rocky_core::traits::SqlDialect, target: &TargetRef) -> Result<String> {
+    Ok(format!(
         "{}.{}.{}",
-        dialect.quote_identifier(&target.catalog),
-        dialect.quote_identifier(&target.schema),
-        dialect.quote_identifier(&target.table),
-    )
+        quote_part(dialect, &target.catalog)?,
+        quote_part(dialect, &target.schema)?,
+        quote_part(dialect, &target.table)?,
+    ))
+}
+
+/// Quote one name part, refusing a name that carries the dialect's own quote
+/// delimiter (#1939).
+///
+/// `quote_identifier` wraps and does not escape, so a delimiter inside the
+/// name ends the identifier early. Every other character is contained by the
+/// quoting, which is why this is not the SQL-identifier allowlist: a branch
+/// name may carry `-` or `.` by design (`validate_branch_name`), and those
+/// still promote.
+///
+/// The delimiter is read back from the dialect rather than listed here, so a
+/// dialect that quotes differently is covered without a second table.
+fn quote_part(dialect: &dyn rocky_core::traits::SqlDialect, part: &str) -> Result<String> {
+    let quoted = dialect.quote_identifier(part);
+    let Some(delimiter) = quoted.chars().next() else {
+        anyhow::bail!("dialect produced no quoting for target name part '{part}'");
+    };
+    if part.contains(delimiter) {
+        anyhow::bail!(
+            "target name part '{part}' contains the quote character {delimiter:?} this \
+             warehouse uses for identifiers. Rocky quotes each part of a promote target \
+             and does not escape, so the name would not survive. Rename the target."
+        );
+    }
+    Ok(quoted)
 }
 
 /// Enumerate the promote plan for a branch.
@@ -2269,11 +2297,68 @@ mod tests {
             schema: "branch__live-test".to_string(),
             table: "orders".to_string(),
         };
-        let sql = build_promote_sql(&dialect, &prod, &branch_source);
+        let sql = build_promote_sql(&dialect, &prod, &branch_source).unwrap();
         assert_eq!(
             sql,
             r#"CREATE OR REPLACE TABLE "playground"."staging__orders"."orders" AS SELECT * FROM "playground"."branch__live-test"."orders""#,
         );
+    }
+
+    /// `quote_identifier` wraps a name in the dialect's delimiter and does
+    /// not escape, so a name carrying that delimiter ends the identifier
+    /// early. `build_promote_sql` must refuse it (#1939).
+    ///
+    /// ```text
+    ///   "north"america"     the wrap ends at the inner quote
+    ///    ^     ^            one identifier, then loose text
+    /// ```
+    ///
+    /// Both names are checked. `shadow_target` copies `catalog` and `table`
+    /// from the production target, so the branch source carries the same
+    /// unchecked parts.
+    #[test]
+    fn build_promote_sql_refuses_a_name_carrying_the_quote_delimiter() {
+        let duckdb = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let databricks = rocky_databricks::dialect::DatabricksSqlDialect;
+
+        let plain = |schema: &str| TargetRef {
+            catalog: "playground".to_string(),
+            schema: schema.to_string(),
+            table: "orders".to_string(),
+        };
+
+        // Control: a hyphen is not a delimiter. Branch names carry hyphens by
+        // design — `validate_branch_name` allows [A-Za-z0-9_.-] — and the
+        // quoting is what makes them safe. This must keep working.
+        let sql = build_promote_sql(
+            &duckdb,
+            &plain("staging__orders"),
+            &plain("branch__live-test"),
+        )
+        .expect("a hyphenated branch name must still promote");
+        assert_eq!(
+            sql,
+            r#"CREATE OR REPLACE TABLE "playground"."staging__orders"."orders" AS SELECT * FROM "playground"."branch__live-test"."orders""#,
+        );
+
+        // The production target is refused.
+        build_promote_sql(&duckdb, &plain("north\"america"), &plain("branch__live"))
+            .expect_err("a double quote must be refused on the DuckDB dialect");
+
+        // So is the branch source: both names reach the statement.
+        build_promote_sql(&duckdb, &plain("staging"), &plain("north\"america"))
+            .expect_err("the branch source is checked too");
+
+        // The delimiter is per dialect. Databricks quotes with backticks, so
+        // a backtick is the hazard there and a double quote is not.
+        build_promote_sql(&databricks, &plain("north`america"), &plain("branch__live"))
+            .expect_err("a backtick must be refused on the Databricks dialect");
+        build_promote_sql(
+            &databricks,
+            &plain("north\"america"),
+            &plain("branch__live"),
+        )
+        .expect("a double quote is contained by backtick quoting");
     }
 
     /// `load_approvals_for_branch` returns empty when the directory does
