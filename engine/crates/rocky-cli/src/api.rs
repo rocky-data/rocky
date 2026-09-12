@@ -255,10 +255,16 @@ pub fn router(state: Arc<ServerState>) -> Router {
 
 /// Start the HTTP server.
 ///
-/// Before the router serves, persisted jobs stranded in a non-terminal state
-/// by a previous sidecar process are swept to `failed` (see
-/// [`sweep_interrupted_jobs`]) so embedders polling `GET /api/v1/jobs/{id}`
-/// until a terminal state never poll a dead job forever.
+/// Before the router serves, persisted jobs left IN FLIGHT — `running` or
+/// `queued` — by a previous sidecar process are swept to `failed` (see
+/// [`sweep_interrupted_jobs`]).
+///
+/// A record in any other non-terminal state is deliberately left alone. It was
+/// written by a version this one does not know, and rewriting it would destroy
+/// a payload this version cannot reproduce. Nothing is stranded either way:
+/// `job_status_from` renders an unrecognized state as terminal `failed`, so a
+/// poller on `GET /api/v1/jobs/{id}` sees a terminal state whether or not the
+/// sweep touched the record.
 ///
 /// # Errors
 ///
@@ -2602,12 +2608,18 @@ pub(crate) fn sweep_interrupted_jobs(state_path: &std::path::Path) -> anyhow::Re
         // here and the clear below would delete that result. That contradicts
         // the preservation contract on `MIN_TRUSTED_REDACTION_VERSION`.
         //
-        // Skipping them costs nothing observable: `job_status_from` renders
-        // `JobState::parse(&job.state).unwrap_or(JobState::Failed)`, the only
-        // parse site in the workspace, and every route renders through it. So
-        // an unrecognized state ALREADY reads as terminal `failed` to a poller
-        // whether or not this sweep touches it. The record keeps its payload
-        // and this version asserts nothing about it.
+        // Skipping them costs nothing ON THE HTTP SURFACE: `job_status_from`
+        // renders `JobState::parse(&job.state).unwrap_or(JobState::Failed)`,
+        // the only parse site in the workspace, and every route renders
+        // through it. So an unrecognized state ALREADY reads as terminal
+        // `failed` to a polling embedder whether or not this sweep runs.
+        //
+        // NOT "nothing observable anywhere", which is a claim this cannot
+        // support: `StateStore::{get_job,list_jobs}` and `JobRegistry::get`
+        // return the raw record, so an in-process Rust consumer sees the
+        // stored string itself. That is the intended outcome. The state
+        // belongs to the version that wrote it, and leaving it verbatim is
+        // the only answer this version can give honestly.
         if !job.is_in_flight() {
             continue;
         }
@@ -3421,14 +3433,22 @@ mod tests {
     /// Codex B. A value that no single field contains and the RECORD does,
     /// because serialization composes them.
     ///
-    /// `principal`, `error` and `result` are adjacent and all three serialize
-    /// as `null` when empty, so the span below sits across the `error` value
-    /// and the `result` key. A field-level check cannot see it: it is not in
-    /// `error`, not in `result`, and not in the `(result, error)` tuple the
-    /// earlier test serializes, which carries neither field names nor order.
+    /// `principal` and `error` are adjacent, so the span below sits across the
+    /// END of the principal value and the `error` key that follows it. A
+    /// field-level check cannot see it: it is in neither field, nor in the
+    /// `(result, error)` tuple the earlier test serializes, which carries
+    /// neither field names nor order.
+    ///
+    /// **The span carries its own entropy on purpose.** A structural span like
+    /// `null,"result":null` would also work here and would be far worse: the
+    /// registry is process-global and monotonic, so registering a generic
+    /// structural string permanently changes every later test whose record has
+    /// those fields empty — including the principal test above, whose sink
+    /// would then fire for the wrong reason while still passing.
     #[test]
     fn a_value_spanning_two_record_fields_is_caught_at_the_sink() {
-        let span = "null,\"result\":null";
+        let principal = "SPANBOUNDARY-4f1a77c3";
+        let span = "4f1a77c3\",\"error\":null";
         assert!(
             span.len() >= rocky_core::secret_registry::SECRET_LENGTH_FLOOR,
             "PRECONDITION: the span must be registerable"
@@ -3436,8 +3456,13 @@ mod tests {
         rocky_core::secret_registry::register_substitution("ROCKY_SINK_SPAN", span);
 
         let mut job = persisted_job("sink-span", "failed");
+        job.principal = Some(principal.to_string());
         job.error = None;
-        job.result = None;
+        assert!(
+            !principal.contains(span),
+            "PRECONDITION: no single field may contain the span, or this is \
+             not testing the seam"
+        );
         let serialized = serde_json::to_string(&job).expect("serializes");
         assert!(
             serialized.contains(span),
@@ -7416,9 +7441,11 @@ mod tests {
         );
     }
 
-    /// The sweep reconciles ONLY non-terminal records: `running` and `queued`
+    /// The sweep reconciles ONLY in-flight records: `running` and `queued`
     /// flip to `failed` with the documented error, while terminal
-    /// `succeeded`/`failed` history is untouched. A missing state file is a
+    /// `succeeded`/`failed` history is untouched. An unrecognized state is
+    /// neither, and `the_sweep_leaves_an_unrecognized_state_untouched` covers
+    /// that third case. A missing state file is a
     /// no-op, not an error (fresh project, nothing ever persisted).
     #[test]
     fn sweep_marks_only_in_flight_jobs_failed() {
@@ -7676,8 +7703,11 @@ mod tests {
         );
         assert!(
             !unknown.is_terminal(),
-            "an unrecognized state must not read as terminal — this version \
-             cannot claim a job finished in a state it does not know"
+            "an unrecognized state must not read as terminal TO THIS \
+             PREDICATE, which classifies the stored string and makes no claim \
+             about a state this version does not know. `job_status_from` \
+             separately renders it as `failed` — a rendering fallback at the \
+             API boundary, not this classification"
         );
     }
 

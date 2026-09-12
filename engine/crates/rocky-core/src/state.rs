@@ -3222,7 +3222,11 @@ impl PersistedJob {
     /// caller should reconcile one on that reasoning. `rocky-cli` renders a
     /// record through one parse site, `JobState::parse(&state)` with an
     /// `unwrap_or(JobState::Failed)` fallback, so an unrecognized state already
-    /// reads as terminal at the API boundary. A caller that instead REWRITES
+    /// reads as terminal at the API boundary. That fallback is a RENDERING
+    /// step, not storage: [`StateStore::get_job`](crate::state::StateStore) and
+    /// `list_jobs` hand back the stored string verbatim, so an in-process
+    /// consumer sees the unrecognized state itself. A caller that instead
+    /// REWRITES
     /// such a record destroys data: `state` is a plain string precisely so a
     /// newer sidecar can add a terminal state, and its record carries a real
     /// result. See `MIN_TRUSTED_REDACTION_VERSION` for the same contract stated
