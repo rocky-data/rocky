@@ -57,6 +57,7 @@ pub mod run_vars;
 pub mod schedule;
 pub mod schema;
 pub mod schema_cache;
+pub mod secret_registry;
 pub mod seeds;
 pub mod shadow;
 pub mod snapshots;

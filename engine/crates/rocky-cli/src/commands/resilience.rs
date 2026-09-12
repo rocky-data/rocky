@@ -38,7 +38,7 @@ use crate::output::MaterializationOutput;
 
 /// Longest error message stored on an [`AttemptRecord`]; longer messages are
 /// truncated so the state blob stays bounded.
-const MAX_ATTEMPT_ERROR_LEN: usize = 500;
+pub(crate) const MAX_ATTEMPT_ERROR_LEN: usize = 500;
 
 /// The resolved policy + budget the run loop applies to one run's retries.
 ///
@@ -255,10 +255,27 @@ pub(crate) fn classify_anyhow(
 }
 
 /// Render an error to a single bounded line for the attempt trail.
+///
+/// **Redacts before truncating, and the order is the point (#1897).** This
+/// message reaches the wire: it is stored on `AttemptRecord::error`, copied
+/// verbatim onto `MaterializationOutput::attempts`, and served by
+/// `GET /api/v1/runs`. The response filter rewrites a resolved `${VAR}` value
+/// wherever it appears — but only if it can still see the whole value. A cut
+/// that lands mid-value leaves a PREFIX the filter cannot match, and a partial
+/// credential ships. Redacting first means the bytes being cut are already
+/// `${NAME}`.
+///
+/// The boundary walk is not cosmetic either: `String::truncate` panics when
+/// the index is not a char boundary, and `{err:#}` can carry any UTF-8 a
+/// warehouse chose to put in a message.
 fn truncate_error(err: &anyhow::Error) -> String {
-    let mut msg = format!("{err:#}");
+    let mut msg = crate::secret_filter::redact(&format!("{err:#}"));
     if msg.len() > MAX_ATTEMPT_ERROR_LEN {
-        msg.truncate(MAX_ATTEMPT_ERROR_LEN);
+        let mut cut = MAX_ATTEMPT_ERROR_LEN;
+        while cut > 0 && !msg.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        msg.truncate(cut);
         msg.push('…');
     }
     msg
