@@ -1268,6 +1268,113 @@ mod unit_tests {
             .expect("an ordinary predicate must still compile");
     }
 
+    /// The call site really threads ITS dialect through to the parser.
+    ///
+    /// Every other test here uses `TestDialect`, which does not override
+    /// `name()`, so it takes the trait default `"unknown"` and
+    /// `dialect_for` hands back `GenericDialect`. That means none of them
+    /// could catch a call site that passed the WRONG dialect — they would
+    /// all parse generically and agree.
+    ///
+    /// `a->'k'` is the discriminator: `GenericDialect` parses it,
+    /// `SnowflakeDialect` does not. So the same expression at the same call
+    /// site must be accepted under one and refused under the other, and that
+    /// difference can only come from the name being threaded.
+    #[test]
+    fn the_call_site_threads_its_own_dialect_to_the_parser() {
+        // Everything but `name()` delegates to TestDialect, so the ONLY
+        // difference between the two runs below is the dialect name.
+        struct SnowflakeNamed;
+        impl SqlDialect for SnowflakeNamed {
+            fn name(&self) -> &'static str {
+                "snowflake"
+            }
+            fn literal_escape(&self) -> crate::traits::LiteralEscape {
+                TestDialect.literal_escape()
+            }
+            fn format_table_ref(&self, c: &str, s: &str, t: &str) -> AdapterResult<String> {
+                TestDialect.format_table_ref(c, s, t)
+            }
+            fn create_table_as(&self, target: &str, select_sql: &str) -> String {
+                TestDialect.create_table_as(target, select_sql)
+            }
+            fn insert_into(&self, a: &str, b: &str) -> String {
+                TestDialect.insert_into(a, b)
+            }
+            fn merge_into(
+                &self,
+                a: &str,
+                b: &str,
+                c: &[std::sync::Arc<str>],
+                d: &ColumnSelection,
+            ) -> AdapterResult<String> {
+                TestDialect.merge_into(a, b, c, d)
+            }
+            fn select_clause(
+                &self,
+                a: &ColumnSelection,
+                b: &[MetadataColumn],
+            ) -> AdapterResult<String> {
+                TestDialect.select_clause(a, b)
+            }
+            fn watermark_where(
+                &self,
+                a: &str,
+                b: Option<&chrono::DateTime<chrono::Utc>>,
+            ) -> AdapterResult<String> {
+                TestDialect.watermark_where(a, b)
+            }
+            fn describe_table_sql(&self, t: &str) -> String {
+                TestDialect.describe_table_sql(t)
+            }
+            fn drop_table_sql(&self, t: &str) -> String {
+                TestDialect.drop_table_sql(t)
+            }
+            fn create_catalog_sql(&self, a: &str) -> Option<AdapterResult<String>> {
+                TestDialect.create_catalog_sql(a)
+            }
+            fn create_schema_sql(&self, a: &str, b: &str) -> Option<AdapterResult<String>> {
+                TestDialect.create_schema_sql(a, b)
+            }
+            fn tablesample_clause(&self, a: u32) -> Option<String> {
+                TestDialect.tablesample_clause(a)
+            }
+            fn insert_overwrite_partition(
+                &self,
+                a: &str,
+                b: &str,
+                c: &str,
+            ) -> AdapterResult<Vec<String>> {
+                TestDialect.insert_overwrite_partition(a, b, c)
+            }
+        }
+
+        let cfg = split_config();
+        let assertions = || {
+            vec![assertion(
+                None,
+                TestType::Expression {
+                    expression: "(a->'k') IS NOT NULL".into(),
+                },
+                None,
+                TestSeverity::Error,
+            )]
+        };
+
+        // TestDialect -> name() defaults to "unknown" -> GenericDialect, which
+        // parses the operator.
+        compile_quarantine_sql(&assertions(), "orders", &table(), &TestDialect, &cfg)
+            .expect("the generic parser accepts this operator");
+
+        // The same expression, same call site, a dialect NAMED snowflake.
+        // Refused under snowflake, where `->` is the LAMBDA arrow rather than
+        // a JSON operator — so the same text parses to a different AST and
+        // the walker refuses it. The reason does not matter here; the
+        // DIFFERENCE does, and it can only come from the name being threaded.
+        compile_quarantine_sql(&assertions(), "orders", &table(), &SnowflakeNamed, &cfg)
+            .expect_err("the snowflake parser must not accept this operator");
+    }
+
     /// The `filter` reaches the same CTAS as the predicate, so it gets the
     /// same boundary. Guarding only `expression` would close one door and
     /// leave an identical one beside it — which is what the independent review
