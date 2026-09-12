@@ -122,7 +122,7 @@ The polled result is the same payload the CLI would have produced.
 
 A submitted job becomes `running` right away. The schema also declares a `queued` state, but this server never uses it, because submissions never sit in a queue. Poll until the state is `succeeded` or `failed` rather than matching on the full set.
 
-There is no cancel route and no timeout route today. A mutating job holds the single mutation lane until its subprocess exits. While that lane is held, the next `run` or `apply` submission returns `409`, so a hung job blocks the next one. Restarting the sidecar is the only way to clear it. On restart the server reconciles its durable job ledger: it marks any job the previous process left non-terminal as `failed`, with the error `interrupted by engine restart`. A client that polls for a terminal state therefore always terminates. A cancel route is planned.
+There is no cancel route and no timeout route today. A mutating job holds the single mutation lane until its subprocess exits. While that lane is held, the next `run` or `apply` submission returns `409`, so a hung job blocks the next one. Restarting the sidecar is the only way to clear it. On restart the server reconciles its durable job ledger: it marks any job the previous process left `running` or `queued` as `failed`, with the error `interrupted by engine restart`. A client that polls for a terminal state therefore always terminates — a state this version does not recognise is reported as `failed` when the record is read, so polling ends either way. A cancel route is planned.
 
 ### Every failure carries an error envelope
 

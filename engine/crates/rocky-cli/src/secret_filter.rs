@@ -383,6 +383,36 @@ pub fn any_value_survives(body: &str) -> bool {
     found
 }
 
+/// Whether any object KEY in this document carries a registered value.
+///
+/// Keys are the one position a text rewrite cannot handle. Two distinct keys
+/// whose names both contain a registered value are rewritten to the SAME
+/// replacement, and re-parsing a document with duplicate keys keeps only one —
+/// so the record loses a field while still parsing cleanly and looking
+/// complete. A caller that cannot rewrite keys safely should withhold the
+/// whole payload instead (#1897).
+pub fn any_key_carries_a_value(value: &serde_json::Value) -> bool {
+    let pairs = secret_registry::substitutions();
+    if pairs.is_empty() {
+        return false;
+    }
+    let forms: Vec<String> = pairs
+        .iter()
+        .flat_map(|(value, _)| escaped_forms(value))
+        .collect();
+
+    fn walk(value: &serde_json::Value, forms: &[String]) -> bool {
+        match value {
+            serde_json::Value::Object(map) => map.iter().any(|(key, inner)| {
+                forms.iter().any(|form| key.contains(form.as_str())) || walk(inner, forms)
+            }),
+            serde_json::Value::Array(items) => items.iter().any(|item| walk(item, forms)),
+            _ => false,
+        }
+    }
+    walk(value, &forms)
+}
+
 /// Visit every string in a JSON document, including object keys.
 fn walk_strings(value: &serde_json::Value, visit: &mut impl FnMut(&str)) {
     match value {

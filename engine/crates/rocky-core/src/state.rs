@@ -3118,9 +3118,76 @@ pub struct PersistedJob {
     #[serde(default)]
     pub error: Option<String>,
     /// The canonical `RunOutput` / `PlanOutput` / `ApplyOutput` the underlying
-    /// `rocky <kind>` subprocess emitted, embedded verbatim, once terminal.
+    /// `rocky <kind>` subprocess emitted, once terminal.
+    ///
+    /// Scrubbed of resolved `${VAR}` values before it is written — see
+    /// [`PersistedJob::redaction_version`]. A record whose version is absent
+    /// or below the trusted floor was written before that scrub existed and
+    /// is served without this field.
     #[serde(default)]
     pub result: Option<serde_json::Value>,
+    /// Which redaction rule was applied to `result` and `error` when this
+    /// record was written. Absent on every record written before the rule
+    /// existed, which is exactly the legacy signal — no migration needed,
+    /// because every field on this struct already defaults.
+    ///
+    /// An integer rather than a bool: a bool cannot say "redacted under an
+    /// older, weaker rule", and the rule is expected to tighten when CLI
+    /// output and logs come into scope.
+    ///
+    /// **The compiler catch has a blind spot.** This field is non-optional in
+    /// the struct literal on purpose, so every writer must name it — that
+    /// found six construction sites where one was known, including the
+    /// scheduler's. But a writer spelled
+    /// `PersistedJob { job_id, ..Default::default() }` compiles untouched and
+    /// stamps nothing, and an unstamped record reads as pre-redaction forever.
+    ///
+    /// No production site uses that form today. It is not ENFORCED: a guard
+    /// scanning the source for it was written and removed, because
+    /// distinguishing production from test code here needs real parsing —
+    /// `state.rs` alone has nine separate `#[cfg(test)]` blocks, so any
+    /// first-occurrence or last-occurrence boundary is wrong, and the version
+    /// that looked right silently scanned zero production code. A guard that
+    /// passes while the property is violated is worse than none.
+    ///
+    /// The durable fix is a constructor that stamps, with the literal
+    /// reserved for tests. Until then this is a convention, and a new writer
+    /// using struct-update syntax is the way it breaks.
+    ///
+    /// **Contract, and a future version may only be introduced under it:**
+    /// redaction versions are monotonically non-decreasing in strictness. A
+    /// version may only be introduced for a rule at least as strict as every
+    /// version below it. A future rule that shows MORE needs a different
+    /// mechanism, not a higher number here. Without that rule
+    /// `>= MIN_TRUSTED_REDACTION_VERSION` would be trusting an assumption
+    /// nothing enforces.
+    #[serde(default)]
+    pub redaction_version: Option<u32>,
+}
+
+/// The redaction rule applied to a job record written by this binary.
+pub const CURRENT_REDACTION_VERSION: u32 = 1;
+
+/// The oldest rule whose output is still served.
+///
+/// A record at or above this is trusted, INCLUDING a version this binary does
+/// not recognise: under the monotonic-strictness contract on
+/// [`PersistedJob::redaction_version`] a newer rule redacts at least as hard,
+/// and refusing its records would make a downgrade lose data that is not at
+/// risk.
+pub const MIN_TRUSTED_REDACTION_VERSION: u32 = 1;
+
+impl PersistedJob {
+    /// Whether this record predates the redaction rule, so its `result` and
+    /// `error` must not be served.
+    ///
+    /// Absent OR below the floor — not absent alone. Defining it as a
+    /// comparison from the start means the mechanism already works the first
+    /// time the rule tightens, instead of needing a second marker then.
+    pub fn redaction_is_legacy(&self) -> bool {
+        self.redaction_version
+            .is_none_or(|v| v < MIN_TRUSTED_REDACTION_VERSION)
+    }
 }
 
 impl PersistedJob {
@@ -3147,10 +3214,23 @@ impl PersistedJob {
     /// Whether the job reached a terminal state — `"succeeded"` or `"failed"`.
     ///
     /// Errs toward *unfinished*: an unrecognized `state` reads as **not**
-    /// terminal, so the restart sweep reconciles it rather than leaving an
-    /// embedder polling a record nothing will ever finish. See
-    /// [`is_in_flight`](Self::is_in_flight) for why the two predicates are not
-    /// complements.
+    /// terminal, because this version cannot claim a state it does not know has
+    /// finished. See [`is_in_flight`](Self::is_in_flight) for why the two
+    /// predicates are not complements.
+    ///
+    /// This does **not** mean an unrecognized state strands a poller, and no
+    /// caller should reconcile one on that reasoning. `rocky-cli` renders a
+    /// record through one parse site, `JobState::parse(&state)` with an
+    /// `unwrap_or(JobState::Failed)` fallback, so an unrecognized state already
+    /// reads as terminal at the API boundary. That fallback is a RENDERING
+    /// step, not storage: [`StateStore::get_job`](crate::state::StateStore) and
+    /// `list_jobs` hand back the stored string verbatim, so an in-process
+    /// consumer sees the unrecognized state itself. A caller that instead
+    /// REWRITES
+    /// such a record destroys data: `state` is a plain string precisely so a
+    /// newer sidecar can add a terminal state, and its record carries a real
+    /// result. See `MIN_TRUSTED_REDACTION_VERSION` for the same contract stated
+    /// for the redaction stamp.
     pub fn is_terminal(&self) -> bool {
         matches!(self.state.as_str(), "succeeded" | "failed")
     }
@@ -13746,6 +13826,7 @@ mod tests {
             principal: Some("ci@example.com".to_string()),
             error: None,
             result: None,
+            redaction_version: Some(CURRENT_REDACTION_VERSION),
         }
     }
 

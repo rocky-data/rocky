@@ -255,10 +255,16 @@ pub fn router(state: Arc<ServerState>) -> Router {
 
 /// Start the HTTP server.
 ///
-/// Before the router serves, persisted jobs stranded in a non-terminal state
-/// by a previous sidecar process are swept to `failed` (see
-/// [`sweep_interrupted_jobs`]) so embedders polling `GET /api/v1/jobs/{id}`
-/// until a terminal state never poll a dead job forever.
+/// Before the router serves, persisted jobs left IN FLIGHT — `running` or
+/// `queued` — by a previous sidecar process are swept to `failed` (see
+/// [`sweep_interrupted_jobs`]).
+///
+/// A record in any other non-terminal state is deliberately left alone. It was
+/// written by a version this one does not know, and rewriting it would destroy
+/// a payload this version cannot reproduce. Nothing is stranded either way:
+/// `job_status_from` renders an unrecognized state as terminal `failed`, so a
+/// poller on `GET /api/v1/jobs/{id}` sees a terminal state whether or not the
+/// sweep touched the record.
 ///
 /// # Errors
 ///
@@ -2417,7 +2423,118 @@ pub(crate) fn job_state_str(state: JobState) -> &'static str {
 /// Build the API presentation type from the durable record. Unknown persisted
 /// `kind`/`state` strings (only reachable from a malformed record) fall back to
 /// safe defaults rather than failing the read.
+/// Strip resolved `${VAR}` values from a job's terminal outcome, before it is
+/// cached or written (#1897).
+///
+/// A pure function on purpose. The alternative is scrubbing inside the spawn
+/// path, and nothing in `cargo test -p rocky-cli --lib` can reach that: the
+/// subprocess is `current_exe`, which is the test harness. Here the seam is
+/// callable directly, so the behaviour is pinned by unit test rather than by
+/// an end-to-end run nobody can drive.
+///
+/// It is also the chokepoint rather than one caller: the spawn path is the only
+/// writer today, and a second one would otherwise be unscrubbed.
+///
+/// `result` is the child's stdout verbatim — a whole `RunOutput` carrying
+/// targets, model names and attempt trails. It is rewritten as text and
+/// re-parsed; if the rewrite breaks the JSON (a registered value in a
+/// non-string position), the payload is REPLACED rather than stored, because
+/// an unparseable blob on disk is worse than a named absence.
+pub(crate) fn scrub_job_outcome(
+    result: Option<serde_json::Value>,
+    error: Option<String>,
+) -> (Option<serde_json::Value>, Option<String>, u32) {
+    let scrub = |text: &str| {
+        crate::secret_filter::redact_truncated_tail(&crate::secret_filter::redact(text))
+    };
+
+    let withheld =
+        || serde_json::json!({ "redaction": "result_withheld_unparseable_after_redaction" });
+
+    let result = result.map(|value| {
+        // A registered value inside an object KEY cannot be rewritten safely.
+        // Two distinct keys whose names both carry one collapse to the same
+        // replacement, and re-parsing then keeps only one of them — a silently
+        // truncated record that still looks complete. Withhold instead.
+        if crate::secret_filter::any_key_carries_a_value(&value) {
+            return withheld();
+        }
+        let Ok(text) = serde_json::to_string(&value) else {
+            return serde_json::json!({ "redaction": "result_unserializable" });
+        };
+        match serde_json::from_str::<serde_json::Value>(&scrub(&text)) {
+            Ok(scrubbed) => scrubbed,
+            Err(_) => withheld(),
+        }
+    });
+    let error = error.map(|text| scrub(&text));
+
+    // THE FINAL CHECK, and its absence was a defect. Everything above is
+    // replacement GENERATION, and #1920 established that no generator can be
+    // trusted: a fallback marker can itself be a registered value, and two
+    // overlapping replacements can concatenate into one. The response filter
+    // ends with this check for exactly that reason; the durable path had no
+    // equivalent, so a surviving value was stamped trusted and written to
+    // disk (#1897).
+    let survives = result
+        .as_ref()
+        .and_then(|v| serde_json::to_string(v).ok())
+        .is_some_and(|t| crate::secret_filter::any_value_survives(&t))
+        || error
+            .as_deref()
+            .is_some_and(crate::secret_filter::any_value_survives);
+    if survives {
+        // The fallback must not be the thing that leaked. Both the marker and
+        // this message are fixed text an operator can register, and this is
+        // the LAST step — nothing scans what it returns — so each is checked
+        // and dropped entirely if it would carry a value. Storing nothing is
+        // always available and cannot leak, which is what makes this
+        // terminate (#1897).
+        let safe = |v: &serde_json::Value| {
+            serde_json::to_string(v)
+                .ok()
+                .is_some_and(|t| !crate::secret_filter::any_value_survives(&t))
+        };
+
+        // Prefer the descriptive marker. If its own text is registered, fall
+        // back to one whose SERIALIZED form is shorter than the floor.
+        //
+        // The invariant is about the serialized bytes, not about tokens.
+        // `any_value_survives` scans a string; token boundaries do not exist
+        // at that layer, so a short-token marker can still contain a
+        // registerable substring spanning them — the same concatenation
+        // fallacy the comment above warns about. `{"h":1}` is SEVEN bytes, so
+        // every substring of it is shorter than the eight-byte floor and the
+        // registry cannot hold any of them. True by construction, not by odds.
+        //
+        // `SHORT_MARKER_IS_UNREGISTERABLE` in the tests pins the length, so
+        // changing the marker or lowering the floor fails there rather than
+        // silently making this claim false.
+        let short = serde_json::json!({ "h": 1 });
+        let marker = withheld();
+        let result = Some(if safe(&marker) { marker } else { short });
+
+        // Same rule for the note: `held` is four bytes raw and six quoted,
+        // both under the floor.
+        const NOTE: &str = "withheld: a resolved value survived redaction";
+        let error = Some(if crate::secret_filter::any_value_survives(NOTE) {
+            "held".to_string()
+        } else {
+            NOTE.to_string()
+        });
+        return (result, error, rocky_core::state::CURRENT_REDACTION_VERSION);
+    }
+
+    (result, error, rocky_core::state::CURRENT_REDACTION_VERSION)
+}
+
 fn job_status_from(job: PersistedJob) -> JobStatus {
+    // A record written before the scrub existed may hold an unredacted result
+    // or error, and nothing distinguishes a safe legacy string from one
+    // carrying a resolved value. Lifecycle fields still answer — a poller
+    // waiting for a terminal state is not left hanging — but the two payload
+    // fields are withheld (#1897).
+    let legacy = job.redaction_is_legacy();
     JobStatus {
         kind: JobKind::parse(&job.kind).unwrap_or(JobKind::Run),
         state: JobState::parse(&job.state).unwrap_or(JobState::Failed),
@@ -2426,8 +2543,8 @@ fn job_status_from(job: PersistedJob) -> JobStatus {
         started_at: job.started_at,
         finished_at: job.finished_at,
         principal: job.principal,
-        error: job.error,
-        result: job.result,
+        error: if legacy { None } else { job.error },
+        result: if legacy { None } else { job.result },
     }
 }
 
@@ -2458,9 +2575,13 @@ fn principal_from_headers(headers: &HeaderMap) -> Result<Option<String>, ApiErro
     Ok(Some(value.to_string()))
 }
 
-/// Mark every persisted job stranded in a non-terminal state (`running` /
-/// `queued`) as `failed` with the error `"interrupted by engine restart"`,
-/// returning how many records were reconciled.
+/// Mark every persisted job stranded [in flight](rocky_core::state::PersistedJob::is_in_flight)
+/// — `running` or `queued` — as `failed` with the error
+/// `"interrupted by engine restart"`, returning how many records were
+/// reconciled.
+///
+/// A record in any OTHER non-terminal state is left untouched; see the loop for
+/// why that is both safe and necessary.
 ///
 /// A job's terminal-state write lives in the background task of the process
 /// that accepted the submission (see [`submit_job`]); when a sidecar dies
@@ -2479,14 +2600,81 @@ pub(crate) fn sweep_interrupted_jobs(state_path: &std::path::Path) -> anyhow::Re
     let store = rocky_core::state::StateStore::open(state_path)?;
     let mut swept = 0;
     for job in store.list_jobs()? {
-        if job.is_terminal() {
+        // IN FLIGHT, not "not terminal". The two are deliberately not
+        // complements: an unrecognized `state` is neither. Sweeping those was a
+        // DOWNGRADE DATA-LOSS path — `state` is a plain string precisely so a
+        // newer sidecar can add a state, so a newer binary's terminal
+        // `"cancelled"` record, carrying a real result, reads as non-terminal
+        // here and the clear below would delete that result. That contradicts
+        // the preservation contract on `MIN_TRUSTED_REDACTION_VERSION`.
+        //
+        // Skipping them costs nothing ON THE HTTP SURFACE: `job_status_from`
+        // renders `JobState::parse(&job.state).unwrap_or(JobState::Failed)`,
+        // the only parse site in the workspace, and every route renders
+        // through it. So an unrecognized state ALREADY reads as terminal
+        // `failed` to a polling embedder whether or not this sweep runs.
+        //
+        // NOT "nothing observable anywhere", which is a claim this cannot
+        // support: `StateStore::{get_job,list_jobs}` and `JobRegistry::get`
+        // return the raw record, so an in-process Rust consumer sees the
+        // stored string itself. That is the intended outcome. The state
+        // belongs to the version that wrote it, and leaving it verbatim is
+        // the only answer this version can give honestly.
+        if !job.is_in_flight() {
             continue;
         }
-        let mut done = job;
-        done.state = job_state_str(JobState::Failed).to_string();
-        done.finished_at = Some(chrono::Utc::now().to_rfc3339());
-        done.error = Some("interrupted by engine restart".to_string());
-        store.record_job(&done)?;
+        // Through the scrub, and RE-STAMPED. This is a terminal writer: it
+        // mutates `error` and persists, so without the scrub it wrote an
+        // unchecked string while inheriting the record's existing trusted
+        // stamp — a durable record claiming current redaction while holding a
+        // registered value. The message is a fixed literal, but an operator
+        // can register any string, including this one (#1897).
+        //
+        // The inherited `result` goes too, and the reason is stronger than
+        // "a previous process wrote it":
+        //
+        // **AT THIS POINT IN STARTUP THE VERIFIER IS NOT TRUSTWORTHY.** The
+        // registry is populated by `substitute_env_vars_inner`, which runs
+        // only on a config LOAD. `build_serve_state` does not load — it
+        // derives paths — so in plain `rocky serve` this sweep is the first
+        // thing after the bind check and the registry may be EMPTY, or
+        // partially filled by the watcher's initial compile, which is a race
+        // rather than an ordering. Scheduler mode is NOT reliably better:
+        // `resolved_poll_interval` returns without loading config when an
+        // explicit interval is supplied (`serve.rs`), so that path can reach
+        // here with an empty registry too.
+        //
+        // `any_value_survives` against an empty registry answers "nothing
+        // survived" and would stamp the record current — a false assertion
+        // produced by the check meant to prevent one.
+        //
+        // **WHAT THE STAMP SPEAKS FOR IS `result` AND `error`** — that is the
+        // pair `job_status_from` withholds on a legacy record, and the pair
+        // this sweep replaces with process-local values. It does NOT speak for
+        // `principal`, which is inherited here: caller-supplied, advisory,
+        // served unconditionally, redacted on the wire by the response filter,
+        // and durable-record exposure disclosed under #1919.
+        //
+        // The literal below is EXPLICIT on every field rather than
+        // `..job`/`let mut done = job`, so adding a field to `PersistedJob`
+        // stops compiling here instead of being inherited silently.
+        let (_, error, version) =
+            scrub_job_outcome(None, Some("interrupted by engine restart".to_string()));
+        let done = rocky_core::state::PersistedJob {
+            state: job_state_str(JobState::Failed).to_string(),
+            finished_at: Some(chrono::Utc::now().to_rfc3339()),
+            result: None,
+            error,
+            redaction_version: Some(version),
+            job_id: job.job_id,
+            kind: job.kind,
+            submitted_at: job.submitted_at,
+            started_at: job.started_at,
+            principal: job.principal,
+        };
+        // The sweep writes directly rather than through `persist_job`, so it
+        // needs the same sink check.
+        store.record_job(&sanitize_for_storage(done))?;
         swept += 1;
     }
     Ok(swept)
@@ -2509,6 +2697,80 @@ pub(crate) fn sweep_interrupted_jobs(state_path: &std::path::Path) -> anyhow::Re
 /// run-download. (Merely being stripped on upload would NOT be enough on its
 /// own: without the download-side preservation, a run-download's wholesale file
 /// replace would still wipe the local `jobs` rows.)
+/// Check the record that is actually about to be WRITTEN, and withhold its
+/// payload if a registered value survives in it.
+///
+/// **The layer is the point.** `scrub_job_outcome` checks the `result` and
+/// `error` FIELDS; what reaches disk is the SERIALIZED RECORD, produced later
+/// by `serde_json::to_vec` inside `record_job`. Three things slip through that
+/// gap, and the first two were reported against the field-level check:
+///
+/// ```text
+/// escaping     register `ABCDEFGH\"`; return the raw error `ABCDEFGH"`.
+///              The raw scan misses it; serializing the record escapes the
+///              quote and writes exactly the registered bytes.
+///
+/// other fields `principal` comes from a caller-supplied X-Rocky-Principal
+///              header and was never scanned at all. Nor is any field added
+///              to this struct in future.
+///
+/// field seams  a value can span two fields — `null,"result":null` sits
+///              across the `error` value and the `result` key that follows
+///              it. No single field contains it; the record does.
+/// ```
+///
+/// Checking the serialized record closes the class rather than those three
+/// instances: the thing checked is the thing written.
+///
+/// **Withholding replaces the record, it does not patch it.** Blanking
+/// `result` and `error` would not help when the survivor is in `principal`, so
+/// the fields that are kept are named explicitly and everything else is
+/// dropped. That is also why this is a full literal rather than `..job`: a
+/// field added to `PersistedJob` stops compiling here instead of being
+/// forwarded into a record this function claims to have cleaned.
+///
+/// **Why it terminates.** The withheld record can itself trip the check — an
+/// operator may register `"held"` padded into something over the length floor.
+/// It is not re-scanned, and does not need to be: every field kept is
+/// generated by this process (`new_job_id`, a fixed `kind` verb, a
+/// `job_state_str` literal, `Utc::now` timestamps) and the two replacements
+/// are fixed. A collision therefore requires an operator to register a value
+/// this process produced, which discloses nothing they did not already hold.
+/// No caller-supplied byte reaches the store either way.
+///
+/// Scope: the DURABLE record. The in-memory cache is served through
+/// `job_status_from` and therefore through the outermost response filter, so
+/// the wire is covered by #1920 regardless; this is the stored-record
+/// guarantee, which is what #1944 adds.
+pub(crate) fn sanitize_for_storage(job: PersistedJob) -> PersistedJob {
+    let Ok(serialized) = serde_json::to_string(&job) else {
+        // Unserializable here means `record_job` would fail too; leave it for
+        // that to report rather than silently altering the record.
+        return job;
+    };
+    if !crate::secret_filter::any_value_survives(&serialized) {
+        return job;
+    }
+
+    PersistedJob {
+        // Kept: generated by this process, never by a caller.
+        job_id: job.job_id,
+        kind: job.kind,
+        state: job.state,
+        submitted_at: job.submitted_at,
+        started_at: job.started_at,
+        finished_at: job.finished_at,
+        // Dropped: caller-supplied, and advisory rather than load-bearing.
+        principal: None,
+        // The same fallbacks `scrub_job_outcome` uses, and safe for the same
+        // reason: `{"h":1}` serializes to seven bytes, below the eight-byte
+        // floor, so it has no substring the registry could hold.
+        error: Some("held".to_string()),
+        result: Some(serde_json::json!({ "h": 1 })),
+        redaction_version: Some(rocky_core::state::CURRENT_REDACTION_VERSION),
+    }
+}
+
 pub(crate) async fn persist_job(
     state: &ServerState,
     state_path: std::path::PathBuf,
@@ -2520,7 +2782,9 @@ pub(crate) async fn persist_job(
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let _held = permit;
         let store = rocky_core::state::StateStore::open(&state_path)?;
-        store.record_job(&job)?;
+        // Checked HERE, on the record about to be serialized, not on the
+        // fields that composed it.
+        store.record_job(&sanitize_for_storage(job))?;
         Ok(())
     })
     .await?
@@ -2599,6 +2863,8 @@ async fn submit_job(
         principal,
         error: None,
         result: None,
+        // Stamped at creation; the terminal write re-stamps after scrubbing.
+        redaction_version: Some(rocky_core::state::CURRENT_REDACTION_VERSION),
     };
 
     let state_path = state_path_for(&state);
@@ -2639,8 +2905,13 @@ async fn submit_job(
         let mut done = record;
         done.state = job_state_str(final_state).to_string();
         done.finished_at = Some(chrono::Utc::now().to_rfc3339());
+        // Before the cache and before the write, so neither holds a resolved
+        // value even briefly, and a reader that races the persist sees the
+        // same bytes a restart would (#1897).
+        let (result, error, version) = scrub_job_outcome(result, error);
         done.result = result;
         done.error = error;
+        done.redaction_version = Some(version);
         task_state.jobs.upsert(done.clone()).await;
         if let Err(e) = persist_job(&task_state, state_path, done.clone()).await {
             tracing::warn!(error = %e, job_id = %done.job_id,
@@ -2998,6 +3269,438 @@ mod tests {
              failed. Body length: {} bytes",
             body.len()
         );
+    }
+
+    /// #1897 PR2. The child's stdout is scrubbed before it is cached or
+    /// written, so neither the in-memory record nor the durable one holds a
+    /// resolved value.
+    #[test]
+    fn a_job_result_is_scrubbed_before_it_is_stored() {
+        let secret = "JOBSCRUB-PROBE-8e26660e-VALUE";
+        rocky_core::secret_registry::register_substitution("ROCKY_JOBSCRUB", secret);
+
+        let child_stdout = serde_json::json!({
+            "version": "1",
+            "command": "run",
+            "materializations": [{ "target": format!("{secret}.marts.orders") }],
+        });
+        let (result, error, version) =
+            scrub_job_outcome(Some(child_stdout), Some(format!("failed at {secret}")));
+
+        let rendered = serde_json::to_string(&result.expect("a result")).expect("serializes");
+        assert!(
+            !rendered.contains(secret),
+            "the stored result still holds it: {rendered}"
+        );
+        assert!(rendered.contains("${ROCKY_JOBSCRUB}"), "{rendered}");
+
+        let error = error.expect("an error");
+        assert!(
+            !error.contains(secret),
+            "the stored error still holds it: {error}"
+        );
+        assert_eq!(version, rocky_core::state::CURRENT_REDACTION_VERSION);
+    }
+
+    /// A result the rewrite would break is REPLACED, not stored. An
+    /// unparseable blob on disk is worse than a named absence, and it would
+    /// fail every later read rather than this one write.
+    #[test]
+    fn a_result_that_cannot_survive_the_rewrite_is_withheld_not_corrupted() {
+        // 10 digits: above the floor, and it lands in a NUMERIC position.
+        let numeric = "1234509876";
+        rocky_core::secret_registry::register_substitution("ROCKY_JOBSCRUB_NUM", numeric);
+
+        let child_stdout = serde_json::json!({ "max_downstreams": 1234509876u64 });
+        let (result, _, _) = scrub_job_outcome(Some(child_stdout), None);
+
+        // Withheld as the marker, or as nothing at all when the marker's own
+        // text is registered by another test — the registry is process-global,
+        // so the exact fallback depends on ordering. The property is that the
+        // original payload is gone and nothing registered survived.
+        let stored = serde_json::to_string(&result).expect("serializes");
+        assert!(
+            !stored.contains("1234509876"),
+            "the numeric value survived into the stored result"
+        );
+        assert!(!crate::secret_filter::any_value_survives(&stored));
+    }
+
+    /// Codex E, the regression this PR introduced and the worst of the round.
+    ///
+    /// `state` is a plain string so a newer sidecar can add a state. Such a
+    /// state reads as non-terminal here, so the sweep used to claim it — and
+    /// once the sweep started clearing `result`, claiming it DELETED a newer
+    /// binary's data on a downgrade.
+    ///
+    /// The record must come back byte-for-byte, and the sweep must not count it.
+    #[test]
+    fn the_sweep_leaves_an_unrecognized_state_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+
+        // Terminal in a NEWER binary, unrecognized here, and carrying a real
+        // result — exactly the downgrade case.
+        let mut newer = persisted_job("from-a-newer-binary", "cancelled");
+        newer.finished_at = Some("2026-07-07T00:00:10Z".to_string());
+        newer.result = Some(serde_json::json!({ "tables_copied": 3 }));
+        assert!(
+            !newer.is_terminal() && !newer.is_in_flight(),
+            "PRECONDITION: the state must fall in the gap between the two \
+             predicates, or this test is not exercising the downgrade case"
+        );
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            store.record_job(&newer).unwrap();
+        }
+
+        assert_eq!(
+            sweep_interrupted_jobs(&state_path).expect("sweep"),
+            0,
+            "a state this version does not recognise must not be swept"
+        );
+
+        let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+        let after = store
+            .get_job("from-a-newer-binary")
+            .unwrap()
+            .expect("record");
+        assert_eq!(
+            after, newer,
+            "the record must survive the sweep unchanged — the result above is \
+             the newer binary's data and this version cannot reproduce it"
+        );
+    }
+
+    /// Codex A, the layer above the field check. A value that only appears
+    /// once the RECORD is serialized.
+    ///
+    /// Register the ESCAPED form. The raw error does not contain it, so the
+    /// field-level scan passes — and then `serde_json` escapes the quote while
+    /// serializing the record, writing exactly the registered bytes.
+    #[test]
+    fn a_value_that_appears_only_after_record_serialization_is_caught() {
+        let escaped = "SINKESC-8e26660e\\\"";
+        rocky_core::secret_registry::register_substitution("ROCKY_SINK_ESCAPED", escaped);
+
+        let raw = "SINKESC-8e26660e\"";
+        assert!(
+            !raw.contains(escaped),
+            "PRECONDITION: the raw text must NOT contain the registered form, \
+             or the field-level scan would already catch it"
+        );
+
+        let mut job = persisted_job("sink-esc", "failed");
+        job.error = Some(raw.to_string());
+        assert!(
+            serde_json::to_string(&job)
+                .expect("serializes")
+                .contains(escaped),
+            "PRECONDITION: serializing the record must produce the registered \
+             form, or this test proves nothing"
+        );
+
+        let held = sanitize_for_storage(job);
+        let after = serde_json::to_string(&held).expect("serializes");
+        assert!(
+            !crate::secret_filter::any_value_survives(&after),
+            "a value appearing only in the serialized record must be caught"
+        );
+    }
+
+    /// Codex A, second instance. `principal` comes from a caller-supplied
+    /// header and was never scanned. Withholding the PAYLOAD does not help
+    /// here, which is why the sink replaces the record instead of blanking two
+    /// fields.
+    #[test]
+    fn a_value_in_a_non_outcome_field_is_caught_at_the_sink() {
+        // Inside the header's own charset, so this is a value a caller can send.
+        let secret = "SINKPRINCIPAL-8e26660e";
+        rocky_core::secret_registry::register_substitution("ROCKY_SINK_PRINCIPAL", secret);
+
+        let mut job = persisted_job("sink-principal", "running");
+        job.principal = Some(secret.to_string());
+
+        // **The survivor must be the principal and nothing else.** The registry
+        // is process-global and monotonic, so a value registered by any other
+        // test in this binary could trip the sink instead and this test would
+        // still pass — it would just be proving something else. Ordering
+        // experiments cannot close that; this can. The same record with
+        // `principal` cleared must be clean.
+        let mut without = job.clone();
+        without.principal = None;
+        assert!(
+            !crate::secret_filter::any_value_survives(
+                &serde_json::to_string(&without).expect("serializes")
+            ),
+            "PRECONDITION: this record must trip the sink ONLY through \
+             `principal`. Something else registered in this process is \
+             matching it, so this test is no longer testing principal."
+        );
+
+        let held = sanitize_for_storage(job);
+        assert_eq!(held.principal, None, "a caller-supplied field is dropped");
+        let after = serde_json::to_string(&held).expect("serializes");
+        assert!(
+            !crate::secret_filter::any_value_survives(&after),
+            "a registered value in ANY field must not reach the store"
+        );
+    }
+
+    /// Codex B. A value that no single field contains and the RECORD does,
+    /// because serialization composes them.
+    ///
+    /// `principal` and `error` are adjacent, so the span below sits across the
+    /// END of the principal value and the `error` key that follows it. A
+    /// field-level check cannot see it: it is in neither field, nor in the
+    /// `(result, error)` tuple the earlier test serializes, which carries
+    /// neither field names nor order.
+    ///
+    /// **The span carries its own entropy on purpose.** A structural span like
+    /// `null,"result":null` would also work here and would be far worse: the
+    /// registry is process-global and monotonic, so registering a generic
+    /// structural string permanently changes every later test whose record has
+    /// those fields empty — including the principal test above, whose sink
+    /// would then fire for the wrong reason while still passing.
+    #[test]
+    fn a_value_spanning_two_record_fields_is_caught_at_the_sink() {
+        let principal = "SPANBOUNDARY-4f1a77c3";
+        let span = "4f1a77c3\",\"error\":null";
+        assert!(
+            span.len() >= rocky_core::secret_registry::SECRET_LENGTH_FLOOR,
+            "PRECONDITION: the span must be registerable"
+        );
+        rocky_core::secret_registry::register_substitution("ROCKY_SINK_SPAN", span);
+
+        let mut job = persisted_job("sink-span", "failed");
+        job.principal = Some(principal.to_string());
+        job.error = None;
+        assert!(
+            !principal.contains(span),
+            "PRECONDITION: no single field may contain the span, or this is \
+             not testing the seam"
+        );
+        let serialized = serde_json::to_string(&job).expect("serializes");
+        assert!(
+            serialized.contains(span),
+            "PRECONDITION: the record must actually compose the span, or the \
+             field order this test depends on has changed"
+        );
+
+        let held = sanitize_for_storage(job);
+        let after = serde_json::to_string(&held).expect("serializes");
+        assert!(
+            !crate::secret_filter::any_value_survives(&after),
+            "a value spanning two fields must be caught at the record level"
+        );
+    }
+
+    /// The ordinary case passes through untouched, or every record would be
+    /// withheld and the tests above would pass vacuously.
+    #[test]
+    fn a_clean_record_is_stored_unchanged() {
+        let mut job = persisted_job("sink-clean", "succeeded");
+        job.principal = Some("an-operator".to_string());
+        job.result = Some(serde_json::json!({ "tables_copied": 3 }));
+
+        assert_eq!(
+            sanitize_for_storage(job.clone()),
+            job,
+            "a clean record must not be altered at the sink"
+        );
+    }
+
+    /// #1897. The last-resort marker is unregisterable BY LENGTH.
+    ///
+    /// `any_value_survives` scans serialized bytes, so the property has to be
+    /// about those bytes and not about token boundaries — a marker of short
+    /// tokens can still contain a registerable substring spanning them. A
+    /// marker whose whole serialized form is shorter than the floor has no
+    /// substring the registry could hold.
+    ///
+    /// This fails if the marker grows or the floor shrinks, which is the point:
+    /// the claim in `scrub_job_outcome` stops being true at exactly that moment.
+    #[test]
+    fn the_last_resort_marker_is_shorter_than_the_secret_floor() {
+        let short = serde_json::json!({ "h": 1 });
+        let serialized = serde_json::to_string(&short).expect("serializes");
+        assert_eq!(serialized, r#"{"h":1}"#);
+        assert!(
+            serialized.len() < rocky_core::secret_registry::SECRET_LENGTH_FLOOR,
+            "the last-resort marker serializes to {} bytes, which is not below \
+             the {}-byte floor — it can therefore contain a registered value",
+            serialized.len(),
+            rocky_core::secret_registry::SECRET_LENGTH_FLOOR
+        );
+        // The note's fallback, quoted as it appears in a JSON body.
+        assert!(
+            serde_json::to_string("held").expect("serializes").len()
+                < rocky_core::secret_registry::SECRET_LENGTH_FLOOR
+        );
+    }
+
+    /// Codex C, the blocking one. `scrub_job_outcome` stamped without ever
+    /// checking whether a value survived its own rewriting.
+    ///
+    /// The trigger is the fallback marker: register the marker's own text and
+    /// a value that forces the marker to be produced. The marker is
+    /// constructed AFTER all rewriting, so nothing scanned it — it was
+    /// stamped current and written to disk carrying a registered value.
+    #[test]
+    fn a_value_surviving_the_scrub_is_withheld_rather_than_stamped() {
+        // Forces the unparseable path: 10 digits in a numeric position.
+        rocky_core::secret_registry::register_substitution("ROCKY_SURV_NUM", "1029384756");
+        // And the marker's own text is registerable.
+        rocky_core::secret_registry::register_substitution(
+            "ROCKY_SURV_MARKER",
+            "result_withheld_unparseable_after_redaction",
+        );
+
+        let child = serde_json::json!({ "duration_ms": 1029384756u64 });
+        let (result, error, _) = scrub_job_outcome(Some(child), None);
+
+        // The marker's own text is registered, so the descriptive marker
+        // cannot be used — but the reader still gets a POSITIVE signal, not a
+        // bare null. The fallback is safe because its WHOLE SERIALIZED FORM is
+        // shorter than SECRET_LENGTH_FLOOR, so it has no substring the
+        // registry could hold. Not because its tokens are short: the check
+        // scans serialized bytes, where token boundaries do not exist.
+        let result = result.expect("a withheld result is still a signal, never null");
+        assert_eq!(
+            result,
+            serde_json::json!({ "h": 1 }),
+            "when the descriptive marker is unusable, the one that is shorter \
+             than the floor is used"
+        );
+        let result = Some(result);
+        let stored = serde_json::to_string(&(result, error)).expect("serializes");
+        assert!(
+            !crate::secret_filter::any_value_survives(&stored),
+            "a registered value survived into the stored record"
+        );
+    }
+
+    /// Codex C, non-blocking. Two distinct object KEYS whose names both carry
+    /// a registered value rewrite to the SAME replacement; re-parsing then
+    /// keeps only one, so the record silently loses a field while still
+    /// parsing cleanly.
+    #[test]
+    fn a_result_whose_keys_carry_a_value_is_withheld_not_silently_truncated() {
+        let shared = "KEYCOLLIDE-8e26660e";
+        rocky_core::secret_registry::register_substitution("ROCKY_KEYCOLLIDE", shared);
+
+        let child = serde_json::json!({
+            format!("{shared}_copied"): 1,
+            format!("{shared}_failed"): 2,
+        });
+        let (result, _, _) = scrub_job_outcome(Some(child), None);
+
+        // Withheld either as the marker or, if the marker text is itself
+        // registered by another test in this process, as nothing at all. The
+        // property is that the ORIGINAL keys are gone, not which fallback was
+        // chosen — the registry is process-global, so asserting the exact
+        // shape would depend on test ordering.
+        let stored = serde_json::to_string(&result).expect("serializes");
+        assert!(
+            !stored.contains("_copied") && !stored.contains("_failed"),
+            "a key collision must withhold, not store a record missing a field"
+        );
+        assert!(!crate::secret_filter::any_value_survives(&stored));
+    }
+
+    /// Codex A/D. The restart sweep mutates `error` and persists. Before this
+    /// it kept the record's existing trusted stamp, so a durable record could
+    /// claim current redaction while holding an unchecked string.
+    #[test]
+    fn the_restart_sweep_scrubs_and_restamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut running = persisted_job("swept-1", "running");
+            // A pre-existing result this process cannot re-verify.
+            running.result = Some(serde_json::json!({ "from": "a previous process" }));
+            store.record_job(&running).unwrap();
+        }
+
+        let swept = sweep_interrupted_jobs(&state_path).expect("sweep");
+        assert_eq!(swept, 1);
+
+        let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+        let done = store.get_job("swept-1").unwrap().expect("record");
+        assert_eq!(
+            done.redaction_version,
+            Some(rocky_core::state::CURRENT_REDACTION_VERSION),
+            "the sweep must RE-STAMP, not inherit"
+        );
+        assert!(
+            done.result.is_none(),
+            "an inherited result cannot be re-verified by this process, so it \
+             must not be carried forward under a current stamp"
+        );
+        assert!(!done.redaction_is_legacy());
+    }
+
+    /// #1897 PR2. A record written before the scrub existed serves its
+    /// lifecycle fields and withholds both payload fields — nothing
+    /// distinguishes a safe legacy string from one carrying a resolved value.
+    ///
+    /// Legacy is ABSENT **or** BELOW the floor. Pinning both means the
+    /// comparison is live from the start, instead of the first tightening
+    /// needing a second marker.
+    #[test]
+    fn a_legacy_job_record_serves_status_and_withholds_its_payload() {
+        let base = PersistedJob {
+            job_id: "job-legacy".to_string(),
+            kind: "run".to_string(),
+            state: "failed".to_string(),
+            submitted_at: "2026-09-11T00:00:00Z".to_string(),
+            started_at: Some("2026-09-11T00:00:01Z".to_string()),
+            finished_at: Some("2026-09-11T00:00:02Z".to_string()),
+            principal: Some("someone".to_string()),
+            error: Some("PRE-FIX-ERROR-TEXT".to_string()),
+            result: Some(serde_json::json!({ "pre": "fix" })),
+            redaction_version: None,
+        };
+
+        for version in [None, Some(0)] {
+            let job = PersistedJob {
+                redaction_version: version,
+                ..base.clone()
+            };
+            let status = job_status_from(job);
+            assert!(
+                status.result.is_none(),
+                "legacy {version:?} served a result"
+            );
+            assert!(status.error.is_none(), "legacy {version:?} served an error");
+            // The lifecycle half still answers, so a poller waiting for a
+            // terminal state is not left hanging.
+            assert_eq!(status.job_id, "job-legacy");
+            assert!(status.finished_at.is_some());
+        }
+
+        // At or above the floor, INCLUDING a version this binary does not know:
+        // the monotonic-strictness contract says a newer rule redacts at least
+        // as hard, so refusing it would lose data that is not at risk.
+        for version in [
+            Some(rocky_core::state::MIN_TRUSTED_REDACTION_VERSION),
+            Some(999),
+        ] {
+            let job = PersistedJob {
+                redaction_version: version,
+                ..base.clone()
+            };
+            let status = job_status_from(job);
+            assert!(
+                status.result.is_some(),
+                "trusted {version:?} withheld a result"
+            );
+            assert!(
+                status.error.is_some(),
+                "trusted {version:?} withheld an error"
+            );
+        }
     }
 
     /// Reference bytes for a canonical output: exactly what
@@ -6624,6 +7327,11 @@ mod tests {
             principal: None,
             error: None,
             result: None,
+            // A fixture for lifecycle tests, so it is stamped current: an
+            // unstamped one would read as pre-redaction and have its payload
+            // withheld, which is a different behaviour than these tests mean
+            // to exercise.
+            redaction_version: Some(rocky_core::state::CURRENT_REDACTION_VERSION),
         }
     }
 
@@ -6750,12 +7458,14 @@ mod tests {
         );
     }
 
-    /// The sweep reconciles ONLY non-terminal records: `running` and `queued`
+    /// The sweep reconciles ONLY in-flight records: `running` and `queued`
     /// flip to `failed` with the documented error, while terminal
-    /// `succeeded`/`failed` history is untouched. A missing state file is a
+    /// `succeeded`/`failed` history is untouched. An unrecognized state is
+    /// neither, and `the_sweep_leaves_an_unrecognized_state_untouched` covers
+    /// that third case. A missing state file is a
     /// no-op, not an error (fresh project, nothing ever persisted).
     #[test]
-    fn sweep_marks_only_nonterminal_jobs_failed() {
+    fn sweep_marks_only_in_flight_jobs_failed() {
         use rocky_core::state::StateStore;
 
         let dir = tempfile::tempdir().unwrap();
@@ -6796,7 +7506,7 @@ mod tests {
         );
         drop(store);
 
-        // Idempotent: a second sweep finds nothing non-terminal.
+        // Idempotent: a second sweep finds nothing in flight.
         assert_eq!(sweep_interrupted_jobs(&state_path).unwrap(), 0);
         // A state file that never existed is a clean no-op.
         assert_eq!(
@@ -6972,7 +7682,10 @@ mod tests {
     /// It also pins the asymmetry: the two predicates are complements for the
     /// four known states and deliberately are NOT for anything else — an
     /// unrecognized string is neither in flight (so it can never defeat the
-    /// cache's capacity bound) nor terminal (so the restart sweep reconciles it).
+    /// cache's capacity bound) nor terminal (so this version never CLAIMS such
+    /// a job finished). The gap between them is the set of records this version
+    /// must not touch; `the_sweep_leaves_an_unrecognized_state_untouched` pins
+    /// that the restart sweep honours it.
     #[test]
     fn every_job_state_is_classified_for_both_the_cache_and_the_sweep() {
         for state in [
@@ -7007,7 +7720,11 @@ mod tests {
         );
         assert!(
             !unknown.is_terminal(),
-            "an unrecognized state must still be swept, or an embedder polls it forever"
+            "an unrecognized state must not read as terminal TO THIS \
+             PREDICATE, which classifies the stored string and makes no claim \
+             about a state this version does not know. `job_status_from` \
+             separately renders it as `failed` — a rendering fallback at the \
+             API boundary, not this classification"
         );
     }
 
