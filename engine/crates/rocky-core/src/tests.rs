@@ -452,7 +452,12 @@ fn generate_test_sql_inner(
         // disallowed function or a subquery reaches just as far from here.
         let sql_dialect =
             rocky_sql::check_expression::dialect_for(dialect.map_or("generic", |d| d.name()));
-        rocky_sql::check_expression::validate_check_expression(&context, f, sql_dialect.as_ref())?;
+        rocky_sql::check_expression::validate_check_expression(
+            &context,
+            f,
+            sql_dialect.as_ref(),
+            rocky_sql::check_expression::ExpressionUse::SinglePredicate,
+        )?;
     }
 
     match &test.test_type {
@@ -537,6 +542,9 @@ fn generate_test_sql_inner(
                 &context,
                 expression,
                 sql_dialect.as_ref(),
+                // Evaluated once, in one statement: a time function here is
+                // a legitimate freshness-shaped check.
+                rocky_sql::check_expression::ExpressionUse::SinglePredicate,
             )?;
             Ok(format!(
                 "SELECT COUNT(*) FROM {table} WHERE {}NOT ({expression})",
@@ -635,6 +643,9 @@ fn generate_test_sql_inner(
                 &context,
                 key_expr,
                 sql_dialect.as_ref(),
+                // A grouping key: a value that changes between evaluations
+                // is not a key.
+                rocky_sql::check_expression::ExpressionUse::GroupingKey,
             )?;
             let where_clause = filter.map(|f| format!(" WHERE ({f})")).unwrap_or_default();
             Ok(format!(
@@ -1277,7 +1288,8 @@ target = { catalog = "c", schema = "s", table = "t" }
             rocky_sql::check_expression::validate_check_expression(
                 "ctx",
                 "read_text('/etc/passwd') IS NULL",
-                duck.as_ref()
+                duck.as_ref(),
+                rocky_sql::check_expression::ExpressionUse::SinglePredicate,
             )
             .is_err()
         );

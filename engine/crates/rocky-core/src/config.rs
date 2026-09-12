@@ -3504,17 +3504,32 @@ pub fn validate_checks(config: &RockyConfig) -> Vec<ConfigError> {
                 value: threshold.to_string(),
             });
         }
-        for assertion in &pipeline.checks().assertions {
-            let Some(declared) = assertion.name.as_deref() else {
-                continue;
-            };
+        // EVERY user-nameable check, not just assertions. A custom check
+        // carries an arbitrary name too, and it reaches the same dagster
+        // keying — the first version of this guard walked assertions alone
+        // and left the collision it exists to stop wide open.
+        let named: Vec<(String, String)> = pipeline
+            .checks()
+            .assertions
+            .iter()
+            .filter_map(|a| a.name.as_deref().map(|n| (a.table.clone(), n.to_string())))
+            .chain(
+                pipeline
+                    .checks()
+                    .custom
+                    .iter()
+                    .map(|c| (name.clone(), c.name.clone())),
+            )
+            .collect();
+        for (table, declared) in named {
+            let declared = declared.as_str();
             let sanitized = sanitized_check_name(declared);
             if let Some(reserved) = RESERVED_CHECK_NAMES
                 .iter()
                 .find(|r| sanitized_check_name(r) == sanitized)
             {
                 errors.push(ConfigError::ReservedAssertionName {
-                    table: assertion.table.clone(),
+                    table,
                     name: declared.to_string(),
                     reserved: (*reserved).to_string(),
                 });
@@ -8602,6 +8617,43 @@ column = "id"
                 "{spelling} must be refused: {errors:?}"
             );
         }
+    }
+
+    /// A CUSTOM check carries a user name too, and the first version of the
+    /// guard walked assertions alone — leaving the collision it exists to
+    /// stop reachable through the other door.
+    ///
+    /// Worse than a duplicate: dagster's component path silently SKIPS the
+    /// later duplicate and reports a generic gate failure, so the quarantine
+    /// result disappears behind a passing custom check.
+    #[test]
+    fn a_reserved_name_on_a_custom_check_is_refused_too() {
+        let cfg = parse(
+            r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.dq]
+type = "quality"
+
+[pipeline.dq.target]
+adapter = "default"
+
+[[pipeline.dq.checks.custom]]
+name = "quarantine_compile"
+sql = "SELECT 0"
+threshold = 0
+"#,
+        );
+        let errors = validate_checks(&cfg);
+        assert!(
+            errors.iter().any(
+                |e| matches!(e, ConfigError::ReservedAssertionName { name, .. }
+                    if name == "quarantine_compile")
+            ),
+            "a custom check may not take the reserved name: {errors:?}"
+        );
     }
 
     /// The control: an ordinary assertion name is untouched, and an assertion

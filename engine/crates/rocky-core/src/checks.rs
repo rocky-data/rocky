@@ -283,7 +283,12 @@ pub fn generate_cross_source_overlap_sql(
         // generated statement. Scalar rather than boolean, which this
         // validator does not care about.
         let sql_dialect = rocky_sql::check_expression::dialect_for(dialect.name());
-        rocky_sql::check_expression::validate_check_expression(context, k, sql_dialect.as_ref())?;
+        rocky_sql::check_expression::validate_check_expression(
+            context,
+            k,
+            sql_dialect.as_ref(),
+            rocky_sql::check_expression::ExpressionUse::GroupingKey,
+        )?;
     }
     let key_list = key_exprs.join(", ");
     let not_null = key_exprs

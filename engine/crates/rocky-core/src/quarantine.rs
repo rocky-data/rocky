@@ -358,6 +358,10 @@ fn lower_valid_predicate(
                 &context,
                 expression,
                 sql_dialect.as_ref(),
+                // Spliced into the quarantine CTAS AND the valid-table CTAS
+                // that follows it, so two evaluations can disagree and put
+                // one row in both outputs.
+                rocky_sql::check_expression::ExpressionUse::ReevaluatedPredicate,
             )?;
             // Wrap in COALESCE so NULL expressions count as passing — matches
             // the existing `WHERE NOT (expression)` semantic.
@@ -465,6 +469,7 @@ fn wrap_filter(
                 &context,
                 f,
                 sql_dialect.as_ref(),
+                rocky_sql::check_expression::ExpressionUse::ReevaluatedPredicate,
             )?;
             Ok(format!(
                 "(CASE WHEN ({f}) THEN ({base_pred}) ELSE TRUE END)"

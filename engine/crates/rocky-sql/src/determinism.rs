@@ -35,7 +35,7 @@ use crate::parser::parse_single_statement;
 
 /// Builtin functions whose value can change between two executions over the
 /// same data. Compared case-insensitively (stored upper-case).
-const VOLATILE_FUNCTIONS: &[&str] = &[
+pub(crate) const VOLATILE_FUNCTIONS: &[&str] = &[
     "CURRENT_TIMESTAMP",
     "LOCALTIMESTAMP",
     "NOW",
@@ -76,7 +76,7 @@ const VOLATILE_FUNCTIONS: &[&str] = &[
 /// `DatabricksDialect` — the [`Expr::Function`] fast-path only fires for the
 /// Postgres/Generic dialects — so they must be screened here as well as in
 /// [`VOLATILE_FUNCTIONS`] (which catches the parenthesised forms).
-const VOLATILE_BARE_IDENTIFIERS: &[&str] = &[
+pub(crate) const VOLATILE_BARE_IDENTIFIERS: &[&str] = &[
     "CURRENT_USER",
     "SESSION_USER",
     "SYSTEM_USER",

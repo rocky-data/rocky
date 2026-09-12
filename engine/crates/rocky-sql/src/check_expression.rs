@@ -213,6 +213,49 @@ const SESSION_IDENTITY_KEYWORDS: &[&str] = &[
     "current_session",
 ];
 
+/// Where a validated expression is going to be used.
+///
+/// The boundary is not the same in all three. A time function is fine in a
+/// predicate evaluated once and wrong in a grouping key, so the caller has to
+/// say which it is — there is deliberately NO `Default`, so a new call site
+/// must choose rather than inherit the permissive answer. That is how this
+/// class of gap comes back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpressionUse {
+    /// A predicate evaluated ONCE, in one statement.
+    ///
+    /// Volatile functions are allowed here: `created_at > now() - interval`
+    /// is a legitimate freshness-shaped check, and refusing it would break
+    /// working configs to close a bug that does not exist in this position.
+    SinglePredicate,
+
+    /// An expression used as a GROUPING KEY (`unique_expr.key_expr`,
+    /// `cross_source_overlap.key_expr`).
+    ///
+    /// A volatile value is not a key. `now()` takes its value from evaluation
+    /// time rather than the row, so rows that should group together do not —
+    /// or everything collapses into one group. `COLLATE` is refused for the
+    /// same reason from the other direction: it changes what equality MEANS,
+    /// so the grouping is no longer the one the key describes.
+    GroupingKey,
+
+    /// A predicate spliced into MORE THAN ONE statement, where two
+    /// evaluations can disagree.
+    ///
+    /// Quarantine evaluates its predicate in the quarantine CTAS and again in
+    /// the valid-table CTAS that follows it, so `created_at <= now()` can
+    /// call a boundary row invalid in the first and valid in the second,
+    /// putting it in both outputs. See the issue linked from #1922.
+    ReevaluatedPredicate,
+}
+
+impl ExpressionUse {
+    /// Whether a value that can change between evaluations is acceptable.
+    fn tolerates_volatility(self) -> bool {
+        matches!(self, ExpressionUse::SinglePredicate)
+    }
+}
+
 /// The sqlparser dialect to parse an expression under, from a Rocky
 /// `SqlDialect::name()`.
 ///
@@ -244,6 +287,7 @@ pub fn validate_check_expression(
     context: &str,
     expression: &str,
     dialect: &dyn Dialect,
+    use_: ExpressionUse,
 ) -> Result<(), ValidationError> {
     let unparseable = |detail: String| ValidationError::ExpressionUnparseable {
         context: context.to_string(),
@@ -263,7 +307,7 @@ pub fn validate_check_expression(
             context: context.to_string(),
         });
     }
-    let mut walker = Walker { context };
+    let mut walker = Walker { context, use_ };
     match expr.visit(&mut walker) {
         ControlFlow::Break(err) => Err(err),
         ControlFlow::Continue(()) => Ok(()),
@@ -277,6 +321,7 @@ pub fn validate_check_expression(
 /// walked, and any `Query` or `Function` inside it is still judged.
 struct Walker<'a> {
     context: &'a str,
+    use_: ExpressionUse,
 }
 
 impl Visitor for Walker<'_> {
@@ -301,6 +346,16 @@ impl Visitor for Walker<'_> {
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
         match expr {
+            // `COLLATE` changes what equality means, so a key that carries
+            // one does not group by what it says it groups by. Deterministic,
+            // so it is not a volatility question — it is refused in the
+            // positions where equality is the point.
+            Expr::Collate { .. } if !self.use_.tolerates_volatility() => {
+                ControlFlow::Break(ValidationError::ExpressionFunctionNotAllowed {
+                    context: self.context.to_string(),
+                    function: "COLLATE".to_string(),
+                })
+            }
             Expr::Function(function) => {
                 let parts = &function.name.0;
                 let [ObjectNamePart::Identifier(ident)] = parts.as_slice() else {
@@ -313,6 +368,20 @@ impl Visitor for Walker<'_> {
                     });
                 };
                 let name = ident.value.to_ascii_lowercase();
+                // Volatile in the sense Rocky already defines elsewhere:
+                // `determinism::VOLATILE_FUNCTIONS`, reused rather than
+                // restated so the two cannot disagree about what "volatile"
+                // means.
+                if !self.use_.tolerates_volatility()
+                    && crate::determinism::VOLATILE_FUNCTIONS
+                        .iter()
+                        .any(|v| v.eq_ignore_ascii_case(&name))
+                {
+                    return ControlFlow::Break(ValidationError::ExpressionFunctionNotAllowed {
+                        context: self.context.to_string(),
+                        function: ident.value.clone(),
+                    });
+                }
                 if CHECK_EXPRESSION_FUNCTIONS.contains(&name.as_str()) {
                     ControlFlow::Continue(())
                 } else {
@@ -374,11 +443,27 @@ mod tests {
     const CTX: &str = "expression test `expression` on wh.main.orders";
 
     fn check(expression: &str) -> Result<(), ValidationError> {
-        validate_check_expression(CTX, expression, &GenericDialect)
+        validate_check_expression(
+            CTX,
+            expression,
+            &GenericDialect,
+            ExpressionUse::SinglePredicate,
+        )
+    }
+
+    /// The same check, in the GROUPING KEY position — where a volatile
+    /// value and a COLLATE are refused.
+    fn check_key(expression: &str) -> Result<(), ValidationError> {
+        validate_check_expression(CTX, expression, &GenericDialect, ExpressionUse::GroupingKey)
     }
 
     fn check_on(dialect: &str, expression: &str) -> Result<(), ValidationError> {
-        validate_check_expression(CTX, expression, dialect_for(dialect).as_ref())
+        validate_check_expression(
+            CTX,
+            expression,
+            dialect_for(dialect).as_ref(),
+            ExpressionUse::SinglePredicate,
+        )
     }
 
     /// A session-variable read spelled as a placeholder is refused, on every
@@ -466,6 +551,62 @@ mod tests {
             "json_extract(a, '$.k')",
         ] {
             check(expr).unwrap_or_else(|e| panic!("a real key shape is refused: {expr} -> {e:?}"));
+        }
+    }
+
+    /// A time function is fine in a predicate and wrong in a key.
+    ///
+    /// The allowlist has carried `now`, `current_timestamp` and friends since
+    /// it was written for PREDICATES, where `created_at > now() - interval`
+    /// is a legitimate freshness check. Widening the same list to guard
+    /// grouping keys made those names reachable somewhere they are wrong: a
+    /// key takes its value from evaluation time rather than the row, so rows
+    /// that should group together do not.
+    ///
+    /// The exclusion doc already said a non-deterministic key groups nothing.
+    /// It said it about `uuid` and `random` while `now` sat on the list.
+    #[test]
+    fn a_volatile_function_is_allowed_in_a_predicate_and_refused_in_a_key() {
+        for expr in [
+            "now()",
+            "current_timestamp()",
+            "current_date()",
+            "localtimestamp()",
+        ] {
+            check(expr)
+                .unwrap_or_else(|e| panic!("a predicate may use a time function: {expr} -> {e:?}"));
+            check_key(expr).expect_err(&format!("a grouping key may not use {expr}"));
+        }
+        // The realistic predicate shape, which must keep working.
+        check("created_at > now()").expect("a freshness-shaped predicate is legitimate");
+    }
+
+    /// `COLLATE` changes what equality MEANS, so a key carrying one does not
+    /// group by what it says it groups by.
+    ///
+    /// The exclusions table claimed this was already refused "because it is a
+    /// clause, not a scalar function". It was not: `Expr::Collate` is a node
+    /// the walker passed straight through. The doc asserted a behaviour that
+    /// had never been tested.
+    #[test]
+    fn collate_is_refused_in_a_key_and_allowed_in_a_predicate() {
+        check_key("email COLLATE NOCASE").expect_err("a collated key is refused");
+        // Deterministic, and equality is not the point in a predicate.
+        check("email COLLATE NOCASE = 'a'").expect("a collated predicate is fine");
+    }
+
+    /// The control for both: an ordinary key is still accepted in key mode.
+    /// Without it, the refusals above would also pass on a change that
+    /// refused every grouping key.
+    #[test]
+    fn an_ordinary_key_is_still_accepted_in_key_mode() {
+        for expr in [
+            "lower(email)",
+            "concat(a, '-', b)",
+            "md5(id)",
+            "customer_id",
+        ] {
+            check_key(expr).unwrap_or_else(|e| panic!("a plain key must pass: {expr} -> {e:?}"));
         }
     }
 
