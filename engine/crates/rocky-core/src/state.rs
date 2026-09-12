@@ -3214,10 +3214,19 @@ impl PersistedJob {
     /// Whether the job reached a terminal state — `"succeeded"` or `"failed"`.
     ///
     /// Errs toward *unfinished*: an unrecognized `state` reads as **not**
-    /// terminal, so the restart sweep reconciles it rather than leaving an
-    /// embedder polling a record nothing will ever finish. See
-    /// [`is_in_flight`](Self::is_in_flight) for why the two predicates are not
-    /// complements.
+    /// terminal, because this version cannot claim a state it does not know has
+    /// finished. See [`is_in_flight`](Self::is_in_flight) for why the two
+    /// predicates are not complements.
+    ///
+    /// This does **not** mean an unrecognized state strands a poller, and no
+    /// caller should reconcile one on that reasoning. `rocky-cli` renders a
+    /// record through one parse site, `JobState::parse(&state)` with an
+    /// `unwrap_or(JobState::Failed)` fallback, so an unrecognized state already
+    /// reads as terminal at the API boundary. A caller that instead REWRITES
+    /// such a record destroys data: `state` is a plain string precisely so a
+    /// newer sidecar can add a terminal state, and its record carries a real
+    /// result. See `MIN_TRUSTED_REDACTION_VERSION` for the same contract stated
+    /// for the redaction stamp.
     pub fn is_terminal(&self) -> bool {
         matches!(self.state.as_str(), "succeeded" | "failed")
     }
