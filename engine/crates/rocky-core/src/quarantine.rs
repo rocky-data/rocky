@@ -1273,6 +1273,10 @@ mod unit_tests {
             .expect("an ordinary predicate must still compile");
     }
 
+    /// A dialect identical to `TestDialect` in every respect EXCEPT its
+    /// name, so a test using both isolates the name as the only variable.
+    struct SnowflakeNamed;
+
     /// The call site really threads ITS dialect through to the parser.
     ///
     /// Every other test here uses `TestDialect`, which does not override
@@ -1289,7 +1293,6 @@ mod unit_tests {
     fn the_call_site_threads_its_own_dialect_to_the_parser() {
         // Everything but `name()` delegates to TestDialect, so the ONLY
         // difference between the two runs below is the dialect name.
-        struct SnowflakeNamed;
         impl SqlDialect for SnowflakeNamed {
             fn name(&self) -> &'static str {
                 "snowflake"
@@ -1378,6 +1381,28 @@ mod unit_tests {
         // DIFFERENCE does, and it can only come from the name being threaded.
         compile_quarantine_sql(&assertions(), "orders", &table(), &SnowflakeNamed, &cfg)
             .expect_err("the snowflake parser must not accept this operator");
+    }
+
+    /// The same proof for the quarantine FILTER route.
+    ///
+    /// The expression route has its own version above. Four of the five new
+    /// call sites were covered only by tests using the default-named test
+    /// dialect, so replacing their dialect argument with generic would have
+    /// left everything green — the review's finding 4.
+    #[test]
+    fn the_filter_route_threads_its_own_dialect_to_the_parser() {
+        let cfg = split_config();
+        let assertions = || {
+            vec![assertion_with_filter(
+                TestType::NotNull,
+                Some("customer_id"),
+                Some("(a->'k') IS NOT NULL"),
+            )]
+        };
+        compile_quarantine_sql(&assertions(), "orders", &table(), &TestDialect, &cfg)
+            .expect("the generic parser accepts this operator");
+        compile_quarantine_sql(&assertions(), "orders", &table(), &SnowflakeNamed, &cfg)
+            .expect_err("the snowflake parser must not accept it");
     }
 
     /// The `filter` reaches the same CTAS as the predicate, so it gets the

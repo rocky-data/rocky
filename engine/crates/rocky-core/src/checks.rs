@@ -1066,6 +1066,96 @@ mod tests {
         assert!(msg.contains("cross_source_overlap `key_expr`"), "{msg}");
     }
 
+    /// The cross-source key route really threads ITS dialect.
+    ///
+    /// Every other test here passes `TestDialect`, whose `name()` takes the
+    /// trait default `"unknown"` and therefore parses generically — so none
+    /// of them could tell a correct call site from one that hardcoded
+    /// generic. `a->'k'` separates the two: generic parses it as an operator,
+    /// snowflake parses `->` as the lambda arrow and refuses it.
+    #[test]
+    fn the_cross_source_key_route_threads_its_own_dialect() {
+        struct SnowflakeNamed;
+        impl SqlDialect for SnowflakeNamed {
+            fn name(&self) -> &'static str {
+                "snowflake"
+            }
+            fn literal_escape(&self) -> crate::traits::LiteralEscape {
+                TestDialect.literal_escape()
+            }
+            fn format_table_ref(
+                &self,
+                c: &str,
+                s: &str,
+                t: &str,
+            ) -> crate::traits::AdapterResult<String> {
+                TestDialect.format_table_ref(c, s, t)
+            }
+            fn create_table_as(&self, a: &str, b: &str) -> String {
+                TestDialect.create_table_as(a, b)
+            }
+            fn insert_into(&self, a: &str, b: &str) -> String {
+                TestDialect.insert_into(a, b)
+            }
+            fn merge_into(
+                &self,
+                a: &str,
+                b: &str,
+                c: &[std::sync::Arc<str>],
+                d: &rocky_ir::ColumnSelection,
+            ) -> crate::traits::AdapterResult<String> {
+                TestDialect.merge_into(a, b, c, d)
+            }
+            fn select_clause(
+                &self,
+                a: &rocky_ir::ColumnSelection,
+                b: &[rocky_ir::MetadataColumn],
+            ) -> crate::traits::AdapterResult<String> {
+                TestDialect.select_clause(a, b)
+            }
+            fn watermark_where(
+                &self,
+                a: &str,
+                b: Option<&chrono::DateTime<chrono::Utc>>,
+            ) -> crate::traits::AdapterResult<String> {
+                TestDialect.watermark_where(a, b)
+            }
+            fn describe_table_sql(&self, t: &str) -> String {
+                TestDialect.describe_table_sql(t)
+            }
+            fn drop_table_sql(&self, t: &str) -> String {
+                TestDialect.drop_table_sql(t)
+            }
+            fn create_catalog_sql(&self, a: &str) -> Option<crate::traits::AdapterResult<String>> {
+                TestDialect.create_catalog_sql(a)
+            }
+            fn create_schema_sql(
+                &self,
+                a: &str,
+                b: &str,
+            ) -> Option<crate::traits::AdapterResult<String>> {
+                TestDialect.create_schema_sql(a, b)
+            }
+            fn tablesample_clause(&self, a: u32) -> Option<String> {
+                TestDialect.tablesample_clause(a)
+            }
+            fn insert_overwrite_partition(
+                &self,
+                a: &str,
+                b: &str,
+                c: &str,
+            ) -> crate::traits::AdapterResult<Vec<String>> {
+                TestDialect.insert_overwrite_partition(a, b, c)
+            }
+        }
+
+        let siblings = vec![sibling("s1", "t"), sibling("s2", "t")];
+        generate_cross_source_overlap_sql(&siblings, &["(a->'k')".into()], &dialect())
+            .expect("generic accepts the operator");
+        generate_cross_source_overlap_sql(&siblings, &["(a->'k')".into()], &SnowflakeNamed)
+            .expect_err("snowflake must not accept it");
+    }
+
     /// The same content boundary as every other user expression spliced into
     /// generated SQL. The terminator check above stops a key ENDING the
     /// statement; it does not stop one that stays inside the expression and

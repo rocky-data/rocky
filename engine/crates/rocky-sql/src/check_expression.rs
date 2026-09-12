@@ -161,9 +161,17 @@ pub const CHECK_EXPRESSION_FUNCTIONS: &[&str] = &[
     "to_hex",
     "encode",
     "decode",
-    // date formatting (pure). A grouping key very often buckets a timestamp
-    // by a formatted string.
-    "to_char",
+    // date formatting. A grouping key very often buckets a timestamp by a
+    // formatted string.
+    //
+    // `to_char` is NOT here. Snowflake's one-argument form falls back to the
+    // session's output-format parameter, which makes it a read of session
+    // state rather than a function of its arguments — the exact thing this
+    // list excludes. The independent review flagged it as its own
+    // least-confidence item and I have no Snowflake to settle it on, so it
+    // stays off rather than shipping on "probably fine". Add it with a
+    // conformance test, or add `to_char(x, fmt)` as a two-argument form if
+    // someone can show the one-argument case is not reachable.
     "date_format",
     "format_date",
     // string shaping (pure)
@@ -539,7 +547,6 @@ mod tests {
             "to_hex(a)",
             "encode(a, 'hex')",
             "decode(a, 'hex')",
-            "to_char(t, 'YYYY')",
             "date_format(t, 'y')",
             "format_date('%Y', t)",
             "translate(a, 'x', 'y')",

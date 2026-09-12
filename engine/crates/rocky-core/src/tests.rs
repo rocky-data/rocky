@@ -813,6 +813,120 @@ mod unit_tests {
 
     // ----- TOML deserialization -----
 
+    /// Both tests.rs routes really thread THEIR dialect.
+    ///
+    /// These two hold an `Option<&dyn SqlDialect>` and fall back to
+    /// `"generic"` when it is `None`, so a test that passes `None` — as every
+    /// other test here does — cannot tell a correct call site from one that
+    /// hardcoded generic. `a->'k'` separates them: generic parses it as an
+    /// operator, snowflake parses `->` as the lambda arrow and refuses it.
+    #[test]
+    fn the_tests_rs_routes_thread_their_own_dialect() {
+        struct SnowflakeNamed;
+        impl crate::traits::SqlDialect for SnowflakeNamed {
+            fn name(&self) -> &'static str {
+                "snowflake"
+            }
+            fn literal_escape(&self) -> crate::traits::LiteralEscape {
+                crate::traits::LiteralEscape::Standard
+            }
+            fn format_table_ref(
+                &self,
+                c: &str,
+                s: &str,
+                t: &str,
+            ) -> crate::traits::AdapterResult<String> {
+                rocky_sql::validation::format_table_ref(c, s, t)
+                    .map_err(crate::traits::AdapterError::new)
+            }
+            fn create_table_as(&self, target: &str, select_sql: &str) -> String {
+                format!("CREATE OR REPLACE TABLE {target} AS\n{select_sql}")
+            }
+            fn insert_into(&self, _: &str, _: &str) -> String {
+                unimplemented!()
+            }
+            fn merge_into(
+                &self,
+                _: &str,
+                _: &str,
+                _: &[std::sync::Arc<str>],
+                _: &rocky_ir::ColumnSelection,
+            ) -> crate::traits::AdapterResult<String> {
+                unimplemented!()
+            }
+            fn select_clause(
+                &self,
+                _: &rocky_ir::ColumnSelection,
+                _: &[rocky_ir::MetadataColumn],
+            ) -> crate::traits::AdapterResult<String> {
+                unimplemented!()
+            }
+            fn watermark_where(
+                &self,
+                _: &str,
+                _: Option<&chrono::DateTime<chrono::Utc>>,
+            ) -> crate::traits::AdapterResult<String> {
+                unimplemented!()
+            }
+            fn describe_table_sql(&self, t: &str) -> String {
+                format!("DESCRIBE TABLE {t}")
+            }
+            fn drop_table_sql(&self, t: &str) -> String {
+                format!("DROP TABLE IF EXISTS {t}")
+            }
+            fn create_catalog_sql(&self, _: &str) -> Option<crate::traits::AdapterResult<String>> {
+                None
+            }
+            fn create_schema_sql(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Option<crate::traits::AdapterResult<String>> {
+                None
+            }
+            fn tablesample_clause(&self, _: u32) -> Option<String> {
+                None
+            }
+            fn insert_overwrite_partition(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> crate::traits::AdapterResult<Vec<String>> {
+                unimplemented!()
+            }
+        }
+
+        // The checks `filter` route.
+        let filtered = |f: &str| TestDecl {
+            test_type: TestType::NotNull,
+            column: Some("name".into()),
+            severity: TestSeverity::Error,
+            filter: Some(f.into()),
+        };
+        // No dialect -> the "generic" default, which parses the operator.
+        generate_test_sql(&filtered("(a->'k') IS NOT NULL"), "wh.main.orders")
+            .expect("generic accepts the operator");
+        generate_test_sql_with_dialect(
+            &filtered("(a->'k') IS NOT NULL"),
+            "wh.main.orders",
+            &SnowflakeNamed,
+        )
+        .expect_err("snowflake must not accept it");
+
+        // The `unique_expr` `key_expr` route.
+        let keyed = |k: &str| TestDecl {
+            test_type: TestType::UniqueExpr { key_expr: k.into() },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        generate_test_sql(&keyed("(a->'k')"), "wh.main.orders")
+            .expect("generic accepts the operator");
+        generate_test_sql_with_dialect(&keyed("(a->'k')"), "wh.main.orders", &SnowflakeNamed)
+            .expect_err("snowflake must not accept it");
+    }
+
     /// The checks `filter` reaches the same generated statement as the
     /// `expression` it filters, so it gets the same boundary. #1820 guarded
     /// the expression and left the filter on the terminator-only check.
