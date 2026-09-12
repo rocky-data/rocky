@@ -2491,29 +2491,31 @@ pub(crate) fn scrub_job_outcome(
         };
 
         // Prefer the descriptive marker. If its own text is registered, fall
-        // back to one that CANNOT be: every token here is shorter than
-        // `SECRET_LENGTH_FLOOR`, and the registry refuses to record anything
-        // below that, so no operator value can appear inside it. The reader
-        // therefore always gets a positive signal — never a bare `null`,
-        // which is indistinguishable from a run that produced nothing.
-        const _: () = assert!(
-            rocky_core::secret_registry::SECRET_LENGTH_FLOOR > 5,
-            "the short marker's tokens must be below the floor to be unregisterable"
-        );
-        let short = serde_json::json!({ "held": true });
+        // back to one whose SERIALIZED form is shorter than the floor.
+        //
+        // The invariant is about the serialized bytes, not about tokens.
+        // `any_value_survives` scans a string; token boundaries do not exist
+        // at that layer, so a short-token marker can still contain a
+        // registerable substring spanning them — the same concatenation
+        // fallacy the comment above warns about. `{"h":1}` is SEVEN bytes, so
+        // every substring of it is shorter than the eight-byte floor and the
+        // registry cannot hold any of them. True by construction, not by odds.
+        //
+        // `SHORT_MARKER_IS_UNREGISTERABLE` in the tests pins the length, so
+        // changing the marker or lowering the floor fails there rather than
+        // silently making this claim false.
+        let short = serde_json::json!({ "h": 1 });
         let marker = withheld();
-        let result = if safe(&marker) {
-            Some(marker)
-        } else {
-            Some(short)
-        };
+        let result = Some(if safe(&marker) { marker } else { short });
 
+        // Same rule for the note: `held` is four bytes raw and six quoted,
+        // both under the floor.
         const NOTE: &str = "withheld: a resolved value survived redaction";
-        let error = if crate::secret_filter::any_value_survives(NOTE) {
-            Some("held".to_string())
+        let error = Some(if crate::secret_filter::any_value_survives(NOTE) {
+            "held".to_string()
         } else {
-            Some(NOTE.to_string())
-        };
+            NOTE.to_string()
+        });
         return (result, error, rocky_core::state::CURRENT_REDACTION_VERSION);
     }
 
@@ -3206,6 +3208,35 @@ mod tests {
         assert!(!crate::secret_filter::any_value_survives(&stored));
     }
 
+    /// #1897. The last-resort marker is unregisterable BY LENGTH.
+    ///
+    /// `any_value_survives` scans serialized bytes, so the property has to be
+    /// about those bytes and not about token boundaries — a marker of short
+    /// tokens can still contain a registerable substring spanning them. A
+    /// marker whose whole serialized form is shorter than the floor has no
+    /// substring the registry could hold.
+    ///
+    /// This fails if the marker grows or the floor shrinks, which is the point:
+    /// the claim in `scrub_job_outcome` stops being true at exactly that moment.
+    #[test]
+    fn the_last_resort_marker_is_shorter_than_the_secret_floor() {
+        let short = serde_json::json!({ "h": 1 });
+        let serialized = serde_json::to_string(&short).expect("serializes");
+        assert_eq!(serialized, r#"{"h":1}"#);
+        assert!(
+            serialized.len() < rocky_core::secret_registry::SECRET_LENGTH_FLOOR,
+            "the last-resort marker serializes to {} bytes, which is not below \
+             the {}-byte floor — it can therefore contain a registered value",
+            serialized.len(),
+            rocky_core::secret_registry::SECRET_LENGTH_FLOOR
+        );
+        // The note's fallback, quoted as it appears in a JSON body.
+        assert!(
+            serde_json::to_string("held").expect("serializes").len()
+                < rocky_core::secret_registry::SECRET_LENGTH_FLOOR
+        );
+    }
+
     /// Codex C, the blocking one. `scrub_job_outcome` stamped without ever
     /// checking whether a value survived its own rewriting.
     ///
@@ -3233,8 +3264,9 @@ mod tests {
         let result = result.expect("a withheld result is still a signal, never null");
         assert_eq!(
             result,
-            serde_json::json!({ "held": true }),
-            "when the descriptive marker is unusable, the unregisterable one is used"
+            serde_json::json!({ "h": 1 }),
+            "when the descriptive marker is unusable, the one that is shorter \
+             than the floor is used"
         );
         let result = Some(result);
         let stored = serde_json::to_string(&(result, error)).expect("serializes");
