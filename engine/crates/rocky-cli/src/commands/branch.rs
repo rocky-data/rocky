@@ -1047,8 +1047,11 @@ fn quote_fqn(dialect: &dyn rocky_core::traits::SqlDialect, target: &TargetRef) -
 ///
 /// - the dialect's own delimiter, because `quote_identifier` wraps and does
 ///   not escape, so the delimiter ends the identifier early;
-/// - a backslash, because BigQuery reads escape sequences inside a quoted
-///   identifier, so a trailing backslash consumes the closing backtick.
+/// - a backslash, but only where the dialect says it escapes there
+///   (`identifier_takes_backslash_escapes`, true for BigQuery alone). A
+///   schema named `raw\` is ordinary on DuckDB — `rocky-duckdb` has an
+///   executed test that creates and discovers one — so refusing it
+///   everywhere would break a working project.
 ///
 /// Every other character is contained by the quoting. That is why this is not
 /// the SQL-identifier allowlist: a branch name may carry `-` or `.` by design
@@ -1062,7 +1065,9 @@ fn quote_fqn(dialect: &dyn rocky_core::traits::SqlDialect, target: &TargetRef) -
 /// pins.
 fn unquotable_char(dialect: &dyn rocky_core::traits::SqlDialect, name: &str) -> Option<char> {
     let delimiter = dialect.quote_identifier("").chars().next()?;
-    name.chars().find(|c| *c == delimiter || *c == '\\')
+    let backslash_escapes = dialect.identifier_takes_backslash_escapes();
+    name.chars()
+        .find(|c| *c == delimiter || (*c == '\\' && backslash_escapes))
 }
 
 /// Quote one name part, refusing a name a quoted identifier cannot carry
@@ -2428,6 +2433,20 @@ mod tests {
             ("trino", &rocky_trino::dialect::TrinoDialect, '"'),
         ];
         for (name, dialect, expected) in cases {
+            // `quote_identifier("")` is the call `unquotable_char` makes, so
+            // pin that one and not a near neighbour.
+            let empty = dialect.quote_identifier("");
+            assert_eq!(
+                empty.chars().next(),
+                Some(expected),
+                "{name}: the delimiter read must see {expected:?}, got {empty}"
+            );
+            assert_eq!(
+                empty.chars().count(),
+                2,
+                "{name} must wrap an empty name in exactly two characters"
+            );
+
             let quoted = dialect.quote_identifier("x");
             assert_eq!(
                 quoted.chars().next(),
@@ -2447,16 +2466,18 @@ mod tests {
         }
     }
 
-    /// A backslash is refused as well as the delimiter, because BigQuery reads
+    /// A backslash is refused on BigQuery only, because only BigQuery reads
     /// escape sequences inside a quoted identifier: a trailing backslash
     /// consumes the closing backtick and the identifier does not end where it
     /// should (#1939).
     ///
-    /// Refused on every dialect, not only BigQuery. A backslash in a warehouse
-    /// name is not something a project relies on, and one rule is easier to
-    /// state than a per-dialect exception.
+    /// Everywhere else a backslash is an ordinary character, and a schema
+    /// named `raw\` is real — `rocky-duckdb/src/discovery.rs` creates and
+    /// discovers one in an executed test (#1596). Refusing it would break a
+    /// working project, which is the same reason this is not the
+    /// SQL-identifier allowlist.
     #[test]
-    fn build_promote_sql_refuses_a_trailing_backslash() {
+    fn a_backslash_is_refused_on_bigquery_and_allowed_elsewhere() {
         let plain = |schema: &str| TargetRef {
             catalog: "playground".to_string(),
             schema: schema.to_string(),
@@ -2464,11 +2485,18 @@ mod tests {
         };
         let bigquery = rocky_bigquery::dialect::BigQueryDialect;
         let duckdb = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let snowflake = rocky_snowflake::dialect::SnowflakeSqlDialect;
 
         build_promote_sql(&bigquery, &plain(r"reporting\"), &plain("branch__live"))
             .expect_err("a trailing backslash must be refused on BigQuery");
-        build_promote_sql(&duckdb, &plain(r"reporting\"), &plain("branch__live"))
-            .expect_err("and on every other dialect, by the same rule");
+
+        // The controls: the same name promotes everywhere else.
+        let sql = build_promote_sql(&duckdb, &plain(r"raw\"), &plain("branch__live"))
+            .expect("a backslash is an ordinary DuckDB schema character");
+        assert!(sql.contains(r#""raw\""#), "got {sql}");
+        build_promote_sql(&snowflake, &plain(r"raw\"), &plain("branch__live"))
+            .expect("and an ordinary Snowflake one");
+
         build_promote_sql(
             &bigquery,
             &plain("branch__live-test"),
