@@ -739,6 +739,13 @@ pub async fn run_quality(
                 // error-severity row-level assertions. Compiles from
                 // config (not from assertion query results) so a failed
                 // assertion query does not suppress quarantine.
+                //
+                // A compile failure does not suppress it silently either: see
+                // the `Err` arm below, which records an error-severity check
+                // rather than skipping. The two together are what the sentence
+                // above claims — before that arm existed, this comment was
+                // half true, because a refused predicate suppressed quarantine
+                // completely.
                 if let Some(ref q_cfg) = pipeline.checks.quarantine
                     && q_cfg.enabled
                 {
@@ -764,11 +771,42 @@ pub async fn run_quality(
                             output.quarantine.push(q_output);
                         }
                         Ok(None) => {} // no quarantinable assertions
-                        Err(e) => warn!(
-                            error = %e,
-                            table = %full_table,
-                            "failed to compile quarantine SQL — skipping"
-                        ),
+                        // A quarantine that did not run is NOT a quarantine
+                        // that found nothing. This used to warn and continue,
+                        // so a refused predicate meant the rows quarantine
+                        // existed to catch flowed on, with nothing in
+                        // `RunOutput` saying the split never happened.
+                        //
+                        // Recorded as a failing error-severity check instead,
+                        // the way #1820 records a refused assertion: the gate
+                        // trips, the run exits non-zero, and the reason
+                        // reaches the JSON and Dagster rather than a log line.
+                        //
+                        // Not a hard abort: the compile runs BEFORE any
+                        // quarantine statement executes, so nothing is
+                        // half-written and there is no partial split to
+                        // unwind. The table is materialized and unsplit, which
+                        // the failing check now says out loud.
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                table = %full_table,
+                                "failed to compile quarantine SQL"
+                            );
+                            output.check_results.push(TableCheckOutput {
+                                asset_key: asset_key.clone(),
+                                // Namespaced with a colon so it cannot
+                                // collide with an assertion's name on this
+                                // asset. Dagster's `emit_check_results` has
+                                // no dedup, and a duplicate
+                                // (asset_key, check_name) raises "returned an
+                                // output multiple times".
+                                checks: vec![rocky_core::checks::quarantine_not_evaluated(
+                                    "quarantine:compile",
+                                    e.to_string(),
+                                )],
+                            });
+                        }
                     }
                 }
             }
