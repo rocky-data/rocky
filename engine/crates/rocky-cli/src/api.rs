@@ -6397,7 +6397,9 @@ mod tests {
             for (label, secret) in SECRETS {
                 assert!(
                     !body.contains(secret),
-                    "GET {path} answered {status} and disclosed {label}"
+                    "GET {path} answered {status} and disclosed {label}; \
+                     response body, {} bytes",
+                    body.len()
                 );
             }
             checked += 1;
@@ -6508,10 +6510,18 @@ mod tests {
         // AND the body into the failure message, so a containment test that
         // fails writes the value into the log it exists to keep it out of.
         // CodeQL flags it as cleartext logging, and is right to.
+        //
+        // The label and the length answer different halves, and both are safe
+        // because each is fixed at the call site, never derived from the body.
+        // The label says WHICH configured value got through, which is what
+        // ends the hunt when three are registered; the length distinguishes an
+        // empty result from a full one. Same shape as #1920's filter tests, so
+        // two containment suites in one release fail the same way.
         for (label, secret) in SECRETS {
             assert!(
                 !body.contains(secret),
-                "the settings document disclosed {label}"
+                "the settings document disclosed {label}; body, {} bytes",
+                body.len()
             );
         }
     }
