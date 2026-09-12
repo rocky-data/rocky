@@ -958,6 +958,39 @@ pub trait LoaderAdapter: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    /// The `rocky-core` twin of this test is
+    /// `manual_default_matches_serde_default_for_every_config_with_field_defaults`
+    /// in `config.rs`. This copy exists because `LoadOptions` lives here, and
+    /// this crate and `rocky-core` do not depend on each other in either
+    /// direction, so neither test can name the other's types.
+    ///
+    /// What it guards: a struct carrying `#[serde(default = "..."]` on any
+    /// field must implement `Default` BY HAND, and that impl must agree with
+    /// the attributes. A DERIVED `Default` cannot see them, so if such a struct
+    /// is ever the target of a `#[serde(default)]` field, an ABSENT table gets
+    /// Rust zero values while an EMPTY table gets the attribute defaults, and
+    /// the two silently disagree. `ChecksConfig` shipped that way (#1924).
+    ///
+    /// Compared via `Debug`, not JSON: a field with `skip_serializing_if` is
+    /// absent from the serialized form, so a JSON comparison could not see a
+    /// mismatch in it.
+    #[test]
+    fn manual_default_matches_serde_default_for_load_options() {
+        let from_rust = format!("{:?}", LoadOptions::default());
+        let from_serde = format!(
+            "{:?}",
+            serde_json::from_str::<LoadOptions>("{}")
+                .expect("LoadOptions must deserialize from an empty object")
+        );
+        assert_eq!(
+            from_rust, from_serde,
+            "`LoadOptions::default()` disagrees with deserializing an empty \
+             object, so an ABSENT table would mean something different from an \
+             EMPTY one. Implement `Default` by hand, calling the same \
+             `default_*` functions the serde attributes name."
+        );
+    }
+
     use super::*;
 
     // Verify that trait objects can be constructed (compile-time check).

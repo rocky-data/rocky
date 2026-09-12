@@ -1238,10 +1238,11 @@ pub struct MetadataColumnConfig {
 // `Default` is implemented by hand below, NOT derived, and the distinction is
 // load-bearing. A derived `Default` cannot see `#[serde(default = "...")]`, so
 // it returned the Rust zero value for every field — and because the `checks`
-// field on each pipeline is `#[serde(default)]`, an ABSENT `[checks]` table
-// went through that derive while an EMPTY one went through the field
-// attributes. The two disagreed: absent gave `fail_on_error = false`, empty
-// gave `true` (#1924).
+// field is `#[serde(default)]` on FOUR of the five pipeline variants
+// (replication, transformation, snapshot, load — NOT quality, where the table
+// is required), an ABSENT `[checks]` table went through that derive while an
+// EMPTY one went through the field attributes. The two disagreed: absent gave
+// `fail_on_error = false`, empty gave `true` (#1924).
 //
 // This is a plain comment, not a doc comment, on purpose: `JsonSchema` exports
 // the doc comment into `schemas/rocky_project.schema.json`, and from there into
@@ -14690,12 +14691,36 @@ mod default_parity {
     /// comparison cannot see a mismatch in it — `ChecksConfig`'s own
     /// `cross_source_overlap` is such a field. `Debug` prints every field.
     ///
-    /// **The list is maintained by hand.** A struct not named here is not
-    /// covered. An automatic version would have to find every
-    /// `#[serde(default = "...")]` and attribute it to its enclosing struct,
-    /// which needs brace-depth tracking rather than a grep, and a scan that
-    /// silently matches nothing reads exactly like a scan that passes. Adding
-    /// a name here is cheap; a guard that lies is not.
+    /// **The list is maintained by hand, and it started incomplete.** The
+    /// first version named the twelve types the report mentioned. A reviewer's
+    /// brace-depth scan of the workspace found six more that both implement
+    /// `Default` and carry a `#[serde(default = "...")]` field. Four joined the
+    /// list — `QuarantineConfig` from this very file, plus
+    /// `ComparisonThresholds`, `StateRetentionConfig` and `ShadowConfig`. All
+    /// were already correct, so there was no second bug, but they were not
+    /// covered.
+    ///
+    /// The other two are outside the class, and the distinction is the point:
+    ///
+    /// ```text
+    /// PreviewConfig   has a REQUIRED field, so it cannot deserialize from
+    ///                 `{}` and therefore cannot be a defaulted table at all.
+    ///                 Asserted separately below.
+    /// LoadOptions     lives in `rocky-adapter-sdk`, which neither depends on
+    ///                 this crate nor is depended on by it, so it cannot be
+    ///                 named here. It has its own copy of this test beside it.
+    /// ```
+    ///
+    /// Note also what `#[serde(default)]` on an `Option<T>` does NOT do: absent
+    /// gives `None`, never `T::default()`. `QuarantineConfig` reaches this list
+    /// on its own merits, not through `checks.quarantine`.
+    ///
+    /// A struct not named here is still not covered. An automatic version
+    /// would have to attribute every `#[serde(default = "...")]` to its
+    /// enclosing struct, which needs brace-depth tracking rather than a grep,
+    /// and a scan that silently matches nothing reads exactly like a scan that
+    /// passes. The real fix is to make the derive unavailable on such a struct;
+    /// until then, adding a name here is cheap and a guard that lies is not.
     #[test]
     fn manual_default_matches_serde_default_for_every_config_with_field_defaults() {
         macro_rules! assert_parity {
@@ -14739,6 +14764,27 @@ mod default_parity {
             ReuseConfig,
             ScheduleDefaultsConfig,
             StateConfig,
+            // Found by a reviewer's workspace scan, not by the report.
+            QuarantineConfig,
+            crate::compare::ComparisonThresholds,
+            crate::retention::StateRetentionConfig,
+            crate::shadow::ShadowConfig,
+        );
+
+        // `crate::preview::PreviewConfig` is deliberately NOT above. It has a
+        // REQUIRED field, `branch`, so it cannot deserialize from `{}` at all —
+        // which means it can never be the target of a `#[serde(default)]` field
+        // without an empty table becoming a parse error. Adding it to the list
+        // fails the precondition rather than the comparison, which is a
+        // different statement than this test makes.
+        //
+        // Pinned here so that making it a defaulted table stops being silent:
+        assert!(
+            serde_json::from_str::<crate::preview::PreviewConfig>("{}").is_err(),
+            "PreviewConfig gained a default for every field. If it is now the \
+             target of a `#[serde(default)]` field, move it into the list above \
+             — an absent table would call `Default::default()` and could \
+             disagree with an empty one."
         );
     }
 

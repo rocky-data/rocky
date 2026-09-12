@@ -35276,10 +35276,14 @@ value = "'{source}'"
     ) -> (bool, rocky_core::state::RunStatus) {
         // Every caller is asking about the DEFAULT gate, so a config with the
         // gate switched off would make any of them pass for a reason it never
-        // states. `ChecksConfig` derives `Default`, which ignores
-        // `#[serde(default = "default_fail_on_error")]` — so a pipeline whose
-        // TOML omits `[checks]` entirely arrives here with `fail_on_error`
-        // FALSE, and this assertion is what says so out loud.
+        // states. This assertion is what says so out loud.
+        //
+        // It used to carry a second reason: `ChecksConfig` derived `Default`,
+        // which ignored `#[serde(default = "default_fail_on_error")]`, so a
+        // pipeline whose TOML omitted `[checks]` arrived with `fail_on_error`
+        // FALSE. That was fixed in #1924 — `Default` is now written by hand and
+        // an absent table matches an empty one. The assertion stays, because a
+        // caller can still hand in a config with the gate off.
         assert!(
             checks.fail_on_error,
             "these tests are about the default gate; fail_on_error must be on"
