@@ -37,6 +37,7 @@ use crate::parser::parse_single_statement;
 /// same data. Compared case-insensitively (stored upper-case).
 pub(crate) const VOLATILE_FUNCTIONS: &[&str] = &[
     "CURRENT_TIMESTAMP",
+    "LOCALTIME",
     "LOCALTIMESTAMP",
     "NOW",
     "GETDATE",

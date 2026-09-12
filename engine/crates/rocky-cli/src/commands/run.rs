@@ -471,12 +471,14 @@ fn merge_replication_compile_and_copy_errors(output: &mut RunOutput, table_error
 /// never read the flag, so a pipeline that copied violating data exited 0
 /// (#1598). This is the missing read, not a new policy.
 ///
-/// Error severity only, so a `severity = "warning"` check stays advisory and
-/// `fail_on_error = false` keeps every check advisory — neither may change a
-/// status or an exit code. A check the engine could NOT evaluate counts as a
-/// failure at its own severity: every `*_not_evaluated` constructor sets
-/// `passed: false` (#1602 / #1595), so a broken check gates exactly as a
-/// violated one does instead of reading as clean.
+/// Error severity only, so a MEASURED `severity = "warning"` check stays
+/// advisory and `fail_on_error = false` keeps every check advisory — neither
+/// may change a status or an exit code.
+///
+/// A FAILED check carrying `not_evaluated` reaches the error bucket whatever
+/// its severity says, so it gates like an error-severity violation (#1741 /
+/// #1602 / #1595). `not_evaluated` with `passed: true` is not a failure and
+/// reaches neither bucket. See [`RunOutput::check_failures_by_severity`].
 fn replication_check_gate_failed(
     output: &RunOutput,
     checks: &rocky_core::config::ChecksConfig,
@@ -6716,7 +6718,7 @@ async fn run_batched_checks(
     // path names the one table whose own query failed, the batch path names
     // every table the failed leg was handed (#1655). A table that a leg
     // answered WITHOUT leaving a row for is not recorded — there is no reason
-    // to give, and it is reported as "returned no result for this table".
+    // to give, and it is reported as "returned no readable count for this table".
     let mut source_count_failures: HashMap<String, String> = HashMap::new();
     let mut target_count_failures: HashMap<String, String> = HashMap::new();
     // In table order, so the emitted results are deterministic.
@@ -6990,7 +6992,7 @@ async fn run_batched_checks(
                         let missing_side = |label: &str, reason: Option<&String>| match reason {
                             Some(reason) => format!("{label}: {reason}"),
                             None => format!(
-                                "{label}: the batch row count query returned no result for this table"
+                                "{label}: the batch row count query returned no readable count for this table"
                             ),
                         };
                         let mut parts = Vec::new();
@@ -7016,8 +7018,17 @@ async fn run_batched_checks(
                 // (#1666). `check_row_count` hard-codes `Error`, so
                 // `severity = "warning"` on a replication pipeline parsed and
                 // was discarded — the operator's own escape hatch did nothing.
-                // Same shape the freshness check already uses below.
-                check.severity = pipeline.checks.row_count.severity();
+                //
+                // Only for a check that RAN (#1871). Severity grades a
+                // measurement: an operator writing `warning` means "a row
+                // count that does not match is advisory", not "a row count I
+                // could not obtain is advisory". `row_count_not_evaluated`
+                // chooses `Error`; overwriting that here is what sent an
+                // unrunnable check to the warning bucket. Same guard the
+                // freshness and null-rate sites use.
+                if check.not_evaluated.is_none() {
+                    check.severity = pipeline.checks.row_count.severity();
+                }
                 let entry =
                     pending_checks
                         .entry(target_key.clone())
@@ -7087,10 +7098,10 @@ async fn run_batched_checks(
         // exactly the silent gap this change closes for row counts. A batch
         // leg that FAILS does record a reason per table (#1655); a leg that
         // answered and left a table out records none, so iterating the
-        // results is the only way to notice that one. A returned `None` is an empty
-        // table and still emits no check: `MAX(ts)` over no rows is NULL
-        // because there is no row to be fresh, which is not the same as a
-        // query that could not answer.
+        // results is the only way to notice that one.
+        //
+        // `None` emits no check. That is correct for an empty table and wrong
+        // for the other states that reach the same `None` (#1929).
         let measured = freshness_batch_refs.iter().filter_map(|tref| {
             let key = tref.full_name();
             match freshness_results.iter().find(|fr| fr.table == *tref) {
@@ -7104,13 +7115,13 @@ async fn run_batched_checks(
                 None if !freshness_failures.iter().any(|(k, _)| *k == key) => {
                     warn!(
                         table = key.as_str(),
-                        "the batch freshness query returned no result for this table — reporting it as not evaluated"
+                        "the batch freshness query returned no readable timestamp for this table — reporting it as not evaluated"
                     );
                     Some((
                         key,
                         checks::freshness_not_evaluated(
                             freshness_cfg.threshold_seconds,
-                            "the batch freshness query returned no result for this table",
+                            "the batch freshness query returned no readable timestamp for this table",
                         ),
                     ))
                 }
@@ -13822,8 +13833,13 @@ async fn process_table(
             &task.column_match_exclude,
         );
         // The configured severity, not `check_column_match`'s hard-coded
-        // `Error` (#1666).
-        check.severity = column_match_severity;
+        // `Error` (#1666) — and only for a check that RAN (#1871). A column
+        // probe that failed is `column_match_not_evaluated`, which chooses
+        // `Error`; downgrading that to the configured `warning` cleared the
+        // gate on a run that had compared nothing.
+        if check.not_evaluated.is_none() {
+            check.severity = column_match_severity;
+        }
         probe_rate_limited = rate_limited;
         Some(check)
     } else {
@@ -22146,6 +22162,78 @@ timestamp_column = "ts"
         }
     }
 
+    /// A warehouse that copies normally and then refuses to describe the
+    /// TARGET — the post-copy probe failure `post_copy_column_match` turns into
+    /// `column_match_not_evaluated`.
+    ///
+    /// Shared by the two tests that need that failure. It used to live inside
+    /// one of them; a second copy is how the three materialized-table call
+    /// sites drifted in #1718.
+    #[cfg(feature = "duckdb")]
+    struct FailPostCopyDescribe<'a> {
+        inner: &'a rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+        copied: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[async_trait::async_trait]
+    impl rocky_core::traits::WarehouseAdapter for FailPostCopyDescribe<'_> {
+        fn dialect(&self) -> &dyn rocky_core::traits::SqlDialect {
+            self.inner.dialect()
+        }
+
+        async fn execute_statement(&self, sql: &str) -> rocky_core::traits::AdapterResult<()> {
+            self.inner.execute_statement(sql).await
+        }
+
+        async fn execute_query(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::QueryResult> {
+            self.inner.execute_query(sql).await
+        }
+
+        async fn describe_table(
+            &self,
+            table: &rocky_ir::TableRef,
+        ) -> rocky_core::traits::AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+            use std::sync::atomic::Ordering;
+            if table.schema == "tgt" && self.copied.load(Ordering::SeqCst) {
+                return Err(rocky_core::traits::AdapterError::msg(
+                    "injected post-copy probe failure",
+                ));
+            }
+            self.inner.describe_table(table).await
+        }
+
+        async fn execute_statement_with_stats(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::ExecutionStats> {
+            use std::sync::atomic::Ordering;
+            let stats = self.inner.execute_statement_with_stats(sql).await?;
+            self.copied.store(true, Ordering::SeqCst);
+            Ok(stats)
+        }
+    }
+
+    /// `src.events` seeded with two rows, plus the empty `tgt` schema the copy
+    /// writes into. Both column_match probe-failure tests start here.
+    #[cfg(feature = "duckdb")]
+    async fn seeded_src_events() -> rocky_duckdb::adapter::DuckDbWarehouseAdapter {
+        use rocky_core::traits::WarehouseAdapter;
+        let inner = rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (event_id INTEGER, user_id INTEGER)",
+            "INSERT INTO src.events VALUES (1, 7), (2, 8)",
+        ] {
+            inner.execute_statement(sql).await.unwrap();
+        }
+        inner
+    }
+
     /// The `(missing, extra)` a `column_match` result reports, sorted so the
     /// assertion does not depend on set iteration order.
     #[cfg(feature = "duckdb")]
@@ -22493,63 +22581,9 @@ timestamp_column = "ts"
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn column_match_records_a_reason_when_the_post_copy_probe_fails() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        use async_trait::async_trait;
         use rocky_core::state::StateStore;
-        use rocky_core::traits::{
-            AdapterError, AdapterResult, ExecutionStats, QueryResult, SqlDialect, WarehouseAdapter,
-        };
-        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
-        struct FailPostCopyDescribe<'a> {
-            inner: &'a DuckDbWarehouseAdapter,
-            copied: AtomicBool,
-        }
-
-        #[async_trait]
-        impl WarehouseAdapter for FailPostCopyDescribe<'_> {
-            fn dialect(&self) -> &dyn SqlDialect {
-                self.inner.dialect()
-            }
-
-            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
-                self.inner.execute_statement(sql).await
-            }
-
-            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
-                self.inner.execute_query(sql).await
-            }
-
-            async fn describe_table(
-                &self,
-                table: &rocky_ir::TableRef,
-            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
-                if table.schema == "tgt" && self.copied.load(Ordering::SeqCst) {
-                    return Err(AdapterError::msg("injected post-copy probe failure"));
-                }
-                self.inner.describe_table(table).await
-            }
-
-            async fn execute_statement_with_stats(
-                &self,
-                sql: &str,
-            ) -> AdapterResult<ExecutionStats> {
-                let stats = self.inner.execute_statement_with_stats(sql).await?;
-                self.copied.store(true, Ordering::SeqCst);
-                Ok(stats)
-            }
-        }
-
-        let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
-        for sql in [
-            "CREATE SCHEMA src",
-            "CREATE SCHEMA tgt",
-            "CREATE TABLE src.events (event_id INTEGER, user_id INTEGER)",
-            "INSERT INTO src.events VALUES (1, 7), (2, 8)",
-        ] {
-            inner.execute_statement(sql).await.unwrap();
-        }
+        let inner = seeded_src_events().await;
 
         let dir = tempfile::tempdir().unwrap();
         let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
@@ -22558,7 +22592,7 @@ timestamp_column = "ts"
 
         let adapter = FailPostCopyDescribe {
             inner: &inner,
-            copied: AtomicBool::new(false),
+            copied: std::sync::atomic::AtomicBool::new(false),
         };
         let outcome = process_table(&adapter, &state, &pipeline, &task, false)
             .await
@@ -22584,6 +22618,92 @@ timestamp_column = "ts"
             "unexpected reason: {reason}"
         );
         assert!(!check.passed, "an unevaluated check never passes");
+    }
+
+    /// #1871's column_match half, and the last of the four replication check
+    /// sites. FAILS before the guard at `process_table`: the probe failure is
+    /// reported as a `warning`, the gate reads zero errors, and a run that
+    /// compared no columns at all exits 0 with `status: "Success"`.
+    ///
+    /// ```text
+    ///   copy succeeds -> post-copy probe of tgt FAILS
+    ///     -> column_match_not_evaluated  (severity Error, by construction)
+    ///     -> site writes the configured `warning` over it   <- the defect
+    ///     -> gate counts a warning, not an error
+    ///     -> Success
+    /// ```
+    ///
+    /// `column_match_carries_the_configured_severity` pins the other half:
+    /// a probe that ANSWERS still reports at the configured severity. Both
+    /// must hold, and asserting only this one would pass against code that
+    /// ignored the configured severity entirely — which is #1666 again.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_failed_column_match_probe_gates_even_when_the_configured_severity_is_warning() {
+        use rocky_core::state::StateStore;
+        use rocky_core::tests::TestSeverity;
+
+        let inner = seeded_src_events().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        // The `[checks]` table is declared, not defaulted: see `gate_for`.
+        // `column_match = true` is what a replication pipeline writes to turn
+        // this check on, and `severity` is the escape hatch under test — the
+        // task carries the resolved value, so it is set below.
+        let pipeline = parse_pipeline(
+            "strategy = \"full_refresh\"\n\n[pipeline.bronze.checks]\ncolumn_match = true\n",
+        );
+        assert!(
+            pipeline.checks.fail_on_error,
+            "the fixture must run under the default gate"
+        );
+        let mut task = column_match_task(vec![], vec![]);
+        task.column_match = Some(TestSeverity::Warning);
+
+        let adapter = FailPostCopyDescribe {
+            inner: &inner,
+            copied: std::sync::atomic::AtomicBool::new(false),
+        };
+        let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+            .await
+            .expect("a failed metadata read must not fail a table that copied");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+
+        let check = result
+            .column_match_check
+            .clone()
+            .expect("the task enables column_match");
+        assert!(
+            check.not_evaluated.is_some(),
+            "the probe must have failed for this test to mean anything: {check:?}"
+        );
+
+        // The gate first: it is the user-visible consequence, so a regression
+        // prints the exit code it changed rather than a field.
+        let pending = HashMap::from([(
+            result.target_full_name.clone(),
+            PendingCheck {
+                asset_key: result.asset_key.clone(),
+                checks: vec![check.clone()],
+            },
+        )]);
+        let (gated, status) = gate_for(&pending, &pipeline.checks);
+        assert!(
+            gated,
+            "a column_match that compared nothing gates: {check:?}"
+        );
+        assert!(matches!(
+            status,
+            rocky_core::state::RunStatus::PartialFailure
+        ));
+        assert_eq!(
+            check.severity,
+            TestSeverity::Error,
+            "a check the engine could not evaluate keeps its own severity: {check:?}"
+        );
     }
 
     /// The other side of the same read. The source is probed after the copy
@@ -33770,8 +33890,8 @@ table = "fct_events"
         assert_eq!(
             result.not_evaluated.as_deref(),
             Some(
-                "source: the batch row count query returned no result for this table; \
-                 target: the batch row count query returned no result for this table"
+                "source: the batch row count query returned no readable count for this table; \
+                 target: the batch row count query returned no readable count for this table"
             ),
             "{result:?}"
         );
@@ -33998,6 +34118,50 @@ table = "fct_events"
         );
     }
 
+    /// #1871 regressed the row-count arm of the same invariant the null-rate
+    /// test above pins: a check the engine COULD NOT RUN is never advisory.
+    ///
+    /// `row_count_not_evaluated` chooses `TestSeverity::Error`. The site
+    /// overwrote it with the configured severity for BOTH arms, so
+    /// `severity = "warning"` downgraded a row-count query that failed and
+    /// the run exited 0 with `status: "Success"`. 1.73.0 always gated it.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_failed_row_count_query_gates_even_when_the_configured_severity_is_warning() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new("row_count = { enabled = true, severity = \"warning\" }");
+
+        let failing = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT COUNT(*) FROM tgt.orders",
+            reply: Intercept::Fail("injected row-count failure"),
+        };
+        let (pending, _) = fx.run(&failing, None, None).await;
+
+        let result = the_result(&pending, &fx.target_key(), "row_count");
+        assert!(
+            result.not_evaluated.is_some(),
+            "the row count must be unevaluated for this test to mean anything: {result:?}"
+        );
+        // The gate first: it is the user-visible consequence, so a regression
+        // prints the exit code it changed rather than a field.
+        let (gated, status) = run_status_for(&fx, &pending);
+        assert!(
+            gated,
+            "an unevaluated row count gates: {checks:?}",
+            checks = pending.get(&fx.target_key()).map(|p| &p.checks)
+        );
+        assert!(matches!(
+            status,
+            rocky_core::state::RunStatus::PartialFailure
+        ));
+        assert_eq!(
+            result.severity,
+            rocky_core::tests::TestSeverity::Error,
+            "a check the engine could not evaluate keeps its own severity: {result:?}"
+        );
+    }
+
     /// The other half, unchanged: a MEASURED column over the threshold still
     /// reports at the configured severity, and `severity = "warning"` still
     /// keeps it advisory. The fix narrows the clobber; it does not remove the
@@ -34064,7 +34228,7 @@ table = "fct_events"
         assert!(!result.passed, "{result:?}");
         assert_eq!(
             result.not_evaluated.as_deref(),
-            Some("the batch freshness query returned no result for this table"),
+            Some("the batch freshness query returned no readable timestamp for this table"),
             "{result:?}"
         );
     }
@@ -34215,7 +34379,13 @@ table = "fct_events"
     /// reported failure. (The row-count analogue — a leg that answers but
     /// leaves a table out — is pinned by
     /// `a_table_the_batch_row_count_left_out_is_not_evaluated`, whose reason
-    /// text says "returned no result", never "failed".)
+    /// text says "returned no readable count", never "failed".)
+    ///
+    /// `None` does NOT mean the table is empty. `MAX(ts)` is NULL over no
+    /// rows AND over rows whose `ts` is all NULL, and the query returns no
+    /// `COUNT(*)` to tell them apart. `None` also carries a missing cell, a
+    /// non-string cell and an unparseable string. Every one of those emits no
+    /// check (#1929).
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn a_batched_freshness_leg_that_answers_null_emits_no_check() {
@@ -35083,24 +35253,46 @@ value = "'{source}'"
         fx: &BatchedCheckFixture,
         pending: &HashMap<String, PendingCheck>,
     ) -> (bool, rocky_core::state::RunStatus) {
-        let mut out = crate::output::RunOutput::new(String::new(), 0, 1);
-        out.tables_copied = 1;
-        for (table, bag) in pending {
-            out.check_results.push(crate::output::TableCheckOutput {
-                asset_key: vec![table.clone()],
-                checks: bag.checks.clone(),
-            });
-        }
         // The FIXTURE's own checks config, which is what the runner reads at
         // `output.check_gate_failed = replication_check_gate_failed(&output,
         // &pipeline.checks)`. Reparsing a different config here would let this
-        // helper answer a question the runner never asks. `fail_on_error`
-        // defaults to `true`, so this is the default gate.
+        // helper answer a question the runner never asks.
+        gate_for(pending, &fx.pipeline.checks)
+    }
+
+    /// The same verdict for a check bag that did not come from
+    /// `BatchedCheckFixture` — `column_match` is produced per table, not in
+    /// the batch phase, so it has no fixture to hang off.
+    ///
+    /// Builds the bag the way run.rs:5741 builds it, field for field, so the
+    /// gate reads the shape production hands it. What is NOT re-proved here is
+    /// that `column_match` reaches `pending_checks` at all; that wire is
+    /// pinned by `a_retried_table_contributes_its_column_match_and_freshness`
+    /// and by the inline-drain test beside it.
+    #[cfg(feature = "duckdb")]
+    fn gate_for(
+        pending: &HashMap<String, PendingCheck>,
+        checks: &rocky_core::config::ChecksConfig,
+    ) -> (bool, rocky_core::state::RunStatus) {
+        // Every caller is asking about the DEFAULT gate, so a config with the
+        // gate switched off would make any of them pass for a reason it never
+        // states. `ChecksConfig` derives `Default`, which ignores
+        // `#[serde(default = "default_fail_on_error")]` — so a pipeline whose
+        // TOML omits `[checks]` entirely arrives here with `fail_on_error`
+        // FALSE, and this assertion is what says so out loud.
         assert!(
-            fx.pipeline.checks.fail_on_error,
-            "these tests are about the DEFAULT gate; fail_on_error must be on"
+            checks.fail_on_error,
+            "these tests are about the default gate; fail_on_error must be on"
         );
-        out.check_gate_failed = super::replication_check_gate_failed(&out, &fx.pipeline.checks);
+        let mut out = crate::output::RunOutput::new(String::new(), 0, 1);
+        out.tables_copied = 1;
+        for bag in pending.values() {
+            out.check_results.push(crate::output::TableCheckOutput {
+                asset_key: bag.asset_key.clone(),
+                checks: bag.checks.clone(),
+            });
+        }
+        out.check_gate_failed = super::replication_check_gate_failed(&out, checks);
         out.status = out.derive_run_status();
         (out.check_gate_failed, out.status)
     }

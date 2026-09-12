@@ -11,7 +11,8 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { DagOutput } from "@rocky-types/dag";
 import mixedDag from "../test/fixtures/dag-mixed-kinds.json";
-import { DagPanel } from "./DagPanel";
+import { DagPanel, floorFor, layoutIdentity } from "./DagPanel";
+import { NODE_HEIGHT, NODE_WIDTH } from "./layout";
 
 const CANVAS = { width: 800, height: 480 };
 
@@ -114,6 +115,18 @@ describe("DagPanel", () => {
     }
   });
 
+  it("draws the card at the size the layout declares", () => {
+    // Measured in a real browser before this: the wrapper was 184x46 and the
+    // card inside it 184x34, so the node carried a 12px invisible clickable
+    // band and its handles sat 6px below the card's visual centre. The layout
+    // declares this size to React Flow and spaces rows by it, so the card has
+    // to actually be it.
+    render(<DagPanel dag={captured} onSelect={vi.fn()} />);
+    const card = nodeElement(MODEL).firstElementChild as HTMLElement;
+    expect(card.style.width).toBe(`${NODE_WIDTH}px`);
+    expect(card.style.height).toBe(`${NODE_HEIGHT}px`);
+  });
+
   it("offers a pointer cursor only where there is something to open", () => {
     render(<DagPanel dag={captured} onSelect={vi.fn()} />);
     expect(nodeElement(MODEL).firstElementChild).toHaveClass("cursor-pointer");
@@ -151,5 +164,49 @@ describe("DagPanel", () => {
     render(<DagPanel dag={captured} onSelect={vi.fn()} />);
     const list = await screen.findByRole("list", { name: "Models in the DAG" });
     expect(list.querySelectorAll("li")).toHaveLength(captured.nodes.length);
+  });
+});
+
+describe("the zoom floor", () => {
+  // `minZoom` is the floor for a HAND on the canvas as well as for a fit, so
+  // lowering it to fit a phone let a person pinch a node to 9x2 pixels. But a
+  // fit below the floor is clamped back up by the next gesture: at 320px an
+  // eleven-layer graph already fits at 0.0965, and a 42-layer one at 0.0247,
+  // which snapped 5x and threw away most of what the fit had just framed.
+  // So the floor follows the fit down, and never up.
+  it("keeps its own floor for a graph that fits above it", () => {
+    expect(floorFor(0.39)).toBe(0.1);
+    expect(floorFor(0.1)).toBe(0.1);
+    expect(floorFor(1)).toBe(0.1);
+  });
+
+  it("follows a deep graph's fit below it, so the next gesture cannot snap", () => {
+    expect(floorFor(0.0965)).toBeCloseTo(0.0965, 6);
+    expect(floorFor(0.0247)).toBeCloseTo(0.0247, 6);
+  });
+});
+
+describe("the refit identity", () => {
+  const at = (id: string, x: number, y: number) =>
+    ({ id, position: { x, y } }) as Parameters<typeof layoutIdentity>[0][number];
+
+  it("changes when a node moves, even though the ids do not", () => {
+    // The case that would otherwise be missed: adding a `depends_on` between
+    // two models that already exist re-layers the graph and changes its span,
+    // with an identical id set. Keyed on ids alone, nothing would re-fit.
+    const before = layoutIdentity([at("a", 0, 0), at("b", 280, 0)]);
+    const after = layoutIdentity([at("a", 0, 0), at("b", 560, 0)]);
+    expect(after).not.toBe(before);
+  });
+
+  it("is stable when nothing about the layout changed", () => {
+    const nodes = [at("a", 0, 0), at("b", 280, 0)];
+    expect(layoutIdentity(nodes)).toBe(layoutIdentity([...nodes]));
+  });
+
+  it("changes when a node is added or removed", () => {
+    const two = layoutIdentity([at("a", 0, 0), at("b", 280, 0)]);
+    expect(layoutIdentity([at("a", 0, 0)])).not.toBe(two);
+    expect(layoutIdentity([at("a", 0, 0), at("b", 280, 0), at("c", 560, 0)])).not.toBe(two);
   });
 });

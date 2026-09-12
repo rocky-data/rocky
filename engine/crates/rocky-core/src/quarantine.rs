@@ -17,6 +17,7 @@ use std::collections::HashSet;
 
 use thiserror::Error;
 
+use rocky_sql::check_expression::ExpressionUse;
 use rocky_sql::validation::{self, ValidationError};
 
 use crate::config::{QualityAssertion, QuarantineConfig, QuarantineMode};
@@ -141,6 +142,16 @@ pub fn compile_quarantine_sql(
     let quarantine_table =
         dialect.format_table_ref(&table_ref.catalog, &table_ref.schema, &quarantine_name)?;
 
+    // Only `split` emits two statements (the quarantine CTAS and the valid
+    // CTAS below), so only `split` can have two evaluations of one predicate
+    // disagree. `drop` and `tag` emit exactly one statement each, where a
+    // clock function is as legitimate as it is in an ordinary check —
+    // refusing it there would be a false refusal that breaks working configs.
+    let expression_use = match config.mode {
+        QuarantineMode::Split => ExpressionUse::ReevaluatedPredicate,
+        QuarantineMode::Drop | QuarantineMode::Tag => ExpressionUse::SinglePredicate,
+    };
+
     let mut names: HashSet<String> = HashSet::new();
     let mut labeled: Vec<LabeledPredicate> = Vec::with_capacity(quarantinable.len());
     for assertion in &quarantinable {
@@ -150,8 +161,15 @@ pub fn compile_quarantine_sql(
             &assertion.test.column,
             &label,
             dialect,
+            expression_use,
         )?;
-        let valid_pred = wrap_filter(&assertion.test.filter, &base_pred, &label, dialect)?;
+        let valid_pred = wrap_filter(
+            &assertion.test.filter,
+            &base_pred,
+            &label,
+            dialect,
+            expression_use,
+        )?;
         labeled.push(LabeledPredicate { label, valid_pred });
     }
 
@@ -306,6 +324,7 @@ fn lower_valid_predicate(
     column: &Option<String>,
     label: &str,
     dialect: &dyn SqlDialect,
+    expression_use: ExpressionUse,
 ) -> Result<String, QuarantineError> {
     match test_type {
         TestType::NotNull => {
@@ -361,7 +380,7 @@ fn lower_valid_predicate(
                 // Spliced into the quarantine CTAS AND the valid-table CTAS
                 // that follows it, so two evaluations can disagree and put
                 // one row in both outputs.
-                rocky_sql::check_expression::ExpressionUse::ReevaluatedPredicate,
+                expression_use,
             )?;
             // Wrap in COALESCE so NULL expressions count as passing — matches
             // the existing `WHERE NOT (expression)` semantic.
@@ -456,6 +475,7 @@ fn wrap_filter(
     base_pred: &str,
     label: &str,
     dialect: &dyn SqlDialect,
+    expression_use: ExpressionUse,
 ) -> Result<String, QuarantineError> {
     match filter.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(f) => {
@@ -469,7 +489,7 @@ fn wrap_filter(
                 &context,
                 f,
                 sql_dialect.as_ref(),
-                rocky_sql::check_expression::ExpressionUse::ReevaluatedPredicate,
+                expression_use,
             )?;
             Ok(format!(
                 "(CASE WHEN ({f}) THEN ({base_pred}) ELSE TRUE END)"
@@ -840,6 +860,79 @@ mod unit_tests {
         let valid_sql = &plan.statements[1].sql;
         assert!(valid_sql.contains("customer_id IS NOT NULL AND"));
         assert!(valid_sql.contains("status IS NULL OR status IN ('pending')"));
+    }
+
+    /// A clock function is refused in `split` and ACCEPTED in `drop` and
+    /// `tag`.
+    ///
+    /// `split` emits two statements, so one predicate is evaluated twice and
+    /// a boundary row can be called invalid by the first and valid by the
+    /// second — landing in both outputs. `drop` and `tag` emit ONE statement
+    /// each, where the same expression is as legitimate as it is in an
+    /// ordinary check.
+    ///
+    /// The first version of this change refused all three modes. That was a
+    /// FALSE REFUSAL: it broke working `drop` and `tag` configs to close a
+    /// bug that only exists in `split`.
+    #[test]
+    fn a_clock_predicate_is_refused_only_in_split_mode() {
+        let volatile = vec![assertion(
+            None,
+            TestType::Expression {
+                expression: "created_at <= now()".to_string(),
+            },
+            None,
+            TestSeverity::Error,
+        )];
+
+        let split =
+            compile_quarantine_sql(&volatile, "orders", &table(), &TestDialect, &split_config());
+        assert!(
+            split.is_err(),
+            "split evaluates the predicate twice, so a clock function must be refused"
+        );
+
+        for mode in [QuarantineMode::Drop, QuarantineMode::Tag] {
+            let cfg = QuarantineConfig {
+                mode,
+                ..split_config()
+            };
+            compile_quarantine_sql(&volatile, "orders", &table(), &TestDialect, &cfg)
+                .unwrap_or_else(|e| {
+                    panic!("{mode:?} emits one statement; a clock function is legal there: {e:?}")
+                })
+                .expect("a quarantinable assertion produces a plan");
+        }
+    }
+
+    /// The same split, for a `filter` rather than the predicate body — the
+    /// filter reaches exactly as far and takes the same mode.
+    #[test]
+    fn a_clock_filter_is_refused_only_in_split_mode() {
+        let mut a = assertion(
+            None,
+            TestType::NotNull,
+            Some("customer_id"),
+            TestSeverity::Error,
+        );
+        a.test.filter = Some("created_at <= now()".to_string());
+        let volatile = vec![a];
+
+        assert!(
+            compile_quarantine_sql(&volatile, "orders", &table(), &TestDialect, &split_config())
+                .is_err(),
+            "a clock filter is re-evaluated in split mode too"
+        );
+
+        for mode in [QuarantineMode::Drop, QuarantineMode::Tag] {
+            let cfg = QuarantineConfig {
+                mode,
+                ..split_config()
+            };
+            compile_quarantine_sql(&volatile, "orders", &table(), &TestDialect, &cfg)
+                .unwrap_or_else(|e| panic!("{mode:?} must accept a clock filter: {e:?}"))
+                .expect("a quarantinable assertion produces a plan");
+        }
     }
 
     #[test]
@@ -1277,6 +1370,70 @@ mod unit_tests {
     /// name, so a test using both isolates the name as the only variable.
     struct SnowflakeNamed;
 
+    impl SqlDialect for SnowflakeNamed {
+        fn name(&self) -> &'static str {
+            "snowflake"
+        }
+        fn literal_escape(&self) -> crate::traits::LiteralEscape {
+            TestDialect.literal_escape()
+        }
+        fn format_table_ref(&self, c: &str, s: &str, t: &str) -> AdapterResult<String> {
+            TestDialect.format_table_ref(c, s, t)
+        }
+        fn create_table_as(&self, target: &str, select_sql: &str) -> String {
+            TestDialect.create_table_as(target, select_sql)
+        }
+        fn insert_into(&self, a: &str, b: &str) -> String {
+            TestDialect.insert_into(a, b)
+        }
+        fn merge_into(
+            &self,
+            a: &str,
+            b: &str,
+            c: &[std::sync::Arc<str>],
+            d: &ColumnSelection,
+        ) -> AdapterResult<String> {
+            TestDialect.merge_into(a, b, c, d)
+        }
+        fn select_clause(
+            &self,
+            a: &ColumnSelection,
+            b: &[MetadataColumn],
+        ) -> AdapterResult<String> {
+            TestDialect.select_clause(a, b)
+        }
+        fn watermark_where(
+            &self,
+            a: &str,
+            b: Option<&chrono::DateTime<chrono::Utc>>,
+        ) -> AdapterResult<String> {
+            TestDialect.watermark_where(a, b)
+        }
+        fn describe_table_sql(&self, t: &str) -> String {
+            TestDialect.describe_table_sql(t)
+        }
+        fn drop_table_sql(&self, t: &str) -> String {
+            TestDialect.drop_table_sql(t)
+        }
+        fn create_catalog_sql(&self, a: &str) -> Option<AdapterResult<String>> {
+            TestDialect.create_catalog_sql(a)
+        }
+        fn create_schema_sql(&self, a: &str, b: &str) -> Option<AdapterResult<String>> {
+            TestDialect.create_schema_sql(a, b)
+        }
+        fn tablesample_clause(&self, a: u32) -> Option<String> {
+            TestDialect.tablesample_clause(a)
+        }
+        fn insert_overwrite_partition(
+            &self,
+            a: &str,
+            b: &str,
+            c: &str,
+        ) -> AdapterResult<Vec<String>> {
+            TestDialect.insert_overwrite_partition(a, b, c)
+        }
+    }
+
     /// The call site really threads ITS dialect through to the parser.
     ///
     /// Every other test here uses `TestDialect`, which does not override
@@ -1293,69 +1450,6 @@ mod unit_tests {
     fn the_call_site_threads_its_own_dialect_to_the_parser() {
         // Everything but `name()` delegates to TestDialect, so the ONLY
         // difference between the two runs below is the dialect name.
-        impl SqlDialect for SnowflakeNamed {
-            fn name(&self) -> &'static str {
-                "snowflake"
-            }
-            fn literal_escape(&self) -> crate::traits::LiteralEscape {
-                TestDialect.literal_escape()
-            }
-            fn format_table_ref(&self, c: &str, s: &str, t: &str) -> AdapterResult<String> {
-                TestDialect.format_table_ref(c, s, t)
-            }
-            fn create_table_as(&self, target: &str, select_sql: &str) -> String {
-                TestDialect.create_table_as(target, select_sql)
-            }
-            fn insert_into(&self, a: &str, b: &str) -> String {
-                TestDialect.insert_into(a, b)
-            }
-            fn merge_into(
-                &self,
-                a: &str,
-                b: &str,
-                c: &[std::sync::Arc<str>],
-                d: &ColumnSelection,
-            ) -> AdapterResult<String> {
-                TestDialect.merge_into(a, b, c, d)
-            }
-            fn select_clause(
-                &self,
-                a: &ColumnSelection,
-                b: &[MetadataColumn],
-            ) -> AdapterResult<String> {
-                TestDialect.select_clause(a, b)
-            }
-            fn watermark_where(
-                &self,
-                a: &str,
-                b: Option<&chrono::DateTime<chrono::Utc>>,
-            ) -> AdapterResult<String> {
-                TestDialect.watermark_where(a, b)
-            }
-            fn describe_table_sql(&self, t: &str) -> String {
-                TestDialect.describe_table_sql(t)
-            }
-            fn drop_table_sql(&self, t: &str) -> String {
-                TestDialect.drop_table_sql(t)
-            }
-            fn create_catalog_sql(&self, a: &str) -> Option<AdapterResult<String>> {
-                TestDialect.create_catalog_sql(a)
-            }
-            fn create_schema_sql(&self, a: &str, b: &str) -> Option<AdapterResult<String>> {
-                TestDialect.create_schema_sql(a, b)
-            }
-            fn tablesample_clause(&self, a: u32) -> Option<String> {
-                TestDialect.tablesample_clause(a)
-            }
-            fn insert_overwrite_partition(
-                &self,
-                a: &str,
-                b: &str,
-                c: &str,
-            ) -> AdapterResult<Vec<String>> {
-                TestDialect.insert_overwrite_partition(a, b, c)
-            }
-        }
 
         let cfg = split_config();
         let assertions = || {

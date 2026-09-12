@@ -128,6 +128,20 @@ describe("layeredFlow", () => {
     expect(flow.nodes.filter((n) => !n.focusable).every((n) => n.selectable === false)).toBe(true);
   });
 
+  it("states each node's size, which is what the minimap needs", () => {
+    // React Flow skips a node whose dimensions it does not know
+    // (`nodeHasDimensions`), and it never learns them here: the graph is
+    // controlled with no `onNodesChange`, so a measurement has nowhere to be
+    // written back to. Measured before this: the minimap drew 0 of 3 nodes
+    // while its viewBox spanned the correct bounds.
+    const flow = layeredFlow(mixedDag as unknown as DagOutput);
+    expect(flow.nodes.length).toBeGreaterThan(0);
+    for (const node of flow.nodes) {
+      expect(node.width).toBe(NODE_WIDTH);
+      expect(node.height).toBe(NODE_HEIGHT);
+    }
+  });
+
   it("refuses a tab stop to a kind it cannot classify", () => {
     const flow = layeredFlow(
       dag({

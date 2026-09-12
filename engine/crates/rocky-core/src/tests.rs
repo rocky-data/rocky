@@ -813,6 +813,81 @@ mod unit_tests {
 
     // ----- TOML deserialization -----
 
+    struct SnowflakeNamed;
+    impl crate::traits::SqlDialect for SnowflakeNamed {
+        fn name(&self) -> &'static str {
+            "snowflake"
+        }
+        fn literal_escape(&self) -> crate::traits::LiteralEscape {
+            crate::traits::LiteralEscape::Standard
+        }
+        fn format_table_ref(
+            &self,
+            c: &str,
+            s: &str,
+            t: &str,
+        ) -> crate::traits::AdapterResult<String> {
+            rocky_sql::validation::format_table_ref(c, s, t)
+                .map_err(crate::traits::AdapterError::new)
+        }
+        fn create_table_as(&self, target: &str, select_sql: &str) -> String {
+            format!("CREATE OR REPLACE TABLE {target} AS\n{select_sql}")
+        }
+        fn insert_into(&self, _: &str, _: &str) -> String {
+            unimplemented!()
+        }
+        fn merge_into(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[std::sync::Arc<str>],
+            _: &rocky_ir::ColumnSelection,
+        ) -> crate::traits::AdapterResult<String> {
+            unimplemented!()
+        }
+        fn select_clause(
+            &self,
+            _: &rocky_ir::ColumnSelection,
+            _: &[rocky_ir::MetadataColumn],
+        ) -> crate::traits::AdapterResult<String> {
+            unimplemented!()
+        }
+        fn watermark_where(
+            &self,
+            _: &str,
+            _: Option<&chrono::DateTime<chrono::Utc>>,
+        ) -> crate::traits::AdapterResult<String> {
+            unimplemented!()
+        }
+        fn describe_table_sql(&self, t: &str) -> String {
+            format!("DESCRIBE TABLE {t}")
+        }
+        fn drop_table_sql(&self, t: &str) -> String {
+            format!("DROP TABLE IF EXISTS {t}")
+        }
+        fn create_catalog_sql(&self, _: &str) -> Option<crate::traits::AdapterResult<String>> {
+            None
+        }
+        fn create_schema_sql(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Option<crate::traits::AdapterResult<String>> {
+            None
+        }
+        fn tablesample_clause(&self, _: u32) -> Option<String> {
+            None
+        }
+        fn insert_overwrite_partition(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> crate::traits::AdapterResult<Vec<String>> {
+            unimplemented!()
+        }
+    }
+
     /// Both tests.rs routes really thread THEIR dialect.
     ///
     /// These two hold an `Option<&dyn SqlDialect>` and fall back to
@@ -822,81 +897,6 @@ mod unit_tests {
     /// operator, snowflake parses `->` as the lambda arrow and refuses it.
     #[test]
     fn the_tests_rs_routes_thread_their_own_dialect() {
-        struct SnowflakeNamed;
-        impl crate::traits::SqlDialect for SnowflakeNamed {
-            fn name(&self) -> &'static str {
-                "snowflake"
-            }
-            fn literal_escape(&self) -> crate::traits::LiteralEscape {
-                crate::traits::LiteralEscape::Standard
-            }
-            fn format_table_ref(
-                &self,
-                c: &str,
-                s: &str,
-                t: &str,
-            ) -> crate::traits::AdapterResult<String> {
-                rocky_sql::validation::format_table_ref(c, s, t)
-                    .map_err(crate::traits::AdapterError::new)
-            }
-            fn create_table_as(&self, target: &str, select_sql: &str) -> String {
-                format!("CREATE OR REPLACE TABLE {target} AS\n{select_sql}")
-            }
-            fn insert_into(&self, _: &str, _: &str) -> String {
-                unimplemented!()
-            }
-            fn merge_into(
-                &self,
-                _: &str,
-                _: &str,
-                _: &[std::sync::Arc<str>],
-                _: &rocky_ir::ColumnSelection,
-            ) -> crate::traits::AdapterResult<String> {
-                unimplemented!()
-            }
-            fn select_clause(
-                &self,
-                _: &rocky_ir::ColumnSelection,
-                _: &[rocky_ir::MetadataColumn],
-            ) -> crate::traits::AdapterResult<String> {
-                unimplemented!()
-            }
-            fn watermark_where(
-                &self,
-                _: &str,
-                _: Option<&chrono::DateTime<chrono::Utc>>,
-            ) -> crate::traits::AdapterResult<String> {
-                unimplemented!()
-            }
-            fn describe_table_sql(&self, t: &str) -> String {
-                format!("DESCRIBE TABLE {t}")
-            }
-            fn drop_table_sql(&self, t: &str) -> String {
-                format!("DROP TABLE IF EXISTS {t}")
-            }
-            fn create_catalog_sql(&self, _: &str) -> Option<crate::traits::AdapterResult<String>> {
-                None
-            }
-            fn create_schema_sql(
-                &self,
-                _: &str,
-                _: &str,
-            ) -> Option<crate::traits::AdapterResult<String>> {
-                None
-            }
-            fn tablesample_clause(&self, _: u32) -> Option<String> {
-                None
-            }
-            fn insert_overwrite_partition(
-                &self,
-                _: &str,
-                _: &str,
-                _: &str,
-            ) -> crate::traits::AdapterResult<Vec<String>> {
-                unimplemented!()
-            }
-        }
-
         // The checks `filter` route.
         let filtered = |f: &str| TestDecl {
             test_type: TestType::NotNull,

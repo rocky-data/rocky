@@ -182,41 +182,54 @@ pub async fn execute_batch_row_counts(
         let sql = generate_batch_row_count_sql(chunk)?;
         let query_result: QueryResult = connector.execute_sql(&sql).await?;
 
-        for row in &query_result.rows {
-            let catalog = row
-                .first()
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let schema = row
-                .get(1)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let table = row
-                .get(2)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let count = row
-                .get(3)
-                .and_then(|v| {
-                    v.as_str()
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .or_else(|| v.as_u64())
-                })
-                .unwrap_or(0);
-
-            results.push(RowCountResult {
-                catalog,
-                schema,
-                table,
-                count,
-            });
-        }
+        results.extend(parse_row_count_rows(&query_result.rows));
     }
 
     Ok(results)
+}
+
+/// Parse the `(catalog, schema, table, count)` rows of a batched row-count
+/// query. A row whose count cell does not read as a non-negative integer is
+/// OMITTED, so the caller reports the table as not evaluated rather than as a
+/// measured zero (#1926). The reason goes to the log: the trait returns only
+/// results (#1928).
+fn parse_row_count_rows(rows: &[Vec<serde_json::Value>]) -> Vec<RowCountResult> {
+    let mut results = Vec::with_capacity(rows.len());
+    for row in rows {
+        let catalog = row
+            .first()
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let schema = row
+            .get(1)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let table = row
+            .get(2)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let Some(count) = rocky_core::checks::cell_as_u64(row.get(3)) else {
+            // The reason lives in the log because the trait returns only
+            // results — `run.rs` sees the absence, not the cause (#1926).
+            tracing::warn!(
+                table = format!("{catalog}.{schema}.{table}"),
+                cell = ?row.get(3),
+                "row count cell was not a non-negative integer — reporting the table as not evaluated"
+            );
+            continue;
+        };
+
+        results.push(RowCountResult {
+            catalog,
+            schema,
+            table,
+            count,
+        });
+    }
+    results
 }
 
 /// Result of a batched freshness query.
@@ -294,10 +307,31 @@ pub async fn execute_batch_freshness(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let max_timestamp = row
-                .get(3)
-                .and_then(|v| v.as_str())
-                .map(std::string::ToString::to_string);
+            // A genuine SQL NULL keeps the row with `None` — an empty table
+            // has no freshness to measure. A missing or non-string cell is
+            // UNREADABLE and omits the row, so the caller reports the table
+            // not evaluated instead of reading `None` as "empty" (#1929).
+            let max_timestamp = match row.get(3) {
+                Some(v) if v.is_null() => None,
+                Some(v) => match v.as_str() {
+                    Some(s) => Some(s.to_string()),
+                    None => {
+                        tracing::warn!(
+                            table = format!("{catalog}.{schema}.{table}"),
+                            cell = ?v,
+                            "freshness timestamp cell was not a string — reporting the table as not evaluated"
+                        );
+                        continue;
+                    }
+                },
+                None => {
+                    tracing::warn!(
+                        table = format!("{catalog}.{schema}.{table}"),
+                        "freshness row carried no timestamp cell — reporting the table as not evaluated"
+                    );
+                    continue;
+                }
+            };
 
             results.push(FreshnessResult {
                 catalog,
@@ -314,6 +348,48 @@ pub async fn execute_batch_freshness(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1926. A count cell that does not read as a non-negative integer is
+    /// omitted, so `run.rs` reports the table not evaluated. It used to become
+    /// `count: 0`, indistinguishable from an empty table — and when BOTH sides
+    /// were unreadable, `0 == 0` passed a check that measured nothing.
+    #[test]
+    fn an_unreadable_count_cell_is_omitted_not_reported_as_zero() {
+        use serde_json::json;
+
+        let row = |count: serde_json::Value| vec![json!("cat"), json!("sch"), json!("tbl"), count];
+
+        for (label, cell) in [
+            ("null", json!(null)),
+            ("a non-numeric string", json!("n/a")),
+            ("a fraction", json!(5.5)),
+            ("an out-of-range float", json!(1e30)),
+            ("a bool", json!(true)),
+        ] {
+            let parsed = parse_row_count_rows(&[row(cell)]);
+            assert!(
+                parsed.is_empty(),
+                "{label}: an unreadable count must not become a measured row: {parsed:?}"
+            );
+        }
+
+        // A missing cell entirely.
+        let parsed = parse_row_count_rows(&[vec![json!("cat"), json!("sch"), json!("tbl")]]);
+        assert!(parsed.is_empty(), "missing cell: {parsed:?}");
+
+        // The shapes that ARE counts still parse, including a real zero.
+        for (label, cell, expected) in [
+            ("integer", json!(7), 7u64),
+            ("numeric string", json!("7"), 7),
+            ("integral float", json!(7.0), 7),
+            ("a real zero", json!(0), 0),
+        ] {
+            let parsed = parse_row_count_rows(&[row(cell)]);
+            assert_eq!(parsed.len(), 1, "{label}: {parsed:?}");
+            assert_eq!(parsed[0].count, expected, "{label}: {parsed:?}");
+            assert_eq!(parsed[0].table, "tbl", "{label}");
+        }
+    }
 
     #[test]
     fn test_single_table_row_count() {

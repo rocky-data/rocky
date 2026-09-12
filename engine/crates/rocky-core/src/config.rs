@@ -274,6 +274,18 @@ pub enum ConfigError {
     SchemaPatternReservedComponent { pipeline: String, component: String },
 
     #[error(
+        "pipeline '{pipeline}' {field} is {separator:?}, which is outside the allowed set \
+         [A-Za-z0-9_.-]. A separator is spliced into generated SQL between the parts of a \
+         multi-valued component, so it may not contain a character that ends a string literal \
+         or begins new SQL."
+    )]
+    UnsafeSeparator {
+        pipeline: String,
+        field: String,
+        separator: String,
+    },
+
+    #[error(
         "[adapter.{adapter}.cache] backend = \"{backend}\" requires `{field}` — set the field \
          under [adapter.{adapter}.cache] or change `backend`"
     )]
@@ -372,6 +384,19 @@ pub enum ConfigError {
          set it to 0 to disable anomaly detection"
     )]
     ChecksAnomalyThresholdNotFinite { pipeline: String, value: String },
+
+    /// A `metadata_columns[].value` is not one parseable SQL expression over
+    /// allowlisted scalar functions. The value is spliced raw into the
+    /// SELECT by each dialect's `select_clause` (#1874).
+    #[error(
+        "pipeline '{pipeline}': metadata_columns entry '{column}' has a value that cannot be \
+         used: {reason}"
+    )]
+    MetadataColumnValueRefused {
+        pipeline: String,
+        column: String,
+        reason: String,
+    },
 }
 
 /// Concurrency strategy for table processing.
@@ -3465,6 +3490,108 @@ pub fn validate_freeze_marker_writes(config: &RockyConfig) -> Vec<ConfigError> {
     errors
 }
 
+/// Check names the engine or the Dagster integration emits itself, which a
+/// user assertion or custom check may not take.
+///
+/// Dagster maps every character outside `[A-Za-z0-9_]` to `_`
+/// (`sanitize_check_name`), then keys results by
+/// `(asset_key, sanitized_name)`. On collision the FIRST spec wins and the
+/// later one is dropped with only a log line (`component.py::_add`), so the
+/// user-visible symptom is a check that silently vanishes rather than an
+/// error. Reserving these names is cheaper than detecting the collision
+/// after it has eaten a result.
+///
+/// Compared AFTER the same sanitization, so `quarantine:compile`,
+/// `quarantine_compile` and `quarantine.compile` are all refused — checking
+/// the raw string would miss the spellings that collide only once mapped.
+///
+/// Keep in step with the Dagster side; each entry names its source:
+///   - `contracts.py`     CONTRACT_REQUIRED_COLUMNS_CHECK and the two beside it
+///   - `component.py`     DEFAULT_CHECK_NAMES
+///   - `freshness.py`     FRESHNESS_CHECK_NAME
+///   - `observability.py` ANOMALY_CHECK_NAME, COMPLIANCE_CHECK_NAME
+///
+/// This covers the FIXED names only. Names that are synthesized from user
+/// input rather than written out — `null_rate:{column}`, an unnamed
+/// assertion's generated name, cross-source names — can still collide with
+/// each other. That needs a resolved per-table name set, tracked separately.
+const RESERVED_CHECK_NAMES: &[&str] = &[
+    // engine
+    "quarantine:compile",
+    // dagster contract checks
+    "contract_required_columns",
+    "contract_protected_columns",
+    "contract_column_constraints",
+    // dagster default checks
+    "row_count",
+    "column_match",
+    "freshness",
+    "row_count_anomaly",
+    // dagster compliance
+    "compliance_exception",
+];
+
+/// Every non-alphanumeric character mapped to `_` — the same shape
+/// `dagster_rocky.contracts.sanitize_check_name` produces. Case is
+/// PRESERVED, matching the Python side.
+fn sanitized_check_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+/// Refuse a `metadata_columns[].value` that is not one parseable SQL
+/// expression calling only allowlisted scalar functions.
+///
+/// The value is spliced raw into the SELECT by each dialect's
+/// `select_clause`, behind only a statement-terminator scan. Five dialects
+/// render it, and not identically — Snowflake uses `value::TYPE` where the
+/// others use `CAST(value AS TYPE)`.
+///
+/// Checked here, at config load, rather than at the three splice sites:
+/// `rocky-ir` has no dialect, so the check cannot live with the
+/// `MetadataColumn` constructor, and three dialect-side copies would drift.
+///
+/// The dialect is the one for the pipeline's TARGET adapter, since that is
+/// the warehouse the expression is sent to. An adapter this config does not
+/// declare is skipped — `validate_adapter_kinds` reports that — and an
+/// adapter type with no specific dialect falls back to generic.
+pub fn validate_metadata_columns(config: &RockyConfig) -> Vec<ConfigError> {
+    let mut errors = Vec::new();
+    for (pipeline_name, pipeline) in &config.pipelines {
+        let PipelineConfig::Replication(replication) = pipeline else {
+            continue;
+        };
+        if replication.metadata_columns.is_empty() {
+            continue;
+        }
+        let adapter_type = config
+            .adapters
+            .get(&replication.target.adapter)
+            .map_or("generic", |a| a.adapter_type.as_str());
+        let dialect = rocky_sql::check_expression::dialect_for(adapter_type);
+        for mc in &replication.metadata_columns {
+            if let Err(e) = rocky_sql::check_expression::validate_check_expression(
+                "metadata_columns[].value",
+                &mc.value,
+                dialect.as_ref(),
+                // A value projected into the SELECT list, rendered once per
+                // statement. Volatile is the ordinary case here —
+                // `_loaded_at = current_timestamp()` is the reason metadata
+                // columns exist.
+                rocky_sql::check_expression::ExpressionUse::ScalarProjection,
+            ) {
+                errors.push(ConfigError::MetadataColumnValueRefused {
+                    pipeline: pipeline_name.clone(),
+                    column: mc.name.clone(),
+                    reason: e.to_string(),
+                });
+            }
+        }
+    }
+    errors
+}
+
 /// Every pipeline's `checks.anomaly_threshold_pct` must be a finite number
 /// (#1816). TOML parses `nan`, `inf` and `-inf` into an `f64` without
 /// complaint, and `detect_anomaly` cannot compare against any of them: NaN
@@ -3472,28 +3599,6 @@ pub fn validate_freeze_marker_writes(config: &RockyConfig) -> Vec<ConfigError> {
 /// with detection silently off; `inf` is never exceeded. Rejected here, at
 /// load, so the run never starts with detection off by accident. Zero and
 /// negative values are the documented off switch and stay accepted.
-/// `CheckResult.name`s the engine emits itself, which a user assertion may
-/// not take.
-///
-/// Dagster maps every character outside `[A-Za-z0-9_]` to `_`
-/// (`sanitize_check_name`), then keys results by
-/// `(asset_key, sanitized_name)` with no dedup — so two results that sanitize
-/// alike are one check, and one of them is lost. Reserving the engine's own
-/// names is cheaper than detecting the collision after it has eaten a result.
-///
-/// Compared AFTER the same sanitization, so `quarantine:compile`,
-/// `quarantine_compile` and `quarantine.compile` are all refused — checking
-/// the raw string would miss the spellings that collide only once mapped.
-const RESERVED_CHECK_NAMES: &[&str] = &["quarantine:compile"];
-
-/// Lowercase, with every non-alphanumeric character mapped to `_` — the same
-/// shape `dagster_rocky.contracts.sanitize_check_name` produces.
-fn sanitized_check_name(name: &str) -> String {
-    name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
-}
-
 pub fn validate_checks(config: &RockyConfig) -> Vec<ConfigError> {
     let mut errors = Vec::new();
     for (name, pipeline) in &config.pipelines {
@@ -6323,6 +6428,66 @@ pub fn validate_schema_pattern_reserved_components(config: &RockyConfig) -> Vec<
     errors
 }
 
+/// Refuse a separator outside `[A-Za-z0-9_.-]` (#1934).
+///
+/// A separator joins the parts of a multi-valued component, and the joined
+/// text is spliced into generated SQL. Three config fields reach that splice:
+///
+/// ```text
+/// source.schema_pattern.separator   the default
+/// target.separator                  overrides it for the target templates
+/// {name:SEP} inside a template      overrides both, for that placeholder
+/// ```
+///
+/// [`crate::schema::separator_is_safe`] is the rule; this only finds the
+/// strings. The same rule runs again at the splice, because a config built in
+/// code never passes through here.
+pub fn validate_separators(config: &RockyConfig) -> Vec<ConfigError> {
+    let mut errors = Vec::new();
+    for (pipeline_name, pipeline) in &config.pipelines {
+        let PipelineConfig::Replication(replication) = pipeline else {
+            continue;
+        };
+        let mut check = |field: &str, separator: &str| {
+            if !crate::schema::separator_is_safe(separator) {
+                errors.push(ConfigError::UnsafeSeparator {
+                    pipeline: pipeline_name.clone(),
+                    field: field.to_string(),
+                    separator: separator.to_string(),
+                });
+            }
+        };
+        check(
+            "source.schema_pattern.separator",
+            &replication.source.schema_pattern.separator,
+        );
+        if let Some(sep) = &replication.target.separator {
+            check("target.separator", sep);
+        }
+        let templates = [
+            (
+                "target.catalog_template",
+                &replication.target.catalog_template,
+            ),
+            (
+                "target.schema_template",
+                &replication.target.schema_template,
+            ),
+        ];
+        for (field, template) in templates {
+            for sep in crate::schema::inline_separators(template) {
+                check(field, &sep);
+            }
+        }
+        for mc in &replication.metadata_columns {
+            for sep in crate::schema::inline_separators(&mc.value) {
+                check("metadata_columns[].value", &sep);
+            }
+        }
+    }
+    errors
+}
+
 /// Does this adapter actively serve `role`?
 ///
 /// An adapter block actively serves a role when:
@@ -6814,12 +6979,14 @@ const CONFIG_VALIDATORS: &[ConfigValidator] = &[
     validate_adapter_kinds,
     validate_replication_strategies,
     validate_schema_pattern_reserved_components,
+    validate_separators,
     validate_replication_overrides,
     validate_fivetran_cache,
     validate_fivetran_resilience,
     validate_policy,
     validate_freeze_marker_writes,
     validate_checks,
+    validate_metadata_columns,
 ];
 
 /// The fail-fast validation chain shared by [`load_rocky_config`] and
@@ -8619,6 +8786,59 @@ column = "id"
         }
     }
 
+    /// Every name Dagster owns is refused, not just the engine's own.
+    ///
+    /// The first version reserved `quarantine:compile` alone. Dagster also
+    /// pre-declares contract, default and compliance check specs, and its
+    /// first-wins dedup drops the LATER spec with only a log line — so a user
+    /// check colliding with one of those vanishes rather than erroring.
+    ///
+    /// `contract.required-columns` is the shape that motivated this: it is a
+    /// plausible thing to call a check, and it sanitizes onto Dagster's
+    /// `contract_required_columns`.
+    #[test]
+    fn a_name_dagster_owns_is_refused_on_an_assertion() {
+        for spelling in [
+            "contract.required-columns",
+            "contract_protected_columns",
+            "contract:column:constraints",
+            "row_count",
+            "column_match",
+            "freshness",
+            "row_count_anomaly",
+            "compliance_exception",
+        ] {
+            let cfg = parse(&format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.dq]
+type = "quality"
+
+[pipeline.dq.target]
+adapter = "default"
+
+[[pipeline.dq.checks.assertions]]
+table = "orders"
+name = "{spelling}"
+type = "not_null"
+column = "id"
+"#
+            ));
+            let errors = validate_checks(&cfg);
+            assert!(
+                errors.iter().any(|e| matches!(
+                    e,
+                    ConfigError::ReservedAssertionName { name, .. } if name == spelling
+                )),
+                "{spelling} collides with a dagster-owned check name and must be refused: \
+                 {errors:?}"
+            );
+        }
+    }
+
     /// A CUSTOM check carries a user name too, and the first version of the
     /// guard walked assertions alone — leaving the collision it exists to
     /// stop reachable through the other door.
@@ -10235,6 +10455,167 @@ severity = "warning"
         assert_eq!(
             q.checks.row_count.severity(),
             crate::tests::TestSeverity::Warning
+        );
+    }
+
+    /// All three separator sources are refused at config load, so `rocky
+    /// validate` names the field instead of the operator finding out mid-run
+    /// (#1934).
+    #[test]
+    fn a_separator_outside_the_allowed_set_is_refused_at_config_load() {
+        let cfg =
+            |sep: &str, target_sep: &str, schema_template: &str, value: &str| -> RockyConfig {
+                let toml_str = format!(
+                    r#"
+[adapter.default]
+type = "duckdb"
+path = "/tmp/x.duckdb"
+
+[pipeline.bronze]
+type = "replication"
+metadata_columns = [
+    {{ name = "_regions", type = "VARCHAR", value = "{value}" }}
+]
+
+[pipeline.bronze.source]
+catalog = "raw_catalog"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "{sep}"
+components = ["tenant", "regions...", "source"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "{schema_template}"
+separator = "{target_sep}"
+"#
+                );
+                toml::from_str(&toml_str).expect("the fixture must parse")
+            };
+
+        // Controls: the separators this repo and its docs actually use.
+        for sep in ["__", "_", "-", "."] {
+            let errors = validate_separators(&cfg(sep, sep, "raw__{regions}", "'{regions}'"));
+            assert!(errors.is_empty(), "{sep:?} must be accepted: {errors:?}");
+        }
+
+        // Source 1: the pattern separator.
+        let errors = validate_separators(&cfg("'", "__", "raw__{regions}", "'{regions}'"));
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ConfigError::UnsafeSeparator { field, separator, .. }]
+                    if field == "source.schema_pattern.separator" && separator == "'"
+            ),
+            "got {errors:?}"
+        );
+
+        // Source 2: the target separator.
+        let errors = validate_separators(&cfg("__", " | ", "raw__{regions}", "'{regions}'"));
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ConfigError::UnsafeSeparator { field, separator, .. }]
+                    if field == "target.separator" && separator == " | "
+            ),
+            "got {errors:?}"
+        );
+
+        // Source 3: an inline pin, in each template that can carry one.
+        let errors = validate_separators(&cfg("__", "__", "raw__{regions:'}", "'{regions}'"));
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ConfigError::UnsafeSeparator { field, .. }] if field == "target.schema_template"
+            ),
+            "got {errors:?}"
+        );
+        let errors = validate_separators(&cfg("__", "__", "raw__{regions}", "'{regions: }'"));
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ConfigError::UnsafeSeparator { field, separator, .. }]
+                    if field == "metadata_columns[].value" && separator == " "
+            ),
+            "got {errors:?}"
+        );
+
+        // The registry runs it, so a bad separator fails the LOAD.
+        assert!(
+            CONFIG_VALIDATORS
+                .iter()
+                .any(|v| !v(&cfg("'", "__", "raw__{regions}", "'{regions}'")).is_empty()),
+            "validate_separators must be registered in CONFIG_VALIDATORS"
+        );
+    }
+
+    /// A `metadata_columns[].value` is spliced raw into `CAST(... AS ...)`.
+    /// Only a parseable expression over allowlisted scalar functions is
+    /// accepted (#1874).
+    #[test]
+    fn a_metadata_column_value_off_the_function_allowlist_is_refused() {
+        let cfg_with = |value: &str| -> RockyConfig {
+            let toml_str = format!(
+                r#"
+[adapter.default]
+type = "duckdb"
+path = "/tmp/x.duckdb"
+
+[pipeline.bronze]
+type = "replication"
+metadata_columns = [
+    {{ name = "_loaded_by", type = "VARCHAR", value = "{value}" }}
+]
+
+[pipeline.bronze.source]
+catalog = "raw_catalog"
+
+[pipeline.bronze.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.bronze.target]
+catalog_template = "wh"
+schema_template = "raw__{{source}}"
+"#
+            );
+            toml::from_str(&toml_str).expect("the fixture must parse")
+        };
+
+        // Values an operator legitimately writes, including a template whose
+        // placeholder is resolved later from schema identifiers.
+        for ok in [
+            "NULL",
+            "'rocky'",
+            "CURRENT_TIMESTAMP",
+            "current_timestamp()",
+            "'{source}'",
+        ] {
+            let errors = validate_metadata_columns(&cfg_with(ok));
+            assert!(errors.is_empty(), "{ok} must be accepted: {errors:?}");
+        }
+
+        // An off-allowlist function. The name is ordinary on purpose: the rule
+        // is "not on the allowlist", not "looks dangerous".
+        let errors = validate_metadata_columns(&cfg_with("my_udf(1)"));
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ConfigError::MetadataColumnValueRefused { pipeline, column, .. }]
+                    if pipeline == "bronze" && column == "_loaded_by"
+            ),
+            "got {errors:?}"
+        );
+
+        // The registry runs it, so a bad value fails the LOAD, not just this
+        // function. That is the wire the fix depends on.
+        assert!(
+            CONFIG_VALIDATORS
+                .iter()
+                .any(|v| !v(&cfg_with("my_udf(1)")).is_empty()),
+            "validate_metadata_columns must be registered in CONFIG_VALIDATORS"
         );
     }
 
