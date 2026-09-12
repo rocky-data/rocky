@@ -2484,16 +2484,37 @@ pub(crate) fn scrub_job_outcome(
         // and dropped entirely if it would carry a value. Storing nothing is
         // always available and cannot leak, which is what makes this
         // terminate (#1897).
-        let marker = withheld();
-        let marker_safe = serde_json::to_string(&marker)
-            .ok()
-            .is_some_and(|t| !crate::secret_filter::any_value_survives(&t));
-        const NOTE: &str = "withheld: a resolved value survived redaction";
-        return (
-            marker_safe.then_some(marker),
-            (!crate::secret_filter::any_value_survives(NOTE)).then(|| NOTE.to_string()),
-            rocky_core::state::CURRENT_REDACTION_VERSION,
+        let safe = |v: &serde_json::Value| {
+            serde_json::to_string(v)
+                .ok()
+                .is_some_and(|t| !crate::secret_filter::any_value_survives(&t))
+        };
+
+        // Prefer the descriptive marker. If its own text is registered, fall
+        // back to one that CANNOT be: every token here is shorter than
+        // `SECRET_LENGTH_FLOOR`, and the registry refuses to record anything
+        // below that, so no operator value can appear inside it. The reader
+        // therefore always gets a positive signal — never a bare `null`,
+        // which is indistinguishable from a run that produced nothing.
+        const _: () = assert!(
+            rocky_core::secret_registry::SECRET_LENGTH_FLOOR > 5,
+            "the short marker's tokens must be below the floor to be unregisterable"
         );
+        let short = serde_json::json!({ "held": true });
+        let marker = withheld();
+        let result = if safe(&marker) {
+            Some(marker)
+        } else {
+            Some(short)
+        };
+
+        const NOTE: &str = "withheld: a resolved value survived redaction";
+        let error = if crate::secret_filter::any_value_survives(NOTE) {
+            Some("held".to_string())
+        } else {
+            Some(NOTE.to_string())
+        };
+        return (result, error, rocky_core::state::CURRENT_REDACTION_VERSION);
     }
 
     (result, error, rocky_core::state::CURRENT_REDACTION_VERSION)
@@ -3205,12 +3226,17 @@ mod tests {
         let child = serde_json::json!({ "duration_ms": 1029384756u64 });
         let (result, error, _) = scrub_job_outcome(Some(child), None);
 
-        // The marker's own text is registered, so the marker cannot be used
-        // either — the withhold path must terminate in storing NOTHING.
-        assert!(
-            result.is_none(),
-            "when even the fallback marker would carry a value, nothing may be stored"
+        // The marker's own text is registered, so the descriptive marker
+        // cannot be used — but the reader still gets a POSITIVE signal, not a
+        // bare null. The short fallback's tokens are below
+        // SECRET_LENGTH_FLOOR, so the registry cannot hold them.
+        let result = result.expect("a withheld result is still a signal, never null");
+        assert_eq!(
+            result,
+            serde_json::json!({ "held": true }),
+            "when the descriptive marker is unusable, the unregisterable one is used"
         );
+        let result = Some(result);
         let stored = serde_json::to_string(&(result, error)).expect("serializes");
         assert!(
             !crate::secret_filter::any_value_survives(&stored),
