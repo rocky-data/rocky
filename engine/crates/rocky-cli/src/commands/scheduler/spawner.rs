@@ -63,6 +63,99 @@ impl JobsModelSpawner {
     }
 }
 
+/// Apply a finished run's outcome to its job record.
+///
+/// Pure, and extracted for the same reason [`crate::api::scrub_job_outcome`]
+/// is: `run` delegates to a concrete `SubprocessSpawner` which spawns
+/// `current_exe` — the test harness under `cargo test` — so nothing inside
+/// `run` can be reached by a unit test. Without a seam, the fact that THIS
+/// writer stamps `redaction_version` would rest on my having noticed it,
+/// which is how it came to be missing in the first place.
+///
+/// The stamp matters more here than the scrub. An unstamped record reads as
+/// pre-redaction forever, so `GET /api/v1/jobs/{id}` withholds its error on
+/// every scheduler-launched run — a silent loss of diagnostics that looks
+/// exactly like the legacy rule working as designed.
+fn finish_scheduler_job(mut record: PersistedJob, exit_code: i32) -> PersistedJob {
+    // Binary success/failure for the job model; the precise outcome
+    // (partial exit 2 vs failure) lives on the run-history record.
+    let (state, error) = if exit_code == 0 {
+        (JobState::Succeeded, None)
+    } else {
+        (
+            JobState::Failed,
+            Some(format!("run exited with code {exit_code}")),
+        )
+    };
+    record.state = job_state_str(state).to_string();
+    record.finished_at = Some(chrono::Utc::now().to_rfc3339());
+    // Through the same seam as the API's spawn path. This message is a fixed
+    // template with an exit code, so nothing can be in it today — routed
+    // anyway, because "this particular string is safe" is an argument that
+    // stops being true when someone edits the string.
+    let (_, error, version) = crate::api::scrub_job_outcome(None, error);
+    record.error = error;
+    record.redaction_version = Some(version);
+    record
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn running_record() -> PersistedJob {
+        PersistedJob {
+            job_id: "sched-1".to_string(),
+            kind: "run".to_string(),
+            state: job_state_str(JobState::Running).to_string(),
+            submitted_at: "2026-09-12T00:00:00Z".to_string(),
+            started_at: Some("2026-09-12T00:00:00Z".to_string()),
+            finished_at: None,
+            principal: Some(SCHEDULER_PRINCIPAL.to_string()),
+            error: None,
+            result: None,
+            redaction_version: Some(rocky_core::state::CURRENT_REDACTION_VERSION),
+        }
+    }
+
+    /// #1897. The writer nobody was looking for stamps its records.
+    ///
+    /// Requested by a reviewer, and the distinction is the point: the API
+    /// tests prove the READER honours a stamp on a record built by hand. They
+    /// say nothing about whether THIS writer applies one. Unstamped, every
+    /// scheduler-launched job would report as pre-redaction forever.
+    #[test]
+    fn a_failed_scheduler_job_is_stamped_and_returns_its_error() {
+        let done = finish_scheduler_job(running_record(), 1);
+
+        assert_eq!(
+            done.redaction_version,
+            Some(rocky_core::state::CURRENT_REDACTION_VERSION),
+            "an unstamped record reads as pre-redaction forever"
+        );
+        assert!(
+            !done.redaction_is_legacy(),
+            "a record this binary just wrote must not read as legacy"
+        );
+        assert_eq!(
+            done.error.as_deref(),
+            Some("run exited with code 1"),
+            "the error must survive the scrub — it carries no config value"
+        );
+        assert_eq!(done.state, "failed");
+    }
+
+    /// A clean run stamps too. The stamp is not conditional on there being
+    /// an error to protect.
+    #[test]
+    fn a_succeeding_scheduler_job_is_stamped_as_well() {
+        let done = finish_scheduler_job(running_record(), 0);
+        assert!(!done.redaction_is_legacy());
+        assert_eq!(done.error, None);
+        assert_eq!(done.state, "succeeded");
+    }
+}
+
 #[async_trait]
 impl Spawner for JobsModelSpawner {
     async fn run(&self, request: &SpawnRequest) -> RunOutcome {
@@ -92,25 +185,7 @@ impl Spawner for JobsModelSpawner {
 
         let outcome = self.inner.run(request).await;
 
-        // Binary success/failure for the job model; the precise outcome
-        // (partial exit 2 vs failure) lives on the run-history record.
-        let (state, error) = if outcome.exit_code == 0 {
-            (JobState::Succeeded, None)
-        } else {
-            (
-                JobState::Failed,
-                Some(format!("run exited with code {}", outcome.exit_code)),
-            )
-        };
-        record.state = job_state_str(state).to_string();
-        record.finished_at = Some(chrono::Utc::now().to_rfc3339());
-        // Through the same seam as the API's spawn path. This message is a
-        // fixed template with an exit code, so nothing can be in it today —
-        // routed anyway, because "this particular string is safe" is an
-        // argument that stops being true when someone edits the string.
-        let (_, error, version) = crate::api::scrub_job_outcome(None, error);
-        record.error = error;
-        record.redaction_version = Some(version);
+        record = finish_scheduler_job(record, outcome.exit_code);
         self.record(record).await;
 
         outcome

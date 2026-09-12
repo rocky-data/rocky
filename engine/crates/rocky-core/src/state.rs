@@ -13783,6 +13783,67 @@ mod tests {
     // JOBS table (v14 — `rocky serve` HTTP job model)
     // -----------------------------------------------------------------------
 
+    /// #1897. No PRODUCTION `PersistedJob` construction may use struct-update
+    /// syntax.
+    ///
+    /// `redaction_version` is deliberately non-optional in the literal, so the
+    /// compiler names every writer that must stamp it. That found six here
+    /// where one was known — including `scheduler/spawner.rs`, whose omission
+    /// would have made every scheduler-launched job report as pre-redaction
+    /// forever.
+    ///
+    /// **The technique has one blind spot.** A writer spelled
+    /// `PersistedJob { job_id, ..Default::default() }` compiles untouched,
+    /// stamps nothing, and is invisible to it. There were none when this
+    /// landed — and this PR's own tests use `..base.clone()`, which is the
+    /// correct way to write those and demonstrates the shape sitting three
+    /// lines from anyone adding a writer.
+    ///
+    /// So the property is enforced rather than described. Tests are exempt:
+    /// the `#[cfg(test)]` boundary is found by scanning, not assumed by line
+    /// number, because matched lines landing in test code is a mistake this
+    /// repository has made before.
+    ///
+    /// Pins one type. A second record with the same shape gets no protection
+    /// from this; the durable fix is a constructor that stamps, with the
+    /// literal reserved for tests.
+    #[test]
+    fn no_production_job_writer_dodges_the_compiler_catch() {
+        const SOURCES: &[(&str, &str)] = &[
+            ("state.rs", include_str!("state.rs")),
+            ("state_sync.rs", include_str!("state_sync.rs")),
+        ];
+
+        for (name, source) in SOURCES {
+            // Everything from the first `#[cfg(test)]` at column 0 onward is
+            // test code and exempt.
+            let production = match source.find("\n#[cfg(test)]") {
+                Some(at) => &source[..at],
+                None => source,
+            };
+
+            let mut offenders = Vec::new();
+            for (i, _) in production.match_indices("PersistedJob {") {
+                // The construction ends at its closing brace; `..` inside that
+                // span is struct-update syntax.
+                let rest = &production[i..];
+                let end = rest.find("\n        }").unwrap_or(rest.len().min(2000));
+                let body = &rest[..end];
+                if body.contains("..") {
+                    let line = production[..i].matches('\n').count() + 1;
+                    offenders.push(format!("{name}:{line}"));
+                }
+            }
+            assert!(
+                offenders.is_empty(),
+                "these production `PersistedJob` constructions use struct-update \
+                 syntax, so the compiler will NOT require them to stamp \
+                 `redaction_version`, and an unstamped record reads as \
+                 pre-redaction forever: {offenders:?}"
+            );
+        }
+    }
+
     fn sample_job(id: &str, state: &str) -> PersistedJob {
         PersistedJob {
             job_id: id.to_string(),
