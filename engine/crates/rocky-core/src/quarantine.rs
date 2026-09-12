@@ -319,6 +319,39 @@ fn synthesize_label(test_type: &TestType, column: Option<&str>) -> String {
 ///
 /// The returned predicate is total — it evaluates to `TRUE` or `FALSE`,
 /// never NULL — so the top-level `AND` and `NOT` cannot propagate NULL.
+/// Refuse an assertion kind whose GENERATED predicate reads a clock, in the
+/// one mode where the predicate is evaluated twice.
+///
+/// `not_in_future` lowers to `col <= <current_timestamp>` and
+/// `older_than_n_days` to a `<current_date>` comparison. Neither passes
+/// through [`rocky_sql::check_expression::validate_check_expression`],
+/// because that gate is for user-written fragments — so the engine was
+/// refusing a user's `created_at <= now()` in split mode while generating
+/// the same predicate itself for `not_in_future`.
+///
+/// In split the predicate is spliced into the quarantine CTAS and again into
+/// the valid CTAS. A row whose timestamp falls between the two executions is
+/// invalid in the first and valid in the second, landing in BOTH outputs —
+/// `older_than_n_days` has the equivalent midnight boundary.
+///
+/// `drop` and `tag` emit one statement, so both kinds stay available there.
+/// That is the whole point of refusing on the MODE rather than on the kind.
+fn reject_generated_clock_in_split(
+    expression_use: ExpressionUse,
+    label: &str,
+    kind: &str,
+) -> Result<(), QuarantineError> {
+    if matches!(expression_use, ExpressionUse::ReevaluatedPredicate) {
+        return Err(QuarantineError::Validation(
+            ValidationError::ExpressionFunctionNotAllowed {
+                context: format!("quarantine assertion '{label}' ({kind}) with mode = \"split\""),
+                function: "the generated clock comparison".to_string(),
+            },
+        ));
+    }
+    Ok(())
+}
+
 fn lower_valid_predicate(
     test_type: &TestType,
     column: &Option<String>,
@@ -420,6 +453,7 @@ fn lower_valid_predicate(
         TestType::NotInFuture => {
             let col = required_column(column, label)?;
             validation::validate_identifier(col)?;
+            reject_generated_clock_in_split(expression_use, label, "not_in_future")?;
             let now = dialect.current_timestamp_expr();
             // NULL-permissive: (col IS NULL OR col <= <now>)
             Ok(format!("({col} IS NULL OR {col} <= {now})"))
@@ -427,6 +461,7 @@ fn lower_valid_predicate(
         TestType::OlderThanNDays { days } => {
             let col = required_column(column, label)?;
             validation::validate_identifier(col)?;
+            reject_generated_clock_in_split(expression_use, label, "older_than_n_days")?;
             if *days == 0 {
                 return Err(QuarantineError::InvalidInRangeBound { value: "0".into() });
             }
@@ -901,6 +936,77 @@ mod unit_tests {
                 .unwrap_or_else(|e| {
                     panic!("{mode:?} emits one statement; a clock function is legal there: {e:?}")
                 })
+                .expect("a quarantinable assertion produces a plan");
+        }
+    }
+
+    /// The engine's OWN generated clock predicates take the same rule.
+    ///
+    /// `not_in_future` lowers to `col <= <current_timestamp>` and
+    /// `older_than_n_days` to a `<current_date>` comparison, neither of which
+    /// passes through the expression validator — that gate only sees
+    /// user-written fragments. So split mode was refusing a user's
+    /// `created_at <= now()` while generating the identical predicate itself.
+    #[test]
+    fn a_generated_clock_predicate_is_refused_only_in_split_mode() {
+        for test_type in [TestType::NotInFuture, TestType::OlderThanNDays { days: 7 }] {
+            let assertions = vec![assertion(
+                None,
+                test_type.clone(),
+                Some("created_at"),
+                TestSeverity::Error,
+            )];
+
+            assert!(
+                compile_quarantine_sql(
+                    &assertions,
+                    "orders",
+                    &table(),
+                    &TestDialect,
+                    &split_config()
+                )
+                .is_err(),
+                "{test_type:?} reads a clock and split evaluates it twice"
+            );
+
+            for mode in [QuarantineMode::Drop, QuarantineMode::Tag] {
+                let cfg = QuarantineConfig {
+                    mode,
+                    ..split_config()
+                };
+                compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+                    .unwrap_or_else(|e| {
+                        panic!("{mode:?} emits one statement, so {test_type:?} is legal: {e:?}")
+                    })
+                    .expect("a quarantinable assertion produces a plan");
+            }
+        }
+    }
+
+    /// Control: a kind with no clock in its generated predicate is accepted
+    /// in every mode, including split.
+    ///
+    /// Without this, a validator that refused every assertion in split would
+    /// pass the test above.
+    #[test]
+    fn a_clockless_generated_predicate_is_accepted_in_every_mode() {
+        let assertions = vec![assertion(
+            None,
+            TestType::NotNull,
+            Some("customer_id"),
+            TestSeverity::Error,
+        )];
+        for mode in [
+            QuarantineMode::Split,
+            QuarantineMode::Drop,
+            QuarantineMode::Tag,
+        ] {
+            let cfg = QuarantineConfig {
+                mode,
+                ..split_config()
+            };
+            compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+                .unwrap_or_else(|e| panic!("not_null reads no clock; {mode:?} must accept: {e:?}"))
                 .expect("a quarantinable assertion produces a plan");
         }
     }

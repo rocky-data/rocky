@@ -3490,46 +3490,51 @@ pub fn validate_freeze_marker_writes(config: &RockyConfig) -> Vec<ConfigError> {
     errors
 }
 
-/// Check names the engine or the Dagster integration emits itself, which a
-/// user assertion or custom check may not take.
+/// Check names that are ALWAYS taken, which a user assertion or custom check
+/// may not use.
 ///
 /// Dagster maps every character outside `[A-Za-z0-9_]` to `_`
 /// (`sanitize_check_name`), then keys results by
 /// `(asset_key, sanitized_name)`. On collision the FIRST spec wins and the
 /// later one is dropped with only a log line (`component.py::_add`), so the
 /// user-visible symptom is a check that silently vanishes rather than an
-/// error. Reserving these names is cheaper than detecting the collision
-/// after it has eaten a result.
+/// error.
 ///
 /// Compared AFTER the same sanitization, so `quarantine:compile`,
 /// `quarantine_compile` and `quarantine.compile` are all refused — checking
 /// the raw string would miss the spellings that collide only once mapped.
 ///
-/// Keep in step with the Dagster side; each entry names its source:
-///   - `contracts.py`     CONTRACT_REQUIRED_COLUMNS_CHECK and the two beside it
-///   - `component.py`     DEFAULT_CHECK_NAMES
-///   - `freshness.py`     FRESHNESS_CHECK_NAME
-///   - `observability.py` ANOMALY_CHECK_NAME, COMPLIANCE_CHECK_NAME
+/// **Only unconditional names belong here.** Dagster declares several check
+/// specs conditionally, and reserving one of those refuses a name the user
+/// could legitimately have used:
 ///
-/// This covers the FIXED names only. Names that are synthesized from user
-/// input rather than written out — `null_rate:{column}`, an unnamed
-/// assertion's generated name, cross-source names — can still collide with
-/// each other. That needs a resolved per-table name set, tracked separately.
+/// | name | declared when | so |
+/// |---|---|---|
+/// | `row_count`, `column_match`, `row_count_anomaly` | always | reserved here |
+/// | `freshness` | the pipeline declares `[checks.freshness]` | reserved per-pipeline below, not here |
+/// | `compliance_exception` | the component opts into `surface_compliance` | NOT reserved — the engine cannot see that flag |
+/// | the three `contract_*` names | a matching contract rule kind is declared | NOT reserved — ownership is per-asset, see #1941 |
+///
+/// A first version of this list reserved all nine unconditionally. That was a
+/// FALSE REFUSAL: a project not using contracts or compliance would have been
+/// refused a name nothing else was using. Refusing a legitimate name breaks a
+/// working project, which is worse than the collision it was guarding.
 const RESERVED_CHECK_NAMES: &[&str] = &[
     // engine
     "quarantine:compile",
-    // dagster contract checks
-    "contract_required_columns",
-    "contract_protected_columns",
-    "contract_column_constraints",
-    // dagster default checks
+    // dagster checks declared on every asset, unconditionally
+    // (`component.py::DEFAULT_CHECK_NAMES`, minus the conditional freshness)
     "row_count",
     "column_match",
-    "freshness",
     "row_count_anomaly",
-    // dagster compliance
-    "compliance_exception",
 ];
+
+/// Reserved only for a pipeline that declares `[checks.freshness]`.
+///
+/// Dagster skips the `freshness` spec when the pipeline has no freshness
+/// config (`component.py`, the `declare_freshness` guard), so the name is
+/// free in a project that does not use it.
+const FRESHNESS_CHECK_NAME: &str = "freshness";
 
 /// Every non-alphanumeric character mapped to `_` — the same shape
 /// `dagster_rocky.contracts.sanitize_check_name` produces. Case is
@@ -3629,8 +3634,14 @@ pub fn validate_checks(config: &RockyConfig) -> Vec<ConfigError> {
         for (table, declared) in named {
             let declared = declared.as_str();
             let sanitized = sanitized_check_name(declared);
+            let conditional: &[&str] = if pipeline.checks().freshness.is_some() {
+                &[FRESHNESS_CHECK_NAME]
+            } else {
+                &[]
+            };
             if let Some(reserved) = RESERVED_CHECK_NAMES
                 .iter()
+                .chain(conditional.iter())
                 .find(|r| sanitized_check_name(r) == sanitized)
             {
                 errors.push(ConfigError::ReservedAssertionName {
@@ -8786,30 +8797,87 @@ column = "id"
         }
     }
 
-    /// Every name Dagster owns is refused, not just the engine's own.
+    /// A name Dagster ALWAYS declares is refused.
     ///
-    /// The first version reserved `quarantine:compile` alone. Dagster also
-    /// pre-declares contract, default and compliance check specs, and its
-    /// first-wins dedup drops the LATER spec with only a log line — so a user
-    /// check colliding with one of those vanishes rather than erroring.
-    ///
-    /// `contract.required-columns` is the shape that motivated this: it is a
-    /// plausible thing to call a check, and it sanitizes onto Dagster's
-    /// `contract_required_columns`.
+    /// The first version reserved `quarantine:compile` alone, which was too
+    /// narrow. The second reserved all nine names Dagster can declare, which
+    /// was too broad — five of them are conditional, and refusing one in a
+    /// project that does not use that feature is a false refusal.
     #[test]
-    fn a_name_dagster_owns_is_refused_on_an_assertion() {
+    fn a_name_dagster_always_declares_is_refused() {
+        for spelling in ["row_count", "column-match", "row_count_anomaly"] {
+            let errors = validate_checks(&parse(&named_assertion(spelling, "")));
+            assert!(
+                errors.iter().any(|e| matches!(
+                    e,
+                    ConfigError::ReservedAssertionName { name, .. } if name == spelling
+                )),
+                "{spelling} is declared on every asset and must be refused: {errors:?}"
+            );
+        }
+    }
+
+    /// A CONDITIONAL Dagster name is free until the pipeline turns the
+    /// feature on.
+    ///
+    /// `freshness` is declared only when the pipeline has `[checks.freshness]`
+    /// (`component.py`'s `declare_freshness` guard). `compliance_exception`
+    /// and the three `contract_*` names depend on state the engine cannot
+    /// see, so they are not reserved here at all — see #1941.
+    ///
+    /// This is the test that would have caught the over-broad version: it
+    /// asserts a name is ACCEPTED, which no amount of extra strictness can
+    /// satisfy.
+    #[test]
+    fn a_conditional_dagster_name_is_free_until_the_feature_is_on() {
+        let reserved = |errors: &[ConfigError]| {
+            errors
+                .iter()
+                .any(|e| matches!(e, ConfigError::ReservedAssertionName { .. }))
+        };
+
+        // Nothing declares freshness, so the name is the user's to take.
+        let errors = validate_checks(&parse(&named_assertion("freshness", "")));
+        assert!(
+            !reserved(&errors),
+            "freshness is free when the pipeline declares no freshness config: {errors:?}"
+        );
+
+        // Declared, so dagster will emit that spec and the name now collides.
+        let errors = validate_checks(&parse(&named_assertion("freshness", FRESHNESS_TOML)));
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ConfigError::ReservedAssertionName { name, .. } if name == "freshness"
+            )),
+            "freshness collides once the pipeline declares it: {errors:?}"
+        );
+
+        // These four depend on state the engine cannot see, so it reserves
+        // none of them. Detecting those collisions is #1941.
         for spelling in [
-            "contract.required-columns",
-            "contract_protected_columns",
-            "contract:column:constraints",
-            "row_count",
-            "column_match",
-            "freshness",
-            "row_count_anomaly",
             "compliance_exception",
+            "contract_required_columns",
+            "contract_protected_columns",
+            "contract_column_constraints",
         ] {
-            let cfg = parse(&format!(
-                r#"
+            let errors = validate_checks(&parse(&named_assertion(spelling, "")));
+            assert!(
+                !reserved(&errors),
+                "{spelling} is conditional in dagster and must not be refused here: {errors:?}"
+            );
+        }
+    }
+
+    const FRESHNESS_TOML: &str = r#"
+[pipeline.dq.checks.freshness]
+threshold_seconds = 86400
+"#;
+
+    /// A quality pipeline with one named assertion, plus any extra TOML.
+    fn named_assertion(name: &str, extra: &str) -> String {
+        format!(
+            r#"
 [adapter]
 type = "duckdb"
 path = "x.duckdb"
@@ -8822,21 +8890,12 @@ adapter = "default"
 
 [[pipeline.dq.checks.assertions]]
 table = "orders"
-name = "{spelling}"
+name = "{name}"
 type = "not_null"
 column = "id"
+{extra}
 "#
-            ));
-            let errors = validate_checks(&cfg);
-            assert!(
-                errors.iter().any(|e| matches!(
-                    e,
-                    ConfigError::ReservedAssertionName { name, .. } if name == spelling
-                )),
-                "{spelling} collides with a dagster-owned check name and must be refused: \
-                 {errors:?}"
-            );
-        }
+        )
     }
 
     /// A CUSTOM check carries a user name too, and the first version of the

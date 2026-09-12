@@ -554,6 +554,14 @@ mod tests {
     /// sat on both lists.
     ///
     /// This fails if either list moves without the other.
+    ///
+    /// **What it does NOT prove.** `CLOCK_SHAPED` is hand-written, so this is
+    /// a consistency check between two lists, not a completeness proof: an
+    /// out-of-row function added to the allowlist and not to `CLOCK_SHAPED`
+    /// leaves this test green. It also has no validator control — it would
+    /// pass against a validator that refused everything. #1942 tracks the
+    /// argument-shape cases (`to_date(x)`, `date_trunc('week', x)`) that name
+    /// matching cannot see at all.
     #[test]
     fn every_clock_name_on_the_allowlist_is_known_volatile() {
         // Names that read a clock, a session, or a sequence. Adding one to
