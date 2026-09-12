@@ -65,7 +65,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Omitting `[pipeline.<name>.checks]` no longer means something different from declaring it empty.** Declaring the table and leaving it empty gave `fail_on_error = true` and `anomaly_threshold_pct = 50`. Omitting it gave `false` and `0`. The struct derived its `Default`, and a derived `Default` cannot see the per-field `#[serde(default = "...")]` attributes, so an absent table fell back to Rust zero values while an empty one used the documented defaults.
 
-  **What this changes for you.** A project whose `rocky.toml` omits `[checks]` now resolves with the failure gate on and the anomaly threshold at 50. **No run is known to behave differently**, and the reason is worth stating rather than asserting: a pipeline with no `[checks]` table also has every individual check disabled, so there is no error-severity check result for the gate to act on, and the anomaly threshold is only read when the row-count check is enabled. The four pipeline kinds that default the table are replication, transformation, snapshot and load; of those only replication runs pipeline-level checks. A quality pipeline requires the table, so it was never affected.
+  **Breaking, for a plan that already exists: re-plan it.** A governed plan embeds the resolved config's identity and `rocky apply` refuses the plan if that identity has moved — the guard that stops a plan being applied against a different destination than it was authorized for. The identity is a digest over the *resolved* pipeline config, so correcting these defaults moves it for any project whose `rocky.toml` omits `[checks]`. A plan authorized before this release is refused after it, with the message it already carries:
+
+  ```
+  refusing to execute plan '<id>': the resolved routing config ... changed
+  since the plan was authorized ... Re-plan with `rocky plan` before applying.
+  ```
+
+  Nothing is lost and nothing is silent — it fails closed and names the fix. Plan ids for the same change also differ across the upgrade, for the same reason.
+
+  **Running a pipeline behaves the same.** A project whose `rocky.toml` omits `[checks]` now resolves with the failure gate on and the anomaly threshold at 50, and that changes no run's outcome. The reason is worth stating rather than asserting: a pipeline with no `[checks]` table also has every individual check disabled, so there is no error-severity check result for the gate to act on, and the anomaly threshold is only read when the row-count check is enabled. The four pipeline kinds that default the table are replication, transformation, snapshot and load; of those only replication runs pipeline-level checks. A quality pipeline requires the table, so it was never affected.
 
   **The published schema was wrong, and that part was visible.** `schemas/rocky_project.schema.json` records the resolved default for an omitted table, so an editor reading it showed `fail_on_error: false` as the contract. It now shows `true` and `50.0`, in the root schema, the VS Code copy, the generated SDK model and `openapi.json`.
 
