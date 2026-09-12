@@ -7506,7 +7506,7 @@ mod tests {
         );
         drop(store);
 
-        // Idempotent: a second sweep finds nothing non-terminal.
+        // Idempotent: a second sweep finds nothing in flight.
         assert_eq!(sweep_interrupted_jobs(&state_path).unwrap(), 0);
         // A state file that never existed is a clean no-op.
         assert_eq!(
