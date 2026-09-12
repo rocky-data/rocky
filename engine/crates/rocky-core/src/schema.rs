@@ -158,6 +158,29 @@ pub enum SchemaError {
 
     #[error("metadata_columns entry '{name}' is not usable in the replication SELECT: {reason}")]
     InvalidMetadataColumn { name: String, reason: String },
+
+    #[error(
+        "metadata_columns value '{template}' joins a multi-valued component with separator \
+         '{separator}', which is outside the allowed set [A-Za-z0-9_.-]. The separator is \
+         spliced into the replication SELECT between the component parts. Change the separator, \
+         or drop the placeholder from this value."
+    )]
+    UnsafeSeparator { template: String, separator: String },
+}
+
+/// A separator may only contain `[A-Za-z0-9_.-]` (#1934).
+///
+/// The separator is spliced raw between component parts, so no character may
+/// end a string literal or begin new SQL. The set is wider than an identifier
+/// because a source schema name may legitimately use `-` or `.`, and a false
+/// refusal breaks a working project.
+///
+/// An empty separator is allowed. It concatenates the parts, which is a
+/// naming question, not an injection one.
+pub fn separator_is_safe(separator: &str) -> bool {
+    separator
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
 impl SchemaPattern {
@@ -530,6 +553,7 @@ impl ParsedSchema {
         default_sep: &str,
     ) -> Result<String, SchemaError> {
         let mut rejected: Option<(String, String)> = None;
+        let mut rejected_sep: Option<String> = None;
         let rendered = render_placeholders(template, |name, sep, out| {
             let Some(value) = self.values.get(name) else {
                 return false;
@@ -551,7 +575,17 @@ impl ParsedSchema {
             match value {
                 SchemaValue::Single(s) => out.push_str(s),
                 SchemaValue::Multiple(v) => {
+                    // The parts are identifiers by the loop above. The
+                    // separator between them is config text and needs its
+                    // own rule (#1934). Checked before any of it is
+                    // appended, like the parts.
                     let sep = sep.unwrap_or(default_sep);
+                    if !separator_is_safe(sep) {
+                        if rejected_sep.is_none() {
+                            rejected_sep = Some(sep.to_string());
+                        }
+                        return false;
+                    }
                     let mut iter = v.iter();
                     if let Some(first) = iter.next() {
                         out.push_str(first);
@@ -564,6 +598,12 @@ impl ParsedSchema {
             }
             true
         });
+        if let Some(separator) = rejected_sep {
+            return Err(SchemaError::UnsafeSeparator {
+                template: template.to_string(),
+                separator,
+            });
+        }
         if let Some((component, value)) = rejected {
             return Err(SchemaError::NonIdentifierComponent {
                 template: template.to_string(),
@@ -746,6 +786,58 @@ mod tests {
         match err {
             SchemaError::NonIdentifierComponent { value, .. } => assert_eq!(value, "eu(west"),
             other => panic!("expected NonIdentifierComponent, got {other:?}"),
+        }
+    }
+
+    /// The parts of a multi-valued placeholder are identifier-validated. The
+    /// separator that joins them is config text spliced between them, so it
+    /// needs its own rule (#1934).
+    ///
+    /// ```text
+    /// '{regions}'  +  parts [us_west, eu_west]  +  sep "__"  ->  'us_west__eu_west'
+    ///                 ^^^^^ validated              ^^^ this
+    /// ```
+    ///
+    /// Two sources reach that splice: the pattern separator, and an inline
+    /// `{name:SEP}` pin that overrides it.
+    #[test]
+    fn the_separator_that_joins_the_parts_is_validated_too() {
+        let pattern = sample_pattern();
+        let parsed = pattern
+            .parse("src__acme__us_west__eu_west__shopify")
+            .unwrap();
+        assert_eq!(
+            parsed.get_multiple("regions"),
+            Some(["us_west".to_string(), "eu_west".to_string()].as_slice()),
+            "precondition: two parts, so a separator is spliced between them"
+        );
+        let configs = [metadata_config("_regions", "VARCHAR", "'{regions}'")];
+
+        // Separators a real project uses must keep working.
+        for sep in ["__", "_", "-", "."] {
+            let cols = resolve_metadata_columns(&parsed, &configs, sep)
+                .unwrap_or_else(|e| panic!("{sep:?} must be accepted: {e:?}"));
+            assert_eq!(cols[0].value(), format!("'us_west{sep}eu_west'"));
+        }
+
+        // Source 1: the pattern separator.
+        for bad in ["'", " | "] {
+            let err = resolve_metadata_columns(&parsed, &configs, bad)
+                .expect_err("a separator outside the allowed set must be refused");
+            assert!(
+                matches!(err, SchemaError::UnsafeSeparator { .. }),
+                "expected UnsafeSeparator for {bad:?}, got {err:?}"
+            );
+        }
+
+        // Source 2: an inline pin. The pattern separator passed in here is the
+        // benign default, so only the pin can fail this.
+        let pinned = [metadata_config("_regions", "VARCHAR", "'{regions:'}'")];
+        let err = resolve_metadata_columns(&parsed, &pinned, "__")
+            .expect_err("a quote pinned inline must be refused");
+        match err {
+            SchemaError::UnsafeSeparator { separator, .. } => assert_eq!(separator, "'"),
+            other => panic!("expected UnsafeSeparator, got {other:?}"),
         }
     }
 
