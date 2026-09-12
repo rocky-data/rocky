@@ -3421,6 +3421,23 @@ mod tests {
         let mut job = persisted_job("sink-principal", "running");
         job.principal = Some(secret.to_string());
 
+        // **The survivor must be the principal and nothing else.** The registry
+        // is process-global and monotonic, so a value registered by any other
+        // test in this binary could trip the sink instead and this test would
+        // still pass — it would just be proving something else. Ordering
+        // experiments cannot close that; this can. The same record with
+        // `principal` cleared must be clean.
+        let mut without = job.clone();
+        without.principal = None;
+        assert!(
+            !crate::secret_filter::any_value_survives(
+                &serde_json::to_string(&without).expect("serializes")
+            ),
+            "PRECONDITION: this record must trip the sink ONLY through \
+             `principal`. Something else registered in this process is \
+             matching it, so this test is no longer testing principal."
+        );
+
         let held = sanitize_for_storage(job);
         assert_eq!(held.principal, None, "a caller-supplied field is dropped");
         let after = serde_json::to_string(&held).expect("serializes");
