@@ -438,30 +438,47 @@ impl BatchCheckAdapter for DatabricksBatchCheckAdapter {
 
         Ok(results
             .into_iter()
-            .map(|r| {
+            .filter_map(|r| {
                 // Databricks returns timestamps as strings via `CAST(... AS STRING)`.
                 // Accept RFC 3339 first, then fall back to the Databricks default
                 // format "YYYY-MM-DD HH:MM:SS[.fff]" — matches the parse logic
                 // previously inlined in run.rs before this dispatch was lifted
                 // behind the BatchCheckAdapter trait.
-                let max_timestamp = r.max_timestamp.and_then(|ts| {
-                    ts.parse::<DateTime<Utc>>().ok().or_else(|| {
-                        chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%d %H:%M:%S%.f")
-                            .or_else(|_| {
-                                chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%d %H:%M:%S")
-                            })
-                            .ok()
-                            .map(|naive| naive.and_utc())
-                    })
-                });
-                FreshnessResult {
+                //
+                // A string that will not parse OMITS the row (#1929). `None`
+                // passes through: it is a genuine SQL NULL.
+                let max_timestamp = match r.max_timestamp {
+                    None => None,
+                    Some(ts) => {
+                        let parsed = ts.parse::<DateTime<Utc>>().ok().or_else(|| {
+                            chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%d %H:%M:%S%.f")
+                                .or_else(|_| {
+                                    chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%d %H:%M:%S")
+                                })
+                                .ok()
+                                .map(|naive| naive.and_utc())
+                        });
+                        match parsed {
+                            Some(dt) => Some(dt),
+                            None => {
+                                tracing::warn!(
+                                    table = format!("{}.{}.{}", r.catalog, r.schema, r.table),
+                                    value = ts.as_str(),
+                                    "freshness timestamp would not parse — reporting the table as not evaluated"
+                                );
+                                return None;
+                            }
+                        }
+                    }
+                };
+                Some(FreshnessResult {
                     table: TableRef {
                         catalog: r.catalog,
                         schema: r.schema,
                         table: r.table,
                     },
                     max_timestamp,
-                }
+                })
             })
             .collect())
     }

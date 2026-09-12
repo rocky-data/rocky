@@ -1235,6 +1235,21 @@ pub trait SqlDialect: Send + Sync {
         format!("\"{name}\"")
     }
 
+    /// Does this warehouse read backslash escape sequences inside a QUOTED
+    /// identifier?
+    ///
+    /// `false` for every dialect but BigQuery. DuckDB, Snowflake, Databricks
+    /// and Trino treat a backslash as an ordinary character there and escape
+    /// the delimiter by doubling it, so `raw\` is an ordinary schema name.
+    /// BigQuery's quoted identifiers take string-literal escapes, so a name
+    /// ending in a backslash consumes the closing backtick (#1939).
+    ///
+    /// Callers that build an identifier from a name they did not validate
+    /// need this to know whether a backslash ends the identifier early.
+    fn identifier_takes_backslash_escapes(&self) -> bool {
+        false
+    }
+
     /// How this warehouse's lexer reads a single-quoted string literal.
     ///
     /// The literal twin of [`SqlDialect::quote_identifier`]. Feed the answer

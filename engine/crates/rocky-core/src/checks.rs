@@ -165,14 +165,20 @@ pub fn null_rate_check_name(column: &str) -> String {
 /// Returns `None` when the cell is absent or not a non-negative integer — the
 /// caller decides whether that is a skip, an error, or a default, rather than a
 /// silent `0` masking a parse failure as a real count.
+///
+/// A float is accepted only when it is integral and in `[0, 2^64)` (#1923).
 pub fn cell_as_u64(cell: Option<&serde_json::Value>) -> Option<u64> {
     cell.and_then(|v| {
         v.as_u64()
             .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
             .or_else(|| {
-                v.as_f64()
-                    .filter(|f| f.is_finite() && *f >= 0.0)
-                    .map(|f| f as u64)
+                v.as_f64().filter(|f| f.is_finite()).and_then(|f| {
+                    // 2^64 exclusive: `u64::MAX` has no exact `f64`. The cast
+                    // is eager (clippy refuses `then` here) and saturating, so
+                    // it runs on a rejected value and the result is dropped.
+                    (f.fract() == 0.0 && (0.0..18_446_744_073_709_551_616.0).contains(&f))
+                        .then_some(f as u64)
+                })
             })
     })
 }
@@ -674,6 +680,37 @@ mod tests {
         assert_eq!(cell_as_u64(Some(&json!("abc"))), None);
         assert_eq!(cell_as_u64(Some(&json!(-1.0))), None);
         assert_eq!(cell_as_u64(Some(&serde_json::Value::Null)), None);
+
+        // A float must be integral and in `[0, 2^64)` (#1923).
+        assert_eq!(cell_as_u64(Some(&json!(5.5))), None);
+        assert_eq!(cell_as_u64(Some(&json!(0.5))), None);
+        assert_eq!(cell_as_u64(Some(&json!(1e30))), None);
+        assert_eq!(cell_as_u64(Some(&json!(0.0))), Some(0));
+        assert_eq!(cell_as_u64(Some(&json!(-0.0))), Some(0));
+        assert_eq!(
+            cell_as_u64(Some(&json!(9007199254740992.0))),
+            Some(9007199254740992)
+        );
+
+        // The bound itself. 2^64 is the first REJECTED value and
+        // 2^64 - 2048 the last accepted one. An inclusive bound would admit
+        // 2^64 and cast it to `u64::MAX`, and no other assertion here would
+        // notice.
+        assert_eq!(
+            cell_as_u64(Some(&json!(18_446_744_073_709_551_616.0_f64))),
+            None
+        );
+        assert_eq!(
+            cell_as_u64(Some(&json!(18_446_744_073_709_549_568.0_f64))),
+            Some(18_446_744_073_709_549_568)
+        );
+
+        // `u64::MAX` is reachable only as an integer or a string.
+        assert_eq!(cell_as_u64(Some(&json!(u64::MAX))), Some(u64::MAX));
+        assert_eq!(
+            cell_as_u64(Some(&json!("18446744073709551615"))),
+            Some(u64::MAX)
+        );
     }
 
     /// Test dialect that mirrors Databricks behavior for rocky-core tests.

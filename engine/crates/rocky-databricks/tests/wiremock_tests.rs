@@ -2347,3 +2347,162 @@ async fn breaker_trip_without_recovery_timeout_emits_none_cooldown() {
         }
     }
 }
+
+/// #1926, through the production path. The unit test beside
+/// `parse_row_count_rows` cannot see the call site, so it stays green if the
+/// guard is reverted inside `execute_batch_row_counts`. This one does not.
+///
+/// Three tables, one readable count each — except `bad`, whose count cell is
+/// a JSON null. `bad` must be ABSENT from the results, not present with 0,
+/// and the other two must be unaffected by its removal.
+#[tokio::test]
+async fn an_unreadable_batched_row_count_cell_is_omitted_from_the_results() {
+    use rocky_databricks::batch::{BatchTableRef, execute_batch_row_counts};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-rowcount",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": {
+                "schema": {
+                    "columns": [
+                        {"name": "c", "type_name": "STRING", "position": 0},
+                        {"name": "s", "type_name": "STRING", "position": 1},
+                        {"name": "t", "type_name": "STRING", "position": 2},
+                        {"name": "cnt", "type_name": "LONG", "position": 3}
+                    ]
+                },
+                "total_row_count": 3
+            },
+            "result": {
+                "data_array": [
+                    ["cat", "sch", "before", 11],
+                    ["cat", "sch", "bad", null],
+                    ["cat", "sch", "after", 22]
+                ]
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let tref = |table: &str| BatchTableRef {
+        catalog: "cat".into(),
+        schema: "sch".into(),
+        table: table.into(),
+    };
+    let tables = vec![tref("before"), tref("bad"), tref("after")];
+
+    let results = execute_batch_row_counts(&test_connector(&server), &tables)
+        .await
+        .expect("a readable response is not an error");
+
+    let named: Vec<(&str, u64)> = results
+        .iter()
+        .map(|r| (r.table.as_str(), r.count))
+        .collect();
+
+    assert!(
+        !named.iter().any(|(t, _)| *t == "bad"),
+        "an unreadable count must not reach the caller as a measured row: {named:?}"
+    );
+    // The rows on either side are untouched, so the omission is not a
+    // truncation and does not shift the ones that follow it.
+    assert_eq!(named, vec![("before", 11), ("after", 22)], "{named:?}");
+}
+
+/// #1929. An unreadable freshness timestamp must become an ABSENT result, so
+/// `run.rs` reports the table not evaluated and the gate trips. It used to
+/// become `max_timestamp: None`, which the consumer reads as "empty table,
+/// emit no check" — so the check silently vanished.
+///
+/// A genuine SQL NULL is the control: it must STILL be returned with `None`,
+/// because a table with no maximum to read has no freshness to measure. A fix
+/// that omits both would pass the unreadable half and break that one.
+///
+/// Drives `batch_freshness`, which crosses both collapse points: the cell read
+/// in `batch.rs` and the timestamp parse in `adapter.rs`.
+#[tokio::test]
+async fn an_unreadable_freshness_timestamp_is_omitted_and_a_null_is_kept() {
+    use std::sync::Arc;
+
+    use rocky_core::traits::BatchCheckAdapter;
+    use rocky_databricks::adapter::DatabricksBatchCheckAdapter;
+    use rocky_ir::TableRef;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-freshness",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": {
+                "schema": {
+                    "columns": [
+                        {"name": "c", "type_name": "STRING", "position": 0},
+                        {"name": "s", "type_name": "STRING", "position": 1},
+                        {"name": "t", "type_name": "STRING", "position": 2},
+                        {"name": "ts", "type_name": "STRING", "position": 3}
+                    ]
+                },
+                "total_row_count": 5
+            },
+            "result": {
+                "data_array": [
+                    ["cat", "sch", "good",       "2026-09-11 10:00:00"],
+                    ["cat", "sch", "empty",      null],
+                    ["cat", "sch", "unparsable", "yesterday"],
+                    ["cat", "sch", "nonstring",  12345],
+                    ["cat", "sch", "shortrow"]
+                ]
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let tref = |table: &str| TableRef {
+        catalog: "cat".into(),
+        schema: "sch".into(),
+        table: table.into(),
+    };
+    let tables: Vec<TableRef> = ["good", "empty", "unparsable", "nonstring", "shortrow"]
+        .iter()
+        .map(|t| tref(t))
+        .collect();
+
+    let adapter = DatabricksBatchCheckAdapter::new(Arc::new(test_connector(&server)));
+    let results = adapter
+        .batch_freshness(&tables, "ts")
+        .await
+        .expect("a readable response is not an error");
+
+    let named: Vec<(&str, bool)> = results
+        .iter()
+        .map(|r| (r.table.table.as_str(), r.max_timestamp.is_some()))
+        .collect();
+
+    // The control: a genuine SQL NULL must still be RETURNED carrying `None`,
+    // so no check is emitted. Correct for an empty table; a non-empty table
+    // whose `ts` is all NULL reaches the same NULL (#1930).
+    assert!(
+        named.contains(&("empty", false)),
+        "a genuine NULL must still be returned: {named:?}"
+    );
+
+    // The measured one survives untouched.
+    assert!(
+        named.contains(&("good", true)),
+        "a readable timestamp must still be measured: {named:?}"
+    );
+
+    // These three must be ABSENT, so run.rs reports them not evaluated
+    // instead of silently emitting nothing.
+    for table in ["unparsable", "nonstring", "shortrow"] {
+        assert!(
+            !named.iter().any(|(t, _)| *t == table),
+            "{table}: an unreadable timestamp must not be returned as None, \
+             which reads as an empty table: {named:?}"
+        );
+    }
+}

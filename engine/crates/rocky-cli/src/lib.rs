@@ -10,6 +10,7 @@ pub mod plan_store;
 pub mod registry;
 pub(crate) mod schema_cache_writer;
 pub(crate) mod scope;
+pub mod secret_filter;
 pub(crate) mod source_schemas;
 pub mod ui;
 

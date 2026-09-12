@@ -339,6 +339,12 @@ impl SqlDialect for BigQueryDialect {
         format!("`{name}`")
     }
 
+    fn identifier_takes_backslash_escapes(&self) -> bool {
+        // GoogleSQL quoted identifiers take the string-literal escape
+        // sequences, unlike every other dialect Rocky ships (#1939).
+        true
+    }
+
     fn materialized_view_ddl(&self, target: &str, select_sql: &str) -> AdapterResult<String> {
         // BigQuery supports `CREATE OR REPLACE MATERIALIZED VIEW` as of
         // GA — the same form Databricks + Snowflake emit. Refresh schedule

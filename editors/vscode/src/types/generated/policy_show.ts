@@ -167,7 +167,9 @@ export interface PolicyAutonomyBudgetOutput {
   [k: string]: unknown;
 }
 /**
- * What a rule matches. Every field is as authored; an empty list or `None` means the field does not narrow the rule.
+ * A rule's scope as authored. An empty list or `None` means the field does not narrow the rule.
+ *
+ * Every field here is a matching predicate EXCEPT `max_downstreams`, which is evaluated after the rule matches.
  */
 export interface PolicyRuleScopeOutput {
   any: boolean;
@@ -176,7 +178,7 @@ export interface PolicyRuleScopeOutput {
   exclude_classifications: string[];
   layer?: string | null;
   /**
-   * The blast-radius ceiling: the rule matches only a model with at most this many downstreams.
+   * The blast-radius ceiling, applied AFTER the rule matches: an `allow` degrades to `require_review` when the target's transitive downstream count exceeds this, or cannot be computed. `deny` and `require_review` rules are unaffected, and the rule still matches either way.
    */
   max_downstreams?: number | null;
   models: string[];

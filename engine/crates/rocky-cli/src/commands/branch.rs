@@ -672,14 +672,16 @@ pub(crate) async fn discover_branch_targets_for_plan(
 
     let planned = discover_branch_targets(config_path, record, filter, pipeline_name).await?;
 
-    Ok(planned
+    planned
         .into_iter()
-        .map(|p| PlannedPromoteWithSql {
-            target: p.prod.full_name(),
-            source: p.branch_source.full_name(),
-            statement: build_promote_sql(dialect, &p.prod, &p.branch_source),
+        .map(|p| {
+            Ok(PlannedPromoteWithSql {
+                target: p.prod.full_name(),
+                source: p.branch_source.full_name(),
+                statement: build_promote_sql(dialect, &p.prod, &p.branch_source)?,
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Run the approval gate for a branch, updating `audit` and returning
@@ -799,6 +801,34 @@ pub(crate) fn run_breaking_change_gate_for_plan(
 /// replacements of one table. Same defect, so refusing is right — but it is a
 /// path #1310 does not mention, and a configuration relying on last-write-wins
 /// there will now fail.
+/// Refuse a persisted promote plan whose names carry a character the
+/// warehouse's identifier quoting cannot survive (#1939).
+///
+/// The builder refuses these when it writes a plan. This is the same rule at
+/// the seam where a plan written by an older build, or by a path that
+/// bypassed the builder, becomes SQL.
+///
+/// The whole `catalog.schema.table` string is scanned rather than split,
+/// because a name part may legitimately contain a `.`.
+fn reject_unquotable_promote_names(
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    targets: &[crate::output::PromoteTargetPlan],
+) -> Result<()> {
+    for step in targets {
+        for (role, name) in [("target", &step.target), ("source", &step.source)] {
+            if let Some(bad) = unquotable_char(dialect, name) {
+                anyhow::bail!(
+                    "refusing to apply this promote plan: its {role} '{name}' contains {bad:?}, \
+                     which cannot survive this warehouse's identifier quoting. The plan predates \
+                     that guard or was built by a path that bypassed it — rebuild it with \
+                     `rocky plan promote` after renaming the target."
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn reject_duplicate_promote_targets(targets: &[crate::output::PromoteTargetPlan]) -> Result<()> {
     let mut claimed: std::collections::HashMap<rocky_sql::defer::CollisionIdentity, &str> =
         std::collections::HashMap::new();
@@ -851,6 +881,12 @@ pub(crate) async fn run_promote_apply(
     let registry = AdapterRegistry::from_config(rocky_cfg)?;
     let (_pipeline_name, pipeline) = crate::registry::resolve_pipeline(rocky_cfg, pipeline_name)?;
     let adapter = registry.warehouse_adapter(pipeline.target_adapter())?;
+
+    // A plan carries its statement as text and the loop below executes it
+    // unchanged, so the builder's guard does not reach a plan written before
+    // it. Re-check the names here, against the dialect this apply resolved
+    // (#1939).
+    reject_unquotable_promote_names(adapter.dialect(), targets)?;
 
     let mut targets_out: Vec<crate::output::PromoteTarget> = Vec::new();
     let mut overall_success = true;
@@ -987,21 +1023,64 @@ fn build_promote_sql(
     dialect: &dyn rocky_core::traits::SqlDialect,
     prod: &TargetRef,
     branch_source: &TargetRef,
-) -> String {
-    format!(
+) -> Result<String> {
+    Ok(format!(
         "CREATE OR REPLACE TABLE {} AS SELECT * FROM {}",
-        quote_fqn(dialect, prod),
-        quote_fqn(dialect, branch_source),
-    )
+        quote_fqn(dialect, prod)?,
+        quote_fqn(dialect, branch_source)?,
+    ))
 }
 
-fn quote_fqn(dialect: &dyn rocky_core::traits::SqlDialect, target: &TargetRef) -> String {
-    format!(
+fn quote_fqn(dialect: &dyn rocky_core::traits::SqlDialect, target: &TargetRef) -> Result<String> {
+    Ok(format!(
         "{}.{}.{}",
-        dialect.quote_identifier(&target.catalog),
-        dialect.quote_identifier(&target.schema),
-        dialect.quote_identifier(&target.table),
-    )
+        quote_part(dialect, &target.catalog)?,
+        quote_part(dialect, &target.schema)?,
+        quote_part(dialect, &target.table)?,
+    ))
+}
+
+/// The character in `name` that a quoted identifier cannot carry, if any
+/// (#1939).
+///
+/// Two of them:
+///
+/// - the dialect's own delimiter, because `quote_identifier` wraps and does
+///   not escape, so the delimiter ends the identifier early;
+/// - a backslash, but only where the dialect says it escapes there
+///   (`identifier_takes_backslash_escapes`, true for BigQuery alone). A
+///   schema named `raw\` is ordinary on DuckDB — `rocky-duckdb` has an
+///   executed test that creates and discovers one — so refusing it
+///   everywhere would break a working project.
+///
+/// Every other character is contained by the quoting. That is why this is not
+/// the SQL-identifier allowlist: a branch name may carry `-` or `.` by design
+/// (`validate_branch_name`), and those still promote.
+///
+/// The delimiter is read back from the dialect rather than listed here, so
+/// there is no second table to keep in step. That read assumes the quoted form
+/// opens with one delimiter character, which every shipped dialect does and
+/// the trait does not promise. A dialect with a different shape needs this
+/// revisited, which is what `the_shipped_dialects_open_with_one_delimiter`
+/// pins.
+fn unquotable_char(dialect: &dyn rocky_core::traits::SqlDialect, name: &str) -> Option<char> {
+    let delimiter = dialect.quote_identifier("").chars().next()?;
+    let backslash_escapes = dialect.identifier_takes_backslash_escapes();
+    name.chars()
+        .find(|c| *c == delimiter || (*c == '\\' && backslash_escapes))
+}
+
+/// Quote one name part, refusing a name a quoted identifier cannot carry
+/// (#1939).
+fn quote_part(dialect: &dyn rocky_core::traits::SqlDialect, part: &str) -> Result<String> {
+    if let Some(bad) = unquotable_char(dialect, part) {
+        anyhow::bail!(
+            "target name part '{part}' contains {bad:?}, which cannot survive this \
+             warehouse's identifier quoting. Rocky quotes each part of a promote target \
+             and does not escape it. Rename the target."
+        );
+    }
+    Ok(dialect.quote_identifier(part))
 }
 
 /// Enumerate the promote plan for a branch.
@@ -2269,10 +2348,202 @@ mod tests {
             schema: "branch__live-test".to_string(),
             table: "orders".to_string(),
         };
-        let sql = build_promote_sql(&dialect, &prod, &branch_source);
+        let sql = build_promote_sql(&dialect, &prod, &branch_source).unwrap();
         assert_eq!(
             sql,
             r#"CREATE OR REPLACE TABLE "playground"."staging__orders"."orders" AS SELECT * FROM "playground"."branch__live-test"."orders""#,
+        );
+    }
+
+    /// `quote_identifier` wraps a name in the dialect's delimiter and does
+    /// not escape, so a name carrying that delimiter ends the identifier
+    /// early. `build_promote_sql` must refuse it (#1939).
+    ///
+    /// ```text
+    ///   "north"america"     the wrap ends at the inner quote
+    ///    ^     ^            one identifier, then loose text
+    /// ```
+    ///
+    /// Both names are checked. `shadow_target` copies `catalog` and `table`
+    /// from the production target, so the branch source carries the same
+    /// unchecked parts.
+    #[test]
+    fn build_promote_sql_refuses_a_name_carrying_the_quote_delimiter() {
+        let duckdb = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let databricks = rocky_databricks::dialect::DatabricksSqlDialect;
+
+        let plain = |schema: &str| TargetRef {
+            catalog: "playground".to_string(),
+            schema: schema.to_string(),
+            table: "orders".to_string(),
+        };
+
+        // Control: a hyphen is not a delimiter. Branch names carry hyphens by
+        // design — `validate_branch_name` allows [A-Za-z0-9_.-] — and the
+        // quoting is what makes them safe. This must keep working.
+        let sql = build_promote_sql(
+            &duckdb,
+            &plain("staging__orders"),
+            &plain("branch__live-test"),
+        )
+        .expect("a hyphenated branch name must still promote");
+        assert_eq!(
+            sql,
+            r#"CREATE OR REPLACE TABLE "playground"."staging__orders"."orders" AS SELECT * FROM "playground"."branch__live-test"."orders""#,
+        );
+
+        // The production target is refused.
+        build_promote_sql(&duckdb, &plain("north\"america"), &plain("branch__live"))
+            .expect_err("a double quote must be refused on the DuckDB dialect");
+
+        // So is the branch source: both names reach the statement.
+        build_promote_sql(&duckdb, &plain("staging"), &plain("north\"america"))
+            .expect_err("the branch source is checked too");
+
+        // The delimiter is per dialect. Databricks quotes with backticks, so
+        // a backtick is the hazard there and a double quote is not.
+        build_promote_sql(&databricks, &plain("north`america"), &plain("branch__live"))
+            .expect_err("a backtick must be refused on the Databricks dialect");
+        build_promote_sql(
+            &databricks,
+            &plain("north\"america"),
+            &plain("branch__live"),
+        )
+        .expect("a double quote is contained by backtick quoting");
+    }
+
+    /// `unquotable_char` reads the delimiter from the first character of the
+    /// quoted form. That is true of every shipped dialect and is not promised
+    /// by the trait, so pin it here rather than trusting the comment (#1939).
+    #[test]
+    fn the_shipped_dialects_open_with_one_delimiter() {
+        let cases: [(&str, &dyn rocky_core::traits::SqlDialect, char); 5] = [
+            ("duckdb", &rocky_duckdb::dialect::DuckDbSqlDialect, '"'),
+            (
+                "databricks",
+                &rocky_databricks::dialect::DatabricksSqlDialect,
+                '`',
+            ),
+            ("bigquery", &rocky_bigquery::dialect::BigQueryDialect, '`'),
+            (
+                "snowflake",
+                &rocky_snowflake::dialect::SnowflakeSqlDialect,
+                '"',
+            ),
+            ("trino", &rocky_trino::dialect::TrinoDialect, '"'),
+        ];
+        for (name, dialect, expected) in cases {
+            // `quote_identifier("")` is the call `unquotable_char` makes, so
+            // pin that one and not a near neighbour.
+            let empty = dialect.quote_identifier("");
+            assert_eq!(
+                empty.chars().next(),
+                Some(expected),
+                "{name}: the delimiter read must see {expected:?}, got {empty}"
+            );
+            assert_eq!(
+                empty.chars().count(),
+                2,
+                "{name} must wrap an empty name in exactly two characters"
+            );
+
+            let quoted = dialect.quote_identifier("x");
+            assert_eq!(
+                quoted.chars().next(),
+                Some(expected),
+                "{name} must open with {expected:?}, got {quoted}"
+            );
+            assert_eq!(
+                quoted.chars().last(),
+                Some(expected),
+                "{name} must close with the same character, got {quoted}"
+            );
+            assert_eq!(
+                quoted.len(),
+                3,
+                "{name} must wrap in ONE character each side"
+            );
+        }
+    }
+
+    /// A backslash is refused on BigQuery only, because only BigQuery reads
+    /// escape sequences inside a quoted identifier: a trailing backslash
+    /// consumes the closing backtick and the identifier does not end where it
+    /// should (#1939).
+    ///
+    /// Everywhere else a backslash is an ordinary character, and a schema
+    /// named `raw\` is real — `rocky-duckdb/src/discovery.rs` creates and
+    /// discovers one in an executed test (#1596). Refusing it would break a
+    /// working project, which is the same reason this is not the
+    /// SQL-identifier allowlist.
+    #[test]
+    fn a_backslash_is_refused_on_bigquery_and_allowed_elsewhere() {
+        let plain = |schema: &str| TargetRef {
+            catalog: "playground".to_string(),
+            schema: schema.to_string(),
+            table: "orders".to_string(),
+        };
+        let bigquery = rocky_bigquery::dialect::BigQueryDialect;
+        let duckdb = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let snowflake = rocky_snowflake::dialect::SnowflakeSqlDialect;
+
+        build_promote_sql(&bigquery, &plain(r"reporting\"), &plain("branch__live"))
+            .expect_err("a trailing backslash must be refused on BigQuery");
+
+        // The controls: the same name promotes everywhere else.
+        let sql = build_promote_sql(&duckdb, &plain(r"raw\"), &plain("branch__live"))
+            .expect("a backslash is an ordinary DuckDB schema character");
+        assert!(sql.contains(r#""raw\""#), "got {sql}");
+        build_promote_sql(&snowflake, &plain(r"raw\"), &plain("branch__live"))
+            .expect("and an ordinary Snowflake one");
+
+        build_promote_sql(
+            &bigquery,
+            &plain("branch__live-test"),
+            &plain("branch__live"),
+        )
+        .expect("a hyphen is still fine on BigQuery");
+    }
+
+    /// A promote plan carries its statement as text, and `run_promote_apply`
+    /// executes that text unchanged. So the builder's guard does not reach a
+    /// plan written before the guard existed. The seam re-checks (#1939).
+    ///
+    /// This drives `run_promote_apply`, the production function, not the
+    /// helper — a plan whose `statement` is already-built SQL is exactly the
+    /// input the builder never sees.
+    #[tokio::test]
+    async fn run_promote_apply_refuses_a_plan_whose_names_cannot_be_quoted() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"probe.duckdb\"\n\n\
+             [pipeline.one]\ntype = \"transformation\"\nmodels = \"models\"\n\n\
+             [pipeline.one.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        let loaded = rocky_core::config::LoadedConfig {
+            config: rocky_core::config::load_rocky_config(&config_path).unwrap(),
+            fingerprint: "0000000000000000".to_string(),
+        };
+
+        // A plan a pre-fix build would have written: the statement is already
+        // SQL, and the name it was built from carries a double quote.
+        let step = crate::output::PromoteTargetPlan {
+            target: "wh.north\"america.orders".to_string(),
+            source: "wh.br.orders".to_string(),
+            statement: "CREATE OR REPLACE TABLE \"wh\".\"north\"america\".\"orders\" \
+                        AS SELECT * FROM \"wh\".\"br\".\"orders\""
+                .to_string(),
+        };
+        let err = run_promote_apply(&loaded, &[step], Some("one"))
+            .await
+            .expect_err("a plan carrying an unquotable name must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("north\"america"),
+            "the refusal must name the offending target, got: {msg}"
         );
     }
 

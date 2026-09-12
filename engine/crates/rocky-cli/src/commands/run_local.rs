@@ -411,25 +411,33 @@ fn quality_row_count_check(
     use rocky_core::checks::{CheckDetails, CheckResult};
 
     match queried {
+        // A query that ANSWERED still has to answer with a number. `unwrap_or(0)`
+        // read an empty row set, a missing cell and a non-numeric cell as a
+        // measured count of zero, so the check claimed `not_evaluated: None` at
+        // the configured severity and a `warning` pipeline exited 0 having
+        // counted nothing — the same shape as the failed-query arm below, which
+        // this function already fixed for `Err`.
+        //
+        // `cell_as_u64` is the shared reader; it also accepts an integral JSON
+        // float, which the hand-rolled chain here did not, so an adapter
+        // returning `5.0` reported a populated table as EMPTY.
         Ok(result) => {
-            let count: u64 = result
-                .rows
-                .first()
-                .and_then(|r| r.first())
-                .and_then(|v| {
-                    v.as_u64()
-                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                })
-                .unwrap_or(0);
-            CheckResult {
-                name: "row_count".into(),
-                passed: count > 0,
-                severity: configured,
-                not_evaluated: None,
-                details: CheckDetails::RowCount {
-                    source_count: count,
-                    target_count: count,
+            match rocky_core::checks::cell_as_u64(result.rows.first().and_then(|r| r.first())) {
+                Some(count) => CheckResult {
+                    name: "row_count".into(),
+                    passed: count > 0,
+                    severity: configured,
+                    not_evaluated: None,
+                    details: CheckDetails::RowCount {
+                        source_count: count,
+                        target_count: count,
+                    },
                 },
+                // A measured `0` is a different answer and keeps the configured
+                // severity: the table really did report zero rows.
+                None => rocky_core::checks::row_count_not_evaluated(
+                    "the row count query returned no readable count",
+                ),
             }
         }
         Err(e) => {
@@ -2677,6 +2685,113 @@ auto_create_schemas = true
             check.severity,
             TestSeverity::Warning,
             "a measured result takes the configured severity: {check:?}"
+        );
+    }
+
+    /// The OTHER unreadable shape, found by review of #1923. The query
+    /// SUCCEEDS and the cell cannot be read — an empty row set, or a cell that
+    /// is not a number. `unwrap_or(0)` turned both into a measured count of
+    /// zero, so the check reported `not_evaluated: None` at the configured
+    /// severity and a `warning` pipeline exited 0 having counted nothing.
+    ///
+    /// ```text
+    ///   query OK, cell unreadable
+    ///     before -> count 0, passed false, not_evaluated None, Warning
+    ///               -> warning bucket -> gate clear -> exit 0
+    ///     after  -> row_count_not_evaluated -> Error -> error bucket
+    ///               -> gates, under the default `fail_on_error = true`
+    /// ```
+    ///
+    /// This is the same class as #1871 but NOT reachable from it, and the gate
+    /// guard in `output.rs` cannot catch it: this path sets
+    /// `not_evaluated: None`, so the gate never sees an unevaluated check.
+    /// The fix has to be here, at the producer.
+    ///
+    /// Reads the cell with `cell_as_u64`, so an integral float counts and a
+    /// fraction or out-of-range float does not (#1923). The Databricks BATCH
+    /// row-count path parses its own cell and is not covered by this (#1926).
+    #[test]
+    fn a_quality_row_count_that_cannot_be_read_is_not_a_measured_zero() {
+        use rocky_core::checks::CheckDetails;
+        use rocky_core::tests::TestSeverity;
+        use rocky_core::traits::QueryResult;
+
+        let ok = |rows: Vec<Vec<serde_json::Value>>| {
+            Ok(QueryResult {
+                columns: vec!["count".into()],
+                rows,
+            })
+        };
+
+        // Shapes of "the query answered, but not with a count". The last two
+        // are the ones `cell_as_u64` itself used to accept: it truncated a
+        // fraction and saturated an out-of-range float, so both arrived here
+        // wearing `Some` as a fabricated row count (#1923).
+        for (label, rows) in [
+            ("no rows", vec![]),
+            ("no cell in the row", vec![vec![]]),
+            (
+                "a cell that is not a number",
+                vec![vec![serde_json::json!("n/a")]],
+            ),
+            ("a fraction", vec![vec![serde_json::json!(5.5)]]),
+            ("an out-of-range float", vec![vec![serde_json::json!(1e30)]]),
+        ] {
+            let check = super::quality_row_count_check(ok(rows), TestSeverity::Warning);
+            assert!(!check.passed, "{label}: {check:?}");
+            assert_eq!(
+                check.severity,
+                TestSeverity::Error,
+                "{label}: declared advisory, but nothing was counted, so it \
+                 gates (#1741): {check:?}"
+            );
+            assert!(
+                check.not_evaluated.is_some(),
+                "{label}: an unreadable count must not claim it ran: {check:?}"
+            );
+            assert!(
+                matches!(check.details, CheckDetails::RowCount { .. }),
+                "{label}: {check:?}"
+            );
+        }
+
+        // An integral JSON float IS a readable count. The chain this replaces
+        // handled only integers and numeric strings, so `5.0` fell through to
+        // `unwrap_or(0)` and a populated table reported as empty.
+        let check = super::quality_row_count_check(
+            ok(vec![vec![serde_json::json!(5.0)]]),
+            TestSeverity::Warning,
+        );
+        assert!(check.passed, "5.0 is five rows, not zero: {check:?}");
+        assert!(check.not_evaluated.is_none(), "{check:?}");
+        assert_eq!(check.severity, TestSeverity::Warning, "{check:?}");
+        assert!(
+            matches!(
+                check.details,
+                CheckDetails::RowCount {
+                    target_count: 5,
+                    ..
+                }
+            ),
+            "{check:?}"
+        );
+
+        // The measured-zero case is a DIFFERENT answer and must stay measured:
+        // an empty table really did report 0, and the operator's `warning`
+        // still applies to it.
+        let check = super::quality_row_count_check(
+            ok(vec![vec![serde_json::json!(0)]]),
+            TestSeverity::Warning,
+        );
+        assert!(!check.passed, "zero rows is a failing row count: {check:?}");
+        assert!(
+            check.not_evaluated.is_none(),
+            "a real zero was measured: {check:?}"
+        );
+        assert_eq!(
+            check.severity,
+            TestSeverity::Warning,
+            "a MEASURED violation still takes the configured severity: {check:?}"
         );
     }
 
