@@ -196,9 +196,25 @@ pub fn redact(text: &str) -> String {
         return text.to_string();
     }
 
+    let spans = discover_spans(text, &pairs);
+    if spans.is_empty() {
+        return text.to_string();
+    }
+    rewrite_merged(text, spans)
+}
+
+/// Every occurrence of every form, with overlapping matches of the SAME form
+/// already collapsed.
+///
+/// Separate from [`redact`] because the collapse is invisible in the output:
+/// the merge step produces identical bytes whether or not this collapses, so
+/// only the span COUNT distinguishes them, and a test needs to see it. That
+/// count is the difference between one span and ~62.9M for a
+/// repeated-character value in a large body.
+fn discover_spans(text: &str, pairs: &[(String, String)]) -> Vec<Span> {
     let mut spans: Vec<Span> = Vec::new();
-    for (value, replacement) in &pairs {
-        let replacement = safe_replacement(replacement, &pairs);
+    for (value, replacement) in pairs {
+        let replacement = safe_replacement(replacement, pairs);
         for form in escaped_forms(value) {
             let mut from = 0;
             // The open run of this form, collapsed as it is found.
@@ -255,10 +271,11 @@ pub fn redact(text: &str) -> String {
             }
         }
     }
-    if spans.is_empty() {
-        return text.to_string();
-    }
+    spans
+}
 
+/// Merge overlapping spans and rewrite each run once.
+fn rewrite_merged(text: &str, mut spans: Vec<Span>) -> String {
     spans.sort_by_key(|s| (s.start, std::cmp::Reverse(s.end)));
 
     let mut out = String::with_capacity(text.len());
@@ -966,7 +983,20 @@ mod tests {
     #[test]
     fn a_repeated_character_run_collapses_to_one_replacement() {
         register_substitution("ROCKY_RUN", "AAAAAAAA");
-        let out = redact(&format!(r#"{{"m":"{}"}}"#, "A".repeat(64)));
+        let body = format!(r#"{{"m":"{}"}}"#, "A".repeat(64));
+
+        // The COUNT is the thing the fix changes. The merge downstream
+        // produces identical output either way, so asserting on `redact`'s
+        // result cannot see this — without the seam the fix is unguardable.
+        let spans = discover_spans(&body, &secret_registry::substitutions());
+        let run_spans = spans.iter().filter(|s| s.end - s.start >= 8).count();
+        assert!(
+            run_spans <= 2,
+            "a 64-character run produced {run_spans} spans; retaining every \
+             overlapping offset is what reached ~62.9M spans on a large body"
+        );
+
+        let out = redact(&body);
         assert_eq!(
             out.matches("${ROCKY_RUN}").count(),
             1,
