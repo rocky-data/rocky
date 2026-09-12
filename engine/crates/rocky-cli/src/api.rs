@@ -3259,8 +3259,10 @@ mod tests {
 
         // The marker's own text is registered, so the descriptive marker
         // cannot be used — but the reader still gets a POSITIVE signal, not a
-        // bare null. The short fallback's tokens are below
-        // SECRET_LENGTH_FLOOR, so the registry cannot hold them.
+        // bare null. The fallback is safe because its WHOLE SERIALIZED FORM is
+        // shorter than SECRET_LENGTH_FLOOR, so it has no substring the
+        // registry could hold. Not because its tokens are short: the check
+        // scans serialized bytes, where token boundaries do not exist.
         let result = result.expect("a withheld result is still a signal, never null");
         assert_eq!(
             result,
