@@ -1,6 +1,6 @@
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import type { ModelFlowNode } from "./layout";
-import { NODE_WIDTH } from "./layout";
+import { NODE_HEIGHT, NODE_WIDTH } from "./layout";
 import { nodeRoute } from "./nodeRoute";
 
 /** Accent by resource kind, the VS Code Inspector's idiom in the SPA's palette. */
@@ -48,7 +48,12 @@ export function ModelNode({ data, selected }: NodeProps<ModelFlowNode>) {
       className={`flex items-center gap-2 rounded-md border border-l-4 bg-white px-2.5 py-2 text-xs shadow-xs dark:bg-zinc-900 ${kindClass(data.kind)} ${
         openable ? "cursor-pointer" : "cursor-default"
       } ${selected ? "border-sky-500" : "border-zinc-200 dark:border-zinc-700"}`}
-      style={{ width: NODE_WIDTH }}
+      // Both, not just the width. `layout.ts` declares this size to React
+      // Flow, and `position()` spaces rows by it. Measured with the card left
+      // to size itself: the wrapper was 184×46 and the card inside it 184×34,
+      // so the node carried a 12px invisible clickable band and its handles
+      // sat 6px below the card's visual centre.
+      style={{ width: NODE_WIDTH, height: NODE_HEIGHT }}
       title={title}
     >
       <Handle type="target" position={Position.Left} className="!bg-zinc-400" />
