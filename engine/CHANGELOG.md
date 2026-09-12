@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.74.0] — 2026-09-12
 
 **State store: schema v23 → v30.** 1.74.0 opens a v23 store written by 1.73.0 and migrates it in place on the next read-write open, keeping every record; a read-only open leaves the v23 stamp as it is. Each step from v24 to v30 adds fields or enum variants to stored records; none adds or changes a table, and none rewrites stored records. The v24 step adds the `observed_failing` state, a new enum variant that a 1.73.0 binary cannot read. When a 1.73.0 binary opens a v30 store, the version check at open catches it. On the paths that honour `[state] on_schema_mismatch`, the default `recreate` starts fresh local state, so the next run is a full refresh, and leaves the shared tier as it is; `fail` refuses. On the other paths, it stops with a schema-mismatch error.
 
