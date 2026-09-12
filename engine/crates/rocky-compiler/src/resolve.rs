@@ -185,12 +185,15 @@ pub fn resolve_dependencies(models: &[Model]) -> Result<ResolveOutput, ResolveEr
 
         // D012: this edge exists because the names match, and on a warehouse
         // run it may name a different object than the model writes. The edge is
-        // KEPT — `rocky_engine::executor::execute_locally` (`rocky test`,
-        // `rocky ci`) materializes each model under its own NAME, so there the
-        // read really does reach it, and dropping the edge would break that
-        // path and reorder `semantic.rs` (changing `SELECT *` expansion).
-        // Reporting is what this layer can honestly do; #1354 holds the
-        // decision about which execution semantics the graph should encode.
+        // KEPT, and the reason has changed: local execution no longer props it
+        // up. `execute_locally` now materializes at the configured
+        // `schema.table` (#1354 step 1), so a bare read of a RENAMED model's
+        // name misses there too, exactly as it does on a warehouse.
+        //
+        // What still holds the edge is `semantic.rs`: dropping it reorders
+        // `SELECT *` expansion, which is #1631 and needs its own change and
+        // test. Reporting is what this layer can honestly do until then; #1354
+        // step 2 is where the edge goes.
         for bare in &renamed_target_reads {
             let target = &renamed_targets[bare.as_str()];
             diagnostics.push(
@@ -581,12 +584,16 @@ mod tests {
     /// #1354: a bare read that matches a model by NAME while that model writes
     /// a differently-named table. The edge is KEPT and the ambiguity reported.
     ///
-    /// Keeping it is not indecision. `rocky_engine::executor::execute_locally`
-    /// (`rocky test`, `rocky ci`) materializes every model as
-    /// `CREATE OR REPLACE TABLE <model name>`, ignoring the configured target,
-    /// so on that path this read really does return the model's output and the
-    /// edge orders it correctly. On a warehouse run it does not. One graph, two
-    /// execution semantics — D012 says so rather than picking silently.
+    /// Keeping it is now purely about `semantic.rs`. It used to be defensible
+    /// on execution grounds as well — `execute_locally` materialized every
+    /// model as `CREATE OR REPLACE TABLE <model name>`, so on `rocky test` the
+    /// read did reach the model. That stopped being true at #1354 step 1: local
+    /// execution materializes at the configured `schema.table`, so both
+    /// execution paths now agree the read misses.
+    ///
+    /// The edge survives because dropping it reorders `SELECT *` expansion
+    /// (#1631). D012 reports the mismatch rather than picking silently, and
+    /// #1354 step 2 is where the edge itself goes.
     #[test]
     fn a_bare_read_of_a_renamed_target_models_name_keeps_its_edge_and_warns() {
         let models = vec![
