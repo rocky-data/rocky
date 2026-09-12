@@ -595,7 +595,7 @@ mod tests {
         let out = redact(r#"{"message":"failed: FILTER-SECRET-8e26660e-aaaa"}"#);
         assert!(
             !out.contains("FILTER-SECRET-8e26660e-aaaa"),
-            "redacted body, {} bytes",
+            "the plain token survived; redacted body, {} bytes",
             out.len()
         );
         assert!(
@@ -624,7 +624,7 @@ mod tests {
         let out = redact(&body);
         assert!(
             !out.contains(r#"FILTER-QUOTE-\"b-8e26660e"#),
-            "the escaped form must be caught: body of {} bytes",
+            "the quote-bearing value survived its escaped form; redacted body, {} bytes",
             out.len()
         );
         assert!(
@@ -652,7 +652,7 @@ mod tests {
         let out = redact(&body);
         assert!(
             !out.contains("second-line-of-the-secret"),
-            "a split value must not survive: body of {} bytes",
+            "the multi-line value survived; redacted body, {} bytes",
             out.len()
         );
     }
@@ -671,7 +671,7 @@ mod tests {
         let out = redact(&format!(r#"{{"message":"{long}"}}"#));
         assert!(
             !out.contains("-AND-THE-REST-OF-IT"),
-            "the longer secret's tail survived — the redactor created this leak: body of {} bytes",
+            "the longer nested value's tail survived — a leak the redactor created; redacted body, {} bytes",
             out.len()
         );
     }
@@ -721,7 +721,7 @@ mod tests {
         let out = redact_truncated_tail(&stored);
         assert!(
             !out.contains(&secret[..20]),
-            "the surviving prefix must be gone: body of {} bytes",
+            "the truncated prefix survived; redacted body, {} bytes",
             out.len()
         );
         assert!(
@@ -779,19 +779,19 @@ mod tests {
         let out = redact(r#"{"m":"ABCDEFGH12345678XYZ"}"#);
         assert!(
             !out.contains("5678XYZ"),
-            "B's tail survived: body of {} bytes",
+            "the overlapping value B's tail survived; redacted body, {} bytes",
             out.len()
         );
         assert!(
             !out.contains("ABCDEFGH"),
-            "A survived: body of {} bytes",
+            "the overlapping value A survived; redacted body, {} bytes",
             out.len()
         );
         // Absence alone would pass for a filter that ate the whole body, so
         // pin what it produced as well.
         assert!(
             out.contains("${ROCKY_OVERLAP_A}") && out.contains("${ROCKY_OVERLAP_B}"),
-            "an overlap must name BOTH variables, not silently drop one: body of {} bytes",
+            "an overlap named only one of A and B; redacted body, {} bytes",
             out.len()
         );
         serde_json::from_str::<serde_json::Value>(&out).unwrap_or_else(|e| {
@@ -821,7 +821,7 @@ mod tests {
         let out = redact(&format!(r#"{{"m":"{secret} and again {secret}"}}"#));
         assert!(
             !out.contains(secret),
-            "the value survived: body of {} bytes",
+            "the registered value for this test survived; redacted body, {} bytes",
             out.len()
         );
         assert!(
@@ -865,7 +865,7 @@ mod tests {
         let body = serde_json::to_string(&serde_json::json!({ "m": secret })).expect("serializes");
         assert!(
             any_value_survives(&body),
-            "a value recoverable by decoding must be detected: body of {} bytes",
+            "the solidus-escaped value was not detected by the decoded scan; body of {} bytes",
             body.len()
         );
     }
@@ -885,7 +885,7 @@ mod tests {
 
         assert!(
             !out.contains(secret),
-            "the value survived: body of {} bytes",
+            "the registered value for this test survived; redacted body, {} bytes",
             out.len()
         );
         serde_json::from_str::<serde_json::Value>(&out).unwrap_or_else(|e| {
@@ -910,12 +910,12 @@ mod tests {
         let out = redact(&body);
         assert!(
             out.contains("${ROCKY_DOUBLE_ESCAPE}"),
-            "the doubly-escaped form was not matched: body of {} bytes",
+            "the Debug-then-JSON escaped value survived; redacted body, {} bytes",
             out.len()
         );
         assert!(
             !any_value_survives(&out),
-            "the backstop must agree the value is gone: body of {} bytes",
+            "the backstop still sees the Debug-then-JSON value; redacted body, {} bytes",
             out.len()
         );
         serde_json::from_str::<serde_json::Value>(&out)
