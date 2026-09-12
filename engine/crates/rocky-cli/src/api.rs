@@ -2442,18 +2442,59 @@ pub(crate) fn scrub_job_outcome(
         crate::secret_filter::redact_truncated_tail(&crate::secret_filter::redact(text))
     };
 
+    let withheld =
+        || serde_json::json!({ "redaction": "result_withheld_unparseable_after_redaction" });
+
     let result = result.map(|value| {
+        // A registered value inside an object KEY cannot be rewritten safely.
+        // Two distinct keys whose names both carry one collapse to the same
+        // replacement, and re-parsing then keeps only one of them — a silently
+        // truncated record that still looks complete. Withhold instead.
+        if crate::secret_filter::any_key_carries_a_value(&value) {
+            return withheld();
+        }
         let Ok(text) = serde_json::to_string(&value) else {
             return serde_json::json!({ "redaction": "result_unserializable" });
         };
         match serde_json::from_str::<serde_json::Value>(&scrub(&text)) {
             Ok(scrubbed) => scrubbed,
-            Err(_) => {
-                serde_json::json!({ "redaction": "result_withheld_unparseable_after_redaction" })
-            }
+            Err(_) => withheld(),
         }
     });
     let error = error.map(|text| scrub(&text));
+
+    // THE FINAL CHECK, and its absence was a defect. Everything above is
+    // replacement GENERATION, and #1920 established that no generator can be
+    // trusted: a fallback marker can itself be a registered value, and two
+    // overlapping replacements can concatenate into one. The response filter
+    // ends with this check for exactly that reason; the durable path had no
+    // equivalent, so a surviving value was stamped trusted and written to
+    // disk (#1897).
+    let survives = result
+        .as_ref()
+        .and_then(|v| serde_json::to_string(v).ok())
+        .is_some_and(|t| crate::secret_filter::any_value_survives(&t))
+        || error
+            .as_deref()
+            .is_some_and(crate::secret_filter::any_value_survives);
+    if survives {
+        // The fallback must not be the thing that leaked. Both the marker and
+        // this message are fixed text an operator can register, and this is
+        // the LAST step — nothing scans what it returns — so each is checked
+        // and dropped entirely if it would carry a value. Storing nothing is
+        // always available and cannot leak, which is what makes this
+        // terminate (#1897).
+        let marker = withheld();
+        let marker_safe = serde_json::to_string(&marker)
+            .ok()
+            .is_some_and(|t| !crate::secret_filter::any_value_survives(&t));
+        const NOTE: &str = "withheld: a resolved value survived redaction";
+        return (
+            marker_safe.then_some(marker),
+            (!crate::secret_filter::any_value_survives(NOTE)).then(|| NOTE.to_string()),
+            rocky_core::state::CURRENT_REDACTION_VERSION,
+        );
+    }
 
     (result, error, rocky_core::state::CURRENT_REDACTION_VERSION)
 }
@@ -2532,7 +2573,42 @@ pub(crate) fn sweep_interrupted_jobs(state_path: &std::path::Path) -> anyhow::Re
         let mut done = job;
         done.state = job_state_str(JobState::Failed).to_string();
         done.finished_at = Some(chrono::Utc::now().to_rfc3339());
-        done.error = Some("interrupted by engine restart".to_string());
+        // Through the scrub, and RE-STAMPED. This is a terminal writer: it
+        // mutates `error` and persists, so without the scrub it wrote an
+        // unchecked string while inheriting the record's existing trusted
+        // stamp — a durable record claiming current redaction while holding a
+        // registered value. The message is a fixed literal, but an operator
+        // can register any string, including this one (#1897).
+        //
+        // The inherited `result` goes too, and the reason is stronger than
+        // "a previous process wrote it":
+        //
+        // **AT THIS POINT IN STARTUP THE VERIFIER IS NOT TRUSTWORTHY.** The
+        // registry is populated by `substitute_env_vars_inner`, which runs
+        // only on a config LOAD. `build_serve_state` does not load — it
+        // derives paths — so in plain `rocky serve` this sweep is the first
+        // thing after the bind check and the registry may be EMPTY, or
+        // partially filled by the watcher's initial compile, which is a race
+        // rather than an ordering. In scheduler mode
+        // `resolved_poll_interval` loads first and the registry is populated.
+        //
+        // `any_value_survives` against an empty registry answers "nothing
+        // survived" and would stamp the record current — a false assertion
+        // produced by the check meant to prevent one.
+        //
+        // **INVARIANT: the stamp here is honest only because every field left
+        // behind is process-local** — a literal error, a fresh timestamp, a
+        // cleared result. Adding an inherited field to this sweep re-opens
+        // the defect silently.
+        //
+        // No record loses data: `result` is assigned only alongside a
+        // terminal state, and the loop above skips terminal records, so a
+        // swept record never carries one.
+        let (_, error, version) =
+            scrub_job_outcome(None, Some("interrupted by engine restart".to_string()));
+        done.result = None;
+        done.error = error;
+        done.redaction_version = Some(version);
         store.record_job(&done)?;
         swept += 1;
     }
@@ -3097,11 +3173,110 @@ mod tests {
         let child_stdout = serde_json::json!({ "max_downstreams": 1234509876u64 });
         let (result, _, _) = scrub_job_outcome(Some(child_stdout), None);
 
-        let result = result.expect("a result");
-        assert_eq!(
-            result["redaction"], "result_withheld_unparseable_after_redaction",
-            "a rewrite that breaks the JSON must withhold, not store: {result}"
+        // Withheld as the marker, or as nothing at all when the marker's own
+        // text is registered by another test — the registry is process-global,
+        // so the exact fallback depends on ordering. The property is that the
+        // original payload is gone and nothing registered survived.
+        let stored = serde_json::to_string(&result).expect("serializes");
+        assert!(
+            !stored.contains("1234509876"),
+            "the numeric value survived into the stored result"
         );
+        assert!(!crate::secret_filter::any_value_survives(&stored));
+    }
+
+    /// Codex C, the blocking one. `scrub_job_outcome` stamped without ever
+    /// checking whether a value survived its own rewriting.
+    ///
+    /// The trigger is the fallback marker: register the marker's own text and
+    /// a value that forces the marker to be produced. The marker is
+    /// constructed AFTER all rewriting, so nothing scanned it — it was
+    /// stamped current and written to disk carrying a registered value.
+    #[test]
+    fn a_value_surviving_the_scrub_is_withheld_rather_than_stamped() {
+        // Forces the unparseable path: 10 digits in a numeric position.
+        rocky_core::secret_registry::register_substitution("ROCKY_SURV_NUM", "1029384756");
+        // And the marker's own text is registerable.
+        rocky_core::secret_registry::register_substitution(
+            "ROCKY_SURV_MARKER",
+            "result_withheld_unparseable_after_redaction",
+        );
+
+        let child = serde_json::json!({ "duration_ms": 1029384756u64 });
+        let (result, error, _) = scrub_job_outcome(Some(child), None);
+
+        // The marker's own text is registered, so the marker cannot be used
+        // either — the withhold path must terminate in storing NOTHING.
+        assert!(
+            result.is_none(),
+            "when even the fallback marker would carry a value, nothing may be stored"
+        );
+        let stored = serde_json::to_string(&(result, error)).expect("serializes");
+        assert!(
+            !crate::secret_filter::any_value_survives(&stored),
+            "a registered value survived into the stored record"
+        );
+    }
+
+    /// Codex C, non-blocking. Two distinct object KEYS whose names both carry
+    /// a registered value rewrite to the SAME replacement; re-parsing then
+    /// keeps only one, so the record silently loses a field while still
+    /// parsing cleanly.
+    #[test]
+    fn a_result_whose_keys_carry_a_value_is_withheld_not_silently_truncated() {
+        let shared = "KEYCOLLIDE-8e26660e";
+        rocky_core::secret_registry::register_substitution("ROCKY_KEYCOLLIDE", shared);
+
+        let child = serde_json::json!({
+            format!("{shared}_copied"): 1,
+            format!("{shared}_failed"): 2,
+        });
+        let (result, _, _) = scrub_job_outcome(Some(child), None);
+
+        // Withheld either as the marker or, if the marker text is itself
+        // registered by another test in this process, as nothing at all. The
+        // property is that the ORIGINAL keys are gone, not which fallback was
+        // chosen — the registry is process-global, so asserting the exact
+        // shape would depend on test ordering.
+        let stored = serde_json::to_string(&result).expect("serializes");
+        assert!(
+            !stored.contains("_copied") && !stored.contains("_failed"),
+            "a key collision must withhold, not store a record missing a field"
+        );
+        assert!(!crate::secret_filter::any_value_survives(&stored));
+    }
+
+    /// Codex A/D. The restart sweep mutates `error` and persists. Before this
+    /// it kept the record's existing trusted stamp, so a durable record could
+    /// claim current redaction while holding an unchecked string.
+    #[test]
+    fn the_restart_sweep_scrubs_and_restamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut running = persisted_job("swept-1", "running");
+            // A pre-existing result this process cannot re-verify.
+            running.result = Some(serde_json::json!({ "from": "a previous process" }));
+            store.record_job(&running).unwrap();
+        }
+
+        let swept = sweep_interrupted_jobs(&state_path).expect("sweep");
+        assert_eq!(swept, 1);
+
+        let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+        let done = store.get_job("swept-1").unwrap().expect("record");
+        assert_eq!(
+            done.redaction_version,
+            Some(rocky_core::state::CURRENT_REDACTION_VERSION),
+            "the sweep must RE-STAMP, not inherit"
+        );
+        assert!(
+            done.result.is_none(),
+            "an inherited result cannot be re-verified by this process, so it \
+             must not be carried forward under a current stamp"
+        );
+        assert!(!done.redaction_is_legacy());
     }
 
     /// #1897 PR2. A record written before the scrub existed serves its
