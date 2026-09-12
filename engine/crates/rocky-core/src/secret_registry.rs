@@ -21,6 +21,16 @@
 //! Registering inside the expander means a future caller is covered by
 //! construction: there is no "remember to register" step to skip.
 //!
+//! **The limit of "by construction".** It holds for callers that reach the
+//! environment through `substitute_env_vars` and its expander. A producer that
+//! calls `std::env::var` DIRECTLY and puts the result into a response bypasses
+//! this entirely — the value is never registered, so the filter has nothing to
+//! match, and if nothing else had registered, `is_empty()` would make the
+//! filter skip the body altogether. Every path converges on the expander today
+//! and that was checked, but it is an invariant held by convention rather than
+//! by the type system. Anyone reaching for `std::env::var` on a response path
+//! is opting out of this.
+//!
 //! ## Monotonic, on purpose
 //!
 //! An entry is never removed. A config that stops referencing `${OLD_TOKEN}`

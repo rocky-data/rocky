@@ -2989,12 +2989,14 @@ mod tests {
             !body.contains(secret),
             "POST /api/v1/compile hand-builds its body with axum::Json, so it \
              bypasses PrettyJson entirely. The resolved value must still be \
-             gone: {body}"
+             gone. Body length: {} bytes",
+            body.len()
         );
         assert!(
             body.contains("${ROCKY_OUTERMOST_PROBE}"),
             "and the variable must be named, or the operator cannot tell what \
-             failed: {body}"
+             failed. Body length: {} bytes",
+            body.len()
         );
     }
 

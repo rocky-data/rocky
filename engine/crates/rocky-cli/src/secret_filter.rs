@@ -593,8 +593,16 @@ mod tests {
     fn a_registered_value_becomes_its_variable_name() {
         register_substitution("ROCKY_FILTER_TOKEN", "FILTER-SECRET-8e26660e-aaaa");
         let out = redact(r#"{"message":"failed: FILTER-SECRET-8e26660e-aaaa"}"#);
-        assert!(!out.contains("FILTER-SECRET-8e26660e-aaaa"), "{out}");
-        assert!(out.contains("${ROCKY_FILTER_TOKEN}"), "{out}");
+        assert!(
+            !out.contains("FILTER-SECRET-8e26660e-aaaa"),
+            "redacted body, {} bytes",
+            out.len()
+        );
+        assert!(
+            out.contains("${ROCKY_FILTER_TOKEN}"),
+            "redacted body, {} bytes",
+            out.len()
+        );
     }
 
     /// The escaping case #1897 names. A raw substring search walks past a
@@ -609,15 +617,21 @@ mod tests {
             serde_json::to_string(&serde_json::json!({ "message": raw })).expect("serializes");
         assert!(
             body.contains(r#"FILTER-QUOTE-\"b-8e26660e"#),
-            "PRECONDITION: serde must have escaped the quote: {body}"
+            "PRECONDITION: serde must have escaped the quote: body of {} bytes",
+            body.len()
         );
 
         let out = redact(&body);
         assert!(
             !out.contains(r#"FILTER-QUOTE-\"b-8e26660e"#),
-            "the escaped form must be caught: {out}"
+            "the escaped form must be caught: body of {} bytes",
+            out.len()
         );
-        assert!(out.contains("${ROCKY_FILTER_QUOTE}"), "{out}");
+        assert!(
+            out.contains("${ROCKY_FILTER_QUOTE}"),
+            "redacted body, {} bytes",
+            out.len()
+        );
     }
 
     /// The line-splitting case. A multi-line value is contiguous once serde
@@ -631,13 +645,15 @@ mod tests {
             serde_json::to_string(&serde_json::json!({ "message": raw })).expect("serializes");
         assert!(
             body.contains("FILTER-LINE-8e26660e\\nsecond-line-of-the-secret"),
-            "PRECONDITION: the newline must be escaped: {body}"
+            "PRECONDITION: the newline must be escaped: body of {} bytes",
+            body.len()
         );
 
         let out = redact(&body);
         assert!(
             !out.contains("second-line-of-the-secret"),
-            "a split value must not survive: {out}"
+            "a split value must not survive: body of {} bytes",
+            out.len()
         );
     }
 
@@ -655,7 +671,8 @@ mod tests {
         let out = redact(&format!(r#"{{"message":"{long}"}}"#));
         assert!(
             !out.contains("-AND-THE-REST-OF-IT"),
-            "the longer secret's tail survived — the redactor created this leak: {out}"
+            "the longer secret's tail survived — the redactor created this leak: body of {} bytes",
+            out.len()
         );
     }
 
@@ -677,7 +694,11 @@ mod tests {
     fn a_value_below_the_floor_is_left_alone() {
         register_substitution("ROCKY_FILTER_SHORTVAL", "abc");
         let out = redact(r#"{"message":"abc is shown"}"#);
-        assert!(out.contains("abc is shown"), "{out}");
+        assert!(
+            out.contains("abc is shown"),
+            "redacted body, {} bytes",
+            out.len()
+        );
     }
 
     /// #1897. A fragment left by a truncation that happened BEFORE the
@@ -700,9 +721,14 @@ mod tests {
         let out = redact_truncated_tail(&stored);
         assert!(
             !out.contains(&secret[..20]),
-            "the surviving prefix must be gone: {out}"
+            "the surviving prefix must be gone: body of {} bytes",
+            out.len()
         );
-        assert!(out.contains("${ROCKY_FILTER_PREFIX}"), "{out}");
+        assert!(
+            out.contains("${ROCKY_FILTER_PREFIX}"),
+            "redacted body, {} bytes",
+            out.len()
+        );
     }
 
     /// The final segment is ordinary trailing text, not a cut. This is the
@@ -751,16 +777,29 @@ mod tests {
         register_substitution("ROCKY_OVERLAP_B", b);
 
         let out = redact(r#"{"m":"ABCDEFGH12345678XYZ"}"#);
-        assert!(!out.contains("5678XYZ"), "B's tail survived: {out}");
-        assert!(!out.contains("ABCDEFGH"), "A survived: {out}");
+        assert!(
+            !out.contains("5678XYZ"),
+            "B's tail survived: body of {} bytes",
+            out.len()
+        );
+        assert!(
+            !out.contains("ABCDEFGH"),
+            "A survived: body of {} bytes",
+            out.len()
+        );
         // Absence alone would pass for a filter that ate the whole body, so
         // pin what it produced as well.
         assert!(
             out.contains("${ROCKY_OVERLAP_A}") && out.contains("${ROCKY_OVERLAP_B}"),
-            "an overlap must name BOTH variables, not silently drop one: {out}"
+            "an overlap must name BOTH variables, not silently drop one: body of {} bytes",
+            out.len()
         );
-        serde_json::from_str::<serde_json::Value>(&out)
-            .unwrap_or_else(|e| panic!("overlap redaction produced invalid JSON ({e}): {out}"));
+        serde_json::from_str::<serde_json::Value>(&out).unwrap_or_else(|e| {
+            panic!(
+                "overlap redaction produced invalid JSON ({e}), {} bytes",
+                out.len()
+            )
+        });
     }
 
     /// Codex, delta pass. The occurrence scan advanced `from = start + 1` and
@@ -780,8 +819,16 @@ mod tests {
         register_substitution("ROCKY_MULTIBYTE_LEAD", secret);
 
         let out = redact(&format!(r#"{{"m":"{secret} and again {secret}"}}"#));
-        assert!(!out.contains(secret), "the value survived: {out}");
-        assert!(out.contains("${ROCKY_MULTIBYTE_LEAD}"), "{out}");
+        assert!(
+            !out.contains(secret),
+            "the value survived: body of {} bytes",
+            out.len()
+        );
+        assert!(
+            out.contains("${ROCKY_MULTIBYTE_LEAD}"),
+            "redacted body, {} bytes",
+            out.len()
+        );
     }
 
     /// Codex, delta pass. The backstop: a finished body that still carries a
@@ -818,7 +865,8 @@ mod tests {
         let body = serde_json::to_string(&serde_json::json!({ "m": secret })).expect("serializes");
         assert!(
             any_value_survives(&body),
-            "a value recoverable by decoding must be detected: {body}"
+            "a value recoverable by decoding must be detected: body of {} bytes",
+            body.len()
         );
     }
 
@@ -835,9 +883,14 @@ mod tests {
             serde_json::to_string(&serde_json::json!({ "message": secret })).expect("serializes");
         let out = redact(&body);
 
-        assert!(!out.contains(secret), "the value survived: {out}");
-        serde_json::from_str::<serde_json::Value>(&out)
-            .unwrap_or_else(|e| panic!("redaction produced invalid JSON ({e}): {out}"));
+        assert!(
+            !out.contains(secret),
+            "the value survived: body of {} bytes",
+            out.len()
+        );
+        serde_json::from_str::<serde_json::Value>(&out).unwrap_or_else(|e| {
+            panic!("redaction produced invalid JSON ({e}), {} bytes", out.len())
+        });
     }
 
     /// Codex C1. A value escaped TWICE on its way to the wire: a
@@ -857,14 +910,16 @@ mod tests {
         let out = redact(&body);
         assert!(
             out.contains("${ROCKY_DOUBLE_ESCAPE}"),
-            "the doubly-escaped form was not matched: {out}"
+            "the doubly-escaped form was not matched: body of {} bytes",
+            out.len()
         );
         assert!(
             !any_value_survives(&out),
-            "the backstop must agree the value is gone: {out}"
+            "the backstop must agree the value is gone: body of {} bytes",
+            out.len()
         );
         serde_json::from_str::<serde_json::Value>(&out)
-            .unwrap_or_else(|e| panic!("produced invalid JSON ({e}): {out}"));
+            .unwrap_or_else(|e| panic!("produced invalid JSON ({e}), {} bytes", out.len()));
     }
 
     /// Codex C4. A replacement can itself contain a registered value when a
@@ -881,7 +936,8 @@ mod tests {
         let out = redact(r#"{"m":"ZZZZZZZZ-c4"}"#);
         assert!(
             !out.contains(first),
-            "the replacement reintroduced an already-scanned value: {out}"
+            "the replacement reintroduced an already-scanned value: body of {} bytes",
+            out.len()
         );
     }
 
@@ -917,7 +973,8 @@ mod tests {
         assert!(
             !body.contains(secret),
             "PRECONDITION: the raw value must be ABSENT from the wire bytes, \
-             or the wire scan would catch it and this proves nothing: {body}"
+             or the wire scan would catch it and this proves nothing: body of {} bytes",
+            body.len()
         );
 
         assert!(
@@ -944,7 +1001,8 @@ mod tests {
         let out = redact_truncated_tail(&stored);
         assert!(
             out.contains("${ROCKY_ESCAPED_TAIL}"),
-            "an escaped truncated prefix must be rewritten: {out}"
+            "an escaped truncated prefix must be rewritten: body of {} bytes",
+            out.len()
         );
     }
 
@@ -1000,9 +1058,14 @@ mod tests {
         assert_eq!(
             out.matches("${ROCKY_RUN}").count(),
             1,
-            "a run of one character must collapse to a single span: {out}"
+            "a run of one character must collapse to a single span: body of {} bytes",
+            out.len()
         );
-        assert!(!out.contains("AAAAAAAA"), "the run survived: {out}");
+        assert!(
+            !out.contains("AAAAAAAA"),
+            "the run survived: body of {} bytes",
+            out.len()
+        );
     }
 
     #[test]
