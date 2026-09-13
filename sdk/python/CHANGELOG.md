@@ -5,7 +5,58 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.15.0] — 2026-09-12
+
+Pairs with engine 1.74.0.
+
+### Added
+
+- **Three typed client methods: `product_list()`, `product_journal()` and `schedule_spool()`.** `product_list()` runs `rocky product list` and returns a `ProductListOutput`, one status row per product (#1677). `product_journal(product)` runs `rocky product journal <name>` and returns a `ProductJournalOutput`, the product's fulfillment journal in append order (#1686). `schedule_spool()` runs `rocky state schedule spool` and returns a `ScheduleSpoolOutput`: the webhook demands that no tick has consumed yet (#1899). All three only read.
+
+  **They need engine 1.74.0.** None of the three verbs is in engine 1.73.0. The SDK's minimum-binary check is still `MIN_ROCKY_VERSION = "1.34.0"`, so it does not catch this. Against an older binary the call fails at the CLI, not at the version check.
+
+- **`parse_rocky_output()` routes three new commands:** `product_list`, `product_journal` and `state-schedule-spool`. The `RockyOutput` union includes the three models, and the schema-parity test maps each to its schema file.
+
+- **`RunResult` gains `check_gate_failed` and `verify_after_failed`.** Both are on the hand-written model that `run()` returns and on the generated `RunOutput`. On `RunResult` both default to `False`; on the generated `RunOutput` both default to `None`. The engine leaves each out of the JSON when it is `false`.
+  - `check_gate_failed` is `True` when an error-severity check failed and the pipeline's `fail_on_error` gate is on. It is a gate, not a tally. Count `check_results` for the number of failed checks. A resumed run can inherit it from the run it resumed, with clean `check_results` of its own. (#1671, #1734)
+  - `verify_after_failed` is `True` when the run auto-applied additive schema drift and the post-apply `verify_after` gate did not confirm it. It is a separate verdict: `check_gate_failed` can be `False` while this one is `True`. (#1749)
+
+- **`not_evaluated` is on every generated check-result variant.** In 0.14.0 only the cross-source overlap variant had it. Every generated check-result variant in `run_schema.py` now carries it (seven at this version), and its docstring says it applies to every check kind: a failed query, an unreadable result cell, a refused SQL fragment or a misconfigured key. While it is set, the numeric fields are placeholders, not readings. `passed` is `False` in those cases, except for a check the configuration does not apply to, which passes. The hand-written `CheckResult` already had the field; only its comment changed. (#1652, #1706)
+
+- **`test()` now returns the compiler diagnostics from the compile that `rocky test` runs.** `TestResult` is an alias of the generated `TestOutput`, which gains `diagnostics`: the non-error diagnostics, such as `W001`, `P002` and `I003`. Errors already fail the command. It defaults to `None` when the engine does not send it. (#1661)
+
+- **`ai_contract()` reports what the drafting loop did not check.** `AiContractOutput` gains `unverified_types`, the declared column types the compiler could not compare (`I003`), and `unmatched_columns`, the optional declared columns the model does not produce (`W010`). An empty `errors` list is not evidence that the declared types are right. (#1660)
+
+- **New generated models, importable from `rocky_sdk.types_generated` only.**
+  - Shapes of the `rocky serve` HTTP API: `HealthOutput`, `ModelListOutput`, `ModelDetailOutput`, `DagLayersOutput` and `DagStatusOutput` (#1665), and `ProjectOutput` (#1690, #1849), with their nested models.
+  - CLI outputs that have no client method: `DocsOutput` and `SnapshotOutput` (#1759); `ListPipelinesOutput`, `ListAdaptersOutput`, `ListModelsOutput` and `ListSourcesOutput` (#1810); `PolicyRulesOutput` for `rocky policy show` (#1874, #1913).
+  - Nested models: `SpoolCounts`, `SpoolPendingEntry` and `SpoolSkippedEntry` inside `ScheduleSpoolOutput`, and `AuditProductScope` (see below).
+
+  The `rocky_sdk.types_generated` barrel gains 42 names. Only five are re-exported from `rocky_sdk.types` and the top-level `rocky_sdk`: `ProductListOutput`, `ProductListEntry`, `ProductJournalOutput`, `ProductJournalEntry` and `ScheduleSpoolOutput`. `parse_rocky_output()` does not route any of the models listed above. For `DocsOutput`, `SnapshotOutput`, the four `List*Output` models and `PolicyRulesOutput`, it raises `ValueError: Unknown Rocky command type`.
+
+### Changed
+
+- **`ReviewQueueEntry` gains a required `models` list and an optional `preview_model`.** `models` names the compiled models the entry stands for. An empty list means "unknown", not "no models". `preview_model` is the one model a row sample can be offered for, or `None`. The `model` docstring now says that on a plan-level escalation (`backfill` / `gc` / `restore`) it is a display label such as `"backfill: 3 model(s)"`, not a model name. (#1828)
+
+  **Output from an older engine fails validation against this model.** Engines before 1.74.0 do not emit `models`. No client method and no `parse_rocky_output()` route returns `ReviewQueueOutput`, so this reaches only code that imports it from `rocky_sdk.types_generated` and validates `rocky review --queue` output itself.
+
+- **Generated enum class names shifted in four modules. Unlike 0.13.0, none shifts silently.** #1874 added `policy_show_schema`, and datamodel-codegen renumbered the positional `Policy*` enum names in four other modules:
+
+  | Module | Was | Is now |
+  |---|---|---|
+  | `review_queue_schema` | `PolicyCapability64` … `74`, `PolicyPrincipal16` | `PolicyCapability77` … `87`, `PolicyPrincipal18` |
+  | `policy_test_schema` | `PolicyCapability51` … `61`, `PolicyEffect19` / `20`, `PolicyPrincipal13` | `PolicyCapability64` … `74`, `PolicyEffect22` / `23`, `PolicyPrincipal15` |
+  | `product_verify_schema` | `PolicyEffect21` / `22` / `23` | `PolicyEffect24` / `25` / `26` |
+  | `rocky_project_schema` | `PolicyCapability77` … `87`, `PolicyEffect24` / `25` / `26`, `PolicyPrincipal19` | `PolicyCapability90` … `100`, `PolicyEffect27` / `28` / `29`, `PolicyPrincipal21` |
+
+  Each old name is gone from its own module. A direct import such as `from rocky_sdk.types_generated.review_queue_schema import PolicyCapability64` now raises `ImportError`. Some old names now exist in a *different* module. For example, `PolicyCapability64` … `74` are now in `policy_test_schema`. None of these names is exported from `rocky_sdk.types` or from the `rocky_sdk.types_generated` barrel. No `BaseModel` class in the four modules was renamed.
+
+- **Smaller additions to existing models.**
+  - `AuditOutput.product` (optional, an `AuditProductScope`): the product filter of `rocky audit --product <name>`, with the output model the ledger rows were filtered to. (#1685)
+  - `BriefOutput.config_error` (optional): set when `rocky.toml` is present and could not be loaded. The digest still renders. `rocky brief` exits non-zero when it is set. (#1755)
+  - `SkippedDemandOutput.reason` can now be `spool_unreadable`: something is at `.rocky/pending-demands` that could not be read, so no pending webhook demand was consumed that tick. A missing spool directory does not produce it. (#1752)
+
+- **Docstring-only updates.** `FulfillOutput.state` lists `observed_failing` (#1539). `ContractResult.warnings` can carry a required column whose type Rocky could not compare (#1643). In the project model: `ChecksConfig.anomaly_threshold_pct` now says `0` disables detection and a non-finite value is refused when the config loads (#1793, #1832). `FulfillConfig.briefs_dir` lists `data-repair.md` (#1539). `RequiredColumn.type` says an unrecognised declared type goes to `ContractResult.warnings` and is not compared, and an unrecognised *landed* type refuses the load (#1805).
 
 ## [0.14.0] — 2026-09-03
 

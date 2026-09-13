@@ -1,6 +1,6 @@
 [project]
 name = "dagster-rocky"
-version = "1.65.0"
+version = "1.66.0"
 description = "Dagster integration for the Rocky SQL transformation engine"
 readme = "README.md"
 license = "Apache-2.0"
@@ -40,7 +40,11 @@ dependencies = [
     # this floor is the only thing protecting the published wheel. Release
     # rocky-sdk 0.13.0 BEFORE any dagster-rocky release carrying this floor.
     # (#1348)
-    "rocky-sdk>=0.13.0",
+    # 0.15.0: `resource.py` imports ProductJournalOutput, ProductListOutput and
+    # ScheduleSpoolOutput, and `component.py` reads RunResult.check_gate_failed.
+    # None of them exists in 0.14.0, so the same import-time failure applies.
+    # Release rocky-sdk 0.15.0 BEFORE dagster-rocky 1.66.0.
+    "rocky-sdk>=0.15.0",
     # Floor matches the version CI actually resolves and tests (uv.lock). The
     # RockyComponent path uses dagster.components.* APIs from preview namespaces,
     # so we advertise a tested floor rather than an older, never-exercised one.
