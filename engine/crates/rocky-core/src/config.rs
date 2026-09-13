@@ -10687,17 +10687,35 @@ schema_template = "raw__{{source}}"
         };
 
         // Values an operator legitimately writes, including a template whose
-        // placeholder is resolved later from schema identifiers.
+        // placeholder is resolved later from schema identifiers. This list is
+        // also the accepted-examples block on the `[pipeline.NAME]` reference
+        // page, so a change here has to change that page too.
         for ok in [
             "NULL",
             "'rocky'",
+            "1",
             "CURRENT_TIMESTAMP",
             "current_timestamp()",
+            "CAST('x' AS VARCHAR)",
             "'{source}'",
+            "CONCAT('{tenant}', '_', '{source}')",
         ] {
             let errors = validate_metadata_columns(&cfg_with(ok));
             assert!(errors.is_empty(), "{ok} must be accepted: {errors:?}");
         }
+
+        // An UNQUOTED placeholder. The reference page tells operators to quote
+        // them and says the refusal is a PARSE failure, so pin the reason and
+        // not only the refusal.
+        let errors = validate_metadata_columns(&cfg_with("{tenant}"));
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ConfigError::MetadataColumnValueRefused { reason, .. }]
+                    if reason.contains("does not parse as a single SQL expression")
+            ),
+            "an unquoted placeholder must be refused as unparseable, got {errors:?}"
+        );
 
         // An off-allowlist function. The name is ordinary on purpose: the rule
         // is "not on the allowlist", not "looks dangerous".

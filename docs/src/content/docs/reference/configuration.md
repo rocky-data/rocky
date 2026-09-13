@@ -222,7 +222,7 @@ A function that is not on the list is refused, and the message names the list so
 value = "my_udf(1)"                  # refused: not on the allowlist
 ```
 
-A **placeholder must be quoted**. `value = "'{tenant}'"` is an expression; `value = "{tenant}"` is not, and is refused, because an unquoted placeholder reads as a bare column reference rather than a value. Every example in this page and in the repo quotes them.
+A **placeholder must be quoted**. `value = "'{tenant}'"` is a string literal, which parses. `value = "{tenant}"` is not valid SQL at all, so the config is refused at load with a parse error. Every placeholder in this page and in the repo is quoted.
 
 The check uses the dialect of the pipeline's **target** adapter, since that is the warehouse the expression is sent to.
 
