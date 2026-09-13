@@ -75,17 +75,23 @@ Model TOML fields (full reference: [Model Format](/reference/model-format/)):
 
 ### `[strategy]`
 
+A sidecar declares at most one `[strategy]`. If it declares none, Rocky takes one from the config group, then from the directory defaults, and otherwise uses `full_refresh`. Pick the block that matches what you need.
+
+**Incremental.**
+
 ```toml
-# Incremental
 [strategy]
 type = "incremental"
 timestamp_column = "updated_at"
+```
 
-# Merge
+**Merge.** `update_columns` is optional and defaults to all non-key columns.
+
+```toml
 [strategy]
 type = "merge"
 unique_key = ["customer_id"]
-update_columns = ["name", "email", "updated_at"]  # optional, defaults to all non-key columns
+update_columns = ["name", "email", "updated_at"]
 ```
 
 ## Example: sidecar model
