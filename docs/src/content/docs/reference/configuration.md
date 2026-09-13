@@ -222,9 +222,13 @@ A function that is not on the list is refused, and the message names the list so
 value = "my_udf(1)"                  # refused: not on the allowlist
 ```
 
-A **placeholder must be quoted**. `value = "'{tenant}'"` is a string literal, which parses. `value = "{tenant}"` is not valid SQL at all, so the config is refused at load with a parse error. Every placeholder in this page and in the repo is quoted.
+A **placeholder in a `value` must be quoted**. `value = "'{tenant}'"` is a string literal, which parses. `value = "{tenant}"` is not valid SQL at all, so the config is refused at load with a parse error.
 
-The check uses the dialect of the pipeline's **target** adapter, since that is the warehouse the expression is sent to.
+This applies to `value` only, because `value` is SQL. A placeholder in a **name** template is not SQL and stays unquoted: `schema_template = "stage__{source}"` is correct as written.
+
+The check parses against the pipeline's **target** adapter, not its source, since the target is the warehouse the expression is sent to.
+
+DuckDB, Snowflake, BigQuery and Databricks each parse under their own dialect. Trino and any adapter type Rocky does not recognise parse under a generic dialect, which accepts a **superset** of that syntax. So on those, a `value` that parses here may still be rejected by the warehouse itself. The allowlist applies either way.
 
 ### `[pipeline.NAME.source]`
 

@@ -787,7 +787,12 @@ Branch names accept `[A-Za-z0-9_.\-]` up to 64 characters. The default schema pr
 | Databricks | `` ` `` | |
 | BigQuery | `` ` `` | `\` — BigQuery reads escape sequences inside a quoted identifier, so a trailing backslash consumes the closing quote |
 
-Nothing else is refused. A hyphen or a dot promotes normally, which matters because branch names allow both. A backslash promotes everywhere except BigQuery.
+**No other character is refused by this check.** A hyphen or a dot passes it, which matters because branch names allow both. A backslash passes it everywhere except BigQuery.
+
+Two limits sit outside this check and still apply:
+
+- A schema name a transformation pipeline derives from `[args]` goes through the stricter identifier rule, `[A-Za-z0-9_]` only. A hyphen or a dot there is refused before promote quotes anything.
+- Promote also refuses a plan in which two steps replace the same production table, whatever the names look like.
 
 The check runs when a promote plan is built and again when one is applied, because a plan stores its statement as ready-made text.
 

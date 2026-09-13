@@ -93,9 +93,13 @@ Measures how long ago the table last received data, by comparing `MAX(timestamp_
 }
 ```
 
-**A table with no usable timestamp emits no freshness check at all.** `MAX()` answers `NULL` both for an empty table and for a non-empty table whose timestamp column is entirely NULL, and Rocky cannot tell those apart from that answer alone. It treats the `NULL` as "nothing to measure" and skips the check rather than reporting a failure.
+**A timestamp column that is entirely NULL emits no freshness check at all.** `MAX()` answers `NULL` both for an empty table and for a non-empty table whose timestamp column is entirely NULL. Rocky cannot tell those apart from that answer alone, so it reads the `NULL` as "nothing to measure" and emits nothing.
 
-So a table that is silently never freshness-checked looks the same in the output as one that has no `freshness` configured: the check is absent, not failing. If freshness matters for a table, confirm its `timestamp_column` is populated. Separating the two cases needs a `COUNT(*)` Rocky does not run today — tracked in [#1930](https://github.com/rocky-data/rocky/issues/1930).
+That is narrower than it sounds. A freshness query that **fails**, or that returns a cell Rocky cannot read as a timestamp, is reported as a failed `freshness_not_evaluated` check. Only a query that succeeds and answers `NULL` goes silent.
+
+In the CLI's JSON, that silence looks the same as a table with no `freshness` configured: the check is absent, not failing. In Dagster it depends on the execution mode. Outside Pipes mode, a configured freshness check has a declared spec, so the missing result surfaces as a failing check at `WARN` severity, marked `not produced by rocky`. In Pipes mode no placeholder is filled in, so the check is absent there too.
+
+If freshness matters for a table, confirm its `timestamp_column` is populated. Separating an empty table from an all-NULL one needs a `COUNT(*)` Rocky does not run today — tracked in [#1930](https://github.com/rocky-data/rocky/issues/1930).
 
 ### Null Rate
 
