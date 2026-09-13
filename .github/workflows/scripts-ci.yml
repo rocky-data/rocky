@@ -51,6 +51,20 @@ jobs:
         # Uses stub commands in scratch repos, so no Rust toolchain is needed.
         run: bash scripts/tests/mutation-check.test.sh
 
+  regen-fixtures-guards:
+    name: Regen-fixtures binary guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Pin the stale-binary refusals
+        # Stub `rocky` binaries, so no Rust toolchain and no duckdb are needed.
+        # Guards the case that regenerated five dagster fixtures BACKWARDS from
+        # a binary left over in engine/target/debug (#1933).
+        run: bash scripts/tests/regen-fixtures.test.sh
+
   ci-change-detector:
     name: CI change detector
     runs-on: ubuntu-latest
@@ -77,7 +91,7 @@ jobs:
       - name: Shellcheck the soak harness (full severity)
         # The scripts this workflow exists to protect hold the full bar and
         # already meet it.
-        run: shellcheck scripts/soak-scheduler.sh scripts/tests/ci-change-detector.test.sh
+        run: shellcheck scripts/soak-scheduler.sh scripts/tests/ci-change-detector.test.sh scripts/tests/regen-fixtures.test.sh
       - name: Shellcheck everything else (error severity)
         # Six pre-existing scripts carry SC2155/SC2012/SC2015 warnings today
         # (release.sh, the vendor_* pair, regen_fixtures.sh, build_rocky_linux.sh).
