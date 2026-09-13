@@ -56,7 +56,9 @@ freshness = { threshold_seconds = 86400 }
 
 Compares `COUNT(*)` between the source and target tables. The check passes when the counts match.
 
-Rocky batches these queries with `UNION ALL` rather than running one per table. A naive approach costs 5N queries for N tables. Batching up to 200 tables per query brings a typical pipeline down to about 3 queries. Freshness checks batch the same way.
+On Databricks, Rocky batches these queries with `UNION ALL` rather than running one per table. A naive approach costs 5N queries for N tables. Batching up to 200 tables per query brings a typical pipeline down to about 3 queries. Freshness batches the same way.
+
+No other warehouse batches these two checks today. Snowflake and BigQuery batch the schema describe only, and run row count and freshness one query per table, as every other adapter does.
 
 ```json
 {
@@ -97,16 +99,13 @@ Measures how long ago the table last received data, by comparing `MAX(timestamp_
 
 That is narrower than it sounds. A freshness query that **fails**, or that returns a cell Rocky cannot read as a timestamp, is reported as a failed `freshness_not_evaluated` check. Of the tables Rocky queries, only one whose query succeeds and answers `NULL` goes silent.
 
-A table can also go silent without any query at all. `prune_unchanged` is off by default. With it on, and only where the adapter can report a source change-marker, a table whose source has not changed skips its data checks entirely — freshness included. [Schema drift](/concepts/schema-drift/) sets out when that applies.
+A table can also go silent without any query at all. `prune_unchanged` is off by default. With it on, and only where the adapter can report a source change-marker, a table whose source has not changed skips its data checks entirely — freshness included. [Schema drift](/concepts/schema-drift/) covers pruning and what it takes.
 
 In the CLI's JSON, that silence looks the same as a table with no `freshness` configured: the check is absent, not failing.
 
-Dagster is different, and which way depends on the mode and on why the result is missing. Outside Pipes mode a configured check has a declared spec, so Dagster fills the gap itself:
+Dagster is different. In Pipes mode nothing is filled in, so the check is absent there as it is in the JSON.
 
-- a **pruned** table carries forward its last recorded verdict, or passes with a note saying it was never checked;
-- a table that was checked but produced no freshness result fails at `WARN` severity, marked `not produced by rocky`.
-
-In Pipes mode nothing is filled in, so the check is absent there as it is in the JSON.
+Outside Pipes mode a configured check has a declared spec, so Dagster never leaves it blank: it fills the gap with a placeholder, and what the placeholder says depends on why the result is missing. A **pruned** table carries forward its last recorded verdict, or passes with a note saying it was never checked. A table that was checked and produced no freshness result fails at `WARN` severity, marked `not produced by rocky`. A table that was never materialized fails at `WARN` too, with its own reason.
 
 If freshness matters for a table, confirm its `timestamp_column` is populated. Separating an empty table from an all-NULL one needs a `COUNT(*)` Rocky does not run today — tracked in [#1930](https://github.com/rocky-data/rocky/issues/1930).
 
