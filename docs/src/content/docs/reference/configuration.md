@@ -201,7 +201,30 @@ metadata_columns = [
 ]
 ```
 
-Rocky inserts the `value` field as a SQL expression, so write `"NULL"` for a null and a function call like `"CURRENT_TIMESTAMP()"` for a computed value.
+Rocky inserts the `value` field into the copy statement as a SQL expression, so write `"NULL"` for a null and a function call like `"CURRENT_TIMESTAMP()"` for a computed value.
+
+Because that text goes into generated SQL, Rocky checks it when the config loads. A `value` must be **one** expression, and any function it calls must be on Rocky's scalar-function allowlist. These all pass:
+
+```toml
+value = "NULL"
+value = "'rocky'"
+value = "1"
+value = "CURRENT_TIMESTAMP"
+value = "current_timestamp()"
+value = "CAST('x' AS VARCHAR)"
+value = "'{source}'"                 # a placeholder, quoted
+value = "CONCAT('{tenant}', '_', '{source}')"
+```
+
+A function that is not on the list is refused, and the message names the list so you can see what is allowed:
+
+```toml
+value = "my_udf(1)"                  # refused: not on the allowlist
+```
+
+A **placeholder must be quoted**. `value = "'{tenant}'"` is an expression; `value = "{tenant}"` is not, and is refused, because an unquoted placeholder reads as a bare column reference rather than a value. Every example in this page and in the repo quotes them.
+
+The check uses the dialect of the pipeline's **target** adapter, since that is the warehouse the expression is sent to.
 
 ### `[pipeline.NAME.source]`
 

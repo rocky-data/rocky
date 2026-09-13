@@ -93,6 +93,10 @@ Measures how long ago the table last received data, by comparing `MAX(timestamp_
 }
 ```
 
+**A table with no usable timestamp emits no freshness check at all.** `MAX()` answers `NULL` both for an empty table and for a non-empty table whose timestamp column is entirely NULL, and Rocky cannot tell those apart from that answer alone. It treats the `NULL` as "nothing to measure" and skips the check rather than reporting a failure.
+
+So a table that is silently never freshness-checked looks the same in the output as one that has no `freshness` configured: the check is absent, not failing. If freshness matters for a table, confirm its `timestamp_column` is populated. Separating the two cases needs a `COUNT(*)` Rocky does not run today — tracked in [#1930](https://github.com/rocky-data/rocky/issues/1930).
+
 ### Null Rate
 
 Samples the table with `TABLESAMPLE` and works out the null percentage per column. Sampling means it never scans the whole table.
