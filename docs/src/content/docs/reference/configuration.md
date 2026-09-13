@@ -228,7 +228,7 @@ This applies to `value` only, because `value` is SQL. A placeholder in a **name*
 
 The check parses against the pipeline's **target** adapter, not its source, since the target is the warehouse the expression is sent to.
 
-DuckDB, Snowflake, BigQuery and Databricks each parse under their own dialect. Trino has none of its own in Rocky's parser, so a Trino target parses under a generic dialect, which accepts more than those four share. A `value` that passes here can therefore still be rejected by Trino itself. The allowlist applies either way.
+DuckDB, Snowflake, BigQuery and Databricks each parse under their own dialect. Trino has none of its own in Rocky's parser, so a Trino target parses under a generic dialect, which accepts more than those four share. A `value` that passes here can still be rejected by Trino itself. The allowlist applies either way.
 
 ### `[pipeline.NAME.source]`
 
