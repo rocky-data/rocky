@@ -156,9 +156,21 @@ severity = "warning"
 
 # not_in_future — created_at must not be in the future. Seed generates
 # timestamps around 2026-04-01; all should pass.
+#
+# Warning severity on purpose, and it has to be: this pipeline quarantines
+# in `split` mode. Split writes two statements — the quarantine CTAS and the
+# valid CTAS — so a `not_in_future` predicate is evaluated twice against a
+# moving clock, and a row on the boundary can land in BOTH tables. Rocky
+# refuses that combination when the SQL is generated.
+#
+# Only error-severity assertions lower into the split predicate, so a
+# warning-severity one is filtered out before it can be re-evaluated. The
+# check still runs and still reports. Make it `error` here and the run is
+# refused; `mode = "drop"` or `"tag"` evaluate once and accept either
+# severity.
 [[pipeline.nightly_dq.checks.assertions]]
 name     = "orders_created_at_not_in_future"
 table    = "orders"
 type     = "not_in_future"
 column   = "created_at"
-severity = "error"
+severity = "warning"
