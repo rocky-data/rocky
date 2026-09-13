@@ -44,6 +44,21 @@ jobs:
           cache-dependency-path: editors/vscode/package-lock.json
       - run: npm ci
       - run: npm run compile
+      - name: Run unit tests (vitest)
+        # BEFORE the integration harness, and deliberately.
+        #
+        # `npm test` is the VS Code integration harness; `npm run test:unit` is
+        # vitest, and nothing ran it — so all 318 unit tests were inert,
+        # including the guard on the hand-maintained generated barrel
+        # (`src/types/generated/index.ts`, which `just codegen` never writes).
+        # Four generated output types sat unreachable on main while
+        # `codegen-drift` stayed green, because both sides it compares agreed
+        # (#1917, exports fixed by #1916).
+        #
+        # It runs first because it is the cheap half: ~3s, no display, no xvfb.
+        # A barrel regression should fail before the runner spends minutes
+        # booting VS Code.
+        run: npm run test:unit
       - name: Run tests
         run: xvfb-run -a npm test
 
