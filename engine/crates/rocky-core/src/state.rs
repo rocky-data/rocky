@@ -6298,6 +6298,96 @@ pub struct PolicyDecisionRecord {
     pub auto_apply: Option<AutoApplyCustody>,
 }
 
+/// What kind of event a [`PolicyDecisionRecord`] row records.
+///
+/// The `policy_decisions` table is documented as one row per policy
+/// *evaluation*, and [`StateStore::record_policy_decision`] says so. It is not:
+/// the table has accumulated several event kinds, each distinguished a
+/// different way, and a reader that switches on `effect` alone treats them all
+/// as evaluations.
+///
+/// ```text
+///   Evaluation           the default — a gate decided something about a plan
+///   VerifyAfterCustody   `verify_after` non-empty; `effect` is the
+///                        VERIFICATION verdict, not a policy verdict
+///   Freeze / Unfreeze    `plan_id` prefixed "freeze:" / "unfreeze:";
+///                        `effect` is Deny / Allow as an administrative act
+/// ```
+///
+/// # Why this is derived rather than stored
+///
+/// A persisted tag would be stronger: an unclassified row would be
+/// unrepresentable rather than merely unusual. It is not worth its price here.
+/// Adding a field to this record means a schema-version bump, and a bump shifts
+/// the remote state key segment, after which the download path finds no object
+/// and empties every replicated table — including this one (#1955). Fixing how
+/// the ledger is *counted* is not worth making the ledger unreachable on every
+/// remote deployment.
+///
+/// So the kind is computed from evidence the row already carries. That is
+/// weaker in one specific way, stated plainly: a future event kind that this
+/// function does not know about is classified `Evaluation` and counted as one.
+/// The mitigation is that there is now exactly ONE place to teach, instead of
+/// the three separate ad-hoc predicates that let this reach three kinds
+/// unnoticed. When a schema bump happens for some other reason, or #1955 is
+/// resolved, this should become a stored tag.
+// Not serialized, by construction: this is derived from the row on read and
+// never written, which is the whole point (#1955). No serde, no schema, no
+// binding to regenerate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionKind {
+    /// A policy gate evaluated a plan. The only kind whose `effect` is a
+    /// policy verdict, and so the only kind the acceptance/denial rates may
+    /// count.
+    Evaluation,
+    /// A post-apply verification custody row. `effect` records whether the
+    /// named checks passed, which is not a statement about policy.
+    VerifyAfterCustody,
+    /// An operator froze a scope. `effect` is `Deny` as an administrative act,
+    /// not because a plan was denied.
+    Freeze,
+    /// An operator lifted a freeze. `effect` is `Allow` for the mirror reason.
+    Unfreeze,
+}
+
+impl PolicyDecisionRecord {
+    /// What kind of event this row records — see [`DecisionKind`].
+    ///
+    /// Order matters. The freeze prefixes are checked first because a freeze
+    /// row carries no `verify_after` and would otherwise fall through to
+    /// `Evaluation`, which is exactly the misclassification that let
+    /// `rocky policy freeze` raise the reported denial rate.
+    ///
+    /// `auto_apply` is deliberately NOT a discriminator. It is an orthogonal
+    /// payload: the initial governed auto-apply row is a genuine evaluation
+    /// that happens to carry custody detail, and its later verification row
+    /// carries both `auto_apply` and a non-empty `verify_after`. Treating the
+    /// payload as a kind would take real evaluations out of the rates.
+    #[must_use]
+    pub fn kind(&self) -> DecisionKind {
+        if self.plan_id.starts_with(crate::policy::FREEZE_PLAN_PREFIX) {
+            return DecisionKind::Freeze;
+        }
+        if self
+            .plan_id
+            .starts_with(crate::policy::UNFREEZE_PLAN_PREFIX)
+        {
+            return DecisionKind::Unfreeze;
+        }
+        if !self.verify_after.is_empty() {
+            return DecisionKind::VerifyAfterCustody;
+        }
+        DecisionKind::Evaluation
+    }
+
+    /// Whether this row is a policy evaluation, and so may count toward the
+    /// acceptance, review and denial rates.
+    #[must_use]
+    pub fn is_evaluation(&self) -> bool {
+        self.kind() == DecisionKind::Evaluation
+    }
+}
+
 impl PolicyDecisionRecord {
     /// Every key this decision can be looked up or matched by: the
     /// [`Self::models`] set, then [`Self::model`].
