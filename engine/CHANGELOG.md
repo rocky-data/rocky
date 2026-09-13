@@ -98,6 +98,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Omitting `[pipeline.<name>.checks]` no longer means something different from declaring it empty.** Declaring the table and leaving it empty gave `fail_on_error = true` and `anomaly_threshold_pct = 50`. Omitting it gave `false` and `0`. The struct derived its `Default`, and a derived `Default` cannot see the per-field `#[serde(default = "...")]` attributes, so an absent table fell back to Rust zero values while an empty one used the documented defaults.
+
+  **Breaking, for a plan that already exists: re-plan it.** A governed plan embeds the resolved config's identity and `rocky apply` refuses the plan if that identity has moved — the guard that stops a plan being applied against a different destination than it was authorized for. The identity is a digest over the *resolved* pipeline config, so correcting these defaults moves it for any project whose `rocky.toml` omits `[checks]`. A plan authorized before this release is refused after it, with the message it already carries:
+
+  ```
+  refusing to execute plan '<id>': the resolved routing config ... changed
+  since the plan was authorized ... Re-plan with `rocky plan` before applying.
+  ```
+
+  Nothing is lost and nothing is silent — it fails closed and names the fix. Plan ids for the same change also differ across the upgrade, for the same reason.
+
+  **Running a pipeline behaves the same.** A project whose `rocky.toml` omits `[checks]` now resolves with the failure gate on and the anomaly threshold at 50, and that changes no run's outcome. The reason is worth stating rather than asserting: a pipeline with no `[checks]` table also has every individual check disabled, so there is no error-severity check result for the gate to act on, and the anomaly threshold is only read when the row-count check is enabled. The four pipeline kinds that default the table are replication, transformation, snapshot and load; of those only replication runs pipeline-level checks. A quality pipeline requires the table, so it was never affected.
+
+  **The published schema was wrong, and that part was visible.** `schemas/rocky_project.schema.json` records the resolved default for an omitted table, so an editor reading it showed `fail_on_error: false` as the contract. It now shows `true` and `50.0`, in the root schema, the VS Code copy, the generated SDK model and `openapi.json`.
+
+  If you relied on the gate being off for a config with no `[checks]` table, declare it: `fail_on_error = false`.
+
 - **`rocky branch promote` no longer builds a statement from a target name it cannot quote.** Rocky renders a table reference through the warehouse dialect's `format_table_ref`, which checks every part before it is used — as the SQL-identifier allowlist, except a BigQuery catalog, which is checked as a GCP project id. Promote did not. It built its `CREATE OR REPLACE TABLE ... AS SELECT * FROM ...` with a local helper that called `quote_identifier` on all three parts of both names and checked nothing, and `quote_identifier` wraps a name in the dialect's delimiter without escaping it. A name carrying that delimiter ended the identifier early and the rest of the name became loose text in the statement.
 
   Promote now refuses such a name and says which character it carries. **On upgrade: a name that promotes today can start refusing.** Two characters are affected, and the second only on BigQuery. The delimiter itself — `"` on DuckDB, Snowflake and Trino, a backtick on Databricks and BigQuery. And, on BigQuery alone, a backslash: its quoted identifiers take string-literal escapes, so a name ending in one consumes the closing backtick. Everywhere else a backslash is an ordinary character and a schema named `raw\` still promotes. Nothing else changes: a hyphen or a dot still promotes on every dialect, which matters because `rocky branch create` allows both.

@@ -3248,12 +3248,12 @@ class ReplicationPipelineConfig(BaseModel):
 
     checks: ChecksConfig | None = Field(
         {
-            "anomaly_threshold_pct": 0.0,
+            "anomaly_threshold_pct": 50.0,
             "assertions": [],
             "column_match": False,
             "custom": [],
             "enabled": False,
-            "fail_on_error": False,
+            "fail_on_error": True,
             "freshness": None,
             "null_rate": None,
             "quarantine": None,
@@ -3526,12 +3526,12 @@ class LoadPipelineConfig(BaseModel):
 
     checks: ChecksConfig | None = Field(
         {
-            "anomaly_threshold_pct": 0.0,
+            "anomaly_threshold_pct": 50.0,
             "assertions": [],
             "column_match": False,
             "custom": [],
             "enabled": False,
-            "fail_on_error": False,
+            "fail_on_error": True,
             "freshness": None,
             "null_rate": None,
             "quarantine": None,
@@ -3632,12 +3632,12 @@ class SnapshotPipelineConfig(BaseModel):
 
     checks: ChecksConfig | None = Field(
         {
-            "anomaly_threshold_pct": 0.0,
+            "anomaly_threshold_pct": 50.0,
             "assertions": [],
             "column_match": False,
             "custom": [],
             "enabled": False,
-            "fail_on_error": False,
+            "fail_on_error": True,
             "freshness": None,
             "null_rate": None,
             "quarantine": None,
@@ -3705,12 +3705,12 @@ class TransformationPipelineConfig(BaseModel):
 
     checks: ChecksConfig | None = Field(
         {
-            "anomaly_threshold_pct": 0.0,
+            "anomaly_threshold_pct": 50.0,
             "assertions": [],
             "column_match": False,
             "custom": [],
             "enabled": False,
-            "fail_on_error": False,
+            "fail_on_error": True,
             "freshness": None,
             "null_rate": None,
             "quarantine": None,

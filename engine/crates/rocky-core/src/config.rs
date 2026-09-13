@@ -1234,7 +1234,24 @@ pub struct MetadataColumnConfig {
 }
 
 /// Data quality checks configuration (row count, column match, freshness, null rate, custom).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+//
+// `Default` is implemented by hand below, NOT derived, and the distinction is
+// load-bearing. A derived `Default` cannot see `#[serde(default = "...")]`, so
+// it returned the Rust zero value for every field — and because the `checks`
+// field is `#[serde(default)]` on FOUR of the five pipeline variants
+// (replication, transformation, snapshot, load — NOT quality, where the table
+// is required), an ABSENT `[checks]` table went through that derive while an
+// EMPTY one went through the field attributes. The two disagreed: absent gave
+// `fail_on_error = false`, empty gave `true` (#1924).
+//
+// This is a plain comment, not a doc comment, on purpose: `JsonSchema` exports
+// the doc comment into `schemas/rocky_project.schema.json`, and from there into
+// the vscode interface and the SDK docstring. A config author reading a tooltip
+// has no use for a note about Rust derive macros.
+//
+// The parity guard is
+// `manual_default_matches_serde_default_for_every_config_with_field_defaults`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChecksConfig {
     #[serde(default)]
@@ -1295,6 +1312,26 @@ fn default_anomaly_threshold_pct() -> f64 {
 
 fn default_fail_on_error() -> bool {
     true
+}
+
+impl Default for ChecksConfig {
+    /// Calls the same `default_*` functions the serde attributes name, so an
+    /// absent `[checks]` table and an empty one agree (#1924).
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            row_count: AggregateCheckToggle::default(),
+            column_match: AggregateCheckToggle::default(),
+            freshness: None,
+            null_rate: None,
+            custom: Vec::new(),
+            cross_source_overlap: None,
+            assertions: Vec::new(),
+            quarantine: None,
+            anomaly_threshold_pct: default_anomaly_threshold_pct(),
+            fail_on_error: default_fail_on_error(),
+        }
+    }
 }
 
 /// Replication `strategy` values the runner recognizes. Anything else parses
@@ -14621,6 +14658,202 @@ x_token = "EXTRA-SECRET"
                     "database": "ANALYTICS",
                 },
             })
+        );
+    }
+}
+
+#[cfg(test)]
+mod default_parity {
+    use super::*;
+
+    /// A config struct carrying `#[serde(default = "..."]` on any field must
+    /// implement `Default` BY HAND, and that impl must agree with the
+    /// attributes.
+    ///
+    /// The failure this catches is silent and asymmetric. A parent field
+    /// declared `#[serde(default)]` takes two different routes:
+    ///
+    /// ```text
+    /// [table] present, empty  ->  serde walks the fields
+    ///                             -> #[serde(default = "f")] applies, f() runs
+    /// [table] absent          ->  serde calls T::default()
+    ///                             -> a DERIVED Default cannot see the
+    ///                                attributes, so every field is its Rust
+    ///                                zero value
+    /// ```
+    ///
+    /// So a derived `Default` makes an absent table mean something different
+    /// from an empty one. `ChecksConfig` had exactly that: absent turned
+    /// `fail_on_error` off (#1924).
+    ///
+    /// **Compared via `Debug`, not JSON, on purpose.** A field with
+    /// `skip_serializing_if` is missing from the serialized form, so a JSON
+    /// comparison cannot see a mismatch in it — `ChecksConfig`'s own
+    /// `cross_source_overlap` is such a field. `Debug` prints every field.
+    ///
+    /// **The list is maintained by hand, and it started incomplete.** The
+    /// first version named the twelve types the report mentioned. A reviewer's
+    /// brace-depth scan of the workspace found six more that both implement
+    /// `Default` and carry a `#[serde(default = "...")]` field. Four joined the
+    /// list — `QuarantineConfig` from this very file, plus
+    /// `ComparisonThresholds`, `StateRetentionConfig` and `ShadowConfig`. All
+    /// were already correct, so there was no second bug, but they were not
+    /// covered.
+    ///
+    /// The other two are outside the class, and the distinction is the point:
+    ///
+    /// ```text
+    /// PreviewConfig   has a REQUIRED field, so it cannot deserialize from
+    ///                 `{}` and therefore cannot be a defaulted table at all.
+    ///                 Asserted separately below.
+    /// LoadOptions     lives in `rocky-adapter-sdk`, which neither depends on
+    ///                 this crate nor is depended on by it, so it cannot be
+    ///                 named here. It has its own copy of this test beside it.
+    /// ```
+    ///
+    /// Note also what `#[serde(default)]` on an `Option<T>` does NOT do: absent
+    /// gives `None`, never `T::default()`. `QuarantineConfig` reaches this list
+    /// on its own merits, not through `checks.quarantine`.
+    ///
+    /// A struct not named here is still not covered. An automatic version
+    /// would have to attribute every `#[serde(default = "...")]` to its
+    /// enclosing struct, which needs brace-depth tracking rather than a grep,
+    /// and a scan that silently matches nothing reads exactly like a scan that
+    /// passes. The real fix is to make the derive unavailable on such a struct;
+    /// until then, adding a name here is cheap and a guard that lies is not.
+    #[test]
+    fn manual_default_matches_serde_default_for_every_config_with_field_defaults() {
+        macro_rules! assert_parity {
+            ($($t:ty),+ $(,)?) => {
+                $(
+                    {
+                        let from_rust = format!("{:?}", <$t>::default());
+                        let from_serde = format!(
+                            "{:?}",
+                            serde_json::from_str::<$t>("{}").unwrap_or_else(|e| panic!(
+                                "{} must deserialize from an empty object, or an \
+                                 absent table could not use its defaults at all: {e}",
+                                stringify!($t)
+                            ))
+                        );
+                        assert_eq!(
+                            from_rust,
+                            from_serde,
+                            "{}: `Default::default()` disagrees with deserializing \
+                             an empty object, so an ABSENT table means something \
+                             different from an EMPTY one. Implement `Default` by \
+                             hand, calling the same `default_*` functions the \
+                             serde attributes name.",
+                            stringify!($t)
+                        );
+                    }
+                )+
+            };
+        }
+
+        assert_parity!(
+            AiSection,
+            BranchApprovalConfig,
+            ChecksConfig,
+            CostSection,
+            ExecutionConfig,
+            IdempotencyConfig,
+            LoadOptionsConfig,
+            ResilienceConfig,
+            RetryConfig,
+            ReuseConfig,
+            ScheduleDefaultsConfig,
+            StateConfig,
+            // Found by a reviewer's workspace scan, not by the report.
+            QuarantineConfig,
+            crate::compare::ComparisonThresholds,
+            crate::retention::StateRetentionConfig,
+            crate::shadow::ShadowConfig,
+        );
+
+        // `crate::preview::PreviewConfig` is deliberately NOT above. It has a
+        // REQUIRED field, `branch`, so it cannot deserialize from `{}` at all —
+        // which means it can never be the target of a `#[serde(default)]` field
+        // without an empty table becoming a parse error. Adding it to the list
+        // fails the precondition rather than the comparison, which is a
+        // different statement than this test makes.
+        //
+        // Pinned here so that making it a defaulted table stops being silent:
+        assert!(
+            serde_json::from_str::<crate::preview::PreviewConfig>("{}").is_err(),
+            "PreviewConfig gained a default for every field. If it is now the \
+             target of a `#[serde(default)]` field, move it into the list above \
+             — an absent table would call `Default::default()` and could \
+             disagree with an empty one."
+        );
+    }
+
+    /// The user-visible symptom, through the real TOML surface rather than
+    /// through `Default` directly.
+    ///
+    /// Omitting `[checks]` used to switch the gate off: `fail_on_error` came
+    /// back `false` and `anomaly_threshold_pct` `0`, while declaring the table
+    /// and leaving it empty gave `true` and `50`.
+    #[test]
+    fn an_absent_checks_table_gives_the_same_defaults_as_an_empty_one() {
+        // Lifted from `duckdb_without_kind_validates_as_both_roles` rather
+        // than hand-built: a fixture invented for this test can be the wrong
+        // shape and still look right.
+        let base = r#"
+[adapter.local]
+type = "duckdb"
+
+[pipeline.poc]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.source.discovery]
+adapter = "local"
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "poc"
+schema_template = "demo"
+"#;
+        let absent: RockyConfig = toml::from_str(base).expect("parses without [checks]");
+        let declared: RockyConfig = toml::from_str(&format!("{base}\n[pipeline.poc.checks]\n"))
+            .expect("parses with an empty [checks]");
+
+        let absent = absent
+            .pipelines
+            .get("poc")
+            .expect("the pipeline is present")
+            .checks()
+            .clone();
+        let declared = declared
+            .pipelines
+            .get("poc")
+            .expect("the pipeline is present")
+            .checks()
+            .clone();
+
+        assert_eq!(
+            format!("{absent:?}"),
+            format!("{declared:?}"),
+            "omitting [checks] must mean the same as declaring it empty"
+        );
+        assert!(
+            absent.fail_on_error,
+            "omitting [checks] must not switch the failure gate off"
+        );
+        assert_eq!(
+            absent.anomaly_threshold_pct,
+            default_anomaly_threshold_pct(),
+            "omitting [checks] must not zero the anomaly threshold, which \
+             disables detection"
         );
     }
 }
