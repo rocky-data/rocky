@@ -5,9 +5,19 @@ description: Writing criterion benchmarks for the Rocky engine and wiring them t
 
 # Criterion benchmarks in Rocky
 
-## The canonical bench and the CI gate
+## The benches and the CI gate
 
-There is exactly one criterion bench in the engine today: `engine/crates/rocky-cli/benches/compile.rs`. It has four groups:
+There are **three** criterion benches in the engine, and the workflow runs two of them:
+
+| Crate | Bench | File | In `engine-bench.yml`? |
+|---|---|---|---|
+| `rocky-cli` | `compile` | `benches/compile.rs` | yes |
+| `rocky-core` | `state_store` | `benches/state_store.rs` | yes |
+| `rocky-core` | `dag_execute` | `benches/dag_execute.rs` | **no** |
+
+`dag_execute` runs only when you invoke it locally. Whether it should be wired into the workflow is an open question — see #1947. Do not assume CI has exercised it.
+
+`compile.rs` has four groups:
 
 - `cold_compile` — full `compile()` over synthetic projects of 10 / 100 / 1,000 models (plus 10,000 in release mode only — debug builds with DuckDB C++ would take ~30 s per iter and dominate CI).
 - `dag_resolution` — `topological_sort` + `execution_layers` on diamond-shaped DAGs of 10 / 100 / 500 / 1000 nodes.
@@ -35,18 +45,21 @@ jobs:
         run: |
           cargo bench --bench compile -p rocky-cli -- --output-format bencher | tee bench-output.txt
           cargo bench --bench state_store -p rocky-core -- --output-format bencher | tee -a bench-output.txt
-      - name: Store benchmark results
-        uses: benchmark-action/github-action-benchmark@...
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@...
         with:
-          alert-threshold: '120%'        # fail-on-alert is false, but a comment is posted
-          fail-on-alert: false
+          name: bench-output
+          path: engine/bench-output.txt
+          if-no-files-found: error
 ```
+
+**There is no comparison step, and there never has been one that worked.** The workflow's own comment says why: it runs only on `perf`-labeled PRs, with no push trigger, so there is no main-branch baseline to compare against. `github-action-benchmark` needs a `gh-pages` history branch, and this repo has none. The run uploads raw bencher output as a downloadable artifact and stops there.
 
 **The rules you actually need to know:**
 
 1. **Benches only run when the `perf` label is on the PR.** Adding a bench doesn't automatically run it on PR. To exercise it, add the `perf` label.
-2. **The action runs two benches** — `cargo bench --bench compile -p rocky-cli` and `cargo bench --bench state_store -p rocky-core` — hardcoded to those targets. If you add a new `[[bench]]` in another crate (or a third one here), the workflow **will not** run it until you add another invocation.
-3. **Alert threshold is 120% of the stored baseline**, with `fail-on-alert: false` — regressions post a PR comment but don't block merge. The comment is how you learn the baseline drifted.
+2. **The workflow runs two of the three benches** — `cargo bench --bench compile -p rocky-cli` and `cargo bench --bench state_store -p rocky-core` — hardcoded to those targets. A new `[[bench]]` is **not** picked up until you add another invocation. This is not hypothetical: `rocky-core`'s `dag_execute` already exists and is already not run.
+3. **Nothing compares your numbers to anything.** No baseline, no alert threshold, no PR comment, no pass/fail. To see a regression you download the `bench-output` artifact and read it, or you run the bench locally on both revisions yourself. Treat the CI run as evidence the bench still COMPILES AND RUNS, not as a perf gate.
 4. **Binary startup bench assumes `cargo run` works from the working directory** — it's advisory, not load-bearing; don't panic if it reports noisy numbers.
 
 ## Adding a new criterion bench to an existing crate
@@ -103,7 +116,7 @@ jobs:
 
 4. **Reduce `sample_size` for expensive iters.** The default 100 samples × ~30 s per iter = 50 minutes. `group.sample_size(10)` is the right call for anything that touches DuckDB, the full compiler, or a real filesystem fixture.
 
-5. **Name groups and IDs stably.** The bench-action stores results by `<group>/<id>` pairs. Renaming a group loses its history. If you must rename, accept that the first post-rename run will look like a regression (it has no baseline).
+5. **Name groups and IDs for a reader, not for history.** Nothing stores results between runs, so renaming a group loses nothing and costs nothing — there is no baseline to break. Criterion's own `target/criterion/` directory is local and per-checkout, so it is not history either: deleting `engine/target` destroys no CI perf record, because none is kept. Name them clearly because a human reads them in the artifact.
 
 6. **Test locally before adding the `perf` label.**
 
