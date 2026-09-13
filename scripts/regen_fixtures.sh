@@ -21,6 +21,9 @@
 # Prerequisites:
 #   - rocky binary built at engine/target/debug/rocky (what `just codegen`
 #     builds) or engine/target/release/rocky; set ROCKY_BIN to override.
+#     The binary's --version must match engine/rocky/Cargo.toml, and the
+#     fallback is refused outright when CARGO_TARGET_DIR is set: a stale
+#     binary here rewrites the fixtures backwards (#1933).
 #     Build with `cargo build --bin rocky` from engine/ if missing.
 #     Fixture bytes are identical under either profile — verified by a
 #     two-profile byte-diff of every generated fixture.
@@ -35,10 +38,13 @@ readonly WORKSPACE_ROOT="$(dirname "$SCRIPT_DIR")"
 # regen-fixtures` to ONE compile; release still works for anyone who has it.
 if [[ -n "${ROCKY_BIN:-}" ]]; then
     readonly ROCKY="$ROCKY_BIN"
+    readonly ROCKY_SOURCE="ROCKY_BIN"
 elif [[ -x "$WORKSPACE_ROOT/engine/target/debug/rocky" ]]; then
     readonly ROCKY="$WORKSPACE_ROOT/engine/target/debug/rocky"
+    readonly ROCKY_SOURCE="fallback"
 else
     readonly ROCKY="$WORKSPACE_ROOT/engine/target/release/rocky"
+    readonly ROCKY_SOURCE="fallback"
 fi
 readonly POC="$WORKSPACE_ROOT/examples/playground/pocs/00-foundations/01-replication-basics"
 readonly PARTITION_POC="$WORKSPACE_ROOT/examples/playground/pocs/02-performance/03-partition-checksum"
@@ -56,6 +62,58 @@ fi
 if [[ ! -x "$ROCKY" ]]; then
     echo "Error: rocky binary not found at $ROCKY" >&2
     echo "Build it with: cd engine && cargo build --bin rocky" >&2
+    exit 1
+fi
+
+# --- The binary must match the tree, or the fixtures regenerate BACKWARDS ---
+#
+# This script captures live `rocky` output, so a binary that predates the tree
+# rewrites the fixtures to the OLDER shape — and the diff reads as ordinary
+# codegen churn. A docs-only PR once rewrote five fixtures from
+# `schema_version 30` to `29` this way, inside a release PR (#1933).
+#
+# `codegen-drift` does catch it, but only after the wrong bytes are pushed, and
+# it reports a drift rather than a stale binary — so the natural next move is to
+# re-run the regen locally and commit the same wrong output again.
+#
+# TWO guards, because neither alone is sufficient:
+#
+#   version   catches a binary from a DIFFERENT release. Blind to a stale
+#             build of the same version.
+#   fallback  catches a same-version stale build, by refusing to guess when
+#             CARGO_TARGET_DIR means the guess cannot be the build you made.
+
+if [[ -n "${CARGO_TARGET_DIR:-}" && "$ROCKY_SOURCE" == "fallback" ]]; then
+    echo "Error: CARGO_TARGET_DIR is set, so $ROCKY cannot be the build you just made." >&2
+    echo "  CARGO_TARGET_DIR: $CARGO_TARGET_DIR" >&2
+    echo "  would have used:  $ROCKY" >&2
+    echo "Point ROCKY_BIN at the build you mean:" >&2
+    echo "  ROCKY_BIN=\"\$CARGO_TARGET_DIR/debug/rocky\" $0${1:+ $1}" >&2
+    exit 1
+fi
+
+expected_version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$WORKSPACE_ROOT/engine/rocky/Cargo.toml" | head -1)"
+readonly expected_version
+if [[ -z "$expected_version" ]]; then
+    echo "Error: could not read the expected version from engine/rocky/Cargo.toml." >&2
+    echo "If the manifest moved, this guard needs updating — it is what stops" >&2
+    echo "the fixtures being regenerated from a stale binary (#1933)." >&2
+    exit 1
+fi
+
+actual_version="$("$ROCKY" --version | awk '{print $NF}')"
+readonly actual_version
+if [[ "$actual_version" != "$expected_version" ]]; then
+    echo "Error: the rocky binary does not match this tree." >&2
+    echo "  tree expects: $expected_version  (engine/rocky/Cargo.toml)" >&2
+    echo "  binary is:    $actual_version" >&2
+    echo "  binary path:  $ROCKY" >&2
+    echo "  resolved by:  $ROCKY_SOURCE" >&2
+    if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+        echo "  CARGO_TARGET_DIR is set to $CARGO_TARGET_DIR" >&2
+    fi
+    echo "Regenerating from this binary would rewrite the fixtures to its shape." >&2
+    echo "Rebuild (cd engine && cargo build --bin rocky), or set ROCKY_BIN." >&2
     exit 1
 fi
 if ! command -v duckdb >/dev/null 2>&1; then
