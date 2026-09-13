@@ -1207,10 +1207,36 @@ fn build_scorecard(
 
     let verify_after = build_scorecard_verify_after(&windowed);
 
+    // Rows the rates deliberately exclude, reported so the numbers reconcile.
+    // Without this a reader sees `rocky audit` list more rows than the
+    // scorecard counted and cannot tell why: `plan_id` reveals a freeze, but
+    // nothing on the audit entry reveals a verification custody row. Carrying
+    // it in the existing `note` keeps the explanation next to the number and
+    // needs no output-shape change (#1921).
+    let excluded = windowed.len() as u64 - total_decisions;
+
     let (availability, note) = if total_decisions == 0 {
         (
             SectionAvailability::NoData,
-            Some("no policy decisions fall in the window".to_string()),
+            Some(if excluded == 0 {
+                "no policy decisions fall in the window".to_string()
+            } else {
+                format!(
+                    "no policy decisions fall in the window; {excluded} ledger \
+                     row(s) here are not evaluations (post-apply verification \
+                     custody, or freeze/unfreeze) and do not count toward these \
+                     rates"
+                )
+            }),
+        )
+    } else if excluded > 0 {
+        (
+            SectionAvailability::Available,
+            Some(format!(
+                "{excluded} ledger row(s) in this window are not policy \
+                 evaluations (post-apply verification custody, or \
+                 freeze/unfreeze) and are excluded from these rates"
+            )),
         )
     } else {
         (SectionAvailability::Available, None)
@@ -2131,6 +2157,46 @@ mod tests {
 
         assert_eq!(out.total_decisions, 0);
         assert!(out.groups.is_empty());
+    }
+
+    /// The exclusion is reported, not silent. A reader comparing `rocky audit`
+    /// against the scorecard must be able to account for the difference —
+    /// `plan_id` reveals a freeze, but nothing on an audit entry reveals a
+    /// verification custody row.
+    #[test]
+    fn the_scorecard_says_how_many_rows_it_excluded() {
+        let evaluation = sc_decision(
+            1,
+            "plan-a",
+            "orders",
+            PolicyPrincipal::Agent,
+            Some(0),
+            PolicyEffect::Allow,
+        );
+        let mut verification = sc_decision(
+            2,
+            "plan-a",
+            "orders",
+            PolicyPrincipal::Agent,
+            Some(0),
+            PolicyEffect::Deny,
+        );
+        verification.verify_after = vec!["row_count".to_string()];
+
+        let out = build_scorecard(
+            ScorecardDimension::Principal,
+            "all",
+            None,
+            &[evaluation.clone(), verification],
+        );
+        let note = out.note.expect("an exclusion must be reported");
+        assert!(note.contains('1'), "{note}");
+        assert!(note.contains("not policy evaluations"), "{note}");
+
+        // No exclusions, no note: the field stays quiet when there is nothing
+        // to reconcile.
+        let clean = build_scorecard(ScorecardDimension::Principal, "all", None, &[evaluation]);
+        assert!(clean.note.is_none());
     }
 
     fn sc_decision(
