@@ -82,7 +82,7 @@ Compares the source and target column sets, ignoring case, and reports any missi
 
 ### Freshness
 
-Measures how long ago the table last received data, by comparing `MAX(timestamp_column)` against the current time. A table that has seen nothing new within the threshold is flagged.
+Measures how long ago the table last received data, by comparing `MAX(timestamp_column)` against the current time. When there is a timestamp to measure, a table that has seen nothing new within the threshold is flagged. It is not always measured — see below.
 
 ```json
 {
@@ -95,7 +95,9 @@ Measures how long ago the table last received data, by comparing `MAX(timestamp_
 
 **A timestamp column that is entirely NULL emits no freshness check at all.** `MAX()` answers `NULL` both for an empty table and for a non-empty table whose timestamp column is entirely NULL. Rocky cannot tell those apart from that answer alone, so it reads the `NULL` as "nothing to measure" and emits nothing.
 
-That is narrower than it sounds. A freshness query that **fails**, or that returns a cell Rocky cannot read as a timestamp, is reported as a failed `freshness_not_evaluated` check. Only a query that succeeds and answers `NULL` goes silent.
+That is narrower than it sounds. A freshness query that **fails**, or that returns a cell Rocky cannot read as a timestamp, is reported as a failed `freshness_not_evaluated` check. Of the tables Rocky queries, only one whose query succeeds and answers `NULL` goes silent.
+
+A table can also go silent without any query at all. With `prune_unchanged` on, a table whose source has not changed since the last successful copy skips its data checks entirely, freshness included.
 
 In the CLI's JSON, that silence looks the same as a table with no `freshness` configured: the check is absent, not failing. In Dagster it depends on the execution mode. Outside Pipes mode, a configured freshness check has a declared spec, so the missing result surfaces as a failing check at `WARN` severity, marked `not produced by rocky`. In Pipes mode no placeholder is filled in, so the check is absent there too.
 
