@@ -68,4 +68,4 @@ regex = { workspace = true }
 # The scripted round-trip test drives the stdio server in-process with an rmcp
 # client over a duplex pipe, so it needs the client side of rmcp too.
 # Pinned exact to match the workspace pin — see the note in engine/Cargo.toml.
-rmcp = { version = "=3.1.4", features = ["server", "macros", "transport-io", "client"] }
+rmcp = { version = "=3.3.0", features = ["server", "macros", "transport-io", "client"] }

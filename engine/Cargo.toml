@@ -117,7 +117,7 @@ tokio = { version = "1", features = ["full"] }
 # the range is now exact. Raise it after the negotiation change in 3.2.0 is
 # understood — NOT by narrowing `supported_protocol_versions`, which is the
 # very extreme that test was written to distinguish from a real fix.
-rmcp = { version = "=3.1.4", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "=3.3.0", features = ["server", "macros", "transport-io"] }
 
 # HTTP
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "http2"] }
