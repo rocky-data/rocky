@@ -34383,9 +34383,10 @@ table = "fct_events"
     ///
     /// `None` does NOT mean the table is empty. `MAX(ts)` is NULL over no
     /// rows AND over rows whose `ts` is all NULL, and the query returns no
-    /// `COUNT(*)` to tell them apart. `None` also carries a missing cell, a
-    /// non-string cell and an unparseable string. Every one of those emits no
-    /// check (#1929).
+    /// `COUNT(*)` to tell them apart. Those two are the whole of `None` now:
+    /// a missing cell, a non-string cell and an unparseable string are
+    /// omitted by the adapter and reported as `freshness_not_evaluated`
+    /// instead, so they no longer reach here (#1929).
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn a_batched_freshness_leg_that_answers_null_emits_no_check() {

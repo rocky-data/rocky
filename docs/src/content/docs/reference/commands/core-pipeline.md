@@ -779,6 +779,23 @@ rocky branch promote <name> --plan <plan-id>   # canonical: plan + apply
 
 Branch names accept `[A-Za-z0-9_.\-]` up to 64 characters. The default schema prefix is `branch__<name>`. Deleting a branch removes the state-store entry but does **not** drop warehouse tables that were materialized under it.
 
+**Target names have their own limit.** `branch promote` writes each name into a `CREATE OR REPLACE TABLE` statement, quoted the way the warehouse quotes identifiers. Quoting is not escaping, so one character cannot survive it: the warehouse's own identifier quote. Promote refuses a catalog, schema or table name containing it, and names the character.
+
+| Warehouse | Identifier quote | Also refused |
+|---|---|---|
+| DuckDB, Snowflake, Trino | `"` | |
+| Databricks | `` ` `` | |
+| BigQuery | `` ` `` | `\` — BigQuery reads escape sequences inside a quoted identifier, so a trailing backslash consumes the closing quote |
+
+**No other character is refused by this check.** A hyphen or a dot passes it, which matters because branch names allow both. A backslash passes it everywhere except BigQuery.
+
+Two limits sit outside this check and still apply:
+
+- A transformation model that takes its schema from its group's `schema_template` goes through the stricter identifier rule, `[A-Za-z0-9_]` only — whether or not the template carries a placeholder. A hyphen or a dot there is refused while the plan is being built, before promote quotes anything.
+- Promote also refuses a plan in which two steps replace the same production table, whatever the names look like.
+
+The check runs when a promote plan is built and again when one is applied, because a plan stores its statement as ready-made text.
+
 ### `branch approve` flags
 
 | Flag | Type | Default | Description |

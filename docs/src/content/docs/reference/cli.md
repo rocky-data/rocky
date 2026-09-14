@@ -313,7 +313,7 @@ rocky run [--filter <key=value>] [flags]
    - Copy data (incremental or full refresh SQL)
    - Apply table tags
    - Update watermark in state store
-4. **Batched checks.** Row count, column match, freshness (batched with UNION ALL for efficiency)
+4. **Checks.** Row count, column match, freshness. Batched with `UNION ALL` on Databricks; one query per table everywhere else
 5. **Retry.** Failed tables retried sequentially (configurable via `execution.table_retries`)
 
 :::note
