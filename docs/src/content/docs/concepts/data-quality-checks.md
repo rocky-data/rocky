@@ -95,9 +95,9 @@ Measures how long ago the table last received data, by comparing `MAX(timestamp_
 }
 ```
 
-**A timestamp column that is entirely NULL emits no freshness check at all.** `MAX()` answers `NULL` both for an empty table and for a non-empty table whose timestamp column is entirely NULL. Rocky cannot tell those apart from that answer alone, so it reads the `NULL` as "nothing to measure" and emits nothing.
+**An empty table emits no freshness check.** `MAX()` answers `NULL` over no rows, and there is nothing to be fresh. Rocky asks for `COUNT(*)` in the same query, so a non-empty table whose timestamp column holds no value is told apart from an empty one: that case is reported as a failed `freshness_not_evaluated` check whose reason gives the row count, because rows exist and nothing says how fresh they are.
 
-That is narrower than it sounds. A freshness query that **fails**, or that returns a cell Rocky cannot read as a timestamp, is reported as a failed `freshness_not_evaluated` check. Of the tables Rocky queries, only one whose query succeeds and answers `NULL` goes silent.
+A freshness query that **fails**, or that returns a cell Rocky cannot read as a timestamp or as a count, is reported the same way. Of the tables Rocky queries, only an empty one goes silent.
 
 A table can also go silent without any query at all. `prune_unchanged` is off by default. With it on, and only where the adapter can report a source change-marker, a table whose source has not changed skips its data checks entirely — freshness included. [Schema drift](/concepts/schema-drift/) covers pruning and what it takes.
 
@@ -107,7 +107,7 @@ Dagster is different. In Pipes mode nothing is filled in, so the check is absent
 
 Outside Pipes mode a configured check has a declared spec, so Dagster never leaves it blank: it fills the gap with a placeholder, and what the placeholder says depends on why the result is missing. A **pruned** table carries forward its last recorded verdict, or passes with a note saying it was never checked. A table that was checked and produced no freshness result fails at `WARN` severity, marked `not produced by rocky`. A table that was never materialized fails at `WARN` too, with its own reason.
 
-If freshness matters for a table, confirm its `timestamp_column` is populated. Separating an empty table from an all-NULL one needs a `COUNT(*)` Rocky does not run today — tracked in [#1930](https://github.com/rocky-data/rocky/issues/1930).
+If freshness matters for a table, confirm its `timestamp_column` is populated: a table with rows and no value in that column fails its freshness check as not evaluated until it is.
 
 ### Null Rate
 

@@ -3303,6 +3303,8 @@ class ReplicationPipelineConfig(BaseModel):
     Downstream continuity — and preserving the table's prior check results — is then the orchestrator's job. The Dagster integration treats a pruned, unmaterialized key as unchanged via `satisfy_empty_outputs`; enabling pruning without an orchestrator that handles unmaterialized keys drops the table from the run.
 
     Defaults to `false` — opt in per pipeline, since silently skipping copies is a behavior change. The marker is compared against the target's recorded last-copied value (never wall-clock), so a failed prior run cannot cause a false skip. Pass `--no-prune` to `rocky run` to force a full pass (e.g. after a manual target-side mutation).
+
+    An `incremental` table is never pruned until it has a recorded watermark: its first run always copies, even when the marker matches, because a table with no watermark has nothing recorded for the next incremental run to append from. A `full_refresh` table has no such condition.
     """
     schedule: ScheduleConfig | None = None
     """

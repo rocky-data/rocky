@@ -13,12 +13,18 @@ DuckDB runs inside the Rocky process. Use it as a warehouse, as a source, or as 
 |-------|------|----------|---------|-------------|
 | `path` | string | No | (in-memory) | Path to a persistent DuckDB file. Required when using the same DuckDB adapter for both discovery and execution, so the discovery side sees rows written by the warehouse side. |
 
+Pick one. Each example is a complete adapter declaration, not a complete `rocky.toml`.
+
+**In-memory.** DuckDB opens an in-memory database instead of a database file.
+
 ```toml
-# In-memory DuckDB
 [adapter.local]
 type = "duckdb"
+```
 
-# Persistent DuckDB file
+**Persistent file.**
+
+```toml
 [adapter.local]
 type = "duckdb"
 path = "warehouse.duckdb"

@@ -2414,15 +2414,21 @@ async fn an_unreadable_batched_row_count_cell_is_omitted_from_the_results() {
 
 /// #1929. An unreadable freshness timestamp must become an ABSENT result, so
 /// `run.rs` reports the table not evaluated and the gate trips. It used to
-/// become `max_timestamp: None`, which the consumer reads as "empty table,
+/// become `max_timestamp: None`, which the consumer read as "empty table,
 /// emit no check" — so the check silently vanished.
 ///
 /// A genuine SQL NULL is the control: it must STILL be returned with `None`,
-/// because a table with no maximum to read has no freshness to measure. A fix
-/// that omits both would pass the unreadable half and break that one.
+/// now beside the `COUNT(*)` that tells the consumer whether the table is
+/// empty or holds rows with no value (#1930). A fix that omits both would
+/// pass the unreadable half and break that one.
 ///
-/// Drives `batch_freshness`, which crosses both collapse points: the cell read
-/// in `batch.rs` and the timestamp parse in `adapter.rs`.
+/// Drives `batch_freshness`, which crosses both collapse points: the cell
+/// read in `batch.rs` and the timestamp parse in `adapter.rs`. The row shape
+/// is the one `generate_batch_freshness_sql` produces, five columns with the
+/// count at position 3 and the maximum at 4, every cell a string as the SQL
+/// Statement API returns them; this is the only test that drives the READER
+/// with that shape, so a reorder of the SELECT list fails here and not only
+/// on the generator's string.
 #[tokio::test]
 async fn an_unreadable_freshness_timestamp_is_omitted_and_a_null_is_kept() {
     use std::sync::Arc;
@@ -2443,18 +2449,21 @@ async fn an_unreadable_freshness_timestamp_is_omitted_and_a_null_is_kept() {
                         {"name": "c", "type_name": "STRING", "position": 0},
                         {"name": "s", "type_name": "STRING", "position": 1},
                         {"name": "t", "type_name": "STRING", "position": 2},
-                        {"name": "ts", "type_name": "STRING", "position": 3}
+                        {"name": "n", "type_name": "LONG", "position": 3},
+                        {"name": "max_ts", "type_name": "STRING", "position": 4}
                     ]
                 },
-                "total_row_count": 5
+                "total_row_count": 7
             },
             "result": {
                 "data_array": [
-                    ["cat", "sch", "good",       "2026-09-11 10:00:00"],
-                    ["cat", "sch", "empty",      null],
-                    ["cat", "sch", "unparsable", "yesterday"],
-                    ["cat", "sch", "nonstring",  12345],
-                    ["cat", "sch", "shortrow"]
+                    ["cat", "sch", "good",          "2",    "2026-09-11 10:00:00"],
+                    ["cat", "sch", "empty",         "0",    null],
+                    ["cat", "sch", "rows_no_value", "3",    null],
+                    ["cat", "sch", "unparsable",    "1",    "yesterday"],
+                    ["cat", "sch", "nonstring",     "1",    12345],
+                    ["cat", "sch", "badcount",      "many", null],
+                    ["cat", "sch", "shortrow",      "1"]
                 ]
             }
         })))
@@ -2466,10 +2475,18 @@ async fn an_unreadable_freshness_timestamp_is_omitted_and_a_null_is_kept() {
         schema: "sch".into(),
         table: table.into(),
     };
-    let tables: Vec<TableRef> = ["good", "empty", "unparsable", "nonstring", "shortrow"]
-        .iter()
-        .map(|t| tref(t))
-        .collect();
+    let tables: Vec<TableRef> = [
+        "good",
+        "empty",
+        "rows_no_value",
+        "unparsable",
+        "nonstring",
+        "badcount",
+        "shortrow",
+    ]
+    .iter()
+    .map(|t| tref(t))
+    .collect();
 
     let adapter = DatabricksBatchCheckAdapter::new(Arc::new(test_connector(&server)));
     let results = adapter
@@ -2477,31 +2494,43 @@ async fn an_unreadable_freshness_timestamp_is_omitted_and_a_null_is_kept() {
         .await
         .expect("a readable response is not an error");
 
-    let named: Vec<(&str, bool)> = results
+    let named: Vec<(&str, bool, Option<u64>)> = results
         .iter()
-        .map(|r| (r.table.table.as_str(), r.max_timestamp.is_some()))
+        .map(|r| {
+            (
+                r.table.table.as_str(),
+                r.max_timestamp.is_some(),
+                r.row_count,
+            )
+        })
         .collect();
 
     // The control: a genuine SQL NULL must still be RETURNED carrying `None`,
-    // so no check is emitted. Correct for an empty table; a non-empty table
-    // whose `ts` is all NULL reaches the same NULL (#1930).
+    // with the count that says which NULL it is. Zero rows: no check.
     assert!(
-        named.contains(&("empty", false)),
-        "a genuine NULL must still be returned: {named:?}"
+        named.contains(&("empty", false, Some(0))),
+        "a genuine NULL over an empty table must still be returned: {named:?}"
+    );
+    // Rows with no value: returned with the count, so the consumer reports
+    // the table not evaluated instead of reading the NULL as empty (#1930).
+    assert!(
+        named.contains(&("rows_no_value", false, Some(3))),
+        "a NULL over rows must be returned with its count: {named:?}"
     );
 
-    // The measured one survives untouched.
+    // The measured one survives untouched, count included.
     assert!(
-        named.contains(&("good", true)),
+        named.contains(&("good", true, Some(2))),
         "a readable timestamp must still be measured: {named:?}"
     );
 
-    // These three must be ABSENT, so run.rs reports them not evaluated
-    // instead of silently emitting nothing.
-    for table in ["unparsable", "nonstring", "shortrow"] {
+    // These four must be ABSENT, so run.rs reports them not evaluated
+    // instead of silently emitting nothing. `badcount` is the new one: a
+    // count that does not read as a number leaves its NULL unclassifiable.
+    for table in ["unparsable", "nonstring", "badcount", "shortrow"] {
         assert!(
-            !named.iter().any(|(t, _)| *t == table),
-            "{table}: an unreadable timestamp must not be returned as None, \
+            !named.iter().any(|(t, _, _)| *t == table),
+            "{table}: an unreadable cell must not be returned as None, \
              which reads as an empty table: {named:?}"
         );
     }

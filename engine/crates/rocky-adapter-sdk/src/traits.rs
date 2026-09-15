@@ -45,6 +45,11 @@
 //!   the `rocky-ir` types, so SDK-only adapter trait objects can't yet
 //!   slot in. Unifying these types is the prerequisite for true
 //!   process-adapter pluggability.
+//! - `FreshnessResult` here lacks the `row_count` that
+//!   `rocky_core::traits::FreshnessResult` gained in #1930 (the `COUNT(*)`
+//!   beside `MAX`, which tells an empty table from rows with no value).
+//!   Nothing bridges the SDK's batch results into the core check runner
+//!   yet, so the field has no consumer here; add it when that bridge lands.
 
 use std::collections::BTreeMap;
 
@@ -725,7 +730,8 @@ pub trait BatchCheckAdapter: Send + Sync {
     }
 
     /// Whether this adapter can answer `batch_freshness`. `false` sends the
-    /// caller to the per-table `SELECT MAX(<timestamp_column>)` path.
+    /// caller to the per-table `SELECT COUNT(*), MAX(<timestamp_column>)`
+    /// path.
     fn supports_freshness(&self) -> bool {
         true
     }

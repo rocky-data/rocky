@@ -478,6 +478,7 @@ impl BatchCheckAdapter for DatabricksBatchCheckAdapter {
                         table: r.table,
                     },
                     max_timestamp,
+                    row_count: Some(r.row_count),
                 })
             })
             .collect())

@@ -238,15 +238,23 @@ pub struct FreshnessResult {
     pub catalog: String,
     pub schema: String,
     pub table: String,
+    /// `COUNT(*)` from the same row as `max_timestamp`, so a NULL maximum
+    /// over a non-empty table is not read as an empty table (#1930).
+    pub row_count: u64,
     pub max_timestamp: Option<String>,
 }
 
 /// Generates a batched freshness query using UNION ALL.
 ///
 /// ```sql
-/// SELECT 'cat' AS c, 'sch' AS s, 'tbl' AS t, CAST(MAX(ts_col) AS STRING) AS max_ts FROM cat.sch.tbl
+/// SELECT 'cat' AS c, 'sch' AS s, 'tbl' AS t, COUNT(*) AS n, CAST(MAX(ts_col) AS STRING) AS max_ts FROM cat.sch.tbl
 /// UNION ALL ...
 /// ```
+///
+/// `COUNT(*)` rides in the same aggregate as `MAX`, so the two describe the
+/// same rows and cost one scan. Without it, `MAX(ts)` is NULL both for an
+/// empty table and for a non-empty one whose `ts` holds no value, and the
+/// second case used to emit no freshness check at all (#1930).
 pub fn generate_batch_freshness_sql(
     tables: &[BatchTableRef],
     timestamp_column: &str,
@@ -265,7 +273,7 @@ pub fn generate_batch_freshness_sql(
 
         let _ = write!(
             sql,
-            "SELECT '{catalog}' AS c, '{schema}' AS s, '{table}' AS t, CAST(MAX({ts}) AS STRING) AS max_ts FROM {catalog}.{schema}.{table}",
+            "SELECT '{catalog}' AS c, '{schema}' AS s, '{table}' AS t, COUNT(*) AS n, CAST(MAX({ts}) AS STRING) AS max_ts FROM {catalog}.{schema}.{table}",
             catalog = table.catalog,
             schema = table.schema,
             table = table.table,
@@ -307,11 +315,26 @@ pub async fn execute_batch_freshness(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            // A genuine SQL NULL keeps the row with `None` — an empty table
-            // has no freshness to measure. A missing or non-string cell is
-            // UNREADABLE and omits the row, so the caller reports the table
-            // not evaluated instead of reading `None` as "empty" (#1929).
-            let max_timestamp = match row.get(3) {
+            // The count comes first, and a row whose count cannot be read
+            // is omitted for the same reason as an unreadable timestamp:
+            // the caller reports the table not evaluated rather than
+            // guessing which of "empty" and "no value" it is (#1930).
+            // `cell_as_u64` is the reader the row-count leg above uses;
+            // Databricks returns every cell as a string over this API.
+            let Some(row_count) = rocky_core::checks::cell_as_u64(row.get(3)) else {
+                tracing::warn!(
+                    table = format!("{catalog}.{schema}.{table}"),
+                    cell = ?row.get(3),
+                    "freshness row count cell was not a non-negative integer — reporting the table as not evaluated"
+                );
+                continue;
+            };
+            // A genuine SQL NULL keeps the row with `None` — the caller
+            // decides between "empty" and "no value" from `row_count`. A
+            // missing or non-string cell is UNREADABLE and omits the row, so
+            // the caller reports the table not evaluated instead of reading
+            // `None` as "empty" (#1929).
+            let max_timestamp = match row.get(4) {
                 Some(v) if v.is_null() => None,
                 Some(v) => match v.as_str() {
                     Some(s) => Some(s.to_string()),
@@ -337,6 +360,7 @@ pub async fn execute_batch_freshness(
                 catalog,
                 schema,
                 table,
+                row_count,
                 max_timestamp,
             });
         }
@@ -473,6 +497,13 @@ mod tests {
         assert!(sql.contains("MAX(_fivetran_synced)"));
         assert!(sql.contains("CAST("));
         assert!(sql.contains("FROM cat.sch.tbl"));
+        // The count sits between the three name columns and the maximum,
+        // which is the column order `execute_batch_freshness` reads (#1930).
+        assert_eq!(
+            sql,
+            "SELECT 'cat' AS c, 'sch' AS s, 'tbl' AS t, COUNT(*) AS n, \
+             CAST(MAX(_fivetran_synced) AS STRING) AS max_ts FROM cat.sch.tbl"
+        );
     }
 
     #[test]
