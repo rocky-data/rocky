@@ -50,6 +50,22 @@ duckdb wh.duckdb < data/warehouse_seed.sql >/dev/null 2>&1 || fail "0 (warehouse
 # rocky --output json <verb...>  → stdout JSON captured to $1, returns the exit code.
 rj() { local out="$1"; shift; rocky --output json "$@" >"$out" 2>"${out%.json}.err"; echo $?; }
 
+# Why an `rj` call failed, for a `fail` message: its stderr when there is
+# any, else the engine's own `message` (or `state`) from the JSON it wrote
+# instead. A blocked loop is reported structurally, in the JSON, with
+# nothing on stderr, so printing the .err alone showed an empty string where
+# the whole explanation sat one file over (#1951).
+why() {
+    local out="$1" err="${1%.json}.err" m
+    if [ -s "$err" ]; then
+        cat "$err"
+    elif m="$(jq -r '.message // .state // empty' "$out" 2>/dev/null)" && [ -n "$m" ]; then
+        printf '%s (from %s)' "$m" "$out"
+    else
+        printf '(no stderr and no message; see %s)' "$out"
+    fi
+}
+
 echo "=================================================================="
 echo " Fulfillment walking skeleton — replay lane (credential-free)"
 echo " spec -> lowering -> human gate -> engine backstop -> apply"
@@ -66,7 +82,7 @@ echo; echo "[1] cold start: elicitation writes the candidate, loop stops for app
 mut 1 && { jq '.tasks.elicitation.outcome.expected_digest="sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"' replay/session.json > .mut && mv .mut replay/session.json; }
 [ -e "products/${PRODUCT}.toml" ] && fail "1 (products/${PRODUCT}.toml existed before the first fulfill — not a cold start)"
 code=$(rj expected/01_cold.json fulfill "$PRODUCT")
-[ "$code" = "0" ] || fail "1 (cold fulfill exit $code, want 0; $(cat expected/01_cold.err))"
+[ "$code" = "0" ] || fail "1 (cold fulfill exit $code, want 0; $(why expected/01_cold.json))"
 [ "$(jq -r .state expected/01_cold.json)" = "needs_input" ] || fail "1 (state $(jq -r .state expected/01_cold.json), want needs_input)"
 [ -e "products/${PRODUCT}.toml" ] || fail "1 (the runner did not write products/${PRODUCT}.toml)"
 jq -e '.next_command | test("approve-spec")' expected/01_cold.json >/dev/null || fail "1 (next_command is not approve-spec)"
@@ -170,11 +186,11 @@ echo; echo "[2] approve + drive: red draft -> repair round -> converged; manifes
 # (exactly 3 worker transcripts) must catch the difference.
 mut 2r && { jq '.tasks.drafting.calls[-1].arguments.sql = .tasks.repair.calls[0].arguments.sql' replay/session.json > .mut && mv .mut replay/session.json; }
 code=$(rj expected/02_approve.json fulfill approve-spec "$PRODUCT")
-[ "$code" = "0" ] || fail "2 (approve-spec exit $code; $(cat expected/02_approve.err))"
+[ "$code" = "0" ] || fail "2 (approve-spec exit $code; $(why expected/02_approve.json))"
 [ "$(jq -r .state expected/02_approve.json)" = "spec_approved" ] || fail "2 (state after approve $(jq -r .state expected/02_approve.json), want spec_approved)"
 APPROVED_DIGEST="$(jq -r .spec_digest expected/02_approve.json)"
 code=$(rj expected/02_drive.json fulfill "$PRODUCT")
-[ "$code" = "0" ] || fail "2 (drive-to-review exit $code; $(cat expected/02_drive.err))"
+[ "$code" = "0" ] || fail "2 (drive-to-review exit $code; $(why expected/02_drive.json))"
 [ "$(jq -r .state expected/02_drive.json)" = "needs_input" ] || fail "2 (state $(jq -r .state expected/02_drive.json), want needs_input(plan_approval))"
 [ -f "$MANIFEST" ] || fail "2 (no lowering manifest at $MANIFEST)"
 # MUTATION 2: inject a REJECTED field into the committed manifest -> the
@@ -244,16 +260,16 @@ if ! mut 6; then
 fi
 EDITED_DIGEST="sha256:$(shasum -a 256 products/${PRODUCT}.toml | awk '{print $1}')"
 code=$(rj expected/06_edit.json fulfill "$PRODUCT")
-[ "$code" = "0" ] || fail "6 (fulfill after edit exit $code; $(cat expected/06_edit.err))"
+[ "$code" = "0" ] || fail "6 (fulfill after edit exit $code; $(why expected/06_edit.json))"
 [ "$(jq -r .state expected/06_edit.json)" = "needs_input" ] || fail "6 (edit changed the state; want needs_input)"
 [ "$(jq -r .plan_id expected/06_edit.json)" = "$PLAN1" ] || fail "6 (a mere candidate edit must NOT supersede the pending plan)"
 echo "    OK  candidate edited (new digest ${EDITED_DIGEST:0:19}…) — plan ${PLAN1:0:12}… still reviewable, not superseded"
 code=$(rj expected/06_reapprove.json fulfill approve-spec "$PRODUCT")
-[ "$code" = "0" ] || fail "6 (re-approve exit $code; $(cat expected/06_reapprove.err))"
+[ "$code" = "0" ] || fail "6 (re-approve exit $code; $(why expected/06_reapprove.json))"
 [ "$(jq -r .state expected/06_reapprove.json)" = "spec_approved" ] || fail "6 (re-approval did not re-enter spec_approved: the fence)"
 [ "$(jq -r .spec_digest expected/06_reapprove.json)" = "$EDITED_DIGEST" ] || fail "6 (re-approval did not bind the edited digest)"
 code=$(rj expected/06_reprop.json fulfill "$PRODUCT")
-[ "$code" = "0" ] || fail "6 (re-propose exit $code; $(cat expected/06_reprop.err))"
+[ "$code" = "0" ] || fail "6 (re-propose exit $code; $(why expected/06_reprop.json))"
 PLAN2="$(jq -r .plan_id expected/06_reprop.json)"
 [ -n "$PLAN2" ] && [ "$PLAN2" != "null" ] || fail "6 (no new plan after re-approval)"
 [ "$PLAN2" != "$PLAN1" ] || fail "6 (re-approval did not supersede: same plan id)"
@@ -310,10 +326,10 @@ if mut 7; then
   echo "    (mutation 7: skipping rocky review --approve)"
 else
   code=$(rj expected/07_review.json review "$PLAN2" --approve)
-  [ "$code" = "0" ] || fail "7 (review --approve exit $code; $(cat expected/07_review.err))"
+  [ "$code" = "0" ] || fail "7 (review --approve exit $code; $(why expected/07_review.json))"
 fi
 code=$(rj expected/07_apply.json fulfill "$PRODUCT")
-[ "$code" = "0" ] || fail "7 (apply+observe exit $code; $(cat expected/07_apply.err))"
+[ "$code" = "0" ] || fail "7 (apply+observe exit $code; $(why expected/07_apply.json))"
 STATE7="$(jq -r .state expected/07_apply.json)"
 [ "$STATE7" = "observing" ] || fail "7 (state $STATE7 after apply, want observing)"
 jq -e '.message | test("applied")' expected/07_apply.json >/dev/null || fail "7 (observing message does not report applied)"
@@ -379,7 +395,7 @@ FRESH_BUD=$(jq -r '.message | capture("budget (?<b>[0-9]+)s").b' expected/07_app
 # never exceeds the budget and the assertion must fail.
 mut 10 || duckdb wh.duckdb "UPDATE out.${PRODUCT} SET loaded_at = TIMESTAMP '2020-01-01 00:00:00'" >/dev/null 2>&1 || fail "10 (could not backdate the output)"
 code=$(rj expected/10_stale.json fulfill "$PRODUCT")
-[ "$code" = "0" ] || fail "10 (re-observe exit $code, staleness must NOT block; $(cat expected/10_stale.err))"
+[ "$code" = "0" ] || fail "10 (re-observe exit $code, staleness must NOT block; $(why expected/10_stale.json))"
 [ "$(jq -r .state expected/10_stale.json)" = "observing" ] || fail "10 (staleness must stay observing, got $(jq -r .state expected/10_stale.json))"
 STALE_LAG=$(jq -r '.message | capture("lag (?<l>[0-9]+)s").l' expected/10_stale.json 2>/dev/null)
 STALE_BUD=$(jq -r '.message | capture("budget (?<b>[0-9]+)s").b' expected/10_stale.json 2>/dev/null)
@@ -413,7 +429,7 @@ mut 11 || duckdb wh.duckdb "INSERT INTO out.${PRODUCT} SELECT * FROM out.${PRODU
 # the check measured, and stops. Exit 4 is its own code: a caller scripting the
 # loop must not read "the live output is wrong" as a clean stop.
 code=$(rj expected/11_red.json fulfill "$PRODUCT")
-[ "$code" = "4" ] || fail "11 (a data-red must exit 4, got $code; $(cat expected/11_red.err))"
+[ "$code" = "4" ] || fail "11 (a data-red must exit 4, got $code; $(why expected/11_red.json))"
 STATE11="$(jq -r .state expected/11_red.json)"
 [ "$STATE11" = "observed_failing" ] || fail "11 (state $STATE11 after a violated declared check, want observed_failing)"
 [ "$STATE11" != "observing" ] || fail "11 (a failing output must never be recorded as a healthy one)"
@@ -425,7 +441,7 @@ jq -e '.message | test("duplicate")' expected/11_red.json >/dev/null \
 # (b) A SECOND, independent reading confirms it and spends ONE repair round,
 # which converges and lands a NEW proposal parked at the human gate.
 code=$(rj expected/11_repair.json fulfill "$PRODUCT")
-[ "$code" = "0" ] || fail "11 (the data-repair round exit $code; $(cat expected/11_repair.err))"
+[ "$code" = "0" ] || fail "11 (the data-repair round exit $code; $(why expected/11_repair.json))"
 STATE11B="$(jq -r .state expected/11_repair.json)"
 [ "$STATE11B" = "needs_input" ] || fail "11 (state $STATE11B after the repair round, want needs_input(plan_approval))"
 PLAN3="$(jq -r '.plan_id // empty' expected/11_repair.json)"
@@ -447,10 +463,10 @@ if mut 11h; then
   echo "    (mutation 11h: skipping the fresh rocky review --approve)"
 else
   code=$(rj expected/11_review.json review "$PLAN3" --approve)
-  [ "$code" = "0" ] || fail "11 (review --approve of the repaired plan exit $code; $(cat expected/11_review.err))"
+  [ "$code" = "0" ] || fail "11 (review --approve of the repaired plan exit $code; $(why expected/11_review.json))"
 fi
 code=$(rj expected/11_clean.json fulfill "$PRODUCT")
-[ "$code" = "0" ] || fail "11 (the repaired apply exit $code; $(cat expected/11_clean.err))"
+[ "$code" = "0" ] || fail "11 (the repaired apply exit $code; $(why expected/11_clean.json))"
 STATE11C="$(jq -r .state expected/11_clean.json)"
 [ "$STATE11C" = "observing" ] || fail "11 (state $STATE11C after the repaired apply, want observing)"
 DUPES="$(duckdb -csv -noheader wh.duckdb "SELECT COUNT(*) FROM (SELECT client_id, day FROM out.${PRODUCT} GROUP BY client_id, day HAVING COUNT(*) > 1)" 2>/dev/null)"
