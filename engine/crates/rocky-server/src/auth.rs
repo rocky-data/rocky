@@ -169,23 +169,21 @@ impl std::fmt::Debug for ServeToken {
 ///    whether one is opened. So `open_read_only` commits a write transaction
 ///    too, and every `GET` that reads the state store does likewise.
 ///
-///    What that does and does not mean — stated more carefully than the
-///    first correction, which was itself too categorical:
-///    - It is NOT a warehouse mutation and NOT a logical-record change. No
-///      run, plan, product or history row is created or altered.
-///    - It CAN change the database layout. Read-only mode skips the version
-///      stamp, but it still opens every table eagerly, so against an older
-///      store missing a newer table a `GET` durably creates that table while
-///      leaving the version stamp untouched. Calling that "no semantic state
-///      change" was an over-claim in the other direction.
-///    - It IS a write transaction, so a read-scoped `GET` serializes against
-///      real writers. Polled by a browser, that is a contention surface.
-///    - It is PRE-EXISTING `serve` behaviour, not introduced by the token
-///      scope. The scope does not make it worse; the earlier claim simply
-///      described it wrongly.
+///    **Corrected again, C1-P1b (#1978)** — the paragraph above describes
+///    behaviour that no longer exists. `open_read_only` now judges a store by
+///    its table set in a READ transaction and takes no write transaction
+///    against a store that holds anything: no stamp, no upgrade, no table
+///    creation; a store missing a table is refused
+///    (`StateError::ReadOnlyNeedsInit`). #1545 had fixed only the case where
+///    the stamp read exactly the current version. What is left:
+///    - A read-only open of a path with NO state file still creates the file
+///      and its tables, unstamped — the pre-existing first-run bootstrap.
+///      Tracked as #1980.
+///    - redb's own open-time recovery of an uncleanly closed file is not a
+///      Rocky transaction and is unchanged.
 ///
-///    Tracked as #1545; do not restate the old claim. Adding a genuinely
-///    mutating `GET` would still break this silently, so don't.
+///    Do not restate the old claim. Adding a genuinely mutating `GET` would
+///    still break this silently, so don't.
 ///
 /// `TRACE` is deliberately absent even though RFC 9110 classifies it as safe:
 /// nothing routes it, and refusing it keeps the cross-site-tracing shape off
