@@ -429,9 +429,9 @@ Section reference:
   - `[pipeline.<name>.target]` — catalog_template, schema_template (with `{variable}` placeholders)
   - `[pipeline.<name>.checks]` — row_count, column_match, freshness, null_rate, anomaly_threshold_pct; plus `fail_on_error`, `[[assertions]]` blocks (DQX parity: `not_null`, `unique`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, `composite`, `not_in_future`, `older_than_n_days` — each supports `severity` and `filter`), and `[quarantine]` (`mode = "split" | "tag" | "drop"`)
   - `[pipeline.<name>.execution]` — concurrency, fail_fast, error_rate_abort_pct, table_retries
-- `[governance]` — auto_create_catalogs, auto_create_schemas, tags, isolation, grants
+- `[pipeline.<name>.target.governance]` — auto_create_catalogs, auto_create_schemas, tags, isolation, grants (per target; there is no top-level `[governance]` table)
 - `[cost]` — storage_cost_per_gb_month, compute_cost_per_dbu, warehouse_size
-- `[state]` — backend (local/s3/valkey/tiered)
+- `[state]` — backend (local/s3/gcs/valkey/tiered)
 - `[cache.schemas]` — the schema cache: enabled, ttl_seconds, replicate (there is no other `[cache]` key)
 
 **Key defaults** (omit when redundant):
