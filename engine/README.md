@@ -98,6 +98,18 @@ rocky state          # Show stored watermarks
 it runs the `[[tests]]` from your model sidecars against the warehouse adapter
 you configured.
 
+**Data products and scheduling**
+
+```bash
+rocky product verify <name>  # Verify a product's propose_only trust posture
+rocky fulfill <name>         # Drive a product's fulfillment loop (experimental)
+rocky tick                   # Run due scheduled pipelines once (experimental)
+```
+
+A product spec (`products/<name>.toml`) declares what a data product must be.
+`rocky product` also has `compile`, `approve`, `status`, `list`, and `journal`.
+`rocky tick` runs once and exits, so drive it from an external timer.
+
 **Understand a project**
 
 ```bash
@@ -246,7 +258,7 @@ Wire the ones you need into your pipeline.
 | You want to catch | Command | How it fails |
 |---|---|---|
 | A model that no longer type-checks | `rocky compile` | Exits non-zero on any `E` code |
-| A broken contract or missing column | `rocky compile` | `E010`-`E013` |
+| A broken contract or missing column | `rocky compile` | `E010`-`E014` |
 | A breaking change reaching production | `rocky branch promote <name>` | Refuses unless you pass `--allow-breaking`. The gate skips itself, and records that it did, when the models directory is missing or when either the base ref or the working tree fails to compile |
 | SQL that will not run on your target warehouse | `rocky compile --target-dialect <dbx\|sf\|bq\|duckdb>` | `P001` at error severity |
 | Classified data left unmasked | `rocky compliance --fail-on exception` | Exits 1 on any exception |
@@ -326,7 +338,9 @@ importer refuses to write into a non-empty directory unless you pass
 rocky validate-migration --dbt-project ./my-dbt --rocky-project ./rocky-out
 ```
 
-Add `--sample-size <n>` to compare rows from the warehouse as well as structure.
+For each dbt model it reports whether the model imports, whether the Rocky
+project has it, and how many of its dbt tests became checks. It reads no rows
+from a warehouse. The command accepts `--sample-size <n>`, but ignores it.
 
 ## Documentation
 
