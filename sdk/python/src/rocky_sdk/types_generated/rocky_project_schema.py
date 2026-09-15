@@ -3304,7 +3304,7 @@ class ReplicationPipelineConfig(BaseModel):
 
     Defaults to `false` — opt in per pipeline, since silently skipping copies is a behavior change. The marker is compared against the target's recorded last-copied value (never wall-clock), so a failed prior run cannot cause a false skip. Pass `--no-prune` to `rocky run` to force a full pass (e.g. after a manual target-side mutation).
 
-    An `incremental` or `microbatch` table is never pruned until it has a recorded watermark: its first run always copies, even when the marker matches, because a table with no watermark has nothing recorded for the next incremental run to append from. A `full_refresh` table has no such condition.
+    An `incremental` table is never pruned until it has a recorded watermark: its first run always copies, even when the marker matches, because a table with no watermark has nothing recorded for the next incremental run to append from. A `full_refresh` table has no such condition.
     """
     schedule: ScheduleConfig | None = None
     """

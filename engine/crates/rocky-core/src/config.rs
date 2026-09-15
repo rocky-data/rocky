@@ -5389,7 +5389,7 @@ pub struct ReplicationPipelineConfig {
     /// prior run cannot cause a false skip. Pass `--no-prune` to `rocky run`
     /// to force a full pass (e.g. after a manual target-side mutation).
     ///
-    /// An `incremental` or `microbatch` table is never pruned until it has a
+    /// An `incremental` table is never pruned until it has a
     /// recorded watermark: its first run always copies, even when the marker
     /// matches, because a table with no watermark has nothing recorded for
     /// the next incremental run to append from. A `full_refresh` table has no
