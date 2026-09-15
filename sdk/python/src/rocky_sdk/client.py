@@ -113,9 +113,11 @@ DEFAULT_HTTP_TIMEOUT_SECONDS = 30
 
 # Minimum Rocky binary version this SDK release is compatible with. Checked
 # lazily on the first CLI invocation; an older binary raises
-# :class:`RockyVersionError`. The floor is shared with the dagster-rocky adapter
-# (whose Pipes path content-addresses every plan, a 1.34+ guarantee).
-MIN_ROCKY_VERSION = "1.34.0"
+# :class:`RockyVersionError`. The floor is shared with the dagster-rocky adapter,
+# whose plan/apply path needs a ``plan_id`` from ``rocky plan`` for every
+# project shape; a replication-only project first got a content-addressed
+# ``plan_id`` in engine 1.35.0 (#1984).
+MIN_ROCKY_VERSION = "1.35.0"
 
 
 class _Unset:

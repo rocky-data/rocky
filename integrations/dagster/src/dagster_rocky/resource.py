@@ -1229,7 +1229,7 @@ class RockyResource(dg.ConfigurableResource):
             raise dg.Failure(
                 description=(
                     "rocky plan did not emit a plan_id — this dagster integration "
-                    "requires engine-v1.34+ which content-addresses every plan, "
+                    "requires engine-v1.35+ which content-addresses every plan, "
                     "including replication-only projects. Upgrade the rocky binary "
                     "or pin dagster-rocky<1.33 if a downgrade is needed."
                 ),

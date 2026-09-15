@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The engine floor is 1.35.0, and the "no plan_id" failure says so.** `MIN_ROCKY_VERSION` (re-exported from `rocky-sdk`) moves from `1.34.0` to `1.35.0`, which is the engine that first gave replication-only projects a content-addressed `plan_id`; a 1.34.x binary is now refused up front instead of failing inside `run_pipes` after passing the check. The `dg.Failure` raised when `rocky plan` emits no `plan_id` names `engine-v1.35+` rather than `1.34+`, so it no longer tells a user to install a version they already have. Needs `rocky-sdk` with the same floor. (#1984)
+
 ## [1.66.0] — 2026-09-12
 
 Pairs with engine 1.74.0 and `rocky-sdk` 0.15.0.
