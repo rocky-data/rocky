@@ -320,6 +320,7 @@ CORS is empty-by-default. Browser apps must declare every allowed origin via `--
 | `--scheduler` | `bool` | `false` | Also run the resident scheduler: a timer loop that evaluates every pipeline's `[schedule]` and runs what is due, in-process. On SIGTERM or Ctrl-C the server drains a running scheduled child before it exits. Run one instance per project directory. Experimental. |
 | `--poll-interval-seconds <SECONDS>` | `u64` | `15` | Seconds between scheduler ticks. Must be at least 1. Only meaningful with `--scheduler`. |
 | `--drain-timeout-seconds <SECONDS>` | `u64` | `60` | Seconds a running scheduled child may keep going after a shutdown signal before Rocky terminates it. Only meaningful with `--scheduler`. |
+| `--open` | `bool` | `false` | With `--ui`: open the printed address in the default browser once the listener is bound — after the startup sweep, never before. The address, token included, is handed to the system opener (`open`, `xdg-open`, `cmd /C start`). A missing or failing opener is a warning; the server still starts and still prints the address. Refused without `--ui`. |
 
 ### The browser UI
 

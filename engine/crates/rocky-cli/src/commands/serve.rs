@@ -153,11 +153,15 @@ pub async fn run_serve(
     ui: bool,
     // `--allowed-host`: extra `Host` values the `--ui` guard accepts.
     allowed_hosts: Vec<String>,
+    // `--open`: hand the printed page address to the system browser once the
+    // listener is bound. Refused without `--ui` (`validate_open_flag`).
+    open: bool,
     scheduler: bool,
     poll_interval_seconds: Option<u64>,
     drain_timeout_seconds: Option<u64>,
     state_path: Option<&Path>,
 ) -> Result<()> {
+    validate_open_flag(open, ui)?;
     // The whole flags -> token -> ServerState segment lives in
     // `build_serve_state` so a test can cross the SAME code production runs.
     // Previously the wire test called `resolve_serve_token` and then built its
@@ -197,16 +201,14 @@ pub async fn run_serve(
     // The one address a person needs: the page, with the token in the
     // fragment. The fragment never reaches the server, and the page clears it
     // after reading it once. Printed on stdout so a script can capture it.
-    if let (true, Some(token)) = (ui, state.auth.as_ref()) {
-        let shown_host = if serve_config.host == "0.0.0.0" || serve_config.host == "::" {
-            "localhost"
-        } else {
-            serve_config.host.as_str()
-        };
-        println!(
-            "Rocky UI: http://{shown_host}:{port}/ui/#token={}",
-            token.secret
-        );
+    // The same string is what `--open` hands the opener (`ui_address`), so the
+    // two cannot drift: the address that opens is the address that printed.
+    let page_address = match (ui, state.auth.as_ref()) {
+        (true, Some(token)) => Some(ui_address(&serve_config.host, port, &token.secret)),
+        _ => None,
+    };
+    if let Some(address) = &page_address {
+        println!("Rocky UI: {address}");
     }
 
     // Start filesystem watcher if requested
@@ -237,6 +239,23 @@ pub async fn run_serve(
             tracing::info!("shutdown signal received; draining");
             shutdown.signal();
         });
+    }
+
+    // `--open`: the browser gets the printed address only once the listener
+    // is bound. The address prints at once (above); the opener waits on the
+    // readiness latch `api::serve` raises after the startup sweep and the
+    // bind, so a browser never lands on a port that is not listening yet, or
+    // on one the server then fails to bind — a failed bind returns from
+    // `api::serve` without raising the latch, and `shutdown` (raised below)
+    // ends the task. A missing or failing opener is a warning, never a reason
+    // not to serve.
+    if open && let Some(address) = page_address.clone() {
+        open_when_ready(
+            server_ready.clone(),
+            shutdown.clone(),
+            address,
+            std::sync::Arc::new(SystemOpener),
+        );
     }
 
     // Process-lifetime scheduler metrics. Stood up only under `--scheduler`, and
@@ -638,6 +657,99 @@ fn build_serve_state(
     ))
 }
 
+/// `--open` needs `--ui`: without the UI there is no page to open. Checked
+/// before anything binds, like the `--ui` rules, so the refusal names the fix
+/// and costs nothing.
+pub(crate) fn validate_open_flag(open: bool, ui: bool) -> Result<()> {
+    if open && !ui {
+        anyhow::bail!(
+            "rocky serve --open needs --ui: without the UI there is no page to open. \
+             Add `--ui` (with `--token <secret> --token-scope read-only`), or drop --open."
+        );
+    }
+    Ok(())
+}
+
+/// The page address `rocky serve --ui` prints, token in the fragment.
+///
+/// One function for the print and for `--open`, so what opens is exactly what
+/// printed. A wildcard bind (`0.0.0.0`, `::`) is shown as `localhost`: the one
+/// name a wildcard bind promises a browser on the same machine can reach. Any
+/// other IPv6 literal is bracketed, as a URL requires. The fragment never
+/// reaches the server, and the page clears it after reading it once.
+pub(crate) fn ui_address(bind_host: &str, port: u16, token_secret: &str) -> String {
+    let shown_host = match bind_host {
+        "0.0.0.0" | "::" => "localhost".to_string(),
+        host if host.contains(':') && !host.starts_with('[') => format!("[{host}]"),
+        host => host.to_string(),
+    };
+    format!("http://{shown_host}:{port}/ui/#token={token_secret}")
+}
+
+/// How `--open` reaches a browser: a seam, so a test can substitute one and
+/// assert the address it receives. Production uses [`SystemOpener`].
+pub(crate) trait BrowserOpener: Send + Sync {
+    fn open(&self, url: &str) -> std::io::Result<()>;
+}
+
+/// The platform's URL opener — `open` on macOS, `cmd /C start` on Windows,
+/// `xdg-open` elsewhere — spawned, and reaped on a thread rather than awaited:
+/// some `xdg-open` handlers stay in the foreground until the browser exits,
+/// and that must not hold the server. Its output is discarded; the address it
+/// was given is already on stdout.
+pub(crate) struct SystemOpener;
+
+impl BrowserOpener for SystemOpener {
+    fn open(&self, url: &str) -> std::io::Result<()> {
+        let mut command = if cfg!(target_os = "macos") {
+            let mut c = std::process::Command::new("open");
+            c.arg(url);
+            c
+        } else if cfg!(target_os = "windows") {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "start", "", url]);
+            c
+        } else {
+            let mut c = std::process::Command::new("xdg-open");
+            c.arg(url);
+            c
+        };
+        let mut child = command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
+    }
+}
+
+/// Open `url` once `ready` is raised, unless `shutdown` comes first. Its own
+/// task, so a slow or failing opener never delays the server; the error is
+/// logged and the address stays on stdout.
+pub(crate) fn open_when_ready(
+    ready: rocky_core::schedule::Drain,
+    shutdown: rocky_core::schedule::Drain,
+    url: String,
+    opener: std::sync::Arc<dyn BrowserOpener>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        tokio::select! {
+            () = ready.signalled() => {
+                if let Err(error) = opener.open(&url) {
+                    tracing::warn!(
+                        %error,
+                        "could not open a browser for the UI; the address is printed above"
+                    );
+                }
+            }
+            () = shutdown.signalled() => {}
+        }
+    })
+}
+
 /// The `--ui` rules, checked before anything binds. Each refusal names the
 /// fix. Without `--ui` nothing here applies.
 ///
@@ -693,6 +805,123 @@ pub(crate) fn validate_ui_flags(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--open` without `--ui` is refused before anything binds, naming the
+    /// fix; every other combination passes.
+    #[test]
+    fn open_without_ui_is_refused_and_names_the_fix() {
+        assert!(validate_open_flag(false, false).is_ok());
+        assert!(validate_open_flag(false, true).is_ok());
+        assert!(validate_open_flag(true, true).is_ok());
+        let err = validate_open_flag(true, false).unwrap_err();
+        assert!(err.to_string().contains("needs --ui"), "{err}");
+    }
+
+    /// The printed shape, with a host a browser on this machine can reach: a
+    /// wildcard bind shows as `localhost`, an IPv6 literal is bracketed, a
+    /// name or IPv4 address passes through.
+    #[test]
+    fn ui_address_is_the_printed_shape_with_a_reachable_host() {
+        assert_eq!(
+            ui_address("127.0.0.1", 8080, "t"),
+            "http://127.0.0.1:8080/ui/#token=t"
+        );
+        assert_eq!(
+            ui_address("0.0.0.0", 9000, "s3cret"),
+            "http://localhost:9000/ui/#token=s3cret"
+        );
+        assert_eq!(
+            ui_address("::", 8080, "t"),
+            "http://localhost:8080/ui/#token=t"
+        );
+        assert_eq!(
+            ui_address("::1", 8080, "t"),
+            "http://[::1]:8080/ui/#token=t"
+        );
+        assert_eq!(
+            ui_address("rocky.internal", 8080, "t"),
+            "http://rocky.internal:8080/ui/#token=t"
+        );
+    }
+
+    struct RecordingOpener(std::sync::Mutex<Vec<String>>);
+
+    impl BrowserOpener for RecordingOpener {
+        fn open(&self, url: &str) -> std::io::Result<()> {
+            self.0.lock().unwrap().push(url.to_string());
+            Ok(())
+        }
+    }
+
+    struct FailingOpener;
+
+    impl BrowserOpener for FailingOpener {
+        fn open(&self, _url: &str) -> std::io::Result<()> {
+            Err(std::io::Error::other("no browser on this machine"))
+        }
+    }
+
+    /// The opener receives EXACTLY the address `run_serve` prints — the same
+    /// `ui_address` string, token fragment included — and only after the
+    /// readiness latch, never on the print.
+    #[tokio::test]
+    async fn the_opener_receives_the_printed_address_only_after_ready() {
+        let ready = rocky_core::schedule::Drain::new();
+        let shutdown = rocky_core::schedule::Drain::new();
+        let opener = std::sync::Arc::new(RecordingOpener(std::sync::Mutex::new(Vec::new())));
+        let address = ui_address("0.0.0.0", 8080, "s3cret");
+        let handle = open_when_ready(
+            ready.clone(),
+            shutdown.clone(),
+            address.clone(),
+            opener.clone(),
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            opener.0.lock().unwrap().is_empty(),
+            "the browser was opened before the listener was bound"
+        );
+
+        ready.signal();
+        handle.await.unwrap();
+        assert_eq!(*opener.0.lock().unwrap(), vec![address]);
+    }
+
+    /// A shutdown before readiness — a bind that failed — opens nothing.
+    #[tokio::test]
+    async fn a_shutdown_before_ready_opens_nothing() {
+        let ready = rocky_core::schedule::Drain::new();
+        let shutdown = rocky_core::schedule::Drain::new();
+        let opener = std::sync::Arc::new(RecordingOpener(std::sync::Mutex::new(Vec::new())));
+        let handle = open_when_ready(
+            ready.clone(),
+            shutdown.clone(),
+            ui_address("127.0.0.1", 8080, "t"),
+            opener.clone(),
+        );
+        shutdown.signal();
+        handle.await.unwrap();
+        assert!(opener.0.lock().unwrap().is_empty());
+    }
+
+    /// A failing opener is a warning: the task completes and nothing propagates
+    /// to the server.
+    #[tokio::test]
+    async fn a_failing_opener_is_not_fatal() {
+        let ready = rocky_core::schedule::Drain::new();
+        let shutdown = rocky_core::schedule::Drain::new();
+        let handle = open_when_ready(
+            ready.clone(),
+            shutdown,
+            ui_address("127.0.0.1", 8080, "t"),
+            std::sync::Arc::new(FailingOpener),
+        );
+        ready.signal();
+        handle
+            .await
+            .expect("the opener task must not panic on a failed open");
+    }
 
     /// The four `--ui` refusals, each naming its fix, and the one shape that
     /// starts. Without `--ui` every combination passes.

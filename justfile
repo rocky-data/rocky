@@ -85,6 +85,64 @@ lint-vscode:
 lint-ui:
     cd engine/ui && npm run lint
 
+# The server below is a debug build of this checkout, started in `dir` with a
+# read-only token, without `--ui` (the page comes from Vite). Vite starts only
+# once `/api/v1/health` answers. Ctrl-C stops both; if either process dies the
+# other is stopped and the recipe fails. The API port is the ONE source for
+# Vite's proxy target: `engine/ui/vite.config.ts` reads it from `ROCKY_API`,
+# which this recipe sets. Override with ROCKY_UI_DEV_PORT and ROCKY_UI_DEV_TOKEN.
+
+# The UI development loop in one command: `rocky serve` + `npm run dev`.
+ui-dev dir="examples/playground/pocs/00-foundations/00-playground-default":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Job control: each child gets its own process group, so a Ctrl-C reaches
+    # this script alone and the trap below stops both groups deliberately —
+    # `npm run dev` and `cargo`-built `rocky` alike, with every child they
+    # spawned. Without it a killed `npm` can leave Vite's node process behind.
+    set -m
+    root="$(pwd)"
+    port="${ROCKY_UI_DEV_PORT:-8080}"
+    token="${ROCKY_UI_DEV_TOKEN:-dev}"
+    (cd engine && cargo build --quiet --bin rocky)
+    (cd "{{dir}}" && exec "$root/engine/target/debug/rocky" serve --port "$port" --token "$token" --token-scope read-only) &
+    server=$!
+    vite=""
+    stop() {
+        kill -- "-$server" 2>/dev/null || true
+        [ -n "$vite" ] && { kill -- "-$vite" 2>/dev/null || true; }
+        wait 2>/dev/null || true
+    }
+    # A signal ENDS the recipe: without the `exit`, bash would run the handler
+    # and then carry on to the `wait` below against a pid it has already reaped.
+    trap stop EXIT
+    trap 'stop; exit 130' INT
+    trap 'stop; exit 143' TERM
+    for _ in $(seq 1 60); do
+        curl -sf "http://127.0.0.1:$port/api/v1/health" >/dev/null 2>&1 && break
+        if ! kill -0 "$server" 2>/dev/null; then
+            echo "ui-dev: rocky serve exited before it answered on :$port" >&2
+            exit 1
+        fi
+        sleep 0.5
+    done
+    curl -sf "http://127.0.0.1:$port/api/v1/health" >/dev/null 2>&1 || {
+        echo "ui-dev: rocky serve did not answer on :$port within 30s" >&2
+        exit 1
+    }
+    echo "ui-dev: API on http://127.0.0.1:$port — open http://localhost:5173/ui/#token=$token"
+    (cd engine/ui && ROCKY_API="http://127.0.0.1:$port" exec npm run dev -- --strictPort --port 5173) &
+    vite=$!
+    # Watch both. Whichever dies first ends the loop; the trap stops the other.
+    while kill -0 "$server" 2>/dev/null && kill -0 "$vite" 2>/dev/null; do
+        sleep 1
+    done
+    if kill -0 "$vite" 2>/dev/null; then
+        echo "ui-dev: rocky serve exited; stopping Vite" >&2
+        exit 1
+    fi
+    wait "$vite"
+
 # --- Phase 2 schema codegen ---
 
 # Run the full codegen pipeline: rust → JSON schemas → Pydantic + TypeScript + VS Code project schema
