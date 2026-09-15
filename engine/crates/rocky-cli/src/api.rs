@@ -4899,14 +4899,43 @@ mod tests {
         assert_eq!(resp.status(), 200, "a client route gets the shell");
         assert_eq!(resp.headers()["content-type"], "text/html; charset=utf-8");
 
-        let resp = client
-            .get(format!("{base}/ui/assets/missing.js"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 404);
-        let err: ErrorEnvelope = resp.json().await.unwrap();
-        assert_eq!(err.code, "asset_not_found");
+        // A deep link whose last segment carries a dot is still a client
+        // route. The app produces two such links: custody for a dotted model
+        // name, and custody for a freeze plan id, whose timestamp carries
+        // fractional seconds. The old rule ("a dot means a file") answered
+        // 404 to both (C3-P0). The shell comes with the same headers as `/ui/`.
+        for route in [
+            "/ui/governor/custody/corp.prod.orders",
+            "/ui/governor/custody/freeze:global:2026-09-15T21:00:00.123Z",
+        ] {
+            let resp = client.get(format!("{base}{route}")).send().await.unwrap();
+            assert_eq!(
+                resp.status(),
+                200,
+                "{route}: a deep link with a dot gets the shell"
+            );
+            assert_eq!(
+                resp.headers()["content-type"],
+                "text/html; charset=utf-8",
+                "{route}"
+            );
+            assert_eq!(resp.headers()["cache-control"], "no-cache", "{route}");
+            assert!(
+                resp.headers().contains_key("content-security-policy"),
+                "{route}: the shell carries the security headers"
+            );
+        }
+
+        // Under the asset namespace a miss is a stale bundle: 404, never the
+        // shell — a page that got HTML for a script would fail less clearly.
+        // With an extension and without: the namespace decides, not the dot,
+        // so `assets/stale` is a 404 too (the old rule gave it the shell).
+        for stale in ["/ui/assets/missing.js", "/ui/assets/stale"] {
+            let resp = client.get(format!("{base}{stale}")).send().await.unwrap();
+            assert_eq!(resp.status(), 404, "{stale}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "asset_not_found", "{stale}");
+        }
 
         let resp = client.get(format!("{base}/ui")).send().await.unwrap();
         assert_eq!(resp.status(), 308);

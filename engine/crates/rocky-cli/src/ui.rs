@@ -98,8 +98,21 @@ async fn serve_index(State(state): State<Arc<ServerState>>) -> Response {
     index_response(&state)
 }
 
-/// A hashed asset by its path; a client route (no extension in its last
-/// segment) gets the shell so a deep link loads; a missing file is a `404`.
+/// A file the build emitted, by its path; anything else is a client route
+/// and gets the shell so a deep link loads — except under `assets/`, the
+/// namespace every hashed file lives in, where a miss is a stale bundle and
+/// a `404`.
+///
+/// The discriminator is the namespace, not the last segment. It used to be
+/// "does the last segment contain a dot", which made every client route
+/// whose last segment carries one a `404` instead of the page: a custody
+/// link for a dotted model name (`/ui/governor/custody/corp.prod.orders`)
+/// or for a freeze plan id, whose timestamp has fractional seconds
+/// (`freeze:global:2026-09-15T21:00:00.123Z`). The SPA's own contract
+/// (`engine/ui/src/router.ts`) has said "the server answers the shell for
+/// every `/ui/*` path" since U2-P1; the server did not honour it (C3-P0).
+/// The `assets/`-only layout is the build's, pinned by
+/// `engine/ui/scripts/check-no-external.mjs`.
 async fn serve_asset(State(state): State<Arc<ServerState>>, Path(path): Path<String>) -> Response {
     let Some(ui) = state.ui.as_ref() else {
         return ui_disabled();
@@ -108,8 +121,7 @@ async fn serve_asset(State(state): State<Arc<ServerState>>, Path(path): Path<Str
     if let Some(file) = ui.file(path) {
         return file_response(file, path.starts_with("assets/"));
     }
-    let last = path.rsplit('/').next().unwrap_or(path);
-    if !last.contains('.') {
+    if !path.starts_with("assets/") {
         return index_response(&state);
     }
     let body = serde_json::json!({
