@@ -1804,6 +1804,10 @@ def test_run_pipes_raises_when_engine_returns_null_plan_id():
     # before reaching the subprocess.
     fake_client.run.assert_not_called()
     assert "plan_id" in str(exc.value)
+    # The hint names the engine that first content-addressed every plan
+    # shape; a wrong floor here sends the user to install what they have
+    # (#1984).
+    assert "engine-v1.35+" in str(exc.value)
 
 
 def test_run_pipes_warns_when_timeout_seconds_is_non_default(caplog):

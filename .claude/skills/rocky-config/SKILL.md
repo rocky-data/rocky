@@ -28,10 +28,12 @@ Two mandatory sections (`[adapter]` + at least one `[pipeline.<name>]`) plus opt
 
 # Optional globals:
 [state]                  # Embedded state store backend
-[cache]                  # Valkey cache for adapter responses
+[cache.schemas]          # Schema (DESCRIBE) cache: enabled, ttl_seconds, replicate
 [cost]                   # Cost model for `rocky optimize`
-[governance]             # Tags, grants, workspace bindings (Databricks)
 [hook.<event>]           # Lifecycle hooks (one per event)
+# Governance (tags, grants, workspace bindings) is NOT a top-level table:
+# it lives under [pipeline.<name>.target.governance]. A top-level
+# [governance] is refused (deny_unknown_fields).
 ```
 
 ## Env var substitution
@@ -343,19 +345,21 @@ table_retries         = 1
 
 ## Governance (Databricks Unity Catalog)
 
+Governance is configured **per pipeline target**, under `[pipeline.<name>.target.governance]`. There is no top-level `[governance]` table; one is refused at load (`deny_unknown_fields` on `RockyConfig`).
+
 ```toml
-[governance]
+[pipeline.bronze.target.governance]
 auto_create_catalogs = true
 auto_create_schemas  = true
 
-[governance.tags]
+[pipeline.bronze.target.governance.tags]
 managed_by = "rocky"
 
-[[governance.grants]]
+[[pipeline.bronze.target.governance.grants]]
 principal   = "data-readers"
 permissions = ["BROWSE", "USE CATALOG", "USE SCHEMA", "SELECT"]
 
-[governance.isolation]
+[pipeline.bronze.target.governance.isolation]
 enabled       = true
 workspace_ids = "${WORKSPACE_IDS:-}"
 ```
@@ -430,14 +434,16 @@ enabled = false   # default; preview-only, NOT live-verified — leave off in pr
 
 `[reuse]` (`ReuseConfig`) is a **preview** surface scoped to the **Databricks–Iceberg content-addressed write path only** (no DuckDB / Snowflake / BigQuery), and it is **not yet live-verified against a warehouse**. When `enabled = true`, a successful run only *populates* an input-match index + provenance record; the reuse decision path only ever resolves to **BUILD** today (an ONLY-BUILD posture) — a fail-closed verdict is computed but nothing is reused, since the live point-to reuse is not yet wired/verified. It attests an input-logic match + byte-identity of the **recorded** bytes, never that a fresh re-run would reproduce them. Default-off keeps `rocky run` byte- and cost-identical. The per-invocation `--no-reuse` flag forces every model to build. Provenance is auditable per `docs/.../guides/verify-a-run.md`.
 
-## Cache (Valkey/Redis)
+## Cache
 
 ```toml
-[cache]
-valkey_url = "${VALKEY_URL}"
+[cache.schemas]
+enabled     = true     # default; false for strict CI (every typecheck hits the warehouse)
+ttl_seconds = 86400    # default 24h; lower for high-DDL-churn teams
+replicate   = false    # default; true to ship the cache through state_sync
 ```
 
-Feature-gated behind `valkey` Cargo feature in `rocky-cache`. Used for three-tier caching: memory → Valkey → source.
+`[cache.schemas]` is the only `[cache]` table (`CacheConfig` in `config.rs`): it stores `DESCRIBE TABLE` results in `state.redb` so leaf models typecheck against real warehouse types without a live round-trip on every compile. There is no `[cache] valkey_url` key: `ValkeyCacheConfig` exists as a type but is not wired into `RockyConfig`, and a `[cache]` table with any other key is refused (`deny_unknown_fields`). The Valkey tier is a `[state]` backend, not a cache setting.
 
 ## Cost model (for `rocky optimize`)
 
@@ -455,7 +461,7 @@ min_history_runs          = 5
 [hook.on_pipeline_start]
 command    = "scripts/notify.sh"
 timeout_ms = 5000
-on_failure = "warn"                  # or "error"
+on_failure = "warn"                  # default; or "abort" (stop the pipeline) / "ignore" (silent)
 
 [hook.on_pipeline_fail]
 url        = "${SLACK_WEBHOOK_URL}"   # webhook instead of command
