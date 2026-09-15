@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`rocky mcp` answers an `initialize` that names `2026-07-28` or later with `2025-11-25`, not `2024-11-05`.** The MCP library moved from 3.1.4 to 3.3.0. Since 3.2 it follows the 2026-07-28 versioning spec: that revision replaced the `initialize` handshake, so any client that still sends `initialize` is a legacy client whatever version it names, and one naming `2026-07-28` is answered with the server's fallback. Rocky's fallback was the oldest version with a handshake; it is now the newest, so such a client keeps the 2025 features rather than being sent back to 2024. A client naming `2025-11-25`, `2025-06-18`, `2025-03-26` or `2024-11-05` is still answered with what it asked for. A peer reaches `2026-07-28` through the library's discover lifecycle, which sends no `initialize`, or by declaring that version in a request's own metadata; the `resultType` field reaches such a peer, and is withheld from a request on a handshake version, as before. (#1965)
+
 ### Fixed
 
 - **A non-empty table whose timestamp column holds no value now fails its freshness check as not evaluated, instead of emitting no check at all.** `MAX(<timestamp_column>)` is NULL both over an empty table and over rows that carry no value, and the freshness query asked for nothing else, so the second case was read as "nothing to measure" and went silent on every adapter. The query now asks for `COUNT(*)` in the same aggregate, batched and per table, and a NULL maximum over one or more rows is reported as `freshness_not_evaluated` with the row count in its reason, at the error severity every unevaluated check keeps. An empty table still emits no check. A batch adapter that answers a NULL maximum without a count keeps the old reading (no check), so the two cases are only told apart where the adapter counts. (#1930)
