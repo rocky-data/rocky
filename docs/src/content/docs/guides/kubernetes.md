@@ -25,7 +25,7 @@ Then put a project on the volume, and reach it:
 
 ```bash
 kubectl port-forward -n rocky svc/rocky 8080:8080
-# http://localhost:8080/
+# http://localhost:8080/ui/
 ```
 
 ## Put your project on the volume
@@ -129,7 +129,7 @@ It does **not** prove the sweep succeeded, that the project compiled, that the s
 
 ## The browser UI
 
-`serve.ui.enabled` defaults to `false`. `rocky serve --ui` and `--allowed-host` shipped after `engine-v1.73.0`, which is the chart's `appVersion`, so the default image cannot serve the page. Turn the UI on and raise `image.tag` together, once a release carries them.
+`serve.ui.enabled` defaults to `true`. `rocky serve --ui` and `--allowed-host` shipped in `engine-v1.74.0`, the chart's `appVersion`, so the default image serves the page at `/ui/`. Set it to `false` for the API alone. With `scheduling.mode=resident` the UI also needs `existingSecret.webhookSecretKey`: the page is handed a read-only token, and the scheduler's webhook route must not be reachable with it.
 
 With the UI on, the Ingress host is passed as `--allowed-host` and a request carrying any other `Host` is refused `421`. Note that a foreign host usually never reaches Rocky at all: it matches no Ingress rule, so the controller's own default backend answers `404` first.
 

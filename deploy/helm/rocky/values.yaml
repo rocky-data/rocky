@@ -54,10 +54,11 @@ initContainers: []
 # Serve
 # ---------------------------------------------------------------------------
 serve:
-  # The browser UI. Needs an engine release carrying `--ui` and `--allowed-host`
-  # — later than 1.73.0. Raise image.tag with it.
+  # The browser UI. Needs an engine release carrying `--ui` and `--allowed-host`:
+  # 1.74.0 and later, which is the chart's appVersion. Off means the API alone.
+  # With scheduling.mode=resident the UI also needs existingSecret.webhookSecretKey.
   ui:
-    enabled: false
+    enabled: true
     # `--token-scope read-only` is refused 403 on any method that is not GET,
     # HEAD or OPTIONS. It is the token to hand a browser.
     tokenScope: read-only

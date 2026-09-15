@@ -6,9 +6,8 @@ Rocky is installed as {{ include "rocky.fullname" . }}.
   browser UI {{ if .Values.serve.ui.enabled }}on, token scope {{ .Values.serve.ui.tokenScope }}{{ else }}off{{ end }}
 
 {{ if not .Values.serve.ui.enabled -}}
-The UI is off. `rocky serve --ui` and `--allowed-host` shipped after
-engine-v1.73.0, which is this chart's appVersion. Raise image.tag to a release
-that carries them, then set serve.ui.enabled=true.
+The UI is off: the API answers, the page does not. Set serve.ui.enabled=true
+for the page; this chart's appVersion carries it.
 {{- end }}
 
 1. Put a project on the volume. The chart does not deliver one.
@@ -17,16 +16,17 @@ that carries them, then set serve.ui.enabled=true.
    exist. The state store is written to /data/models/.rocky-state.redb and the
    scheduler's files to /data/.rocky/.
 
-     kubectl cp ./my-project \
-       "$(kubectl get pod -l app.kubernetes.io/instance={{ .Release.Name }} -o name | cut -d/ -f2):/data"
-
-   Or set initContainers to clone it from your repository.
+   `kubectl cp` straight into the Rocky pod does not work: the image is
+   distroless and has no tar. Copy through a throwaway pod that mounts the
+   same claim, then chown the tree to 65532 — the steps are in
+   docs/guides/kubernetes/ under "Put your project on the volume". Or set
+   initContainers to clone it from your repository.
 
 2. Reach it.
 
 {{- if .Values.ingress.enabled }}
 
-     http{{ if .Values.ingress.tls }}s{{ end }}://{{ .Values.ingress.host }}{{ .Values.ingress.path }}
+     http{{ if .Values.ingress.tls }}s{{ end }}://{{ .Values.ingress.host }}{{ .Values.ingress.path }}{{ if .Values.serve.ui.enabled }}ui/{{ end }}
 
    Only that host works. The server is started with --allowed-host
    {{ .Values.ingress.host }}, and a request carrying any other Host is
@@ -34,7 +34,7 @@ that carries them, then set serve.ui.enabled=true.
 {{- else }}
 
      kubectl port-forward svc/{{ include "rocky.fullname" . }} 8080:{{ .Values.service.port }}
-     # http://localhost:8080/
+     # http://localhost:8080/{{ if .Values.serve.ui.enabled }}ui/{{ end }}
 {{- end }}
 
 3. The token is in the Secret you named, {{ .Values.existingSecret.name }}, under

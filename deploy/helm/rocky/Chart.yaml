@@ -6,15 +6,12 @@ type: application
 # The chart version moves with the chart. `appVersion` names the engine release
 # the default image tag pulls.
 #
-# `appVersion` is 1.73.0 because that is the newest published engine release
-# (`gh release list --repo rocky-data/rocky`). Every default in this chart is
-# therefore installable today.
-#
-# `rocky serve --ui` and `--allowed-host` shipped AFTER 1.73.0 (rocky #1687,
-# 2026-09-05; the tag is 2026-09-04). So `ui.enabled` defaults to false. Turn it
-# on and raise `image.tag` together, once an engine release carries the flags.
+# `appVersion` is 1.74.0: the newest published engine release
+# (`gh release list --repo rocky-data/rocky`), and the first one that carries
+# `rocky serve --ui` and `--allowed-host` (rocky #1687). Every default in this
+# chart is therefore installable today, the page included.
 version: 0.1.0
-appVersion: "1.73.0"
+appVersion: "1.74.0"
 
 home: https://rocky-data.github.io
 sources:

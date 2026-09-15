@@ -2,7 +2,7 @@
 [1m== 0  Provenance[0m
 
 $ date -u +%Y-%m-%dT%H:%M:%SZ
-2026-09-11T00:24:17Z
+2026-09-15T19:34:33Z
 
 $ helm version --short
 v4.3.0+gbec5b06
@@ -18,18 +18,29 @@ $ kubectl config current-context
 minikube
 
 $ kubectl get nodes -o wide
-NAME       STATUS   ROLES           AGE   VERSION   INTERNAL-IP    EXTERNAL-IP   OS-IMAGE             KERNEL-VERSION    CONTAINER-RUNTIME
-minikube   Ready    control-plane   74m   v1.31.0   192.168.49.2   <none>        Ubuntu 22.04.4 LTS   7.0.12-linuxkit   docker://27.2.0
+NAME       STATUS   ROLES           AGE   VERSION   INTERNAL-IP    EXTERNAL-IP   OS-IMAGE                         KERNEL-VERSION            CONTAINER-RUNTIME
+minikube   Ready    control-plane   18m   v1.37.0   192.168.49.2   <none>        Debian GNU/Linux 12 (bookworm)   7.0.12-linuxkit (arm64)   containerd://2.3.4
 
-chart:  deploy/helm/rocky
-image:  rocky:local
-engine: rocky 1.73.0
+chart:       deploy/helm/rocky
+appVersion:  1.74.0
+image:       ghcr.io/rocky-data/rocky:1.74.0  (the chart default; no image.tag was set)
+pull policy: IfNotPresent
+engine:      rocky 1.74.0
 
 $ helm lint 'deploy/helm/rocky' --set existingSecret.name=x --set persistence.storageClassName=standard
 ==> Linting deploy/helm/rocky
 [INFO] Chart.yaml: icon is recommended
 
 1 chart(s) linted, 0 chart(s) failed
+
+[1m== The Ingress controller the page is proved through[0m
+
+$ kubectl wait --namespace ingress-nginx --for=condition=ready pod --selector=app.kubernetes.io/component=controller --timeout=180s
+pod/ingress-nginx-controller-d7cd8c989-x8nnq condition met
+
+$ kubectl get svc -n ingress-nginx ingress-nginx-controller
+NAME                       TYPE       CLUSTER-IP     EXTERNAL-IP   PORT(S)                      AGE
+ingress-nginx-controller   NodePort   10.98.87.236   <none>        80:31457/TCP,443:32663/TCP   18m
 
 [1m== Row 3  Every refusal fires, and says why[0m
   PASS  replicaCount=2 is refused with the contract's sentence
@@ -48,6 +59,10 @@ $ helm lint 'deploy/helm/rocky' --set existingSecret.name=x --set persistence.st
         | rocky: persistence.storageClassName is empty.
   PASS  an Ingress with no host is refused
         | rocky: ingress.enabled is true and ingress.host is empty.
+  PASS  an Ingress with the UI off is refused unless acknowledged
+        | rocky: ingress.enabled is true and serve.ui.enabled is false.
+  PASS  the resident scheduler with the UI on needs a webhook secret
+        | rocky: serve.ui.enabled with scheduling.mode=resident needs
 
 [1m== Row 4  No secret reaches the rendered output[0m
   PASS  the chart renders no Secret object at all  (0)
@@ -60,7 +75,18 @@ $ helm lint 'deploy/helm/rocky' --set existingSecret.name=x --set persistence.st
     |                   key: token
     |           ports:
 
-[1m== Row 1 (partial)  One pod, and the API answers[0m
+  the serve arguments the chart renders by default:
+    |           args:
+    |             - serve
+    |             - --host
+    |             - 0.0.0.0
+    |             - --ui
+    |             - --token-scope
+    |             - "read-only"
+    |             - --allowed-host
+    |             - "rocky.acceptance.test"
+
+[1m== Row 1  One pod, the page on the Ingress host, a foreign Host is 421[0m
 
 $ kubectl create namespace rocky-acceptance
 namespace/rocky-acceptance created
@@ -68,9 +94,9 @@ namespace/rocky-acceptance created
 $ kubectl create secret generic rocky-serve -n rocky-acceptance --from-literal=token="$(openssl rand -hex 32)"
 secret/rocky-serve created
 
-$ helm install rocky-acc 'deploy/helm/rocky' -n rocky-acceptance --set image.repository=rocky --set image.tag=local --set image.pullPolicy=Never --set existingSecret.name=rocky-serve --set persistence.storageClassName=standard
+$ helm install rocky-acc 'deploy/helm/rocky' -n rocky-acceptance --set image.repository=ghcr.io/rocky-data/rocky --set image.pullPolicy=IfNotPresent --set existingSecret.name=rocky-serve --set persistence.storageClassName=standard --set ingress.enabled=true --set ingress.host=rocky.acceptance.test --set ingress.className=nginx
 NAME: rocky-acc
-LAST DEPLOYED: Fri Sep 11 01:24:18 2026
+LAST DEPLOYED: Tue Sep 15 20:34:35 2026
 NAMESPACE: rocky-acceptance
 STATUS: deployed
 REVISION: 1
@@ -79,14 +105,12 @@ TEST SUITE: None
 NOTES:
 Rocky is installed as rocky-acc.
 
-  image      rocky:local
+  image      ghcr.io/rocky-data/rocky:1.74.0
   volume     rocky-acc (ReadWriteOnce, class standard)
   scheduler  disabled
-  browser UI off
+  browser UI on, token scope read-only
 
-The UI is off. `rocky serve --ui` and `--allowed-host` shipped after
-engine-v1.73.0, which is this chart's appVersion. Raise image.tag to a release
-that carries them, then set serve.ui.enabled=true.
+
 
 1. Put a project on the volume. The chart does not deliver one.
 
@@ -94,15 +118,19 @@ that carries them, then set serve.ui.enabled=true.
    exist. The state store is written to /data/models/.rocky-state.redb and the
    scheduler's files to /data/.rocky/.
 
-     kubectl cp ./my-project \
-       "$(kubectl get pod -l app.kubernetes.io/instance=rocky-acc -o name | cut -d/ -f2):/data"
-
-   Or set initContainers to clone it from your repository.
+   `kubectl cp` straight into the Rocky pod does not work: the image is
+   distroless and has no tar. Copy through a throwaway pod that mounts the
+   same claim, then chown the tree to 65532 — the steps are in
+   docs/guides/kubernetes/ under "Put your project on the volume". Or set
+   initContainers to clone it from your repository.
 
 2. Reach it.
 
-     kubectl port-forward svc/rocky-acc 8080:8080
-     # http://localhost:8080/
+     http://rocky.acceptance.test/ui/
+
+   Only that host works. The server is started with --allowed-host
+   rocky.acceptance.test, and a request carrying any other Host is
+   refused 421.
 
 3. The token is in the Secret you named, rocky-serve, under
    the key token. This chart never printed it and
@@ -110,7 +138,13 @@ that carries them, then set serve.ui.enabled=true.
 
      kubectl get secret rocky-serve -o jsonpath='{.data.token}' | base64 -d
 
-Two things to know before you rely on this:
+Three things to know before you rely on this:
+
+  - The claim rocky-acc is annotated
+    helm.sh/resource-policy: keep. `helm uninstall` leaves it behind, so your
+    project and its run history survive. Installing again under this release
+    name ADOPTS that same claim, with whatever was already on it. To start
+    clean, delete the claim yourself.
 
   - /api/v1/health, which both probes use, is shallow. It answers as soon as
     the listener is bound. It does not prove the project compiled or that the
@@ -122,22 +156,30 @@ Two things to know before you rely on this:
 
   deployment: rocky-acc
 
-$ kubectl rollout status deploy/rocky-acc -n rocky-acceptance --timeout=180s
+$ kubectl rollout status deploy/rocky-acc -n rocky-acceptance --timeout=300s
 Waiting for deployment "rocky-acc" rollout to finish: 0 of 1 updated replicas are available...
 deployment "rocky-acc" successfully rolled out
-  PASS  exactly one pod  (1)
-  pod  rocky-acc-5bf77d649c-l9dv8
-  uid  ce331b4c-2488-47a0-9b70-b8e825334850
+  PASS  exactly one RUNNING pod  (1)
+  pod  rocky-acc-76dcc55d7d-zk878
+  uid  2c58bafb-c966-41fb-a5e6-8f7ba1062897
+
+[1m== The image it actually runs[0m
+  image    ghcr.io/rocky-data/rocky:1.74.0
+  imageID  ghcr.io/rocky-data/rocky@sha256:c74dd1858769cbc340fb5824b2a2c0c3abcad7dee9d50a4c989958e3f0f8460a
+  PASS  the running image is the chart default, by digest, from the registry  (1)
+
+  the arguments the pod was started with:
+    | ["serve","--host","0.0.0.0","--ui","--token-scope","read-only","--allowed-host","rocky.acceptance.test"]
 
 [1m== The volume it actually bound[0m
 
 $ kubectl get pvc -n rocky-acceptance -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,VOLUME:.spec.volumeName,CLASS:.spec.storageClassName,MODE:.spec.accessModes
 NAME        STATUS   VOLUME                                     CLASS      MODE
-rocky-acc   Bound    pvc-cfef76e8-d4a8-4800-b887-54c528e2107f   standard   [ReadWriteOnce]
+rocky-acc   Bound    pvc-b3fb9d9c-68c3-444a-8219-9aa900b059d7   standard   [ReadWriteOnce]
 
-$ kubectl get pv pvc-cfef76e8-d4a8-4800-b887-54c528e2107f -o custom-columns=NAME:.metadata.name,DRIVER:.spec.hostPath.path,RECLAIM:.spec.persistentVolumeReclaimPolicy,CLASS:.spec.storageClassName
+$ kubectl get pv pvc-b3fb9d9c-68c3-444a-8219-9aa900b059d7 -o custom-columns=NAME:.metadata.name,DRIVER:.spec.hostPath.path,RECLAIM:.spec.persistentVolumeReclaimPolicy,CLASS:.spec.storageClassName
 NAME                                       DRIVER                                                 RECLAIM   CLASS
-pvc-cfef76e8-d4a8-4800-b887-54c528e2107f   /tmp/hostpath-provisioner/rocky-acceptance/rocky-acc   Delete    standard
+pvc-b3fb9d9c-68c3-444a-8219-9aa900b059d7   /tmp/hostpath-provisioner/rocky-acceptance/rocky-acc   Delete    standard
 
   NOTE  a single-node cluster cannot settle whether a class is block-backed.
         The contract limits its locking claims to block storage, and flock
@@ -159,14 +201,14 @@ $ kubectl exec -n rocky-acceptance loader -- chown -R 65532:65532 /data
 
 $ kubectl exec -n rocky-acceptance loader -- ls -la /data
 total 552
-drwxrwxrwx    6 65532    65532         4096 Sep 11 00:24 .
-drwxr-xr-x    1 root     root          4096 Sep 11 00:24 ..
-drwxr-xr-x    3 65532    65532         4096 Sep 11 00:24 .rocky
-drwxr-xr-x    2 65532    65532         4096 Sep 11 00:24 contracts
-drwxr-xr-x    2 65532    65532         4096 Sep 11 00:24 data
-drwxr-xr-x    2 65532    65532         4096 Sep 11 00:24 models
--rw-r--r--    1 65532    65532       536576 Sep 11 00:24 playground.duckdb
--rw-r--r--    1 65532    65532         1069 Sep 11 00:24 rocky.toml
+drwxrwxrwx    6 65532    65532         4096 Sep 15 19:34 .
+drwxr-xr-x    1 root     root          4096 Sep 15 19:34 ..
+drwxr-xr-x    3 65532    65532         4096 Sep 15 19:34 .rocky
+drwxr-xr-x    2 65532    65532         4096 Sep 15 19:34 contracts
+drwxr-xr-x    2 65532    65532         4096 Sep 15 19:34 data
+drwxr-xr-x    2 65532    65532         4096 Sep 15 19:34 models
+-rw-r--r--    1 65532    65532       536576 Sep 15 19:34 playground.duckdb
+-rw-r--r--    1 65532    65532         1069 Sep 15 19:34 rocky.toml
 
 $ kubectl delete pod loader -n rocky-acceptance --wait=true
 pod "loader" deleted from rocky-acceptance namespace
@@ -184,17 +226,17 @@ deployment "rocky-acc" successfully rolled out
 [1m== Write real state, so the upgrade row is not vacuous[0m
 
 $ kubectl exec -n rocky-acceptance deploy/rocky-acc -- /usr/local/bin/rocky --version
-rocky 1.73.0
+rocky 1.74.0
 
 $ kubectl exec -n rocky-acceptance deploy/rocky-acc -- /usr/local/bin/rocky run --output json | tail -c 600
-{"timestamp":"2026-09-11T00:25:13.059503Z","level":"INFO","fields":{"message":"resolved pipeline","pipeline":"playground","pipeline_type":"transformation"},"target":"rocky_cli::commands::run","span":{"run_id":"run-20260911-002513-059","name":"run"},"spans":[{"run_id":"run-20260911-002513-059","name":"run"}]}
-{"timestamp":"2026-09-11T00:25:13.068752Z","level":"INFO","fields":{"message":"compiling and executing transformation models","models_dir":"./models/"},"target":"rocky_cli::commands::run","span":{"name":"execute_models"},"spans":[{"run_id":"run-20260911-002513-059","name":"run"},{"name":"run_transformation"},{"name":"execute_models"}]}
-{"timestamp":"2026-09-11T00:25:13.069343Z","level":"INFO","fields":{"message":"loaded .rocky models","count":1,"dir":"./models/"},"target":"rocky_compiler::project","span":{"name":"execute_models"},"spans":[{"run_id":"run-20260911-002513-059","name":"run"},{"name":"run_transformation"},{"name":"execute_models"}]}
-{"timestamp":"2026-09-11T00:25:13.069628Z","level":"INFO","fields":{"message":"compile finished","project_load_ms":0,"semantic_graph_ms":0,"typecheck_ms":0,"typecheck_join_keys_ms":0,"contracts_ms":0,"total_ms":0,"models":3},"target":"rocky::compile::timings","span":{"name":"execute_models"},"spans":[{"run_id":"run-20260911-002513-059","name":"run"},{"name":"run_transformation"},{"name":"execute_models"}]}
-{"timestamp":"2026-09-11T00:25:13.070043Z","level":"INFO","fields":{"message":"executing model","model":"raw_orders","target":"playground.main.raw_orders","statements":1,"skip_strategy_exec":false},"target":"rocky_cli::commands::run","span":{"name":"execute_models"},"spans":[{"run_id":"run-20260911-002513-059","name":"run"},{"name":"run_transformation"},{"name":"execute_models"}]}
-{"timestamp":"2026-09-11T00:25:13.071419Z","level":"INFO","fields":{"message":"executing model","model":"customer_orders","target":"playground.main.customer_orders","statements":1,"skip_strategy_exec":false},"target":"rocky_cli::commands::run","span":{"name":"execute_models"},"spans":[{"run_id":"run-20260911-002513-059","name":"run"},{"name":"run_transformation"},{"name":"execute_models"}]}
-{"timestamp":"2026-09-11T00:25:13.072705Z","level":"INFO","fields":{"message":"executing model","model":"revenue_summary","target":"playground.main.revenue_summary","statements":1,"skip_strategy_exec":false},"target":"rocky_cli::commands::run","span":{"name":"execute_models"},"spans":[{"run_id":"run-20260911-002513-059","name":"run"},{"name":"run_transformation"},{"name":"execute_models"}]}
-{"timestamp":"2026-09-11T00:25:13.073633Z","level":"INFO","fields":{"message":"model execution complete","models":3},"target":"rocky_cli::commands::run","span":{"name":"execute_models"},"spans":[{"run_id":"run-20260911-002513-059","name":"run"},{"name":"run_transformation"},{"name":"execute_models"}]}
+{"timestamp":"2026-09-15T19:35:28.539545Z","level":"INFO","fields":{"message":"resolved pipeline","pipeline":"playground","pipeline_type":"transformation"},"target":"rocky_cli::commands::run","span":{"run_id":"run-20260915-193528-539","name":"run"},"spans":[{"run_id":"run-20260915-193528-539","name":"run"}]}
+{"timestamp":"2026-09-15T19:35:28.555554Z","level":"INFO","fields":{"message":"compiling and executing transformation models","models_dir":"./models/"},"target":"rocky_cli::commands::run","span":{"name":"execute_models"},"spans":[{"run_id":"run-20260915-193528-539","name":"run"},{"name":"run_transformation"},{"name":"execute_models"}]}
+{"timestamp":"2026-09-15T19:35:28.556080Z","level":"INFO","fields":{"message":"loaded .rocky models","count":1,"dir":"./models/"},"target":"rocky_compiler::project","span":{"name":"execute_models"},"spans":[{"run_id":"run-20260915-193528-539","name":"run"},{"name":"run_transformation"},{"name":"execute_models"}]}
+{"timestamp":"2026-09-15T19:35:28.556419Z","level":"INFO","fields":{"message":"compile finished","project_load_ms":0,"semantic_graph_ms":0,"typecheck_ms":0,"typecheck_join_keys_ms":0,"contracts_ms":0,"total_ms":0,"models":3},"target":"rocky::compile::timings","span":{"name":"execute_models"},"spans":[{"run_id":"run-20260915-193528-539","name":"run"},{"name":"run_transformation"},{"name":"execute_models"}]}
+{"timestamp":"2026-09-15T19:35:28.556846Z","level":"INFO","fields":{"message":"executing model","model":"raw_orders","target":"playground.main.raw_orders","statements":1,"skip_strategy_exec":false},"target":"rocky_cli::commands::run","span":{"name":"execute_models"},"spans":[{"run_id":"run-20260915-193528-539","name":"run"},{"name":"run_transformation"},{"name":"execute_models"}]}
+{"timestamp":"2026-09-15T19:35:28.558654Z","level":"INFO","fields":{"message":"executing model","model":"customer_orders","target":"playground.main.customer_orders","statements":1,"skip_strategy_exec":false},"target":"rocky_cli::commands::run","span":{"name":"execute_models"},"spans":[{"run_id":"run-20260915-193528-539","name":"run"},{"name":"run_transformation"},{"name":"execute_models"}]}
+{"timestamp":"2026-09-15T19:35:28.559959Z","level":"INFO","fields":{"message":"executing model","model":"revenue_summary","target":"playground.main.revenue_summary","statements":1,"skip_strategy_exec":false},"target":"rocky_cli::commands::run","span":{"name":"execute_models"},"spans":[{"run_id":"run-20260915-193528-539","name":"run"},{"name":"run_transformation"},{"name":"execute_models"}]}
+{"timestamp":"2026-09-15T19:35:28.560741Z","level":"INFO","fields":{"message":"model execution complete","models":3},"target":"rocky_cli::commands::run","span":{"name":"execute_models"},"spans":[{"run_id":"run-20260915-193528-539","name":"run"},{"name":"run_transformation"},{"name":"execute_models"}]}
 .0,
     "total_duration_ms": 2,
     "per_model": [
@@ -233,25 +275,30 @@ $ kubectl exec -n rocky-acceptance deploy/rocky-acc -- /usr/local/bin/rocky run 
   run records on the volume before the upgrade: 1
   PASS  real state exists before the upgrade  (1 run records)
 
-[1m== The API answers, and the token is enforced[0m
+[1m== The page answers on the Ingress host, THROUGH the controller[0m
+  PASS  GET /ui/ on the Ingress host, through the controller  (200)
+  PASS  and it is Rocky's page, not the controller's error body  (1)
+  PASS  GET /api/v1/health on the Ingress host, through the controller  (200)
+  note  a foreign Host through the controller answers 404. That is the
+        controller's default backend, not Rocky, so it proves nothing about
+        the server's host guard. The 421 is asserted below, straight at the Service.
+
+[1m== The API answers, the token is enforced, a foreign Host is 421[0m
+./deploy/helm/acceptance.sh: line 123: 38060 Terminated: 15          kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller 18081:80 > /dev/null 2>&1
   PASS  GET /api/v1/health with no token  (200)
   PASS  GET /api/v1/runs with no token  (401)
   PASS  GET /api/v1/runs with the token  (200)
-  note  /api/v1/project answers 404 here. It is a UI-era route and this
-        binary predates it. The 401 above still proves the token is enforced.
-
-  GATED  "the page answers on the Ingress host" and "a foreign Host is 421"
-         need --ui and --allowed-host. Neither exists in engine-v1.73.0.
-         Proof:
-         | error: unexpected argument '--allowed-host' found
-         | 
+  PASS  GET /api/v1/project with the token  (200)
+  PASS  GET /ui/ with a foreign Host is refused 421  (421)
+  PASS  GET /api/v1/runs with a foreign Host and the token is refused 421  (421)
+  PASS  GET /api/v1/health with a foreign Host still answers (the probe exemption)  (200)
 
 [1m== Row 2  helm upgrade replaces the pod, and the state survives[0m
 
-$ helm upgrade rocky-acc 'deploy/helm/rocky' -n rocky-acceptance --set image.repository=rocky --set image.tag=local --set image.pullPolicy=Never --set existingSecret.name=rocky-serve --set persistence.storageClassName=standard --set podAnnotations.acceptance=upgrade-2
+$ helm upgrade rocky-acc 'deploy/helm/rocky' -n rocky-acceptance --set image.repository=ghcr.io/rocky-data/rocky --set image.pullPolicy=IfNotPresent --set existingSecret.name=rocky-serve --set persistence.storageClassName=standard --set ingress.enabled=true --set ingress.host=rocky.acceptance.test --set ingress.className=nginx --set podAnnotations.acceptance=upgrade-2
 Release "rocky-acc" has been upgraded. Happy Helming!
 NAME: rocky-acc
-LAST DEPLOYED: Fri Sep 11 01:25:14 2026
+LAST DEPLOYED: Tue Sep 15 20:35:31 2026
 NAMESPACE: rocky-acceptance
 STATUS: deployed
 REVISION: 2
@@ -260,14 +307,12 @@ TEST SUITE: None
 NOTES:
 Rocky is installed as rocky-acc.
 
-  image      rocky:local
+  image      ghcr.io/rocky-data/rocky:1.74.0
   volume     rocky-acc (ReadWriteOnce, class standard)
   scheduler  disabled
-  browser UI off
+  browser UI on, token scope read-only
 
-The UI is off. `rocky serve --ui` and `--allowed-host` shipped after
-engine-v1.73.0, which is this chart's appVersion. Raise image.tag to a release
-that carries them, then set serve.ui.enabled=true.
+
 
 1. Put a project on the volume. The chart does not deliver one.
 
@@ -275,15 +320,19 @@ that carries them, then set serve.ui.enabled=true.
    exist. The state store is written to /data/models/.rocky-state.redb and the
    scheduler's files to /data/.rocky/.
 
-     kubectl cp ./my-project \
-       "$(kubectl get pod -l app.kubernetes.io/instance=rocky-acc -o name | cut -d/ -f2):/data"
-
-   Or set initContainers to clone it from your repository.
+   `kubectl cp` straight into the Rocky pod does not work: the image is
+   distroless and has no tar. Copy through a throwaway pod that mounts the
+   same claim, then chown the tree to 65532 — the steps are in
+   docs/guides/kubernetes/ under "Put your project on the volume". Or set
+   initContainers to clone it from your repository.
 
 2. Reach it.
 
-     kubectl port-forward svc/rocky-acc 8080:8080
-     # http://localhost:8080/
+     http://rocky.acceptance.test/ui/
+
+   Only that host works. The server is started with --allowed-host
+   rocky.acceptance.test, and a request carrying any other Host is
+   refused 421.
 
 3. The token is in the Secret you named, rocky-serve, under
    the key token. This chart never printed it and
@@ -291,7 +340,13 @@ that carries them, then set serve.ui.enabled=true.
 
      kubectl get secret rocky-serve -o jsonpath='{.data.token}' | base64 -d
 
-Two things to know before you rely on this:
+Three things to know before you rely on this:
+
+  - The claim rocky-acc is annotated
+    helm.sh/resource-policy: keep. `helm uninstall` leaves it behind, so your
+    project and its run history survive. Installing again under this release
+    name ADOPTS that same claim, with whatever was already on it. To start
+    clean, delete the claim yourself.
 
   - /api/v1/health, which both probes use, is shallow. It answers as soon as
     the listener is bound. It does not prove the project compiled or that the
@@ -300,7 +355,7 @@ Two things to know before you rely on this:
   - This chart is community-supported, like the Compose example in
     deploy/rocky/. It encodes the deployment contract; it is not a supported
     deployment.
-deploy/helm/acceptance.sh: line 62: 20478 Terminated: 15          kubectl port-forward -n "$NS" "svc/$DEPLOY" 18080:8080 > /dev/null 2>&1
+./deploy/helm/acceptance.sh: line 77: 38076 Terminated: 15          kubectl port-forward -n "$NS" "svc/$DEPLOY" 18080:8080 > /dev/null 2>&1
 
 $ kubectl rollout status deploy/rocky-acc -n rocky-acceptance --timeout=180s
 Waiting for deployment "rocky-acc" rollout to finish: 0 out of 1 new replicas have been updated...
@@ -308,21 +363,20 @@ Waiting for deployment "rocky-acc" rollout to finish: 0 out of 1 new replicas ha
 Waiting for deployment "rocky-acc" rollout to finish: 0 out of 1 new replicas have been updated...
 Waiting for deployment "rocky-acc" rollout to finish: 0 of 1 updated replicas are available...
 deployment "rocky-acc" successfully rolled out
-  pod before  rocky-acc-5bf77d649c-l9dv8  ce331b4c-2488-47a0-9b70-b8e825334850
-  pod after   rocky-acc-b9d85545b-zkw2s  89c7d3bb-a4a5-4ed4-8904-222b7030a009
-  PASS  the pod was really replaced
-  PASS  still exactly one pod  (1)
-  PASS  the same claim is mounted  (rocky-acc)
+  pod before  rocky-acc-76dcc55d7d-zk878  2c58bafb-c966-41fb-a5e6-8f7ba1062897
+  pod after   rocky-acc-5c74dd7d64-xl2dx  b6af87e2-64c1-44e2-9481-c05a407da14c  (Running)
+  PASS  the pod was really replaced, and the replacement runs
+  PASS  still exactly one RUNNING pod  (1)
+  PASS  the same bound volume is mounted  (pvc-b3fb9d9c-68c3-444a-8219-9aa900b059d7)
   PASS  the run history survived the replacement  (1 records, both sides)
 
 [1m== Result[0m
-  passed 20
+  passed 30
   failed 0
 
   still owed, and not claimed above:
-    - the page, and the 421 on a foreign Host  (needs an engine release with --ui)
-    - the chart default image pulled from GHCR (needs the package to be public)
-    - a block-backed storage class             (a single node cannot settle it)
+    - a block-backed storage class   (a single node cannot settle it)
+    - the same run as a CI job       (this transcript is the interim evidence row 1 allows)
 
 
 == Cleanup
