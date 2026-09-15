@@ -967,11 +967,10 @@ class RockyClient:
                     print(statement.purpose, "->", statement.target)
                     print(statement.sql)
 
-                # `plan_id` is None for replication-only invocations — only a
-                # run that compiled a models/ directory persists a blueprint,
-                # so guard before applying rather than assuming a string.
-                if plan.plan_id is not None:
-                    result = client.apply(plan.plan_id)
+                # Every project shape gets a content-addressed `plan_id` on
+                # the engines this SDK accepts (1.35.0 and newer), replication-
+                # only projects included, so it can be applied directly.
+                result = client.apply(plan.plan_id)
 
             Governance previews (``classification_actions``, ``mask_actions``,
             ``retention_actions``) are empty on projects without the

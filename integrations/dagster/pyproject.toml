@@ -44,6 +44,10 @@ dependencies = [
     # ScheduleSpoolOutput, and `component.py` reads RunResult.check_gate_failed.
     # None of them exists in 0.14.0, so the same import-time failure applies.
     # Release rocky-sdk 0.15.0 BEFORE dagster-rocky 1.66.0.
+    # MIN_ROCKY_VERSION moved to 1.35.0 in the SDK after 0.15.0 (#1984). A
+    # dagster-rocky release that claims the 1.35.0 floor needs the rocky-sdk
+    # release that carries it: release that SDK first, then raise this floor
+    # to it. Against rocky-sdk 0.15.0 only the "no plan_id" hint text changes.
     "rocky-sdk>=0.15.0",
     # Floor matches the version CI actually resolves and tests (uv.lock). The
     # RockyComponent path uses dagster.components.* APIs from preview namespaces,

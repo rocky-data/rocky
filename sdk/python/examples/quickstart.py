@@ -9,7 +9,7 @@ Or point it at an existing project's ``rocky.toml``:
 
     python quickstart.py path/to/rocky.toml
 
-Requires the ``rocky`` binary on PATH (engine v1.34.0+). The engine has DuckDB
+Requires the ``rocky`` binary on PATH (engine v1.35.0+). The engine has DuckDB
 embedded, so the playground path needs nothing else installed.
 """
 
