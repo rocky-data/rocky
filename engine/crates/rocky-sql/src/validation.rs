@@ -1,3 +1,4 @@
+use crate::check_expression::ExpressionUse;
 use regex::Regex;
 use std::sync::LazyLock;
 use thiserror::Error;
@@ -77,42 +78,70 @@ pub enum ValidationError {
 
     // ---- `expression` check content (#1524) -------------------------------
     // An expression check is interpolated into `WHERE NOT (<expression>)` and
-    // executed with the project's warehouse credentials. These four refuse
-    // anything that is not one boolean expression over the model's own
-    // columns. See `crate::check_expression`.
+    // executed with the project's warehouse credentials. These five refuse
+    // anything that is not one expression over the model's own columns. See
+    // `crate::check_expression`.
+    //
+    // The same validator judges a metadata column value and a grouping key,
+    // so the advice beside each refusal comes from `use_` rather than being
+    // written for `[checks.assertions]` alone: telling the author of a
+    // metadata column value to write "one boolean expression" states a rule
+    // that position does not apply (#1959).
     #[error(
-        "{context}: expression does not parse as a single SQL expression ({detail}). An \
-         expression check is one boolean expression over the model's columns, e.g. \
-         `amount >= 0`"
+        "{context}: expression does not parse as a single SQL expression ({detail}). {} is {}",
+        .use_.noun(),
+        .use_.accepted_shape()
     )]
-    ExpressionUnparseable { context: String, detail: String },
+    ExpressionUnparseable {
+        context: String,
+        detail: String,
+        use_: ExpressionUse,
+    },
 
     #[error(
-        "{context}: expression continues past the end of one expression. Only a single \
-         boolean expression is accepted — no trailing clauses, commas or operators"
+        "{context}: expression continues past the end of one expression. {} is {} — no \
+         trailing clauses, commas or operators",
+        .use_.noun(),
+        .use_.accepted_shape()
     )]
-    ExpressionTrailingTokens { context: String },
+    ExpressionTrailingTokens {
+        context: String,
+        use_: ExpressionUse,
+    },
 
     #[error(
-        "{context}: expression contains a subquery. An expression check may only read the \
-         row's own columns; it cannot read other tables"
+        "{context}: expression contains a subquery. {} may only read the row's own columns; \
+         it cannot read other tables",
+        .use_.noun()
     )]
-    ExpressionSubquery { context: String },
+    ExpressionSubquery {
+        context: String,
+        use_: ExpressionUse,
+    },
 
     #[error(
         "{context}: expression calls `{function}`, which is not on the allowlist of pure \
-         scalar functions an expression check may use. Warehouse functions can read files, \
-         secrets, session state or remote endpoints, so only a named set is permitted. To \
-         extend it, add the function to `CHECK_EXPRESSION_FUNCTIONS` in rocky-sql"
+         scalar functions {} may use. Warehouse functions can read files, secrets, session \
+         state or remote endpoints, so only a named set is permitted. To extend it, add the \
+         function to `CHECK_EXPRESSION_FUNCTIONS` in rocky-sql",
+        .use_.noun_lowercase()
     )]
-    ExpressionFunctionNotAllowed { context: String, function: String },
+    ExpressionFunctionNotAllowed {
+        context: String,
+        function: String,
+        use_: ExpressionUse,
+    },
 
     #[error(
         "{context}: expression calls the qualified function `{function}`. Qualified names \
-         reach user-defined, remote or plugin functions, which are never allowed in an \
-         expression check"
+         reach user-defined, remote or plugin functions, which are never allowed in {}",
+        .use_.noun_lowercase()
     )]
-    ExpressionQualifiedFunction { context: String, function: String },
+    ExpressionQualifiedFunction {
+        context: String,
+        function: String,
+        use_: ExpressionUse,
+    },
 }
 
 /// Validates a SQL identifier (catalog, schema, table, column names).

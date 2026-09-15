@@ -240,13 +240,15 @@ pub enum ExpressionUse {
     /// A scalar value projected into the SELECT list, evaluated ONCE per
     /// statement (`metadata_columns[].value`).
     ///
-    /// Behaves exactly like [`ExpressionUse::SinglePredicate`] today. It is a
-    /// separate variant because the two differ in what they ARE, not in what
-    /// they currently permit: one is a boolean tested per row, the other a
-    /// value written into a column. A future rule can apply to one and not
-    /// the other — a type or nullability constraint belongs to the
-    /// projection, a three-valued-logic rule to the predicate. Do NOT merge
-    /// them back together on the grounds that the bodies match.
+    /// Permits exactly what [`ExpressionUse::SinglePredicate`] permits today;
+    /// only the advice beside a refusal differs, because it has to describe a
+    /// column value rather than a check (#1959). It is a separate variant
+    /// because the two differ in what they ARE, not in what they currently
+    /// permit: one is a boolean tested per row, the other a value written
+    /// into a column. A future rule can apply to one and not the other — a
+    /// type or nullability constraint belongs to the projection, a
+    /// three-valued-logic rule to the predicate. Do NOT merge them back
+    /// together on the grounds that the bodies match.
     ///
     /// Volatile is allowed and is the ordinary case: `_loaded_at` is
     /// `current_timestamp()`. Each of `select_clause`'s three callers renders
@@ -301,6 +303,55 @@ impl ExpressionUse {
     fn refuses_collate(self) -> bool {
         matches!(self, ExpressionUse::GroupingKey)
     }
+
+    /// What a refusal calls the expression in this position, at the start
+    /// of a sentence.
+    ///
+    /// The advice beside a refusal has to describe the field being
+    /// validated. One validator serves three fields, so the noun comes from
+    /// the mode rather than from a sentence written for `[checks.assertions]`
+    /// (#1959). `context` still names the exact field; this names its kind.
+    pub fn noun(self) -> &'static str {
+        match self {
+            ExpressionUse::SinglePredicate | ExpressionUse::ReevaluatedPredicate => {
+                "An expression check"
+            }
+            ExpressionUse::ScalarProjection => "A metadata column value",
+            ExpressionUse::GroupingKey => "A key expression",
+        }
+    }
+
+    /// [`Self::noun`], mid-sentence.
+    pub fn noun_lowercase(self) -> &'static str {
+        match self {
+            ExpressionUse::SinglePredicate | ExpressionUse::ReevaluatedPredicate => {
+                "an expression check"
+            }
+            ExpressionUse::ScalarProjection => "a metadata column value",
+            ExpressionUse::GroupingKey => "a key expression",
+        }
+    }
+
+    /// The shape this position accepts, with an example, for the message a
+    /// parse failure carries.
+    ///
+    /// A predicate is a boolean. A metadata column value is not: `NULL`,
+    /// `1` and `'rocky'` are all accepted there, so the boolean advice would
+    /// send its author looking for a rule the validator never applies. A key
+    /// is any expression over the row that rows can be grouped by.
+    pub fn accepted_shape(self) -> &'static str {
+        match self {
+            ExpressionUse::SinglePredicate | ExpressionUse::ReevaluatedPredicate => {
+                "one boolean expression over the model's columns, e.g. `amount >= 0`"
+            }
+            ExpressionUse::ScalarProjection => {
+                "one scalar expression, e.g. `current_timestamp()`, `'rocky'` or `NULL`"
+            }
+            ExpressionUse::GroupingKey => {
+                "one expression over the row's own columns, e.g. `lower(email)`"
+            }
+        }
+    }
 }
 
 /// The sqlparser dialect to parse an expression under, from a Rocky
@@ -339,6 +390,7 @@ pub fn validate_check_expression(
     let unparseable = |detail: String| ValidationError::ExpressionUnparseable {
         context: context.to_string(),
         detail,
+        use_,
     };
     let mut parser = Parser::new(dialect)
         .try_with_sql(expression)
@@ -352,6 +404,7 @@ pub fn validate_check_expression(
     if parser.peek_token().token != Token::EOF {
         return Err(ValidationError::ExpressionTrailingTokens {
             context: context.to_string(),
+            use_,
         });
     }
     let mut walker = Walker { context, use_ };
@@ -379,6 +432,7 @@ impl Visitor for Walker<'_> {
     fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
         ControlFlow::Break(ValidationError::ExpressionSubquery {
             context: self.context.to_string(),
+            use_: self.use_,
         })
     }
 
@@ -388,6 +442,7 @@ impl Visitor for Walker<'_> {
     fn pre_visit_table_factor(&mut self, _tf: &TableFactor) -> ControlFlow<Self::Break> {
         ControlFlow::Break(ValidationError::ExpressionSubquery {
             context: self.context.to_string(),
+            use_: self.use_,
         })
     }
 
@@ -400,6 +455,7 @@ impl Visitor for Walker<'_> {
             Expr::Collate { .. } if self.use_.refuses_collate() => {
                 ControlFlow::Break(ValidationError::ExpressionFunctionNotAllowed {
                     context: self.context.to_string(),
+                    use_: self.use_,
                     function: "COLLATE".to_string(),
                 })
             }
@@ -411,6 +467,7 @@ impl Visitor for Walker<'_> {
                     // functions and plugin functions are reached.
                     return ControlFlow::Break(ValidationError::ExpressionQualifiedFunction {
                         context: self.context.to_string(),
+                        use_: self.use_,
                         function: function.name.to_string(),
                     });
                 };
@@ -426,6 +483,7 @@ impl Visitor for Walker<'_> {
                 {
                     return ControlFlow::Break(ValidationError::ExpressionFunctionNotAllowed {
                         context: self.context.to_string(),
+                        use_: self.use_,
                         function: ident.value.clone(),
                     });
                 }
@@ -434,6 +492,7 @@ impl Visitor for Walker<'_> {
                 } else {
                     ControlFlow::Break(ValidationError::ExpressionFunctionNotAllowed {
                         context: self.context.to_string(),
+                        use_: self.use_,
                         function: ident.value.clone(),
                     })
                 }
@@ -443,6 +502,7 @@ impl Visitor for Walker<'_> {
             // and nothing an expression check needs is expressed as one.
             Expr::Lambda(_) => ControlFlow::Break(ValidationError::ExpressionFunctionNotAllowed {
                 context: self.context.to_string(),
+                use_: self.use_,
                 function: "<lambda>".to_string(),
             }),
             // A bare, unquoted `current_user` is a session read spelled as
@@ -454,6 +514,7 @@ impl Visitor for Walker<'_> {
             {
                 ControlFlow::Break(ValidationError::ExpressionFunctionNotAllowed {
                     context: self.context.to_string(),
+                    use_: self.use_,
                     function: ident.value.clone(),
                 })
             }
@@ -475,6 +536,7 @@ impl Visitor for Walker<'_> {
                 };
                 ControlFlow::Break(ValidationError::ExpressionFunctionNotAllowed {
                     context: self.context.to_string(),
+                    use_: self.use_,
                     function: name,
                 })
             }
@@ -525,6 +587,79 @@ mod tests {
             ExpressionUse::ScalarProjection,
         )
         .expect("a projected value is not compared against other rows");
+    }
+
+    /// The advice beside a refusal describes the position that was
+    /// validated, not `[checks.assertions]` (#1959).
+    ///
+    /// A metadata column value that fails to parse used to be told to write
+    /// "one boolean expression over the model's columns", a rule the
+    /// projection mode never applies: `NULL`, `1` and `'rocky'` are all
+    /// accepted there. Every one of the five refusals carries the noun, so
+    /// each is checked, and the predicate wording is pinned unchanged so this
+    /// cannot pass by rewording the check advice instead.
+    #[test]
+    fn a_refusal_describes_the_position_it_was_validated_for() {
+        let refuse = |e: &str, use_: ExpressionUse| {
+            validate_check_expression("metadata_columns[].value", e, &GenericDialect, use_)
+                .expect_err("must be refused")
+                .to_string()
+        };
+
+        let projected = refuse("1 +", ExpressionUse::ScalarProjection);
+        assert!(
+            projected.contains("does not parse as a single SQL expression")
+                && projected.contains(
+                    "A metadata column value is one scalar expression, e.g. \
+                     `current_timestamp()`, `'rocky'` or `NULL`"
+                )
+                && !projected.contains("boolean"),
+            "{projected}"
+        );
+        let trailing = refuse("1, 2", ExpressionUse::ScalarProjection);
+        assert!(
+            trailing.contains("A metadata column value is one scalar expression")
+                && !trailing.contains("boolean"),
+            "{trailing}"
+        );
+        let subquery = refuse("(SELECT 1)", ExpressionUse::ScalarProjection);
+        assert!(
+            subquery.contains("A metadata column value may only read the row's own columns"),
+            "{subquery}"
+        );
+        let off_list = refuse("my_udf(1)", ExpressionUse::ScalarProjection);
+        assert!(
+            off_list.contains("pure scalar functions a metadata column value may use"),
+            "{off_list}"
+        );
+        let qualified = refuse("s.f(1)", ExpressionUse::ScalarProjection);
+        assert!(
+            qualified.contains("never allowed in a metadata column value"),
+            "{qualified}"
+        );
+
+        // The check wording is unchanged for the field it was written for.
+        let predicate = refuse("1 +", ExpressionUse::SinglePredicate);
+        assert!(
+            predicate.contains(
+                "An expression check is one boolean expression over the model's columns, \
+                 e.g. `amount >= 0`"
+            ),
+            "{predicate}"
+        );
+        let split = refuse("1 +", ExpressionUse::ReevaluatedPredicate);
+        assert!(
+            split.contains("An expression check is one boolean"),
+            "{split}"
+        );
+
+        // A key is grouped by, so it is neither a boolean nor a column value.
+        let key = refuse("1 +", ExpressionUse::GroupingKey);
+        assert!(
+            key.contains("A key expression is one expression over the row's own columns")
+                && !key.contains("boolean"),
+            "{key}"
+        );
     }
 
     /// `ScalarProjection` accepts the metadata-column case that gives it a
