@@ -74,7 +74,7 @@ pub mod schedule_spool;
 pub mod schedule_status;
 pub mod scheduler;
 mod seed;
-mod serve;
+pub(crate) mod serve;
 mod shadow_lifecycle;
 mod shell;
 mod skip_gate;

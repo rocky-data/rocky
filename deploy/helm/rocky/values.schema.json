@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "Rocky Helm chart values",
+  "description": "This schema validates SHAPE and TYPE only. Every rule that carries a reason lives in templates/_guards.tpl instead. Helm validates the schema FIRST and stops, so putting a constraint in both places means the operator reads 'value must be 1' and never reads why. One enforcement point per rule, and it is the one that can explain itself.",
+  "type": "object",
+  "required": ["replicaCount", "strategy", "image", "persistence", "existingSecret", "scheduling", "terminationGracePeriodSeconds"],
+  "properties": {
+    "replicaCount": {
+      "type": "integer",
+      "description": "One. _guards.tpl refuses anything else and prints the contract's sentence."
+    },
+    "strategy": {
+      "type": "string",
+      "description": "Recreate. _guards.tpl refuses anything else and prints the reason."
+    },
+    "terminationGracePeriodSeconds": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Must exceed scheduling.resident.drainTimeoutSeconds + 60. That floor is relational, so no schema can express it; _guards.tpl computes it and prints the arithmetic."
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "imagePullSecrets": { "type": "array" },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "storageClassName": {
+          "type": "string",
+          "description": "Name a block-backed class deliberately. _guards.tpl refuses an empty one and says why."
+        },
+        "size": { "type": "string" },
+        "accessMode": {
+          "type": "string",
+          "description": "ReadWriteOnce. _guards.tpl refuses anything else and prints the reason."
+        },
+        "existingClaim": { "type": "string" }
+      }
+    },
+    "initContainers": { "type": "array" },
+    "serve": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ui": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "tokenScope": { "enum": ["read-only", "full"] }
+          }
+        },
+        "allowedOrigins": { "type": "array", "items": { "type": "string" } },
+        "extraAllowedHosts": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "scheduling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "description": "resident, cron or disabled. One value, because two is two schedulers. _guards.tpl refuses anything else."
+        },
+        "resident": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "pollIntervalSeconds": { "type": "integer", "minimum": 1 },
+            "drainTimeoutSeconds": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "cron": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "schedule": { "type": "string", "minLength": 1 },
+            "concurrencyPolicy": {
+              "type": "string",
+              "description": "Forbid. _guards.tpl refuses anything else and prints the reason."
+            }
+          }
+        }
+      }
+    },
+    "existingSecret": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "tokenKey"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "A Secret you created. This chart never creates one and accepts no secret value, so nothing secret reaches helm template output or the release state."
+        },
+        "tokenKey": { "type": "string", "minLength": 1 },
+        "webhookSecretKey": { "type": "string" }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "ingress": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "className": { "type": "string" },
+        "annotations": { "type": "object" },
+        "host": { "type": "string" },
+        "path": { "type": "string" },
+        "pathType": { "enum": ["Prefix", "Exact", "ImplementationSpecific"] },
+        "tls": { "type": "array" },
+        "acknowledgeNoHostCheck": {
+          "type": "boolean",
+          "description": "Publish an Ingress with the UI off, accepting that no --allowed-host guard is passed. The bearer token still gates every route."
+        }
+      }
+    },
+    "resources": { "type": "object" },
+    "probes": { "type": "object" },
+    "podAnnotations": { "type": "object" },
+    "podLabels": { "type": "object" },
+    "nodeSelector": { "type": "object" },
+    "tolerations": { "type": "array" },
+    "affinity": { "type": "object" },
+    "extraEnv": { "type": "array" }
+  }
+}
