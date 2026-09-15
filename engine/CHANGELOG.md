@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`rocky mcp` answers an `initialize` that names `2026-07-28` or later with `2025-11-25`, not `2024-11-05`.** The MCP library moved from 3.1.4 to 3.3.0. Since 3.2 it follows the 2026-07-28 versioning spec: that revision replaced the `initialize` handshake, so any client that still sends `initialize` is a legacy client whatever version it names, and one naming `2026-07-28` is answered with the server's fallback. Rocky's fallback was the oldest version with a handshake; it is now the newest, so such a client keeps the 2025 features rather than being sent back to 2024. A client naming `2025-11-25`, `2025-06-18`, `2025-03-26` or `2024-11-05` is still answered with what it asked for. A peer reaches `2026-07-28` only through the library's discover lifecycle, which sends no `initialize`; the `resultType` field reaches such a peer and is still withheld from every `initialize` peer, as before. (#1965)
+
 ## [1.74.0] — 2026-09-12
 
 **State store: schema v23 → v30.** 1.74.0 opens a v23 store written by 1.73.0 and migrates it in place on the next read-write open, keeping every record; a read-only open leaves the v23 stamp as it is. Each step from v24 to v30 adds fields or enum variants to stored records; none adds or changes a table, and none rewrites stored records. The v24 step adds the `observed_failing` state, a new enum variant that a 1.73.0 binary cannot read. When a 1.73.0 binary opens a v30 store, the version check at open catches it. On the paths that honour `[state] on_schema_mismatch`, the default `recreate` starts fresh local state, so the next run is a full refresh, and leaves the shared tier as it is; `fail` refuses. On the other paths, it stops with a schema-mismatch error.

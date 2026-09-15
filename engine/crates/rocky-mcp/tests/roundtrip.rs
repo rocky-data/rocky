@@ -76,10 +76,20 @@ async fn connect(server: RockyMcpServer) -> rmcp::service::RunningService<rmcp::
 /// `impl ClientHandler for ClientInfo` returns the value itself from
 /// `get_info`, so handing `serve` a `ClientInfo` is the whole mechanism — no
 /// custom handler type is needed.
-async fn connect_at_version(
+/// A peer on `2026-07-28`, reached the only way rmcp 3.2+ allows: over the
+/// `server/discover` lifecycle, with no `initialize` at all.
+///
+/// Under rmcp 3.1 this helper sent an `initialize` naming `2026-07-28` and
+/// the server echoed it. rmcp 3.2 follows the 2026-07-28 versioning spec:
+/// that revision replaced the handshake, so an `initialize` request is a
+/// legacy client whatever version it names, and the server answers it with
+/// its fallback. Naming the version over `initialize` therefore cannot
+/// reach a modern session any more (#1965).
+async fn connect_modern(
     server: RockyMcpServer,
-    protocol_version: rmcp::model::ProtocolVersion,
 ) -> rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientInfo> {
+    use rmcp::service::{ClientLifecycleMode, ClientServiceExt};
+
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
         if let Ok(svc) = server.serve(server_io).await {
@@ -87,9 +97,16 @@ async fn connect_at_version(
         }
     });
     // `ClientInfo::default()` is exactly what the `()` handler in [`connect`]
-    // sends, so the ONLY difference between the two clients is the version.
-    let info = rmcp::model::ClientInfo::default().with_protocol_version(protocol_version);
-    info.serve(client_io).await.expect("client connects")
+    // sends, so the ONLY difference between the two clients is the lifecycle.
+    rmcp::model::ClientInfo::default()
+        .serve_with_lifecycle(
+            client_io,
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+            },
+        )
+        .await
+        .expect("modern client connects over discover")
 }
 
 #[tokio::test]
@@ -4997,8 +5014,9 @@ async fn compile_rejects_unknown_target_dialect() {
 /// Only the pair distinguishes "negotiated per peer" from either extreme.
 ///
 /// The negotiated version is asserted first on each connection, because
-/// `result_type` says nothing if the handshake did not land where the test
-/// thinks it did.
+/// `result_type` says nothing if the lifecycle did not land where the test
+/// thinks it did. The modern peer discovers rather than initializes, which
+/// is the only route to `2026-07-28` since rmcp 3.2 (see `connect_modern`).
 ///
 /// This does not change what the server SPEAKS. Closing the gap by
 /// construction would mean narrowing `supported_protocol_versions`, which is a
@@ -5011,22 +5029,21 @@ async fn result_type_reaches_a_2026_07_28_client_and_no_other() {
     write_project(dir.path(), &dir.path().join("test.duckdb"));
     let config_path = dir.path().join("rocky.toml");
 
-    // 1. A client that ASKS for 2026-07-28 is given it, and keeps `resultType`.
-    let modern = connect_at_version(
-        RockyMcpServer::new(config_path.clone()),
-        ProtocolVersion::V_2026_07_28,
-    )
-    .await;
+    // 1. A client that DISCOVERS at 2026-07-28 is given it, and keeps
+    //    `resultType`. Over `initialize` the same request would be answered
+    //    with the server's legacy fallback (rmcp 3.2+), so the discover
+    //    lifecycle is the only way to reach this branch.
+    let modern = connect_modern(RockyMcpServer::new(config_path.clone())).await;
     let negotiated = modern
         .peer_info()
-        .expect("the server returned an initialize result")
+        .expect("the server answered discover")
         .protocol_version
         .clone();
     assert_eq!(
         negotiated,
         ProtocolVersion::V_2026_07_28,
         "the server advertises rmcp's whole KNOWN_VERSIONS list and does not \
-         override supported_protocol_versions, so a client asking for \
+         override supported_protocol_versions, so a client discovering at \
          2026-07-28 must be given it; if this fails the rest of the test is \
          measuring the wrong session"
     );
