@@ -167,22 +167,36 @@ jobs:
         # (run 32012139494): the denominator changes when dead code is no
         # longer linked in. Read the first green run as the new baseline.
         #
-        # `--failure-mode all` (#1952). The workspace's tests include a
-        # SIGKILL drill (`product::commit`: the child half re-executes this
-        # instrumented test binary and is killed mid-protocol). A child
-        # killed that way never finishes writing its profile, so every run
-        # leaves one or two `.profraw` files with a corrupt header, and
-        # `llvm-profdata merge` defaults to failing when ANY input is
-        # invalid. That is what kept this job red on every run since the
-        # llvm-cov migration while every test passed. `all` fails only when
-        # no profile at all can be merged; a killed child carries no coverage
-        # data in either mode. The same flag goes on `report` below, which
-        # merges the raw profiles again.
+        # `--failure-mode all` (#1952). Every run of this job since the
+        # llvm-cov migration ended with one or two `.profraw` files whose
+        # header is corrupt, and `llvm-profdata merge` defaults to failing
+        # when ANY input is invalid, so the job was red while every test
+        # passed. A corrupt header is a truncated file: the profile runtime
+        # writes the file in the process's exit hook (merge mode writes
+        # nothing at startup), so some test signals an instrumented child
+        # while it is exiting. Which test is not pinned; the most consistent
+        # candidate is the `rocky mcp` servers `fulfill_e2e.rs` spawns, which
+        # the fulfill driver SIGTERMs right after each replay. A process
+        # killed outright while idle writes no file at all, so it is not the
+        # SIGKILL drill. `all` fails only when no profile at all can be
+        # merged, and still prints one warning per bad file. The same flag
+        # goes on `report` below, which merges the raw profiles again. The
+        # listing step after the run carries the count and the sizes, which
+        # is what the logs have lacked to pin the producer.
         run: |
           mkdir -p coverage
           cargo llvm-cov --workspace --cobertura \
             --failure-mode all \
             --output-path coverage/cobertura.xml
+      - name: Raw profiles written by the run
+        # `always()` so a failed merge still shows what it was handed. A
+        # truncated profile is small next to its siblings; the smallest few
+        # are the ones to look at.
+        if: always()
+        run: |
+          find target/llvm-cov-target -maxdepth 1 -name '*.profraw' | wc -l | sed 's/^ *//; s/$/ raw profiles/'
+          echo "smallest five (bytes, path):"
+          find target/llvm-cov-target -maxdepth 1 -name '*.profraw' -printf '%s %p\n' | sort -n | head -5
       - name: Coverage summary
         # The cobertura file goes to an artifact nobody opens unless they
         # are already looking. Print the number too, so the run itself says
