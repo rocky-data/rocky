@@ -36,6 +36,11 @@ use crate::result_types::*;
 /// untouched.
 const INSTRUCTIONS: &str = include_str!("../../../../.claude/skills/rocky-ai-workflow/SKILL.md");
 
+/// What `rocky mcp` calls itself in the `initialize` result's
+/// `serverInfo.name`. The version beside it is this crate's
+/// `CARGO_PKG_VERSION`, which is the engine's (#1973).
+pub const SERVER_NAME: &str = "rocky";
+
 /// Prepended to the served `instructions` under the worker profile.
 ///
 /// DERIVED from the excluded set, not written out. The old banner named six
@@ -1182,8 +1187,8 @@ fn worker_tools_that_read_the_warehouse<'a>(table: &[(&'a str, WorkerToolEffect)
 /// independently settable, and a mutation into `title` is caught by the
 /// widened sweep and was invisible to the field-selecting one. Row 1 sits
 /// with rows 8 and 9 on this axis rather than with 2 and 4/5: its newly
-/// covered fields are all `None` under
-/// `Implementation::from_build_env()`, so widening it found nothing either.
+/// covered fields are all `None` under the hand-built
+/// `Implementation::new(SERVER_NAME, ..)`, so widening it found nothing either.
 /// The mutation that proves the sweep works has to POPULATE one first.
 ///
 /// So the honest form of the guarantee is about the SWEEPS, not the row
@@ -6364,7 +6369,13 @@ impl ServerHandler for RockyMcpServer {
                 .enable_prompts()
                 .build(),
         )
-        .with_server_info(Implementation::from_build_env())
+        // Rocky's own name and version, not the library's. rmcp's
+        // `Implementation::from_build_env()` reads `CARGO_PKG_NAME` /
+        // `CARGO_PKG_VERSION` where IT is compiled, so it announced
+        // "rmcp 3.3.0" to every client and moved the served-text golden on
+        // every library bump for a reason that had nothing to do with Rocky
+        // (#1973). This crate's version is the engine's.
+        .with_server_info(Implementation::new(SERVER_NAME, env!("CARGO_PKG_VERSION")))
         // The server's FALLBACK, not the wire version: rmcp echoes any
         // version a client names that still has an `initialize` handshake
         // and this server supports, and answers with this one otherwise.
@@ -9242,8 +9253,8 @@ database = ":memory:"
         // carries `title`, `description`, `icons` and `websiteUrl` besides
         // `name` and `version` — four free-text fields on the channel a
         // worker reads at handshake, before it reads anything else.
-        // `Implementation::from_build_env()` leaves all four `None`, so
-        // nothing leaks today. The UNBACKED GUARANTEE was the defect, the
+        // The hand-built `Implementation::new(SERVER_NAME, ..)` leaves all
+        // four `None`, so nothing leaks today. The UNBACKED GUARANTEE was the defect, the
         // same shape as rows 2 and 4/5: no leak, a claim the sweep did not
         // support.
         //
@@ -10707,6 +10718,27 @@ database = ":memory:"
                 !description.contains("draft_check"),
                 "worker prompt `{name}` steers toward a tool this profile does not \
                  serve: {description}"
+            );
+        }
+    }
+
+    /// `serverInfo` names Rocky and the engine's version, not the MCP
+    /// library's (#1973). Every profile serves the same identity, and it is
+    /// what the served-text golden's two `initialize` rows now pin: the
+    /// golden moves when Rocky's version moves, not when rmcp's does.
+    #[test]
+    fn server_info_names_rocky_and_the_engine_version() {
+        for profile in [
+            McpProfile::Default,
+            McpProfile::Worker,
+            McpProfile::Approver,
+        ] {
+            let info = server_with(profile).get_info().server_info;
+            assert_eq!(info.name, SERVER_NAME, "{profile:?}");
+            assert_eq!(info.version, env!("CARGO_PKG_VERSION"), "{profile:?}");
+            assert_ne!(
+                info.name, "rmcp",
+                "{profile:?} must not introduce itself as the library"
             );
         }
     }
