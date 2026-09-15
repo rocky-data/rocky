@@ -2175,7 +2175,18 @@ pub struct RowCountResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FreshnessResult {
     pub table: TableRef,
+    /// `MAX(<timestamp_column>)`. `None` is a SQL NULL, which the warehouse
+    /// answers both for an empty table and for a non-empty table whose
+    /// timestamp column holds no value; `row_count` is what tells them apart.
     pub max_timestamp: Option<DateTime<Utc>>,
+    /// `COUNT(*)` measured in the same query as `max_timestamp`, when the
+    /// adapter asked for it. `None` means the adapter did not report a count
+    /// (a query written before #1930), so a NULL `max_timestamp` cannot be
+    /// told apart from an empty table and the caller treats it as one. An
+    /// adapter that counts must report the count on EVERY row it answers,
+    /// so the absent case stays distinguishable from a zero.
+    #[serde(default)]
+    pub row_count: Option<u64>,
 }
 
 /// Optional batch check execution for warehouses that support
