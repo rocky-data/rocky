@@ -157,7 +157,7 @@ A sketch of that panel:
 
 ## In your browser
 
-`rocky serve --ui` opens a read-only view of the project in the browser. The UI is built into the release binary. It has three areas: the estate (models, the DAG and runs), the plans waiting for a human, and the governor's record of what agents did and why.
+`rocky serve --ui` serves a read-only view of the project to your browser. The UI is built into the release binary. It has three areas: the estate (models, the DAG and runs), the plans waiting for a human, and the governor's record of what agents did and why.
 
 ```bash
 rocky serve --ui --token "$(openssl rand -hex 16)" --token-scope read-only
@@ -165,7 +165,7 @@ rocky serve --ui --token "$(openssl rand -hex 16)" --token-scope read-only
 ```
 
 <p align="center">
-  <img src="docs/public/demo-ui-tour.gif" alt="A tour of the Rocky browser UI: the estate with its DAG, the review queue, one plan awaiting a human with the rocky review --approve command to copy, the governor brief, a model's custody chain, and a data product's journal" width="900" />
+  <img src="docs/public/demo-ui-tour.gif" alt="A tour of the Rocky browser UI: the estate with its DAG, the review queue, an agent's breaking change awaiting a human with the rocky review --approve command to copy, the governor brief, a model's custody chain, and a data product's journal" width="900" />
 </p>
 
 The page cannot run or approve anything. Its token is read-only, and you approve a plan in a terminal. See the [browser UI guide](https://rocky-data.dev/guides/browser-ui/).

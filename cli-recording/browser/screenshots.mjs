@@ -44,6 +44,10 @@ await page.goto(url);
 await page.waitForFunction(() => !location.hash.includes("token"), null, { timeout: 10_000 });
 const origin = new URL(url).origin;
 
+// The lanes' in-flight lines all end in an ellipsis: "Loading the digest…",
+// "reading the plan…", "compiling both sides…", "running the query…".
+const LOADING = /(loading|reaching the engine|compiling both sides|reading the [a-z ]+|running the query|tracing)[^\n]*…/i;
+
 for (const pair of argv) {
   const [name, uiPath] = pair.split("=");
   await page.goto(`${origin}${uiPath}`);
@@ -52,7 +56,7 @@ for (const pair of argv) {
   let stable = 0;
   for (let i = 0; i < 150 && stable < 15; i++) {
     const text = await page.evaluate(() => document.body.innerText);
-    stable = text === last && !/loading|reaching the engine/i.test(text) ? stable + 1 : 0;
+    stable = text === last && !LOADING.test(text) ? stable + 1 : 0;
     last = text;
     await page.waitForTimeout(100);
   }
