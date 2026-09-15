@@ -2224,7 +2224,7 @@ pub trait BatchCheckAdapter: Send + Sync {
     /// Defaults to `true`, on the same reasoning as
     /// [`supports_row_counts`](Self::supports_row_counts). An adapter that
     /// returns `false` is never asked, and the caller falls back to one
-    /// `SELECT MAX(<timestamp_column>)` per table.
+    /// `SELECT COUNT(*), MAX(<timestamp_column>)` per table.
     fn supports_freshness(&self) -> bool {
         true
     }

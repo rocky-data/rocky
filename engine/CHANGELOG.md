@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **A non-empty table whose timestamp column holds no value now fails its freshness check as not evaluated, instead of emitting no check at all.** `MAX(<timestamp_column>)` is NULL both over an empty table and over rows that carry no value, and the freshness query asked for nothing else, so the second case was read as "nothing to measure" and went silent on every adapter. The query now asks for `COUNT(*)` in the same aggregate, batched and per table, and a NULL maximum over one or more rows is reported as `freshness_not_evaluated` with the row count in its reason, at the error severity every unevaluated check keeps. An empty table still emits no check. A batch adapter that answers without a count keeps the old reading, so an adapter written before this change does not start failing healthy empty tables. (#1930)
+- **A non-empty table whose timestamp column holds no value now fails its freshness check as not evaluated, instead of emitting no check at all.** `MAX(<timestamp_column>)` is NULL both over an empty table and over rows that carry no value, and the freshness query asked for nothing else, so the second case was read as "nothing to measure" and went silent on every adapter. The query now asks for `COUNT(*)` in the same aggregate, batched and per table, and a NULL maximum over one or more rows is reported as `freshness_not_evaluated` with the row count in its reason, at the error severity every unevaluated check keeps. An empty table still emits no check. A batch adapter that answers a NULL maximum without a count keeps the old reading (no check), so the two cases are only told apart where the adapter counts. (#1930)
 
 ## [1.74.0] — 2026-09-12
 

@@ -6886,14 +6886,16 @@ async fn run_batched_checks(
                             ));
                         }
                         (_, None) => {
+                            let reason = if row.is_some() {
+                                "the freshness query returned a row without its second cell"
+                            } else {
+                                "the freshness query returned no rows"
+                            };
                             warn!(
                                 table = br.table.as_str(),
-                                "per-table freshness check returned no rows"
+                                "per-table freshness check: {reason}"
                             );
-                            freshness_failures.push((
-                                br.full_name(),
-                                "the freshness query returned no rows".to_string(),
-                            ));
+                            freshness_failures.push((br.full_name(), reason.to_string()));
                         }
                     }
                 }
