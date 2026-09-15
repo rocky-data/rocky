@@ -211,7 +211,7 @@ rocky import-dbt --dbt-project ~/projects/acme-dbt --output-dir ./acme-rocky --o
 
 ## `rocky serve`
 
-Start an HTTP API server that exposes the compiler's semantic graph. Provides REST endpoints for model metadata, lineage, and compilation results. Useful for editor integrations, dashboards, and custom tooling.
+Start an HTTP server for the project. It answers under `/api/v1` with the same payloads as the CLI's `--output json`: models, lineage and the DAG, runs and schedules, products, the review queue, and the governor's brief, audit and custody reads. It also runs `run`, `plan` and `apply` as background jobs. `--ui` adds the [browser UI](#the-browser-ui), and `--scheduler` adds the resident scheduler. The [Embedding guide](/guides/embedding/#serve-api) covers the routes, and the [OpenAPI document](/openapi.json) lists every one.
 
 ```bash
 rocky serve [flags]
@@ -289,7 +289,7 @@ The rules, each refused at start with its fix:
 - `--ui` needs a token, and the token must be read-only. The page holds it, and a page must never reach a mutating route. One server has one token, so for job submissions run a second sidecar without `--ui`, or use the CLI.
 - The printed address carries the token in the fragment. Browsers never send a fragment, so the secret is in no access log; the page reads it once, keeps it for the tab, and clears the address.
 - The page and its files are public: they carry no data. Every API call the page makes carries the token.
-- With `--ui`, a request whose `Host` is not a loopback name, the bind host, or an `--allowed-host` entry is refused `421 host_not_allowed` before routing. A present `Origin` that is neither this server's own nor an `--allowed-origin` entry is refused `403 origin_not_allowed`. Both refusals carry the error envelope. Without `--ui` neither check runs.
+- With `--ui`, a request whose `Host` is not a loopback name, the bind host, or an `--allowed-host` entry is refused `421 host_not_allowed` before routing. A present `Origin` that is neither this server's own nor an `--allowed-origin` entry is refused `403 origin_not_allowed`. Both refusals carry the error envelope. Without `--ui` neither check runs. `GET /api/v1/health` skips both checks, so a load balancer or a Kubernetes probe that sends the pod IP as `Host` still gets `200`. The route carries no data.
 - Every UI response carries a Content Security Policy that allows scripts, styles, images, fonts and connections from this server only and forbids framing. The page loads nothing from any other host.
 - `--ui --scheduler` refuses to start without `ROCKY_WEBHOOK_SECRET`: a browser can reach the webhook route.
 

@@ -60,7 +60,7 @@ One line each, for finding the right command. Commands with a section on this pa
 | [`watch`](#rocky-watch) | Recompile when a file in the models directory changes. |
 | [`fmt`](#rocky-fmt) | Format `.rocky` files: normalize indentation, trim whitespace. |
 | [`list`](#rocky-list) | List pipelines, adapters, models, sources, and dependency relationships. |
-| `serve` | Start the HTTP API server exposing the compiler's semantic graph. |
+| `serve` | Start the HTTP API server (`/api/v1`), with an optional browser UI (`--ui`) and resident scheduler (`--scheduler`). |
 | `lsp` | Start the Language Server Protocol server for IDE integration. |
 | `mcp` | Serve Rocky's tools to an AI agent over MCP. |
 | `import-dbt` | Convert a dbt project into Rocky models. |
