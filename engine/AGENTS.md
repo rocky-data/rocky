@@ -432,7 +432,7 @@ Section reference:
 - `[governance]` — auto_create_catalogs, auto_create_schemas, tags, isolation, grants
 - `[cost]` — storage_cost_per_gb_month, compute_cost_per_dbu, warehouse_size
 - `[state]` — backend (local/s3/valkey/tiered)
-- `[cache]` — valkey_url
+- `[cache.schemas]` — the schema cache: enabled, ttl_seconds, replicate (there is no other `[cache]` key)
 
 **Key defaults** (omit when redundant):
 - `pipeline.type` → `"replication"`, unnamed `[adapter]` → `adapter.default`
@@ -448,7 +448,7 @@ Rocky supports lifecycle hooks configured in `rocky.toml`. Hooks fire shell comm
 [hook.on_pipeline_start]
 command = "scripts/notify.sh"
 timeout_ms = 5000
-on_failure = "warn"  # or "error"
+on_failure = "warn"  # or "abort" (stop the pipeline) or "ignore" (silent); "warn" is the default
 ```
 
 Implementation in `crates/rocky-core/src/hooks/` (mod.rs, webhook.rs, template.rs, presets.rs).
