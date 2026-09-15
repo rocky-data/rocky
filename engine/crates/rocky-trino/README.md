@@ -13,14 +13,18 @@ dependency.
 Coverage is intentionally narrow, but the supported surface is exercised
 end-to-end by the Docker conformance harness behind the
 `trino-conformance` cargo feature (see [Conformance harness](#conformance-harness)
-below). Unsupported gaps (MERGE, OAuth/Kerberos, governance, loader,
-batch-checks) fail loudly at validate time rather than emitting broken
-SQL silently.
+below). The gaps (MERGE, OAuth/Kerberos, governance, loader,
+batch checks) are not checked by `rocky validate`. A model with
+`strategy = "merge"` and a pipeline with `auto_create_catalogs = true`
+both pass validation. MERGE fails later, when the dialect refuses to
+build the statement. Governance calls go to a no-op adapter, so they
+succeed and change nothing.
 
 ## Configuration (`rocky.toml`)
 
-The Trino coordinator URL goes in `host`; auth is selected by which
-credential field is set. Internally the registry reuses the shared
+Run `rocky init --template trino <dir>` to scaffold a Trino project with
+this config shape. The Trino coordinator URL goes in `host`; auth is
+selected by which credential field is set. Internally the registry reuses the shared
 `AdapterConfig` slots (`host`, `username`, `password`, `token`,
 `database`, `timeout_secs`); there is no Trino-specific TOML schema.
 
@@ -42,27 +46,31 @@ timeout_secs = 300               # optional: per-query polling deadline
 [adapters.warehouse]
 type = "trino"
 host = "https://trino.example.com"
-username = "alice"               # required: populates X-Trino-User
-token    = "${TRINO_JWT}"        # mutually exclusive with password
+username = "alice"               # needed: populates X-Trino-User
+token    = "${TRINO_JWT}"        # if password is also set, the token wins
 database = "iceberg"
 ```
 
-Notes the registry enforces (see `engine/crates/rocky-cli/src/registry.rs`):
+Notes on how the registry reads these fields (see `engine/crates/rocky-cli/src/registry.rs`):
 
 - `host` is required (the error message names it the *coordinator URL*).
-- For Basic auth, both `username` and `password` are required.
-- For JWT auth, `token` selects JWT mode and `username` is still required
-  to populate the `X-Trino-User` header: Trino requires that header on
-  every request, and the JWT path doesn't infer it from the token's
-  `sub` claim.
+- When `token` is set, the registry selects JWT mode and ignores
+  `password`. The token wins if both are set.
+- For Basic auth (no `token`), both `username` and `password` are required.
+- For JWT auth, the registry does not require `username`. You still need
+  it: Trino requires the `X-Trino-User` header on every request, and the
+  JWT path does not infer it from the token's `sub` claim. Without
+  `username`, the config loads and the first query fails with
+  `no X-Trino-User available`.
 - `database` maps to Trino's *catalog*, surfaced via the `X-Trino-Catalog`
   request header. A pipeline-level default schema is not currently
   threaded through the registry, so model SQL should reference fully
   qualified `<catalog>.<schema>.<table>` names.
 - `auto_create_catalogs = true` is incompatible with this adapter: OSS
   Trino has no `CREATE CATALOG` SQL (catalogs are server-side connector
-  instances), and `TrinoDialect::create_catalog_sql` returns `None`. The
-  validate-time capability check trips before any SQL runs.
+  instances), and `TrinoDialect::create_catalog_sql` returns `None`.
+  `rocky validate` accepts the key. The run skips the `CREATE CATALOG`
+  step, so the catalog must already exist on the coordinator.
 
 ## Authentication
 
@@ -94,7 +102,10 @@ state machine rather than a one-shot REST call:
    supplies them.
 2. Parse the `QueryResults` envelope. While `nextUri` is set, `GET nextUri`
    for the next page; concatenate any `data` rows; keep the first
-   non-empty `columns` slice as the column metadata.
+   non-empty `columns` slice as the column metadata. The client refuses a
+   `nextUri` whose scheme, host or port differs from the coordinator URL.
+   It returns `TrinoError::UntrustedNextUri` and does not send the
+   `Authorization` header to that host.
 3. When `nextUri` is absent the query is in a terminal state. `stats.state == "FINISHED"`
    returns `Ok`; `FAILED` / `CANCELED` (or anything unexpected) maps to
    `TrinoError::QueryFailed`, carrying the structured `error.errorCode`
@@ -153,13 +164,13 @@ happens.
 | `insert_into` | `INSERT INTO <ref>\n<select>` |
 | `merge_into` | **Errors** — `"MERGE not supported by the Trino adapter v0"` |
 | `select_clause` | ANSI `SELECT` with `CAST(<expr> AS <type>) AS <name>` for metadata columns |
-| `watermark_where` | ANSI `TIMESTAMP '...'` literal with `COALESCE(MAX(<col>), TIMESTAMP '1970-01-01 00:00:00')` |
+| `watermark_where` | `WHERE <col> > TIMESTAMP '<last watermark>'`, with the literal `TIMESTAMP '1970-01-01 00:00:00'` when no watermark exists yet |
 | `describe_table_sql` | `DESCRIBE <ref>` (Trino native, returns `(Column, Type, Extra, Comment)`) |
 | `drop_table_sql` | `DROP TABLE IF EXISTS <ref>` |
 | `create_catalog_sql` | `None` — OSS Trino catalogs are server-side connector instances |
 | `create_schema_sql` | `CREATE SCHEMA IF NOT EXISTS "c"."s"` |
 | `tablesample_clause(n)` | `TABLESAMPLE BERNOULLI (<n>)` (per-row sampling, matches Rocky's null-rate-check semantics) |
-| `insert_overwrite_partition` | Two-statement `DELETE FROM ... WHERE <pred>` + `INSERT INTO` (Trino's REST API runs each statement in its own transaction; true `INSERT OVERWRITE` requires Iceberg-specific wiring deferred to a follow-up) |
+| `insert_overwrite_partition` | Two-statement `DELETE FROM ... WHERE <pred>` + `INSERT INTO`. **Not atomic**: Trino's REST API runs each statement in its own transaction, so if the `INSERT` fails the `DELETE` stays committed and the partition is left empty. True `INSERT OVERWRITE` requires Iceberg-specific wiring deferred to a follow-up |
 | `row_hash_expr` | Trait default — errors at bisection time |
 
 Type mapping is implicit: `describe_table` parses Trino's `DESCRIBE`
@@ -175,11 +186,10 @@ DropAndRecreate.
 ## Not in v0 (follow-ups)
 
 - **MERGE.** Trino's MERGE landed in 414 (2023) but is connector-dependent
-  (Iceberg yes, Hive limited). The dialect errors loudly so
-  `strategy = "merge"` fails at validate time rather than emitting
-  broken SQL.
+  (Iceberg yes, Hive limited). The dialect returns an error instead of
+  emitting MERGE SQL. `rocky validate` does not catch
+  `strategy = "merge"`; the model fails when Rocky builds the statement.
 - **OAuth 2.0 / Kerberos / SPNEGO auth.** Basic + JWT only.
-- **`rocky init trino` template** — no scaffold exists yet.
 - **Playground POC** (full `docker compose up` walkthrough with a
   row-count assertion via the REST API) lives at
   `examples/playground/pocs/07-adapters/07-trino-docker/`. The
@@ -194,7 +204,7 @@ DropAndRecreate.
   but neither is wired into the dialect; checksum-bisection diff is a
   follow-up.
 - **True `INSERT OVERWRITE`.** Iceberg-backed catalogs support it
-  natively; v0 falls back to `DELETE` + `INSERT`.
+  natively; v0 falls back to `DELETE` + `INSERT`, which is not atomic.
 - **`information_schema`-backed nullability** in `describe_table`.
 - **Arrow record batches** from the connector: `fetch_arrow_batch` is
   implemented via the spooled-protocol Arrow path (see [Wire protocol](#wire-protocol)
@@ -245,21 +255,29 @@ The `trino-conformance` Cargo feature gates an opt-in integration test
 at [`tests/conformance.rs`](tests/conformance.rs) that drives the
 adapter against a real Trino coordinator. It's off by default so the
 default `cargo test -p rocky-trino` invocation stays credential- and
-network-free. The two network-dependent tests are also marked
+network-free. All five network-dependent tests are also marked
 `#[ignore]` so they stay skipped under `cargo test --all-features` (as
 CI runs); execution requires both the feature flag and `-- --ignored`.
 
 What it covers:
 
-- `TrinoDialect::format_table_ref` round-trips against the live
-  coordinator (the dialect's identifier-quoting contract has to match
-  what Trino's parser actually accepts).
-- The full `WarehouseAdapter` round-trip via the writable `memory`
-  connector: `SELECT 1`, then `CREATE TABLE AS` / `INSERT INTO` /
-  `SELECT *` / `DROP TABLE` against `memory.default.<unique_table>`.
-  Every statement flows through the same `/v1/statement` polling state
-  machine the unit tests exercise via `wiremock`, but here it lands on
-  a real coordinator.
+- `round_trip_select_one`: `SELECT 1` against the live coordinator.
+- `round_trip_create_insert_select_drop`: the full `WarehouseAdapter`
+  round-trip via the writable `memory` connector: `CREATE TABLE AS` /
+  `INSERT INTO` / `SELECT *` / `DROP TABLE` against
+  `memory.default.<unique_table>`, with table refs built by
+  `TrinoDialect::format_table_ref`. Every statement flows through the
+  same `/v1/statement` polling state machine the unit tests exercise via
+  `wiremock`, but here it lands on a real coordinator.
+- `fetch_arrow_batch_against_live_trino_surfaces_version_gate`: asserts
+  the `ArrowEncodingUnavailable` error until upstream Trino ships Arrow
+  spooling.
+- `literal_escape_round_trips_live`: string literals with quotes and
+  backslashes round-trip byte-identical.
+- `drift_widening_alters_iceberg_in_place`: an Iceberg type widening
+  through `ALTER ... SET DATA TYPE`. It needs the stack in
+  `tests/iceberg/docker-compose.yml` and prints a skip message against a
+  coordinator without an `iceberg` catalog.
 
 The harness reads the coordinator URL from `${TRINO_HOST:-localhost}`
 and `${TRINO_PORT:-8080}` and authenticates via the JWT-bearer path

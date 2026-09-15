@@ -53,7 +53,7 @@ curl -fsS http://127.0.0.1:8080/api/v1/health
 
 ## On Linux: make the volume writable
 
-The server runs as uid `65532` and writes the state store under `./project/models/`. A bind mount keeps the host's owner, so on Linux do one of two things: give the directory to that user (`sudo chown -R 65532:65532 project/models`), or run the container as yourself by adding to the service:
+The server runs as uid `65532`. It writes the state store under `./project/models/`. With `--scheduler` it also creates `./project/.rocky/` and writes the tick lock there (`/data/.rocky/tick.lock` in the container). Commands write trace files under the same `.rocky/` directory. So owning `project/models` alone is not enough. A bind mount keeps the host's owner, so on Linux do one of two things: give the whole project to that user (`sudo chown -R 65532:65532 project`), or run the container as yourself by adding to the service:
 
 ```yaml
     user: "1000:1000"   # your uid:gid, from `id -u` and `id -g`
