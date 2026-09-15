@@ -7,6 +7,8 @@ sidebar:
 
 `rocky serve --ui` serves a browser UI for one project. It shows the project's models and runs, the plans waiting for a human, and the policy decisions and product history the engine recorded. The UI is read-only. Every value on the page comes from the same `/api/v1` payloads the CLI prints with `--output json`.
 
+![A tour of the Rocky browser UI: the estate with its DAG, the review queue, one plan awaiting a human, the governor brief, a model's custody chain, and a data product's journal](/demo-ui-tour.gif)
+
 The UI ships inside the release binaries and the container image. It has three areas:
 
 ```

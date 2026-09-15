@@ -295,6 +295,8 @@ The rules, each refused at start with its fix:
 
 A reverse proxy in front of the UI names itself with `--allowed-host proxy.internal`; a page served from another origin lists it with `--allowed-origin https://app.example`.
 
+The [browser UI guide](/guides/browser-ui/) shows what each screen displays.
+
 ### Ask the server what it is doing
 
 `GET /api/v1/settings` reports the posture of the running server. Read it when you want to check what a server is actually enforcing, rather than what its start command looked like.
