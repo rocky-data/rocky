@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`init_rocky_project()` writes a `rocky.toml` the engine accepts.** The scaffold's template used the top-level `[source]`, `[warehouse]`, `[target]`, `[replication]` and `[checks]` tables that no current engine reads: `rocky validate` failed on it with `V001 unknown field 'checks'`, so a scaffolded project could never plan or run. Its header and README also said `rocky run --config rocky.toml`, which exits 2 because `--config` is a global flag and belongs before the verb. The template now declares `[adapter]` plus `[pipeline.main]` and was validated and run end-to-end against engine 1.74.0; both command lines put `--config` first; the README's install one-liner points at `engine/install.sh` on `main`, because the release-asset URL it used returns 404. (#1991)
+
 ## [1.66.0] — 2026-09-12
 
 Pairs with engine 1.74.0 and `rocky-sdk` 0.15.0.

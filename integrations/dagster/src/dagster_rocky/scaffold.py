@@ -68,35 +68,41 @@ attributes:
 #: scaffold runs end-to-end without warehouse credentials.
 ROCKY_TOML_TEMPLATE: str = """\
 # Rocky pipeline configuration.
-# Run with: rocky run --config rocky.toml
+# Validate with: rocky --config rocky.toml validate
+# Run with:      rocky --config rocky.toml run
 
-[source]
+# One local DuckDB file next to this one holds both the source schemas and
+# the replicated tables, so the scaffold runs end-to-end without warehouse
+# credentials.
+[adapter]
 type = "duckdb"
-path = ".rocky/source.duckdb"
+path = "warehouse.duckdb"
 
-[source.schema_pattern]
+[pipeline.main]
+strategy = "incremental"
+timestamp_column = "_loaded_at"
+
+[pipeline.main.source.discovery]
+adapter = "default"
+
+# Every source schema named `src__<source>` is replicated into `raw__<source>`.
+[pipeline.main.source.schema_pattern]
 prefix = "src__"
 separator = "__"
 components = ["source"]
 
-[warehouse]
-type = "duckdb"
-path = ".rocky/warehouse.duckdb"
-
-[target]
+[pipeline.main.target]
 catalog_template = "warehouse"
 schema_template = "raw__{source}"
 
-[replication]
-strategy = "incremental"
-timestamp_column = "_loaded_at"
+[pipeline.main.target.governance]
+auto_create_schemas = true
 
-[checks]
-enabled = true
+[pipeline.main.checks]
 row_count = true
 column_match = true
 
-[checks.freshness]
+[pipeline.main.checks.freshness]
 threshold_seconds = 86400  # 24 hours
 """
 
@@ -111,10 +117,13 @@ integration.
 
 ```bash
 # Install the rocky binary (once)
-curl -sSL https://github.com/rocky-data/rocky/releases/latest/download/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
 
-# Validate the pipeline locally (DuckDB, no credentials required)
-rocky run --config rocky.toml
+# Check the pipeline config (DuckDB, no credentials required)
+rocky --config rocky.toml validate
+
+# Replicate every `src__*` schema in warehouse.duckdb into `raw__*`
+rocky --config rocky.toml run
 
 # Launch the Dagster UI
 dg dev
@@ -132,7 +141,7 @@ dg dev
 
 ## Next steps
 
-1. Add a connector under `[source]` (e.g. Fivetran) — see the
+1. Point `[pipeline.main.source.discovery]` at a connector adapter (e.g. Fivetran) — see the
    [`rocky-fivetran` docs](https://github.com/rocky-data/rocky/blob/main/engine/crates/rocky-fivetran/README.md).
 2. Define your first model under `models/` and run `rocky test` to validate.
 3. Open the asset graph in the Dagster UI and trigger a materialization.

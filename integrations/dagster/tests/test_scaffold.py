@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -81,8 +82,38 @@ def test_rocky_toml_template_uses_duckdb_adapter():
 def test_rocky_toml_template_includes_freshness_config():
     """The freshness threshold demonstrates the T1.1 wiring — useful
     pedagogical default for new users."""
-    assert "[checks.freshness]" in ROCKY_TOML_TEMPLATE
+    assert "[pipeline.main.checks.freshness]" in ROCKY_TOML_TEMPLATE
     assert "threshold_seconds" in ROCKY_TOML_TEMPLATE
+
+
+def test_rocky_toml_template_uses_the_pipeline_layout_the_engine_reads():
+    """The engine reads `[adapter]` plus `[pipeline.<name>]`, with source,
+    target and checks nested under the pipeline. The old top-level
+    `[source]` / `[warehouse]` / `[target]` / `[replication]` / `[checks]`
+    tables fail `rocky validate` with V001 (unknown field), so a project
+    scaffolded with them could never plan or run (#1991). This suite runs
+    without the binary, so the layout is pinned here."""
+    config = tomllib.loads(ROCKY_TOML_TEMPLATE)
+
+    assert set(config) == {"adapter", "pipeline"}
+    assert config["adapter"]["type"] == "duckdb"
+
+    pipeline = config["pipeline"]["main"]
+    assert pipeline["strategy"] == "incremental"
+    assert pipeline["source"]["discovery"]["adapter"] == "default"
+    assert pipeline["source"]["schema_pattern"]["components"] == ["source"]
+    assert pipeline["target"]["schema_template"] == "raw__{source}"
+    assert pipeline["checks"]["freshness"]["threshold_seconds"] == 86400
+
+
+def test_templates_put_config_before_the_verb():
+    """`--config` is a global flag: `rocky --config rocky.toml run` works and
+    `rocky run --config rocky.toml` exits 2 (#1991). Both the config header
+    and the README quickstart teach the working order."""
+    for template in (ROCKY_TOML_TEMPLATE, README_TEMPLATE):
+        assert "rocky run --config" not in template
+        assert "rocky --config rocky.toml run" in template
+    assert "rocky --config rocky.toml validate" in README_TEMPLATE
 
 
 def test_init_returns_resolved_path(tmp_path: Path):
