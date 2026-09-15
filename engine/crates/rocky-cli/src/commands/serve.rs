@@ -692,11 +692,15 @@ pub(crate) trait BrowserOpener: Send + Sync {
     fn open(&self, url: &str) -> std::io::Result<()>;
 }
 
-/// The platform's URL opener — `open` on macOS, `cmd /C start` on Windows,
-/// `xdg-open` elsewhere — spawned, and reaped on a thread rather than awaited:
-/// some `xdg-open` handlers stay in the foreground until the browser exits,
-/// and that must not hold the server. Its output is discarded; the address it
-/// was given is already on stdout.
+/// The platform's URL opener — `open` on macOS, `xdg-open` elsewhere, and on
+/// Windows `rundll32 url.dll,FileProtocolHandler`, which takes the URL as a
+/// plain argument (never `cmd /C start`: `cmd` re-parses its line, so a token
+/// carrying `&` or `%` would cut the URL and run the rest). Spawned, and
+/// reaped on a thread rather than awaited: some `xdg-open` handlers stay in
+/// the foreground until the browser exits, and that must not hold the server.
+/// Its output is discarded; the address it was given is already on stdout. An
+/// opener that exits non-zero is logged by its status — never by its argument,
+/// which carries the token.
 pub(crate) struct SystemOpener;
 
 impl BrowserOpener for SystemOpener {
@@ -706,8 +710,8 @@ impl BrowserOpener for SystemOpener {
             c.arg(url);
             c
         } else if cfg!(target_os = "windows") {
-            let mut c = std::process::Command::new("cmd");
-            c.args(["/C", "start", "", url]);
+            let mut c = std::process::Command::new("rundll32");
+            c.args(["url.dll,FileProtocolHandler", url]);
             c
         } else {
             let mut c = std::process::Command::new("xdg-open");
@@ -719,8 +723,13 @@ impl BrowserOpener for SystemOpener {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()?;
-        std::thread::spawn(move || {
-            let _ = child.wait();
+        std::thread::spawn(move || match child.wait() {
+            Ok(status) if status.success() => {}
+            Ok(status) => tracing::warn!(
+                %status,
+                "the browser opener exited without opening the UI; the address is printed above"
+            ),
+            Err(error) => tracing::warn!(%error, "could not wait for the browser opener"),
         });
         Ok(())
     }
@@ -736,7 +745,11 @@ pub(crate) fn open_when_ready(
     opener: std::sync::Arc<dyn BrowserOpener>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // `biased`, shutdown first: a Ctrl-C that lands in the same instant as
+        // the bind must not open a browser at a server that is going away.
         tokio::select! {
+            biased;
+            () = shutdown.signalled() => {}
             () = ready.signalled() => {
                 if let Err(error) = opener.open(&url) {
                     tracing::warn!(
@@ -745,7 +758,6 @@ pub(crate) fn open_when_ready(
                     );
                 }
             }
-            () = shutdown.signalled() => {}
         }
     })
 }

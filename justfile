@@ -104,26 +104,43 @@ ui-dev dir="examples/playground/pocs/00-foundations/00-playground-default":
     root="$(pwd)"
     port="${ROCKY_UI_DEV_PORT:-8080}"
     token="${ROCKY_UI_DEV_TOKEN:-dev}"
+    target="${CARGO_TARGET_DIR:-$root/engine/target}"
     (cd engine && cargo build --quiet --bin rocky)
-    (cd "{{dir}}" && exec "$root/engine/target/debug/rocky" serve --port "$port" --token "$token" --token-scope read-only) &
+    # `</dev/null` on BOTH jobs. Under job control a background job keeps the
+    # terminal as its stdin; Vite reads stdin for its keyboard shortcuts, and a
+    # background read of the terminal stops the process (SIGTTIN) on the first
+    # Enter — a frozen dev server with no message. With no terminal on stdin
+    # the shortcuts stay off and nothing reads.
+    (cd "{{dir}}" && exec "$target/debug/rocky" serve --port "$port" --token "$token" --token-scope read-only) </dev/null &
     server=$!
     vite=""
     stop() {
-        kill -- "-$server" 2>/dev/null || true
-        [ -n "$vite" ] && { kill -- "-$vite" 2>/dev/null || true; }
+        # TERM, then CONT: a stopped process group only sees the TERM once it
+        # is continued. Without the CONT a stopped job would hold `wait` forever.
+        kill -TERM -- "-$server" 2>/dev/null || true
+        kill -CONT -- "-$server" 2>/dev/null || true
+        if [ -n "$vite" ]; then
+            kill -TERM -- "-$vite" 2>/dev/null || true
+            kill -CONT -- "-$vite" 2>/dev/null || true
+        fi
         wait 2>/dev/null || true
     }
-    # A signal ENDS the recipe: without the `exit`, bash would run the handler
-    # and then carry on to the `wait` below against a pid it has already reaped.
+    # Ctrl-C: under job control the terminal delivers it to the foreground
+    # child (the `sleep` in the watch loop), `set -e` then ends this script on
+    # the interrupted `sleep`, and the EXIT trap stops both groups. The INT and
+    # TERM traps cover a signal sent to this script itself; each ENDS the
+    # recipe, so bash never carries on to a `wait` on a pid it already reaped.
     trap stop EXIT
     trap 'stop; exit 130' INT
     trap 'stop; exit 143' TERM
     for _ in $(seq 1 60); do
-        curl -sf "http://127.0.0.1:$port/api/v1/health" >/dev/null 2>&1 && break
+        # The liveness check FIRST: a health answer from a server that is not
+        # ours (the port already held) must not read as ours coming up.
         if ! kill -0 "$server" 2>/dev/null; then
-            echo "ui-dev: rocky serve exited before it answered on :$port" >&2
+            echo "ui-dev: rocky serve exited before it answered on :$port (is the port already in use?)" >&2
             exit 1
         fi
+        curl -sf "http://127.0.0.1:$port/api/v1/health" >/dev/null 2>&1 && break
         sleep 0.5
     done
     curl -sf "http://127.0.0.1:$port/api/v1/health" >/dev/null 2>&1 || {
@@ -131,14 +148,14 @@ ui-dev dir="examples/playground/pocs/00-foundations/00-playground-default":
         exit 1
     }
     echo "ui-dev: API on http://127.0.0.1:$port — open http://localhost:5173/ui/#token=$token"
-    (cd engine/ui && ROCKY_API="http://127.0.0.1:$port" exec npm run dev -- --strictPort --port 5173) &
+    (cd engine/ui && ROCKY_API="http://127.0.0.1:$port" exec npm run dev -- --strictPort --port 5173) </dev/null &
     vite=$!
     # Watch both. Whichever dies first ends the loop; the trap stops the other.
     while kill -0 "$server" 2>/dev/null && kill -0 "$vite" 2>/dev/null; do
         sleep 1
     done
     if kill -0 "$vite" 2>/dev/null; then
-        echo "ui-dev: rocky serve exited; stopping Vite" >&2
+        echo "ui-dev: rocky serve exited (is :$port already in use?); stopping Vite" >&2
         exit 1
     fi
     wait "$vite"

@@ -1735,7 +1735,9 @@ enum Command {
         /// the listener is bound — after the startup sweep, never before, so
         /// the page lands on a server that answers. The address, token
         /// included, is handed to the system opener (`open`, `xdg-open`,
-        /// `cmd /C start`). A missing or failing opener is a warning; the
+        /// `rundll32`) as an argument, so it is visible in the process list
+        /// while the opener runs — the same secret the terminal shows. A
+        /// missing opener, or one that exits non-zero, is a warning; the
         /// server still starts and still prints the address. Refused without
         /// `--ui`.
         #[arg(long)]
