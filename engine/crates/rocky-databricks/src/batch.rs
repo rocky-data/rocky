@@ -319,21 +319,15 @@ pub async fn execute_batch_freshness(
             // is omitted for the same reason as an unreadable timestamp:
             // the caller reports the table not evaluated rather than
             // guessing which of "empty" and "no value" it is (#1930).
+            // `cell_as_u64` is the reader the row-count leg above uses;
             // Databricks returns every cell as a string over this API.
-            let row_count = match row.get(3).and_then(|v| match v {
-                serde_json::Value::Number(n) => n.as_u64(),
-                serde_json::Value::String(s) => s.trim().parse::<u64>().ok(),
-                _ => None,
-            }) {
-                Some(n) => n,
-                None => {
-                    tracing::warn!(
-                        table = format!("{catalog}.{schema}.{table}"),
-                        cell = ?row.get(3),
-                        "freshness row count cell was not a number — reporting the table as not evaluated"
-                    );
-                    continue;
-                }
+            let Some(row_count) = rocky_core::checks::cell_as_u64(row.get(3)) else {
+                tracing::warn!(
+                    table = format!("{catalog}.{schema}.{table}"),
+                    cell = ?row.get(3),
+                    "freshness row count cell was not a non-negative integer — reporting the table as not evaluated"
+                );
+                continue;
             };
             // A genuine SQL NULL keeps the row with `None` — the caller
             // decides between "empty" and "no value" from `row_count`. A

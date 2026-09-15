@@ -6817,16 +6817,6 @@ async fn run_batched_checks(
         Ok(counts)
     }
 
-    /// A `COUNT(*)` cell as a number. DuckDB answers with a JSON number;
-    /// the REST warehouses answer with a string.
-    fn count_cell(cell: &serde_json::Value) -> Option<u64> {
-        match cell {
-            serde_json::Value::Number(n) => n.as_u64(),
-            serde_json::Value::String(s) => s.trim().parse::<u64>().ok(),
-            _ => None,
-        }
-    }
-
     /// One `SELECT COUNT(*), MAX(<timestamp_column>)` per table, for a
     /// freshness leg nothing batches. A table the query could not answer for
     /// is recorded in `freshness_failures`, in table order, and contributes
@@ -6857,11 +6847,13 @@ async fn run_batched_checks(
                     // dropped without a trace. So is a count that does not
                     // read as a number: without it a NULL maximum cannot be
                     // classified, and guessing "empty" is the defect the
-                    // count exists to remove.
+                    // count exists to remove. `cell_as_u64` is the reader
+                    // every other integer aggregate goes through (a JSON
+                    // integer, a numeric string, an integral float).
                     let row = result.rows.first();
                     let count = row.and_then(|r| r.first());
                     let max = row.and_then(|r| r.get(1));
-                    match (count.and_then(count_cell), max) {
+                    match (checks::cell_as_u64(count), max) {
                         (Some(rows), Some(cell)) if cell.is_null() => {
                             fresh_results.push(BatchFreshnessResult {
                                 table: br.clone(),
