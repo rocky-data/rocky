@@ -119,7 +119,7 @@ Declare a connection once, then reference it by name from any number of pipeline
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `type` | string | Yes | Adapter type. One of `"databricks"`, `"snowflake"`, `"duckdb"`, `"bigquery"`, `"trino"`, `"fivetran"`, `"airbyte"`, `"iceberg"`, `"manual"`. An unrecognized value is a hard error. |
-| `kind` | `"data"` \| `"discovery"` | See description | The role of this block. `"discovery"` is **required** for the discovery-only types: `fivetran`, `airbyte`, `iceberg` and `manual`. Leave it out for `databricks` and `snowflake`, which move data only. For `duckdb` and `bigquery`, which can do both, leaving it out registers both roles. |
+| `kind` | `"data"` \| `"discovery"` | See description | The role of this block. `"discovery"` is **required** for the discovery-only types: `fivetran`, `airbyte`, `iceberg` and `manual`. Leave it out for `databricks` and `snowflake`, which move data only. For `duckdb` and `bigquery`, which can do both, leaving it out registers both roles. Rocky does not check `kind` for `trino`. |
 | `retry` | table | No | Retry policy (see [`[adapter.NAME.retry]`](#adapternameretry)). |
 | `extra` | table | No | Escape hatch for adapter-specific keys Rocky's typed config doesn't model (see below). |
 
@@ -505,7 +505,7 @@ Use `unique_expr` when the meaningful identity is a *computed* value rather than
 
 #### `[pipeline.NAME.checks.quarantine]`
 
-Keep the bad rows out of the clean table instead of only counting them. Rocky takes the rows that fail an `error`-severity row-level assertion and puts them in their own table, or marks them in place. Quarantine runs in `quality` pipelines.
+Keep the bad rows out of the clean table instead of only counting them. Rocky takes the rows that fail an `error`-severity row-level assertion and puts them in their own table, or marks them in place. Quarantine runs in `quality` pipelines only. Rocky accepts the block on other pipeline types and ignores it there, with no warning.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

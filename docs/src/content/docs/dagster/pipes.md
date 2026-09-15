@@ -146,7 +146,7 @@ code.
 | Structured `MaterializationEvent` from Pipes | ❌ | ❌ | ✅ |
 | Returns | `RunResult` | `RunResult` | `PipesClientCompletedInvocation` |
 | Needs Dagster context | no | yes | yes |
-| Engine Pipes support required | no | no | yes (engine ≥1.34) |
+| Engine Pipes support required | no | no | yes (the SDK's engine floor, 1.34; 1.35 for replication-only projects) |
 
 ### `run()`: buffered (non-Dagster callers)
 
@@ -187,8 +187,8 @@ metadata. A reviewer can click from the materialization straight back to
 the plan artifact that produced it.
 
 The rocky engine detects those env vars and emits structured Pipes
-messages on the messages channel. This needs engine ≥1.34, which the
-SDK's `MIN_ROCKY_VERSION` floor verifies. See [Engine-side
+messages on the messages channel. The SDK's `MIN_ROCKY_VERSION` floor
+(1.34) checks the engine version before the first call. See [Engine-side
 emission](#engine-side-dagster-pipes-message-emission) for the message
 types. In the run viewer they arrive as `MaterializationEvent`s, carrying
 strategy, duration_ms, rows_copied, sql_hash, and partition_key, plus
@@ -199,7 +199,7 @@ extract the materialization events Dagster built from the Pipes
 messages.
 
 `run_pipes` requires engine ≥1.35.0 for a replication-only project (one
-with no `models/` directory). Engine 1.35.0 is the first version that
+with no `models/` directory, or with zero compiled models). Engine 1.35.0 is the first version that
 content-addresses and persists a plan for every project shape. There is no fallback. If
 `rocky plan` emits no `plan_id`, `run_pipes` raises `dg.Failure` rather
 than running without one.

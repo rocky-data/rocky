@@ -114,8 +114,9 @@ Scope on the ELT spectrum:
 - `delete_insert` — delete the affected partitions, then insert
 - `time_interval` / `microbatch` — Partition-keyed processing
 - `view` / `ephemeral` — A view, or a CTE inlined into its consumers
-- `materialized_view` — Databricks materialized views
+- `materialized_view` — warehouse-managed materialized views (Databricks, Snowflake, BigQuery)
 - `dynamic_table` — Snowflake dynamic tables with target lag
+- `content_addressed` — hash-addressed Parquet written to a Delta UniForm table
 
 ## Configuration (`rocky.toml`)
 
@@ -140,11 +141,11 @@ Select pipelines at runtime with `--pipeline NAME`.
 | Source | Fivetran | REST API discovery; metadata only |
 | Source | Airbyte | REST API discovery; metadata only |
 | Source | DuckDB | `information_schema` discovery |
-| Source | Iceberg | Catalog/manifest discovery for content-addressed reads |
+| Source | Iceberg | REST catalog discovery; metadata only |
 | Source | Manual | Tables declared in `rocky.toml` |
 | Warehouse | Databricks | SQL Statement API, Unity Catalog, adaptive concurrency |
 | Warehouse | Snowflake | Beta: OAuth, key-pair JWT, password |
-| Warehouse | BigQuery | Beta: service account, ADC |
+| Warehouse | BigQuery | Beta: service account, ADC; also usable for discovery |
 | Warehouse | Trino | Beta: HTTP Basic, JWT |
 | Warehouse | DuckDB | In-process; used by the playground and `rocky test` |
 

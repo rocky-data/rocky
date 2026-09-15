@@ -945,6 +945,7 @@ Sampled row-level diff plus structural (column-level) diff for every model in th
 |------|------|---------|-------------|
 | `--name <NAME>` | `string` | **(required)** | Branch name created by `preview create`. |
 | `--base <REF>` | `string` | `main` | Git ref to compare against. Must match what `preview create` was invoked with. |
+| `--models <PATH>` | `PathBuf` | `models` | Models directory. Bisection reads each model's primary-key column from here. |
 | `--sample-size <N>` | `usize` | `1000` | Number of rows to sample per model for row-level diffing. Larger windows reduce false-negative risk; see [coverage warning](/concepts/preview-internals/#coverage-warning-roll-up). |
 
 **Example.** Print a Markdown report ready to post on a PR:

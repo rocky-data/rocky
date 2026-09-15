@@ -293,7 +293,7 @@ Comparisons, `CASE`, `CAST`, `BETWEEN`, `IN (...)` with literals, and functions 
 
 ### Row quarantine
 
-A row-level assertion can move its failing rows aside instead of only reporting a count. Configure quarantine at the pipeline level:
+A row-level assertion can move its failing rows aside instead of only reporting a count. Configure quarantine on a `quality` pipeline. Rocky ignores the block on any other pipeline type:
 
 ```toml
 [pipeline.silver.checks.quarantine]

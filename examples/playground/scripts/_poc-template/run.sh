@@ -18,7 +18,7 @@ mkdir -p expected
 # duckdb poc.duckdb < data/seed.sql
 
 # Validate the config
-rocky validate -c rocky.toml
+rocky -c rocky.toml validate
 
 # Compile / type-check models (if the POC has models/)
 # rocky compile --models models/ ${HAS_CONTRACTS:+--contracts contracts/}
