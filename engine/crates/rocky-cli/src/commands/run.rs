@@ -6817,9 +6817,14 @@ async fn run_batched_checks(
         Ok(counts)
     }
 
-    /// One `SELECT MAX(<timestamp_column>)` per table, for a freshness leg
-    /// nothing batches. A table the query could not answer for is recorded in
-    /// `freshness_failures`, in table order, and contributes no measurement.
+    /// One `SELECT COUNT(*), MAX(<timestamp_column>)` per table, for a
+    /// freshness leg nothing batches. A table the query could not answer for
+    /// is recorded in `freshness_failures`, in table order, and contributes
+    /// no measurement.
+    ///
+    /// The count rides in the same aggregate as the maximum: `MAX()` is NULL
+    /// over an empty table AND over rows whose column holds no value, and
+    /// only the count tells the caller which (#1930).
     async fn per_table_freshness(
         warehouse: &dyn WarehouseAdapter,
         refs: &[TableRef],
@@ -6832,44 +6837,65 @@ async fn run_batched_checks(
             let table_ref = dialect
                 .format_table_ref(&br.catalog, &br.schema, &br.table)
                 .map_err(anyhow::Error::from)?;
-            let sql = format!("SELECT MAX({timestamp_column}) FROM {table_ref}");
+            let sql = format!("SELECT COUNT(*), MAX({timestamp_column}) FROM {table_ref}");
             match warehouse.execute_query(&sql).await {
                 Ok(result) => {
-                    // `MAX()` over an empty table is NULL: there is no row
-                    // to be fresh, and no check is emitted (unchanged). A
-                    // non-NULL cell that does not read as a timestamp — a
-                    // DATE or numeric `timestamp_column`, say — is a check
-                    // the engine could not evaluate, and used to be
-                    // dropped without a trace.
-                    match result.rows.first().and_then(|r| r.first()) {
-                        Some(cell) if cell.is_null() => {
+                    // One row, two cells: the count, then the maximum. A
+                    // non-NULL maximum that does not read as a timestamp —
+                    // a DATE or numeric `timestamp_column`, say — is a
+                    // check the engine could not evaluate, and used to be
+                    // dropped without a trace. So is a count that does not
+                    // read as a number: without it a NULL maximum cannot be
+                    // classified, and guessing "empty" is the defect the
+                    // count exists to remove. `cell_as_u64` is the reader
+                    // every other integer aggregate goes through (a JSON
+                    // integer, a numeric string, an integral float).
+                    let row = result.rows.first();
+                    let count = row.and_then(|r| r.first());
+                    let max = row.and_then(|r| r.get(1));
+                    match (checks::cell_as_u64(count), max) {
+                        (Some(rows), Some(cell)) if cell.is_null() => {
                             fresh_results.push(BatchFreshnessResult {
                                 table: br.clone(),
                                 max_timestamp: None,
+                                row_count: Some(rows),
                             });
                         }
-                        Some(cell) => match cell.as_str().and_then(parse_freshness_timestamp) {
-                            Some(ts) => fresh_results.push(BatchFreshnessResult {
-                                table: br.clone(),
-                                max_timestamp: Some(ts),
-                            }),
-                            None => {
-                                warn!(table = br.table.as_str(), cell = %cell, "per-table freshness check returned an unreadable timestamp");
-                                freshness_failures.push((
-                                    br.full_name(),
-                                    format!("could not read {cell} as a timestamp"),
-                                ));
+                        (Some(rows), Some(cell)) => {
+                            match cell.as_str().and_then(parse_freshness_timestamp) {
+                                Some(ts) => fresh_results.push(BatchFreshnessResult {
+                                    table: br.clone(),
+                                    max_timestamp: Some(ts),
+                                    row_count: Some(rows),
+                                }),
+                                None => {
+                                    warn!(table = br.table.as_str(), cell = %cell, "per-table freshness check returned an unreadable timestamp");
+                                    freshness_failures.push((
+                                        br.full_name(),
+                                        format!("could not read {cell} as a timestamp"),
+                                    ));
+                                }
                             }
-                        },
-                        None => {
-                            warn!(
-                                table = br.table.as_str(),
-                                "per-table freshness check returned no rows"
-                            );
+                        }
+                        (None, Some(_)) => {
+                            let cell = count.cloned().unwrap_or(serde_json::Value::Null);
+                            warn!(table = br.table.as_str(), cell = %cell, "per-table freshness check returned an unreadable row count");
                             freshness_failures.push((
                                 br.full_name(),
-                                "the freshness query returned no rows".to_string(),
+                                format!("could not read {cell} as a row count"),
                             ));
+                        }
+                        (_, None) => {
+                            let reason = if row.is_some() {
+                                "the freshness query returned a row without its second cell"
+                            } else {
+                                "the freshness query returned no rows"
+                            };
+                            warn!(
+                                table = br.table.as_str(),
+                                "per-table freshness check: {reason}"
+                            );
+                            freshness_failures.push((br.full_name(), reason.to_string()));
                         }
                     }
                 }
@@ -7100,16 +7126,31 @@ async fn run_batched_checks(
         // answered and left a table out records none, so iterating the
         // results is the only way to notice that one.
         //
-        // `None` emits no check. That is correct for an empty table and wrong
-        // for the other states that reach the same `None` (#1929).
+        // A NULL maximum emits no check only when the table is empty. Over
+        // rows whose timestamp column holds no value it is a check the
+        // engine could not evaluate (#1930); the adapter's `row_count` is
+        // what separates the two. An adapter that did not count (`None`)
+        // cannot separate them, and its NULL is read as empty, as it was
+        // before the count existed.
         let measured = freshness_batch_refs.iter().filter_map(|tref| {
             let key = tref.full_name();
             match freshness_results.iter().find(|fr| fr.table == *tref) {
-                Some(fr) => {
-                    let ts = fr.max_timestamp?;
-                    let lag = (now - ts).num_seconds().unsigned_abs();
-                    Some((key, checks::check_freshness(lag, freshness_cfg.threshold_seconds)))
-                }
+                Some(fr) => match (fr.max_timestamp, fr.row_count) {
+                    (Some(ts), _) => {
+                        let lag = (now - ts).num_seconds().unsigned_abs();
+                        Some((key, checks::check_freshness(lag, freshness_cfg.threshold_seconds)))
+                    }
+                    (None, Some(rows)) if rows > 0 => Some((
+                        key,
+                        checks::freshness_not_evaluated(
+                            freshness_cfg.threshold_seconds,
+                            format!(
+                                "the table has {rows} row(s) and no value in its timestamp column, so there is no timestamp to measure freshness from"
+                            ),
+                        ),
+                    )),
+                    (None, _) => None,
+                },
                 // Absent from the results and with no recorded reason: the
                 // batch query left this table out.
                 None if !freshness_failures.iter().any(|(k, _)| *k == key) => {
@@ -33797,6 +33838,9 @@ table = "fct_events"
         /// What every answered freshness row carries. `None` is what
         /// `MAX(ts)` over an empty table returns — an answer, not a failure.
         max_timestamp: Option<DateTime<Utc>>,
+        /// The `COUNT(*)` every answered freshness row carries beside the
+        /// maximum (#1930). `None` is an adapter that did not count.
+        freshness_row_count: Option<u64>,
     }
 
     #[cfg(feature = "duckdb")]
@@ -33807,6 +33851,7 @@ table = "fct_events"
                 fail: FailingLeg::Nothing,
                 count: 1,
                 max_timestamp: Some(Utc::now()),
+                freshness_row_count: Some(1),
             }
         }
 
@@ -33863,6 +33908,7 @@ table = "fct_events"
                 .map(|t| BatchFreshnessResult {
                     table: t.clone(),
                     max_timestamp: self.max_timestamp,
+                    row_count: self.freshness_row_count,
                 })
                 .collect())
         }
@@ -33942,7 +33988,7 @@ table = "fct_events"
 
         let failing = InterceptingDuckDb {
             inner: &inner,
-            prefix: "SELECT MAX(",
+            prefix: "SELECT COUNT(*), MAX(",
             reply: Intercept::Fail("injected MAX failure"),
         };
         let (pending, _) = fx.run(&failing, None, None).await;
@@ -33980,8 +34026,11 @@ table = "fct_events"
 
         let unreadable = InterceptingDuckDb {
             inner: &inner,
-            prefix: "SELECT MAX(",
-            reply: Intercept::Rows(vec![vec![serde_json::json!("yesterday")]]),
+            prefix: "SELECT COUNT(*), MAX(",
+            reply: Intercept::Rows(vec![vec![
+                serde_json::json!(1),
+                serde_json::json!("yesterday"),
+            ]]),
         };
         let (pending, _) = fx.run(&unreadable, None, None).await;
         let result = the_result(&pending, &fx.target_key(), "freshness");
@@ -33991,6 +34040,74 @@ table = "fct_events"
             Some("could not read \"yesterday\" as a timestamp"),
             "{result:?}"
         );
+    }
+
+    /// A `COUNT(*)` cell that is not a number is the same class as an
+    /// unreadable timestamp: without it a NULL maximum cannot be classified,
+    /// and guessing "empty" is the defect the count exists to remove (#1930).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_freshness_count_that_is_not_a_number_is_not_evaluated() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.freshness]\nthreshold_seconds = 3600",
+        );
+
+        let unreadable = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT COUNT(*), MAX(",
+            reply: Intercept::Rows(vec![vec![
+                serde_json::json!("many"),
+                serde_json::Value::Null,
+            ]]),
+        };
+        let (pending, _) = fx.run(&unreadable, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), "freshness");
+        assert!(!result.passed, "{result:?}");
+        assert_eq!(
+            result.not_evaluated.as_deref(),
+            Some("could not read \"many\" as a row count"),
+            "{result:?}"
+        );
+    }
+
+    /// A non-empty table whose timestamp column holds no value used to emit
+    /// no freshness check at all: `MAX(ts)` is NULL there exactly as it is
+    /// over an empty table, and the query carried nothing to tell the two
+    /// apart. The per-table query now counts, and the count is what turns
+    /// this into a check the engine could not evaluate (#1930).
+    ///
+    /// Real DuckDB, real query: the table is emptied of VALUES, not of rows.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_non_empty_table_with_no_timestamp_value_has_its_freshness_not_evaluated() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.freshness]\nthreshold_seconds = 3600",
+        );
+
+        inner
+            .execute_statement("INSERT INTO tgt.orders VALUES (2, NULL)")
+            .await
+            .unwrap();
+        inner
+            .execute_statement("UPDATE tgt.orders SET ts = NULL")
+            .await
+            .unwrap();
+        let (pending, _) = fx.run(&inner, None, None).await;
+        let result = the_result(&pending, &fx.target_key(), "freshness");
+        assert!(!result.passed, "{result:?}");
+        assert_eq!(
+            result.not_evaluated.as_deref(),
+            Some(
+                "the table has 2 row(s) and no value in its timestamp column, so there is no \
+                 timestamp to measure freshness from"
+            ),
+            "{result:?}"
+        );
+        // An unevaluated check gates at Error whatever the configured
+        // severity, like every other `freshness_not_evaluated` (#1719).
+        assert_eq!(result.severity, rocky_core::tests::TestSeverity::Error);
     }
 
     /// Pinned, not changed: `MAX()` over an empty table is NULL, there is no
@@ -34381,12 +34498,12 @@ table = "fct_events"
     /// `a_table_the_batch_row_count_left_out_is_not_evaluated`, whose reason
     /// text says "returned no readable count", never "failed".)
     ///
-    /// `None` does NOT mean the table is empty. `MAX(ts)` is NULL over no
-    /// rows AND over rows whose `ts` is all NULL, and the query returns no
-    /// `COUNT(*)` to tell them apart. Those two are the whole of `None` now:
-    /// a missing cell, a non-string cell and an unparseable string are
-    /// omitted by the adapter and reported as `freshness_not_evaluated`
-    /// instead, so they no longer reach here (#1929).
+    /// `None` alone does NOT mean the table is empty. `MAX(ts)` is NULL over
+    /// no rows AND over rows whose `ts` is all NULL; the adapter's
+    /// `row_count` is what tells them apart (#1930), and this test is the
+    /// empty half: a count of zero. A missing cell, a non-string cell and an
+    /// unparseable string are omitted by the adapter and reported as
+    /// `freshness_not_evaluated` instead, so they do not reach here (#1929).
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn a_batched_freshness_leg_that_answers_null_emits_no_check() {
@@ -34397,6 +34514,7 @@ table = "fct_events"
 
         let empty = LegFailingBatchCheck {
             max_timestamp: None,
+            freshness_row_count: Some(0),
             ..LegFailingBatchCheck::healthy()
         };
         let (pending, _) = fx
@@ -34406,6 +34524,69 @@ table = "fct_events"
         assert!(
             results_named(&pending, &fx.target_key(), "freshness").is_empty(),
             "an empty table has no freshness to measure: {checks:?}",
+            checks = pending.get(&fx.target_key()).map(|p| &p.checks)
+        );
+    }
+
+    /// The other half of a NULL maximum: rows exist and none carries a
+    /// timestamp. That is a check the engine could not evaluate, reported as
+    /// such with the count in its reason, at the Error severity every
+    /// unevaluated check keeps (#1930).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_batched_freshness_leg_that_answers_null_over_rows_is_not_evaluated() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.freshness]\nthreshold_seconds = 3600\nseverity = \"warning\"",
+        );
+
+        let rows_without_a_value = LegFailingBatchCheck {
+            max_timestamp: None,
+            freshness_row_count: Some(3),
+            ..LegFailingBatchCheck::healthy()
+        };
+        let (pending, _) = fx
+            .try_run(&inner, Some(&rows_without_a_value), None)
+            .await
+            .expect("an answered leg is not a failure");
+        let result = the_result(&pending, &fx.target_key(), "freshness");
+        assert!(!result.passed, "{result:?}");
+        assert_eq!(
+            result.not_evaluated.as_deref(),
+            Some(
+                "the table has 3 row(s) and no value in its timestamp column, so there is no \
+                 timestamp to measure freshness from"
+            ),
+            "{result:?}"
+        );
+        assert_eq!(result.severity, rocky_core::tests::TestSeverity::Error);
+    }
+
+    /// An adapter that answers NULL WITHOUT a count cannot tell the two
+    /// cases apart, and its NULL is read as empty, as it was before the count
+    /// existed. The absent count is its own state, not a zero: a batch
+    /// adapter written before #1930 must not start failing healthy empty
+    /// tables because the field it never set now means "rows".
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_batched_freshness_leg_that_does_not_count_keeps_the_empty_reading() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            "[pipeline.bronze.checks.freshness]\nthreshold_seconds = 3600",
+        );
+
+        let uncounted = LegFailingBatchCheck {
+            max_timestamp: None,
+            freshness_row_count: None,
+            ..LegFailingBatchCheck::healthy()
+        };
+        let (pending, _) = fx
+            .try_run(&inner, Some(&uncounted), None)
+            .await
+            .expect("an answered leg is not a failure");
+        assert!(
+            results_named(&pending, &fx.target_key(), "freshness").is_empty(),
+            "an uncounted NULL keeps the empty reading: {checks:?}",
             checks = pending.get(&fx.target_key()).map(|p| &p.checks)
         );
     }
@@ -34512,6 +34693,7 @@ table = "fct_events"
                 .map(|t| BatchFreshnessResult {
                     table: t.clone(),
                     max_timestamp: Some(Utc::now()),
+                    row_count: Some(1),
                 })
                 .collect())
         }
