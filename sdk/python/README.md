@@ -37,7 +37,7 @@ pip install rocky-sdk
 The `rocky` binary is not bundled. Install it separately and put it on `$PATH`,
 or pass `binary_path=` to the client. See the
 [releases page](https://github.com/rocky-data/rocky/releases). The SDK requires
-engine **v1.34.0 or newer** and checks the version on first use.
+engine **v1.35.0 or newer** and checks the version on first use.
 
 ## Usage
 
