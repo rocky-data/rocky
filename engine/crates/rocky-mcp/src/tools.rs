@@ -1097,13 +1097,16 @@ fn worker_tools_that_read_the_warehouse<'a>(table: &[(&'a str, WorkerToolEffect)
 /// with per-request metadata, so ANY `initialize` request is a legacy
 /// client, and one that names `2026-07-28` is answered with the server's
 /// fallback (`V_2025_11_25` here, the newest version that has a handshake).
-/// A modern peer reaches `2026-07-28` only through the `server/discover`
-/// lifecycle (`ClientLifecycleMode::Discover`), which sends no `initialize`
-/// at all. For such a peer `sep_2322_supported` is true, the strip call is
-/// skipped, and `resultType` DOES reach it.
+/// A modern peer reaches `2026-07-28` through the `server/discover`
+/// lifecycle (`ClientLifecycleMode::Discover` or `Auto`), which sends no
+/// `initialize` at all, or by declaring `2026-07-28` and its capabilities in
+/// a request's own `_meta`, which rmcp honours even inside an `initialize`
+/// session (rmcp's own client never does the latter after `initialize`; a
+/// hand-rolled one can). For such a request `sep_2322_supported` is true,
+/// the strip call is skipped, and `resultType` DOES reach it.
 ///
-/// The stripping therefore holds because no PRODUCTION client discovers
-/// yet, not because this server refuses to speak `2026-07-28`. The
+/// The stripping therefore holds because no PRODUCTION client discovers or
+/// declares yet, not because this server refuses to speak `2026-07-28`. The
 /// negotiated version is `2025-11-25` against rmcp's own default client —
 /// BLESSED, as part of row 1's `initialize` payload in
 /// `served_text_golden_pins_every_worded_surface`, so the day it moves the
