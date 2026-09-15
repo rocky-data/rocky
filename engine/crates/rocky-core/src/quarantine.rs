@@ -346,6 +346,7 @@ fn reject_generated_clock_in_split(
             ValidationError::ExpressionFunctionNotAllowed {
                 context: format!("quarantine assertion '{label}' ({kind}) with mode = \"split\""),
                 function: "the generated clock comparison".to_string(),
+                use_: expression_use,
             },
         ));
     }
