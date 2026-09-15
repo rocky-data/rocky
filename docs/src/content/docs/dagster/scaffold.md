@@ -80,7 +80,7 @@ After scaffolding, the README guides users through:
 curl -sSL https://github.com/rocky-data/rocky/releases/latest/download/install.sh | sh
 
 # Validate the pipeline locally (DuckDB, no credentials required)
-rocky run --config rocky.toml
+rocky --config rocky.toml run
 
 # Launch the Dagster UI
 dg dev

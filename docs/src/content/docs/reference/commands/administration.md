@@ -1139,8 +1139,8 @@ A hold controls whichever scheduler reads the same state file this command write
                          │ read on every tick
                          ▼
             ┌────────────────────────────┐   suppresses the cron,
-            │  rocky serve --scheduler   │   after, freshness, and
-            │        --state-path X      │   webhook demand sources,
+            │  rocky --state-path X      │   after, freshness, and
+            │    serve --scheduler       │   webhook demand sources,
             └────────────────────────────┘   and records a `paused`
                                              skip on each tick
 ```

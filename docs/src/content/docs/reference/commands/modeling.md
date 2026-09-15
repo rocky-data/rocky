@@ -947,13 +947,13 @@ Sampled row-level diff plus structural (column-level) diff for every model in th
 | `--base <REF>` | `string` | `main` | Git ref to compare against. Must match what `preview create` was invoked with. |
 | `--sample-size <N>` | `usize` | `1000` | Number of rows to sample per model for row-level diffing. Larger windows reduce false-negative risk; see [coverage warning](/concepts/preview-internals/#coverage-warning-roll-up). |
 
-**Example.** Render a Markdown report ready to post on a PR:
+**Example.** Print a Markdown report ready to post on a PR:
 
 ```bash
-rocky preview diff --name preview-fix-price --output markdown
+rocky preview diff --name preview-fix-price --output json | jq -r .markdown
 ```
 
-The JSON shape (`PreviewDiffOutput`) carries the same data plus the per-model `sampling_window` block with `coverage_warning`, and `rocky preview diff --output json | jq -r .markdown` reproduces the `--output markdown` report.
+There is no `--output markdown`. The report lives in the `markdown` field of the JSON output (`PreviewDiffOutput`). The same JSON also carries the per-model `sampling_window` block with `coverage_warning`.
 
 ### `rocky preview cost`
 
@@ -962,15 +962,15 @@ Per-model cost delta between the branch run and the latest base-schema `RunRecor
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--name <NAME>` | `string` | **(required)** | Branch name created by `preview create`. |
-| `--base <REF>` | `string` | `main` | Git ref the base run is identified by. |
+| `--models <PATH>` | `PathBuf` | `models` | Models directory. Rocky reads per-model `[budget]` blocks from the sidecars here, so a projected breach can name a single model. |
 
 **Example.**
 
 ```bash
-rocky preview cost --name preview-fix-price --output markdown
+rocky preview cost --name preview-fix-price --output json | jq -r .markdown
 ```
 
-The JSON shape (`PreviewCostOutput`) reports per-model `delta_usd`, `branch_duration_ms`, `base_duration_ms`, and bytes scanned, plus an aggregate `summary.delta_usd`, `summary.savings_from_copy_usd`, and `models_skipped_via_copy`. Underlying cost math is identical to [`rocky cost`](/reference/commands/administration/#rocky-cost) (Databricks / Snowflake duration × DBU rate; BigQuery bytes × $/TB; DuckDB zero); fields fall back to `null` when no base `RunRecord` exists or when the adapter does not surface USD.
+The JSON shape (`PreviewCostOutput`) carries the Markdown report in its `markdown` field. It reports per-model `delta_usd`, `branch_duration_ms`, `base_duration_ms`, and bytes scanned, plus an aggregate `summary.delta_usd`, `summary.savings_from_copy_usd`, and `models_skipped_via_copy`. Underlying cost math is identical to [`rocky cost`](/reference/commands/administration/#rocky-cost) (Databricks / Snowflake duration × DBU rate; BigQuery bytes × $/TB; DuckDB zero); fields fall back to `null` when no base `RunRecord` exists or when the adapter does not surface USD.
 
 ### `rocky preview rows`
 

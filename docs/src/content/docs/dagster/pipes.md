@@ -179,7 +179,7 @@ def my_asset(context: dg.AssetExecutionContext, rocky: RockyResource):
 
 Spawns rocky via [`dg.PipesSubprocessClient`](https://docs.dagster.io/api/dagster/pipes#dagster.PipesSubprocessClient),
 which sets the `DAGSTER_PIPES_CONTEXT` and `DAGSTER_PIPES_MESSAGES` env
-vars. As of `dagster-rocky` v1.30, the client runs `rocky plan` first to
+vars. As of `dagster-rocky` v1.31, the client runs `rocky plan` first to
 write `.rocky/plans/<plan-id>.json`. It then runs `rocky apply <plan-id>`
 as the Pipes subprocess. The plan id travels along as
 `extras={"plan_id": plan_id}`, so the run viewer shows it as run
@@ -198,9 +198,9 @@ Returns a `PipesClientCompletedInvocation`. Call `.get_results()` to
 extract the materialization events Dagster built from the Pipes
 messages.
 
-`run_pipes` requires engine ≥1.34. That version content-addresses and
-persists a plan for every project shape, including replication-only
-projects with no `models/` directory. There is no fallback. If
+`run_pipes` requires engine ≥1.35.0 for a replication-only project (one
+with no `models/` directory). Engine 1.35.0 is the first version that
+content-addresses and persists a plan for every project shape. There is no fallback. If
 `rocky plan` emits no `plan_id`, `run_pipes` raises `dg.Failure` rather
 than running without one.
 

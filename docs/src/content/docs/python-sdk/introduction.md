@@ -135,5 +135,5 @@ Each method's full signature, parameters, and return type are in the [`RockyReso
 ## Requirements
 
 - Python 3.11 or newer
-- `pydantic >= 2.0`
+- `pydantic >= 2.10`
 - The `rocky` binary on `PATH` (engine v1.34.0 or newer), or a path passed via `binary_path`

@@ -119,6 +119,7 @@ Declare a connection once, then reference it by name from any number of pipeline
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `type` | string | Yes | Adapter type. One of `"databricks"`, `"snowflake"`, `"duckdb"`, `"bigquery"`, `"trino"`, `"fivetran"`, `"airbyte"`, `"iceberg"`, `"manual"`. An unrecognized value is a hard error. |
+| `kind` | `"data"` \| `"discovery"` | See description | The role of this block. `"discovery"` is **required** for the discovery-only types: `fivetran`, `airbyte`, `iceberg` and `manual`. Leave it out for `databricks` and `snowflake`, which move data only. For `duckdb` and `bigquery`, which can do both, leaving it out registers both roles. |
 | `retry` | table | No | Retry policy (see [`[adapter.NAME.retry]`](#adapternameretry)). |
 | `extra` | table | No | Escape hatch for adapter-specific keys Rocky's typed config doesn't model (see below). |
 
@@ -236,12 +237,17 @@ Point the pipeline at the system it reads from.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `adapter` | string | Yes | Name of the adapter that owns the source data. Must match a `[adapter.NAME]` key. |
+| `adapter` | string | Yes | Name of the adapter that reads the source rows. Must match a `[adapter.NAME]` key, and that adapter must move data. A discovery-only adapter such as Fivetran goes in [`source.discovery`](#pipelinenamesourcediscovery) instead. |
 | `catalog` | string | No | Source catalog name (used by warehouse-resident sources like Databricks). |
+
+Fivetran lands its tables in your warehouse. So the warehouse adapter reads the rows, and the Fivetran adapter only lists what exists:
 
 ```toml
 [pipeline.bronze.source]
-adapter = "fivetran"
+adapter = "prod"            # the warehouse adapter
+
+[pipeline.bronze.source.discovery]
+adapter = "fivetran"        # an adapter with kind = "discovery"
 ```
 
 ### `[pipeline.NAME.source.discovery]`
@@ -414,7 +420,7 @@ See [Data quality checks](/concepts/data-quality-checks/) for what each one mean
 | `null_rate` | table | | `{ columns = [...], threshold = 0.0–1.0, sample_percent = 10 }`. |
 | `custom` | list | `[]` | Custom SQL checks. Each entry has `name`, `sql`, and optional `threshold`. |
 | `anomaly_threshold_pct` | float | `50.0` | Row count deviation percentage that triggers an anomaly. Set to 0 (or a negative value) to disable detection. Must be a finite number: `nan` and `inf` are refused when the config loads. |
-| `quarantine` | table | | `{ mode = "split" \| "tag" \| "drop" }`. See below. |
+| `quarantine` | table | | `{ enabled = true, mode = "split" \| "tag" \| "drop" }`. Off unless `enabled = true`. See below. |
 | `assertions` | list | `[]` | Repeated `[[assertions]]` blocks (DQX parity). See below. |
 | `cross_source_overlap` | table | | Flags the same business key appearing across sibling sources that feed one consolidation target. See [Cross-source duplicate detection](#cross-source-duplicate-detection). |
 
@@ -499,15 +505,28 @@ Use `unique_expr` when the meaningful identity is a *computed* value rather than
 
 #### `[pipeline.NAME.checks.quarantine]`
 
-Keep the bad rows out of the clean table instead of only counting them. Pick a mode and Rocky routes rows that fail a row-level assertion into their own table, or marks them in place.
+Keep the bad rows out of the clean table instead of only counting them. Rocky takes the rows that fail an `error`-severity row-level assertion and puts them in their own table, or marks them in place. Quarantine runs in `quality` pipelines.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Turn quarantine on. Without `enabled = true`, the block does nothing. |
+| `mode` | `"split"` \| `"tag"` \| `"drop"` | `"split"` | What Rocky does with the failing rows. See the table below. |
+| `suffix_valid` | string | `"__valid"` | Suffix for the table of passing rows. |
+| `suffix_quarantine` | string | `"__quarantine"` | Suffix for the table of failing rows. |
+
+```toml
+[pipeline.dq.checks.quarantine]
+enabled = true
+mode = "split"
+```
 
 | Mode | Behavior |
 |---|---|
-| `split` | Materializes `<target>` (valid rows) and `<target>__quarantine` (failing rows). Downstream models see only the clean table. |
-| `tag` | Adds `__dqx_valid` boolean column; failing rows stay with `__dqx_valid = FALSE`. |
-| `drop` | Drops failing rows from `<target>`. |
+| `split` | Writes `<table>__valid` with the passing rows and `<table>__quarantine` with the failing rows. Each failing row carries an `_error_<name>` column per assertion. The original `<table>` stays as it is. Point downstream models at `<table>__valid`. |
+| `tag` | Rewrites `<table>` in place and adds an `_error_<name>` column per assertion, set on the failing rows. Every row stays. This rewrites the source, so take care on a raw replication target. |
+| `drop` | Writes only `<table>__valid`. Rocky discards the failing rows. |
 
-Set-based and table-level assertions (`unique`, `unique_expr`, `composite`, `row_count_range`, `aggregate`) run as post-hoc checks regardless of mode.
+Only these row-level kinds are quarantined: `not_null`, `accepted_values`, `expression`, `in_range`, `regex_match`, `not_in_future` and `older_than_n_days`. Set-based, table-level and referential assertions (`unique`, `unique_expr`, `composite`, `relationships`, `row_count_range`, `aggregate`) run as ordinary checks whatever the mode.
 
 #### Cross-source duplicate detection
 
@@ -1386,6 +1405,7 @@ A complete Fivetran → Databricks pipeline with governance:
 # ──────────────────────────────────────────────────
 [adapter.fivetran]
 type = "fivetran"
+kind = "discovery"
 destination_id = "${FIVETRAN_DESTINATION_ID}"
 api_key = "${FIVETRAN_API_KEY}"
 api_secret = "${FIVETRAN_API_SECRET}"
@@ -1408,6 +1428,9 @@ metadata_columns = [
 ]
 
 [pipeline.bronze.source]
+adapter = "prod"
+
+[pipeline.bronze.source.discovery]
 adapter = "fivetran"
 
 [pipeline.bronze.source.schema_pattern]

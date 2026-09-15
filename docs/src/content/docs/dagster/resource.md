@@ -32,7 +32,7 @@ The resource also accepts four optional **resolver** fields: `shadow_suffix_fn`,
 - On CLI failure, raises `dagster.Failure` with stderr attached as metadata.
 - If the binary is not found on `PATH`, raises `Failure` with a link to the installation instructions.
 - **Partial success**: Rocky can exit non-zero and still print valid JSON. That happens when some tables succeed and others fail. `run()`, `compile()`, `test()`, and `ci()` handle it for you. They return the parsed result, so you can tell the successes from the failures.
-- **Execution paths**: `run()` and `run_streaming()` invoke a single fused `rocky run`, which is the engine's own plan+apply path. Neither persists a separate plan artifact. Only `run_pipes()` keeps the two-step shape. It runs `rocky plan`, then `rocky apply <plan-id>`. It persists an auditable plan artifact to `.rocky/plans/<plan-id>.json` and surfaces the `plan_id` as Pipes `extras`. A materialization therefore traces back to the exact plan it applied. `run_pipes()` requires engine `v1.34+`, which content-addresses every plan, replication-only projects included. If `rocky plan` emits no `plan_id`, `run_pipes()` raises `dagster.Failure` with an upgrade hint rather than falling back.
+- **Execution paths**: `run()` and `run_streaming()` invoke a single fused `rocky run`, which is the engine's own plan+apply path. Neither persists a separate plan artifact. Only `run_pipes()` keeps the two-step shape. It runs `rocky plan`, then `rocky apply <plan-id>`. It persists an auditable plan artifact to `.rocky/plans/<plan-id>.json` and surfaces the `plan_id` as Pipes `extras`. A materialization therefore traces back to the exact plan it applied. `run_pipes()` requires engine `v1.35+` for a replication-only project. That is the first version that content-addresses a plan for every project shape. If `rocky plan` emits no `plan_id`, `run_pipes()` raises `dagster.Failure` with an upgrade hint rather than falling back.
 
 ---
 
@@ -105,7 +105,7 @@ def replicate(context: dg.AssetExecutionContext, rocky: RockyResource):
 
 Full Dagster Pipes execution with structured event streaming. Spawns `rocky plan` followed by `rocky apply <plan-id>` via `PipesSubprocessClient`, which sets the `DAGSTER_PIPES_CONTEXT` / `DAGSTER_PIPES_MESSAGES` env vars on the apply subprocess. The engine emits one Pipes message per materialization, asset check, and log line. The run viewer therefore gets `MaterializationEvent` and `AssetCheckEvaluation` events in real time. The plan id is attached via `extras={"plan_id": plan_id}`, so Dagster shows it as run metadata.
 
-**Wraps**: `rocky plan --filter <filter> --output json` followed by `rocky apply <plan-id> --output json`, over the Dagster Pipes protocol. This is the only execution mode that keeps the two-step shape. Replication-only projects route through plan+apply too, because engine `v1.34+` content-addresses every plan. A missing `plan_id` therefore raises `dagster.Failure` with an upgrade hint rather than falling back to `rocky run`.
+**Wraps**: `rocky plan --filter <filter> --output json` followed by `rocky apply <plan-id> --output json`, over the Dagster Pipes protocol. This is the only execution mode that keeps the two-step shape. Replication-only projects route through plan+apply too, because engine `v1.35+` content-addresses every plan. A missing `plan_id` therefore raises `dagster.Failure` with an upgrade hint rather than falling back to `rocky run`.
 
 | Parameter | Type | Description |
 |---|---|---|
