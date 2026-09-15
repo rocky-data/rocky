@@ -445,16 +445,27 @@ impl ApiError {
     /// `409` — the state store on disk lacks tables this server reads, and a
     /// read never creates them (`StateStore::open_read_only` takes no write
     /// transaction against a store that holds anything, #1978). Only a store
-    /// written by a Rocky older than schema v22 can be in this state. Any
-    /// read-write open — a `rocky run` — migrates it, after which every read
-    /// answers. Deliberately not the retryable `503`: no amount of retrying
-    /// migrates a store, so a client must not back off and try again; it must
-    /// tell an operator.
+    /// written by a Rocky older than schema v22 can be in this state.
+    ///
+    /// On a real `rocky serve` this is rare: the startup job sweep
+    /// ([`sweep_interrupted_jobs`]) opens the store read-write before the
+    /// router serves, and a read-write open creates every missing table and
+    /// re-stamps. So a store that is old at startup is migrated before the
+    /// first read. What reaches this arm is a store that CHANGED under a
+    /// running server (a file copied or restored over it), or a startup sweep
+    /// that could not open the store (it is best-effort under lock
+    /// contention). Either way one read-write open fixes it — restarting
+    /// `rocky serve`, or any read-write command such as `rocky run`.
+    ///
+    /// Deliberately not the retryable `503`: no amount of retrying migrates a
+    /// store, so a client must not back off and try again; it must tell an
+    /// operator.
     fn state_needs_migration(found: Option<u32>, expected: u32, missing: &[String]) -> Self {
         let stamp = found.map_or_else(|| "unversioned".to_string(), |v| format!("v{v}"));
         let hint = format!(
-            "run `rocky run` (any read-write command) against this project once to migrate \
-             the store to v{expected}; reads never migrate it"
+            "restart `rocky serve`, or run any read-write command such as `rocky run` \
+             against this project once, to migrate the store to v{expected}; reads never \
+             migrate it"
         );
         Self::new(
             StatusCode::CONFLICT,
@@ -7103,8 +7114,23 @@ mod tests {
         );
         let hint = mapped.envelope.remediation_hint.as_deref().unwrap_or("");
         assert!(
-            hint.contains("rocky run") && hint.contains("v30"),
-            "the hint names the migrating command and the target version: {hint}"
+            hint.contains("rocky run") && hint.contains("rocky serve") && hint.contains("v30"),
+            "the hint names both remedies and the target version: {hint}"
+        );
+
+        // The read cores wrap the open in `.with_context(...)`; the funnel
+        // must still see the inner `StateError` through that wrapper.
+        let wrapped = anyhow::Error::from(StateError::ReadOnlyNeedsInit {
+            path: "x".to_string(),
+            found: Some(18),
+            expected: 30,
+            missing: vec!["tombstones".to_string()],
+        })
+        .context("opening the state store for the audit ledger");
+        assert_eq!(
+            map_state_err(wrapped, None).envelope.code,
+            "state_needs_migration",
+            "a context-wrapped ReadOnlyNeedsInit must still map"
         );
         assert!(
             mapped.retry_after_seconds.is_none(),
@@ -7181,8 +7207,13 @@ mod tests {
             "the hint names the migrating command"
         );
 
-        // The one thing that migrates: a read-write open. Reads answer after it.
-        drop(StateStore::open(&state_path).expect("a read-write open migrates the store"));
+        // What migrates it on a real server: the startup job sweep, which
+        // `api::serve` runs before the router — a read-write open. This test
+        // drives the router directly, so it calls the sweep itself; a server
+        // started on this store would have migrated it before its first read.
+        let swept = sweep_interrupted_jobs(&state_path)
+            .expect("the startup sweep opens the store read-write and migrates it");
+        assert_eq!(swept, 0, "nothing to sweep, but the open migrated");
         let resp = reqwest::get(format!("{base}/api/v1/runs")).await.unwrap();
         assert_eq!(resp.status(), 200, "after the migration the read answers");
     }

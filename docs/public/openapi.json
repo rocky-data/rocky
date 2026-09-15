@@ -22503,7 +22503,7 @@
                 }
               }
             },
-            "description": "`products/<name>.toml` exists but the spec loader rejects it, so the product's output model cannot be resolved. The body carries the loader's code and reason."
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
           },
           "500": {
             "content": {
@@ -22582,6 +22582,16 @@
             },
             "description": "A query parameter is not one of its documented values, or the subject is longer than 512 bytes."
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
+          },
           "500": {
             "content": {
               "application/json": {
@@ -22649,6 +22659,16 @@
               }
             },
             "description": "A query parameter is not one of its documented values, or the subject is longer than 512 bytes."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
           },
           "500": {
             "content": {
@@ -22766,6 +22786,16 @@
               }
             },
             "description": "A query parameter is not one of its documented values, or the subject is longer than 512 bytes."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
           },
           "500": {
             "content": {
@@ -23238,6 +23268,16 @@
               }
             },
             "description": "No job with this id (neither in-memory nor persisted)."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
           }
         },
         "summary": "Job status",
@@ -23378,6 +23418,16 @@
               }
             },
             "description": "The model's run history."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
           },
           "503": {
             "content": {
@@ -23536,6 +23586,16 @@
               }
             },
             "description": "The model's quality snapshots."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
           },
           "503": {
             "content": {
@@ -23718,6 +23778,16 @@
             },
             "description": "The policy plane as configured and as it stands."
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
+          },
           "500": {
             "content": {
               "application/json": {
@@ -23759,6 +23829,16 @@
               }
             },
             "description": "The product list."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
           },
           "500": {
             "content": {
@@ -23823,6 +23903,16 @@
             },
             "description": "No spec file and no state record exists under this product name."
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
+          },
           "500": {
             "content": {
               "application/json": {
@@ -23886,6 +23976,16 @@
             },
             "description": "No spec file and no state record exists under this product name."
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
+          },
           "500": {
             "content": {
               "application/json": {
@@ -23928,6 +24028,16 @@
             },
             "description": "The project."
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
+          },
           "500": {
             "content": {
               "application/json": {
@@ -23969,6 +24079,16 @@
               }
             },
             "description": "The ranked queue."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
           },
           "500": {
             "content": {
@@ -24114,7 +24234,7 @@
                 }
               }
             },
-            "description": "A review marker exists for the plan but does not parse, or names another plan. Re-approve with `rocky review <plan-id> --approve` to rewrite it."
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
           },
           "500": {
             "content": {
@@ -24158,6 +24278,16 @@
             },
             "description": "The project run history."
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
+          },
           "503": {
             "content": {
               "application/json": {
@@ -24189,6 +24319,16 @@
               }
             },
             "description": "The scheduler status snapshot."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The state store on disk lacks tables this server reads, and a read never creates them. `rocky serve` migrates the store at startup (its job sweep opens it read-write), so this means the file changed under a running server, or that sweep could not open it. Restart `rocky serve`, or run any read-write command such as `rocky run`, once. Not retryable."
           },
           "500": {
             "content": {
