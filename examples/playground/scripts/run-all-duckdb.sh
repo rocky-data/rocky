@@ -4,6 +4,8 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Where the caller stood: a relative `ROCKY_BIN` is theirs, not this script's.
+caller_dir="$PWD"
 cd "$REPO_ROOT"
 
 # Name the binary under test ONCE, make both spellings of it resolve to that
@@ -38,7 +40,25 @@ if [ -z "$ROCKY_BIN" ]; then
     echo "  (cd engine && cargo build -p rocky) then add engine/target/debug to PATH" >&2
     exit 1
 fi
-if [ ! -x "$ROCKY_BIN" ]; then
+command -v jq >/dev/null 2>&1 || {
+    echo "error: jq is required (the version check reads each POC's JSON artifacts)." >&2
+    exit 1
+}
+# A bare name is looked up on PATH; a relative path is relative to where the
+# caller stood, since this script has already moved to the playground.
+case "$ROCKY_BIN" in
+    /*) ;;
+    */*) ROCKY_BIN="$caller_dir/$ROCKY_BIN" ;;
+    *)
+        resolved="$(command -v "$ROCKY_BIN" || true)"
+        if [ -z "$resolved" ]; then
+            echo "error: ROCKY_BIN=$ROCKY_BIN is not on PATH." >&2
+            exit 1
+        fi
+        ROCKY_BIN="$resolved"
+        ;;
+esac
+if [ ! -f "$ROCKY_BIN" ] || [ ! -x "$ROCKY_BIN" ]; then
     echo "error: ROCKY_BIN=$ROCKY_BIN is not an executable file." >&2
     exit 1
 fi
@@ -46,9 +66,12 @@ fi
 ROCKY_BIN="$(cd "$(dirname "$ROCKY_BIN")" && pwd)/$(basename "$ROCKY_BIN")"
 export ROCKY_BIN
 
-shim_dir="$(mktemp -d)"
+# Both must succeed, or an empty PATH entry (search the current directory,
+# which is every POC directory in turn) or a missing shim would leave the two
+# spellings pointing at different files while the version check still passes.
+shim_dir="$(mktemp -d)" || { echo "error: mktemp -d failed." >&2; exit 1; }
 trap 'rm -rf "$shim_dir"' EXIT
-ln -s "$ROCKY_BIN" "$shim_dir/rocky"
+ln -s "$ROCKY_BIN" "$shim_dir/rocky" || { echo "error: could not create the rocky shim in $shim_dir." >&2; exit 1; }
 PATH="$shim_dir:$PATH"
 export PATH
 
