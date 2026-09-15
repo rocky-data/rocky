@@ -10716,6 +10716,18 @@ schema_template = "raw__{{source}}"
             ),
             "an unquoted placeholder must be refused as unparseable, got {errors:?}"
         );
+        // The advice beside that refusal describes THIS field (#1959). The
+        // validator is shared with `[checks.assertions]`, whose advice says
+        // "one boolean expression"; a metadata column value is a scalar, and
+        // the accepted list above has no boolean in it.
+        let [ConfigError::MetadataColumnValueRefused { reason, .. }] = errors.as_slice() else {
+            unreachable!("pinned by the assertion above");
+        };
+        assert!(
+            reason.contains("A metadata column value is one scalar expression")
+                && !reason.contains("boolean"),
+            "the refusal must explain a column value, not a check: {reason}"
+        );
 
         // An off-allowlist function. The name is ordinary on purpose: the rule
         // is "not on the allowlist", not "looks dangerous".
