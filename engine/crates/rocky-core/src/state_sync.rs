@@ -1725,10 +1725,17 @@ fn publish_atomically(src: &Path, dst: &Path) -> Result<(), StateSyncError> {
     std::fs::rename(src, dst).map_err(StateSyncError::Io)
 }
 
-/// Delete the named tables from the redb at `dst` (leaving every other table
-/// untouched), so they reappear empty on the next `StateStore::open`. Used to
-/// scrub any remote-carried local-only rows on a `Restored` download with no
-/// prior local file (finding 6a).
+/// Empty the named tables in the redb at `dst` — every row removed, the tables
+/// themselves KEPT, and created if the remote object lacked them — leaving
+/// every other table untouched. Used to scrub any remote-carried local-only
+/// rows on a `Restored` download with no prior local file (finding 6a).
+///
+/// Kept, not dropped: a read-only open judges a store by its table set and
+/// never creates a table in a store that holds anything
+/// (`StateStore::init_db_read_only`), so a cold pod's first `GET` — before its
+/// first `rocky run` — must find these tables present and empty, not missing.
+/// Every table in [`crate::state::LOCAL_ONLY_TABLE_NAMES`] is a
+/// `TableDefinition<&str, &[u8]>`, which is what the open below assumes.
 fn clear_named_tables(dst: &Path, tables: &[&str]) -> Result<(), StateSyncError> {
     let io = |ctx: &str, e: &dyn std::fmt::Display| {
         StateSyncError::Io(std::io::Error::other(format!("{ctx}: {e}")))
@@ -1740,8 +1747,12 @@ fn clear_named_tables(dst: &Path, tables: &[&str]) -> Result<(), StateSyncError>
         .map_err(|e| io("redb begin_write for local-only clear", &e))?;
     for name in tables {
         let def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(name);
-        txn.delete_table(def)
-            .map_err(|e| io("redb delete_table for local-only clear", &e))?;
+        let mut table = txn
+            .open_table(def)
+            .map_err(|e| io("redb open_table for local-only clear", &e))?;
+        table
+            .retain(|_, _| false)
+            .map_err(|e| io("redb retain for local-only clear", &e))?;
     }
     txn.commit()
         .map_err(|e| io("redb commit for local-only clear", &e))?;
@@ -1756,9 +1767,12 @@ fn clear_named_tables(dst: &Path, tables: &[&str]) -> Result<(), StateSyncError>
 /// Every table in [`crate::state::LOCAL_ONLY_TABLE_NAMES`] is a
 /// `TableDefinition<&str, &[u8]>` (opaque serialized blobs), so the copy is a
 /// faithful, bit-exact key/value replay over that shape. A table absent from
-/// `src` clears the corresponding table in `dst` (delete + no re-insert). If a
-/// future local-only table used a different key/value type, opening it here
-/// would surface a redb type error rather than silently mis-copying.
+/// `src` leaves the corresponding table in `dst` present and EMPTY — never
+/// absent: a read-only open judges a store by its table set and creates
+/// nothing (`StateStore::init_db_read_only`), so the published file must carry
+/// every table. If a future local-only table used a different key/value type,
+/// opening it here would surface a redb type error rather than silently
+/// mis-copying.
 fn copy_named_tables(src: &Path, dst: &Path, tables: &[&str]) -> Result<(), StateSyncError> {
     // `iter()` lives on the `ReadableTable` trait — scope it locally.
     use redb::ReadableTable;
@@ -1803,10 +1817,14 @@ fn copy_named_tables(src: &Path, dst: &Path, tables: &[&str]) -> Result<(), Stat
                 // `dst_table` (the write borrow on `txn`) is dropped at the end
                 // of the iteration, so `txn.commit()` has no outstanding borrow.
             }
-            // A local-only table absent from `src` is a legitimate no-op — the
-            // destination table stays deleted (cleared) and is recreated empty
-            // on the next `StateStore::open`.
-            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            // A local-only table absent from `src` is legitimate: the
+            // destination table is recreated EMPTY here, not left absent, so a
+            // read-only open of the published file finds every table.
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                let _empty = txn
+                    .open_table(def)
+                    .map_err(|e| io("redb open_table (dst, empty) for local-only copy", &e))?;
+            }
             Err(e) => return Err(io("redb open_table (src) for local-only copy", &e)),
         }
     }
@@ -4958,6 +4976,26 @@ mod tests {
             .expect("restored download should succeed");
         test_support::clear();
         assert_eq!(authority, StateAuthority::Authoritative);
+
+        // A cold pod's first reads come BEFORE its first run. The scrub must
+        // leave the local-only tables present and empty — not dropped — so a
+        // read-only open (every `GET` on `rocky serve`) finds every table and
+        // takes no write transaction. Byte identity is the evidence: a
+        // committed redb transaction advances the on-disk transaction id.
+        let before = std::fs::read(&local).unwrap();
+        {
+            let ro = StateStore::open_read_only(&local)
+                .expect("a cold-restored store opens read-only without a write");
+            assert!(
+                ro.list_jobs().unwrap().is_empty(),
+                "the scrubbed jobs table is present and empty on the read-only path"
+            );
+        }
+        assert!(
+            before == std::fs::read(&local).unwrap(),
+            "a read-only open of a cold-restored store wrote: the scrub dropped a local-only \
+             table instead of emptying it"
+        );
 
         let store = StateStore::open(&local).unwrap();
         assert!(
