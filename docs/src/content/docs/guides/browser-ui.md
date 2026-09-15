@@ -47,7 +47,7 @@ Below the project strip, the DAG draws every model and the edges between them. C
 
 ## Review
 
-The Review screen lists the plans that a policy rule sent to a human. The engine ranks the queue by a score: blast radius × classification × staleness. A wide change to classified data that has waited long comes first. It is the same list `rocky review --queue` prints.
+The Review screen lists the plans that the policy plane sent to a human, by a rule or by the default effect. The engine ranks the queue by a score: blast radius × classification × staleness. A wide change to classified data that has waited long comes first. It is the same list `rocky review --queue` prints.
 
 Open a plan to see why it waits:
 
@@ -58,7 +58,7 @@ The plan screen shows:
 - **What it would break.** The breaking-change findings against `HEAD`, or why that check could not run.
 - **Why it needs a human.** The rule, the capability, the principal and the blast radius behind the `require_review` decision.
 - **The spec it was planned against.** For a product plan only: whether the product spec changed after the plan was made.
-- **Sample rows.** Nothing is read until you ask. The button runs the model's query against the warehouse for up to 20 rows, and that query has a cost. The engine masks classification-tagged columns before the rows leave it. If it cannot mask a column, it refuses the sample with `422` rather than return the column unmasked. A plan that names more than one model has no single model to sample, so the button does not appear.
+- **Sample rows.** Nothing is read until you ask. The button runs the model's query against the warehouse for up to 20 rows, and that query has a cost. The engine masks classification-tagged columns before the rows leave it. If it cannot mask a column, it refuses the sample with `422` rather than return the column unmasked. The button appears only when the plan names exactly one model to sample.
 - **How to approve.** The command to copy.
 
 You approve in a terminal, not on the page. The approval marker records a git identity, and the page holds a read-only token:
@@ -85,7 +85,7 @@ The scorecard shows acceptance, review and denial rates for a window you pick. G
 
 ### Custody
 
-Enter a subject to trace its chain of custody. A subject is a model, a run id, a plan id, or a ledger id such as `product:revenue_daily`. It shows the decisions about it, the plan, the runs that applied it, any verification after apply, and its blast radius. It matches `rocky audit --for <subject>`.
+Enter a subject to trace its chain of custody. A subject is a model, a run id, a plan id, or another id the ledger records, such as `freeze:global`. It shows the decisions about it, the plan, the runs that applied it, any verification after apply, and its blast radius. It matches `rocky audit --for <subject>`.
 
 ![The Custody tab for the model revenue_daily: ten policy decisions, the latest plan, two apply runs, no verification row, and a blast radius of zero downstream models](/ui-governor-custody.png)
 
@@ -103,7 +103,7 @@ The products tab shows each [data product](/reference/commands/products/): its f
 
 The page reads. It does not write.
 
-- **It cannot start a run.** The UI token must be read-only. A read-only token gets `403 forbidden_read_only_token` on `POST /api/v1/jobs/run` and every other token-checked write. The one route that ignores the token is the webhook route, which checks its own HMAC signature. The page does not hold that secret. To submit jobs over HTTP, run a second `rocky serve` without `--ui`, or use the CLI.
+- **It cannot start a run.** The UI token must be read-only. A read-only token gets `403 forbidden_read_only_token` on `POST /api/v1/jobs/run` and every other token-checked write. The one write route that ignores the token is the webhook route, which checks its own HMAC signature. The page does not hold that secret. To submit jobs over HTTP, run a second `rocky serve` without `--ui`, or use the CLI.
 - **It cannot approve a plan.** Review shows the command. You run it in a terminal.
 - **It cannot change policy.** The Governor screens report decisions. The rules live in the `[policy]` block of `rocky.toml`, and `rocky policy freeze` and `rocky policy unfreeze` are the CLI's only policy writes.
 

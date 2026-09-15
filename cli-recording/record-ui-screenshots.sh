@@ -55,10 +55,14 @@ cp -R "$POCS/04-governance/11-agent-policy/models" "$SCRATCH/review/"
   rocky --output json run >/dev/null
   printf 'SELECT 1 AS id\n' > models/dim_customer.sql   # the agent drops `email`
   rocky --output json plan --principal agent --base HEAD --model dim_customer > plan.json
-  plan="$(jq -r '.plan_id' plan.json)"
+  plan="$(jq -er '.plan_id' plan.json)"
   # The apply is refused on purpose: that refusal is what queues the plan.
-  if ROCKY_PRINCIPAL=agent rocky apply "$plan" > apply.txt 2>&1; then
-    echo "FAIL: the agent's apply was not sent to review" >&2
+  # A non-zero exit that names human review is the policy refusal; any other
+  # outcome (success, or a failure for another reason) is not.
+  status=0
+  ROCKY_PRINCIPAL=agent rocky apply "$plan" > apply.txt 2>&1 || status=$?
+  if [ "$status" -eq 0 ] || ! grep -q "policy requires human review" apply.txt; then
+    echo "FAIL: the agent's apply was not sent to review (exit $status); see $SCRATCH/review/apply.txt" >&2
     exit 1
   fi
 )
@@ -111,7 +115,7 @@ leak_check() { # <port> <route>...
       sleep 0.5
     done
     [ -n "$body" ] || { echo "FAIL: GET /api/v1/$route on :$port did not answer 200" >&2; exit 1; }
-    if printf '%s' "$body" | grep -q -e "$HOME" -e "/Users/" -e "/home/" -e "$REPO"; then
+    if printf '%s' "$body" | grep -qF -e "$HOME" -e "/Users/" -e "/home/" -e "$REPO"; then
       echo "FAIL: /api/v1/$route on :$port carries a local path or home directory" >&2
       exit 1
     fi
