@@ -166,16 +166,29 @@ jobs:
         # The total is NOT comparable to the 2026-08-17 tarpaulin baseline
         # (run 32012139494): the denominator changes when dead code is no
         # longer linked in. Read the first green run as the new baseline.
+        #
+        # `--failure-mode all` (#1952). The workspace's tests include a
+        # SIGKILL drill (`product::commit`: the child half re-executes this
+        # instrumented test binary and is killed mid-protocol). A child
+        # killed that way never finishes writing its profile, so every run
+        # leaves one or two `.profraw` files with a corrupt header, and
+        # `llvm-profdata merge` defaults to failing when ANY input is
+        # invalid. That is what kept this job red on every run since the
+        # llvm-cov migration while every test passed. `all` fails only when
+        # no profile at all can be merged; a killed child carries no coverage
+        # data in either mode. The same flag goes on `report` below, which
+        # merges the raw profiles again.
         run: |
           mkdir -p coverage
           cargo llvm-cov --workspace --cobertura \
+            --failure-mode all \
             --output-path coverage/cobertura.xml
       - name: Coverage summary
         # The cobertura file goes to an artifact nobody opens unless they
         # are already looking. Print the number too, so the run itself says
         # what it measured. `report` re-renders the profile data the step
         # above already produced — it does not re-run the tests.
-        run: cargo llvm-cov report --summary-only
+        run: cargo llvm-cov report --summary-only --failure-mode all
       - name: Machine state after coverage
         # `always()` so a failing coverage step still reports. Note the
         # limit: when the disk fills hard enough the runner AGENT dies, and
