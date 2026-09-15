@@ -10,7 +10,7 @@
  *
  * Every non-2xx `/api/v1` response carries this envelope: the HTTP status line carries the error *class* (`400`/`401`/`404`/`409`/`500`/`503`) and the body carries a stable machine token plus a human message and an optional actionable hint. Embedders switch on [`code`](Self::code) and surface [`message`](Self::message) / [`remediation_hint`](Self::remediation_hint) to operators.
  *
- * Stable codes emitted today: `engine_not_ready` (no compile available yet), `engine_busy` (state locked by a running job — retryable), `model_not_found`, `job_not_found`, `mutation_in_progress` (a `run`/`apply` job already holds the mutation permit — carries [`running_job_id`](Self::running_job_id)), `bad_request`, `unauthorized`, `internal_error`.
+ * Stable codes emitted today: `engine_not_ready` (no compile available yet), `engine_busy` (state locked by a running job — retryable), `state_needs_migration` (`409`: the state store lacks tables this server reads and a read never creates them; one read-write command — a `rocky run` — migrates it; not retryable), `model_not_found`, `job_not_found`, `mutation_in_progress` (a `run`/`apply` job already holds the mutation permit — carries [`running_job_id`](Self::running_job_id)), `bad_request`, `unauthorized`, `internal_error`.
  */
 export interface ErrorEnvelope {
   /**

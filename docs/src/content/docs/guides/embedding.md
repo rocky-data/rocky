@@ -175,6 +175,8 @@ So if agent-scoped `[policy]` rules gate `run` and `apply` in your setup, set `R
 
 **Reads queue, one at a time.** Every state-backed read (`/runs`, `/schedule`, `/audit`, `/brief`, `/products`, `/review/queue`, and the rest) opens the state store for the request, and the store's file lock allows one open at a time. The server queues its own reads on one permit, so two clients refreshing together wait for each other instead of racing for the lock. Routes served from the compile result (`/models`, `/dag/layers`, `/dag`) never take the queue. The queue sets the ceiling of one process.
 
+**A store a read cannot serve.** A read never writes to the state store, and never creates a table in it. A store written by a Rocky older than schema v22 lacks tables this server reads, so every state-backed read answers `409 state_needs_migration`, naming the missing tables and the stamp on disk, until one read-write command — a `rocky run` — migrates it. It is not the retryable `503`: retrying never migrates a store. Tell an operator. A project that has never run is not this case: its store is created empty on first read and answers "nothing yet".
+
 ### What one process carries
 
 Measured with `scripts/serve-ceiling.py` on 2026-09-05, against the playground project, on an Apple M3 Pro: a staircase of concurrent clients, each looping over the reads the browser UI makes, 20 seconds per step.
