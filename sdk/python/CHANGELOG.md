@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`MIN_ROCKY_VERSION` is `1.35.0`, up from `1.34.0`.** The floor is shared with `dagster-rocky`, whose plan/apply path needs a `plan_id` from `rocky plan` for every project shape, and a replication-only project first got a content-addressed `plan_id` in engine 1.35.0. Against a 1.34.x binary the old floor passed the version check and the run then failed with "rocky plan did not emit a plan_id", with a hint naming the version already installed. A 1.34.x binary is now refused by `RockyVersionError` before any command runs. (#1984)
+
 ## [0.15.0] — 2026-09-12
 
 Pairs with engine 1.74.0.

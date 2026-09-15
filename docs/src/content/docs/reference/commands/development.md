@@ -23,6 +23,53 @@ rocky playground [path]
 |----------|------|---------|-------------|
 | `path` | `string` | `rocky-playground` | Directory name for the playground project. |
 
+### Ask the server what it is doing
+
+`GET /api/v1/settings` reports the posture of the running server. Read it when you want to check what a server is actually enforcing, rather than what its start command looked like.
+
+```bash
+curl -H "Authorization: Bearer $ROCKY_SERVE_TOKEN" \
+  http://127.0.0.1:8080/api/v1/settings
+```
+
+It reports the bind host, the CORS allowlist, the `Host` values the UI guard accepts, whether the scheduler and the UI are on, the token's scope, and the state backend.
+
+No secret is in the response. The token appears as its name and scope. The webhook secret appears only as whether it can sign a webhook:
+
+```text
+  webhook_secret       what it means
+  ------------------   --------------------------------------------------
+  present              webhook requests must carry a signature
+  absent               loopback accepts UNSIGNED; non-loopback answers 404
+  set_but_unusable     blank or not valid UTF-8 -- --scheduler will REFUSE
+                       to start
+```
+
+That field is reported even when the scheduler is off. It tells you what will happen when you turn the scheduler on, which is the point.
+
+Two fields have a different freshness from the rest. `state_backend` and `concurrency_control` come from `rocky.toml`, and are read once on the **first request to this route**, then fixed for the life of the process. They are not read at startup on purpose. On a plain `rocky serve`, nothing on the path to binding the listener reads a file, and reading `rocky.toml` eagerly would put one there — letting a `rocky.toml` on a stalled mount stop the server binding at all. (`--scheduler` without an explicit `--poll-interval` already reads the config before binding; that is unchanged.)
+
+That read runs one at a time under a 5 second deadline, so a stuck file cannot starve the server either:
+
+```text
+  503 engine_busy               another settings read is in flight -- retry
+  504 settings_config_timeout   the read blew its deadline; usually a file
+                                that will not return, so retrying will not help
+```
+
+Every other field on the route is unaffected by either.
+
+So a config edited after that first request is not reflected here, while the scheduler — which re-reads the file every tick — acts on the new one. They are `null` when there was no readable config, and `config_status` says which:
+
+```text
+  loaded       read and parsed
+  absent       no rocky.toml -- an ordinary fact, not a failure
+  unreadable   present but would not parse; the scheduler will skip every
+               tick until it does
+```
+
+`allowed_hosts` and `allowed_origins` both report what is **enforced**, not what was typed. `--allowed-host` only becomes a guard under `--ui`, so that list is empty without one. `--allowed-origin` values that are not valid header values are dropped when the CORS layer is built, and an origin that could not be installed grants nothing, so they are absent here too.
+
 ### Flags
 
 | Flag | Type | Default | Description |
