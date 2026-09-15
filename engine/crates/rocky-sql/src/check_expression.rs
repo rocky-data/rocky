@@ -308,10 +308,19 @@ impl ExpressionUse {
     /// of a sentence.
     ///
     /// The advice beside a refusal has to describe the field being
-    /// validated. One validator serves three fields, so the noun comes from
-    /// the mode rather than from a sentence written for `[checks.assertions]`
+    /// validated. One validator serves every user expression Rocky splices
+    /// into generated SQL — assertion expressions and filters, quarantine
+    /// predicates and filters, the two key expressions, metadata column
+    /// values and the MCP `draft_check` tool — so the noun comes from the
+    /// mode rather than from a sentence written for `[checks.assertions]`
     /// (#1959). `context` still names the exact field; this names its kind.
-    pub fn noun(self) -> &'static str {
+    ///
+    /// The mode is an evaluation position, not a field kind, so it cannot
+    /// tell an assertion's `filter` from its `expression`: both are a
+    /// boolean over the row and share a predicate mode. A refused `filter`
+    /// is therefore still called an expression check. The shape advice is
+    /// right for it; only the noun is off. Tracked separately (#1971).
+    pub(crate) fn noun(self) -> &'static str {
         match self {
             ExpressionUse::SinglePredicate | ExpressionUse::ReevaluatedPredicate => {
                 "An expression check"
@@ -322,7 +331,7 @@ impl ExpressionUse {
     }
 
     /// [`Self::noun`], mid-sentence.
-    pub fn noun_lowercase(self) -> &'static str {
+    pub(crate) fn noun_lowercase(self) -> &'static str {
         match self {
             ExpressionUse::SinglePredicate | ExpressionUse::ReevaluatedPredicate => {
                 "an expression check"
@@ -339,7 +348,7 @@ impl ExpressionUse {
     /// `1` and `'rocky'` are all accepted there, so the boolean advice would
     /// send its author looking for a rule the validator never applies. A key
     /// is any expression over the row that rows can be grouped by.
-    pub fn accepted_shape(self) -> &'static str {
+    pub(crate) fn accepted_shape(self) -> &'static str {
         match self {
             ExpressionUse::SinglePredicate | ExpressionUse::ReevaluatedPredicate => {
                 "one boolean expression over the model's columns, e.g. `amount >= 0`"
@@ -350,6 +359,19 @@ impl ExpressionUse {
             ExpressionUse::GroupingKey => {
                 "one expression over the row's own columns, e.g. `lower(email)`"
             }
+        }
+    }
+
+    /// [`Self::accepted_shape`] reduced to its kind, for the trailing-text
+    /// refusal ("Only a single … is accepted"). Kept separate so the
+    /// predicate wording of that refusal stays exactly what it was.
+    pub(crate) fn single_kind(self) -> &'static str {
+        match self {
+            ExpressionUse::SinglePredicate | ExpressionUse::ReevaluatedPredicate => {
+                "boolean expression"
+            }
+            ExpressionUse::ScalarProjection => "scalar expression",
+            ExpressionUse::GroupingKey => "key expression",
         }
     }
 }
@@ -596,8 +618,9 @@ mod tests {
     /// "one boolean expression over the model's columns", a rule the
     /// projection mode never applies: `NULL`, `1` and `'rocky'` are all
     /// accepted there. Every one of the five refusals carries the noun, so
-    /// each is checked, and the predicate wording is pinned unchanged so this
-    /// cannot pass by rewording the check advice instead.
+    /// each is checked against a substring only that variant emits, and the
+    /// predicate wording of all five is pinned to what it was before #1959,
+    /// so this cannot pass by rewording the check advice instead.
     #[test]
     fn a_refusal_describes_the_position_it_was_validated_for() {
         let refuse = |e: &str, use_: ExpressionUse| {
@@ -616,9 +639,13 @@ mod tests {
                 && !projected.contains("boolean"),
             "{projected}"
         );
+        // `1, 2` parses `1` and stops at the comma, so this is the
+        // trailing-text refusal and not a parse failure; the first
+        // substring is what tells the two apart.
         let trailing = refuse("1, 2", ExpressionUse::ScalarProjection);
         assert!(
-            trailing.contains("A metadata column value is one scalar expression")
+            trailing.contains("continues past the end of one expression")
+                && trailing.contains("Only a single scalar expression is accepted")
                 && !trailing.contains("boolean"),
             "{trailing}"
         );
@@ -638,7 +665,8 @@ mod tests {
             "{qualified}"
         );
 
-        // The check wording is unchanged for the field it was written for.
+        // The check wording is unchanged for the field it was written for:
+        // all five refusals, byte for byte where the sentence is quoted.
         let predicate = refuse("1 +", ExpressionUse::SinglePredicate);
         assert!(
             predicate.contains(
@@ -651,6 +679,32 @@ mod tests {
         assert!(
             split.contains("An expression check is one boolean"),
             "{split}"
+        );
+        let trailing_check = refuse("1, 2", ExpressionUse::SinglePredicate);
+        assert!(
+            trailing_check.contains(
+                "Only a single boolean expression is accepted — no trailing clauses, commas \
+                 or operators"
+            ),
+            "{trailing_check}"
+        );
+        let subquery_check = refuse("(SELECT 1)", ExpressionUse::SinglePredicate);
+        assert!(
+            subquery_check.contains(
+                "An expression check may only read the row's own columns; it cannot read \
+                 other tables"
+            ),
+            "{subquery_check}"
+        );
+        let off_list_check = refuse("my_udf(1)", ExpressionUse::SinglePredicate);
+        assert!(
+            off_list_check.contains("pure scalar functions an expression check may use"),
+            "{off_list_check}"
+        );
+        let qualified_check = refuse("s.f(1)", ExpressionUse::SinglePredicate);
+        assert!(
+            qualified_check.contains("which are never allowed in an expression check"),
+            "{qualified_check}"
         );
 
         // A key is grouped by, so it is neither a boolean nor a column value.

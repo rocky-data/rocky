@@ -99,10 +99,9 @@ pub enum ValidationError {
     },
 
     #[error(
-        "{context}: expression continues past the end of one expression. {} is {} — no \
-         trailing clauses, commas or operators",
-        .use_.noun(),
-        .use_.accepted_shape()
+        "{context}: expression continues past the end of one expression. Only a single {} \
+         is accepted — no trailing clauses, commas or operators",
+        .use_.single_kind()
     )]
     ExpressionTrailingTokens {
         context: String,
