@@ -114,14 +114,39 @@ impl UiConfig {
 /// non-loopback IPv6 bind an address the same server then refused with 421
 /// (#1993). `[::1]` escaped that only because it was special-cased by name.
 ///
-/// A malformed authority keeps its brackets and so still fails to match: the
-/// suffix is only stripped when the prefix was there to strip.
+/// A bracketed authority is parsed STRICTLY, and this is the part that has to
+/// stay strict. The brackets are removed only when what is inside them is a
+/// real IPv6 literal AND what follows the `]` is nothing or a `:port`. Any
+/// other bracketed text keys to itself, so it matches only an identical
+/// configured value and can never reduce to a trusted host.
+///
+/// Reviewing the first version of this function found why that matters.
+/// [`host_without_port`] returns `&authority[..end + 2]`, which DISCARDS
+/// whatever follows the first `]`. Stripping a matched pair after that meant
+/// `[rocky.internal]evil` arrived as `[rocky.internal]` and keyed to
+/// `rocky.internal` — the bind host. `[localhost]x` and `[127.0.0.1]x` reached
+/// the loopback arm the same way, and `origin_allowed` inherited all of it.
+/// Every one of those was refused before #1993, so the normalisation, not the
+/// deleted `"[::1]"` match arm, was the widening. Parsing here instead of
+/// reusing the truncating helper is what closes it.
+///
+/// A zone id (`[fe80::1%25eth0]`) does not parse as an IPv6 literal and so is
+/// refused rather than trusted. That matches the behaviour before #1993.
 fn host_key(authority: &str) -> String {
-    let host = host_without_port(authority.trim());
-    host.strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .unwrap_or(host)
-        .to_ascii_lowercase()
+    let authority = authority.trim();
+    let Some(rest) = authority.strip_prefix('[') else {
+        return host_without_port(authority).to_ascii_lowercase();
+    };
+    let Some(end) = rest.find(']') else {
+        return authority.to_ascii_lowercase();
+    };
+    let (inside, after) = (&rest[..end], &rest[end + 1..]);
+    let port_ok = after.is_empty()
+        || matches!(after.strip_prefix(':'), Some(p) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    if port_ok && inside.parse::<std::net::Ipv6Addr>().is_ok() {
+        return inside.to_ascii_lowercase();
+    }
+    authority.to_ascii_lowercase()
 }
 
 /// Strip an optional `:port` from a host or authority, keeping IPv6
@@ -259,29 +284,81 @@ mod tests {
     /// is refused in every spelling, and a bracketed name matches only the
     /// same name. Written because a guard that gets more permissive needs its
     /// new permissiveness bounded, not just its new acceptance demonstrated.
+    /// Brackets are removed only around a real IPv6 literal, so a bracketed
+    /// authority can never reduce to a trusted name.
+    ///
+    /// The first version of this fix failed exactly here, and the cases below
+    /// are the ones that caught it. `host_without_port` truncates at the first
+    /// `]`, so `[rocky.internal]evil` became `[rocky.internal]`, then
+    /// `rocky.internal`, and matched the bind host. Every input in this test
+    /// was refused before #1993 and must stay refused.
     #[test]
-    fn stripping_brackets_never_makes_one_host_match_a_different_one() {
+    fn a_bracketed_authority_never_reduces_to_a_trusted_host() {
         let ui = config("rocky.internal", &["ui.internal"]);
         for bad in [
             "evil.example",
             "[evil.example]",
             "[evil.example]:8080",
             "[rocky.internal.evil.example]",
+            // Bracketing a name is not a spelling of that name.
+            "[rocky.internal]",
+            "[ui.internal]:8443",
+            // Text after the closing bracket: the class the truncating helper hid.
+            "[rocky.internal]evil",
+            "[ui.internal]evil",
+            "[rocky.internal]:notaport",
+            "[rocky.internal]:",
             "[]",
             "[",
             "]",
             "[]:8080",
+            "[[rocky.internal]]",
         ] {
             assert!(!ui.host_allowed(bad), "{bad}");
         }
-        // A bracketed spelling matches only its own host — the intended widening.
-        assert!(ui.host_allowed("[rocky.internal]"));
-        assert!(ui.host_allowed("[ui.internal]:8443"));
 
-        // An empty authority is refused whether or not brackets produced it,
-        // so bracket-stripping cannot manufacture the empty match.
+        // Loopback is reached only through a well-formed bracketed literal.
+        let lo = config("127.0.0.1", &[]);
+        assert!(lo.host_allowed("[::1]:8080"));
+        assert!(lo.host_allowed("::1"));
+        for bad in [
+            "[localhost]x",
+            "[127.0.0.1]x",
+            "[127.0.0.1]",
+            "[localhost]",
+            // Accepted before this fix by the old `"[::1]"` arm, and still
+            // wrong: everything after the bracket was being discarded.
+            "[::1]extra",
+            "[::1]:80x",
+        ] {
+            assert!(!lo.host_allowed(bad), "{bad}");
+        }
+
+        // A zone id is not a bare IPv6 literal, so it is refused rather than
+        // trusted — the behaviour before #1993.
+        assert!(!config("fe80::1", &[]).host_allowed("[fe80::1%25eth0]"));
+
+        // An empty authority is refused whether or not brackets produced it.
         assert!(!config("", &[]).host_allowed("[]"));
         assert!(!config("", &[]).host_allowed(""));
+    }
+
+    /// The Origin gate runs through `host_allowed`, so it inherits whatever
+    /// that accepts. The widening reached `origin_allowed` too, and a fix
+    /// proved only at the Host sink would leave this one open.
+    #[test]
+    fn a_malformed_bracketed_origin_is_refused() {
+        let ui = config("fd00::1", &[]);
+        assert!(ui.origin_allowed("http://[fd00::1]:8080", &[]));
+        for bad in [
+            "http://[fd00::1]evil",
+            "https://[fd00::1]evil",
+            "http://[rocky.internal]evil",
+            "http://[localhost]x",
+            "http://[::1]extra",
+        ] {
+            assert!(!ui.origin_allowed(bad, &[]), "{bad}");
+        }
     }
 
     #[test]
