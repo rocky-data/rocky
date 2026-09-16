@@ -204,6 +204,8 @@ Neither CI (`engine-release.yml`) nor `scripts/release.sh` bump versions for you
 - **Forgetting the namespace**: `v0.2.0` instead of `engine-v0.2.0`. The install scripts filter by prefix; a bare tag is invisible to them.
 - **Wrong commit tagged**: verify `git log -1` before tagging — the tag captures HEAD, not main.
 - **Missing Cargo.toml bumps**: every crate in `engine/crates/*` must bump. Grep for the old version before pushing the release PR: `grep -rn '^version = "1.2.0"$' engine --include="Cargo.toml"` should return zero after the bump.
+- **Missing the `rocky-mcp` bump specifically**: `rocky mcp` announces its own crate version to every MCP client as `serverInfo.version`, so a missed bump makes the server claim an older Rocky than `rocky --version` prints. `engine/rocky/tests/mcp_server_identity.rs` fails the build when the two disagree, which the grep above cannot do (it looks for the OLD version, so a crate that already fell behind is invisible to it).
+- **The MCP served-text golden moves on every release**: `rocky-mcp`'s `served_text.golden` pins the `initialize` payload, which carries the version. Expect exactly two rows to change, `default/initialize` and `worker/initialize`, and re-bless with `ROCKY_BLESS_MCP_SERVED_TEXT=1 cargo test -p rocky-mcp --test roundtrip`. Any OTHER row moving in the same diff is a real change to the served text: read it before blessing.
 - **Dirty codegen**: `just codegen` produced a diff that wasn't committed — `codegen-drift.yml` CI retroactively fails.
 - **Docker not running (fallback only)**: `scripts/build_rocky_linux.sh` silently falls back to zigbuild which has its own issues with `ring` on newer Rust. The `--docker` flag forces the Docker path.
 
