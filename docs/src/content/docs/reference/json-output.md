@@ -26,9 +26,12 @@ Read the [exit code](/reference/glossary/#exit-code) alongside the JSON, because
 |---|---|
 | `0` | Success. |
 | `1` | Hard failure — bad config, unreachable warehouse. |
-| `2` | Partial success. The run finished; some models failed. |
-| `3` | `rocky doctor` only: at least one health check is critical. |
+| `2` | `rocky run`: the run finished and something in it failed. Either some models failed, or an error-severity check failed on a run that had already copied data. `rocky fulfill`: the loop is blocked and needs a human. `rocky product verify`: the product failed verification. |
+| `3` | `rocky doctor`: at least one health check is critical. `rocky fulfill`: the loop is parked at `applying_unknown`. |
+| `4` | `rocky ci`: compile and tests passed with advisory warnings. `rocky fulfill`: the plan applied and its output is failing a check the product declared. |
 | `130` | `rocky run` only: you interrupted the run with Ctrl-C. |
+
+A quality pipeline moves no data, so a failed check gate there exits `1`, not `2`.
 
 Exit `2` still writes valid JSON to stdout, so parse the payload rather than treating a non-zero code as no output.
 
@@ -290,14 +293,32 @@ The number returned by `bq show -j` is the same value the BigQuery console displ
 | Field | Type | Description |
 |-------|------|-------------|
 | `asset_key` | array of strings | The table this check applies to. |
-| `checks[].name` | string | Check name: `"row_count"`, `"column_match"`, or `"freshness"`. |
+| `checks[].name` | string | Check name. See the list below. |
 | `checks[].passed` | boolean | Whether the check passed. |
+| `checks[].severity` | string | `"error"` or `"warning"`. An error-severity failure fails the run when the pipeline's `fail_on_error` is on. |
+| `checks[].not_evaluated` | string | Present only when Rocky could not run the check, carrying the reason. Such a result always has `passed: false` and `severity: "error"`, whatever the config asked for. The one exception passes: a cross-source group whose siblings do not all carry the key column. |
+
+A check name is one of:
+
+- `row_count`, `column_match`, `freshness` — the per-table aggregate checks.
+- `null_rate:<column>` — one per configured column.
+- `cross_source_overlap:<source_type>.<table>` — one per sibling group.
+- `quarantine:compile` — a quarantine plan Rocky refused to compile.
+- `schema_expansion` — a `[[tables]]` entry naming a whole schema that could not be listed.
+- the `name` you gave a `[[checks.custom]]` block.
+- an assertion's `name`, or `{kind}:{column}` when you did not set one (`{kind}:-` when the kind has no column).
 
 Additional fields vary by check type:
 
 - **row_count**: `source_count` (integer), `target_count` (integer)
 - **column_match**: `missing` (list of column names missing from target), `extra` (list of unexpected columns in target)
 - **freshness**: `lag_seconds` (integer), `threshold_seconds` (integer)
+- **null_rate**: `column` (string), `null_rate` (float), `threshold` (float)
+- **assertion**: `kind` (string, e.g. `"not_null"`), `column` (string, when the kind has one), `failing_rows` (integer)
+- **custom**: `query` (string), `result_value` (integer), `threshold` (integer)
+- **cross_source_overlap**: `overlap_count` (integer), `contributing_tables` (list of table names), `sample` (list of overlapping keys)
+
+When `not_evaluated` is set, these numbers are placeholders, not measurements.
 
 **`permissions`:**
 

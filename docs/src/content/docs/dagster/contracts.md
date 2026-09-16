@@ -64,7 +64,7 @@ kinds the contract declares:
 
 - `contract_required_columns`: passes when there are no E010 diagnostics
 - `contract_protected_columns`: passes when there are no E013 diagnostics
-- `contract_column_constraints`: passes when there are no E011/E012/W010 diagnostics
+- `contract_column_constraints`: passes when there are no E011/E012/E014/W010 diagnostics
 
 ## Diagnostic code mapping
 
@@ -77,6 +77,7 @@ Rocky's compiler emits a stable code for each kind of contract violation.
 | E011 | ERROR | Column type mismatch | `contract_column_constraints` |
 | E012 | ERROR | Column nullability violated | `contract_column_constraints` |
 | E013 | ERROR | Protected column removed | `contract_protected_columns` |
+| E014 | ERROR | Nullable column the contract does not declare, under `[rules] no_new_nullable` | `contract_column_constraints` |
 | W010 | WARN | Contract column not in model output | `contract_column_constraints` |
 
 When a check fails, the `AssetCheckResult` includes:
@@ -85,6 +86,19 @@ When a check fails, the `AssetCheckResult` includes:
 - `severity=ERROR` (or `WARN` if every failing diagnostic is W010)
 - `rocky/violation_count`: number of contract violations for this check
 - `rocky/violation_<i>`: text of each violation in the form `[<code>] <message>`
+
+## Checks that report "not verified"
+
+A check can also fail because nothing was checked. Both cases fail at `WARN`, because the contract may be violated and nobody looked. Each carries a metadata key that tells it apart from a real violation:
+
+| Case | Metadata key | What happened |
+|---|---|---|
+| No compile output to read | `rocky/compile_missing` | `rocky compile` failed, or had not run, when the cached state was written. Refresh the state after a successful compile. |
+| The compiler did not find the model (`W011`) | `rocky/contract_model_not_found` | The contract names a model the project does not contain, so Rocky never validated it. The contract file may name a model that was renamed or removed. |
+
+Both cases report **every** check the contract declares, in the same order as an evaluated contract, so a declared check never vanishes.
+
+A passing check can also carry `rocky/unverified_<i>` entries, with `rocky/unverified_count`. Those come from `I003`, where the column's inferred type is `Unknown` and the declared type was compared against nothing. They never fail the check; they stop a pass from claiming a constraint was tested when it was not.
 
 ## Standalone helpers
 
