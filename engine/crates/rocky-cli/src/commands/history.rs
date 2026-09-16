@@ -376,10 +376,10 @@ pub fn run_history(
             let short = prefix_on_char_boundary(recipe_hash, 16);
             println!("Executions of recipe {short}…:");
             println!(
-                "{:<14} {:<24} {:<24} {:<10} {:<12} {:<10}",
+                "{:<24} {:<24} {:<24} {:<10} {:<12} {:<10}",
                 "RUN ID", "MODEL", "STARTED", "DURATION", "STATUS", "INPUT"
             );
-            println!("{}", "-".repeat(96));
+            println!("{}", "-".repeat(106));
             for exec in &output.executions {
                 let input_class = exec
                     .recipe_identity
@@ -387,8 +387,8 @@ pub fn run_history(
                     .and_then(|r| r.input_proof_class.as_deref())
                     .unwrap_or("-");
                 println!(
-                    "{:<14} {:<24} {:<24} {:<10} {:<12} {:<10}",
-                    &exec.run_id[..exec.run_id.len().min(13)],
+                    "{:<24} {:<24} {:<24} {:<10} {:<12} {:<10}",
+                    exec.run_id,
                     truncate_cell(&exec.model_name, 23),
                     exec.started_at.format("%Y-%m-%d %H:%M:%S"),
                     format!("{}ms", exec.duration_ms),
@@ -463,15 +463,15 @@ pub fn run_history(
 /// The run summary table `rocky history` prints, one row per run.
 fn print_runs_table(output: &HistoryOutput) {
     println!(
-        "{:<12} {:<24} {:<10} {:<8} {:<10}",
+        "{:<24} {:<24} {:<10} {:<8} {:<10}",
         "RUN ID", "STARTED", "STATUS", "MODELS", "TRIGGER"
     );
-    println!("{}", "-".repeat(66));
+    println!("{}", "-".repeat(78));
 
     for run in &output.runs {
         println!(
-            "{:<12} {:<24} {:<10} {:<8} {:<10}",
-            &run.run_id[..run.run_id.len().min(11)],
+            "{:<24} {:<24} {:<10} {:<8} {:<10}",
+            run.run_id,
             run.started_at.format("%Y-%m-%d %H:%M:%S"),
             run.status,
             run.models_executed,
@@ -488,12 +488,12 @@ fn print_audit_table(runs: &[RunRecord]) {
     println!();
     println!("Governance audit trail (--audit):");
     println!(
-        "{:<12} {:<18} {:<8} {:<10} {:<16} {:<20} {:<12}",
+        "{:<24} {:<18} {:<8} {:<10} {:<16} {:<20} {:<12}",
         "RUN ID", "IDENTITY", "SOURCE", "COMMIT", "BRANCH", "CATALOG", "HOST"
     );
-    println!("{}", "-".repeat(100));
+    println!("{}", "-".repeat(112));
     for run in runs {
-        let run_id = &run.run_id[..run.run_id.len().min(11)];
+        let run_id = &run.run_id;
         let identity = run.triggering_identity.as_deref().unwrap_or("-");
         let identity = if identity.len() > 17 {
             &identity[..17]
@@ -533,7 +533,7 @@ fn print_audit_table(runs: &[RunRecord]) {
     // Emit version + idempotency key as an extra per-run detail line
     // because they don't fit a fixed-column layout cleanly.
     for run in runs {
-        let run_id = &run.run_id[..run.run_id.len().min(11)];
+        let run_id = &run.run_id;
         let key = run.idempotency_key.as_deref().unwrap_or("-");
         println!(
             "  {}  version={}  idempotency_key={}",
