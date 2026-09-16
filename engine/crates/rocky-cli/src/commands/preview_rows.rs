@@ -513,6 +513,11 @@ struct MaskResolution {
 ///
 /// ```text
 ///   [mask] pii = "hash"        → masked      the tag has a workspace default
+///   [mask] internal = "none"   → neither     raw ON PURPOSE: `none` is
+///                                            "explicit identity (not a gap; a
+///                                            policy decision)" in the config's
+///                                            own words, and `inline_mask_expr`
+///                                            returns no expression for it
 ///   [mask.prod] pii = "hash"   → UNRESOLVED  env overrides do not apply here,
 ///                                            and W004 stays silent about it
 ///   no [mask] entry            → UNRESOLVED  W004 warns, but warnings do not gate
@@ -520,8 +525,11 @@ struct MaskResolution {
 ///                                            suppresses W004
 /// ```
 ///
-/// A strategy of [`MaskStrategy::None`] counts as unresolved: it masks
-/// nothing, so treating it as "handled" would return the raw value.
+/// The distinction the refusal draws is **written down or not**, never
+/// "masked or not": a tag an operator answered — with a strategy, with `none`,
+/// or by listing it under `allow_unmasked` — is their decision to make. Only a
+/// tag that resolves to *nothing here* is refused, because that is the case
+/// where no one has said anything and the value would leave anyway.
 fn resolve_classified_columns(
     classification: &BTreeMap<String, String>,
     masks: &BTreeMap<String, MaskStrategy>,
@@ -533,7 +541,11 @@ fn resolve_classified_columns(
     let mut unresolved = Vec::new();
     for (col, tag) in classification {
         match masks.get(tag) {
-            Some(&strat) if strat != MaskStrategy::None => {
+            // An explicit `none` is a policy decision, not a gap: the operator
+            // wrote the entry and chose identity. Refusing it would break a
+            // configuration the config reference documents.
+            Some(MaskStrategy::None) => {}
+            Some(&strat) => {
                 masked.insert(col.clone(), strat);
             }
             _ if allowed.contains(tag.as_str()) => {}
@@ -978,16 +990,21 @@ mod tests {
         assert!(r.masked.is_empty());
         assert_eq!(r.unresolved, vec![("email".to_string(), "pii".to_string())]);
 
-        // 3. A strategy that masks nothing is NOT "handled".
+        // 3. An explicit `none` is a POLICY DECISION, not a gap — the config
+        //    reference says so in those words — so the rows come back, and the
+        //    column is neither masked nor refused. THIS is the row that bounds
+        //    the guard from above: every other assertion here is "is refused",
+        //    and a guard that refuses more satisfies all of them.
+        //    `04-governance/05-classification-masking-compliance` ships exactly
+        //    this shape (`internal = "none"` with `region = "internal"`), so
+        //    refusing it would break a documented example.
         let none: BTreeMap<String, MaskStrategy> = [("pii".to_string(), MaskStrategy::None)]
             .into_iter()
             .collect();
         let r = resolve_classified_columns(&classification, &none, &[]);
-        assert!(r.masked.is_empty());
-        assert_eq!(
-            r.unresolved.len(),
-            1,
-            "MaskStrategy::None must not pass as masked"
+        assert!(
+            r.masked.is_empty() && r.unresolved.is_empty(),
+            "an explicit `none` is the operator's decision; the preview must return the rows"
         );
 
         // 4. The operator's explicit opt-out: raw on purpose, no refusal.
