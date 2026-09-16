@@ -60,7 +60,9 @@ The plan screen shows:
 - **The spec it was planned against.** For a product plan only: whether the product spec changed after the plan was made.
 - **Sample rows.** Nothing is read until you ask. The button runs the model's query against the warehouse for up to 20 rows, and that query has a cost. The engine masks each classified column before the rows leave it, and refuses the whole sample rather than return a classified column it cannot mask. The refusal names every column and tag, and both ways out.
 
-  A tag is refused when nobody has answered it: no `[mask]` entry at all, or an entry only under `[mask.<env>]`, which this path does not read. Two answers are not refusals, because someone made the decision: a `[mask]` strategy masks the column, and `none` or `[classifications.allow_unmasked]` returns it raw on purpose.
+  The workspace `[mask]` block decides first. A strategy masks the column, and `none` returns it raw, which is an operator's decision rather than a gap. `[classifications.allow_unmasked]` is only the fallback for a tag that block does not answer: a tag with a strategy is masked even when the list names it.
+
+  What is left is refused: a tag with no `[mask]` entry that the list does not name, and a tag answered only under `[mask.<env>]`, which this path does not read.
 
   The button appears only when the plan names exactly one model to sample.
 - **How to approve.** The command to copy.
