@@ -58,8 +58,16 @@ pub fn run_ci(
         println!("  Exit code: {}", result.exit_code());
     }
 
-    if !result.passed() {
-        std::process::exit(result.exit_code());
+    // Exit with the code the result reports, not with a second opinion about
+    // it. This gate used to be `if !result.passed()`, and `passed()` is
+    // `compile_ok && tests_ok` — which a warnings-only run satisfies. So the
+    // JSON said `"exit_code": 4` while the process exited 0, and a CI step
+    // gating on `$?` disagreed with one gating on `jq .exit_code` about the
+    // same run (#2030). `exit_code()` is the single definition of the
+    // outcome; this is the only place that acts on it.
+    let code = result.exit_code();
+    if code != 0 {
+        std::process::exit(code);
     }
 
     Ok(())
