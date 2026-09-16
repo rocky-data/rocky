@@ -58,7 +58,7 @@ The plan screen shows:
 - **What it would break.** The breaking-change findings against `HEAD`, or why that check could not run.
 - **Why it needs a human.** The rule, the capability, the principal and the blast radius behind the `require_review` decision.
 - **The spec it was planned against.** For a product plan only: whether the product spec changed after the plan was made.
-- **Sample rows.** Nothing is read until you ask. The button runs the model's query against the warehouse for up to 20 rows, and that query has a cost. The engine masks classification-tagged columns before the rows leave it. If it cannot mask a column, it refuses the sample with `422` rather than return the column unmasked. The button appears only when the plan names exactly one model to sample.
+- **Sample rows.** Nothing is read until you ask. The button runs the model's query against the warehouse for up to 20 rows, and that query has a cost. Before the rows leave the engine, it masks each classified column that a workspace-default `[mask]` strategy covers, and refuses the sample with `422` when it cannot build that mask. A tag with no default `[mask]` strategy, or one set only for another environment, masks nothing: those columns come back raw. `rocky compile` reports the gap as `W004`, and it does not stop the sample. Check your `[mask]` block before you hand this page to someone who may not read a column's classification. The button appears only when the plan names exactly one model to sample.
 - **How to approve.** The command to copy.
 
 You approve in a terminal, not on the page. The approval marker records a git identity, and the page holds a read-only token:
@@ -113,7 +113,7 @@ With `--ui`, the server adds checks that a plain `rocky serve` does not run:
 
 - `--ui` refuses to start without a token, or with a token that is not read-only.
 - A request whose `Host` is not a loopback name, the bind host, or an `--allowed-host` entry gets `421 host_not_allowed`. This defends against DNS rebinding, where an attacker's domain is made to resolve to `127.0.0.1`. `GET /api/v1/health` skips this check, so a load balancer probe still works.
-- A request whose `Origin` is neither the server's own nor an `--allowed-origin` entry gets `403 origin_not_allowed`.
+- A request whose `Origin` is neither the server's own nor an `--allowed-origin` entry gets `403 origin_not_allowed`. The check reads the origin's host, not the whole origin, so an `http` or `https` origin on an allowed host passes whatever its port. On a loopback server that includes `http://localhost:5173`, a local dev server. `GET /api/v1/health` skips this check too.
 - Every UI file response carries a Content Security Policy. The page loads scripts and fonts from this server only, and styles from this server or inline. Nothing may frame it.
 - `--ui --scheduler` refuses to start without `ROCKY_WEBHOOK_SECRET`, because a browser can reach the webhook route.
 

@@ -74,7 +74,9 @@ cp -R "$POCS/03-ai/08-fulfillment-walking-skeleton" "$SCRATCH/governor"
   exit 1
 }
 
-TOKEN="screenshots-read-only"
+# A token per invocation: a server left behind by an interrupted run holds
+# the old one, so it cannot answer for this run's workspace.
+TOKEN="screenshots-$RANDOM$RANDOM$$"
 AUTH="Authorization: Bearer $TOKEN"
 PIDS=()
 cleanup() { for pid in ${PIDS[@]+"${PIDS[@]}"}; do kill "$pid" 2>/dev/null || true; done; }
@@ -82,10 +84,15 @@ trap cleanup EXIT
 
 serve() { # <dir> <port>
   (cd "$1" && exec rocky serve --ui --token "$TOKEN" --token-scope read-only --port "$2") >"$1/serve.log" 2>&1 &
-  PIDS+=("$!")
+  local child="$!"
+  PIDS+=("$child")
   # Probe an authenticated route: /health is token-exempt, so a stale server
   # left on the port by an earlier run would pass a health probe.
   for _ in $(seq 1 50); do
+    if ! kill -0 "$child" 2>/dev/null; then
+      echo "FAIL: rocky serve in $1 exited; see $1/serve.log" >&2
+      exit 1
+    fi
     curl -fsS -H "$AUTH" "http://127.0.0.1:$2/api/v1/meta" >/dev/null 2>&1 && return 0
     sleep 0.2
   done
@@ -103,7 +110,7 @@ PLAN="$(curl -fsS -H "$AUTH" http://127.0.0.1:18752/api/v1/review/queue | jq -r 
 # renders. The body is captured first, so a failed request fails the script
 # instead of reading as "no leak".
 leak_check() { # <port> <route>...
-  local port="$1" route body
+  local port="$1" route body grep_status
   shift
   for route in "$@"; do
     # A 503 (engine_not_ready while the startup compile runs, or engine_busy)
@@ -115,8 +122,17 @@ leak_check() { # <port> <route>...
       sleep 0.5
     done
     [ -n "$body" ] || { echo "FAIL: GET /api/v1/$route on :$port did not answer 200" >&2; exit 1; }
-    if printf '%s' "$body" | grep -qF -e "$HOME" -e "/Users/" -e "/home/" -e "$REPO"; then
+    # No pipeline: `grep -q` exits at the first match, and a pipe would
+    # then kill `printf` with SIGPIPE, which `pipefail` reads as a failed
+    # check — a leak that passes. A here-string has no writer to kill.
+    grep_status=0
+    grep -qF -e "$HOME" -e "/Users/" -e "/home/" -e "$REPO" <<< "$body" || grep_status=$?
+    if [ "$grep_status" -eq 0 ]; then
       echo "FAIL: /api/v1/$route on :$port carries a local path or home directory" >&2
+      exit 1
+    fi
+    if [ "$grep_status" -ne 1 ]; then
+      echo "FAIL: the leak check on /api/v1/$route errored (grep exit $grep_status)" >&2
       exit 1
     fi
   done
