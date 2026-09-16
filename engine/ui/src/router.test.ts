@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   auditPath,
   laneFromPath,
-  navigate,
+  navigateTo,
   pathForLane,
   segmentsFromPath,
   subpathFromPath,
@@ -54,8 +54,8 @@ describe("laneFromPath", () => {
   });
 });
 
-describe("navigate", () => {
-  it("pushes the lane's path and announces it without a reload", () => {
+describe("navigateTo", () => {
+  it("pushes the path and announces it without a reload", () => {
     const pushed: string[] = [];
     const events: string[] = [];
     const win = {
@@ -69,7 +69,7 @@ describe("navigate", () => {
         return true;
       },
     } as unknown as Window;
-    navigate("review", win);
+    navigateTo(pathForLane("review"), win);
     expect(pushed).toEqual(["/ui/review"]);
     expect(events).toEqual(["popstate"]);
   });

@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MetaOutput } from "@rocky-types/meta";
 import { ApiError } from "./api";
@@ -85,38 +85,119 @@ describe("EnginePanel", () => {
 });
 
 describe("App", () => {
-  it("renders the three lanes and the engine slot", () => {
-    render(<App token="t" engine={<span>engine slot</span>} estate={<span>estate slot</span>} />);
-    for (const lane of ["Estate", "Review", "Governor"]) {
-      expect(screen.getByRole("link", { name: lane })).toHaveAttribute(
-        "href",
-        `/ui/${lane.toLowerCase()}`,
-      );
-    }
+  const slots = {
+    engine: <span>engine slot</span>,
+    estate: <span>estate slot</span>,
+    review: <span>review slot</span>,
+    governor: <span>governor slot</span>,
+  };
+
+  /** The sidebar's nav, so a Governor tab link of the same name never matches. */
+  const areas = () => within(screen.getByRole("navigation", { name: "Areas" }));
+
+  it("renders the eleven areas: five links, six disabled with their reasons", () => {
+    window.history.pushState(null, "", "/ui/estate");
+    render(<App token="t" {...slots} />);
+    const nav = screen.getByRole("navigation", { name: "Areas" });
+    expect(within(nav).getAllByRole("listitem")).toHaveLength(11);
+    expect(within(nav).getAllByRole("link").map((link) => link.textContent)).toEqual([
+      "Needs you",
+      "Estate",
+      "Review",
+      "Products",
+      "Governance",
+    ]);
+    const disabled = nav.querySelectorAll('[aria-disabled="true"]');
+    expect(disabled).toHaveLength(6);
+    // Not a link, so not in the tab order; its reason is on the page.
+    for (const entry of disabled) expect(entry.closest("a")).toBeNull();
+    expect(within(nav).getByText("No page of its own yet. The runs table is on Estate.")).toBeInTheDocument();
     expect(screen.getByText("engine slot")).toBeInTheDocument();
   });
 
-  it("switches lanes on a nav click without a reload, and deep-links by path", async () => {
+  it("switches areas on a click without a reload, and marks exactly one current", async () => {
     window.history.pushState(null, "", "/ui/governor");
-    render(
-      <App
-        token="t"
-        engine={<span>engine slot</span>}
-        estate={<span>estate slot</span>}
-        review={<span>review slot</span>}
-        governor={<span>governor slot</span>}
-      />,
-    );
+    render(<App token="t" {...slots} />);
     expect(screen.getByText("governor slot")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Governor" })).toHaveAttribute("aria-current", "page");
+    // A bare governor path opens the brief, so Needs you is current.
+    expect(areas().getByRole("link", { name: "Needs you" })).toHaveAttribute("aria-current", "page");
 
-    screen.getByRole("link", { name: "Estate" }).click();
+    areas().getByRole("link", { name: "Estate" }).click();
     await waitFor(() => expect(screen.getByText("estate slot")).toBeInTheDocument());
     expect(window.location.pathname).toBe("/ui/estate");
 
-    screen.getByRole("link", { name: "Review" }).click();
+    areas().getByRole("link", { name: "Governance" }).click();
+    await waitFor(() => expect(window.location.pathname).toBe("/ui/governor/scorecard"));
+    expect(screen.getByText("governor slot")).toBeInTheDocument();
+
+    const current = screen
+      .getByRole("navigation", { name: "Areas" })
+      .querySelectorAll('[aria-current="page"]');
+    expect([...current].map((node) => node.textContent)).toEqual(["Governance"]);
+  });
+
+  it.each([
+    ["/ui/governor/custody/freeze%3Aglobal", "Governance", "governor slot"],
+    ["/ui/governor/audit/revenue%20daily", "Governance", "governor slot"],
+    ["/ui/governor/products/revenue%20daily", "Products", "governor slot"],
+    ["/ui/review/plan-1", "Review", "review slot"],
+    ["/ui/nope", "Estate", "estate slot"],
+  ])("deep-links %s under %s", (path, area, slot) => {
+    window.history.pushState(null, "", path);
+    render(<App token="t" {...slots} />);
+    expect(screen.getByText(slot)).toBeInTheDocument();
+    expect(areas().getByRole("link", { name: area })).toHaveAttribute("aria-current", "page");
+  });
+
+  it("follows Back and Forward", async () => {
+    window.history.pushState(null, "", "/ui/estate");
+    render(<App token="t" {...slots} />);
+    areas().getByRole("link", { name: "Review" }).click();
     await waitFor(() => expect(screen.getByText("review slot")).toBeInTheDocument());
-    expect(window.location.pathname).toBe("/ui/review");
+
+    act(() => {
+      window.history.back();
+    });
+    await waitFor(() => expect(screen.getByText("estate slot")).toBeInTheDocument());
+    expect(areas().getByRole("link", { name: "Estate" })).toHaveAttribute("aria-current", "page");
+  });
+
+  describe("the menu on a narrow screen", () => {
+    it("opens and folds the one sidebar, and says which it controls", () => {
+      window.history.pushState(null, "", "/ui/estate");
+      render(<App token="t" {...slots} />);
+      const button = screen.getByRole("button", { name: "Menu" });
+      const sidebar = document.getElementById(button.getAttribute("aria-controls") ?? "");
+      expect(sidebar).not.toBeNull();
+      expect(button).toHaveAttribute("aria-expanded", "false");
+      expect(sidebar).toHaveClass("hidden");
+
+      fireEvent.click(button);
+      expect(button).toHaveAttribute("aria-expanded", "true");
+      expect(sidebar).not.toHaveClass("hidden");
+      // One sidebar at every width, so the engine line is rendered once.
+      expect(screen.getAllByText("engine slot")).toHaveLength(1);
+    });
+
+    it("folds on a navigation", async () => {
+      window.history.pushState(null, "", "/ui/estate");
+      render(<App token="t" {...slots} />);
+      const button = screen.getByRole("button", { name: "Menu" });
+      fireEvent.click(button);
+      areas().getByRole("link", { name: "Review" }).click();
+      await waitFor(() => expect(button).toHaveAttribute("aria-expanded", "false"));
+    });
+
+    it("folds on Escape and gives focus back to the button", () => {
+      window.history.pushState(null, "", "/ui/estate");
+      render(<App token="t" {...slots} />);
+      const button = screen.getByRole("button", { name: "Menu" });
+      fireEvent.click(button);
+      areas().getByRole("link", { name: "Review" }).focus();
+      fireEvent.keyDown(document, { key: "Escape" });
+      expect(button).toHaveAttribute("aria-expanded", "false");
+      expect(document.activeElement).toBe(button);
+    });
   });
 });
 

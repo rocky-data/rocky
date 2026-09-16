@@ -5,39 +5,20 @@ import { BriefScreen } from "./BriefScreen";
 import { CustodyScreen } from "./CustodyScreen";
 import { ProductsScreen } from "./ProductsScreen";
 import { ScorecardScreen } from "./ScorecardScreen";
-
-const TABS = [
-  { id: "brief", label: "Brief", producer: "GET /api/v1/brief" },
-  { id: "scorecard", label: "Scorecard", producer: "GET /api/v1/audit/scorecard" },
-  { id: "custody", label: "Custody", producer: "GET /api/v1/custody/{subject}" },
-  { id: "audit", label: "Audit", producer: "GET /api/v1/audit" },
-  { id: "products", label: "Products", producer: "GET /api/v1/products/{name}/journal" },
-] as const;
-
-type Tab = (typeof TABS)[number]["id"];
-
-function tabFromSegment(segment: string | undefined): Tab {
-  switch (segment) {
-    case "scorecard":
-    case "custody":
-    case "audit":
-    case "products":
-      return segment;
-    default:
-      return "brief";
-  }
-}
+import { GOVERNOR_TABS, governorAreaOf, governorTabFromSegment } from "./tabs";
 
 /**
  * The governor lane: the brief, the trust scorecard, the custody
- * drill-down, the audit browse and the product timelines, one tab each,
- * deep-linked at `/ui/governor/<screen>` (`/ui/governor/custody/<subject>`
- * for a subject, `/ui/governor/products/<name>` for one product,
+ * drill-down, the audit browse and the product timelines, deep-linked at
+ * `/ui/governor/<screen>` (`/ui/governor/custody/<subject>` for a subject,
+ * `/ui/governor/products/<name>` for one product,
  * `/ui/governor/audit/<product>` for the ledger scoped to one product).
  *
- * The product timeline lives here rather than in a lane of its own: it
- * answers the question the other four answer — what happened, and who decided
- * it — for the same reader.
+ * The shell's sidebar gives the brief and the product timelines areas of
+ * their own (Needs you, Products), so the tab bar shows only the tabs of the
+ * current area: Scorecard, Custody and Audit under Governance, and no bar at
+ * all for an area of one screen. A tab that was also a sidebar entry would be
+ * two navigations marking the same page current.
  */
 export function GovernorScreen({
   brief,
@@ -53,7 +34,9 @@ export function GovernorScreen({
   products?: (name: string | null) => ReactNode;
 }) {
   const segments = useSegments();
-  const tab = tabFromSegment(segments[1]);
+  const tab = governorTabFromSegment(segments[1]);
+  const area = governorAreaOf(tab);
+  const tabs = GOVERNOR_TABS.filter((entry) => entry.area === area);
   const subject = tab === "custody" && segments[2] ? decodeURIComponent(segments[2]) : null;
   const productName = tab === "products" && segments[2] ? decodeURIComponent(segments[2]) : null;
   const auditProduct = tab === "audit" && segments[2] ? decodeURIComponent(segments[2]) : null;
@@ -80,35 +63,37 @@ export function GovernorScreen({
   return (
     <div className="space-y-4">
       {/*
-        `flex-wrap`, because five tabs do not fit 320px: measured, the row ran
+        `flex-wrap`, because five tabs did not fit 320px: measured, the row ran
         3–4px past the page body and took the whole page sideways with it.
-        Wrapping to a second line costs a few pixels of height and keeps every
-        tab reachable, which a horizontal page scroll does not.
+        Three fit today; wrapping still costs nothing and keeps every tab
+        reachable if one is added, which a horizontal page scroll does not.
       */}
-      <nav
-        aria-label="Governor screens"
-        className="flex flex-wrap gap-x-4 gap-y-1 border-b border-zinc-200 text-sm dark:border-zinc-800"
-      >
-        {TABS.map((entry) => (
-          <a
-            key={entry.id}
-            href={pathForLane("governor", entry.id)}
-            aria-current={entry.id === tab ? "page" : undefined}
-            onClick={(event) => {
-              event.preventDefault();
-              navigateTo(pathForLane("governor", entry.id));
-            }}
-            className={
-              entry.id === tab
-                ? "-mb-px border-b-2 border-zinc-900 pb-2 font-medium text-zinc-900 dark:border-white dark:text-white"
-                : "pb-2 text-zinc-600 hover:text-zinc-900 dark:text-zinc-300 dark:hover:text-white"
-            }
-            title={entry.producer}
-          >
-            {entry.label}
-          </a>
-        ))}
-      </nav>
+      {tabs.length > 1 && (
+        <nav
+          aria-label="Governor screens"
+          className="flex flex-wrap gap-x-4 gap-y-1 border-b border-zinc-200 text-sm dark:border-zinc-800"
+        >
+          {tabs.map((entry) => (
+            <a
+              key={entry.id}
+              href={pathForLane("governor", entry.id)}
+              aria-current={entry.id === tab ? "page" : undefined}
+              onClick={(event) => {
+                event.preventDefault();
+                navigateTo(pathForLane("governor", entry.id));
+              }}
+              className={
+                entry.id === tab
+                  ? "-mb-px border-b-2 border-zinc-900 pb-2 font-medium text-zinc-900 dark:border-white dark:text-white"
+                  : "pb-2 text-zinc-600 hover:text-zinc-900 dark:text-zinc-300 dark:hover:text-white"
+              }
+              title={entry.producer}
+            >
+              {entry.label}
+            </a>
+          ))}
+        </nav>
+      )}
       {screen}
     </div>
   );

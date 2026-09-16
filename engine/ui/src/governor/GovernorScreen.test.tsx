@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { GovernorScreen } from "./GovernorScreen";
 
@@ -13,25 +13,38 @@ function slots() {
 }
 
 describe("GovernorScreen", () => {
-  it("shows the brief by default and switches tabs without a reload", async () => {
+  it("shows the brief by default, with no tab bar: it is an area of its own", () => {
     window.history.pushState(null, "", "/ui/governor");
     render(<GovernorScreen {...slots()} />);
     expect(screen.getByText("brief slot")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Brief" })).toHaveAttribute("aria-current", "page");
+    // The sidebar's "Needs you" is the one navigation that marks this page.
+    expect(screen.queryByRole("navigation", { name: "Governor screens" })).toBeNull();
+  });
 
-    screen.getByRole("link", { name: "Scorecard" }).click();
-    await waitFor(() => expect(screen.getByText("scorecard slot")).toBeInTheDocument());
-    expect(window.location.pathname).toBe("/ui/governor/scorecard");
+  it("shows no tab bar on Products, an area of its own", () => {
+    window.history.pushState(null, "", "/ui/governor/products");
+    render(<GovernorScreen {...slots()} />);
+    expect(screen.getByText("products slot: none")).toBeInTheDocument();
+    expect(screen.queryByRole("navigation", { name: "Governor screens" })).toBeNull();
+  });
 
-    screen.getByRole("link", { name: "Audit" }).click();
+  it("switches between Governance's three tabs without a reload", async () => {
+    window.history.pushState(null, "", "/ui/governor/scorecard");
+    render(<GovernorScreen {...slots()} />);
+    const tabs = within(screen.getByRole("navigation", { name: "Governor screens" }));
+    expect(tabs.getAllByRole("link").map((link) => link.textContent)).toEqual([
+      "Scorecard",
+      "Custody",
+      "Audit",
+    ]);
+    expect(tabs.getByRole("link", { name: "Scorecard" })).toHaveAttribute("aria-current", "page");
+
+    tabs.getByRole("link", { name: "Audit" }).click();
     await waitFor(() => expect(screen.getByText("audit slot: none")).toBeInTheDocument());
 
     screen.getByRole("link", { name: "Custody" }).click();
     await waitFor(() => expect(screen.getByText("custody slot: none")).toBeInTheDocument());
-
-    screen.getByRole("link", { name: "Products" }).click();
-    await waitFor(() => expect(screen.getByText("products slot: none")).toBeInTheDocument());
-    expect(window.location.pathname).toBe("/ui/governor/products");
+    expect(window.location.pathname).toBe("/ui/governor/custody");
   });
 
   it("deep-links one product's timeline", () => {

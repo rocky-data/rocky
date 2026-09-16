@@ -1,0 +1,94 @@
+/**
+ * The shell's eleven areas, and which one a path belongs to.
+ *
+ * An area either opens a screen that exists, at a route that already existed
+ * before the sidebar, or is disabled with its reason. No route was renamed for
+ * the sidebar: deep links, the link helpers in `router.ts` and the docs'
+ * screenshot script all navigate by address.
+ */
+
+import { governorAreaOf, governorTabFromSegment } from "./governor/tabs";
+import { UI_BASE, laneFromPath, segmentsFromPath } from "./router";
+
+export type AreaId =
+  | "needs-you"
+  | "projects"
+  | "estate"
+  | "runs"
+  | "scheduler"
+  | "review"
+  | "policies"
+  | "products"
+  | "governance"
+  | "agents"
+  | "settings";
+
+export type Area =
+  | { readonly id: AreaId; readonly label: string; readonly kind: "link"; readonly href: string }
+  | { readonly id: AreaId; readonly label: string; readonly kind: "disabled"; readonly reason: string };
+
+/**
+ * In the order of the design brief. Each disabled reason says what is true
+ * today, and where to look instead when something exists elsewhere: a route
+ * with no page is not the same as nothing at all.
+ */
+export const AREAS: readonly Area[] = [
+  { id: "needs-you", label: "Needs you", kind: "link", href: `${UI_BASE}/governor/brief` },
+  {
+    id: "projects",
+    label: "Projects",
+    kind: "disabled",
+    reason: "One project for now: the one this server runs.",
+  },
+  { id: "estate", label: "Estate", kind: "link", href: `${UI_BASE}/estate` },
+  {
+    id: "runs",
+    label: "Runs",
+    kind: "disabled",
+    reason: "No page of its own yet. The runs table is on Estate.",
+  },
+  {
+    id: "scheduler",
+    label: "Scheduler",
+    kind: "disabled",
+    reason: "No page of its own yet. The schedule status is on Estate.",
+  },
+  { id: "review", label: "Review", kind: "link", href: `${UI_BASE}/review` },
+  {
+    id: "policies",
+    label: "Policies",
+    kind: "disabled",
+    reason: "No page yet. The engine serves the rules at /api/v1/policy.",
+  },
+  { id: "products", label: "Products", kind: "link", href: `${UI_BASE}/governor/products` },
+  { id: "governance", label: "Governance", kind: "link", href: `${UI_BASE}/governor/scorecard` },
+  {
+    id: "agents",
+    label: "Agents & Clusters",
+    kind: "disabled",
+    reason: "No page yet. Agent activity is on Needs you.",
+  },
+  {
+    id: "settings",
+    label: "Settings",
+    kind: "disabled",
+    reason: "No page yet. The engine serves them at /api/v1/settings.",
+  },
+];
+
+/**
+ * The area a path belongs to. It follows the lane router, so an unknown path
+ * is Estate, as it always was; inside the governor lane it follows the lane's
+ * own tab rule, so a bare `/ui/governor` is Needs you, because it opens the
+ * brief.
+ */
+export function areaFromPath(pathname: string): AreaId {
+  switch (laneFromPath(pathname)) {
+    case "estate":
+      return "estate";
+    case "review":
+      return "review";
+    case "governor":
+      return governorAreaOf(governorTabFromSegment(segmentsFromPath(pathname)[1]));
+  }
+}
