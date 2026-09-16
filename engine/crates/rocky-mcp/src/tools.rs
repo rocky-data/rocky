@@ -5516,7 +5516,7 @@ impl RockyMcpServer {
     #[tool(
         description = "The ranked pending-review queue, and an OPT-IN approve action. With no \
          `approve_plan_id`, lists every `require_review` escalation not yet signed off, ranked by \
-         blast_radius × classification × staleness, each carrying its decision_ref, plan_id, and \
+         blast_radius × change_class × staleness, each carrying its decision_ref, plan_id, and \
          `approve_command`. Listing works on every profile. APPROVING is different: it writes the \
          human sign-off marker that unblocks `rocky apply`, and MOST SERVERS DO NOT SERVE IT — it \
          is refused with `approve_not_enabled` unless the operator started this server as `rocky \

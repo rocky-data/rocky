@@ -1469,6 +1469,15 @@ mod tests {
     /// the queue reads — and the browser UI prints the string above the
     /// queue, so the page told a reader that classified data ranks higher
     /// (#2009). The middle factor is the change class.
+    ///
+    /// WHAT THIS PINS, exactly: the string's three tokens and their order,
+    /// and that each of the three factors moves the score. WHAT IT CANNOT
+    /// PIN: that the middle token names what `change_class_weight` READS.
+    /// Rewrite that function tomorrow to read a column classification and
+    /// every assertion below still passes — its only argument is a
+    /// `PolicyCapability`, so today the compiler is what ties the token to
+    /// the change class, not this test. A reviewer changing the weight has
+    /// to re-read the string; nothing here will remind them.
     #[test]
     fn the_ranking_string_names_the_factors_the_score_multiplies() {
         assert_eq!(
