@@ -59,9 +59,11 @@ whether it is nullable. The command opens no warehouse adapter. In this example
 no source schemas are cached, so every type shows as `?` and every column as
 nullable.
 
-If the project does not compile, or compiles with errors, the page still
+If every model loads but the project does not compile, the page still
 renders. Rocky logs a warning, and each model shows
-`No column metadata available`.
+`No column metadata available`. A model that cannot be PARSED is different:
+the loader is strict, so a malformed `.sql`, `.rocky` or sidecar `.toml` fails
+`rocky docs` before it renders anything.
 
 `rocky.toml` is not optional. The command reads it before it reads a model, and
 it counts the configured pipelines and adapters for the banner. Run `rocky docs`
