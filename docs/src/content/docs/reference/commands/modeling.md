@@ -883,7 +883,7 @@ The `breaking_findings` field is JSON-only: `--output table` still renders the s
 
 Preview a change before it merges. Rocky re-executes only the changed models and their downstream column lineage on a per-pull-request branch, and copies everything else from the base ref.
 
-Three subcommands compose into one review artifact. `preview create` runs the workflow, `preview diff` reports the structural and sampled row-level diff, and `preview cost` reports the cost delta against base. A fourth, `preview rows`, is separate: it samples the output rows of a single model.
+Three subcommands compose into one review artifact. `preview create` prepares the branch, `preview diff` reports what changed, and `preview cost` reports the cost delta against base. A fourth, `preview rows`, is separate: it samples the output rows of a single model.
 
 For the design (why CTAS today and warehouse-native clones tomorrow, how the column-level pruner works, what the sampling window's correctness ceiling is), see the [How Preview Works](/concepts/preview-internals/) concept page. For a step-by-step walkthrough on a feature branch, see the [Preview a PR](/guides/preview-a-pr/) how-to.
 
@@ -898,7 +898,7 @@ rocky preview rows   --model <name> [--cte <name>] [--limit <N>]
 
 ### `rocky preview create`
 
-Compute the prune set, copy the rest from the base schema, run only the prune set against a per-PR branch.
+Compute the prune set and copy the rest from the base schema into a per-PR branch. It does not run the prune set: it reports `run_status: "planned"` with an empty `run_id`. Run `rocky run --branch <name>` over the prune set before `preview diff` or `preview cost`. Today `preview diff` looks for a run whose recorded git branch equals the preview branch name, and a run records the branch you are actually on, so the two only meet when your git branch carries the preview name. See [#2032](https://github.com/rocky-data/rocky/issues/2032).
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
@@ -939,14 +939,20 @@ rocky preview create --base main
 
 ### `rocky preview diff`
 
-Sampled row-level diff plus structural (column-level) diff for every model in the prune set.
+Compare the branch run with the base run, for every model in the prune set.
+
+By default this compares the `rows_affected` the two run records hold. It reports `rows_added` and `rows_removed`, leaves `rows_changed` at 0, returns no samples and no column-level delta, and sets `coverage: "not_yet_sampled"` with `coverage_warning: true`.
+
+Two limits follow. A change that rewrites values without changing row counts shows nothing. And an ordinary transformation run records no `rows_affected` at all, which the diff reads as 0, so a model that goes from 10 rows to 20 can also report nothing.
+
+Pass `--algorithm bisection` to compare row content. It needs a `Merge` model whose single `unique_key` holds whole numbers: the bounds are parsed as integers, so a decimal key falls back to the default comparison without saying so. Read each model's `algorithm.kind` before you treat its result as a content comparison.
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--name <NAME>` | `string` | **(required)** | Branch name created by `preview create`. |
 | `--base <REF>` | `string` | `main` | Git ref to compare against. Must match what `preview create` was invoked with. |
 | `--models <PATH>` | `PathBuf` | `models` | Models directory. Bisection reads each model's primary-key column from here. |
-| `--sample-size <N>` | `usize` | `1000` | Number of rows to sample per model for row-level diffing. Larger windows reduce false-negative risk; see [coverage warning](/concepts/preview-internals/#coverage-warning-roll-up). |
+| `--sample-size <N>` | `usize` | `1000` | Accepted and ignored today. The default comparison samples no rows, so this value changes nothing ([#2032](https://github.com/rocky-data/rocky/issues/2032)). |
 
 **Example.** Print a Markdown report ready to post on a PR:
 

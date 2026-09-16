@@ -38,6 +38,10 @@ This does five things:
 
 `preview create` does **not** run the prune-set models itself. It emits `run_status: "planned"` with an empty `run_id`. Run `rocky run --branch <name>`, with a selector limited to the prune set, before `preview diff` or `preview cost`. That gives them a branch run to compare against.
 
+:::caution[The pairing does not work yet]
+`preview diff` and `preview cost` look for a run whose recorded branch equals the preview branch name, such as `pr-preview-fix-price`. A run records the branch you are actually on, such as `fix-price`, and `--branch` changes only where the run writes. So the two do not meet unless your branch carries the preview name. `--sample-size` is also accepted and ignored, and an ordinary transformation records no row count for the comparison to read. Track all three in [#2032](https://github.com/rocky-data/rocky/issues/2032).
+:::
+
 The output is a `PreviewCreateOutput` JSON document:
 
 ```json

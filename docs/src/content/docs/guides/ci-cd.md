@@ -97,6 +97,10 @@ The hard gate lives on `rocky plan promote` and `rocky apply`. When you promote 
 
 The gate fires once. A blocked promote produces no `plan_id`, so `rocky apply` has nothing to run. Rocky records the gate result in the persisted plan and does **not** re-evaluate it at apply time; `rocky apply` replays the recorded verdict. To ship a breaking change on purpose, once downstream consumers have migrated, pass `--allow-breaking` at plan time. The override emits a `breaking_changes_allowed` audit event, so the bypass leaves a paper trail.
 
+:::caution[The two-step promote works in a single-pipeline project only]
+In a project whose `rocky.toml` declares more than one pipeline, `rocky plan promote <branch> --pipeline <name>` writes a plan, and `rocky apply <plan-id>` then refuses it: `multiple pipelines defined (…). Use --pipeline <name> to select one`. `rocky apply` has no `--pipeline` flag, so the recipe below cannot complete. Use the deprecated `rocky branch promote <branch> --pipeline <name>` until [#2019](https://github.com/rocky-data/rocky/issues/2019) is fixed. `rocky branch compare` refuses the same way.
+:::
+
 ```bash
 # PR-time: detect (informational)
 rocky ci-diff --semantic
