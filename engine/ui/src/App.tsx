@@ -1,11 +1,19 @@
-import { Component, useEffect, useState, type ErrorInfo, type ReactNode } from "react";
+import {
+  Component,
+  useEffect,
+  useRef,
+  useState,
+  type ErrorInfo,
+  type ReactNode,
+} from "react";
 import type { MetaOutput } from "@rocky-types/meta";
 import { ApiError, apiGet } from "./api";
+import { AREAS, areaFromPath, areaHasTabs, type AreaId } from "./areas";
 import { EmptyState, StatusCard } from "./components";
 import { EstateScreen } from "./estate/EstateScreen";
 import { GovernorScreen } from "./governor/GovernorScreen";
 import { ReviewScreen } from "./review/ReviewScreen";
-import { LANES, navigate, pathForLane, useLane, type Lane } from "./router";
+import { laneFromPath, navigateTo, usePathname, type Lane } from "./router";
 import { currentToken } from "./token";
 
 interface ErrorBoundaryState {
@@ -187,15 +195,67 @@ function LaneScreen({
   }
 }
 
+/** The id the menu button controls. One sidebar exists, at every width. */
+const SIDEBAR_ID = "shell-sidebar";
+
 /**
- * The shell: the lane nav, the engine line, and the selected lane.
+ * The eleven areas. A link for an area with a screen; for one without, its
+ * name and the reason as plain text — not a link, not in the tab order, and
+ * marked disabled for assistive technology.
+ */
+function AreaNav({ current }: { current: AreaId }) {
+  return (
+    <nav aria-label="Areas">
+      <ul className="space-y-0.5 text-sm">
+        {AREAS.map((area) => (
+          <li key={area.id}>
+            {area.kind === "link" ? (
+              <a
+                href={area.href}
+                // "page" unless the area's screen has tabs of its own; then
+                // the tab is the page and this is the section it is in.
+                aria-current={area.id === current ? (areaHasTabs(area.id) ? "true" : "page") : undefined}
+                onClick={(event) => {
+                  event.preventDefault();
+                  // The menu folds on the route change this causes (see `App`).
+                  navigateTo(area.href);
+                }}
+                className={`block rounded px-2 py-1.5 ${
+                  area.id === current
+                    ? "bg-zinc-100 font-medium text-zinc-900 dark:bg-zinc-800 dark:text-white"
+                    : "text-zinc-700 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:text-white"
+                }`}
+              >
+                {area.label}
+              </a>
+            ) : (
+              <span aria-disabled="true" className="block px-2 py-1.5 text-zinc-400 dark:text-zinc-500">
+                {area.label}
+                <span className="block text-xs text-zinc-500 dark:text-zinc-400">{area.reason}</span>
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+    </nav>
+  );
+}
+
+/**
+ * The shell: the sidebar of areas, the engine line in its footer, and the
+ * selected lane.
  *
- * The token check is **one boundary here**, above `LaneScreen`, rather than a
- * gate inside each lane. A lane cannot gate itself: returning after its
- * `useResource` calls is too late, the loads have already started, and
- * returning before them makes the hooks conditional. One boundary is also the
- * only shape that stays true when a fourth lane is added — a per-lane gate
- * would let that lane fire requests nobody notices.
+ * The token check is **one boundary here**, above `LaneScreen` and the engine
+ * line, rather than a gate inside each lane. A lane cannot gate itself:
+ * returning after its `useResource` calls is too late, the loads have already
+ * started, and returning before them makes the hooks conditional. One boundary
+ * is also the only shape that stays true when a lane is added — a per-lane
+ * gate would let that lane fire requests nobody notices.
+ *
+ * On a narrow screen the sidebar is folded behind a menu button. It is the
+ * same element at every width, shown or hidden by CSS, so the engine line is
+ * fetched once and its ids stay unique. It folds again on every navigation and
+ * on Escape, which returns focus to the button.
  */
 export function App({
   engine,
@@ -210,48 +270,64 @@ export function App({
   governor?: ReactNode;
   token?: string | null;
 }) {
-  const lane = useLane();
+  const pathname = usePathname();
+  const lane: Lane = laneFromPath(pathname);
+  const area = areaFromPath(pathname);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuButton = useRef<HTMLButtonElement | null>(null);
+
+  // Fold on any route change, Back and Forward included, not only on a click.
+  useEffect(() => setMenuOpen(false), [pathname]);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setMenuOpen(false);
+      menuButton.current?.focus();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [menuOpen]);
+
   return (
     <ErrorBoundary>
-      <div className="min-h-screen bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
-        <header className="border-b border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
-          <div className="mx-auto flex max-w-6xl items-center gap-6 px-4 py-3">
-            <span className="text-base font-semibold tracking-tight">Rocky</span>
-            <nav aria-label="Lanes" className="flex gap-4 text-sm">
-              {LANES.map((entry) => (
-                <a
-                  key={entry.id}
-                  href={pathForLane(entry.id)}
-                  aria-current={entry.id === lane ? "page" : undefined}
-                  onClick={(event) => {
-                    event.preventDefault();
-                    navigate(entry.id);
-                  }}
-                  className={
-                    entry.id === lane
-                      ? "font-medium text-zinc-900 dark:text-white"
-                      : "text-zinc-600 hover:text-zinc-900 dark:text-zinc-300 dark:hover:text-white"
-                  }
-                >
-                  {entry.label}
-                </a>
-              ))}
-            </nav>
-          </div>
+      <div className="min-h-screen bg-zinc-50 text-zinc-900 md:flex dark:bg-zinc-950 dark:text-zinc-100">
+        <header className="flex items-center justify-between border-b border-zinc-200 bg-white px-4 py-3 md:hidden dark:border-zinc-800 dark:bg-zinc-900">
+          <span className="text-base font-semibold tracking-tight">Rocky</span>
+          <button
+            ref={menuButton}
+            type="button"
+            aria-expanded={menuOpen}
+            aria-controls={SIDEBAR_ID}
+            onClick={() => setMenuOpen((open) => !open)}
+            className="rounded border border-zinc-300 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-800"
+          >
+            Menu
+          </button>
         </header>
-        <main className="mx-auto max-w-6xl space-y-4 px-4 py-6">
+        <aside
+          id={SIDEBAR_ID}
+          className={`${menuOpen ? "flex" : "hidden"} flex-col gap-4 border-b border-zinc-200 bg-white px-3 py-4 md:sticky md:top-0 md:flex md:h-screen md:w-60 md:shrink-0 md:overflow-y-auto md:border-r md:border-b-0 dark:border-zinc-800 dark:bg-zinc-900`}
+        >
+          <span className="hidden px-2 text-base font-semibold tracking-tight md:block">Rocky</span>
+          <AreaNav current={area} />
+          {token !== null && (
+            <section aria-label="Engine" className="mt-auto border-t border-zinc-200 px-2 pt-3 dark:border-zinc-800">
+              {engine ?? <EnginePanel />}
+            </section>
+          )}
+        </aside>
+        <main className="mx-auto w-full max-w-6xl min-w-0 space-y-4 px-4 py-6">
           {token === null ? (
             <NoToken />
           ) : (
-            <>
-              <section aria-label="Engine">{engine ?? <EnginePanel />}</section>
-              <LaneScreen
-                lane={lane}
-                estate={estate ?? <EstateScreen />}
-                review={review ?? <ReviewScreen />}
-                governor={governor ?? <GovernorScreen />}
-              />
-            </>
+            <LaneScreen
+              lane={lane}
+              estate={estate ?? <EstateScreen />}
+              review={review ?? <ReviewScreen />}
+              governor={governor ?? <GovernorScreen />}
+            />
           )}
         </main>
       </div>

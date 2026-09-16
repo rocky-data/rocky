@@ -2,7 +2,8 @@
  * The shell's client router: three lanes under `/ui/`, each with optional
  * sub-routes (`/ui/governor/scorecard`). The server answers the shell for
  * every `/ui/*` path (U2-P1), so a deep link loads; in the page, a route
- * change is a `pushState`, not a reload.
+ * change is a `pushState`, not a reload. The sidebar's eleven areas sit on
+ * top of these lanes (`areas.ts`); no route changed for them.
  */
 
 import { useEffect, useState } from "react";
@@ -10,12 +11,6 @@ import { useEffect, useState } from "react";
 export const UI_BASE = "/ui";
 
 export type Lane = "estate" | "review" | "governor";
-
-export const LANES: readonly { id: Lane; label: string }[] = [
-  { id: "estate", label: "Estate" },
-  { id: "review", label: "Review" },
-  { id: "governor", label: "Governor" },
-];
 
 /** The segments after `/ui`, empty for the shell's root. */
 export function segmentsFromPath(pathname: string): string[] {
@@ -44,11 +39,8 @@ export function navigateTo(path: string, win: Window = window): void {
   win.dispatchEvent(new PopStateEvent("popstate"));
 }
 
-export function navigate(lane: Lane, win: Window = window): void {
-  navigateTo(pathForLane(lane), win);
-}
-
-function usePathname(): string {
+/** The address bar's path, following `navigateTo` and Back/Forward. */
+export function usePathname(): string {
   const [pathname, setPathname] = useState(() => window.location.pathname);
   useEffect(() => {
     const onChange = () => setPathname(window.location.pathname);
@@ -58,7 +50,7 @@ function usePathname(): string {
   return pathname;
 }
 
-/** The current lane, following the address bar and `navigate`. */
+/** The current lane, following the address bar and `navigateTo`. */
 export function useLane(): Lane {
   return laneFromPath(usePathname());
 }
