@@ -57,9 +57,11 @@ function SampleTable({ sample }: { sample: PreviewRowsOutput }) {
         {sample.row_count} {sample.row_count === 1 ? "row" : "rows"}
         {sample.truncated ? ` (capped at ${sample.limit_applied})` : ""} from{" "}
         {sample.adapter_kind}. A classification-tagged column is masked by the engine before the
-        rows leave it, or the sample is refused — except a tag the project lists under{" "}
-        <span className="font-mono">allow_unmasked</span>, which comes back raw on purpose. A
-        hashed column is pseudonymous, not anonymous.
+        rows leave it, or the sample is refused. Two kinds of tag come back raw on purpose: one
+        whose workspace <span className="font-mono">[mask]</span> strategy is{" "}
+        <span className="font-mono">none</span>, and one the project lists under{" "}
+        <span className="font-mono">allow_unmasked</span>. A hashed column is pseudonymous, not
+        anonymous.
       </p>
       <details className="text-[11px] text-zinc-500 dark:text-zinc-400">
         <summary className="cursor-pointer">the SQL that ran</summary>
