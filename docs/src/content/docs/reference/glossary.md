@@ -169,7 +169,7 @@ The record of where a result came from: which SQL produced it, which inputs it r
 
 ### Quarantine
 
-Separating a model's failing rows from its passing ones, so bad data does not block the run or reach downstream readers. Turn it on under `[pipeline.<name>.checks.quarantine]` and pick a mode: split the rows into separate tables, tag them in place, or drop them. See [`[pipeline.NAME.checks]`](/reference/configuration/#pipelinenamechecks).
+Separating a model's failing rows from its passing ones, so bad data does not block the run or reach downstream readers. Turn it on under `[pipeline.<name>.checks.quarantine]` of a `quality` pipeline and pick a mode: split the rows into separate tables, tag them in place, or drop them. See [`[pipeline.NAME.checks]`](/reference/configuration/#pipelinenamechecks).
 
 ### Reconcile
 

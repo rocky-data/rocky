@@ -66,7 +66,7 @@ A flag in `AdapterCapabilities` gates each opt-in trait. Set the flag, implement
 
 - `execute_statement`: every DDL and DML statement Rocky generates: `CREATE TABLE`, `INSERT INTO`, `MERGE INTO`, `ALTER TABLE`, `DROP TABLE`, partition replace.
 - `execute_query`: `EXPLAIN`, `DESCRIBE`, row-count assertions, and the `SELECT 1` connectivity check at `rocky compile` time.
-- `describe_table`: drift detection (`rocky drift`), contract validation, and the column-list step before Rocky generates an incremental insert.
+- `describe_table`: schema drift detection during `rocky run`, contract validation, and the column-list step before Rocky generates an incremental insert.
 - `table_exists`: the full-refresh-versus-create branch at the start of a materialization.
 - `dialect()` methods: every SQL string Rocky emits. Identifier validation lives here.
 

@@ -45,7 +45,7 @@ Setting `server_url` diverts three read-only commands off this path. See [Use a 
 pip install rocky-sdk
 ```
 
-The `rocky` binary is not bundled with the package. Install it separately and put it on `PATH`, or pass `binary_path=` to the client. Get it from the [releases page](https://github.com/rocky-data/rocky/releases). The SDK needs engine v1.34.0 or newer.
+The `rocky` binary is not bundled with the package. Install it separately and put it on `PATH`, or pass `binary_path=` to the client. Get it from the [releases page](https://github.com/rocky-data/rocky/releases). The SDK needs engine v1.35.0 or newer.
 
 ## Quick start
 
@@ -135,5 +135,5 @@ Each method's full signature, parameters, and return type are in the [`RockyReso
 ## Requirements
 
 - Python 3.11 or newer
-- `pydantic >= 2.0`
-- The `rocky` binary on `PATH` (engine v1.34.0 or newer), or a path passed via `binary_path`
+- `pydantic >= 2.10`
+- The `rocky` binary on `PATH` (engine v1.35.0 or newer), or a path passed via `binary_path`

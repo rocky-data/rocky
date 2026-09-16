@@ -11,7 +11,7 @@ The two commands to know first are `rocky plan` and `rocky apply`. `rocky plan` 
 
 ## Global Flags
 
-The global flags (`--config`, `--output`, `--state-path`, `--state-namespace`, `--cache-ttl`) apply to every command. See [Global Flags in the CLI Reference](/reference/cli/#global-flags) for the canonical list, defaults, and the `--state-path` resolution order.
+The global flags (`--config`, `--output`, `--state-path`, `--state-namespace`, `--principal`, `--cache-ttl`) apply to every command. Put `--config`, `--state-path` and `--state-namespace` before the subcommand: `rocky --config prod.toml run`, not `rocky run --config prod.toml`. See [Global Flags in the CLI Reference](/reference/cli/#global-flags) for the canonical list, defaults, and the `--state-path` resolution order.
 
 ### `--state-namespace`
 

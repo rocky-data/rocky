@@ -272,7 +272,7 @@ A transformation model that fails to compile during a run counts as a failure, n
 
 ```sh
 # Capture the first job id from a run.
-rocky run --config rocky.toml --output json \
+rocky --config rocky.toml run --output json \
   | jq -r '.materializations[].job_ids[]' \
   | head -1
 # → bquxjob_5f3c4e2a_19a1b6d3e21

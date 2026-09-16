@@ -976,8 +976,8 @@ A Rocky transformation incremental expects the model SQL to carry its own row fi
 dbt branches on environment with `{{ target.name }}`. Rocky has no environment-specific SQL. Use one `rocky.toml` per environment instead:
 
 ```bash
-rocky compile --config pipeline.prod.toml --models ./rocky-models
-rocky compile --config pipeline.dev.toml --models ./rocky-models
+rocky --config pipeline.prod.toml compile --models ./rocky-models
+rocky --config pipeline.dev.toml compile --models ./rocky-models
 ```
 
 ### Macros that generate SQL dynamically

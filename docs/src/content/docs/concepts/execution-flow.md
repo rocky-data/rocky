@@ -10,7 +10,7 @@ This page traces the engine from the moment you type `rocky run` to the moment t
 ## The high-level flow
 
 ```
-rocky run -c rocky.toml
+rocky -c rocky.toml run
       │
       ▼
 1. Mint run_id
@@ -254,8 +254,8 @@ Resume flags fail if the checkpoint is missing or unreadable. Every path that do
 There is no way to resume half of a combined run. `--all` and `--models` re-run the replication phase before the model phase, so a second command cannot pick up where a resumed replication left off — it copies the same tables again. If a `--all` or `--dag` run fails, either re-run it whole, or split the work: resume the replication pipeline on its own with `--resume-latest`, then build the models by naming their transformation pipeline, which runs no replication of its own.
 
 ```bash
-rocky run -c rocky.toml --pipeline <replication-pipeline> --resume-latest
-rocky run -c rocky.toml --pipeline <transformation-pipeline>
+rocky -c rocky.toml run --pipeline <replication-pipeline> --resume-latest
+rocky -c rocky.toml run --pipeline <transformation-pipeline>
 ```
 
 That split needs the models to live in their own transformation pipeline. In a single pipeline driven by `--all`, they do not, and the whole run repeats.
@@ -266,10 +266,10 @@ A model whose watermark was never committed re-runs from its last committed wate
 
 ```bash
 # Resume the most recent run:
-rocky run -c rocky.toml --resume-latest
+rocky -c rocky.toml run --resume-latest
 
 # Resume a specific run:
-rocky run -c rocky.toml --resume run-20240115-123456-789
+rocky -c rocky.toml run --resume run-20240115-123456-789
 ```
 
 ## AIMD adaptive concurrency

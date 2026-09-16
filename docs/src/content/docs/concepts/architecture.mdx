@@ -97,7 +97,7 @@ The playground catalog currently ships {pocCounts.total} POCs across {pocCounts.
 
 ## Crate overview
 
-The 25 crates under `engine/crates/`, and the two binary crates that ship as executables:
+The 27 crates under `engine/crates/`, the two binary crates that ship as executables, and the browser UI:
 
 ```
 engine/
@@ -105,6 +105,7 @@ engine/
 │   ├── rocky-ir/            # Typed Intermediate Representation (ModelIr, MaterializationStrategy)
 │   ├── rocky-core/          # Generic SQL transformation engine (depends on rocky-ir)
 │   ├── rocky-core-compiletest/  # Compile-fail (trybuild) guards for rocky-core
+│   ├── rocky-cli-compiletest/   # Compile-fail guard: rocky-cli's plan writers stay crate-private
 │   ├── rocky-catalog-core/  # Catalog client abstraction (Iceberg REST, Unity Catalog, Polaris, Nessie)
 │   ├── rocky-sql/           # SQL parsing + typed AST
 │   ├── rocky-lang/          # Rocky DSL parser (.rocky files)
@@ -119,16 +120,18 @@ engine/
 │   ├── rocky-iceberg/       # Iceberg + content-addressed Delta UniForm writer
 │   ├── rocky-duckdb/        # DuckDB local execution adapter
 │   ├── rocky-engine/        # Local execution engine (DuckDB-backed)
-│   ├── rocky-server/        # HTTP API + LSP server
+│   ├── rocky-server/        # HTTP server support (auth, jobs, UI guard) + LSP server
 │   ├── rocky-cache/         # Three-tier caching
 │   ├── rocky-ai/            # AI intent layer
+│   ├── rocky-fulfill/       # Fulfillment loop behind `rocky fulfill` (experimental)
 │   ├── rocky-mcp/           # MCP server backing `rocky mcp`
 │   ├── rocky-verify/        # Standalone offline verifier for rocky-manifest attestations
 │   ├── rocky-observe/       # Observability
 │   ├── rocky-wasm/          # WebAssembly exports for browser/edge
-│   └── rocky-cli/           # CLI framework + Dagster Pipes
+│   └── rocky-cli/           # CLI framework, `/api/v1` routes, Dagster Pipes
 ├── rocky/                   # Binary crate (the `rocky` CLI)
-└── rocky-lsp/               # Binary crate (the `rocky lsp` language server)
+├── rocky-lsp/               # Binary crate (the `rocky lsp` language server)
+└── ui/                      # Browser UI (React), embedded by `rocky serve --ui`
 ```
 
 ### rocky-ir
@@ -276,9 +279,9 @@ Local execution engine backed by DuckDB (via `rocky-duckdb`). Powers `rocky test
 
 ### rocky-server
 
-HTTP API and Language Server Protocol (LSP) server.
+Support for the HTTP server, and the Language Server Protocol (LSP) server.
 
-- **REST API** (via `axum`): model metadata, lineage, DAG endpoints for `rocky serve`
+- **HTTP support** (via `axum`): bearer-token auth and token scope, the async job model, webhook ingress, and the browser UI's `Host`/`Origin` guard and headers. The `/api/v1` routes themselves live in `rocky-cli` (`api.rs`), and so do the embedded UI files.
 - **LSP** (via `tower-lsp`): diagnostics, hover, completion, go-to-definition, rename for `rocky lsp`
 
 ### rocky-ai
