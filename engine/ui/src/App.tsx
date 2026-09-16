@@ -203,7 +203,7 @@ const SIDEBAR_ID = "shell-sidebar";
  * name and the reason as plain text — not a link, not in the tab order, and
  * marked disabled for assistive technology.
  */
-function AreaNav({ current, onNavigate }: { current: AreaId; onNavigate: () => void }) {
+function AreaNav({ current }: { current: AreaId }) {
   return (
     <nav aria-label="Areas">
       <ul className="space-y-0.5 text-sm">
@@ -215,8 +215,8 @@ function AreaNav({ current, onNavigate }: { current: AreaId; onNavigate: () => v
                 aria-current={area.id === current ? "page" : undefined}
                 onClick={(event) => {
                   event.preventDefault();
+                  // The menu folds on the route change this causes (see `App`).
                   navigateTo(area.href);
-                  onNavigate();
                 }}
                 className={`block rounded px-2 py-1.5 ${
                   area.id === current
@@ -309,7 +309,7 @@ export function App({
           className={`${menuOpen ? "flex" : "hidden"} flex-col gap-4 border-b border-zinc-200 bg-white px-3 py-4 md:sticky md:top-0 md:flex md:h-screen md:w-60 md:shrink-0 md:overflow-y-auto md:border-r md:border-b-0 dark:border-zinc-800 dark:bg-zinc-900`}
         >
           <span className="hidden px-2 text-base font-semibold tracking-tight md:block">Rocky</span>
-          <AreaNav current={area} onNavigate={() => setMenuOpen(false)} />
+          <AreaNav current={area} />
           {token !== null && (
             <section aria-label="Engine" className="mt-auto border-t border-zinc-200 px-2 pt-3 dark:border-zinc-800">
               {engine ?? <EnginePanel />}
