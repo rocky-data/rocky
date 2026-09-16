@@ -157,7 +157,7 @@ A sketch of that panel:
 
 ## In your browser
 
-`rocky serve --ui` serves a read-only view of the project to your browser. The UI is built into the release binary. A sidebar lists eleven areas, five of which open a screen today: what needs you now, the estate (models, the DAG and runs), the plans waiting for a human, your data products, and the record of what agents did and why.
+`rocky serve --ui` serves a read-only view of the project to your browser. The UI is built into the release binary. It shows what needs you now, the estate (models, the DAG and runs), the plans waiting for a human, your data products, and the record of what agents did and why.
 
 ```bash
 rocky serve --ui --token "$(openssl rand -hex 16)" --token-scope read-only
