@@ -722,7 +722,7 @@ pub fn run_review_status(config_path: &Path, plan_id: &str, output_json: bool) -
 const MAX_HISTORY_SCAN: usize = 10_000;
 
 /// Human-readable description of the queue ordering.
-const QUEUE_RANKING: &str = "blast_radius × classification × staleness";
+const QUEUE_RANKING: &str = "blast_radius × change_class × staleness";
 
 /// Execute `rocky review --queue`.
 ///
@@ -892,9 +892,9 @@ fn build_queue(
                 .as_ref()
                 .and_then(|r| blast_radius_union(r, models.iter().map(String::as_str)))
                 .map(|reached| reached.len() as u64);
-            let classification_weight = classification_weight(d.capability);
+            let change_class_weight = change_class_weight(d.capability);
             let staleness_seconds = (now - d.timestamp).num_seconds().max(0);
-            let score = queue_score(blast_radius, classification_weight, staleness_seconds);
+            let score = queue_score(blast_radius, change_class_weight, staleness_seconds);
             ReviewQueueEntry {
                 plan_id: d.plan_id.clone(),
                 decision_ref: format!("{}|{}|{}", d.timestamp.to_rfc3339(), d.plan_id, d.model),
@@ -907,7 +907,7 @@ fn build_queue(
                 rule_id: d.rule_id,
                 reason: d.reason.clone(),
                 blast_radius,
-                classification_weight,
+                change_class_weight,
                 staleness_seconds,
                 score,
                 approve_command: format!("rocky review {} --approve", d.plan_id),
@@ -1094,7 +1094,7 @@ pub(crate) fn record_plan_review_escalation(
     }
 }
 
-/// Composite priority score: `(blast + 1) × classification_weight ×
+/// Composite priority score: `(blast + 1) × change_class_weight ×
 /// (1 + staleness_hours)`. Higher sorts first. An unknown blast radius
 /// contributes as zero so the entry still ranks on class and age rather than
 /// dropping out.
@@ -1108,18 +1108,14 @@ pub(crate) fn record_plan_review_escalation(
 /// plan is unknown, not a small number. Zero is the ranking's honest floor for
 /// every one of those, and it is not a measured radius of zero, which is
 /// `Some(0)` and means the plan really does reach nothing.
-fn queue_score(
-    blast_radius: Option<u64>,
-    classification_weight: u32,
-    staleness_seconds: i64,
-) -> f64 {
+fn queue_score(blast_radius: Option<u64>, change_class_weight: u32, staleness_seconds: i64) -> f64 {
     let staleness_factor = 1.0 + (staleness_seconds.max(0) as f64 / 3600.0);
-    (blast_radius.unwrap_or(0) + 1) as f64 * f64::from(classification_weight) * staleness_factor
+    (blast_radius.unwrap_or(0) + 1) as f64 * f64::from(change_class_weight) * staleness_factor
 }
 
 /// Change-class weight for the ranking: a breaking schema change outranks a
 /// bare mutating verb, which outranks an additive / value-only change.
-fn classification_weight(capability: PolicyCapability) -> u32 {
+fn change_class_weight(capability: PolicyCapability) -> u32 {
     match capability {
         PolicyCapability::SchemaChangeBreaking => 3,
         PolicyCapability::Apply | PolicyCapability::Promote | PolicyCapability::Backfill => 2,
@@ -1440,18 +1436,18 @@ mod tests {
     }
 
     #[test]
-    fn classification_weight_orders_breaking_over_verb_over_additive() {
+    fn change_class_weight_orders_breaking_over_verb_over_additive() {
         assert!(
-            classification_weight(PolicyCapability::SchemaChangeBreaking)
-                > classification_weight(PolicyCapability::Apply)
+            change_class_weight(PolicyCapability::SchemaChangeBreaking)
+                > change_class_weight(PolicyCapability::Apply)
         );
         assert!(
-            classification_weight(PolicyCapability::Apply)
-                > classification_weight(PolicyCapability::SchemaChangeAdditive)
+            change_class_weight(PolicyCapability::Apply)
+                > change_class_weight(PolicyCapability::SchemaChangeAdditive)
         );
         assert_eq!(
-            classification_weight(PolicyCapability::ValueChange),
-            classification_weight(PolicyCapability::SchemaChangeAdditive)
+            change_class_weight(PolicyCapability::ValueChange),
+            change_class_weight(PolicyCapability::SchemaChangeAdditive)
         );
     }
 
@@ -1465,6 +1461,39 @@ mod tests {
         assert!(queue_score(Some(0), 1, 7200) > queue_score(Some(0), 1, 0));
         // An unknown blast radius contributes as zero, not as a drop-out.
         assert_eq!(queue_score(None, 2, 0), queue_score(Some(0), 2, 0));
+    }
+
+    /// The queue's own description of its ordering has to name the factors
+    /// `queue_score` actually multiplies. It said "classification", which in
+    /// this codebase is the `[classification]` block's column tags — nothing
+    /// the queue reads — and the browser UI prints the string above the
+    /// queue, so the page told a reader that classified data ranks higher
+    /// (#2009). The middle factor is the change class.
+    #[test]
+    fn the_ranking_string_names_the_factors_the_score_multiplies() {
+        assert_eq!(
+            QUEUE_RANKING.split(" × ").collect::<Vec<_>>(),
+            vec!["blast_radius", "change_class", "staleness"],
+            "the three factors, in the order the score applies them"
+        );
+        assert!(
+            !QUEUE_RANKING.contains("classification"),
+            "`classification` names the column tags, which the queue never reads: {QUEUE_RANKING}"
+        );
+        // Each factor moves the score, so none of the three is decoration.
+        assert!(queue_score(Some(5), 1, 0) > queue_score(Some(0), 1, 0));
+        assert!(
+            queue_score(
+                Some(0),
+                change_class_weight(PolicyCapability::SchemaChangeBreaking),
+                0
+            ) > queue_score(
+                Some(0),
+                change_class_weight(PolicyCapability::ValueChange),
+                0
+            )
+        );
+        assert!(queue_score(Some(0), 1, 7200) > queue_score(Some(0), 1, 0));
     }
 
     #[test]
