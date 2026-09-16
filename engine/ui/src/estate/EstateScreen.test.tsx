@@ -419,6 +419,27 @@ describe("EstateScreen", () => {
         expect(line("weekly_revenue")).toContain(NOT_COMPILED);
       });
 
+      it("reads the list again when a read is cut", async () => {
+        // A list whose count disagrees with its entries is read as unknown,
+        // so it is no more of an answer than a refusal.
+        const cut: ModelListOutput = { ...partModels, count: partModels.count + 1 };
+        const models = answering(() => cut, () => partModels);
+        render(
+          <EstateScreen
+            loaders={loaders({ dag: async () => partDag, models })}
+            refreshMs={0}
+            recheckMs={5_000}
+            now={NOW}
+          />,
+        );
+        await advance(0);
+        expect(line("weekly_revenue")).not.toContain(NOT_COMPILED);
+
+        await advance(5_000);
+        expect(models).toHaveBeenCalledTimes(2);
+        expect(line("weekly_revenue")).toContain(NOT_COMPILED);
+      });
+
       it("reads the list again when the first read is refused", async () => {
         const models = answering(refused, () => partModels);
         render(
