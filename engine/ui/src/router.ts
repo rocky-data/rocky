@@ -77,3 +77,17 @@ export function useSegments(): string[] {
 export function custodyPath(subject: string): string {
   return `${UI_BASE}/governor/custody/${encodeURIComponent(subject)}`;
 }
+
+/**
+ * The audit ledger, whole or scoped to one product's output model.
+ *
+ * A product is not a custody subject — custody resolves a model, a run or a
+ * plan id, and `product:<name>` is none of those (#2003). The ledger scoped by
+ * `?product=` is what the engine can actually answer about a product, so this
+ * is where a product's decisions are linked from.
+ */
+export function auditPath(product?: string | null): string {
+  return product
+    ? `${UI_BASE}/governor/audit/${encodeURIComponent(product)}`
+    : `${UI_BASE}/governor/audit`;
+}
