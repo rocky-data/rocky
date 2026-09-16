@@ -284,7 +284,7 @@ Rocky parses the fragment under the target dialect and accepts exactly one expre
 - any subquery, in any position;
 - any qualified function name, such as `schema.fn(...)` — that is how user-defined, remote and plugin functions are reached;
 - any function that is not on Rocky's allowlist of pure scalar functions;
-- a placeholder (`$name`, `$1`, `?`) and a bare `current_user`, because each reads session state rather than the row.
+- a placeholder (`$name`, `$1`, `?`), and an unquoted session-identity word such as `current_user`, `session_user`, `current_role`, `current_catalog` or `current_warehouse`. Each reads session state rather than the row.
 
 Before that, Rocky refuses a fragment that could end the query it is building, or that the five target dialects do not lex the same way:
 
