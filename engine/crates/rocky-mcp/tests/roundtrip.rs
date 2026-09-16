@@ -3828,9 +3828,10 @@ async fn worker_profile_guidance_surfaces_name_no_excluded_tool() {
     // `protocolVersion`, `capabilities` and `serverInfo`, whose
     // `Implementation` has `title` / `description` / `icons` / `websiteUrl`
     // — free text a worker reads before anything else. All four are `None`
-    // under `from_build_env()`, so nothing leaks; the unbacked guarantee was
-    // the defect. The banner is spliced out and nothing else is, because it
-    // is the one surface that names excluded tools on purpose.
+    // under the hand-built `Implementation::new(SERVER_NAME, ..)`, so nothing
+    // leaks; the unbacked guarantee was the defect. The banner is spliced out
+    // and nothing else is, because it is the one surface that names excluded
+    // tools on purpose.
     let mut handshake = serde_json::to_value(
         client
             .peer_info()
@@ -5982,11 +5983,22 @@ async fn served_text_digests(
     // under the old key it moved without moving the golden.
     //
     // Pinning the whole value is CHEAP here, which is why there is no
-    // carve-out. `Implementation::from_build_env()` expands `env!` inside
-    // rmcp, so `serverInfo` is rmcp's own name and version — NOT
-    // rocky-mcp's — and the row therefore does not churn on a Rocky release
-    // bump. It moves on an rmcp upgrade, which is a change that should
-    // force someone to re-read what this server announces.
+    // carve-out — but read what it now costs. Until #1973, `serverInfo` was
+    // built by `Implementation::from_build_env()`, which expands `env!`
+    // inside rmcp, so the value was rmcp's own name and version and this row
+    // moved on an rmcp upgrade and never on a Rocky release. It now carries
+    // Rocky's name and THIS CRATE'S version, so the trade is reversed: an
+    // rmcp bump no longer moves it, and every engine release does.
+    //
+    // That churn is deliberate and it is not a rubber stamp. The version is
+    // served text: a client asking which Rocky it is talking to reads this
+    // field, so a release that changes it SHOULD need someone to say so. The
+    // re-bless is one line of `ROCKY_BLESS_MCP_SERVED_TEXT=1` per release,
+    // and it fails loudly in `just test` during the release pre-flight rather
+    // than silently. What it must never become is reflex: if this row and the
+    // worker one are the only two that moved, and the version is the only
+    // difference, that is the expected release diff — anything else in the
+    // payload moving with them is a real change to read.
     //
     // The banner is NOT spliced out: this golden is about drift, and a
     // banner that changes because the allowlist changed is exactly the kind

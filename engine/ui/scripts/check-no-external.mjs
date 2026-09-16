@@ -53,6 +53,26 @@ export function scan(dir) {
   return problems;
 }
 
+// The layout the server trusts: `index.html` at the root and every other
+// emitted file under `assets/`. `rocky serve --ui` answers the shell for any
+// `/ui/*` path that is not a file EXCEPT under `assets/`, where a miss is a
+// stale bundle and a 404 (`engine/crates/rocky-cli/src/ui.rs`, `serve_asset`).
+// That rule is only right while this layout holds — it is Vite's default
+// `assetsDir`, pinned by nothing else — so a root-level file other than
+// `index.html`, or a second top-level directory, fails the build here.
+export function layoutProblems(dir) {
+  const problems = [];
+  for (const name of readdirSync(dir)) {
+    const path = join(dir, name);
+    if (statSync(path).isDirectory()) {
+      if (name !== "assets") problems.push(`${path}: a top-level directory other than assets/`);
+      continue;
+    }
+    if (name !== "index.html") problems.push(`${path}: a root-level file other than index.html`);
+  }
+  return problems;
+}
+
 const invokedDirectly = process.argv[1] && process.argv[1].endsWith("check-no-external.mjs");
 if (invokedDirectly) {
   const dir = process.argv[2] ?? "dist";
@@ -62,5 +82,13 @@ if (invokedDirectly) {
     for (const p of problems) console.error(`  ${p}`);
     process.exit(1);
   }
-  console.log(`no external loads under ${dir}`);
+  const layout = layoutProblems(dir);
+  if (layout.length > 0) {
+    console.error(
+      "the build's layout is not the one the server trusts (index.html at the root, everything else under assets/):",
+    );
+    for (const p of layout) console.error(`  ${p}`);
+    process.exit(1);
+  }
+  console.log(`no external loads under ${dir}; layout is index.html + assets/`);
 }
