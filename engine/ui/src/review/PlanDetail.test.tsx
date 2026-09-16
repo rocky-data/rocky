@@ -570,7 +570,11 @@ describe("PlanDetail", () => {
       />,
     );
     await screen.findByText("the spec moved");
-    expect(screen.getByText(/Applying this plan would be refused/)).toBeTruthy();
+    // The card must not claim apply refuses a stale plan outright (#2001):
+    // apply compares the flag with the plan's OWN digest, so passing the digest
+    // the plan was planned against applies it. Both directions are named.
+    expect(screen.getByText(/not with the spec\s+on disk/)).toBeTruthy();
+    expect(screen.getByText(/applies it, stale/)).toBeTruthy();
     moved.unmount();
 
     render(

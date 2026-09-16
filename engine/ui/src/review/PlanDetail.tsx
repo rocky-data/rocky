@@ -215,7 +215,9 @@ function SpecDrift({
       sub={
         <>
           Planned against <Clip value={planned} />; the product is now <Clip value={current} />.
-          Applying this plan would be refused, because apply checks the digest.
+          Apply compares the digest you pass with the one this plan carries, not with the spec
+          on disk. Passing the current digest refuses this plan; passing the digest it was
+          planned against applies it, stale. Re-propose against the current spec.
         </>
       }
     />
