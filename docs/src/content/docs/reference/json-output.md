@@ -26,12 +26,14 @@ Read the [exit code](/reference/glossary/#exit-code) alongside the JSON, because
 |---|---|
 | `0` | Success. |
 | `1` | Hard failure — bad config, unreachable warehouse. |
-| `2` | `rocky run`: the run finished and something in it failed. Either some models failed, or an error-severity check failed on a run that had already copied data. `rocky fulfill`: the loop is blocked and needs a human. `rocky product verify`: the product failed verification. |
+| `2` | `rocky run`: the run finished and something in it failed. Either some models failed, or an error-severity check failed on a run that had already copied data. `rocky tick`: a run it launched failed or came back partial. `rocky fulfill`: the loop is blocked and needs a human. `rocky product verify`: the product failed verification. |
 | `3` | `rocky doctor`: at least one health check is critical. `rocky fulfill`: the loop is parked at `applying_unknown`. |
-| `4` | `rocky ci`: compile and tests passed with advisory warnings. `rocky fulfill`: the plan applied and its output is failing a check the product declared. |
+| `4` | `rocky fulfill` only: the plan applied and its output is failing a check the product declared. |
 | `130` | `rocky run` only: you interrupted the run with Ctrl-C. |
 
-A quality pipeline moves no data, so a failed check gate there exits `1`, not `2`.
+A quality pipeline's failed check gate exits `1`, not `2`.
+
+**`rocky ci` and the number `4`.** A warnings-only CI run puts `"exit_code": 4` in its JSON, but the process exits `0`, because compile and the tests passed. Branch on the `exit_code` field if you want to act on advisory warnings. The process status alone will not tell you.
 
 Exit `2` still writes valid JSON to stdout, so parse the payload rather than treating a non-zero code as no output.
 
@@ -296,7 +298,7 @@ The number returned by `bq show -j` is the same value the BigQuery console displ
 | `checks[].name` | string | Check name. See the list below. |
 | `checks[].passed` | boolean | Whether the check passed. |
 | `checks[].severity` | string | `"error"` or `"warning"`. An error-severity failure fails the run when the pipeline's `fail_on_error` is on. |
-| `checks[].not_evaluated` | string | Present only when Rocky could not run the check, carrying the reason. Such a result always has `passed: false` and `severity: "error"`, whatever the config asked for. The one exception passes: a cross-source group whose siblings do not all carry the key column. |
+| `checks[].not_evaluated` | string | Present only when Rocky could not run the check, carrying the reason. Such a result always has `passed: false` and `severity: "error"`, whatever the config asked for. One case passes instead: a cross-source group where exactly one sibling carries the key, so there is nothing to compare. A group where no sibling carries it fails. |
 
 A check name is one of:
 

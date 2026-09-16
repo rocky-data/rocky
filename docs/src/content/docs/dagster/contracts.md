@@ -77,7 +77,7 @@ Rocky's compiler emits a stable code for each kind of contract violation.
 | E011 | ERROR | Column type mismatch | `contract_column_constraints` |
 | E012 | ERROR | Column nullability violated | `contract_column_constraints` |
 | E013 | ERROR | Protected column removed | `contract_protected_columns` |
-| E014 | ERROR | Nullable column the contract does not declare, under `[rules] no_new_nullable` | `contract_column_constraints` |
+| E014 | ERROR | Under `[rules] no_new_nullable`: a nullable column the contract does not declare, or the contract declaring no `[[columns]]` at all, which leaves no baseline for what counts as new | `contract_column_constraints` |
 | W010 | WARN | Contract column not in model output | `contract_column_constraints` |
 
 When a check fails, the `AssetCheckResult` includes:

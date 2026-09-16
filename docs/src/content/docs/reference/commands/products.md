@@ -60,9 +60,12 @@ The command picks the phase itself: Phase A on a fresh product, Phase B once `mo
 
 Every generation commits through staged same-directory writes, journaled, with the lowering manifest renamed **last** as the commit marker. The next run recovers from the journal. If the marker landed, the new generation stands and the staging files are cleaned up. If it did not, the previous generation is restored exactly. The journal is treated as untrusted input during recovery — forged, traversing, symlinked, or foreign entries are refused before anything mutates.
 
-Recovery refuses instead of guessing in three cases, and each keeps the journal so the next run asks the same question:
+Recovery reads the marker first. If it cannot read it at all — a permission fault, a link swapped in — it changes nothing and fails with `commit-io`, because rolling back there would restore backups over a commit that may have succeeded.
 
-- The commit marker is there but cannot be read (a permission fault, a link swapped in). Rocky cannot tell whether the generation committed, so it changes nothing and fails with `commit-io`. Rolling back here would restore backups over a commit that may have succeeded.
+If the marker says the generation **committed**, recovery finishes the job: it deletes each `.ff-staged` and `.ff-prev` sibling and keeps the new files. It does not inspect them, so an orphan `.ff-prev` is removed rather than questioned.
+
+If the marker says it did **not** commit, recovery restores the previous generation, and refuses instead of guessing in two cases. Each keeps the journal, so the next run asks the same question:
+
 - A `.ff-prev` backup exists that the journal does not record. Rocky will not restore a backup it did not create, and fails with `commit-unexpected-backup` naming the file to inspect.
 - A new file is in place that recovery cannot read to identify. It is left alone, with `commit-io`.
 
