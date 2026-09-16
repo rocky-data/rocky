@@ -1,22 +1,26 @@
-import { useState, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import type { DagOutput } from "@rocky-types/dag";
 import type { HistoryOutput } from "@rocky-types/history";
 import type { ModelDetailOutput } from "@rocky-types/model_detail";
+import type { ModelListOutput } from "@rocky-types/model_list";
 import type { ProjectOutput } from "@rocky-types/project";
 import type { ScheduleStatusOutput } from "@rocky-types/schedule_status";
 import { apiGet } from "../api";
 import { StatusCard } from "../components";
 import { DagPanel } from "./DagPanel";
 import { ModelDetail } from "./ModelDetail";
+import { type CompiledModels, compiledModels, isWholeList } from "./nodeRoute";
 import { ProjectStrip } from "./ProjectStrip";
 import { RunsPanel } from "./RunsPanel";
 import { SchedulePanel } from "./SchedulePanel";
 import { type Resource, useResource } from "./useResource";
 
-/** The four producers this screen reads. Tests hand in fixtures. */
+/** The producers this screen reads. Tests hand in fixtures. */
 export interface EstateLoaders {
   project: () => Promise<ProjectOutput>;
   dag: () => Promise<DagOutput>;
+  /** The compiled model set: which DAG nodes the detail route can serve. */
+  models: () => Promise<ModelListOutput>;
   runs: () => Promise<HistoryOutput>;
   schedule: () => Promise<ScheduleStatusOutput>;
   detail: (name: string) => Promise<ModelDetailOutput>;
@@ -25,6 +29,7 @@ export interface EstateLoaders {
 export const defaultLoaders: EstateLoaders = {
   project: () => apiGet<ProjectOutput>("project"),
   dag: () => apiGet<DagOutput>("dag"),
+  models: () => apiGet<ModelListOutput>("models"),
   runs: () => apiGet<HistoryOutput>("runs"),
   schedule: () => apiGet<ScheduleStatusOutput>("schedule"),
   detail: (name) => apiGet<ModelDetailOutput>(`models/${encodeURIComponent(name)}`),
@@ -49,13 +54,25 @@ export function EstateScreen({
 }) {
   const project = useResource(loaders.project, [loaders], refreshMs);
   const dag = useResource(loaders.dag, [loaders]);
+  // Refreshed with the DAG and only with it, so the graph and the set that
+  // decides which of its nodes open are read at the same moment.
+  const models = useResource(loaders.models, [loaders]);
   const runs = useResource(loaders.runs, [loaders], refreshMs);
   const schedule = useResource(loaders.schedule, [loaders], refreshMs);
   const [selected, setSelected] = useState<string | null>(null);
 
+  // Keyed on the list itself, so the set keeps its identity across the
+  // ledger panels' refreshes and the graph is not laid out again for them.
+  const listed = models.kind === "ready" ? models.value : null;
+  const compiled = useMemo<CompiledModels>(
+    () => (listed === null ? "unknown" : compiledModels(listed)),
+    [listed],
+  );
+
   const refreshAll = () => {
     project.reload();
     dag.reload();
+    models.reload();
     runs.reload();
     schedule.reload();
   };
@@ -77,11 +94,14 @@ export function EstateScreen({
         <Loaded resource={project}>{(value) => <ProjectStrip project={value} now={now} />}</Loaded>
       </Panel>
 
-      <Panel title="DAG" producer="GET /api/v1/dag">
+      <Panel title="DAG" producer="GET /api/v1/dag + GET /api/v1/models">
         <Loaded resource={dag}>
           {(value) => (
             <div className={selected ? "grid gap-3 lg:grid-cols-[1fr_360px]" : ""}>
-              <DagPanel dag={value} onSelect={setSelected} />
+              <div>
+                <DagPanel dag={value} compiled={compiled} onSelect={setSelected} />
+                <UnknownCompile models={models} />
+              </div>
               {selected && (
                 <ModelDetail
                   name={selected}
@@ -139,6 +159,35 @@ function Panel({ title, producer, children }: { title: string; producer: string;
       </span>
       {children}
     </section>
+  );
+}
+
+/**
+ * Says so when the compiled model list could not be used, because then no
+ * node is marked as outside the compile and one that is will open onto the
+ * route's refusal. Nothing while the list is loading: that is not a failure.
+ */
+function UnknownCompile({ models }: { models: Resource<ModelListOutput> }) {
+  let reason: string;
+  switch (models.kind) {
+    case "loading":
+      return null;
+    case "ready":
+      if (isWholeList(models.value)) return null;
+      reason = `the list says ${models.value.count} but carries ${models.value.models.length}`;
+      break;
+    case "refused":
+      reason = `refused (${models.error.status}): ${models.error.envelope.code}`;
+      break;
+    case "unreachable":
+      reason = "unreachable";
+      break;
+  }
+  return (
+    <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">
+      Could not read which models the server compiled ({reason}). Every model is offered, and one
+      outside the compile opens onto an error.
+    </p>
   );
 }
 

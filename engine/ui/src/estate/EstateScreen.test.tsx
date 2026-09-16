@@ -1,21 +1,28 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 import type { DagOutput } from "@rocky-types/dag";
 import type { HistoryOutput } from "@rocky-types/history";
 import type { ModelDetailOutput } from "@rocky-types/model_detail";
+import type { ModelListOutput } from "@rocky-types/model_list";
 import type { ProjectOutput } from "@rocky-types/project";
 import type { ScheduleStatusOutput } from "@rocky-types/schedule_status";
 import dagFixture from "@rocky-fixtures/dag.json";
 import historyFixture from "@rocky-fixtures/history.json";
 import mixedDag from "../test/fixtures/dag-mixed-kinds.json";
+import twoPipelinesDag from "../test/fixtures/dag-two-pipelines.json";
+import twoPipelinesModels from "../test/fixtures/model-list-two-pipelines.json";
 import { ApiError } from "../api";
 import { NOT_RECORDED } from "../format";
 import { EstateScreen, type EstateLoaders } from "./EstateScreen";
+import { NOT_COMPILED } from "./ModelNode";
 
 const capturedDag = dagFixture as unknown as DagOutput;
 const capturedHistory = historyFixture as unknown as HistoryOutput;
 /** The captured DAG that has a transformation node in it. See its README. */
 const mixedNodes = (mixedDag as unknown as DagOutput).nodes;
+/** One `rocky serve` whose DAG draws a model its compile does not have. */
+const partDag = twoPipelinesDag as unknown as DagOutput;
+const partModels = twoPipelinesModels as unknown as ModelListOutput;
 
 const NOW = Date.parse("2026-09-05T08:00:00Z");
 
@@ -63,6 +70,7 @@ function loaders(overrides: Partial<EstateLoaders> = {}): EstateLoaders {
   return {
     project: async () => project,
     dag: async () => capturedDag,
+    models: async () => partModels,
     runs: async () => capturedHistory,
     schedule: async () => emptySchedule,
     detail: async (name) => detail(name),
@@ -97,7 +105,7 @@ describe("EstateScreen", () => {
     // governor tabs already use.
     for (const [heading, route] of [
       ["Project", "GET /api/v1/project"],
-      ["DAG", "GET /api/v1/dag"],
+      ["DAG", "GET /api/v1/dag + GET /api/v1/models"],
       ["Runs", "GET /api/v1/runs"],
       ["Schedule", "GET /api/v1/schedule"],
     ]) {
@@ -209,6 +217,71 @@ describe("EstateScreen", () => {
     expect(await screen.findByText("engine_not_ready")).toBeInTheDocument();
     expect(screen.getByText("retry shortly")).toBeInTheDocument();
     expect(await screen.findByRole("table", { name: "Runs" })).toBeInTheDocument();
+  });
+
+  describe("which models open", () => {
+    /** The DAG list's line for one label, once it has rendered. */
+    async function lineFor(label: string): Promise<string> {
+      const list = await screen.findByRole("list", { name: "Models in the DAG" });
+      const line = within(list)
+        .getAllByRole("listitem")
+        .map((item) => item.textContent ?? "")
+        .find((text) => text.startsWith(`${label} (layer`));
+      if (line === undefined) throw new Error(`no line for ${label}`);
+      return line;
+    }
+
+    it("marks a model the server did not compile, from the model list", async () => {
+      render(
+        <EstateScreen loaders={loaders({ dag: async () => partDag })} refreshMs={0} now={NOW} />,
+      );
+      await waitFor(async () => expect(await lineFor("weekly_revenue")).toContain(NOT_COMPILED));
+      expect(await lineFor("raw_orders")).not.toContain(NOT_COMPILED);
+      expect(screen.queryByText(/Could not read which models/)).toBeNull();
+    });
+
+    it("says the list was refused, and marks no model, rather than guessing", async () => {
+      const refused = new ApiError(503, { code: "engine_not_ready", message: "no compile yet" });
+      render(
+        <EstateScreen
+          loaders={loaders({
+            dag: async () => partDag,
+            models: async () => {
+              throw refused;
+            },
+          })}
+          refreshMs={0}
+          now={NOW}
+        />,
+      );
+      expect(
+        await screen.findByText(/Could not read which models the server compiled \(refused \(503\): engine_not_ready\)/),
+      ).toBeInTheDocument();
+      expect(await lineFor("weekly_revenue")).not.toContain(NOT_COMPILED);
+    });
+
+    it("reads a cut list as unknown, so no real model is marked absent", async () => {
+      const cut: ModelListOutput = { ...partModels, count: partModels.count + 1 };
+      render(
+        <EstateScreen
+          loaders={loaders({ dag: async () => partDag, models: async () => cut })}
+          refreshMs={0}
+          now={NOW}
+        />,
+      );
+      expect(await screen.findByText(/the list says 4 but carries 3/)).toBeInTheDocument();
+      expect(await lineFor("weekly_revenue")).not.toContain(NOT_COMPILED);
+    });
+
+    it("reads the model list again when the DAG is refreshed", async () => {
+      const models = vi.fn(async () => partModels);
+      render(
+        <EstateScreen loaders={loaders({ dag: async () => partDag, models })} refreshMs={0} now={NOW} />,
+      );
+      await waitFor(() => expect(models).toHaveBeenCalledTimes(1));
+      fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+      await waitFor(() => expect(models).toHaveBeenCalledTimes(2));
+    });
   });
 
   it("opens a model's detail under the name the route can serve", async () => {
