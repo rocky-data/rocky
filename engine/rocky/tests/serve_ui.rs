@@ -501,6 +501,157 @@ fn wait_for_compiled_models(port: u16) {
     }
 }
 
+/// `--open` hands the system opener EXACTLY the address the server printed,
+/// and an opener that exits non-zero leaves the server serving. The real
+/// binary, a real page, and a fake `open` / `xdg-open` first on `PATH` that
+/// records the one argument it is given. Same skip rule as the page test: it
+/// needs `engine/ui/dist` in the binary.
+///
+/// What it does not pin: that the opener runs only AFTER the bind. That
+/// ordering is a race a test cannot observe from outside without flaking,
+/// and it is pinned in-process by `the_opener_receives_the_printed_address_only_after_ready`
+/// on the readiness latch.
+#[cfg(unix)]
+#[test]
+fn open_hands_the_opener_the_printed_address_and_survives_an_opener_that_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dist_index = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui/dist/index.html");
+    if !dist_index.is_file() {
+        eprintln!(
+            "skipping: {} is absent, so the binary embeds no page",
+            dist_index.display()
+        );
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("project");
+    let out = rocky()
+        .args(["playground", root.to_str().unwrap()])
+        .output()
+        .expect("spawn rocky playground");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let config = root.join("rocky.toml");
+
+    // A fake opener under both names the binary may call on unix. It appends
+    // its first argument to `record` and exits with `code`.
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("bin dir");
+    let install_fake = |record: &std::path::Path, code: i32| {
+        for name in ["open", "xdg-open"] {
+            let path = bin.join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\nexit {code}\n",
+                    record.display()
+                ),
+            )
+            .expect("write the fake opener");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("make the fake opener executable");
+        }
+    };
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let serve_with_open = |port: u16| -> (Server, String) {
+        let mut child = rocky()
+            .current_dir(&root)
+            .env("PATH", &path_env)
+            .args([
+                "--config",
+                config.to_str().unwrap(),
+                "serve",
+                "--ui",
+                "--open",
+                "--token",
+                "s3cret",
+                "--token-scope",
+                "read-only",
+                "--port",
+                &port.to_string(),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn rocky serve --ui --open");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let mut first_line = String::new();
+        BufReader::new(stdout)
+            .read_line(&mut first_line)
+            .expect("read the banner");
+        (Server(child), first_line.trim().to_string())
+    };
+    let free_port = || {
+        TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr")
+            .port()
+    };
+    let recorded = |record: &std::path::Path| -> Vec<String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(record)
+                && !text.trim().is_empty()
+            {
+                return text.lines().map(str::to_string).collect();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the opener was never invoked"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    // An opener that succeeds: it receives the printed address, exactly.
+    let record_ok = dir.path().join("opened-ok.txt");
+    install_fake(&record_ok, 0);
+    let port = free_port();
+    let (server, printed) = serve_with_open(port);
+    let address = printed
+        .strip_prefix("Rocky UI: ")
+        .unwrap_or_else(|| panic!("the banner is the address line: {printed}"))
+        .to_string();
+    assert_eq!(address, format!("http://127.0.0.1:{port}/ui/#token=s3cret"));
+    wait_for_health(port);
+    assert_eq!(
+        recorded(&record_ok),
+        vec![address.clone()],
+        "the opener must receive the printed address, once"
+    );
+    drop(server);
+
+    // An opener that exits 3 ("no application"): invoked with the same
+    // address, and the server still serves and still printed it.
+    let record_fail = dir.path().join("opened-fail.txt");
+    install_fake(&record_fail, 3);
+    let port = free_port();
+    let (server, printed) = serve_with_open(port);
+    assert_eq!(
+        printed,
+        format!("Rocky UI: http://127.0.0.1:{port}/ui/#token=s3cret")
+    );
+    wait_for_health(port);
+    assert_eq!(recorded(&record_fail).len(), 1);
+    let (status, _, _) = http_get(port, "/api/v1/health", "");
+    assert!(
+        status.contains("200"),
+        "a failing opener must not take the server down: {status}"
+    );
+    drop(server);
+}
+
 /// Block until the server answers `/api/v1/health`, or fail the test.
 fn wait_for_health(port: u16) {
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
