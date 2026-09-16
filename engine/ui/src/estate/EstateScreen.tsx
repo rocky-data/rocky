@@ -80,7 +80,20 @@ export function EstateScreen({
   // again for it.
   const fromList: CompiledModels =
     models.kind === "ready" ? compiledModels(models.value) : "unknown";
-  const namesKey = fromList === "unknown" ? null : JSON.stringify([...fromList].sort());
+  const freshKey = fromList === "unknown" ? null : JSON.stringify([...fromList].sort());
+  // The last whole list, kept when a later read fails. A recheck can be
+  // refused (`engine_not_ready` while a recompile fails) or cut. Dropping to
+  // "unknown" then would open every model and stop the rechecks for good, so
+  // a model that is really outside the compile would stay clickable onto a
+  // 404. Tagged with the loaders it came from, so another project never
+  // inherits it.
+  const [lastWhole, setLastWhole] = useState<{ loaders: EstateLoaders; key: string } | null>(null);
+  useEffect(() => {
+    if (freshKey !== null) setLastWhole({ loaders, key: freshKey });
+  }, [freshKey, loaders]);
+  const retainedKey = lastWhole !== null && lastWhole.loaders === loaders ? lastWhole.key : null;
+  const namesKey = freshKey ?? retainedKey;
+  const retained = freshKey === null && retainedKey !== null;
   const compiled = useMemo<CompiledModels>(
     () => (namesKey === null ? "unknown" : new Set(JSON.parse(namesKey) as string[])),
     [namesKey],
@@ -128,7 +141,7 @@ export function EstateScreen({
             <div className={shown ? "grid gap-3 lg:grid-cols-[1fr_360px]" : ""}>
               <div>
                 <DagPanel dag={value} compiled={compiled} onSelect={setSelected} />
-                <UnknownCompile models={models} />
+                <UnknownCompile models={models} retained={retained} />
               </div>
               {shown && (
                 <ModelDetail
@@ -192,11 +205,12 @@ function Panel({ title, producer, children }: { title: string; producer: string;
 }
 
 /**
- * Says so when the compiled model list could not be used, because then no
- * node is marked as outside the compile and one that is will open onto the
- * route's refusal. Nothing while the list is loading: that is not a failure.
+ * Says so when the latest compiled model list could not be used. With an
+ * earlier whole list on hand the graph keeps it; with none, no node is marked
+ * as outside the compile and one that is will open onto the route's refusal.
+ * Nothing while the list is loading: that is not a failure.
  */
-function UnknownCompile({ models }: { models: Resource<ModelListOutput> }) {
+function UnknownCompile({ models, retained }: { models: Resource<ModelListOutput>; retained: boolean }) {
   let reason: string;
   switch (models.kind) {
     case "loading":
@@ -214,8 +228,10 @@ function UnknownCompile({ models }: { models: Resource<ModelListOutput> }) {
   }
   return (
     <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">
-      Could not read which models the server compiled ({reason}). Every model is offered, and one
-      outside the compile opens onto an error.
+      Could not read which models the server compiled ({reason}).{" "}
+      {retained
+        ? "The graph keeps the last list the server gave."
+        : "Every model is offered, and one outside the compile opens onto an error."}
     </p>
   );
 }

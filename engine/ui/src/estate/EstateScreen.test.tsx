@@ -1,5 +1,5 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DagOutput } from "@rocky-types/dag";
 import type { HistoryOutput } from "@rocky-types/history";
 import type { ModelDetailOutput } from "@rocky-types/model_detail";
@@ -273,60 +273,113 @@ describe("EstateScreen", () => {
       expect(await lineFor("weekly_revenue")).not.toContain(NOT_COMPILED);
     });
 
-    it("reads the list again while a model is outside it, until the compile catches up", async () => {
-      // `/dag` reads the disk now; `/models` reads the last compile, which
-      // `serve --watch` replaces a moment later. The mark must not outlive it.
-      const caughtUp: ModelListOutput = {
+    describe("the recheck while a model is outside the compile", () => {
+      // Fake timers, so the interval runs exactly when the test says and a
+      // busy machine cannot make these pass or fail on timing.
+      beforeEach(() => vi.useFakeTimers());
+      afterEach(() => vi.useRealTimers());
+
+      /** Let pending loads settle and effects run, then move the clock. */
+      const advance = (ms: number) => act(() => vi.advanceTimersByTimeAsync(ms));
+
+      /** The DAG list's line for one label, read synchronously. */
+      function line(label: string): string {
+        const list = screen.getByRole("list", { name: "Models in the DAG" });
+        const found = within(list)
+          .getAllByRole("listitem")
+          .map((item) => item.textContent ?? "")
+          .find((text) => text.startsWith(`${label} (layer`));
+        if (found === undefined) throw new Error(`no line for ${label}`);
+        return found;
+      }
+
+      const withWeekly: ModelListOutput = {
         count: partModels.count + 1,
         models: [
           ...partModels.models,
           { name: "weekly_revenue", columns: 2, has_star: false, upstream: [], downstream: [] },
         ],
       };
-      let compiledYet = false;
-      const models = vi.fn(async () => (compiledYet ? caughtUp : partModels));
-      render(
-        <EstateScreen
-          loaders={loaders({ dag: async () => partDag, models })}
-          refreshMs={0}
-          recheckMs={20}
-          now={NOW}
-        />,
-      );
-      await waitFor(async () => expect(await lineFor("weekly_revenue")).toContain(NOT_COMPILED));
 
-      compiledYet = true;
-      await waitFor(async () => expect(await lineFor("weekly_revenue")).not.toContain(NOT_COMPILED));
+      it("reads the list again until the compile catches up, then stops", async () => {
+        // `/dag` reads the disk now; `/models` reads the last compile, which
+        // `serve --watch` replaces a moment later. The mark must not outlive it.
+        let compiledYet = false;
+        const models = vi.fn(async () => (compiledYet ? withWeekly : partModels));
+        render(
+          <EstateScreen
+            loaders={loaders({ dag: async () => partDag, models })}
+            refreshMs={0}
+            recheckMs={5_000}
+            now={NOW}
+          />,
+        );
+        await advance(0);
+        expect(line("weekly_revenue")).toContain(NOT_COMPILED);
+        expect(models).toHaveBeenCalledTimes(1);
 
-      // Nothing is outside the compile now, so the rechecks stop.
-      const settled = models.mock.calls.length;
-      await new Promise((resolve) => setTimeout(resolve, 150));
-      expect(models.mock.calls.length).toBe(settled);
-    });
+        compiledYet = true;
+        await advance(5_000);
+        expect(models).toHaveBeenCalledTimes(2);
+        expect(line("weekly_revenue")).not.toContain(NOT_COMPILED);
 
-    it("does not read the list again when every model in the graph is compiled", async () => {
-      const whole: ModelListOutput = {
-        count: 4,
-        models: ["customer_orders", "raw_orders", "revenue_summary", "weekly_revenue"].map((name) => ({
-          name,
-          columns: 1,
-          has_star: false,
-          upstream: [],
-          downstream: [],
-        })),
-      };
-      const models = vi.fn(async () => whole);
-      render(
-        <EstateScreen
-          loaders={loaders({ dag: async () => partDag, models })}
-          refreshMs={0}
-          recheckMs={20}
-          now={NOW}
-        />,
-      );
-      expect(await lineFor("weekly_revenue")).not.toContain(NOT_COMPILED);
-      await new Promise((resolve) => setTimeout(resolve, 150));
-      expect(models).toHaveBeenCalledTimes(1);
+        // Nothing is outside the compile now, so the rechecks stop.
+        await advance(30_000);
+        expect(models).toHaveBeenCalledTimes(2);
+      });
+
+      it("does not read the list again when every model in the graph is compiled", async () => {
+        const models = vi.fn(async () => withWeekly);
+        render(
+          <EstateScreen
+            loaders={loaders({ dag: async () => partDag, models })}
+            refreshMs={0}
+            recheckMs={5_000}
+            now={NOW}
+          />,
+        );
+        await advance(0);
+        expect(line("weekly_revenue")).not.toContain(NOT_COMPILED);
+        await advance(30_000);
+        expect(models).toHaveBeenCalledTimes(1);
+      });
+
+      it("keeps the last whole list across a refused recheck, and keeps checking", async () => {
+        // A recompile that fails clears the server's compile, so a recheck can
+        // answer `503 engine_not_ready`. Dropping to "unknown" there would open
+        // every model and stop the rechecks, leaving a model that is really
+        // outside the compile clickable onto a 404 for good.
+        const answers: Array<() => ModelListOutput> = [
+          () => partModels,
+          () => {
+            throw new ApiError(503, { code: "engine_not_ready", message: "recompiling" });
+          },
+          () => partModels,
+        ];
+        const models = vi.fn(async () => (answers.shift() ?? (() => partModels))());
+        render(
+          <EstateScreen
+            loaders={loaders({ dag: async () => partDag, models })}
+            refreshMs={0}
+            recheckMs={5_000}
+            now={NOW}
+          />,
+        );
+        await advance(0);
+        expect(line("weekly_revenue")).toContain(NOT_COMPILED);
+
+        await advance(5_000);
+        expect(models).toHaveBeenCalledTimes(2);
+        expect(line("weekly_revenue")).toContain(NOT_COMPILED);
+        expect(
+          screen.getByText(/The graph keeps the last list the server gave\./),
+        ).toHaveTextContent("refused (503): engine_not_ready");
+
+        await advance(5_000);
+        expect(models).toHaveBeenCalledTimes(3);
+        expect(line("weekly_revenue")).toContain(NOT_COMPILED);
+        expect(screen.queryByText(/Could not read which models/)).toBeNull();
+      });
     });
 
     it("reads the model list again when the DAG is refreshed", async () => {
