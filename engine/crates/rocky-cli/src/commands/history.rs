@@ -525,7 +525,7 @@ fn print_audit_table(runs: &[RunRecord]) {
             host_full
         };
         println!(
-            "{:<12} {:<18} {:<8} {:<10} {:<16} {:<20} {:<12}",
+            "{:<24} {:<18} {:<8} {:<10} {:<16} {:<20} {:<12}",
             run_id, identity, source, commit, branch, catalog, host
         );
     }
