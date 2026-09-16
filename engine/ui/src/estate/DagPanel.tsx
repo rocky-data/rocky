@@ -286,8 +286,9 @@ export function DagPanel({
         // who never hovers a node still learns why some do not open.
         <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">
           {notCompiled} model(s), drawn dashed, are not in the server's compile, so they have no
-          detail to open. The server compiles one models directory, and this graph reads every
-          pipeline's.
+          detail to open. A model is outside the compile when it lives in another pipeline's
+          models directory, or when the server has not yet compiled a change on disk. The
+          compiled list is read again every few seconds while this line shows.
         </p>
       )}
     </div>

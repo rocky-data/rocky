@@ -409,6 +409,13 @@ fn the_model_list_names_exactly_the_dag_models_the_detail_route_serves() {
         "the live model list and engine/ui/src/test/fixtures/model-list-two-pipelines.json \
          disagree; recapture it (its README says how)"
     );
+    // The SPA reads a list whose `count` disagrees with its entries as unknown,
+    // and then offers every model. So the capture's `count` is compared too.
+    let fixture = ui_fixture("model-list-two-pipelines.json");
+    assert_eq!(
+        fixture["count"], list["count"],
+        "the captured model list's count disagrees with the live one; recapture it"
+    );
 }
 
 /// Start `rocky serve` on a free loopback port, and return once the project

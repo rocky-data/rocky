@@ -1,16 +1,13 @@
 /**
- * React Flow paints nothing in jsdom until its canvas reports a size, which
- * is why the estate screen's own test drives the detail pane through the
- * loader instead of clicking. These tests give it that size, so the click
- * and the keyboard run against the real canvas and the real nodes.
- *
- * The shims below are local to this file. Vitest isolates each test file, so
- * the rest of the suite still sees the inert `ResizeObserver` from setup.ts.
+ * React Flow paints nothing in jsdom until its canvas reports a size. These
+ * tests give it that size (`installFlowCanvas`), so the click and the keyboard
+ * run against the real canvas and the real nodes.
  */
 import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { DagOutput } from "@rocky-types/dag";
 import type { ModelListOutput } from "@rocky-types/model_list";
+import { installFlowCanvas, nodeElement } from "../test/flowCanvas";
 import mixedDag from "../test/fixtures/dag-mixed-kinds.json";
 import twoPipelinesDag from "../test/fixtures/dag-two-pipelines.json";
 import twoPipelinesModels from "../test/fixtures/model-list-two-pipelines.json";
@@ -19,46 +16,9 @@ import { NODE_HEIGHT, NODE_WIDTH } from "./layout";
 import { NOT_COMPILED } from "./ModelNode";
 import { compiledModels } from "./nodeRoute";
 
-const CANVAS = { width: 800, height: 480 };
-
-/** A ResizeObserver that reports once, so React Flow measures its canvas. */
-class FiringResizeObserver {
-  constructor(private readonly callback: ResizeObserverCallback) {}
-  observe(target: Element): void {
-    const entry = {
-      target,
-      contentRect: { ...CANVAS, x: 0, y: 0, top: 0, left: 0, bottom: 480, right: 800 },
-    } as ResizeObserverEntry;
-    this.callback([entry], this as unknown as ResizeObserver);
-  }
-  unobserve(): void {}
-  disconnect(): void {}
-}
-
-beforeAll(() => {
-  (globalThis as { ResizeObserver?: unknown }).ResizeObserver = FiringResizeObserver;
-  (globalThis as { DOMMatrixReadOnly?: unknown }).DOMMatrixReadOnly = class {
-    m22 = 1;
-  };
-  // jsdom lays nothing out, so every box is 0x0 and React Flow renders no
-  // nodes. Report the node width the card asks for, and a canvas big enough
-  // to hold the graph.
-  Object.defineProperties(HTMLElement.prototype, {
-    offsetWidth: { get(this: HTMLElement) { return parseFloat(this.style.width) || 800; } },
-    offsetHeight: { get(this: HTMLElement) { return parseFloat(this.style.height) || 480; } },
-  });
-  (SVGElement.prototype as unknown as { getBBox: () => DOMRect }).getBBox = () =>
-    ({ x: 0, y: 0, width: 0, height: 0 }) as DOMRect;
-});
+beforeAll(installFlowCanvas);
 
 const captured = mixedDag as unknown as DagOutput;
-
-/** The rendered node wrapper for a DAG node id. */
-function nodeElement(id: string): HTMLElement {
-  const el = document.querySelector(`.react-flow__node[data-id="${id}"]`);
-  if (!el) throw new Error(`no rendered node for ${id}`);
-  return el as HTMLElement;
-}
 
 const MODEL = "transformation:customer_orders";
 const SOURCE = "source:ecommerce";

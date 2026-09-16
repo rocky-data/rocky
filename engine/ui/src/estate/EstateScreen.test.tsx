@@ -273,6 +273,62 @@ describe("EstateScreen", () => {
       expect(await lineFor("weekly_revenue")).not.toContain(NOT_COMPILED);
     });
 
+    it("reads the list again while a model is outside it, until the compile catches up", async () => {
+      // `/dag` reads the disk now; `/models` reads the last compile, which
+      // `serve --watch` replaces a moment later. The mark must not outlive it.
+      const caughtUp: ModelListOutput = {
+        count: partModels.count + 1,
+        models: [
+          ...partModels.models,
+          { name: "weekly_revenue", columns: 2, has_star: false, upstream: [], downstream: [] },
+        ],
+      };
+      let compiledYet = false;
+      const models = vi.fn(async () => (compiledYet ? caughtUp : partModels));
+      render(
+        <EstateScreen
+          loaders={loaders({ dag: async () => partDag, models })}
+          refreshMs={0}
+          recheckMs={20}
+          now={NOW}
+        />,
+      );
+      await waitFor(async () => expect(await lineFor("weekly_revenue")).toContain(NOT_COMPILED));
+
+      compiledYet = true;
+      await waitFor(async () => expect(await lineFor("weekly_revenue")).not.toContain(NOT_COMPILED));
+
+      // Nothing is outside the compile now, so the rechecks stop.
+      const settled = models.mock.calls.length;
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(models.mock.calls.length).toBe(settled);
+    });
+
+    it("does not read the list again when every model in the graph is compiled", async () => {
+      const whole: ModelListOutput = {
+        count: 4,
+        models: ["customer_orders", "raw_orders", "revenue_summary", "weekly_revenue"].map((name) => ({
+          name,
+          columns: 1,
+          has_star: false,
+          upstream: [],
+          downstream: [],
+        })),
+      };
+      const models = vi.fn(async () => whole);
+      render(
+        <EstateScreen
+          loaders={loaders({ dag: async () => partDag, models })}
+          refreshMs={0}
+          recheckMs={20}
+          now={NOW}
+        />,
+      );
+      expect(await lineFor("weekly_revenue")).not.toContain(NOT_COMPILED);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(models).toHaveBeenCalledTimes(1);
+    });
+
     it("reads the model list again when the DAG is refreshed", async () => {
       const models = vi.fn(async () => partModels);
       render(

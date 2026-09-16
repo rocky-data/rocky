@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import type { DagOutput } from "@rocky-types/dag";
 import type { HistoryOutput } from "@rocky-types/history";
 import type { ModelDetailOutput } from "@rocky-types/model_detail";
@@ -9,7 +9,7 @@ import { apiGet } from "../api";
 import { StatusCard } from "../components";
 import { DagPanel } from "./DagPanel";
 import { ModelDetail } from "./ModelDetail";
-import { type CompiledModels, compiledModels, isWholeList } from "./nodeRoute";
+import { type CompiledModels, anyNotCompiled, compiledModels, isWholeList } from "./nodeRoute";
 import { ProjectStrip } from "./ProjectStrip";
 import { RunsPanel } from "./RunsPanel";
 import { SchedulePanel } from "./SchedulePanel";
@@ -39,6 +39,15 @@ export const defaultLoaders: EstateLoaders = {
 export const LEDGER_REFRESH_MS = 30_000;
 
 /**
+ * How often the model list is read again while the graph shows a model
+ * outside it. `/dag` reads the files on disk; `/models` reads the last
+ * compile, which `serve --watch` replaces a moment after a file changes. A
+ * model marked "not compiled" only because the compile had not caught up
+ * then opens within this interval, without a Refresh.
+ */
+export const COMPILE_RECHECK_MS = 5_000;
+
+/**
  * The estate: the DAG, the runs list, the schedule status. Each panel owns
  * its producer's state, so one refused route shows its envelope while the
  * others render.
@@ -46,28 +55,46 @@ export const LEDGER_REFRESH_MS = 30_000;
 export function EstateScreen({
   loaders = defaultLoaders,
   refreshMs = LEDGER_REFRESH_MS,
+  recheckMs = COMPILE_RECHECK_MS,
   now,
 }: {
   loaders?: EstateLoaders;
   refreshMs?: number;
+  recheckMs?: number;
   now?: number;
 }) {
   const project = useResource(loaders.project, [loaders], refreshMs);
   const dag = useResource(loaders.dag, [loaders]);
-  // Refreshed with the DAG and only with it, so the graph and the set that
-  // decides which of its nodes open are read at the same moment.
-  const models = useResource(loaders.models, [loaders]);
+  // Read with the DAG on Refresh, and again on an interval only while the
+  // graph shows a model the list does not have.
+  const [recheck, setRecheck] = useState(false);
+  const models = useResource(loaders.models, [loaders], recheck ? recheckMs : undefined);
   const runs = useResource(loaders.runs, [loaders], refreshMs);
   const schedule = useResource(loaders.schedule, [loaders], refreshMs);
   const [selected, setSelected] = useState<string | null>(null);
+  // Bumped by Refresh, so an open model's detail is read again too.
+  const [generation, setGeneration] = useState(0);
 
-  // Keyed on the list itself, so the set keeps its identity across the
-  // ledger panels' refreshes and the graph is not laid out again for them.
-  const listed = models.kind === "ready" ? models.value : null;
+  // Keyed on the names, not on the list object. Every recheck delivers a new
+  // object; an unchanged set keeps its identity, so the graph is not laid out
+  // again for it.
+  const fromList: CompiledModels =
+    models.kind === "ready" ? compiledModels(models.value) : "unknown";
+  const namesKey = fromList === "unknown" ? null : JSON.stringify([...fromList].sort());
   const compiled = useMemo<CompiledModels>(
-    () => (listed === null ? "unknown" : compiledModels(listed)),
-    [listed],
+    () => (namesKey === null ? "unknown" : new Set(JSON.parse(namesKey) as string[])),
+    [namesKey],
   );
+
+  const outsideCompile = dag.kind === "ready" && anyNotCompiled(dag.value.nodes, compiled);
+  useEffect(() => setRecheck(outsideCompile), [outsideCompile]);
+
+  // An open model the server no longer compiles closes: its node is now
+  // drawn as having no detail, and the pane would contradict it.
+  const shown = selected !== null && (compiled === "unknown" || compiled.has(selected)) ? selected : null;
+  useEffect(() => {
+    if (selected !== null && shown === null) setSelected(null);
+  }, [selected, shown]);
 
   const refreshAll = () => {
     project.reload();
@@ -75,6 +102,7 @@ export function EstateScreen({
     models.reload();
     runs.reload();
     schedule.reload();
+    setGeneration((g) => g + 1);
   };
 
   return (
@@ -97,14 +125,15 @@ export function EstateScreen({
       <Panel title="DAG" producer="GET /api/v1/dag + GET /api/v1/models">
         <Loaded resource={dag}>
           {(value) => (
-            <div className={selected ? "grid gap-3 lg:grid-cols-[1fr_360px]" : ""}>
+            <div className={shown ? "grid gap-3 lg:grid-cols-[1fr_360px]" : ""}>
               <div>
                 <DagPanel dag={value} compiled={compiled} onSelect={setSelected} />
                 <UnknownCompile models={models} />
               </div>
-              {selected && (
+              {shown && (
                 <ModelDetail
-                  name={selected}
+                  key={generation}
+                  name={shown}
                   load={loaders.detail}
                   onClose={() => setSelected(null)}
                 />

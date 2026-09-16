@@ -28,6 +28,13 @@
  * (#2011). Such a node is `not-compiled`. The compiled set is
  * `GET /api/v1/models`, which reads the same compile the detail route reads.
  *
+ * The two reads are not one snapshot. `/dag` reads the files on disk at
+ * request time; `/models` reads the last compile, which `serve --watch`
+ * replaces a moment after a file changes. So a model can be `not-compiled`
+ * only because the compile has not caught up yet. The estate screen reads
+ * the list again while any node is `not-compiled`, so that state corrects
+ * itself instead of lasting until the next Refresh.
+ *
  * When that set is not known (still loading, refused, unreachable), a
  * transformation node stays servable. Not knowing is not evidence that a
  * model is absent: gating on nothing would disable every model on one
@@ -91,6 +98,14 @@ export function nodeRoute(
     return { state: "not-compiled", model: node.label };
   }
   return { state: "servable", model: node.label };
+}
+
+/** Whether any of these nodes is a model the server did not compile. */
+export function anyNotCompiled(
+  nodes: readonly { readonly kind: string; readonly label: string }[],
+  compiled: CompiledModels,
+): boolean {
+  return nodes.some((node) => nodeRoute(node, compiled).state === "not-compiled");
 }
 
 /**
