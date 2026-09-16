@@ -1,6 +1,6 @@
 ---
 title: The Browser UI
-description: "What rocky serve --ui shows: the estate, the review queue, and the governor's brief, custody, audit and product screens. How to open it, and what it can and cannot do."
+description: "What rocky serve --ui shows: eleven areas in a sidebar, five of which open a screen today. How to open it, and what it can and cannot do."
 sidebar:
   order: 5.8
 ---
@@ -9,13 +9,25 @@ sidebar:
 
 ![A tour of the Rocky browser UI: the estate with its DAG, the review queue, an agent's breaking change awaiting a human, the governor brief, a model's custody chain, and a data product's journal](/demo-ui-tour.gif)
 
-The UI ships inside the release binaries and the container image. It has three areas:
+The screenshots and the tour above come from the current release, which still groups the screens under a header of three lanes. The sidebar described below arrives in the next release. No address changed, so every link on this page works in both.
+
+The UI ships inside the release binaries and the container image. A sidebar lists eleven areas. Five open a screen today:
 
 ```
-  Estate     models, the DAG, runs and schedules        what is there
-  Review     plans that need a human, one plan in full  what waits for you
-  Governor   brief, scorecard, custody, audit, products what happened, and why
+  Needs you          what waits for you now
+  Projects           -
+  Estate             models, the DAG, runs and schedules
+  Runs               -
+  Scheduler          -
+  Review             plans that need a human, one plan in full
+  Policies           -
+  Products           each data product, and its journal
+  Governance         scorecard, custody, audit
+  Agents & Clusters  -
+  Settings           -
 ```
+
+The other six are not links. Each shows, under its name, what is true instead. They are listed in [Areas without a screen](#areas-without-a-screen). On a screen narrower than 768 pixels the sidebar folds behind a **Menu** button.
 
 ## Open the UI
 
@@ -37,9 +49,17 @@ A tab opened without the token shows **No token for this tab**. Open the printed
 
 To run the UI somewhere other than your own machine, use the [container image](/guides/run-the-image/) or the [Helm chart](/guides/kubernetes/). The chart serves the UI by default.
 
+## Needs you
+
+The brief is the estate digest that `rocky brief` prints, for a window you pick (7 days by default). It has a card for each part of the digest. The first card, which gives the area its name, is what needs you. The rest are the agents' policy decisions, runs, autonomy (degraded rules and active freezes), cost, drift, freshness, quality and the scheduler.
+
+![The brief: one pending plan under Needs you, ten agent decisions with their capability, effect and rule, two successful runs, no degraded autonomy, and a cost card](/ui-governor-brief.png)
+
+Each card says whether its data was available. A signal the ledger does not hold shows as **not recorded**, never as a zero.
+
 ## Estate
 
-The estate is the first screen. It shows the project as the engine compiled it. The strip at the top names the config file, the pipelines and adapters, the compiled models with their diagnostics, and the newest run.
+The printed address opens Estate, even though Needs you is first in the sidebar. It shows the project as the engine compiled it. The strip at the top names the config file, the pipelines and adapters, the compiled models with their diagnostics, and the newest run.
 
 ![The estate screen for the playground project: a project strip with one transformation pipeline, one DuckDB adapter and three compiled models, the newest run, and a DAG of raw_orders, customer_orders and revenue_summary](/ui-estate.png)
 
@@ -73,17 +93,15 @@ You approve in a terminal, not on the page. The approval marker records a git id
 rocky review <plan-id> --approve
 ```
 
-## Governor
+## Products
 
-The Governor area answers "what did the agents do, and was it allowed?" It has five tabs.
+Products shows each [data product](/reference/commands/products/): its fulfillment loop state, its working spec digest, whether its approval is recorded, and its journal. The journal lists every event the engine recorded for the product, in order.
 
-### Brief
+![The products screen for revenue_daily: the loop state is observing, the approval is recorded, and the journal lists 82 events from ownership acquired through elicitation, spec approval, drafting and repair](/ui-governor-product.png)
 
-The brief is the estate digest that `rocky brief` prints, for a window you pick (7 days by default). It has a card for each part of the digest: what needs you, the agents' policy decisions, runs, autonomy (degraded rules and active freezes), cost, drift, freshness, quality and the scheduler.
+## Governance
 
-![The Governor brief: one pending plan under Needs you, ten agent decisions with their capability, effect and rule, two successful runs, no degraded autonomy, and a cost card](/ui-governor-brief.png)
-
-Each card says whether its data was available. A signal the ledger does not hold shows as **not recorded**, never as a zero.
+Governance answers "what did the agents do, and was it allowed?" It is the one area with tabs of its own: Scorecard, Custody and Audit.
 
 ### Scorecard
 
@@ -99,11 +117,20 @@ Enter a subject to trace its chain of custody. A subject is a model, a run id, a
 
 The audit tab is the whole policy decision ledger, oldest first. Filter it to one product. It matches `rocky audit` and `rocky audit --product <name>`.
 
-### Products
+## Areas without a screen
 
-The products tab shows each [data product](/reference/commands/products/): its fulfillment loop state, its working spec digest, whether its approval is recorded, and its journal. The journal lists every event the engine recorded for the product, in order.
+Six of the eleven areas open nothing today. The sidebar shows each name with the reason under it, as plain text. A reason says where the same information is now, when it is somewhere:
 
-![The Products tab for revenue_daily: the loop state is observing, the approval is recorded, and the journal lists 82 events from ownership acquired through elicitation, spec approval, drafting and repair](/ui-governor-product.png)
+| Area | What the sidebar says |
+|---|---|
+| Projects | One project for now: the one this server runs. |
+| Runs | No page of its own yet. The runs table is on Estate. |
+| Scheduler | No page of its own yet. The schedule status is on Estate. |
+| Policies | No page yet. The engine serves the rules at `/api/v1/policy`. |
+| Agents & Clusters | No page yet. Agent activity is on Needs you. |
+| Settings | No page yet. The engine serves them at `/api/v1/settings`. |
+
+A route with no page is not the same as nothing at all. The two API routes named above answer today, and the [Embedding guide](/guides/embedding/) covers them.
 
 ## What the UI cannot do
 
@@ -111,7 +138,7 @@ The page reads. It does not write.
 
 - **It cannot start a run.** The UI token must be read-only. A read-only token gets `403 forbidden_read_only_token` on `POST /api/v1/jobs/run` and every other token-checked write. The one write route that ignores the token is the webhook route, which checks its own HMAC signature. The page does not hold that secret. To submit jobs over HTTP, run a second `rocky serve` without `--ui`, or use the CLI.
 - **It cannot approve a plan.** Review shows the command. You run it in a terminal.
-- **It cannot change policy.** The Governor screens report decisions. The rules live in the `[policy]` block of `rocky.toml`, and `rocky policy freeze` and `rocky policy unfreeze` are the CLI's only policy writes.
+- **It cannot change policy.** The Governance screens report decisions, and `/api/v1/policy` reads the rules back. The rules themselves live in the `[policy]` block of `rocky.toml`, and `rocky policy freeze` and `rocky policy unfreeze` are the CLI's only policy writes.
 
 ## How the server protects the page
 
