@@ -16,8 +16,9 @@ inserts the delta. `rocky state` confirms the watermark advances.
 
 ## Why it's distinctive
 
-- This is the canonical Rocky `incremental` flow — fully working on local
-  DuckDB after the run-path additions in rocky 0.1.x.
+- This is the canonical Rocky `incremental` flow, and it runs on local DuckDB.
+  Verified on `rocky` 1.74.0: run 2 appends the 25 delta rows, for 525 in the
+  target.
 - All state lives in the embedded `.rocky-state.redb` file. No external metadata DB.
 
 ## Layout

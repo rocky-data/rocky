@@ -56,7 +56,7 @@ schema_template = "out"
 /// Spawn `server` on one end of a duplex pipe and return a connected client.
 ///
 /// The `()` handler requests `ClientInfo::default()`, whose `protocol_version`
-/// is rmcp 3.1.2's `ProtocolVersion::LATEST` — `2025-11-25` today. Every test
+/// is rmcp's `ProtocolVersion::LATEST` — `2025-11-25` today. Every test
 /// in this file that uses `connect` is therefore describing THAT negotiated
 /// version, which matters for `resultType`: see
 /// [`result_type_reaches_a_2026_07_28_client_and_no_other`].
@@ -70,16 +70,24 @@ async fn connect(server: RockyMcpServer) -> rmcp::service::RunningService<rmcp::
     ().serve(client_io).await.expect("client connects")
 }
 
-/// [`connect`], but the client asks for a SPECIFIC protocol version instead of
-/// taking rmcp's default.
+/// A peer on `2026-07-28`, reached the way rmcp 3.2+ allows a client to: over
+/// the `server/discover` lifecycle, with no `initialize` at all.
 ///
 /// `impl ClientHandler for ClientInfo` returns the value itself from
-/// `get_info`, so handing `serve` a `ClientInfo` is the whole mechanism — no
+/// `get_info`, so handing rmcp a `ClientInfo` is the whole mechanism — no
 /// custom handler type is needed.
-async fn connect_at_version(
+///
+/// Under rmcp 3.1 this helper sent an `initialize` naming `2026-07-28` and
+/// the server echoed it. rmcp 3.2 follows the 2026-07-28 versioning spec:
+/// that revision replaced the handshake, so an `initialize` request is a
+/// legacy client whatever version it names, and the server answers it with
+/// its fallback. Naming the version over `initialize` therefore cannot
+/// reach a modern session any more (#1965).
+async fn connect_modern(
     server: RockyMcpServer,
-    protocol_version: rmcp::model::ProtocolVersion,
 ) -> rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientInfo> {
+    use rmcp::service::{ClientLifecycleMode, ClientServiceExt};
+
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
         if let Ok(svc) = server.serve(server_io).await {
@@ -87,9 +95,16 @@ async fn connect_at_version(
         }
     });
     // `ClientInfo::default()` is exactly what the `()` handler in [`connect`]
-    // sends, so the ONLY difference between the two clients is the version.
-    let info = rmcp::model::ClientInfo::default().with_protocol_version(protocol_version);
-    info.serve(client_io).await.expect("client connects")
+    // sends, so the ONLY difference between the two clients is the lifecycle.
+    rmcp::model::ClientInfo::default()
+        .serve_with_lifecycle(
+            client_io,
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+            },
+        )
+        .await
+        .expect("modern client connects over discover")
 }
 
 #[tokio::test]
@@ -3393,17 +3408,17 @@ async fn worker_profile_prompts_end_at_the_runner_handoff() {
         let whole = serde_json::to_string(&result).expect("prompt result serializes");
         // ELEVENTH ROUND, finding 4 — the row's field list in
         // `WORKER_GUIDANCE_SURFACES` named only `messages` and
-        // `description`, while rmcp 3.1.2's `GetPromptResult` also carries
+        // `description`, while rmcp's `GetPromptResult` also carries
         // `resultType` and `_meta`. The list was stale, not the coverage:
         // the sweep below reads the whole value.
         //
         // AND `resultType` IS NOT ON THE WIRE, which the first attempt at
         // this correction asserted the opposite of. `GetPromptResult::new`
-        // does set `Some(ResultType::COMPLETE)`, but `get_info` pins
-        // `ProtocolVersion::V_2024_11_05`, and rmcp's server handler calls
-        // `strip_result_type_for_legacy_peer()` for any peer older than
-        // `2026-07-28`. So the field is defined, set, and then cleared
-        // before it is serialized.
+        // does set `Some(ResultType::COMPLETE)`, but this client connected
+        // with `initialize`, which rmcp 3.2+ always answers with a version
+        // older than `2026-07-28`, and rmcp's server handler calls
+        // `strip_result_type_for_legacy_peer()` for such a peer. So the
+        // field is defined, set, and then cleared before it is serialized.
         //
         // Pinned in the direction that is TRUE, so a protocol-version bump
         // fails here and the row gets re-read rather than quietly gaining a
@@ -3418,8 +3433,9 @@ async fn worker_profile_prompts_end_at_the_runner_handoff() {
         );
         assert!(
             shape.get("resultType").is_none(),
-            "`resultType` is stripped for peers older than 2026-07-28, and this server \
-             pins 2024-11-05 — if it is on the wire the negotiated version moved, and \
+            "`resultType` is stripped for peers older than 2026-07-28, and an \
+             `initialize` peer always negotiates one — if it is on the wire this client \
+             discovered instead, or a request declared 2026-07-28 in its own _meta, and \
              row 3's field list needs re-reading: {whole}"
         );
         assert_eq!(
@@ -3812,9 +3828,10 @@ async fn worker_profile_guidance_surfaces_name_no_excluded_tool() {
     // `protocolVersion`, `capabilities` and `serverInfo`, whose
     // `Implementation` has `title` / `description` / `icons` / `websiteUrl`
     // — free text a worker reads before anything else. All four are `None`
-    // under `from_build_env()`, so nothing leaks; the unbacked guarantee was
-    // the defect. The banner is spliced out and nothing else is, because it
-    // is the one surface that names excluded tools on purpose.
+    // under the hand-built `Implementation::new(SERVER_NAME, ..)`, so nothing
+    // leaks; the unbacked guarantee was the defect. The banner is spliced out
+    // and nothing else is, because it is the one surface that names excluded
+    // tools on purpose.
     let mut handshake = serde_json::to_value(
         client
             .peer_info()
@@ -4969,11 +4986,14 @@ async fn compile_rejects_unknown_target_dialect() {
 ///
 /// The fifteenth round corrected a false justification in `tools.rs`: the
 /// server does NOT pin `2024-11-05`, it advertises rmcp's whole
-/// `KNOWN_VERSIONS` list, and `negotiate_protocol_version` hands a client back
-/// whatever it asked for when the server supports it. So a client that
-/// requests `2026-07-28` gets it, `sep_2322_supported` is true,
-/// `strip_result_type_for_legacy_peer()` is skipped, and `resultType` reaches
-/// that client.
+/// `KNOWN_VERSIONS` list, and under rmcp 3.1 `negotiate_protocol_version`
+/// handed a client back whatever it asked for when the server supported it.
+/// So a client that requested `2026-07-28` over `initialize` got it,
+/// `sep_2322_supported` was true, `strip_result_type_for_legacy_peer()` was
+/// skipped, and `resultType` reached that client. (Since rmcp 3.2 the same
+/// request over `initialize` is answered with a handshake version; a peer
+/// reaches `2026-07-28` over the discover lifecycle, `Discover` or `Auto`,
+/// or by declaring it in a request's own `_meta`. See `connect_modern`.)
 ///
 /// That correction was right and completely unexercised: every roundtrip in
 /// this file connects with rmcp's default `()` handler, which asks for
@@ -4997,8 +5017,9 @@ async fn compile_rejects_unknown_target_dialect() {
 /// Only the pair distinguishes "negotiated per peer" from either extreme.
 ///
 /// The negotiated version is asserted first on each connection, because
-/// `result_type` says nothing if the handshake did not land where the test
-/// thinks it did.
+/// `result_type` says nothing if the lifecycle did not land where the test
+/// thinks it did. The modern peer discovers rather than initializes, which
+/// is the only route to `2026-07-28` since rmcp 3.2 (see `connect_modern`).
 ///
 /// This does not change what the server SPEAKS. Closing the gap by
 /// construction would mean narrowing `supported_protocol_versions`, which is a
@@ -5011,22 +5032,21 @@ async fn result_type_reaches_a_2026_07_28_client_and_no_other() {
     write_project(dir.path(), &dir.path().join("test.duckdb"));
     let config_path = dir.path().join("rocky.toml");
 
-    // 1. A client that ASKS for 2026-07-28 is given it, and keeps `resultType`.
-    let modern = connect_at_version(
-        RockyMcpServer::new(config_path.clone()),
-        ProtocolVersion::V_2026_07_28,
-    )
-    .await;
+    // 1. A client that DISCOVERS at 2026-07-28 is given it, and keeps
+    //    `resultType`. Over `initialize` the same request would be answered
+    //    with the server's legacy fallback (rmcp 3.2+), so the discover
+    //    lifecycle is the only way to reach this branch.
+    let modern = connect_modern(RockyMcpServer::new(config_path.clone())).await;
     let negotiated = modern
         .peer_info()
-        .expect("the server returned an initialize result")
+        .expect("the server answered discover")
         .protocol_version
         .clone();
     assert_eq!(
         negotiated,
         ProtocolVersion::V_2026_07_28,
         "the server advertises rmcp's whole KNOWN_VERSIONS list and does not \
-         override supported_protocol_versions, so a client asking for \
+         override supported_protocol_versions, so a client discovering at \
          2026-07-28 must be given it; if this fails the rest of the test is \
          measuring the wrong session"
     );
@@ -5087,6 +5107,59 @@ async fn result_type_reaches_a_2026_07_28_client_and_no_other() {
     );
 
     legacy.cancel().await.unwrap();
+}
+
+/// The fallback `get_info` supplies is what an `initialize` naming
+/// `2026-07-28` gets under rmcp 3.2+, and it is the NEWEST handshake version,
+/// not the oldest (#1965). Nothing else exercised that value: the default
+/// client names `2025-11-25` and is echoed, the discover peer never sees the
+/// fallback, and rocky-fulfill's driver names `2024-11-05` and is echoed. So
+/// reverting the fallback to `V_2024_11_05` passed every other test; this one
+/// fails on it.
+///
+/// Such a client is also a legacy peer once answered, so `resultType` is
+/// withheld from it, which is the half of the claim the changelog makes.
+#[tokio::test]
+async fn an_initialize_that_names_2026_07_28_is_answered_with_the_newest_handshake_version() {
+    use rmcp::model::ProtocolVersion;
+
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if let Ok(svc) = server.serve(server_io).await {
+            let _ = svc.waiting().await;
+        }
+    });
+    let asked_too_much = rmcp::model::ClientInfo::default()
+        .with_protocol_version(ProtocolVersion::V_2026_07_28)
+        .serve(client_io)
+        .await
+        .expect("an initialize naming 2026-07-28 is still answered");
+
+    let negotiated = asked_too_much
+        .peer_info()
+        .expect("the server returned an initialize result")
+        .protocol_version
+        .clone();
+    assert_eq!(
+        negotiated,
+        ProtocolVersion::V_2025_11_25,
+        "an `initialize` cannot land on 2026-07-28 (rmcp 3.2+), and the fallback this \
+         server supplies is the newest version that still has a handshake, not the oldest"
+    );
+    let result = asked_too_much
+        .call_tool(CallToolRequestParams::new("compile"))
+        .await
+        .expect("compile call returns a result");
+    assert_eq!(
+        result.result_type, None,
+        "a peer answered with a handshake version is legacy, so resultType is withheld: \
+         {result:?}"
+    );
+    asked_too_much.cancel().await.unwrap();
 }
 
 /// SIXTEENTH ROUND, finding 1 — the two tools that read `self.config_path`
@@ -5910,11 +5983,22 @@ async fn served_text_digests(
     // under the old key it moved without moving the golden.
     //
     // Pinning the whole value is CHEAP here, which is why there is no
-    // carve-out. `Implementation::from_build_env()` expands `env!` inside
-    // rmcp, so `serverInfo` is rmcp's own name and version — NOT
-    // rocky-mcp's — and the row therefore does not churn on a Rocky release
-    // bump. It moves on an rmcp upgrade, which is a change that should
-    // force someone to re-read what this server announces.
+    // carve-out — but read what it now costs. Until #1973, `serverInfo` was
+    // built by `Implementation::from_build_env()`, which expands `env!`
+    // inside rmcp, so the value was rmcp's own name and version and this row
+    // moved on an rmcp upgrade and never on a Rocky release. It now carries
+    // Rocky's name and THIS CRATE'S version, so the trade is reversed: an
+    // rmcp bump no longer moves it, and every engine release does.
+    //
+    // That churn is deliberate and it is not a rubber stamp. The version is
+    // served text: a client asking which Rocky it is talking to reads this
+    // field, so a release that changes it SHOULD need someone to say so. The
+    // re-bless is one line of `ROCKY_BLESS_MCP_SERVED_TEXT=1` per release,
+    // and it fails loudly in `just test` during the release pre-flight rather
+    // than silently. What it must never become is reflex: if this row and the
+    // worker one are the only two that moved, and the version is the only
+    // difference, that is the expected release diff — anything else in the
+    // payload moving with them is a real change to read.
     //
     // The banner is NOT spliced out: this golden is about drift, and a
     // banner that changes because the allowlist changed is exactly the kind

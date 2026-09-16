@@ -44,24 +44,32 @@ Rocky tries the credentials in a fixed order and uses the first one the config s
 
 So a config that sets both `pat` and `password` authenticates with the PAT, and never uses the password.
 
+Pick one. Each example is a complete adapter declaration, not a complete `rocky.toml`. These three are not the full set: Rocky also accepts an `oauth_token`, which the order above ranks second.
+
+**Programmatic Access Token (PAT).** Use this for trial accounts and scripts. Issue the token in Snowsight.
+
 ```toml
-# Programmatic Access Token (PAT) auth — recommended for trial accounts and
-# scripts; issue via Snowsight → User Profile → Personal Access Tokens.
 [adapter.snow]
 type = "snowflake"
 account = "${SNOWFLAKE_ACCOUNT}"
 warehouse = "COMPUTE_WH"
 pat = "${SNOWFLAKE_PAT}"
+```
 
-# Key-pair JWT auth — recommended for production (rotateable, scoped per user).
+**Key-pair JWT.** Use this in production. You can rotate the key, and it is scoped to one user.
+
+```toml
 [adapter.snow]
 type = "snowflake"
 account = "${SNOWFLAKE_ACCOUNT}"
 warehouse = "COMPUTE_WH"
 username = "${SNOWFLAKE_USER}"
 private_key_path = "${SNOWFLAKE_KEY_PATH}"
+```
 
-# Password auth
+**Password.**
+
+```toml
 [adapter.snow]
 type = "snowflake"
 account = "${SNOWFLAKE_ACCOUNT}"

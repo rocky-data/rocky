@@ -56,7 +56,9 @@ freshness = { threshold_seconds = 86400 }
 
 Compares `COUNT(*)` between the source and target tables. The check passes when the counts match.
 
-Rocky batches these queries with `UNION ALL` rather than running one per table. A naive approach costs 5N queries for N tables. Batching up to 200 tables per query brings a typical pipeline down to about 3 queries. Freshness checks batch the same way.
+On Databricks, Rocky batches these queries with `UNION ALL` rather than running one per table. A naive approach costs 5N queries for N tables. Batching up to 200 tables per query brings a typical pipeline down to about 3 queries. Freshness batches the same way.
+
+No other warehouse batches these two checks today. Snowflake and BigQuery batch the schema describe only, and run row count and freshness one query per table, as every other adapter does.
 
 ```json
 {
@@ -69,7 +71,7 @@ Rocky batches these queries with `UNION ALL` rather than running one per table. 
 
 ### Column Match
 
-Compares the source and target column sets, ignoring case, and reports any missing or extra column. It reuses the columns cached by drift detection, so it costs no extra query.
+Compares the source and target column sets, ignoring case, and reports any missing or extra column. Rocky reads both column lists again after the copy, one schema read per side, so the check costs two extra metadata queries per table. It reads them after the copy so it sees the schema the copy produced, including a column the run itself added. A read that fails is retried once, but only when the adapter classifies the failure as retryable and it is not a rate limit. A rate limit, a permanent error, or a second failure reports the check as not evaluated instead of comparing against a list nobody read.
 
 ```json
 {
@@ -82,7 +84,7 @@ Compares the source and target column sets, ignoring case, and reports any missi
 
 ### Freshness
 
-Measures how long ago the table last received data, by comparing `MAX(timestamp_column)` against the current time. A table that has seen nothing new within the threshold is flagged.
+Measures how long ago the table last received data, by comparing `MAX(timestamp_column)` against the current time. When there is a timestamp to measure, a table that has seen nothing new within the threshold is flagged. It is not always measured — see below.
 
 ```json
 {
@@ -92,6 +94,20 @@ Measures how long ago the table last received data, by comparing `MAX(timestamp_
   "threshold_seconds": 86400
 }
 ```
+
+**An empty table emits no freshness check.** `MAX()` answers `NULL` over no rows, and there is nothing to be fresh. Rocky asks for `COUNT(*)` in the same query, so a non-empty table whose timestamp column holds no value is told apart from an empty one: that case is reported as a failed `freshness_not_evaluated` check whose reason gives the row count, because rows exist and nothing says how fresh they are.
+
+A freshness query that **fails**, or that returns a cell Rocky cannot read as a timestamp or as a count, is reported the same way. Of the tables Rocky queries, only an empty one goes silent.
+
+A table can also go silent without any query at all. `prune_unchanged` is off by default. With it on, and only where the adapter can report a source change-marker, a table whose source has not changed skips its data checks entirely — freshness included. [Schema drift](/concepts/schema-drift/) covers pruning and what it takes.
+
+In the CLI's JSON, that silence looks the same as a table with no `freshness` configured: the check is absent, not failing.
+
+Dagster is different. In Pipes mode nothing is filled in, so the check is absent there as it is in the JSON.
+
+Outside Pipes mode a configured check has a declared spec, so Dagster never leaves it blank: it fills the gap with a placeholder, and what the placeholder says depends on why the result is missing. A **pruned** table carries forward its last recorded verdict, or passes with a note saying it was never checked. A table that was checked and produced no freshness result fails at `WARN` severity, marked `not produced by rocky`. A table that was never materialized fails at `WARN` too, with its own reason.
+
+If freshness matters for a table, confirm its `timestamp_column` is populated: a table with rows and no value in that column fails its freshness check as not evaluated until it is.
 
 ### Null Rate
 
@@ -154,7 +170,7 @@ filter = "region = 'US'"
 |---|---|---|---|
 | `not_null` | row | — | Column contains no NULL values. |
 | `unique` | set | — | Column contains only unique values. |
-| `unique_expr` | set | `key_expr: String` | A derived **key expression** is unique across rows (`GROUP BY <expr> HAVING COUNT(*) > 1`). For when the meaningful identity is a *computed* value (e.g. a surrogate built to be stable across a multi-tenant union) that neither `unique` (single column) nor `composite` (column tuple) can express. `key_expr` is passed through as written (like `expression`), subject to the one narrow refusal described under **Filters**. NULL keys are not excluded — use `filter` to scope them out. |
+| `unique_expr` | set | `key_expr: String` | A derived **key expression** is unique across rows (`GROUP BY <expr> HAVING COUNT(*) > 1`). For when the meaningful identity is a *computed* value (e.g. a surrogate built to be stable across a multi-tenant union) that neither `unique` (single column) nor `composite` (column tuple) can express. `key_expr` goes through the same gate as `expression`, plus the two key-position rules under **Filters**. NULL keys are not excluded — use `filter` to scope them out. |
 | `accepted_values` | row | `values: [String]` | Every non-NULL value is in the fixed set. |
 | `relationships` | row | `to_table`, `to_column` | Every non-NULL value exists in `to_table.to_column` (referential integrity). |
 | `expression` | row | `expression: String` | Custom SQL boolean predicate must hold per row. Bounded: one expression over the row's own columns, calling only allowlisted pure scalar functions — no subquery, no qualified function. See **Filters** below. |
@@ -174,22 +190,32 @@ The set-based, table-level, and referential assertions (`unique`, `unique_expr`,
 
 Each assertion takes an optional `severity`, either `error` (the default) or `warning`. Each pipeline takes an optional `fail_on_error`, which defaults to `true`.
 
-- `severity = "error"` + `fail_on_error = true` — a failing assertion exits the pipeline non-zero. That is code 2, partial success, if other tables succeeded.
+- `severity = "error"` + `fail_on_error = true` — a failing assertion fails the run. A replication run that already copied data exits `2`, partial success. A quality pipeline's failed check gate exits `1`.
 - `severity = "warning"` — a failing assertion appears in `check_results[]` with `passed = false` and `severity = "warning"`. It never fails the pipeline.
 - `fail_on_error = false` at the pipeline level downgrades every `error` to a non-fatal result. Use it for shadow runs and observation modes.
 
 For the replication checks, `severity` describes a check that ran and found a problem. It does not apply to a check Rocky could not run at all.
 
-A check whose query fails is reported with `passed = false` and a `not_evaluated` field saying why. For `row_count`, `freshness`, `null_rate` and `[[checks.custom]]`, that result always carries `severity = "error"`, whatever the config says, so it fails the run.
+A check whose query fails is reported with `passed = false` and a `not_evaluated` field saying why. That result always carries `severity = "error"`, whatever the config says, so it fails the run while `fail_on_error` is on. This holds for every kind: `row_count`, `column_match`, `freshness`, `null_rate`, `[[checks.custom]]`, `[[assertions]]`, `cross_source_overlap`, and a quarantine plan Rocky could not compile.
 
 ```
 the query answers, the data is bad   -> your severity   (warning stays advisory)
-the query never ran                  -> always error    (the run fails)
+the query never ran                  -> always error    (gates, unless
+                                                         fail_on_error = false)
 ```
 
 The two say different things. Writing `severity = "warning"` on `freshness` means "a stale table is only a warning". It does not mean "a freshness query I could not run is only a warning" — that is an unknown, not a tolerated result.
 
-`cross_source_overlap` and the `[[assertions]]` blocks differ today: their unevaluated results carry the configured severity, so `severity = "warning"` does keep an unevaluated one advisory there. That difference is a known gap, not a design — see [#1741](https://github.com/rocky-data/rocky/issues/1741).
+One result is the exception, and it is not a failure. Rocky counts how many siblings in a `cross_source_overlap` group carry the key, then splits three ways:
+
+```
+0 siblings carry the key  -> not evaluated, error severity, fails   (a typo)
+1 sibling carries it      -> passes, your severity, does not gate   (nothing
+                                                                     to compare)
+2 or more carry it        -> measured across those siblings, and it can fail
+```
+
+So a group of three where two share a duplicate key still fails, even though the third sibling has no such column. A group whose query failed, or whose key expression was refused, is an unevaluated failure like every other kind.
 
 ```toml
 [pipeline.silver.checks]
@@ -254,30 +280,56 @@ min = "0"
 filter = "region = 'US' AND status != 'cancelled'"
 ```
 
-The filter is your SQL. You are responsible for making it valid in the target dialect. Rocky validates identifiers inside structured parameters, such as columns and values, but it passes the filter expression through as written.
+The filter is your SQL, and it must be valid in the target dialect. Rocky does not rewrite it. It does check it, with one gate that covers these fields:
 
-One check does apply, to `filter`, `expression` and `key_expr` alike. Rocky refuses a fragment that could end the query it is building, and refuses anything it cannot read the same way on every warehouse it targets:
+- an assertion's `filter` and its `expression`;
+- a `unique_expr` `key_expr` and a `cross_source_overlap` `key_expr`;
+- the same `expression` and `filter` again when quarantine lowers that assertion into its own statements. `[checks.quarantine]` itself takes only `enabled`, `mode` and the two suffixes;
+- a `metadata_columns[].value`;
+- a check an agent drafts through the `draft_check` MCP tool, which parses under the generic dialect because it has no target yet.
+
+One config field is **not** gated: a `[[checks.custom]]` `sql` query. Rocky substitutes `{target}` into it and runs it as written, so treat a custom check as code you are running.
+
+Rocky parses the fragment under the target dialect and accepts exactly one expression over the row's own columns. It refuses:
+
+- anything left over after that one expression, so the fragment cannot close the parenthesis Rocky wraps it in and add clauses of its own;
+- any subquery, in any position;
+- any qualified function name, such as `schema.fn(...)` — that is how user-defined, remote and plugin functions are reached;
+- any function that is not on Rocky's allowlist of pure scalar functions;
+- a lambda, because its body is the same question one level down;
+- a placeholder (`$name`, `$1`, `?`), and an unquoted session-identity word such as `current_user`, `session_user`, `current_role`, `current_catalog` or `current_warehouse`. Each reads session state rather than the row.
+
+Before that, Rocky refuses a fragment that could end the query it is building, or that the five target dialects do not lex the same way:
 
 - a statement terminator `;` outside a string literal, a quoted identifier or a comment — including a trailing one;
 - an unbalanced quote, or a `/* */` comment that never closes;
-- a backslash inside a quoted literal, a triple-quoted string, a `$$…$$` dollar quote, a backtick, a `//` comment, or a nested `/*`. Snowflake, Databricks, BigQuery, DuckDB and Trino do not agree on these, so Rocky refuses rather than guess which reading applies.
+- a backslash inside a quoted literal, a triple-quoted string, a `$$…$$` dollar quote, a backtick, a `//` or `#` line comment, or a nested `/*`. Snowflake, Databricks, BigQuery, DuckDB and Trino do not agree on these, so Rocky refuses rather than guess which reading applies.
 
-The check runs when Rocky builds the query, and it names the field and the table so you know which line to fix.
+Comparisons, `CASE`, `CAST`, `BETWEEN`, `IN (...)` with literals, and functions such as `coalesce`, `nullif`, `abs`, `round`, `length`, `lower`, `upper`, `trim`, `regexp_like`, `md5` and `date_trunc` pass. Functions that read a file, a secret, a session variable or a remote endpoint do not, whatever their name looks like — DuckDB's `read_text`, Snowflake's `GETVARIABLE` and Databricks' `secret` all sit in ordinary scalar position and are refused by name.
 
-Be clear about what this check does not do. It stops the fragment ending Rocky's statement and starting another. It does **not** make the fragment a single expression: Rocky does not track parentheses here, so a `filter` or `key_expr` can still close the parenthesis Rocky wraps it in and add its own clauses. And it does not limit what a `filter` or `key_expr` may read — a subquery runs with the same warehouse credentials as the rest of the pipeline. Treat those two as code you are running, because they are.
+Two positions add a rule, because the expression is used differently there:
 
-`expression` gets a second, stronger gate. Rocky parses it under the target dialect and refuses it unless it is exactly one boolean expression over the row's own columns:
+| Position | Extra rule |
+|---|---|
+| `unique_expr` `key_expr`, `cross_source_overlap` `key_expr` | No clock function (`now()`, `current_timestamp`), and no `COLLATE`. A value that changes between evaluations is not a key, and a collation changes what equality means. |
+| A quarantine `expression` or `filter` under `mode = "split"` | No clock function. Split runs two statements, so `created_at <= now()` can put one boundary row in both outputs. `drop` and `tag` run one statement each and accept a clock function, as an ordinary check `filter` does. |
 
-- anything left over after one expression — so it cannot close Rocky's parenthesis and add clauses;
-- any subquery, in any position;
-- any qualified function name, such as `schema.fn(...)` — that is how user-defined, remote and plugin functions are reached;
-- any function that is not on Rocky's allowlist of pure scalar functions.
+`random()` and `uuid()` need no rule here. Neither is on the allowlist, so both are refused in every position.
 
-Comparisons, `CASE`, `CAST`, `BETWEEN`, `IN (...)` with literals, and functions such as `coalesce`, `nullif`, `abs`, `round`, `length`, `lower`, `upper`, `trim`, `regexp_like`, `now` and `date_trunc` pass. Functions that read a file, a secret, a session variable or a remote endpoint do not, whatever their name looks like — DuckDB's `read_text`, Snowflake's `GETVARIABLE` and Databricks' `secret` all sit in ordinary scalar position and are refused by name. The refusal names the function. The gate runs when Rocky builds the test SQL, before anything executes, so a refused check is reported as refused rather than silently skipped. The same gate runs when an agent authors a check through the `draft_check` MCP tool, so a bad expression is refused when written.
+Split mode refuses one more thing for the same reason: an **error-severity** `not_in_future` or `older_than_n_days` assertion on the split table. Rocky generates the same clock comparison for those two kinds. Both work under `drop` and `tag`, and a warning-severity one never lowers into the split, so it is unaffected.
+
+The gate runs before anything executes, and how a refusal reaches you depends on the field:
+
+| Field | What a refusal does |
+|---|---|
+| An assertion `filter` or `expression`, a `key_expr` | The check is reported as failing at error severity, with a `not_evaluated` reason naming the field, the table and the construct to remove. |
+| A quarantine `expression` or `filter` | Reported the same way under the name `quarantine:compile`. The table is materialized and left unsplit. |
+| `metadata_columns[].value` | The config load fails, so no command runs. |
+| The `draft_check` MCP tool | The tool refuses the write, so the bad check is never saved. |
 
 ### Row quarantine
 
-A row-level assertion can move its failing rows aside instead of only reporting a count. Configure quarantine at the pipeline level:
+A row-level assertion can move its failing rows aside instead of only reporting a count. Configure quarantine on a `quality` pipeline. Rocky ignores the block on any other pipeline type:
 
 ```toml
 [pipeline.silver.checks.quarantine]
@@ -328,7 +380,7 @@ max_overlap_rows = 0          # any overlap fails; raise to tolerate a known set
 sample = 20                   # overlapping keys attached to the result for triage
 ```
 
-Give exactly one of `keys` (a column tuple) or `key_expr` (a derived SQL expression, passed through as written). This mirrors `unique` and `unique_expr`.
+Give exactly one of `keys` (a column tuple) or `key_expr` (a derived SQL expression). This mirrors `unique` and `unique_expr`, and `key_expr` goes through the same gate, including the two key-position rules under [Per-assertion `filter`](#per-assertion-filter).
 
 **How it works.** The runner buckets the pipeline's managed source tables into **sibling groups**. Siblings share a source type and a table name, and they landed in more than one target schema. That is the tenant or region fan-out that gets unioned downstream. Rocky tags each sibling's rows with its source identity and runs:
 

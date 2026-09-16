@@ -224,15 +224,25 @@ fn prepare_preview(
         macro_defs,
     } = admit_model(&result, models_dir, model)?;
 
-    // Resolve which output columns must be masked (workspace-default env).
+    // Resolve which output columns must be masked (workspace-default env),
+    // and which classified columns this preview cannot mask at all.
     let masks = rocky_cfg.resolve_mask_for_env(None);
-    let mut masked: BTreeMap<String, MaskStrategy> = BTreeMap::new();
-    for (col, tag) in &m.config.classification {
-        if let Some(&strat) = masks.get(tag)
-            && strat != MaskStrategy::None
-        {
-            masked.insert(col.clone(), strat);
-        }
+    let MaskResolution { masked, unresolved } = resolve_classified_columns(
+        &m.config.classification,
+        &masks,
+        &rocky_cfg.classifications.allow_unmasked,
+    );
+
+    // Fail closed. A tag that resolves only under `[mask.<env>]` is absent
+    // from `resolve_mask_for_env(None)`, which used to leave `masked` empty
+    // and send the plain SELECT — the raw values of a column the project
+    // classified. W004 does not catch it either: its coverage set counts a
+    // key found in ANY env-override table, so an env-only entry warns
+    // nothing. Refusing here is the same fail-safe the CTE and ad-hoc paths
+    // already take, and it is the one a browser holding a read-only token
+    // reaches (#2029).
+    if !unresolved.is_empty() {
+        return Err(unresolved_masking_failure(model, &unresolved));
     }
 
     // CTE side-door: a CTE's intermediate columns carry no classification, so
@@ -481,6 +491,100 @@ fn pipeline_target_adapter(pipeline: &PipelineConfig) -> String {
 /// most `limit` rows, regardless of any inner `LIMIT`/`ORDER BY`.
 fn wrap_with_limit(inner: &str, limit: u32) -> String {
     format!("SELECT * FROM ({inner}) AS rocky_preview LIMIT {limit}")
+}
+
+/// How a model's classified columns resolve against the masks in force for
+/// this preview.
+struct MaskResolution {
+    /// Column → the strategy that will replace its value.
+    masked: BTreeMap<String, MaskStrategy>,
+    /// Classified columns with NO applicable strategy, as `(column, tag)`.
+    /// Non-empty means the preview must refuse: returning them would hand the
+    /// caller the raw values of a column the project classified (#2029).
+    unresolved: Vec<(String, String)>,
+}
+
+/// Split a model's `[classification]` columns into "will be masked" and
+/// "cannot be masked", given the strategies `resolve_mask_for_env` produced
+/// and the operator's `[classifications.allow_unmasked]` list.
+///
+/// Three inputs, no I/O, so the four configurations a project can be in are
+/// testable directly:
+///
+/// ```text
+///   [mask] pii = "hash"        → masked      the tag has a workspace default
+///   [mask] internal = "none"   → neither     raw ON PURPOSE: `none` is
+///                                            "explicit identity (not a gap; a
+///                                            policy decision)" in the config's
+///                                            own words, and `inline_mask_expr`
+///                                            returns no expression for it
+///   [mask.prod] pii = "hash"   → UNRESOLVED  env overrides do not apply here,
+///                                            and W004 stays silent about it
+///   no [mask] entry            → UNRESOLVED  W004 warns, but warnings do not gate
+///   allow_unmasked = ["pii"]   → neither     raw ON PURPOSE, the same list that
+///                                            suppresses W004
+/// ```
+///
+/// The distinction the refusal draws is **written down or not**, never
+/// "masked or not": a tag an operator answered — with a strategy, with `none`,
+/// or by listing it under `allow_unmasked` — is their decision to make. Only a
+/// tag that resolves to *nothing here* is refused, because that is the case
+/// where no one has said anything and the value would leave anyway.
+fn resolve_classified_columns(
+    classification: &BTreeMap<String, String>,
+    masks: &BTreeMap<String, MaskStrategy>,
+    allow_unmasked: &[String],
+) -> MaskResolution {
+    let allowed: std::collections::BTreeSet<&str> =
+        allow_unmasked.iter().map(String::as_str).collect();
+    let mut masked = BTreeMap::new();
+    let mut unresolved = Vec::new();
+    for (col, tag) in classification {
+        match masks.get(tag) {
+            // An explicit `none` is a policy decision, not a gap: the operator
+            // wrote the entry and chose identity. Refusing it would break a
+            // configuration the config reference documents.
+            Some(MaskStrategy::None) => {}
+            Some(&strat) => {
+                masked.insert(col.clone(), strat);
+            }
+            _ if allowed.contains(tag.as_str()) => {}
+            _ => unresolved.push((col.clone(), tag.clone())),
+        }
+    }
+    MaskResolution { masked, unresolved }
+}
+
+/// The refusal for [`MaskResolution::unresolved`]: name every column and tag,
+/// and both ways out — a `[mask]` strategy, or the explicit opt-out.
+fn unresolved_masking_failure(model: &str, unresolved: &[(String, String)]) -> PreviewFailure {
+    let columns: Vec<String> = unresolved
+        .iter()
+        .map(|(col, tag)| format!("{col} ({tag})"))
+        .collect();
+    let tags: std::collections::BTreeSet<&str> =
+        unresolved.iter().map(|(_, tag)| tag.as_str()).collect();
+    fail(
+        "masking_unresolved",
+        &format!(
+            "model '{model}' classifies {n} column(s) whose tag resolves to no mask strategy \
+             for this preview: {cols}. Previewing would return their raw values. Give {tag_list} \
+             a strategy under `[mask]` — an entry under `[mask.<env>]` alone does not apply \
+             here — or list the tag in `[classifications.allow_unmasked]` to return it unmasked \
+             on purpose.",
+            n = unresolved.len(),
+            cols = columns.join(", "),
+            tag_list = tags
+                .iter()
+                .map(|t| format!("`{t}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        Some(serde_json::json!({
+            "columns": unresolved.iter().map(|(c, _)| c).collect::<Vec<_>>(),
+            "tags": tags.iter().collect::<Vec<_>>(),
+        })),
+    )
 }
 
 /// Build a `LIMIT`-bounded masking projection over a model's ordered output
@@ -859,6 +963,89 @@ mod tests {
             classify_query_error_kind("syntax error near SELECT"),
             "execution_error"
         );
+    }
+
+    /// Every configuration a classified column can be in, and what the
+    /// preview does about it (#2029). The second row is the one that used to
+    /// return raw values with no signal anywhere: an env-only `[mask.prod]`
+    /// entry does not reach `resolve_mask_for_env(None)`, and W004 counts it
+    /// as covering the tag, so the compiler says nothing either.
+    #[test]
+    fn a_classified_column_is_masked_allowed_or_refused_never_silently_raw() {
+        let classification: BTreeMap<String, String> = [("email".to_string(), "pii".to_string())]
+            .into_iter()
+            .collect();
+
+        // 1. A workspace default → masked.
+        let masks: BTreeMap<String, MaskStrategy> = [("pii".to_string(), MaskStrategy::Hash)]
+            .into_iter()
+            .collect();
+        let r = resolve_classified_columns(&classification, &masks, &[]);
+        assert_eq!(r.masked.get("email"), Some(&MaskStrategy::Hash));
+        assert!(r.unresolved.is_empty());
+
+        // 2. `[mask.prod]` only: `resolve_mask_for_env(None)` yields nothing,
+        //    so the column is refused rather than returned raw.
+        let r = resolve_classified_columns(&classification, &BTreeMap::new(), &[]);
+        assert!(r.masked.is_empty());
+        assert_eq!(r.unresolved, vec![("email".to_string(), "pii".to_string())]);
+
+        // 3. An explicit `none` is a POLICY DECISION, not a gap — the config
+        //    reference says so in those words — so the rows come back, and the
+        //    column is neither masked nor refused. THIS is the row that bounds
+        //    the guard from above: every other assertion here is "is refused",
+        //    and a guard that refuses more satisfies all of them.
+        //    `04-governance/05-classification-masking-compliance` ships exactly
+        //    this shape (`internal = "none"` with `region = "internal"`), so
+        //    refusing it would break a documented example.
+        let none: BTreeMap<String, MaskStrategy> = [("pii".to_string(), MaskStrategy::None)]
+            .into_iter()
+            .collect();
+        let r = resolve_classified_columns(&classification, &none, &[]);
+        assert!(
+            r.masked.is_empty() && r.unresolved.is_empty(),
+            "an explicit `none` is the operator's decision; the preview must return the rows"
+        );
+
+        // 4. The operator's explicit opt-out: raw on purpose, no refusal.
+        let r = resolve_classified_columns(&classification, &BTreeMap::new(), &["pii".to_string()]);
+        assert!(r.masked.is_empty());
+        assert!(
+            r.unresolved.is_empty(),
+            "`[classifications.allow_unmasked]` is a deliberate choice, not an omission"
+        );
+
+        // An unclassified column is never either.
+        let r = resolve_classified_columns(&BTreeMap::new(), &masks, &[]);
+        assert!(r.masked.is_empty() && r.unresolved.is_empty());
+    }
+
+    /// The refusal names every column, every tag, and both ways out — an
+    /// operator reading it must not have to guess which knob applies.
+    #[test]
+    fn the_unresolved_masking_refusal_names_the_columns_and_both_remedies() {
+        let unresolved = vec![
+            ("email".to_string(), "pii".to_string()),
+            ("ssn".to_string(), "secret".to_string()),
+        ];
+        let failure = unresolved_masking_failure("dim_customer", &unresolved);
+        assert_eq!(failure.kind, "masking_unresolved");
+        for needle in [
+            "dim_customer",
+            "email (pii)",
+            "ssn (secret)",
+            "`[mask.<env>]` alone does not apply",
+            "allow_unmasked",
+        ] {
+            assert!(
+                failure.message.contains(needle),
+                "the refusal must name {needle}: {}",
+                failure.message
+            );
+        }
+        let extra = failure.extra.expect("the envelope carries the columns");
+        assert_eq!(extra["columns"], serde_json::json!(["email", "ssn"]));
+        assert_eq!(extra["tags"], serde_json::json!(["pii", "secret"]));
     }
 
     /// Parse a `rocky.toml` body into its single pipeline config.

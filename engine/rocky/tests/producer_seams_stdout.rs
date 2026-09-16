@@ -795,14 +795,14 @@ fn history_run_text_prints_the_run_table_then_the_audit_table() {
     let state = state_path.to_str().unwrap();
 
     let expected_table = format!(
-        "{:<12} {:<24} {:<10} {:<8} {:<10}\n{}\n{:<12} {:<24} {:<10} {:<8} {:<10}\n\nTotal runs: 1\n",
+        "{:<24} {:<24} {:<10} {:<8} {:<10}\n{}\n{:<24} {:<24} {:<10} {:<8} {:<10}\n\nTotal runs: 1\n",
         "RUN ID",
         "STARTED",
         "STATUS",
         "MODELS",
         "TRIGGER",
-        "-".repeat(66),
-        "run-under-t",
+        "-".repeat(78),
+        RUN_ID,
         "2026-04-21 12:00:00",
         "Success",
         2,
@@ -854,11 +854,16 @@ fn history_run_text_prints_the_run_table_then_the_audit_table() {
         "then the audit table:\n{rest}"
     );
     assert!(
-        rest.contains("run-under-t  seams-test         cli      -          -                -                    seams-test-"),
+        rest.contains(&format!(
+            "{:<24} {:<18} {:<8} {:<10} {:<16} {:<20} ",
+            RUN_ID, "seams-test", "cli", "-", "-", "-"
+        )),
         "the audit row carries the identity, source and host:\n{rest}"
     );
     assert!(
-        rest.contains("  run-under-t  version=0.0.0-test  idempotency_key=-\n"),
+        rest.contains(&format!(
+            "  {RUN_ID}  version=0.0.0-test  idempotency_key=-\n"
+        )),
         "the detail line carries the version:\n{rest}"
     );
 }

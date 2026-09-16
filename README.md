@@ -155,6 +155,21 @@ A sketch of that panel:
 
 [Install the VS Code extension →](https://marketplace.visualstudio.com/items?itemName=rocky-data.rocky)
 
+## In your browser
+
+`rocky serve --ui` serves a read-only view of the project to your browser. The UI is built into the release binary. It has three areas: the estate (models, the DAG and runs), the plans waiting for a human, and the governor's record of what agents did and why.
+
+```bash
+rocky serve --ui --token "$(openssl rand -hex 16)" --token-scope read-only
+# Rocky UI: http://127.0.0.1:8080/ui/#token=...
+```
+
+<p align="center">
+  <img src="docs/public/demo-ui-tour.gif" alt="A tour of the Rocky browser UI: the estate with its DAG, the review queue, an agent's breaking change awaiting a human with the rocky review --approve command to copy, the governor brief, a model's custody chain, and a data product's journal" width="900" />
+</p>
+
+The page cannot run or approve anything. Its token is read-only, and you approve a plan in a terminal. See the [browser UI guide](https://rocky-data.dev/guides/browser-ui/).
+
 ## When an AI agent writes your pipelines
 
 Agents now write real pipeline changes. An agent that is trusted too much, with production access, can destroy real data in seconds. Rocky treats an agent as an operator with a controlled path to production.
@@ -284,7 +299,7 @@ The checker, named branches, replay, column lineage, rule enforcement and per-mo
 - **Replay says what it cannot re-run.** `rocky replay --execute --verify` runs a recorded recipe again and confirms the output is identical, byte for byte. If a model reads a source that can change, Rocky marks it non-replayable rather than re-running it against today's data.
 - **Iceberg.** Rocky reads tables from a REST catalog. Writes land as Iceberg-readable tables through Delta UniForm. Native Iceberg writes are on the roadmap.
 - **No built-in metrics layer.** Use Cube, or whichever metrics layer you already run.
-- **Dagster is the one built-in scheduler integration** ([`dagster-rocky`](integrations/dagster/)). For anything else, use the [`rocky-sdk`](sdk/python/) Python client or `rocky serve`. `rocky tick` runs cron and freshness schedules with no orchestrator, but it is experimental.
+- **Dagster is the one built-in scheduler integration** ([`dagster-rocky`](integrations/dagster/)). For anything else, use the [`rocky-sdk`](sdk/python/) Python client or `rocky serve`. `rocky tick` and `rocky serve --scheduler` run cron and freshness schedules with no orchestrator, but both are experimental.
 
 [Open a discussion](https://github.com/rocky-data/rocky/discussions) if any of these are a blocker.
 
@@ -307,6 +322,8 @@ Already have a project in another tool? `rocky import-dbt` converts a dbt Core p
 | Path | What ships | Language | What it does |
 |---|---|---|---|
 | [`engine/`](engine/) | `rocky` CLI and `rocky-lsp` | Rust | Core engine: SQL checking, drift detection, incremental loads, adapters |
+| [`engine/ui/`](engine/ui/) | built into `rocky` | TypeScript | The browser UI that `rocky serve --ui` serves |
+| [`deploy/`](deploy/) | (config only) | YAML | Docker Compose and Helm setups for a self-hosted `rocky serve`, and a local observability stack |
 | [`sdk/python/`](sdk/python/) | `rocky-sdk` (PyPI) | Python | Python client wrapping the CLI, for notebooks and scripts |
 | [`integrations/dagster/`](integrations/dagster/) | `dagster-rocky` (PyPI) | Python | Dagster resource built on `rocky-sdk` |
 | [`editors/vscode/`](editors/vscode/) | Rocky VS Code extension | TypeScript | Live checking, syntax highlighting, AI commands |
@@ -337,7 +354,8 @@ Building a connector for ClickHouse, Redshift, or another warehouse? See the [Ad
 ```bash
 git clone https://github.com/rocky-data/rocky.git
 cd rocky
-just build   # engine + sdk + dagster + vscode
+just build   # engine + sdk + dagster + vscode (the engine without the browser UI)
+just build-engine-ui   # the engine with the browser UI embedded, as releases ship it
 just test
 just lint
 ```
@@ -348,7 +366,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for per-subproject build commands.
 
 Each artifact ships independently via CI-driven tags:
 
-- `engine-v*` → Rocky CLI binary on GitHub Releases (macOS, Linux, Windows)
+- `engine-v*` → Rocky CLI binary on GitHub Releases (macOS, Linux, Windows), and the container image `ghcr.io/rocky-data/rocky` (Linux amd64 and arm64)
 - `sdk-v*` → `rocky-sdk` on PyPI
 - `dagster-v*` → `dagster-rocky` on PyPI
 - `vscode-v*` → Rocky extension on the VS Code Marketplace

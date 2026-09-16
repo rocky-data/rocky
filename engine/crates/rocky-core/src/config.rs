@@ -852,12 +852,17 @@ pub struct StateConfig {
     /// identical to pre-CAS). Set to `"cas"` on live multi-pod deployments with
     /// a durable object tier (`s3`, `gcs`, `tiered`) so a writer that lost a
     /// cross-pod race is reconciled by writer class instead of silently
-    /// overwriting the winner: the end-of-run upload fail-closes, and the
-    /// `rocky policy` freeze/unfreeze ledger write replays onto the winner.
-    /// `rocky gc` and `rocky apply` still write unconditionally (issue #1228),
-    /// so `cas` reduces but does not yet eliminate lost updates. On `tiered` it
-    /// additionally makes the Valkey tier coherent with the durable object.
-    /// Auto-downgrades to `off` (with a warn) on `local` and `valkey`.
+    /// overwriting the winner: the end-of-run upload fail-closes, the
+    /// `rocky policy` freeze/unfreeze ledger write replays onto the winner,
+    /// and `rocky gc` commits through the same seam (since #1372). `rocky
+    /// restore` still uploads unconditionally on every remote backend, `rocky
+    /// apply` of a restore plan routes through that same path and so uploads
+    /// unconditionally too, and `rocky apply` elsewhere does so only for its
+    /// verify-after custody rows (issue #1228), so `cas` reduces but does not
+    /// yet eliminate lost updates. On
+    /// `tiered` it additionally makes the Valkey tier coherent with the
+    /// durable object. Auto-downgrades to `off` (with a warn) on `local` and
+    /// `valkey`.
     #[serde(default)]
     pub concurrency_control: ConcurrencyControl,
 }
@@ -5388,6 +5393,12 @@ pub struct ReplicationPipelineConfig {
     /// target's recorded last-copied value (never wall-clock), so a failed
     /// prior run cannot cause a false skip. Pass `--no-prune` to `rocky run`
     /// to force a full pass (e.g. after a manual target-side mutation).
+    ///
+    /// An `incremental` table is never pruned until it has a
+    /// recorded watermark: its first run always copies, even when the marker
+    /// matches, because a table with no watermark has nothing recorded for
+    /// the next incremental run to append from. A `full_refresh` table has no
+    /// such condition.
     #[serde(default)]
     pub prune_unchanged: bool,
 }
@@ -10687,17 +10698,47 @@ schema_template = "raw__{{source}}"
         };
 
         // Values an operator legitimately writes, including a template whose
-        // placeholder is resolved later from schema identifiers.
+        // placeholder is resolved later from schema identifiers. This list is
+        // also the accepted-examples block on the `[pipeline.NAME]` reference
+        // page, so a change here has to change that page too.
         for ok in [
             "NULL",
             "'rocky'",
+            "1",
             "CURRENT_TIMESTAMP",
             "current_timestamp()",
+            "CAST('x' AS VARCHAR)",
             "'{source}'",
+            "CONCAT('{tenant}', '_', '{source}')",
         ] {
             let errors = validate_metadata_columns(&cfg_with(ok));
             assert!(errors.is_empty(), "{ok} must be accepted: {errors:?}");
         }
+
+        // An UNQUOTED placeholder. The reference page tells operators to quote
+        // them and says the refusal is a PARSE failure, so pin the reason and
+        // not only the refusal.
+        let errors = validate_metadata_columns(&cfg_with("{tenant}"));
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ConfigError::MetadataColumnValueRefused { reason, .. }]
+                    if reason.contains("does not parse as a single SQL expression")
+            ),
+            "an unquoted placeholder must be refused as unparseable, got {errors:?}"
+        );
+        // The advice beside that refusal describes THIS field (#1959). The
+        // validator is shared with `[checks.assertions]`, whose advice says
+        // "one boolean expression"; a metadata column value is a scalar, and
+        // the accepted list above has no boolean in it.
+        let [ConfigError::MetadataColumnValueRefused { reason, .. }] = errors.as_slice() else {
+            unreachable!("pinned by the assertion above");
+        };
+        assert!(
+            reason.contains("A metadata column value is one scalar expression")
+                && !reason.contains("boolean"),
+            "the refusal must explain a column value, not a check: {reason}"
+        );
 
         // An off-allowlist function. The name is ordinary on purpose: the rule
         // is "not on the allowlist", not "looks dangerous".

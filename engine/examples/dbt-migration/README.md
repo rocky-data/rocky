@@ -134,8 +134,9 @@ rocky validate-migration --dbt-project dbt-project/ --rocky-project rocky-projec
 ```
 
 The report lists models it could not match and metadata it found missing.
-`--rocky-project` is optional; drop it to inspect the dbt side alone. Add
-`--sample-size <n>` to sample rows when a warehouse is reachable.
+`--rocky-project` is optional; drop it to inspect the dbt side alone. The
+command connects to no warehouse. It accepts `--sample-size <n>` but ignores
+it, so the flag samples no rows and does not change the report.
 
 ## Compile the Rocky project
 

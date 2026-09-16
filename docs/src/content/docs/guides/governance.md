@@ -725,7 +725,7 @@ Compares `COUNT(*)` on the source against `COUNT(*)` on the target. Rocky batche
 
 #### Column match
 
-Compares the source and target column sets, ignoring case, and reports a missing or extra column. It reuses the columns drift detection already cached, so it costs no extra query:
+Compares the source and target column sets, ignoring case, and reports a missing or extra column. Rocky reads both column lists again after the copy, so the check costs two extra metadata queries per table, one per side:
 
 ```json
 {

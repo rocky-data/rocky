@@ -1165,6 +1165,8 @@ export interface ReplicationPipelineConfig {
    * Downstream continuity — and preserving the table's prior check results — is then the orchestrator's job. The Dagster integration treats a pruned, unmaterialized key as unchanged via `satisfy_empty_outputs`; enabling pruning without an orchestrator that handles unmaterialized keys drops the table from the run.
    *
    * Defaults to `false` — opt in per pipeline, since silently skipping copies is a behavior change. The marker is compared against the target's recorded last-copied value (never wall-clock), so a failed prior run cannot cause a false skip. Pass `--no-prune` to `rocky run` to force a full pass (e.g. after a manual target-side mutation).
+   *
+   * An `incremental` table is never pruned until it has a recorded watermark: its first run always copies, even when the marker matches, because a table with no watermark has nothing recorded for the next incremental run to append from. A `full_refresh` table has no such condition.
    */
   prune_unchanged?: boolean;
   /**
@@ -2273,7 +2275,7 @@ export interface StateConfig {
    */
   backend?: StateBackend & string;
   /**
-   * Concurrency control for remote state writes. Default [`ConcurrencyControl::Off`] (unconditional last-writer-wins, byte- identical to pre-CAS). Set to `"cas"` on live multi-pod deployments with a durable object tier (`s3`, `gcs`, `tiered`) so a writer that lost a cross-pod race is reconciled by writer class instead of silently overwriting the winner: the end-of-run upload fail-closes, and the `rocky policy` freeze/unfreeze ledger write replays onto the winner. `rocky gc` and `rocky apply` still write unconditionally (issue #1228), so `cas` reduces but does not yet eliminate lost updates. On `tiered` it additionally makes the Valkey tier coherent with the durable object. Auto-downgrades to `off` (with a warn) on `local` and `valkey`.
+   * Concurrency control for remote state writes. Default [`ConcurrencyControl::Off`] (unconditional last-writer-wins, byte- identical to pre-CAS). Set to `"cas"` on live multi-pod deployments with a durable object tier (`s3`, `gcs`, `tiered`) so a writer that lost a cross-pod race is reconciled by writer class instead of silently overwriting the winner: the end-of-run upload fail-closes, the `rocky policy` freeze/unfreeze ledger write replays onto the winner, and `rocky gc` commits through the same seam (since #1372). `rocky restore` still uploads unconditionally on every remote backend, `rocky apply` of a restore plan routes through that same path and so uploads unconditionally too, and `rocky apply` elsewhere does so only for its verify-after custody rows (issue #1228), so `cas` reduces but does not yet eliminate lost updates. On `tiered` it additionally makes the Valkey tier coherent with the durable object. Auto-downgrades to `off` (with a warn) on `local` and `valkey`.
    */
   concurrency_control?: ConcurrencyControl & string;
   /**

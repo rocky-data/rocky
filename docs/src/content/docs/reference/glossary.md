@@ -97,7 +97,7 @@ A model that is never written to the warehouse. Rocky inlines its SQL as a [CTE]
 
 ### Exit code
 
-The number a command returns to the shell. Rocky uses `0` for success, `1` for a hard failure (bad config, unreachable warehouse), and `2` for partial success, where the run finished but some models failed. `rocky doctor` returns `3` when a check is critical. A partial run still writes valid JSON to stdout.
+The number a command returns to the shell. Rocky uses `0` for success, `1` for a hard failure (bad config, unreachable warehouse), and `2` for partial success, where the run finished but some models failed, or an error-severity check failed after the data had landed. `rocky doctor` returns `3` when a check is critical, and `rocky fulfill` and `rocky product verify` use `2`, `3` and `4` for their own stops. A partial run still writes valid JSON to stdout. See the [full table](/reference/json-output/#exit-codes).
 
 ### Fingerprint
 
@@ -169,7 +169,7 @@ The record of where a result came from: which SQL produced it, which inputs it r
 
 ### Quarantine
 
-Separating a model's failing rows from its passing ones, so bad data does not block the run or reach downstream readers. Turn it on under `[pipeline.<name>.checks.quarantine]` and pick a mode: split the rows into separate tables, tag them in place, or drop them. See [`[pipeline.NAME.checks]`](/reference/configuration/#pipelinenamechecks).
+Separating a model's failing rows from its passing ones, so bad data does not block the run or reach downstream readers. Turn it on under `[pipeline.<name>.checks.quarantine]` of a `quality` pipeline and pick a mode: split the rows into separate tables, tag them in place, or drop them. See [`[pipeline.NAME.checks]`](/reference/configuration/#pipelinenamechecks).
 
 ### Reconcile
 

@@ -36,6 +36,23 @@ use crate::result_types::*;
 /// untouched.
 const INSTRUCTIONS: &str = include_str!("../../../../.claude/skills/rocky-ai-workflow/SKILL.md");
 
+/// What `rocky mcp` calls itself in the `initialize` result's
+/// `serverInfo.name` (#1973).
+pub const SERVER_NAME: &str = "rocky";
+
+/// The version `rocky mcp` announces beside [`SERVER_NAME`].
+///
+/// This is `rocky-mcp`'s own crate version. Every crate in the workspace
+/// carries the engine's version as a literal in its `Cargo.toml` and a
+/// release bumps them by hand, so this can only be the engine's version for
+/// as long as the bump does not miss this crate. Three workspace crates have
+/// already fallen off the shared version that way, and the release check for
+/// it greps for the OLD version, which cannot see a crate that is already
+/// behind. So the lockstep is pinned from the binary side instead:
+/// `engine/rocky/tests/mcp_server_identity.rs` fails the build when this and
+/// `rocky --version` disagree.
+pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Prepended to the served `instructions` under the worker profile.
 ///
 /// DERIVED from the excluded set, not written out. The old banner named six
@@ -1086,30 +1103,43 @@ fn worker_tools_that_read_the_warehouse<'a>(table: &[(&'a str, WorkerToolEffect)
 /// wire version. It supplies the server's FALLBACK, and rmcp's
 /// `serve_server` then overwrites `init_response.protocol_version` with
 /// `negotiate_protocol_version(client_requested, server_fallback,
-/// supported)` — which returns the CLIENT's request whenever the server
-/// supports it. `RockyMcpServer` does not override
+/// supported)`. `RockyMcpServer` does not override
 /// `Service::supported_protocol_versions`, so it advertises rmcp's whole
-/// `KNOWN_VERSIONS` list, `V_2026_07_28` included. A client that asks for
-/// `2026-07-28` is given it, `sep_2322_supported` is then true, the strip
-/// call is skipped, and `resultType` DOES reach that client.
+/// `KNOWN_VERSIONS` list, `V_2026_07_28` included.
 ///
-/// The stripping therefore holds because no PRODUCTION client asks for
-/// `2026-07-28` yet, not because this server refuses to speak it. The
-/// negotiated version is `2025-11-25` against rmcp 3.1.2's own client —
-/// which is now BLESSED, as part of row 1's `initialize` payload in
+/// HOW A PEER REACHES `2026-07-28` CHANGED WITH rmcp 3.2 (#1965). Under
+/// rmcp 3.1 the negotiation returned the client's request whenever the
+/// server supported it, `initialize` included. rmcp 3.2 follows the
+/// 2026-07-28 versioning spec instead: that revision replaced the handshake
+/// with per-request metadata, so ANY `initialize` request is a legacy
+/// client, and one that names `2026-07-28` is answered with the server's
+/// fallback (`V_2025_11_25` here, the newest version that has a handshake).
+/// A modern peer reaches `2026-07-28` through the `server/discover`
+/// lifecycle (`ClientLifecycleMode::Discover` or `Auto`), which sends no
+/// `initialize` at all, or by declaring `2026-07-28` and its capabilities in
+/// a request's own `_meta`, which rmcp honours even inside an `initialize`
+/// session (rmcp's own client never does the latter after `initialize`; a
+/// hand-rolled one can). For such a request `sep_2322_supported` is true,
+/// the strip call is skipped, and `resultType` DOES reach it.
+///
+/// The stripping therefore holds because no PRODUCTION client discovers or
+/// declares yet, not because this server refuses to speak `2026-07-28`. The
+/// negotiated version is `2025-11-25` against rmcp's own default client —
+/// BLESSED, as part of row 1's `initialize` payload in
 /// `served_text_golden_pins_every_worded_surface`, so the day it moves the
 /// golden moves with it and this paragraph gets re-read. Closing the gap by
 /// construction would mean narrowing `supported_protocol_versions`, which is
 /// a behaviour change to what this server speaks and is not made here.
 ///
 /// SIXTEENTH ROUND, finding 3 — THAT IS NOW GUARDED, NOT MERELY OBSERVED.
-/// The two paragraphs above were correct and completely unexercised: every
+/// The paragraphs above were correct and completely unexercised: every
 /// roundtrip connected with rmcp's default `()` handler, so the branch they
-/// describe — a peer that DOES negotiate `2026-07-28` — was reached by no
+/// describe — a peer that DOES speak `2026-07-28` — was reached by no
 /// test. `result_type_reaches_a_2026_07_28_client_and_no_other` (in
-/// `tests/roundtrip.rs`) now drives both peers and asserts the negotiated
-/// version on each before reading `result_type`, so "stripped for the
-/// default client, served to a modern one" is a checked claim.
+/// `tests/roundtrip.rs`) now drives both peers, the modern one over the
+/// discover lifecycle, and asserts the negotiated version on each before
+/// reading `result_type`, so "stripped for the default client, served to a
+/// modern one" is a checked claim.
 ///
 /// It asserts BOTH directions on purpose, and each one covers the extreme
 /// the other cannot see. Present-only survives the field being ON
@@ -1169,8 +1199,8 @@ fn worker_tools_that_read_the_warehouse<'a>(table: &[(&'a str, WorkerToolEffect)
 /// independently settable, and a mutation into `title` is caught by the
 /// widened sweep and was invisible to the field-selecting one. Row 1 sits
 /// with rows 8 and 9 on this axis rather than with 2 and 4/5: its newly
-/// covered fields are all `None` under
-/// `Implementation::from_build_env()`, so widening it found nothing either.
+/// covered fields are all `None` under the hand-built
+/// `Implementation::new(SERVER_NAME, ..)`, so widening it found nothing either.
 /// The mutation that proves the sweep works has to POPULATE one first.
 ///
 /// So the honest form of the guarantee is about the SWEEPS, not the row
@@ -5503,7 +5533,7 @@ impl RockyMcpServer {
     #[tool(
         description = "The ranked pending-review queue, and an OPT-IN approve action. With no \
          `approve_plan_id`, lists every `require_review` escalation not yet signed off, ranked by \
-         blast_radius × classification × staleness, each carrying its decision_ref, plan_id, and \
+         blast_radius × change_class × staleness, each carrying its decision_ref, plan_id, and \
          `approve_command`. Listing works on every profile. APPROVING is different: it writes the \
          human sign-off marker that unblocks `rocky apply`, and MOST SERVERS DO NOT SERVE IT — it \
          is refused with `approve_not_enabled` unless the operator started this server as `rocky \
@@ -6351,8 +6381,23 @@ impl ServerHandler for RockyMcpServer {
                 .enable_prompts()
                 .build(),
         )
-        .with_server_info(Implementation::from_build_env())
-        .with_protocol_version(ProtocolVersion::V_2024_11_05)
+        // Rocky's own name and version, not the library's. rmcp's
+        // `Implementation::from_build_env()` reads `CARGO_PKG_NAME` /
+        // `CARGO_PKG_VERSION` where IT is compiled, so it announced
+        // "rmcp 3.3.0" to every client and moved the served-text golden on
+        // every library bump for a reason that had nothing to do with Rocky
+        // (#1973). This crate's version is the engine's.
+        .with_server_info(Implementation::new(SERVER_NAME, SERVER_VERSION))
+        // The server's FALLBACK, not the wire version: rmcp echoes any
+        // version a client names that still has an `initialize` handshake
+        // and this server supports, and answers with this one otherwise.
+        // Since rmcp 3.2 "otherwise" includes every client that names
+        // `2026-07-28` or later over `initialize` (that revision replaced the
+        // handshake, so an `initialize` request is legacy by definition), so
+        // the fallback is the NEWEST version with a handshake rather than the
+        // oldest: a client that asked for more is not sent back to 2024. See
+        // the negotiation note on the served-text sweep above.
+        .with_protocol_version(ProtocolVersion::V_2025_11_25)
         .with_instructions(instructions)
     }
 }
@@ -9220,8 +9265,8 @@ database = ":memory:"
         // carries `title`, `description`, `icons` and `websiteUrl` besides
         // `name` and `version` — four free-text fields on the channel a
         // worker reads at handshake, before it reads anything else.
-        // `Implementation::from_build_env()` leaves all four `None`, so
-        // nothing leaks today. The UNBACKED GUARANTEE was the defect, the
+        // The hand-built `Implementation::new(SERVER_NAME, ..)` leaves all
+        // four `None`, so nothing leaks today. The UNBACKED GUARANTEE was the defect, the
         // same shape as rows 2 and 4/5: no leak, a claim the sweep did not
         // support.
         //
@@ -10685,6 +10730,27 @@ database = ":memory:"
                 !description.contains("draft_check"),
                 "worker prompt `{name}` steers toward a tool this profile does not \
                  serve: {description}"
+            );
+        }
+    }
+
+    /// `serverInfo` names Rocky and the engine's version, not the MCP
+    /// library's (#1973). Every profile serves the same identity, and it is
+    /// what the served-text golden's two `initialize` rows now pin: the
+    /// golden moves when Rocky's version moves, not when rmcp's does.
+    #[test]
+    fn server_info_names_rocky_and_the_engine_version() {
+        for profile in [
+            McpProfile::Default,
+            McpProfile::Worker,
+            McpProfile::Approver,
+        ] {
+            let info = server_with(profile).get_info().server_info;
+            assert_eq!(info.name, SERVER_NAME, "{profile:?}");
+            assert_eq!(info.version, SERVER_VERSION, "{profile:?}");
+            assert_ne!(
+                info.name, "rmcp",
+                "{profile:?} must not introduce itself as the library"
             );
         }
     }

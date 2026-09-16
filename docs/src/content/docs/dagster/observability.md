@@ -59,7 +59,7 @@ guide](/concepts/plan-store-v1-to-v2/).
 Dagster then shows it as run metadata in the run viewer, one click from a
 failed materialization back to the plan that produced it.
 
-Engine `v1.34+` content-addresses a plan for every project shape,
+Engine `v1.35+` content-addresses a plan for every project shape,
 including replication-only projects with no `models/` directory. So
 `run_pipes` always writes a `.rocky/plans/<plan-id>.json` artifact. If the
 engine emits no `plan_id`, `run_pipes` raises `dg.Failure` rather than

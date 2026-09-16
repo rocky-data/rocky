@@ -101,7 +101,7 @@ know or care how many tenants exist; it just runs every model under
 
 ## Related
 
-- `rocky load` source: [`engine/crates/rocky-cli/src/commands/load.rs`](../../../../engine/crates/rocky-cli/src/commands/load.rs)
-- `execute_models` (transformation runtime): [`engine/crates/rocky-cli/src/commands/run.rs`](../../../../engine/crates/rocky-cli/src/commands/run.rs)
+- `rocky load` source: [`engine/crates/rocky-cli/src/commands/load.rs`](../../../../../engine/crates/rocky-cli/src/commands/load.rs)
+- `execute_models` (transformation runtime): [`engine/crates/rocky-cli/src/commands/run.rs`](../../../../../engine/crates/rocky-cli/src/commands/run.rs)
 - Sibling: [`09-files-to-duckdb`](../09-files-to-duckdb) — Parquet/CSV/JSONL
   ingest in one `rocky load` (no fan-out).

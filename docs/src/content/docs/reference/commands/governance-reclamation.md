@@ -189,8 +189,8 @@ rocky audit --scorecard --by principal --window 30d
 |------|------|---------|-------------|
 | `--for <SUBJECT>` | `string` | | Drill into the custody chain for a model/table name, a `run_id`, or a `plan_id`: who proposed, what policy decided, what the plan changed, which runs materialized it, what verification found, and the downstream blast radius. |
 | `--scorecard` | `bool` | `false` | Aggregate the ledger into acceptance / denial / escalation rates instead of listing decisions. |
-| `--by <DIM>` | `principal` \| `rule` \| `scope` | `principal` | Scorecard grouping dimension. |
-| `--window <W>` | `string` | `all` | Scorecard window, e.g. `30d` or `12h`. |
+| `--by <DIM>` | `principal` \| `rule` \| `scope` | `principal` | Scorecard grouping dimension. Requires `--scorecard`. |
+| `--window <W>` | `string` | `all` | Scorecard window, e.g. `30d` or `12h`. Requires `--scorecard`. |
 | `--product <NAME>` | `string` | | List only the decisions about one product: the rows whose model is the product's output model (`product.output.model`, default the product name), read from `products/<NAME>.toml`. Conflicts with `--for` and `--scorecard`. |
 
 Read-only. Only mutating enforcement seams record decisions — reads are never logged — so the ledger is the audit trail of governed mutations. A signal the ledger does not persist is reported as *not recorded* rather than inferred, and the scorecard is wired to no automatic policy change.

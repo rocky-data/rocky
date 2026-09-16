@@ -32,7 +32,8 @@ function tabFromSegment(segment: string | undefined): Tab {
  * The governor lane: the brief, the trust scorecard, the custody
  * drill-down, the audit browse and the product timelines, one tab each,
  * deep-linked at `/ui/governor/<screen>` (`/ui/governor/custody/<subject>`
- * for a subject, `/ui/governor/products/<name>` for one product).
+ * for a subject, `/ui/governor/products/<name>` for one product,
+ * `/ui/governor/audit/<product>` for the ledger scoped to one product).
  *
  * The product timeline lives here rather than in a lane of its own: it
  * answers the question the other four answer — what happened, and who decided
@@ -48,13 +49,14 @@ export function GovernorScreen({
   brief?: ReactNode;
   scorecard?: ReactNode;
   custody?: (subject: string | null) => ReactNode;
-  audit?: ReactNode;
+  audit?: (product: string | null) => ReactNode;
   products?: (name: string | null) => ReactNode;
 }) {
   const segments = useSegments();
   const tab = tabFromSegment(segments[1]);
   const subject = tab === "custody" && segments[2] ? decodeURIComponent(segments[2]) : null;
   const productName = tab === "products" && segments[2] ? decodeURIComponent(segments[2]) : null;
+  const auditProduct = tab === "audit" && segments[2] ? decodeURIComponent(segments[2]) : null;
 
   let screen: ReactNode;
   switch (tab) {
@@ -68,7 +70,7 @@ export function GovernorScreen({
       screen = custody ? custody(subject) : <CustodyScreen subject={subject} />;
       break;
     case "audit":
-      screen = audit ?? <AuditScreen />;
+      screen = audit ? audit(auditProduct) : <AuditScreen product={auditProduct} />;
       break;
     case "products":
       screen = products ? products(productName) : <ProductsScreen name={productName} />;

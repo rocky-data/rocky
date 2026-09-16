@@ -648,18 +648,20 @@ Inspect, audit, or re-execute a recorded run from the state store. The default v
 
 ```bash
 rocky replay <target> [flags]
+rocky replay --at <RUN_ID> [flags]
 ```
 
 ### Arguments
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `target` | `string` | **(required)** | A specific `run_id`, or the literal `latest` for the most recent run. |
+| `target` | `string` | | A specific `run_id`, or the literal `latest` for the most recent run. Give it here or with `--at`. With neither, the command exits `1` with `provide a run id (positional or --at <RUN_ID>), or the literal 'latest'`. |
 
 ### Flags
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
+| `--at <RUN_ID>` | `string` | | The run to read, instead of the positional argument. Takes the same values, including `latest`. When both are given, `--at` wins. |
 | `--model <NAME>` | `string` | | Filter to a single model within the run. Errors if the model wasn't executed. |
 | `--check` | `bool` | `false` | Read-only replayability audit instead of the inspection view. Classifies each model as `replayable` or `non_replayable` from the ledger alone and flags static non-determinism. Executes nothing. |
 | `--execute` | `bool` | `false` | Re-execute the recorded recipe (reconstructed from provenance, never the working tree) and re-derive the output hash. Runs on an ephemeral in-memory DuckDB engine by default. |
@@ -901,7 +903,9 @@ rocky cost <target> [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--model <NAME>` | `string` | | Filter to a single model within the run. |
-| `--output <FORMAT>` | `json|table` | `json` | Output format. Table form is a compact per-model breakdown. |
+| `--by <DIMENSION>` | `tenant` \| `model` | | Roll the per-model cost up by a dimension and add a `groups` array to the output. `tenant` reads the discover-time schema-pattern `{tenant}` component. `per_model` is present either way. Any other value errors. |
+
+`--output` is a [global flag](/reference/cli/). Its default depends on stdout: `table` on an interactive terminal, `json` otherwise. Pass `--output json` or `--output table` to force one.
 
 ### Examples
 
@@ -1139,8 +1143,8 @@ A hold controls whichever scheduler reads the same state file this command write
                          │ read on every tick
                          ▼
             ┌────────────────────────────┐   suppresses the cron,
-            │  rocky serve --scheduler   │   after, freshness, and
-            │        --state-path X      │   webhook demand sources,
+            │  rocky --state-path X      │   after, freshness, and
+            │    serve --scheduler       │   webhook demand sources,
             └────────────────────────────┘   and records a `paused`
                                              skip on each tick
 ```

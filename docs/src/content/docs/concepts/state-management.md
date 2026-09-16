@@ -61,8 +61,8 @@ This is **opt-in and default-off**. With neither knob set, Rocky uses the single
 Per invocation, route a run to its own state file with `--state-namespace <key>`:
 
 ```bash
-rocky run --state-namespace acme       # writes/reads <models>/.rocky-state/acme.redb
-rocky run --state-namespace globex      # independent file, independent lock — runs concurrently
+rocky --state-namespace acme run       # writes/reads <models>/.rocky-state/acme.redb
+rocky --state-namespace globex run      # independent file, independent lock — runs concurrently
 ```
 
 `<key>` becomes a path segment, so it must be a SQL identifier (`^[a-zA-Z0-9_]+$`). Rocky rejects anything else.
@@ -148,7 +148,7 @@ Clear the state and the next run does a full refresh. Do this to backfill data o
 - **Route the run to a fresh namespace** so it starts from an empty state file without touching the global one:
 
   ```bash
-  rocky run --state-namespace backfill
+  rocky --state-namespace backfill run
   ```
 
 For a scoped, review-gated re-run of specific models, use [`rocky backfill`](/reference/commands/governance-reclamation/#rocky-backfill) instead.

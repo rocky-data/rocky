@@ -883,7 +883,7 @@ The `breaking_findings` field is JSON-only: `--output table` still renders the s
 
 Preview a change before it merges. Rocky re-executes only the changed models and their downstream column lineage on a per-pull-request branch, and copies everything else from the base ref.
 
-Three subcommands compose into one review artifact. `preview create` runs the workflow, `preview diff` reports the structural and sampled row-level diff, and `preview cost` reports the cost delta against base. A fourth, `preview rows`, is separate: it samples the output rows of a single model.
+Three subcommands compose into one review artifact. `preview create` prepares the branch, `preview diff` reports what changed, and `preview cost` reports the cost delta against base. A fourth, `preview rows`, is separate: it samples the output rows of a single model.
 
 For the design (why CTAS today and warehouse-native clones tomorrow, how the column-level pruner works, what the sampling window's correctness ceiling is), see the [How Preview Works](/concepts/preview-internals/) concept page. For a step-by-step walkthrough on a feature branch, see the [Preview a PR](/guides/preview-a-pr/) how-to.
 
@@ -898,7 +898,7 @@ rocky preview rows   --model <name> [--cte <name>] [--limit <N>]
 
 ### `rocky preview create`
 
-Compute the prune set, copy the rest from the base schema, run only the prune set against a per-PR branch.
+Compute the prune set and copy the rest from the base schema into a per-PR branch. It does not run the prune set: it reports `run_status: "planned"` with an empty `run_id`. Run `rocky run --branch <name>` over the prune set before `preview diff` or `preview cost`. Today `preview diff` looks for a run whose recorded git branch equals the preview branch name, and a run records the branch you are actually on, so the two only meet when your git branch carries the preview name. See [#2032](https://github.com/rocky-data/rocky/issues/2032).
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
@@ -939,21 +939,28 @@ rocky preview create --base main
 
 ### `rocky preview diff`
 
-Sampled row-level diff plus structural (column-level) diff for every model in the prune set.
+Compare the branch run with the base run, for every model in the prune set.
+
+By default this compares the `rows_affected` the two run records hold. It reports `rows_added` and `rows_removed`, leaves `rows_changed` at 0, returns no samples and no column-level delta, and sets `coverage: "not_yet_sampled"` with `coverage_warning: true`.
+
+Two limits follow. A change that rewrites values without changing row counts shows nothing. And an ordinary transformation run records no `rows_affected` at all, which the diff reads as 0, so a model that goes from 10 rows to 20 can also report nothing.
+
+Pass `--algorithm bisection` to compare row content. It needs a `Merge` model whose single `unique_key` holds whole numbers: the bounds are parsed as integers, so a decimal key falls back to the default comparison without saying so. Read each model's `algorithm.kind` before you treat its result as a content comparison.
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--name <NAME>` | `string` | **(required)** | Branch name created by `preview create`. |
 | `--base <REF>` | `string` | `main` | Git ref to compare against. Must match what `preview create` was invoked with. |
-| `--sample-size <N>` | `usize` | `1000` | Number of rows to sample per model for row-level diffing. Larger windows reduce false-negative risk; see [coverage warning](/concepts/preview-internals/#coverage-warning-roll-up). |
+| `--models <PATH>` | `PathBuf` | `models` | Models directory. Bisection reads each model's primary-key column from here. |
+| `--sample-size <N>` | `usize` | `1000` | Accepted and ignored today. The default comparison samples no rows, so this value changes nothing ([#2032](https://github.com/rocky-data/rocky/issues/2032)). |
 
-**Example.** Render a Markdown report ready to post on a PR:
+**Example.** Print a Markdown report ready to post on a PR:
 
 ```bash
-rocky preview diff --name preview-fix-price --output markdown
+rocky preview diff --name preview-fix-price --output json | jq -r .markdown
 ```
 
-The JSON shape (`PreviewDiffOutput`) carries the same data plus the per-model `sampling_window` block with `coverage_warning`, and `rocky preview diff --output json | jq -r .markdown` reproduces the `--output markdown` report.
+There is no `--output markdown`. The report lives in the `markdown` field of the JSON output (`PreviewDiffOutput`). The same JSON also carries the per-model `sampling_window` block with `coverage_warning`.
 
 ### `rocky preview cost`
 
@@ -962,15 +969,15 @@ Per-model cost delta between the branch run and the latest base-schema `RunRecor
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--name <NAME>` | `string` | **(required)** | Branch name created by `preview create`. |
-| `--base <REF>` | `string` | `main` | Git ref the base run is identified by. |
+| `--models <PATH>` | `PathBuf` | `models` | Models directory. Rocky reads per-model `[budget]` blocks from the sidecars here, so a projected breach can name a single model. |
 
 **Example.**
 
 ```bash
-rocky preview cost --name preview-fix-price --output markdown
+rocky preview cost --name preview-fix-price --output json | jq -r .markdown
 ```
 
-The JSON shape (`PreviewCostOutput`) reports per-model `delta_usd`, `branch_duration_ms`, `base_duration_ms`, and bytes scanned, plus an aggregate `summary.delta_usd`, `summary.savings_from_copy_usd`, and `models_skipped_via_copy`. Underlying cost math is identical to [`rocky cost`](/reference/commands/administration/#rocky-cost) (Databricks / Snowflake duration × DBU rate; BigQuery bytes × $/TB; DuckDB zero); fields fall back to `null` when no base `RunRecord` exists or when the adapter does not surface USD.
+The JSON shape (`PreviewCostOutput`) carries the Markdown report in its `markdown` field. It reports per-model `delta_usd`, `branch_duration_ms`, `base_duration_ms`, and bytes scanned, plus an aggregate `summary.delta_usd`, `summary.savings_from_copy_usd`, and `models_skipped_via_copy`. Underlying cost math is identical to [`rocky cost`](/reference/commands/administration/#rocky-cost) (Databricks / Snowflake duration × DBU rate; BigQuery bytes × $/TB; DuckDB zero); fields fall back to `null` when no base `RunRecord` exists or when the adapter does not surface USD.
 
 ### `rocky preview rows`
 

@@ -38,6 +38,10 @@ This does five things:
 
 `preview create` does **not** run the prune-set models itself. It emits `run_status: "planned"` with an empty `run_id`. Run `rocky run --branch <name>`, with a selector limited to the prune set, before `preview diff` or `preview cost`. That gives them a branch run to compare against.
 
+:::caution[The pairing does not work yet]
+`preview diff` and `preview cost` look for a run whose recorded branch equals the preview branch name, such as `pr-preview-fix-price`. A run records the branch you are actually on, such as `fix-price`, and `--branch` changes only where the run writes. So the two do not meet unless your branch carries the preview name. `--sample-size` is also accepted and ignored, and an ordinary transformation records no row count for the comparison to read. Track all three in [#2032](https://github.com/rocky-data/rocky/issues/2032).
+:::
+
 The output is a `PreviewCreateOutput` JSON document:
 
 ```json
@@ -252,7 +256,7 @@ jobs:
           github_token: ${{ github.token }}
           # working_directory: my-pipeline   # if rocky.toml lives in a subdir
           # models_dir: models               # default
-          # rocky_version: latest            # or 1.17.4 / engine-v1.17.4
+          # rocky_version: latest            # or 1.74.0 / engine-v1.74.0
 ```
 
 The first PR after you wire this in installs Rocky and posts a comment with the plan, the diff, and the cost delta. Later pushes update that same comment in place, through the `<!-- rocky-preview -->` marker, so there is no PR-comment spam.
@@ -265,7 +269,7 @@ The first PR after you wire this in installs Rocky and posts a comment with the 
 | `branch_name` | PR head ref, slugged | Preview branch name passed to `rocky preview --name`. Pre-slug if you pass it explicitly: only `[A-Za-z0-9_-]` are preserved. |
 | `models_dir` | `models` | Directory containing model files. Passed to `rocky preview create --models`. |
 | `working_directory` | `.` | Directory containing `rocky.toml`. The action `cd`s here before each subcommand. |
-| `rocky_version` | `latest` | Engine version. `latest` resolves the highest `engine-v*` tag; otherwise pass `1.17.4` or `engine-v1.17.4`. |
+| `rocky_version` | `latest` | Engine version. `latest` resolves the highest `engine-v*` tag; otherwise pass `1.74.0` or `engine-v1.74.0`. |
 | `comment_marker` | `<!-- rocky-preview -->` | Magic-string marker used for comment upsert. Override only if you run multiple preview workflows on the same PR. |
 | `fail_on_preview_error` | `false` | When `true`, fail the PR check if any `rocky preview` subcommand errors. The default keeps preview advisory: failures still post a section in the comment. |
 | `github_token` | (required) | Token used to read the PR and upsert the comment. Pass `${{ github.token }}` from the workflow (or a PAT for cross-repo permissions). Required because composite actions cannot reference `${{ github.token }}` in input defaults. |

@@ -12,7 +12,7 @@ const PLAN = "c".repeat(64);
 const QUEUE: ReviewQueueOutput = {
   version: "1.74.0",
   command: "review",
-  ranking: "blast_radius × classification × staleness",
+  ranking: "blast_radius × change_class × staleness",
   total: 0,
   excluded_non_plan_rows: 0,
   pending: [],

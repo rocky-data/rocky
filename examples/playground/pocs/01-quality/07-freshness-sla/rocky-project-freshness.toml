@@ -1,5 +1,5 @@
 # Same project as rocky.toml, plus a project-wide [freshness] default. Point
-# `rocky compile -c rocky-project-freshness.toml` at this to show that declaring
+# `rocky -c rocky-project-freshness.toml compile` at this to show that declaring
 # `expected_lag_seconds` at the project level suppresses W005 for every model.
 
 [adapter]

@@ -1,14 +1,16 @@
 # Rocky observability quickstart
 
 A single-node Grafana + Alloy + Tempo + Loki + Prometheus stack that receives
-Rocky's OpenTelemetry and shows your runs: traces, run metrics, and logs, all
-correlated by trace ID.
+Rocky's OpenTelemetry and shows your runs: traces, run metrics, and logs.
+Logs are not linked to traces: Rocky's JSON log lines carry no trace ID
+(see [Log collection](#log-collection)).
 
-Rocky exports OpenTelemetry when you set `OTEL_EXPORTER_OTLP_ENDPOINT` (from a
-build that includes the exporter — see Prerequisites).
+Rocky exports OpenTelemetry when you set `OTEL_EXPORTER_OTLP_ENDPOINT`. The
+exporter is a default Cargo feature (`otel`), so release binaries and a plain
+`cargo build` include it.
 It emits distributed traces (a span tree per run), run metrics (tables
 processed/failed, error rate, table and query duration histograms, retries),
-and structured JSON logs on stderr. This stack is somewhere to send all of
+and structured logs on stderr. This stack is somewhere to send all of
 that so you can look at it.
 
 > This is a **dev / quickstart** stack, not a hardened production deployment.
@@ -40,13 +42,9 @@ grafana <-- tempo / prometheus / loki               (provisioned datasources)
 
 - Docker with Compose v2 (`docker compose version`).
 - The DuckDB CLI (`duckdb`) — step 2 seeds a local DuckDB file with it.
-- A `rocky` binary **built with the OpenTelemetry exporter**. If setting
-  `OTEL_EXPORTER_OTLP_ENDPOINT` appears to do nothing, your binary was built
-  without it; build one with:
-
-  ```bash
-  cargo build --release --features otel   # run from the engine/ directory
-  ```
+- A `rocky` binary with the OpenTelemetry exporter. Release binaries have it,
+  because `otel` is a default feature. Only a build with
+  `--no-default-features` leaves it out.
 
 ## Quickstart (3 commands)
 
@@ -66,14 +64,18 @@ docker compose ps
 
 **2. Run a Rocky pipeline with OTel pointed at the stack.** This seeds and
 runs the replication playground POC, which produces a trace, run metrics, and
-the table-duration histogram. `2>` also tees Rocky's stderr JSON into `./logs`
-so the log pipeline picks it up.
+the table-duration histogram. `2>` also writes Rocky's stderr logs into
+`./logs` so the log pipeline picks them up.
+
+The log format follows the output format. At a terminal, Rocky prints tables
+and writes colored text logs. `--output json` makes the logs JSON lines, which
+is the shape Alloy parses.
 
 ```bash
 cd ../../examples/playground/pocs/00-foundations/01-replication-basics
 duckdb playground.duckdb < data/seed.sql
 OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 OTEL_SERVICE_NAME=rocky \
-  rocky run --filter source=orders \
+  rocky --output json run --filter source=orders \
   2> "$(git rev-parse --show-toplevel)/deploy/observability/logs/rocky.jsonl"
 ```
 
@@ -86,7 +88,8 @@ open http://localhost:3000        # macOS; use xdg-open on Linux
 Grafana is provisioned with anonymous admin access (no login). Open the
 **Rocky Runs** dashboard in the **Rocky** folder. You'll see the run's metrics
 and, in the trace panel at the bottom, the run's trace; click it to open the
-full span tree and pivot to its logs in Loki.
+full span tree. The link from a span to its logs in Loki has nothing to match
+on, because the log lines carry no trace ID.
 
 Any `rocky run` (or `plan`, `apply`, …) with those two env vars set will land
 here — the replication POC is just a convenient one that exercises every
@@ -120,17 +123,20 @@ by hand if you want a truly clean tree.
 
 ## Log collection
 
-Rocky writes structured JSON logs to stderr, one object per line. The Alloy
-config ships two log paths:
+Rocky writes structured logs to stderr. With JSON output (`--output json`, or
+any run whose stdout is not a terminal) each log is one JSON object per line.
+At a terminal the logs are colored text. The Alloy config ships two log paths:
 
 - **OTLP logs** — wired to Loki's native OTLP endpoint for any source that
   exports OTLP logs. Rocky does not export OTLP logs today (it uses stderr
   JSON), so this route is there for completeness and forward-compatibility.
 - **File-tail (the one Rocky uses today)** — redirect Rocky's stderr to a file
   under `./logs/` (as the quickstart does) and Alloy tails `./logs/*.jsonl`,
-  parses each line, promotes `level` to a label, and attaches `trace_id` /
-  `span_id` as structured metadata. That trace_id is what lets Grafana jump
-  from a span in Tempo straight to its log lines in Loki.
+  parses each line, promotes `level` to a label, and reads `trace_id` /
+  `span_id` into structured metadata. Rocky's JSON log lines do not contain
+  those fields at the default log level, even with OpenTelemetry on. A line
+  carries span names and span fields, not the OpenTelemetry trace ID. So
+  Grafana cannot jump from a span in Tempo to its log lines in Loki.
 
 See `alloy/config.alloy` for both pipelines; the file-tail block is documented
 inline.
@@ -177,13 +183,28 @@ All images are pinned to explicit version tags in `compose.yaml`.
 
 ### Alerts
 
-Two provisioned rules live in `grafana/alerting/rocky-alerts.yaml`:
+Six provisioned rules live in `grafana/alerting/rocky-alerts.yaml`, in two
+groups.
+
+The `rocky-runs` group reads run metrics:
 
 - **Rocky run reported failed tables** — fires when any run in the last 15
   minutes reported `rocky.tables_failed > 0`.
 - **Rocky error rate above 5 percent** — fires when `rocky.error_rate_pct`
   stays above 5 for 15 minutes.
 
-They provision the rules only; wire a Grafana contact point to actually deliver
-notifications. A commented scheduler-alert stub is left in the same file for
-when Rocky's native scheduler telemetry lands.
+The `rocky-scheduler` group reads the `rocky.scheduler.*` metrics. Only a
+running `rocky serve --scheduler` (experimental) emits them. With no scheduler
+running, the series are absent and the rules stay quiet.
+
+- **Rocky scheduler is ticking but not reconciling** — ticks end in
+  `config_error` or `fault` for 5 minutes.
+- **Rocky scheduler cannot read its webhook spool** — ticks end in
+  `spool_unreadable` for 5 minutes.
+- **Rocky scheduled pipeline is failing repeatedly** — a scheduled pipeline
+  failed 3 or more times in a row.
+- **Rocky scheduler is falling behind** — p95 execution lag stays above 120
+  seconds for 5 minutes.
+
+The file provisions the rules only; wire a Grafana contact point to deliver
+notifications.

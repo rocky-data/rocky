@@ -1,5 +1,29 @@
 import { describe, expect, it } from "vitest";
-import { laneFromPath, navigate, pathForLane, subpathFromPath } from "./router";
+import {
+  auditPath,
+  laneFromPath,
+  navigate,
+  pathForLane,
+  segmentsFromPath,
+  subpathFromPath,
+} from "./router";
+
+describe("auditPath", () => {
+  it("is the bare ledger without a product", () => {
+    expect(auditPath()).toBe("/ui/governor/audit");
+    expect(auditPath(null)).toBe("/ui/governor/audit");
+  });
+
+  it("carries the product as an encoded segment the governor lane can read back", () => {
+    expect(auditPath("revenue_daily")).toBe("/ui/governor/audit/revenue_daily");
+    // A name needing escaping round-trips: the segment the lane decodes is the
+    // name, and the slash never becomes a path separator (#2003).
+    const awkward = "a/b c";
+    const path = auditPath(awkward);
+    expect(path).toBe(`/ui/governor/audit/${encodeURIComponent(awkward)}`);
+    expect(decodeURIComponent(segmentsFromPath(path)[2])).toBe(awkward);
+  });
+});
 
 describe("subpathFromPath", () => {
   it("reads the segment after the lane, or null", () => {

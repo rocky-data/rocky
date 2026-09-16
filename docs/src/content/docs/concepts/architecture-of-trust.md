@@ -153,17 +153,18 @@ The accuracy depends on the warehouse:
 ### Compile-time contracts
 
 A `.contract.toml` declares what a model must produce. The compiler checks the
-model's inferred schema against it. Four codes cover the intra-project case:
+model's inferred schema against it. Five codes cover the intra-project case:
 
 - `E010`: a required column is missing from the model output.
 - `E011`: a column's type does not match the contract.
 - `E012`: the contract says non-nullable and the model output is nullable.
 - `E013`: a protected column has been removed.
+- `E014`: the model output holds a nullable column the contract does not declare, while `[rules] no_new_nullable` is on. That rule is off by default.
 
 Any of these fails compilation, so a broken contract is a red CI check rather
 than a production surprise.
 
-Those four are intra-project: they check a model against a contract inside one
+Those five are intra-project: they check a model against a contract inside one
 Rocky project. Enforcement across a project boundary also ships, through a
 **vendored snapshot**. Vendored means the consuming team keeps its own committed
 copy of the producing team's compiled schema, and diffs against that copy.
@@ -185,7 +186,7 @@ change:
 type. See [Cross-Team Contracts](/concepts/cross-team-contracts/) for the full
 workflow.
 
-**Shipped.** Intra-project (`E010`–`E013`) and cross-team via published-IR snapshots (`E030`–`E034`, enforced at the consumer's compile).
+**Shipped.** Intra-project (`E010`–`E014`) and cross-team via published-IR snapshots (`E030`–`E034`, enforced at the consumer's compile).
 
 ### Declarative governance
 

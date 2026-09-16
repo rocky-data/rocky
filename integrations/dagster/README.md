@@ -97,9 +97,11 @@ written at all.
 Loading the definitions then reads that cached state:
 
 1. Build one subset-aware `multi_asset` per Rocky group. Each table gets at
-   least four declared checks: `row_count`, `column_match`, `freshness`, and
-   `row_count_anomaly`. Contract rules from `contracts_dir` add more, and so do
-   `surface_compliance` and `surface_configured_checks` when you turn them on.
+   least three declared checks: `row_count`, `column_match`, and
+   `row_count_anomaly`. A fourth, `freshness`, is declared only when the
+   pipeline configures `[checks.freshness]`. Contract rules from
+   `contracts_dir` add more, and so do `surface_compliance` and
+   `surface_configured_checks` when you turn them on.
 2. Run `rocky run --filter <key>=<value>` on materialization, for the selected
    subset only.
 

@@ -394,6 +394,15 @@ fn route_table() -> Vec<Route> {
              The holder's id is carried in `running_job_id`.",
         body: Body::Component("ErrorEnvelope"),
     };
+    const STATE_NEEDS_MIGRATION: Resp = Resp {
+        status: "409",
+        description: "The state store on disk lacks tables this server reads, and a read \
+             never creates them. `rocky serve` migrates the store at startup (its job \
+             sweep opens it read-write), so this means the file changed under a running \
+             server, or that sweep could not open it. Restart `rocky serve`, or run any \
+             read-write command such as `rocky run`, once. Not retryable.",
+        body: Body::Component("ErrorEnvelope"),
+    };
 
     vec![
         Route {
@@ -546,6 +555,7 @@ fn route_table() -> Vec<Route> {
                     body: Body::Component("ModelHistoryOutput"),
                 },
                 ENGINE_BUSY_OR_NOT_READY,
+                STATE_NEEDS_MIGRATION,
             ],
             auth_exempt: false,
         },
@@ -568,6 +578,7 @@ fn route_table() -> Vec<Route> {
                     body: Body::Component("MetricsOutput"),
                 },
                 ENGINE_BUSY_OR_NOT_READY,
+                STATE_NEEDS_MIGRATION,
             ],
             auth_exempt: false,
         },
@@ -590,6 +601,7 @@ fn route_table() -> Vec<Route> {
                     body: Body::Component("HistoryOutput"),
                 },
                 ENGINE_BUSY_OR_NOT_READY,
+                STATE_NEEDS_MIGRATION,
             ],
             auth_exempt: false,
         },
@@ -702,6 +714,7 @@ fn route_table() -> Vec<Route> {
                 },
                 ENGINE_BUSY_OR_NOT_READY,
                 GOVERNOR_READ_FAILED,
+                STATE_NEEDS_MIGRATION,
             ],
             auth_exempt: false,
         },
@@ -799,6 +812,7 @@ fn route_table() -> Vec<Route> {
                     description: "No job with this id (neither in-memory nor persisted).",
                     body: Body::Component("ErrorEnvelope"),
                 },
+                STATE_NEEDS_MIGRATION,
             ],
             auth_exempt: false,
         },
@@ -829,6 +843,7 @@ fn route_table() -> Vec<Route> {
                 },
                 ENGINE_BUSY_OR_NOT_READY,
                 PRODUCT_READ_FAILED,
+                STATE_NEEDS_MIGRATION,
             ],
             auth_exempt: false,
         },
@@ -856,6 +871,7 @@ fn route_table() -> Vec<Route> {
                 PRODUCT_NOT_FOUND,
                 ENGINE_BUSY_OR_NOT_READY,
                 PRODUCT_READ_FAILED,
+                STATE_NEEDS_MIGRATION,
             ],
             auth_exempt: false,
         },
@@ -884,6 +900,7 @@ fn route_table() -> Vec<Route> {
                 PRODUCT_NOT_FOUND,
                 ENGINE_BUSY_OR_NOT_READY,
                 PRODUCT_READ_FAILED,
+                STATE_NEEDS_MIGRATION,
             ],
             auth_exempt: false,
         },
@@ -993,6 +1010,7 @@ fn route_table() -> Vec<Route> {
                 },
                 ENGINE_BUSY_OR_NOT_READY,
                 REVIEW_READ_FAILED,
+                STATE_NEEDS_MIGRATION,
             ],
             auth_exempt: false,
         },
@@ -1052,6 +1070,7 @@ fn route_table() -> Vec<Route> {
                 REVIEW_MARKER_MALFORMED,
                 ENGINE_BUSY_OR_NOT_READY,
                 REVIEW_READ_FAILED,
+                STATE_NEEDS_MIGRATION,
             ],
             auth_exempt: false,
         },
@@ -1088,6 +1107,7 @@ fn route_table() -> Vec<Route> {
                 PRODUCT_SPEC_INVALID,
                 ENGINE_BUSY_OR_NOT_READY,
                 GOVERNOR_READ_FAILED,
+                STATE_NEEDS_MIGRATION,
             ],
             auth_exempt: false,
         },
@@ -1124,6 +1144,7 @@ fn route_table() -> Vec<Route> {
                 BAD_QUERY,
                 ENGINE_BUSY_OR_NOT_READY,
                 GOVERNOR_READ_FAILED,
+                STATE_NEEDS_MIGRATION,
             ],
             auth_exempt: false,
         },
@@ -1166,6 +1187,7 @@ fn route_table() -> Vec<Route> {
                 BAD_QUERY,
                 ENGINE_BUSY_OR_NOT_READY,
                 GOVERNOR_READ_FAILED,
+                STATE_NEEDS_MIGRATION,
             ],
             auth_exempt: false,
         },
@@ -1195,6 +1217,7 @@ fn route_table() -> Vec<Route> {
                 BAD_QUERY,
                 ENGINE_BUSY_OR_NOT_READY,
                 GOVERNOR_READ_FAILED,
+                STATE_NEEDS_MIGRATION,
             ],
             auth_exempt: false,
         },
@@ -1225,6 +1248,7 @@ fn route_table() -> Vec<Route> {
                     body: Body::Component("ErrorEnvelope"),
                 },
                 ENGINE_BUSY_OR_NOT_READY,
+                STATE_NEEDS_MIGRATION,
             ],
             auth_exempt: false,
         },
@@ -1266,6 +1290,57 @@ fn route_table() -> Vec<Route> {
         },
         Route {
             method: "get",
+            path: "/api/v1/settings",
+            operation_id: "getSettings",
+            tag: "meta",
+            summary: "Server posture",
+            description: "How this server is bound and what it will accept: bind host, the \
+                 CORS allowlist, the `Host` values the UI guard accepts, whether the \
+                 scheduler and the UI are on, whether `ROCKY_WEBHOOK_SECRET` can sign a \
+                 webhook, and the token's scope. An allowlist, not a config dump — no \
+                 secret appears, and nothing is reached through serde of `RockyConfig`. \
+                 `webhook_secret` is reported even with the scheduler off, which is the \
+                 point: it says what will happen when you turn the scheduler on. \
+                 `state_backend` and `concurrency_control` are read from `rocky.toml` when \
+                 the server starts and are `null` when there was no readable config — \
+                 `config_status` says which. Everything else is fixed for the life of the \
+                 process.",
+            path_params: &[],
+            query_params: &[],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The running server's posture.",
+                    body: Body::Component("SettingsOutput"),
+                },
+                Resp {
+                    status: "503",
+                    description: "The one `rocky.toml` read this route needs is already in \
+                         flight. Only `state_backend` and `concurrency_control` need the \
+                         file; every other value was resolved at startup. Retry.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                Resp {
+                    status: "504",
+                    description: "That read did not finish inside its deadline — usually a \
+                         `rocky.toml` that will not return, so a retry is unlikely to \
+                         help. Distinct from `503`, which is ordinary contention.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                Resp {
+                    status: "500",
+                    description: "That config read panicked. Distinct from \
+                         `config_status: unreadable`, which means the file WAS read and \
+                         would not parse.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+            ],
+            auth_exempt: false,
+        },
+        Route {
+            method: "get",
             path: "/api/v1/policy",
             operation_id: "getPolicy",
             tag: "policy",
@@ -1298,6 +1373,7 @@ fn route_table() -> Vec<Route> {
                     body: Body::Component("ErrorEnvelope"),
                 },
                 ENGINE_BUSY_OR_NOT_READY,
+                STATE_NEEDS_MIGRATION,
             ],
             auth_exempt: false,
         },

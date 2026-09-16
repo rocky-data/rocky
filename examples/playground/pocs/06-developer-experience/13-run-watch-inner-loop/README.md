@@ -1,7 +1,5 @@
 # 13-run-watch-inner-loop — `rocky run --watch` reacts to file edits
 
-![rocky run --watch detects a touch, debounces 200 ms, and re-runs the pipeline; Ctrl-C exits cleanly](../../../../../docs/public/demo-run-watch.gif)
-
 > **Category:** 06-developer-experience
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 10s (background watcher + one synthetic edit, then SIGINT)
@@ -61,7 +59,7 @@ change` notices.
 ## What happened
 
 1. **Seed** `raw__orders.orders` into DuckDB (50 rows).
-2. **Launch watch** — `rocky run --watch -c rocky.toml --filter source=orders` runs in the background, prints a watching banner on stderr, runs the pipeline once on startup.
+2. **Launch watch** — `rocky -c rocky.toml run --watch --filter source=orders` runs in the background, prints a watching banner on stderr, runs the pipeline once on startup.
 3. **Touch `rocky.toml`** — fires a filesystem event; the 200 ms debounce window collects any related events; one re-run is dispatched.
 4. **Two `RunOutput` records** land in `expected/watch.log`, one per iteration, newline-delimited.
 5. **SIGINT** completes the in-flight run, then the watch loop exits 0.
