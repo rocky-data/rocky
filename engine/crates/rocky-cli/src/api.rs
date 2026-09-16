@@ -1891,6 +1891,7 @@ fn sample_failure_to_api_error(failure: crate::commands::PreviewFailure) -> ApiE
         | "cte_error"
         | "cte_masking_unverified"
         | "adhoc_masking_blocked"
+        | "masking_unresolved"
         | "unmaskable_column" => StatusCode::UNPROCESSABLE_ENTITY,
         "upstream_not_materialized" | "missing_catalog" => StatusCode::CONFLICT,
         "config_error" | "pipeline_error" => StatusCode::SERVICE_UNAVAILABLE,
@@ -1907,6 +1908,9 @@ fn sample_failure_to_api_error(failure: crate::commands::PreviewFailure) -> ApiE
         }
         "unmaskable_column" => Some(
             "this adapter cannot express the column's mask strategy; change the strategy, or sample from an adapter that can",
+        ),
+        "masking_unresolved" => Some(
+            "give the classification tag a strategy under `[mask]` — an entry under `[mask.<env>]` alone does not apply to a preview — or list it in `[classifications.allow_unmasked]` to return it unmasked on purpose",
         ),
         "upstream_not_materialized" => Some("run the pipeline first, then sample"),
         _ => None,

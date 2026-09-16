@@ -8,7 +8,7 @@
 /**
  * JSON output for `rocky preview rows`.
  *
- * A sample of result rows for a single transformation model (or one of its CTEs), executed against the pipeline's configured adapter. Classified columns are masked inline before execution, so the rows match what the materialized target would expose. `truncated` is `true` when the model produced at least `limit_applied` rows.
+ * A sample of result rows for a single transformation model (or one of its CTEs), executed against the pipeline's configured adapter. Classified columns are masked inline before execution, so the rows match what the materialized target would expose; a classified column whose tag resolves to no mask strategy refuses the preview (`masking_unresolved`) rather than returning raw values, unless the project lists that tag under `[classifications.allow_unmasked]`, which returns it unmasked on purpose. `truncated` is `true` when the model produced at least `limit_applied` rows.
  */
 export interface PreviewRowsOutput {
   /**
