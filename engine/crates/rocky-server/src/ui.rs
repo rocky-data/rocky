@@ -250,6 +250,40 @@ mod tests {
         assert!(ui.host_allowed("::1"));
     }
 
+    /// What stripping the brackets does NOT do: let one host stand in for
+    /// another.
+    ///
+    /// `host_key` is applied to both sides, so the only pairs it newly makes
+    /// equal are a host and its own bracketed spelling — never two different
+    /// hosts. That is the whole widening, stated as a test: an unrelated name
+    /// is refused in every spelling, and a bracketed name matches only the
+    /// same name. Written because a guard that gets more permissive needs its
+    /// new permissiveness bounded, not just its new acceptance demonstrated.
+    #[test]
+    fn stripping_brackets_never_makes_one_host_match_a_different_one() {
+        let ui = config("rocky.internal", &["ui.internal"]);
+        for bad in [
+            "evil.example",
+            "[evil.example]",
+            "[evil.example]:8080",
+            "[rocky.internal.evil.example]",
+            "[]",
+            "[",
+            "]",
+            "[]:8080",
+        ] {
+            assert!(!ui.host_allowed(bad), "{bad}");
+        }
+        // A bracketed spelling matches only its own host — the intended widening.
+        assert!(ui.host_allowed("[rocky.internal]"));
+        assert!(ui.host_allowed("[ui.internal]:8443"));
+
+        // An empty authority is refused whether or not brackets produced it,
+        // so bracket-stripping cannot manufacture the empty match.
+        assert!(!config("", &[]).host_allowed("[]"));
+        assert!(!config("", &[]).host_allowed(""));
+    }
+
     #[test]
     fn origins_pass_by_exact_allowlist_or_by_an_allowed_host() {
         let ui = config("127.0.0.1", &["ui.internal"]);
