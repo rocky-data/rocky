@@ -73,15 +73,18 @@ describe("SamplePanel", () => {
 
   it("names both ways a classified column comes back raw on purpose", async () => {
     // The route refuses a tag nobody answered (`masking_unresolved`) and
-    // returns raw only a tag an operator answered with `none` or with
-    // `allow_unmasked` (`resolve_classified_columns` in preview_rows.rs).
-    // Naming only one of the two told a reviewer the other was masked.
+    // returns raw only a tag whose `[mask]` strategy is `none`, or a tag with
+    // no strategy listed under `allow_unmasked` (`resolve_classified_columns`
+    // in preview_rows.rs). The list is a fallback: a tag with a strategy is
+    // masked even when listed. Naming only one raw case told a reviewer the
+    // other was masked; naming the list without its condition overstates it.
     render(<SamplePanel model="orders" load={async () => SAMPLE} />);
     fireEvent.click(screen.getByRole("button", { name: `Show ${SAMPLE_LIMIT} rows` }));
     const note = (await screen.findByText(/pseudonymous, not anonymous/)).textContent ?? "";
     expect(note).toContain("or the sample is refused");
     expect(note).toContain("[mask] strategy is none");
-    expect(note).toContain("allow_unmasked");
+    expect(note).toContain("no workspace [mask] strategy that the project lists under allow_unmasked");
+    expect(note).toContain("masked even if it is on that list");
   });
 
   it("renders each refusal as itself, so a reviewer can tell them apart", async () => {
