@@ -526,7 +526,7 @@ mode = "split"
 | `tag` | Rewrites `<table>` in place and adds an `_error_<name>` column per assertion, set on the failing rows. Every row stays. This rewrites the source, so take care on a raw replication target. |
 | `drop` | Writes only `<table>__valid`. Rocky discards the failing rows. |
 
-Only these row-level kinds are quarantined: `not_null`, `accepted_values`, `expression`, `in_range`, `regex_match`, `not_in_future` and `older_than_n_days`. Set-based, table-level and referential assertions (`unique`, `unique_expr`, `composite`, `relationships`, `row_count_range`, `aggregate`) run as ordinary checks whatever the mode.
+Only these row-level kinds are quarantined: `not_null`, `accepted_values`, `expression`, `in_range`, `regex_match`, `not_in_future` and `older_than_n_days`. The last two work in `tag` and `drop` only. `split` re-evaluates its predicate, so it refuses a clock-dependent one, and the run fails with a `quarantine:compile` result rather than writing either table. The same refusal covers a clock-dependent `expression` or `filter` under `split`. Set-based, table-level and referential assertions (`unique`, `unique_expr`, `composite`, `relationships`, `row_count_range`, `aggregate`) run as ordinary checks whatever the mode.
 
 #### Cross-source duplicate detection
 

@@ -211,7 +211,7 @@ rocky import-dbt --dbt-project ~/projects/acme-dbt --output-dir ./acme-rocky --o
 
 ## `rocky serve`
 
-Start an HTTP server for the project. It answers under `/api/v1` with the same payloads as the CLI's `--output json`: models, lineage and the DAG, runs and schedules, products, the review queue, and the governor's brief, audit and custody reads. It also runs `run`, `plan` and `apply` as background jobs. `--ui` adds the [browser UI](#the-browser-ui), and `--scheduler` adds the resident scheduler. The [Embedding guide](/guides/embedding/#serve-api) covers the routes, and the [OpenAPI document](/openapi.json) lists every one.
+Start an HTTP server for the project. It answers under `/api/v1` with typed, schema-backed payloads: models, lineage and the DAG, runs and schedules, products, the review queue, and the governor's brief, audit and custody reads. A route that matches a CLI command returns what that command's `--output json` prints. The routes with no CLI counterpart, such as `/models` and `/dag/layers`, have their own shapes. It also runs `run`, `plan` and `apply` as background jobs. `--ui` adds the [browser UI](#the-browser-ui), and `--scheduler` adds the resident scheduler. The [Embedding guide](/guides/embedding/#serve-api) covers the routes, and the [OpenAPI document](/openapi.json) lists every one.
 
 ```bash
 rocky serve [flags]

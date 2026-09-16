@@ -21,7 +21,7 @@ Scope on the ELT spectrum:
 - **Rocky DSL** (`.rocky` files) is an optional pipeline-oriented syntax; raw SQL stays the default.
 - **State** (watermarks, run history) lives in a local `redb` database with optional S3, GCS or Valkey sync.
 - **JSON output** is versioned and schema-backed, for orchestrators and agents.
-- **HTTP API and browser UI**: `rocky serve` answers under `/api/v1` with the same payloads as the CLI. `rocky serve --ui` adds a read-only browser UI at `/ui/`.
+- **HTTP API and browser UI**: `rocky serve` answers under `/api/v1` with typed payloads; a route that matches a CLI command returns what that command prints with `--output json`. `rocky serve --ui` adds a read-only browser UI at `/ui/`.
 
 ## Monorepo
 

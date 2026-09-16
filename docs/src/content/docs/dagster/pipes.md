@@ -146,7 +146,7 @@ code.
 | Structured `MaterializationEvent` from Pipes | ❌ | ❌ | ✅ |
 | Returns | `RunResult` | `RunResult` | `PipesClientCompletedInvocation` |
 | Needs Dagster context | no | yes | yes |
-| Engine Pipes support required | no | no | yes (the SDK's engine floor, 1.34; 1.35 for replication-only projects) |
+| Engine Pipes support required | no | no | yes (the SDK's engine floor is 1.35.0) |
 
 ### `run()`: buffered (non-Dagster callers)
 
@@ -188,7 +188,7 @@ the plan artifact that produced it.
 
 The rocky engine detects those env vars and emits structured Pipes
 messages on the messages channel. The SDK's `MIN_ROCKY_VERSION` floor
-(1.34) checks the engine version before the first call. See [Engine-side
+(1.35.0) checks the engine version before the first call. See [Engine-side
 emission](#engine-side-dagster-pipes-message-emission) for the message
 types. In the run viewer they arrive as `MaterializationEvent`s, carrying
 strategy, duration_ms, rows_copied, sql_hash, and partition_key, plus
