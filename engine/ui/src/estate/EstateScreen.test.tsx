@@ -344,19 +344,25 @@ describe("EstateScreen", () => {
         expect(models).toHaveBeenCalledTimes(1);
       });
 
-      it("keeps the last whole list across a refused recheck, and keeps checking", async () => {
+      const refused = () => {
+        throw new ApiError(503, { code: "engine_not_ready", message: "recompiling" });
+      };
+
+      /** A models loader that gives these answers in order, then the last one forever. */
+      function answering(...answers: Array<() => ModelListOutput>) {
+        let next = 0;
+        return vi.fn(async () => answers[Math.min(next++, answers.length - 1)]());
+      }
+
+      it("keeps reading across a refused recheck, and gates again once it reads", async () => {
         // A recompile that fails clears the server's compile, so a recheck can
-        // answer `503 engine_not_ready`. Dropping to "unknown" there would open
-        // every model and stop the rechecks, leaving a model that is really
-        // outside the compile clickable onto a 404 for good.
-        const answers: Array<() => ModelListOutput> = [
+        // answer `503 engine_not_ready`. The rechecks must not stop there, or a
+        // model really outside the compile stays clickable onto a 404 for good.
+        const models = answering(
           () => partModels,
-          () => {
-            throw new ApiError(503, { code: "engine_not_ready", message: "recompiling" });
-          },
+          refused,
           () => partModels,
-        ];
-        const models = vi.fn(async () => (answers.shift() ?? (() => partModels))());
+        );
         render(
           <EstateScreen
             loaders={loaders({ dag: async () => partDag, models })}
@@ -370,15 +376,65 @@ describe("EstateScreen", () => {
 
         await advance(5_000);
         expect(models).toHaveBeenCalledTimes(2);
-        expect(line("weekly_revenue")).toContain(NOT_COMPILED);
-        expect(
-          screen.getByText(/The graph keeps the last list the server gave\./),
-        ).toHaveTextContent("refused (503): engine_not_ready");
+        // Unknown now: no stale list stands in for the compile.
+        expect(line("weekly_revenue")).not.toContain(NOT_COMPILED);
+        expect(screen.getByText(/Could not read which models/)).toHaveTextContent(
+          "refused (503): engine_not_ready",
+        );
 
         await advance(5_000);
         expect(models).toHaveBeenCalledTimes(3);
         expect(line("weekly_revenue")).toContain(NOT_COMPILED);
         expect(screen.queryByText(/Could not read which models/)).toBeNull();
+      });
+
+      it("keeps reading while refused, even when the last list covered every model", async () => {
+        // Every drawn model was in the last list, so nothing was outside it.
+        // A Refresh then reads a refused list; the model has since moved out of
+        // the compile. The rechecks must still run until a list reads.
+        const models = answering(
+          () => withWeekly,
+          refused,
+          () => partModels,
+        );
+        render(
+          <EstateScreen
+            loaders={loaders({ dag: async () => partDag, models })}
+            refreshMs={0}
+            recheckMs={5_000}
+            now={NOW}
+          />,
+        );
+        await advance(0);
+        await advance(30_000);
+        expect(models).toHaveBeenCalledTimes(1);
+        expect(line("weekly_revenue")).not.toContain(NOT_COMPILED);
+
+        fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+        await advance(0);
+        expect(models).toHaveBeenCalledTimes(2);
+
+        await advance(5_000);
+        expect(models).toHaveBeenCalledTimes(3);
+        expect(line("weekly_revenue")).toContain(NOT_COMPILED);
+      });
+
+      it("reads the list again when the first read is refused", async () => {
+        const models = answering(refused, () => partModels);
+        render(
+          <EstateScreen
+            loaders={loaders({ dag: async () => partDag, models })}
+            refreshMs={0}
+            recheckMs={5_000}
+            now={NOW}
+          />,
+        );
+        await advance(0);
+        expect(line("weekly_revenue")).not.toContain(NOT_COMPILED);
+
+        await advance(5_000);
+        expect(models).toHaveBeenCalledTimes(2);
+        expect(line("weekly_revenue")).toContain(NOT_COMPILED);
       });
     });
 
