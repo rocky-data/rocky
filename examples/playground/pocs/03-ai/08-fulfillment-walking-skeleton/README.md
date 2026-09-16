@@ -122,15 +122,23 @@ failing plan already had.
 ## Binary provenance (read before running)
 
 The `rocky` on your `PATH` must carry the fulfillment verbs (`product`, `fulfill`,
-`review --approve`, `apply --expect-spec-digest`, `mcp --profile worker`). Those
-ship in the engine but may be newer than the last released binary. Until the next
-engine release, build locally and put that binary first on `PATH`:
+`review --approve`, `apply --expect-spec-digest`, `mcp --profile worker`). Engine
+1.74.0 carries all of them, and the replay lane passes on that released binary.
+`rocky product` and `rocky fulfill` first shipped in 1.72.0, and the checks
+assert 11 and assert 12 exercise landed in 1.74.0, so use 1.74.0 or newer.
+
+```bash
+rocky --version        # 1.74.0 or newer
+rocky product --help   # must succeed — run.sh fail-fasts if it does not
+```
+
+To run the POC against unreleased engine changes, build from source and put that
+binary first on `PATH`:
 
 ```bash
 # from the monorepo root
 cargo build --release -p rocky --manifest-path engine/Cargo.toml
 export PATH="$PWD/engine/target/release:$PATH"
-rocky product --help   # must succeed — run.sh fail-fasts if it does not
 ```
 
 `run.sh` runs whatever `rocky` is on `PATH` and stops with a clear message if the
@@ -152,7 +160,7 @@ replay/session.json        # the recorded worker session, replayed against `rock
 broken-specs/*.toml        # 6 one-fault specs for assert 3 (the negative lowering cases)
 briefs/elicitation.md      # live lane only: grounds the worker in the exact closed spec schema
 briefs/drafting.md         # live lane only: steers the worker to author SQL only (cooperative, not enforced)
-run.sh                     # the replay lane — 10 asserts, credential-free, exits 0 in < 10s
+run.sh                     # the replay lane — 12 asserts, credential-free, exits 0
 run-live.sh                # the live lane — a real `claude -p` worker (needs ANTHROPIC_API_KEY)
 mutation-pass.sh           # disables one gate per assert and shows each assert FAIL (the ledger)
 expected/live/             # the banked live-run evidence bundle (committed)
@@ -207,7 +215,7 @@ redundant-free sidecar.
 ## Run
 
 ```bash
-./run.sh          # replay lane (no credentials); prints [1]..[10], each an engine gate
+./run.sh          # replay lane (no credentials); prints [1]..[12], each an engine gate
 ./mutation-pass.sh # breaks one gate per assert, shows each assert catches it
 ANTHROPIC_API_KEY=... ./run-live.sh   # live lane: a real worker drafts the SQL
 ```
@@ -223,13 +231,18 @@ ANTHROPIC_API_KEY=... ./run-live.sh   # live lane: a real worker drafts the SQL
 ...
 [10] staleness: fresh observe (lag<budget), then stale after backdating (lag>budget)
     OK  fresh lag 5s < 86400s; stale lag 209383917s > 86400s; journal=44 rows
+...
+[12] routing custody: a post-apply re-route holds instead of certifying another warehouse
+    OK  re-route -> hold (state applied, both causes named) -> restore -> observing
 
 POC complete: spec -> lowering -> red draft -> REPAIR -> propose -> human
-gate -> digest-gated apply, with 6 refusal paths exercised (negatives,
-policy, supersession, backstop, staleness).
+gate -> digest-gated apply -> observation, including a post-apply DATA-RED
+routed back through repair and a SECOND human review, with 7 refusal paths
+exercised (negatives, policy, supersession, backstop, staleness, bare apply
+of the repaired plan).
 ```
 
-## The 11 asserts, each mapped to the engine gate it exercises
+## The 12 asserts, each mapped to the engine gate it exercises
 
 | # | Assert | Engine gate |
 |---|---|---|
@@ -244,3 +257,4 @@ policy, supersession, backstop, staleness).
 | 9 | Composite-unique grain test RAN green (declarative) | `rocky test --declarative` executes the generated `[[tests]] type=composite kind=unique` on `[client_id, day]` against the warehouse (plain `rocky test` runs only the model) |
 | 10 | Staleness observed after backdating | the runner's observation phase (MAX(time_column) vs budget), reported not enforced |
 | 11 | A violated declared check → `observed_failing` (exit 4) → repair round → NEW plan → second human review → `observing` | the post-apply reading of the declared `[[tests]]` through the same typed core `rocky test --declarative` uses; the data-repair route, its own budget, and the plan-id/marker binding that stops a repair inheriting the failing plan's approval |
+| 12 | A post-apply re-route holds instead of certifying another warehouse | routing custody: the loop compares the configured warehouse with the one this generation applied under, stops with `applied` when they differ, and names both causes (an edited config, or a changed env value) |

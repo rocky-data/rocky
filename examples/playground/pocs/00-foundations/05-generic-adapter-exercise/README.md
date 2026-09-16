@@ -3,7 +3,7 @@
 > **Category:** 00-foundations
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 5s
-> **Rocky features:** validate, list, doctor, seed, discover, plan, compile, test, `[[tests]]` declarative assertions
+> **Rocky features:** validate, list, doctor, seed, discover, plan, compile, test
 
 ## What it shows
 
@@ -33,7 +33,7 @@ Commands exercised:
 | `rocky discover` | Schema pattern matching against DuckDB schemas |
 | `rocky plan` | Dry-run SQL generation with `--filter` |
 | `rocky compile` | Model type-checking |
-| `rocky test` | Declarative `[[tests]]` execution (unique, not_null, accepted_values) |
+| `rocky test` | Local model execution in an in-memory DuckDB (1 model passes) |
 
 ## Why it's distinctive
 
@@ -52,11 +52,11 @@ Commands exercised:
 ├── rocky.toml              pipeline: flat schema pattern, checks enabled
 ├── run.sh                  exercises every generic command
 ├── seeds/
-│   ├── customers.csv       7 rows (id, name, email, tier, created_at)
+│   ├── customers.csv       7 rows (customer_id, name, email, tier, created_at)
 │   ├── customers.toml      routes to raw__customers schema
-│   ├── orders.csv          10 rows (id, customer_id, product, amount, status)
+│   ├── orders.csv          10 rows (order_id, customer_id, product, amount, status, ordered_at)
 │   ├── orders.toml         routes to raw__orders schema
-│   ├── products.csv        5 rows (id, name, category, price, in_stock)
+│   ├── products.csv        5 rows (product_id, name, category, price, in_stock)
 │   └── products.toml       routes to raw__products schema
 ├── data/
 │   └── seed.sql            raw__orders table — auto-loaded by `rocky test`
@@ -65,6 +65,11 @@ Commands exercised:
     ├── stg_orders.sql      SELECT from replicated orders
     └── stg_orders.toml     [[tests]]: unique(order_id), not_null(customer_id), accepted_values(status)
 ```
+
+`run.sh` calls `rocky test` without `--declarative`. That compiles the models
+and runs them in an in-memory DuckDB loaded from `data/seed.sql`. It does
+**not** run the `[[tests]]` in `stg_orders.toml`. Those run only under
+`rocky test --declarative`, against the configured warehouse adapter.
 
 ## Prerequisites
 
@@ -107,22 +112,35 @@ stg_orders                     poc.analytics.stg_orders                 full_ref
 
 === discover ===
 raw__customers | source="customers" | 1 tables
-raw__orders    | source="orders"    | 1 tables
-raw__products  | source="products"  | 1 tables
+raw__orders | source="orders" | 1 tables
+raw__products | source="products" | 1 tables
 
 === plan (orders only) ===
 -- full_refresh_copy (staging__orders.orders)
-CREATE OR REPLACE TABLE staging__orders.orders AS SELECT * FROM raw__orders.orders;
+CREATE OR REPLACE TABLE staging__orders.orders AS
+SELECT *
+FROM raw__orders.orders;
+
 Run plan persisted — 1 model(s) across 1 layer(s)
+Plan ID:   <64-hex plan id>
+Apply with: rocky apply <64-hex plan id>
 
 === compile ===
-(stg_orders compiles; JSON written to expected/compile.json)
+                                                     # JSON in expected/compile.json
 
 === test ===
-(1 passed, 0 failed; JSON written to expected/test.json)
+                                                     # expected/test.json: 1 passed, 0 failed
 
 POC complete: generic adapter exercise passed.
+  - 3 seeds loaded (customers, orders, products)
+  - 3 source schemas discovered
+  - plan generated for orders pipeline
+  - stg_orders compiled and tested (unique, not_null, accepted_values)
+  - Artifacts saved to expected/
 ```
+
+The `stg_orders compiled and tested` line of the summary names the three
+`[[tests]]`. As explained above, plain `rocky test` does not run them.
 
 ## Related
 

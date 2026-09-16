@@ -85,7 +85,7 @@ How Rocky catches bad data. These POCs cover contracts, inline checks, named and
 | POC | Feature |
 |---|---|
 | [01-data-contracts-strict](pocs/01-quality/01-data-contracts-strict) | Every contract rule (`required`, `protected`, columns) + a deliberately broken sibling that exercises every diagnostic code |
-| [02-inline-checks](pocs/01-quality/02-inline-checks) | Built-in `[checks]` (row_count, column_match, freshness, null_rate) running inline during `rocky run` |
+| [02-inline-checks](pocs/01-quality/02-inline-checks) | Built-in `[checks]` (row_count, column_match) running inline during `rocky run`; freshness and null_rate stay commented out in `rocky.toml` |
 | [03-anomaly-detection](pocs/01-quality/03-anomaly-detection) | `rocky history` + `rocky metrics --alerts` driven by row count anomalies across runs |
 | [04-local-test-with-duckdb](pocs/01-quality/04-local-test-with-duckdb) | `rocky test` with both passing and intentionally failing assertions |
 | [05-snapshot-scd2](pocs/01-quality/05-snapshot-scd2) | `type = "snapshot"` pipeline — SCD Type 2 with `unique_key`, `updated_at`, `invalidate_hard_deletes` |
@@ -130,7 +130,7 @@ How Rocky keeps a language model honest. A generated model goes through the comp
 | [05-schema-grounded-validation](pocs/03-ai/05-schema-grounded-validation) | **Trust arc 5** — `ValidationContext` schema grounding + compile-verify retry loop |
 | [06-mcp-grounding](pocs/03-ai/06-mcp-grounding) | `rocky mcp` server — a schema-only model compiles but reconciles wrong; sampling the data via the MCP tools fixes it (creds-free `run.sh`) |
 | [07-policy](pocs/03-ai/07-policy) | `rocky policy test` — scenario assertions pin an agent `[policy]` so a careless edit that opens a hole becomes a red CI check (creds-free `run.sh`) |
-| [08-fulfillment-walking-skeleton](pocs/03-ai/08-fulfillment-walking-skeleton) | `rocky fulfill` — the whole spec → lower → human gate → digest-gated apply loop on one binary; creds-free replay `run.sh` (11 asserts + mutation pass, including a post-apply data-red routed back through repair and a second human review), plus `run-live.sh` where a real `claude -p` worker drafts it end to end |
+| [08-fulfillment-walking-skeleton](pocs/03-ai/08-fulfillment-walking-skeleton) | `rocky fulfill` — the whole spec → lower → human gate → digest-gated apply loop on one binary; creds-free replay `run.sh` (12 asserts + mutation pass, including a post-apply data-red routed back through repair and a second human review), plus `run-live.sh` where a real `claude -p` worker drafts it end to end |
 
 ### 04 — Governance (11 POCs · Databricks / DuckDB)
 
@@ -176,7 +176,7 @@ The daily loop: edit, check, review, ship. Lineage, previews, CI gates, dbt impo
 | POC | Feature |
 |---|---|
 | [01-lineage-column-level](pocs/06-developer-experience/01-lineage-column-level) | `rocky lineage <model> --column <col> --output json` on a 4-model branching DAG |
-| [02-rocky-serve-api](pocs/06-developer-experience/02-rocky-serve-api) | `rocky serve --watch` HTTP API with curl examples |
+| [02-rocky-serve-api](pocs/06-developer-experience/02-rocky-serve-api) | `rocky serve --port 9876` HTTP API with curl examples (health, models, lineage, dag) |
 | [03-import-dbt-validate](pocs/06-developer-experience/03-import-dbt-validate) | `rocky import-dbt` on a real dbt project + `rocky validate-migration` correctness report |
 | [04-shadow-mode-compare](pocs/06-developer-experience/04-shadow-mode-compare) | `rocky compare` shadow targets with row count + schema diffs |
 | [05-doctor-and-ci](pocs/06-developer-experience/05-doctor-and-ci) | `rocky doctor` + `rocky ci --output json` + a GitHub Actions example |

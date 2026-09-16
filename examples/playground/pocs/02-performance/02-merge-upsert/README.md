@@ -52,7 +52,7 @@ update_columns = ["name", "email", "tier"]
 - `rocky` on PATH
 - `duckdb` CLI (`brew install duckdb`), which seeds the source table, applies
   the delta, and verifies post-MERGE row counts
-- Engine ≥ 1.29 (or this branch). The two enabling fixes shipped in PRs
+- `rocky` ≥ 1.29.0 on PATH. The two enabling fixes shipped in 1.29.0, in PRs
   [#448](https://github.com/rocky-data/rocky/pull/448)
   (`auto_create_schemas` for transformation pipelines) and
   [#449](https://github.com/rocky-data/rocky/pull/449) (DuckDB MERGE
@@ -112,10 +112,10 @@ customer_id |     name              |     email                       | tier
 ## Related
 
 - DuckDB MERGE dialect:
-  [`engine/crates/rocky-duckdb/src/dialect.rs`](../../../../engine/crates/rocky-duckdb/src/dialect.rs)
+  [`engine/crates/rocky-duckdb/src/dialect.rs`](../../../../../engine/crates/rocky-duckdb/src/dialect.rs)
   (`merge_into`)
 - Transformation MERGE codegen:
-  [`engine/crates/rocky-core/src/sql_gen.rs`](../../../../engine/crates/rocky-core/src/sql_gen.rs)
+  [`engine/crates/rocky-core/src/sql_gen.rs`](../../../../../engine/crates/rocky-core/src/sql_gen.rs)
   (`generate_transformation_sql` MERGE arm)
 - Sibling: [`01-incremental-watermark`](../01-incremental-watermark),
   watermark-based incremental writes (no MERGE, append only)

@@ -62,10 +62,17 @@ the whole directory. Delete `.rocky/` when you are done.
 rocky --output json snapshot --dry-run
 ```
 
-Without `--dry-run`, `rocky snapshot` executes those statements against the
-configured adapter. It reads `main.raw.customers` and writes
-`main.history.customers_history`. This example ships neither table, so create
-`main.raw.customers` first.
+This example is dry-run only on DuckDB. Without `--dry-run`, `rocky snapshot`
+executes the statements against the configured adapter, and on DuckDB that
+fails:
+
+- DuckDB has no catalog named `main`, so `initial_load` stops with
+  `Catalog with name main does not exist!`.
+- `merge_1` uses `INSERT (*) VALUES (source.*, ...)`. DuckDB rejects it with
+  `Parser Error: syntax error at or near "*"`, even after you point the
+  pipeline at a real catalog and schema.
+
+Issue [#2012](https://github.com/rocky-data/rocky/issues/2012) tracks the fix.
 
 ## The four history columns
 

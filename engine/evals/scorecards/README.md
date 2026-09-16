@@ -1,8 +1,10 @@
 # Published scorecards
 
-Committed, per-release agent-conformance scorecards — the published artifact of
-the eval suite (the live `results/` directory a run writes is gitignored; these
-are the snapshots worth keeping).
+Committed agent-conformance scorecards: the snapshots of an eval run worth
+keeping. The live `results/` directory a run writes is gitignored. Copying a
+run in here is a hand step, so this directory is not a per-release record. It
+holds one scorecard today, `2026-07-08-claude-sonnet-4-5`, run against engine
+1.57.0.
 
 Each file is the verbatim output of `run_evals.py` (`scorecard.md` + the machine
 `scorecard.json`), named `<date>-<model>.{md,json}`. Every scorecard stamps the

@@ -138,7 +138,7 @@ pipeline default (`full_refresh`) because no rule overrides its strategy.
 ## Related
 
 - Config structs: `TableOverride`, `TableMatch`, `ResolvedTableOverride`
-  in [`engine/crates/rocky-core/src/config.rs`](../../../../engine/crates/rocky-core/src/config.rs)
+  in [`engine/crates/rocky-core/src/config.rs`](../../../../../engine/crates/rocky-core/src/config.rs)
 - Resolver: `resolve_table_override()` in `rocky-core/src/config.rs`
 - Validation: `validate_replication_overrides()` in `rocky-core/src/config.rs`
 - Replication strategies showcase: [`02-performance/11-strategy-showcase`](../11-strategy-showcase)

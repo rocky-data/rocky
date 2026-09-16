@@ -88,7 +88,7 @@ surface, all on a single 3-model DuckDB pipeline:
 
 ## Related
 
-- Engine source: `engine/crates/rocky-core/src/branch.rs`,
+- Engine source: `engine/crates/rocky-engine/src/branch.rs`,
   `engine/crates/rocky-cli/src/commands/{branch.rs,replay.rs,lineage.rs}`
 - Companion example: [`engine/examples/multi-layer/`](../../../../../engine/examples/multi-layer/)
 - Sibling POC: [`06-developer-experience/01-lineage-column-level/`](../../06-developer-experience/01-lineage-column-level/)
