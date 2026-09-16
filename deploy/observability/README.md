@@ -134,8 +134,9 @@ At a terminal the logs are colored text. The Alloy config ships two log paths:
   under `./logs/` (as the quickstart does) and Alloy tails `./logs/*.jsonl`,
   parses each line, promotes `level` to a label, and reads `trace_id` /
   `span_id` into structured metadata. Rocky's JSON log lines do not contain
-  those fields, even with OpenTelemetry on. A line carries span names and
-  span fields, not the OpenTelemetry trace ID. So Grafana cannot jump from a span in Tempo to its log lines in Loki.
+  those fields at the default log level, even with OpenTelemetry on. A line
+  carries span names and span fields, not the OpenTelemetry trace ID. So
+  Grafana cannot jump from a span in Tempo to its log lines in Loki.
 
 See `alloy/config.alloy` for both pipelines; the file-tail block is documented
 inline.

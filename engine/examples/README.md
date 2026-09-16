@@ -40,5 +40,5 @@ rocky playground
 
 ## Prerequisites
 
-- The Rocky CLI. Install it with `engine/install.sh` (see the [engine README](../README.md#installation)) or build it from source. Rocky is not published on crates.io, so `cargo install rocky` does not install it.
+- The Rocky CLI. Install it with `engine/install.sh` (see the [engine README](../README.md#installation)) or build it from source. Rocky is not published on crates.io. `cargo install rocky` installs an unrelated crate of that name, not this tool.
 - No warehouse. The pipeline examples use DuckDB locally. `ai-intent` needs `ANTHROPIC_API_KEY`.

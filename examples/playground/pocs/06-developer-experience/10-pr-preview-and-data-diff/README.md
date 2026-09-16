@@ -168,8 +168,8 @@ cd examples/playground/pocs/06-developer-experience/10-pr-preview-and-data-diff
 4. Runs the pipeline on `main` state.
 5. Captures the current git HEAD as the `--base` ref. Run the POC inside
    a git checkout. Outside one, `run.sh` falls back to the sentinel ref
-   `poc-base`, and step 7 then fails: `rocky preview create` cannot
-   `git diff` against it, so `run.sh` exits 1.
+   `poc-base`, and the `rocky preview create` step below then fails: it
+   cannot `git diff` against that ref, so `run.sh` exits 1.
 6. Swaps `models/fct_revenue.sql` for `fct_revenue.sql.changed` in the
    working tree, adding a `WHERE s.amount > 25` filter. (This edit is
    *uncommitted* — see "What the local `./run.sh` actually produces": the

@@ -90,7 +90,8 @@ unless `required` lists it. The code is `W010` and the message is
 `contract column '<name>' not found in model output`. This contract declares
 nine columns, and all nine are in the model output, so no `W010` appears here.
 
-The compile line reports 12 columns for `fct_user_activity`, not nine. The
+The plain `rocky compile` line above reports 12 columns for
+`fct_user_activity`, not nine. The
 `keep` block in the join outputs `full_name`, `email`, and `country`, and the
 `group` block outputs them again, so each name appears twice.
 

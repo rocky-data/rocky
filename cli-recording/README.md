@@ -97,9 +97,9 @@ frame.png`) and confirming it is equal-or-better than what it replaces.
 `tapes/` holds 11 single-demo tapes, one per row below, and the three
 `fulfillment-review-*` tapes that only `record-screencast.sh` drives. Each
 single-demo tape maps to a playground POC or to the `rocky playground`
-scaffold. Ten of the 11 are published to `docs/public/` as
-`demo-<name>.gif`. The published `demo-incremental-watermark.gif` is still
-the hand-made original (see the table note).
+scaffold. Each of the 11 has a `docs/public/demo-<name>.gif`. Ten of those
+GIFs were rendered from a tape. `demo-incremental-watermark.gif` is still the
+hand-made original, never re-rendered (see the table note).
 
 | Demo | POC | Tape notes |
 |---|---|---|
