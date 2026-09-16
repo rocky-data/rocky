@@ -47,7 +47,7 @@ Below the project strip, the DAG draws every model and the edges between them. C
 
 ## Review
 
-The Review screen lists the plans that the policy plane sent to a human, by a rule or by the default effect. The engine ranks the queue by a score: blast radius × change class × staleness. A breaking schema change weighs 3, a bare `apply`, `promote` or `backfill` weighs 2, and anything else weighs 1. So a wide-reaching breaking change that has waited long comes first. The queue's own `ranking` field spells the middle term "classification", which names the field, not the data's classification tags. It is the same list `rocky review --queue` prints.
+The Review screen lists the plans that the policy plane sent to a human, by a rule or by the default effect. The engine ranks the queue by a score: blast radius × change class × staleness. A breaking schema change weighs 3, a bare `apply`, `promote` or `backfill` weighs 2, and anything else weighs 1. So a wide-reaching breaking change that has waited long comes first. It is the same list `rocky review --queue` prints.
 
 Open a plan to see why it waits:
 
@@ -58,7 +58,7 @@ The plan screen shows:
 - **What it would break.** The breaking-change findings against `HEAD`, or why that check could not run.
 - **Why it needs a human.** The rule, the capability, the principal and the blast radius behind the `require_review` decision.
 - **The spec it was planned against.** For a product plan only: whether the product spec changed after the plan was made.
-- **Sample rows.** Nothing is read until you ask. The button runs the model's query against the warehouse for up to 20 rows, and that query has a cost. Before the rows leave the engine, it masks each classified column that a workspace-default `[mask]` strategy covers, and refuses the sample with `422` when it cannot build that mask. A tag with no default `[mask]` strategy, or one set only for another environment, masks nothing: those columns come back raw. `rocky compile` reports the gap as `W004`, and it does not stop the sample. Check your `[mask]` block before you hand this page to someone who may not read a column's classification. The button appears only when the plan names exactly one model to sample.
+- **Sample rows.** Nothing is read until you ask. The button runs the model's query against the warehouse for up to 20 rows, and that query has a cost. Before the rows leave the engine, it masks each classified column that a workspace-default `[mask]` strategy covers, and refuses the sample with `422` when it cannot build that mask. A tag with no default `[mask]` strategy, or one set only for another environment, masks nothing: those columns come back raw. A tag with no `[mask]` entry at all draws a `W004` compile warning, which does not stop the sample. A tag whose only entry is an environment override, such as `[mask.prod]`, draws no warning either, so that case has no signal at all. Check your `[mask]` block before you hand this page to someone who may not read a column's classification. The button appears only when the plan names exactly one model to sample.
 - **How to approve.** The command to copy.
 
 You approve in a terminal, not on the page. The approval marker records a git identity, and the page holds a read-only token:
