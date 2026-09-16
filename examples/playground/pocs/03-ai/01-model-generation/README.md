@@ -36,7 +36,7 @@ The POC runs `rocky ai` twice to cover both flag paths:
 - **All materializations on the same flag surface** — `full_refresh`,
   `incremental` (+ `--watermark`), `merge` (v1 limitation: no `--unique-key`
   yet, so the sidecar needs a hand-edit), `ephemeral`.
-- Different from `rocky/examples/ai-intent` (which ships pre-generated tests).
+- Different from `engine/examples/ai-intent` (which ships pre-generated tests).
   This POC generates fresh models live.
 
 ## Run

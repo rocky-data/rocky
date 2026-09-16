@@ -69,9 +69,9 @@ each pipeline's section of `rocky.toml`.
 - `rocky` on PATH
 - `duckdb` CLI (`brew install duckdb`), which seeds the source, applies the
   delta, and runs the side-by-side verification queries
-- Engine ≥ 1.29 (or this branch). `auto_create_schemas` for transformation
-  pipelines landed in PR #448; if your binary predates it, either pre-create
-  `poc.merge` via duckdb or wait for the next release.
+- `rocky` ≥ 1.29.0 on PATH. `auto_create_schemas` for transformation pipelines
+  landed in 1.29.0, in PR #448. On an older binary, pre-create `poc.merge` with
+  duckdb.
 
 ## Run
 
@@ -128,10 +128,10 @@ total count.
 ## Related
 
 - Replication strategy parsing:
-  [`engine/crates/rocky-core/src/config.rs`](../../../../engine/crates/rocky-core/src/config.rs)
+  [`engine/crates/rocky-core/src/config.rs`](../../../../../engine/crates/rocky-core/src/config.rs)
 - Strategy SQL generation:
-  [`engine/crates/rocky-core/src/sql_gen.rs`](../../../../engine/crates/rocky-core/src/sql_gen.rs)
+  [`engine/crates/rocky-core/src/sql_gen.rs`](../../../../../engine/crates/rocky-core/src/sql_gen.rs)
   (`generate_create_table_as_sql`, watermark `WHERE` injection,
   `generate_transformation_sql` MERGE arm)
 - DuckDB MERGE dialect:
-  [`engine/crates/rocky-duckdb/src/dialect.rs`](../../../../engine/crates/rocky-duckdb/src/dialect.rs)
+  [`engine/crates/rocky-duckdb/src/dialect.rs`](../../../../../engine/crates/rocky-duckdb/src/dialect.rs)

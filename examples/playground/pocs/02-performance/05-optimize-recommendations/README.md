@@ -14,8 +14,9 @@ some run history:
   recommends materialization strategy changes (e.g., "this view is queried
   100x/day; promote to a table").
 - `rocky profile-storage <model>` — Suggests column encodings + compression.
-- `rocky compact <model>` — Generates `OPTIMIZE`/`VACUUM` SQL for table
-  compaction. This is a **warehouse-only** maintenance op — see the note
+- `rocky compact <catalog.schema.table>` — Generates `OPTIMIZE`/`VACUUM`
+  SQL for table compaction. It takes a fully qualified table, not a bare
+  model name. This is a **warehouse-only** maintenance op. See the note
   under Status.
 
 ## Why it's distinctive
@@ -41,18 +42,26 @@ expected/      # captured JSON (gitignored): run/optimize/profile/compact
   recommendations are minimal, so the POC just documents the commands and
   their JSON shape.
 - `rocky compact` generates `OPTIMIZE`/`VACUUM` SQL, which is a warehouse
-  maintenance operation. On the **DuckDB** dialect the engine's dialect guard
-  rejects it (regardless of `--dry-run`):
+  maintenance operation. `run.sh` calls it with the bare name `events`, so
+  the engine refuses before it looks at the dialect:
 
   ```
-  Error: failed to generate compaction SQL for 'events'
+  Error: refusing to plan a compaction of 'events': `rocky compact` takes a fully qualified table (catalog.schema.table). A bare name cannot say whether it means a physical table or a model, and this plan regenerates OPTIMIZE/VACUUM against whatever it names
+  ```
+
+  With a fully qualified table, the **DuckDB** dialect guard rejects it
+  (with or without `--dry-run`):
+
+  ```
+  $ rocky -c rocky.toml compact poc.staging__events.events
+  Error: failed to generate compaction SQL for 'poc.staging__events.events'
+
   Caused by:
       maintenance operation 'OPTIMIZE' is not supported for dialect 'duckdb'
   ```
 
-  `run.sh` runs the `compact` step to demonstrate this guard (it captures the
-  error into `expected/compact.json` and continues). Compaction is exercised
-  for real against Databricks/Snowflake, not DuckDB.
+  `run.sh` captures the error into `expected/compact.json` and continues.
+  Compaction runs for real against Databricks, not DuckDB.
 
 ## Run
 
@@ -64,15 +73,14 @@ expected/      # captured JSON (gitignored): run/optimize/profile/compact
 
 `run.sh` prints, in order:
 
-- the seed row count (`200`),
 - `rocky validate` JSON (config valid),
 - `run` log lines building `poc.staging__events.events`,
 - `=== rocky optimize ===` followed by a `recommendations` array,
 - `=== rocky profile-storage ===` followed by a `profile_sql` string and a
   per-column `recommendations` array,
-- `=== rocky compact events (expected to fail on DuckDB) ===` followed by the
-  dialect-guard error above,
-- `POC complete: optimize + profile-storage emitted JSON; compact hit the
-  DuckDB dialect guard (warehouse-only).`
+- `=== rocky compact events (expected to fail) ===` followed by the
+  bare-name refusal above,
+- `POC complete: optimize + profile-storage emitted JSON; compact refused the
+  bare table name (it needs catalog.schema.table).`
 
 Full JSON for each command is captured under `expected/`.

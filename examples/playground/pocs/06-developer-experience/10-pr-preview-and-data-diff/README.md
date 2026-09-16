@@ -150,6 +150,8 @@ fields (timestamps, branch schema, run ids) run to run.
 
 - `rocky` ≥ 1.18.0 on PATH
 - `duckdb` CLI for seeding (`brew install duckdb`)
+- `git`, and the POC inside a git checkout (`rocky preview create` runs
+  `git diff` against the base ref)
 
 ## How to run
 
@@ -164,8 +166,10 @@ cd examples/playground/pocs/06-developer-experience/10-pr-preview-and-data-diff
 2. Runs `rocky compile` against the 5-model DAG.
 3. Seeds the raw tables into DuckDB.
 4. Runs the pipeline on `main` state.
-5. Captures the current git HEAD as the `--base` ref (or a sentinel
-   string when not in a git checkout).
+5. Captures the current git HEAD as the `--base` ref. Run the POC inside
+   a git checkout. Outside one, `run.sh` falls back to the sentinel ref
+   `poc-base`, and step 7 then fails: `rocky preview create` cannot
+   `git diff` against it, so `run.sh` exits 1.
 6. Swaps `models/fct_revenue.sql` for `fct_revenue.sql.changed` in the
    working tree, adding a `WHERE s.amount > 25` filter. (This edit is
    *uncommitted* — see "What the local `./run.sh` actually produces": the

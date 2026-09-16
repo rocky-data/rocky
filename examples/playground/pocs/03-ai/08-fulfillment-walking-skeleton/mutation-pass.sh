@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Per-assert mutation pass: prove each of run.sh's 11 asserts is NON-VACUOUS.
+# Per-assert mutation pass: prove each of run.sh's 12 asserts is NON-VACUOUS.
 #
 # For each assert n, run.sh carries a guarded `MUTATE=n` hook that breaks THAT
 # assert's engine gate (a lying digest, a dropped contract column, an un-stripped
@@ -77,6 +77,6 @@ echo
 echo "Ledger (assert | broken gate | observed | verdict):"
 printf '%s' "$LEDGER"
 echo
-echo "Mutation pass: $pass / $total gate mutations caught (11 asserts; assert 2 has two — totality + repair evidence; assert 9 has three — failed + errored + warned; assert 11 has two — the data-red itself and the fresh human gate behind it)."
+echo "Mutation pass: $pass / $total gate mutations caught (12 asserts; assert 2 has two — totality + repair evidence; assert 9 has three — failed + errored + warned; assert 11 has two — the data-red itself and the fresh human gate behind it)."
 [ "$pass" = "$total" ] || { echo "MUTATION PASS INCOMPLETE — $((total - pass)) mutation(s) not caught."; exit 1; }
 echo "Every broken gate is caught. The replay lane is a real gate exerciser."

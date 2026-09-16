@@ -24,7 +24,7 @@ The guarantee is backend-specific:
 |---|---|
 | `local` | redb write txn inside the existing `state.redb.lock` file lock |
 | `valkey` / `tiered` | Valkey `SET NX EX` on `{prefix}:idempotency:<key>` |
-| `s3` / `gcs` | Object-store conditional PUT (`If-None-Match: "*"`) |
+| `s3` / `gcs` | Object-store conditional PUT (`If-None-Match: "*"` on S3, `x-goog-if-generation-match: 0` on GCS) |
 
 This POC uses the `local` backend (DuckDB, single-writer) so no external
 services are required.

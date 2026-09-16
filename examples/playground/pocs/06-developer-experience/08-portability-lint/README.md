@@ -67,7 +67,7 @@ Three escape hatches:
 
 ## Related
 
-- Engine source: `engine/crates/rocky-compiler/src/portability.rs`,
+- Engine source: `engine/crates/rocky-sql/src/portability.rs`,
   `engine/crates/rocky-sql/src/pragma.rs`
 - CLI surface: `rocky compile --target-dialect {dbx,sf,bq,duckdb}`
 - Companion arc: Arc 7 blast-radius lint (P002 `SELECT *`); see
