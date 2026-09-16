@@ -59,7 +59,7 @@ Each card says whether its data was available. A signal the ledger does not hold
 
 ## Estate
 
-The printed address opens the Estate, whichever area the sidebar lists first. It shows the project as the engine compiled it. The strip at the top names the config file, the pipelines and adapters, the compiled models with their diagnostics, and the newest run.
+The printed address opens Estate, even though Needs you is first in the sidebar. It shows the project as the engine compiled it. The strip at the top names the config file, the pipelines and adapters, the compiled models with their diagnostics, and the newest run.
 
 ![The estate screen for the playground project: a project strip with one transformation pipeline, one DuckDB adapter and three compiled models, the newest run, and a DAG of raw_orders, customer_orders and revenue_summary](/ui-estate.png)
 
