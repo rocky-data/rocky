@@ -1170,10 +1170,28 @@ fn build_scorecard(
         .collect();
     windowed.sort_by_key(|d| std::cmp::Reverse(d.timestamp));
 
-    let total_decisions = windowed.len() as u64;
+    // EVALUATIONS, so the scorecard reconciles: the group totals sum to this,
+    // and a reader adding allow + require_review + deny across the groups gets
+    // the same number. Counting every ledger event here while the rates count
+    // only evaluations would leave the document internally inconsistent, which
+    // is harder to explain than either choice on its own.
+    //
+    // A window holding only freezes therefore reports "no policy decisions",
+    // which is the true answer for a POLICY scorecard: an operator freezing a
+    // scope is not policy evaluating a plan.
+    let total_decisions = windowed.iter().filter(|d| d.is_evaluation()).count() as u64;
 
+    // EVALUATIONS ONLY. `policy_decisions` holds more than evaluations, and
+    // counting the rest by `effect` is what made a failed post-apply check
+    // halve the acceptance rate and every `rocky policy freeze` raise the
+    // denial rate (#1921). A verification verdict and an administrative freeze
+    // are not statements about what policy allowed.
+    //
+    // The window filter above is deliberately left over ALL rows: the
+    // verify-after aggregate below reads the same slice and needs its own
+    // kind.
     let mut accumulators: BTreeMap<String, GroupAccumulator> = BTreeMap::new();
-    for d in &windowed {
+    for d in windowed.iter().filter(|d| d.is_evaluation()) {
         accumulators
             .entry(scorecard_group_key(by, d))
             .or_default()
@@ -1189,10 +1207,36 @@ fn build_scorecard(
 
     let verify_after = build_scorecard_verify_after(&windowed);
 
+    // Rows the rates deliberately exclude, reported so the numbers reconcile.
+    // Without this a reader sees `rocky audit` list more rows than the
+    // scorecard counted and cannot tell why: `plan_id` reveals a freeze, but
+    // nothing on the audit entry reveals a verification custody row. Carrying
+    // it in the existing `note` keeps the explanation next to the number and
+    // needs no output-shape change (#1921).
+    let excluded = windowed.len() as u64 - total_decisions;
+
     let (availability, note) = if total_decisions == 0 {
         (
             SectionAvailability::NoData,
-            Some("no policy decisions fall in the window".to_string()),
+            Some(if excluded == 0 {
+                "no policy decisions fall in the window".to_string()
+            } else {
+                format!(
+                    "no policy decisions fall in the window; {excluded} ledger \
+                     row(s) here are not evaluations (post-apply verification \
+                     custody, or freeze/unfreeze) and do not count toward these \
+                     rates"
+                )
+            }),
+        )
+    } else if excluded > 0 {
+        (
+            SectionAvailability::Available,
+            Some(format!(
+                "{excluded} ledger row(s) in this window are not policy \
+                 evaluations (post-apply verification custody, or \
+                 freeze/unfreeze) and are excluded from these rates"
+            )),
         )
     } else {
         (SectionAvailability::Available, None)
@@ -1925,6 +1969,236 @@ mod tests {
 
     /// Full-control decision builder: principal, rule, effect, model, and a
     /// second offset in a fixed day so timestamps order deterministically.
+    /// **The legacy matrix (#1921).** Every kind the ledger holds, classified.
+    ///
+    /// The two that matter most are the last two: a governed auto-apply row is
+    /// a GENUINE evaluation that happens to carry custody detail, and removing
+    /// it from the rates would be the same defect in the opposite direction.
+    #[test]
+    fn every_ledger_row_kind_is_classified() {
+        use rocky_core::state::DecisionKind;
+
+        let evaluation = sc_decision(
+            1,
+            "plan-a",
+            "orders",
+            PolicyPrincipal::Agent,
+            Some(0),
+            PolicyEffect::Allow,
+        );
+        assert_eq!(evaluation.kind(), DecisionKind::Evaluation);
+
+        let mut verification = evaluation.clone();
+        verification.verify_after = vec!["row_count".to_string()];
+        assert_eq!(verification.kind(), DecisionKind::VerifyAfterCustody);
+
+        let mut freeze = evaluation.clone();
+        freeze.plan_id = format!(
+            "{}agent:2026-09-13T00:00:00Z",
+            rocky_core::policy::FREEZE_PLAN_PREFIX
+        );
+        freeze.effect = PolicyEffect::Deny;
+        assert_eq!(freeze.kind(), DecisionKind::Freeze);
+
+        let mut unfreeze = evaluation.clone();
+        unfreeze.plan_id = format!(
+            "{}agent:2026-09-13T00:00:00Z",
+            rocky_core::policy::UNFREEZE_PLAN_PREFIX
+        );
+        assert_eq!(unfreeze.kind(), DecisionKind::Unfreeze);
+
+        // A plain governed auto-apply row: custody payload, still an evaluation.
+        let mut auto_apply_eval = evaluation.clone();
+        auto_apply_eval.auto_apply = Some(rocky_core::state::AutoApplyCustody {
+            drift_summary: "1 column added".to_string(),
+            classification: "additive".to_string(),
+            applied: true,
+            revert_pointer: None,
+        });
+        assert_eq!(
+            auto_apply_eval.kind(),
+            DecisionKind::Evaluation,
+            "auto_apply is an orthogonal payload, not a kind — classifying it as \
+             custody would take real evaluations out of the rates"
+        );
+
+        // Its LATER verification row carries both fields; verify_after wins.
+        let mut auto_apply_verification = auto_apply_eval.clone();
+        auto_apply_verification.verify_after = vec!["row_count".to_string()];
+        assert_eq!(
+            auto_apply_verification.kind(),
+            DecisionKind::VerifyAfterCustody
+        );
+    }
+
+    /// **The defect this closes.** A failed post-apply check must not move the
+    /// acceptance rate of a policy that denied nothing.
+    ///
+    /// Before: total=2, allow=1, acceptance=0.50. The verification row was
+    /// counted as a policy evaluation AND in its own aggregate.
+    #[test]
+    fn a_failed_verification_does_not_move_the_acceptance_rate() {
+        let evaluation = sc_decision(
+            1,
+            "plan-a",
+            "orders",
+            PolicyPrincipal::Agent,
+            Some(0),
+            PolicyEffect::Allow,
+        );
+        let mut verification = sc_decision(
+            2,
+            "plan-a",
+            "orders",
+            PolicyPrincipal::Agent,
+            Some(0),
+            PolicyEffect::Deny,
+        );
+        verification.verify_after = vec!["row_count".to_string()];
+
+        let out = build_scorecard(
+            ScorecardDimension::Principal,
+            "all",
+            None,
+            &[evaluation, verification],
+        );
+
+        assert_eq!(out.total_decisions, 1, "one policy evaluation was recorded");
+        let g = &out.groups[0];
+        assert_eq!(g.total, 1);
+        assert_eq!(g.allow, 1);
+        assert!(
+            (g.acceptance_rate - 1.0).abs() < f64::EPSILON,
+            "policy allowed 1 of 1"
+        );
+
+        // The verification still has its OWN aggregate — excluded from the
+        // rates, not discarded.
+        let va = out
+            .verify_after
+            .expect("the verification row is still reported");
+        assert_eq!((va.total, va.passed), (1, 0));
+    }
+
+    /// An administrative freeze must not raise the reported denial rate, and an
+    /// unfreeze must not raise acceptance. One `rocky policy freeze --all`
+    /// writes one row per principal, so this is two Deny rows from one command.
+    #[test]
+    fn freezing_a_scope_does_not_move_the_policy_rates() {
+        let evaluation = sc_decision(
+            1,
+            "plan-a",
+            "orders",
+            PolicyPrincipal::Agent,
+            Some(0),
+            PolicyEffect::Allow,
+        );
+
+        let mut freeze = sc_decision(
+            2,
+            "x",
+            "orders",
+            PolicyPrincipal::Agent,
+            None,
+            PolicyEffect::Deny,
+        );
+        freeze.plan_id = format!(
+            "{}agent:2026-09-13T00:00:00Z",
+            rocky_core::policy::FREEZE_PLAN_PREFIX
+        );
+        let mut unfreeze = sc_decision(
+            3,
+            "y",
+            "orders",
+            PolicyPrincipal::Agent,
+            None,
+            PolicyEffect::Allow,
+        );
+        unfreeze.plan_id = format!(
+            "{}agent:2026-09-13T00:00:01Z",
+            rocky_core::policy::UNFREEZE_PLAN_PREFIX
+        );
+
+        let out = build_scorecard(
+            ScorecardDimension::Principal,
+            "all",
+            None,
+            &[evaluation, freeze, unfreeze],
+        );
+
+        assert_eq!(out.total_decisions, 1, "freezes are not policy decisions");
+        let g = &out.groups[0];
+        assert_eq!((g.total, g.allow, g.deny), (1, 1, 0));
+        assert!(
+            (g.denial_rate - 0.0).abs() < f64::EPSILON,
+            "a freeze must not read as a denial"
+        );
+    }
+
+    /// A window holding nothing but administrative rows reports no decisions,
+    /// which is the true answer for a POLICY scorecard rather than a zero rate
+    /// computed over events that evaluated nothing.
+    #[test]
+    fn a_window_of_only_freezes_reports_no_policy_decisions() {
+        let mut freeze = sc_decision(
+            1,
+            "x",
+            "orders",
+            PolicyPrincipal::Agent,
+            None,
+            PolicyEffect::Deny,
+        );
+        freeze.plan_id = format!(
+            "{}agent:2026-09-13T00:00:00Z",
+            rocky_core::policy::FREEZE_PLAN_PREFIX
+        );
+
+        let out = build_scorecard(ScorecardDimension::Principal, "all", None, &[freeze]);
+
+        assert_eq!(out.total_decisions, 0);
+        assert!(out.groups.is_empty());
+    }
+
+    /// The exclusion is reported, not silent. A reader comparing `rocky audit`
+    /// against the scorecard must be able to account for the difference —
+    /// `plan_id` reveals a freeze, but nothing on an audit entry reveals a
+    /// verification custody row.
+    #[test]
+    fn the_scorecard_says_how_many_rows_it_excluded() {
+        let evaluation = sc_decision(
+            1,
+            "plan-a",
+            "orders",
+            PolicyPrincipal::Agent,
+            Some(0),
+            PolicyEffect::Allow,
+        );
+        let mut verification = sc_decision(
+            2,
+            "plan-a",
+            "orders",
+            PolicyPrincipal::Agent,
+            Some(0),
+            PolicyEffect::Deny,
+        );
+        verification.verify_after = vec!["row_count".to_string()];
+
+        let out = build_scorecard(
+            ScorecardDimension::Principal,
+            "all",
+            None,
+            &[evaluation.clone(), verification],
+        );
+        let note = out.note.expect("an exclusion must be reported");
+        assert!(note.contains('1'), "{note}");
+        assert!(note.contains("not policy evaluations"), "{note}");
+
+        // No exclusions, no note: the field stays quiet when there is nothing
+        // to reconcile.
+        let clean = build_scorecard(ScorecardDimension::Principal, "all", None, &[evaluation]);
+        assert!(clean.note.is_none());
+    }
+
     fn sc_decision(
         secs: u32,
         plan_id: &str,
