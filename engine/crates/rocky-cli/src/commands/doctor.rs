@@ -672,9 +672,14 @@ async fn collect_health_checks(
 ///
 /// * `rocky restore` calls the unconditional
 ///   [`upload_state`][rocky_core::state_sync::upload_state] on **every**
-///   remote backend, on every restore apply, including a failing one. It is
-///   the only writer exposed unconditionally.
-/// * `rocky apply` reaches the same unconditional upload only for its
+///   remote backend, on every restore apply, including a failing one.
+/// * `rocky apply` of a RESTORE plan reaches the same unconditional upload,
+///   on every remote backend and with no `verify_after` involved: the
+///   `PlanKind::Restore` arm routes into `run_restore_apply_in`, which calls
+///   `upload_remote_ledger_fail_closed` on every path. "Fail-closed" there
+///   names the DURABILITY policy (the command fails if the upload fails), not
+///   a compare-and-swap — it funnels into the same `upload_state`.
+/// * `rocky apply` of any OTHER plan kind reaches that upload only for its
 ///   verify-after custody rows, which are gated on a non-empty `verify_after`
 ///   — so a project with no `[policy]` block never reaches it.
 ///

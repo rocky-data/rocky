@@ -855,9 +855,11 @@ pub struct StateConfig {
     /// overwriting the winner: the end-of-run upload fail-closes, the
     /// `rocky policy` freeze/unfreeze ledger write replays onto the winner,
     /// and `rocky gc` commits through the same seam (since #1372). `rocky
-    /// restore` still uploads unconditionally on every remote backend, and
-    /// `rocky apply` does so only for its verify-after custody rows (issue
-    /// #1228), so `cas` reduces but does not yet eliminate lost updates. On
+    /// restore` still uploads unconditionally on every remote backend, `rocky
+    /// apply` of a restore plan routes through that same path and so uploads
+    /// unconditionally too, and `rocky apply` elsewhere does so only for its
+    /// verify-after custody rows (issue #1228), so `cas` reduces but does not
+    /// yet eliminate lost updates. On
     /// `tiered` it additionally makes the Valkey tier coherent with the
     /// durable object. Auto-downgrades to `off` (with a warn) on `local` and
     /// `valkey`.
