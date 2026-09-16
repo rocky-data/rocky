@@ -49,19 +49,19 @@ impl UiConfig {
     /// its names, the bind host, or an `--allowed-host` entry. The port is
     /// ignored; a proxy may rewrite it.
     pub fn host_allowed(&self, host_header: &str) -> bool {
-        let host = host_without_port(host_header.trim()).to_ascii_lowercase();
+        let host = host_key(host_header);
         if host.is_empty() {
             return false;
         }
-        if matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]" | "::1") {
+        if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1") {
             return true;
         }
-        if host == host_without_port(&self.bind_host).to_ascii_lowercase() {
+        if host == host_key(&self.bind_host) {
             return true;
         }
         self.allowed_hosts
             .iter()
-            .any(|allowed| host_without_port(allowed).eq_ignore_ascii_case(&host))
+            .any(|allowed| host_key(allowed) == host)
     }
 
     /// Whether a present `Origin` header may reach this server: an exact
@@ -100,6 +100,28 @@ impl UiConfig {
             content_type: content_type_for(path),
         })
     }
+}
+
+/// The value two hosts are compared by: the port removed, IPv6 brackets
+/// stripped, lowercased. `[fd00::1]:8080`, `[fd00::1]` and `fd00::1` all key
+/// to `fd00::1`.
+///
+/// The brackets are why this exists. A `Host` header carries an IPv6 literal
+/// bracketed, because the URL it came from must bracket it — that is what
+/// `serve --ui` prints. A `--host` / `--allowed-host` value carries the same
+/// address bare, because a command-line argument is not a URL. Comparing the
+/// two forms directly made the one address the server advertises for a
+/// non-loopback IPv6 bind an address the same server then refused with 421
+/// (#1993). `[::1]` escaped that only because it was special-cased by name.
+///
+/// A malformed authority keeps its brackets and so still fails to match: the
+/// suffix is only stripped when the prefix was there to strip.
+fn host_key(authority: &str) -> String {
+    let host = host_without_port(authority.trim());
+    host.strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host)
+        .to_ascii_lowercase()
 }
 
 /// Strip an optional `:port` from a host or authority, keeping IPv6
@@ -204,6 +226,28 @@ mod tests {
         }
         // A named bind host is accepted without being listed.
         assert!(config("rocky.internal", &[]).host_allowed("rocky.internal:8080"));
+    }
+
+    /// The address `serve --ui` advertises for a non-loopback IPv6 bind is one
+    /// the same server must accept (#1993). The browser brackets the literal
+    /// because the URL does; `--host` and `--allowed-host` carry it bare.
+    #[test]
+    fn a_non_loopback_ipv6_bind_accepts_the_bracketed_host_it_advertises() {
+        let ui = config("fd00::1", &[]);
+        for ok in ["[fd00::1]:8080", "[fd00::1]", "fd00::1", "[FD00::1]:8080"] {
+            assert!(ui.host_allowed(ok), "{ok}");
+        }
+        // Still bounded: a different address, and a malformed authority whose
+        // brackets never closed, are refused.
+        for bad in ["[fd00::2]:8080", "fd00::2", "[fd00::1", "fd00::1]"] {
+            assert!(!ui.host_allowed(bad), "{bad}");
+        }
+        // `--allowed-host` has the same two spellings as `--host`.
+        assert!(config("127.0.0.1", &["fd00::5"]).host_allowed("[fd00::5]:8080"));
+        assert!(config("127.0.0.1", &["[fd00::5]"]).host_allowed("fd00::5"));
+        // The loopback literal keeps passing by name, bracketed or not.
+        assert!(ui.host_allowed("[::1]:8080"));
+        assert!(ui.host_allowed("::1"));
     }
 
     #[test]
