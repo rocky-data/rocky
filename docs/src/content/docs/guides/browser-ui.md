@@ -47,7 +47,7 @@ Below the project strip, the DAG draws every model and the edges between them. C
 
 ## Review
 
-The Review screen lists the plans that the policy plane sent to a human, by a rule or by the default effect. The engine ranks the queue by a score: blast radius × classification × staleness. A wide change to classified data that has waited long comes first. It is the same list `rocky review --queue` prints.
+The Review screen lists the plans that the policy plane sent to a human, by a rule or by the default effect. The engine ranks the queue by a score: blast radius × change class × staleness. A breaking schema change weighs 3, a bare `apply`, `promote` or `backfill` weighs 2, and anything else weighs 1. So a wide-reaching breaking change that has waited long comes first. The queue's own `ranking` field spells the middle term "classification", which names the field, not the data's classification tags. It is the same list `rocky review --queue` prints.
 
 Open a plan to see why it waits:
 
