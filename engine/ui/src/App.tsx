@@ -8,7 +8,7 @@ import {
 } from "react";
 import type { MetaOutput } from "@rocky-types/meta";
 import { ApiError, apiGet } from "./api";
-import { AREAS, areaFromPath, type AreaId } from "./areas";
+import { AREAS, areaFromPath, areaHasTabs, type AreaId } from "./areas";
 import { EmptyState, StatusCard } from "./components";
 import { EstateScreen } from "./estate/EstateScreen";
 import { GovernorScreen } from "./governor/GovernorScreen";
@@ -212,7 +212,9 @@ function AreaNav({ current }: { current: AreaId }) {
             {area.kind === "link" ? (
               <a
                 href={area.href}
-                aria-current={area.id === current ? "page" : undefined}
+                // "page" unless the area's screen has tabs of its own; then
+                // the tab is the page and this is the section it is in.
+                aria-current={area.id === current ? (areaHasTabs(area.id) ? "true" : "page") : undefined}
                 onClick={(event) => {
                   event.preventDefault();
                   // The menu folds on the route change this causes (see `App`).

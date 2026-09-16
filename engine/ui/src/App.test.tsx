@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MetaOutput } from "@rocky-types/meta";
 import { ApiError } from "./api";
 import { App, EnginePanel } from "./App";
+import { GovernorScreen } from "./governor/GovernorScreen";
 import { TOKEN_STORAGE_KEY } from "./token";
 
 const META: MetaOutput = {
@@ -132,21 +133,47 @@ describe("App", () => {
 
     const current = screen
       .getByRole("navigation", { name: "Areas" })
-      .querySelectorAll('[aria-current="page"]');
+      .querySelectorAll("[aria-current]");
     expect([...current].map((node) => node.textContent)).toEqual(["Governance"]);
   });
 
   it.each([
-    ["/ui/governor/custody/freeze%3Aglobal", "Governance", "governor slot"],
-    ["/ui/governor/audit/revenue%20daily", "Governance", "governor slot"],
-    ["/ui/governor/products/revenue%20daily", "Products", "governor slot"],
-    ["/ui/review/plan-1", "Review", "review slot"],
-    ["/ui/nope", "Estate", "estate slot"],
-  ])("deep-links %s under %s", (path, area, slot) => {
+    // Governance has tabs, so its sidebar entry is the current section ("true").
+    ["/ui/governor/custody/freeze%3Aglobal", "Governance", "true", "governor slot"],
+    ["/ui/governor/audit/revenue%20daily", "Governance", "true", "governor slot"],
+    ["/ui/governor/products/revenue%20daily", "Products", "page", "governor slot"],
+    ["/ui/review/plan-1", "Review", "page", "review slot"],
+    ["/ui/nope", "Estate", "page", "estate slot"],
+  ])("deep-links %s under %s", (path, area, mark, slot) => {
     window.history.pushState(null, "", path);
     render(<App token="t" {...slots} />);
     expect(screen.getByText(slot)).toBeInTheDocument();
-    expect(areas().getByRole("link", { name: area })).toHaveAttribute("aria-current", "page");
+    expect(areas().getByRole("link", { name: area })).toHaveAttribute("aria-current", mark);
+  });
+
+  it.each([
+    ["/ui/governor", "Needs you"],
+    ["/ui/governor/scorecard", "Scorecard"],
+    ["/ui/governor/custody/freeze%3Aglobal", "Custody"],
+    ["/ui/governor/audit", "Audit"],
+    ["/ui/governor/products", "Products"],
+    ["/ui/estate", "Estate"],
+  ])("marks exactly one current page on the whole page at %s", (path, page) => {
+    // The real governor tab bar, not a slot: the defect this pins was a tab
+    // and a sidebar entry both claiming the page, which a slot cannot show.
+    window.history.pushState(null, "", path);
+    const governor = (
+      <GovernorScreen
+        brief={<span>brief slot</span>}
+        scorecard={<span>scorecard slot</span>}
+        custody={() => <span>custody slot</span>}
+        audit={() => <span>audit slot</span>}
+        products={() => <span>products slot</span>}
+      />
+    );
+    render(<App token="t" {...slots} governor={governor} />);
+    const pages = document.querySelectorAll('[aria-current="page"]');
+    expect([...pages].map((node) => node.textContent)).toEqual([page]);
   });
 
   it("follows Back and Forward", async () => {

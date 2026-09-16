@@ -7,7 +7,7 @@
  * screenshot script all navigate by address.
  */
 
-import { governorAreaOf, governorTabFromSegment } from "./governor/tabs";
+import { GOVERNOR_TABS, governorAreaOf, governorTabFromSegment } from "./governor/tabs";
 import { UI_BASE, laneFromPath, segmentsFromPath } from "./router";
 
 export type AreaId =
@@ -75,6 +75,16 @@ export const AREAS: readonly Area[] = [
     reason: "No page yet. The engine serves them at /api/v1/settings.",
   },
 ];
+
+/**
+ * Whether an area's screen carries its own tab bar. Governance does: its
+ * Scorecard, Custody and Audit tabs. There the tab is the current page, and
+ * the sidebar entry is only the current section — two `aria-current="page"`
+ * marks on one page would tell a screen reader two different things are it.
+ */
+export function areaHasTabs(id: AreaId): boolean {
+  return GOVERNOR_TABS.filter((tab) => tab.area === id).length > 1;
+}
 
 /**
  * The area a path belongs to. It follows the lane router, so an unknown path
