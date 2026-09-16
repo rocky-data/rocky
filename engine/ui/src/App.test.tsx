@@ -188,6 +188,20 @@ describe("App", () => {
       await waitFor(() => expect(button).toHaveAttribute("aria-expanded", "false"));
     });
 
+    it("folds on Back, not only on a click in the menu", async () => {
+      window.history.pushState(null, "", "/ui/estate");
+      window.history.pushState(null, "", "/ui/review");
+      render(<App token="t" {...slots} />);
+      const button = screen.getByRole("button", { name: "Menu" });
+      fireEvent.click(button);
+      expect(button).toHaveAttribute("aria-expanded", "true");
+      act(() => {
+        window.history.back();
+      });
+      await waitFor(() => expect(screen.getByText("estate slot")).toBeInTheDocument());
+      expect(button).toHaveAttribute("aria-expanded", "false");
+    });
+
     it("folds on Escape and gives focus back to the button", () => {
       window.history.pushState(null, "", "/ui/estate");
       render(<App token="t" {...slots} />);
@@ -218,6 +232,17 @@ describe("the no-token page", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     window.sessionStorage.clear();
+  });
+
+  it("keeps the engine line inside the token boundary, though it sits in the sidebar", () => {
+    // The sidebar renders at every width and for every path, including with no
+    // token. The engine line reads the API, so it must not render there.
+    render(<App token={null} engine={<span>engine slot</span>} />);
+    expect(screen.getByText("No token for this tab")).toBeInTheDocument();
+    expect(screen.queryByText("engine slot")).toBeNull();
+    expect(screen.queryByRole("region", { name: "Engine" })).toBeNull();
+    // The areas still show: they read nothing.
+    expect(screen.getByRole("navigation", { name: "Areas" })).toBeInTheDocument();
   });
 
   it.each(["estate", "review", "governor"])(
