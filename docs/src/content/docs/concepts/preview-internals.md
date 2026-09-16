@@ -7,7 +7,7 @@ sidebar:
 
 `rocky preview` is the workflow you reach for when reviewing a PR that touches transformation models. It runs only the models the PR changed. Everything else is copied from the base ref into a per-PR branch.
 
-It answers a reviewer's question before merge: *what does this PR change in the warehouse, and what does it cost?* It does that on a small fraction of a full run's bytes. It produces three artifacts you can attach to the PR: a structural diff, a sampled row-level data diff, and a cost delta against base.
+It answers a reviewer's question before merge: *what does this PR change in the warehouse, and what does it cost?* It does that on a small fraction of a full run's bytes. It produces three artifacts you can attach to the PR: a row-count comparison of the two runs, a row-content diff when you ask for `--algorithm bisection`, and a cost delta against base. The column-level delta is an open follow-up, so the structural arrays come back empty.
 
 ## The prune-and-copy substrate
 
