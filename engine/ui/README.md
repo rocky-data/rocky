@@ -1,6 +1,8 @@
 # rocky-ui
 
-The browser UI that `rocky serve --ui` embeds. A React shell over `/api/v1`; every value it shows comes from a typed engine payload, and nothing it loads comes from another host.
+The browser UI that `rocky serve --ui` embeds. A React shell over `/api/v1`; every value it shows comes from a typed engine payload, and nothing it loads comes from another host. Release binaries and the container image already include it. The [browser UI guide](https://rocky-data.dev/guides/browser-ui/) shows each screen.
+
+![The estate screen: the project strip and the DAG of the playground's three models](../../docs/public/ui-estate.png)
 
 ```bash
 npm ci

@@ -130,7 +130,9 @@ starts where this one ended, so `rocky brief` writes state. The other windows,
 **Serve and integrate**
 
 ```bash
-rocky serve          # HTTP API over the compiler's semantic graph
+rocky serve          # HTTP API under /api/v1, the same payloads as --output json
+rocky serve --ui --token T --token-scope read-only
+                     # ...plus the read-only browser UI at /ui/
 rocky lsp            # Language Server Protocol for IDEs
 rocky mcp            # Model Context Protocol server (31 agent tools, 6 write;
                      #   a 7th, approving, needs --profile approver)

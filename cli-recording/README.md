@@ -12,6 +12,18 @@ This records the *CLI/terminal*. Two related harnesses:
 - [`editors/vscode/recording/`](../editors/vscode/recording/) records the
   **VS Code extension**, driving a real VS Code instance.
 
+## The browser UI screenshots
+
+`./record-ui-screenshots.sh` rebuilds the `docs/public/ui-*.png` screenshots and `demo-ui-tour.gif` from scratch against the `rocky` on `PATH`. It prepares two workspaces (the playground quickstart for the estate, the fulfillment POC for review and governor), serves each with `rocky serve --ui`, and captures with `browser/screenshots.mjs`. It runs under a neutral `$USER` and git identity, because run records and approval markers put both on screen.
+
+```bash
+(cd browser && npm ci && npx playwright install chromium)   # once
+./record-ui-screenshots.sh             # -> out/ui/
+./record-ui-screenshots.sh --publish   # ...and copy into docs/public/
+```
+
+Look at every image before you commit it.
+
 ## The fulfillment screencast
 
 `./record-screencast.sh` is a different shape from the single-tape demos below:
