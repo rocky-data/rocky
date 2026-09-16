@@ -7976,7 +7976,7 @@ pub struct ReviewQueueOutput {
     pub version: String,
     pub command: String,
     /// Human-readable description of the ordering, e.g.
-    /// `"blast_radius × classification × staleness"`.
+    /// `"blast_radius × change_class × staleness"`.
     pub ranking: String,
     /// Count of pending escalations in the queue.
     pub total: u64,
@@ -8052,7 +8052,7 @@ pub struct ReviewQueueEntry {
     pub blast_radius: Option<u64>,
     /// The change-class weight the ranking used (breaking > bare verb >
     /// additive / value-only).
-    pub classification_weight: u32,
+    pub change_class_weight: u32,
     /// How long the escalation has waited, in whole seconds.
     pub staleness_seconds: i64,
     /// The composite priority score. Higher sorts first. Reported so a

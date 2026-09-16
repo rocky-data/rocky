@@ -46,7 +46,7 @@ export interface ReviewQueueOutput {
    */
   pending: ReviewQueueEntry[];
   /**
-   * Human-readable description of the ordering, e.g. `"blast_radius × classification × staleness"`.
+   * Human-readable description of the ordering, e.g. `"blast_radius × change_class × staleness"`.
    */
   ranking: string;
   /**
@@ -75,7 +75,7 @@ export interface ReviewQueueEntry {
   /**
    * The change-class weight the ranking used (breaking > bare verb > additive / value-only).
    */
-  classification_weight: number;
+  change_class_weight: number;
   /**
    * Composite ledger key (`"{timestamp}|{plan_id}|{model}"`) — the stable identity a governor drills into via `rocky audit --for`.
    */

@@ -150,7 +150,7 @@ class ReviewQueueEntry(BaseModel):
     """
     The capability that was evaluated (its `schema_change.*` refinement is the change class the ranking weighs).
     """
-    classification_weight: conint(ge=0)
+    change_class_weight: conint(ge=0)
     """
     The change-class weight the ranking used (breaking > bare verb > additive / value-only).
     """
@@ -222,7 +222,7 @@ class ReviewQueueOutput(BaseModel):
     """
     ranking: str
     """
-    Human-readable description of the ordering, e.g. `"blast_radius × classification × staleness"`.
+    Human-readable description of the ordering, e.g. `"blast_radius × change_class × staleness"`.
     """
     total: conint(ge=0)
     """
