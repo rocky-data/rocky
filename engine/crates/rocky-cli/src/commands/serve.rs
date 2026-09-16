@@ -854,6 +854,46 @@ mod tests {
             ui_address("rocky.internal", 8080, "t"),
             "http://rocky.internal:8080/ui/#token=t"
         );
+        assert_eq!(
+            ui_address("fd00::1", 8080, "t"),
+            "http://[fd00::1]:8080/ui/#token=t"
+        );
+    }
+
+    /// The address that prints is an address this server will serve (#1993).
+    ///
+    /// The two halves live in different crates and spell an IPv6 literal
+    /// differently — the URL brackets it, `--host` does not — so each was
+    /// individually right while the pair was broken. This asserts the pair:
+    /// for every bind host, the authority in the printed URL passes the host
+    /// guard that bind produces.
+    #[test]
+    fn every_printed_ui_address_passes_the_host_guard_for_that_bind() {
+        for bind in [
+            "127.0.0.1",
+            "0.0.0.0",
+            "::",
+            "::1",
+            "fd00::1",
+            "rocky.internal",
+        ] {
+            let url = ui_address(bind, 8080, "t");
+            let authority = url
+                .strip_prefix("http://")
+                .and_then(|rest| rest.split('/').next())
+                .expect("the printed address is an http URL with a path");
+            let ui = rocky_server::ui::UiConfig {
+                bind_host: bind.to_string(),
+                allowed_hosts: Vec::new(),
+                assets: std::sync::Arc::new(rocky_server::ui::InMemoryAssets(
+                    std::collections::BTreeMap::new(),
+                )),
+            };
+            assert!(
+                ui.host_allowed(authority),
+                "bind {bind} advertises {authority}, which its own guard refuses"
+            );
+        }
     }
 
     struct RecordingOpener(std::sync::Mutex<Vec<String>>);
