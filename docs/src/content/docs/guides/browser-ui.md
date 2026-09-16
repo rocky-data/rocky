@@ -58,7 +58,11 @@ The plan screen shows:
 - **What it would break.** The breaking-change findings against `HEAD`, or why that check could not run.
 - **Why it needs a human.** The rule, the capability, the principal and the blast radius behind the `require_review` decision.
 - **The spec it was planned against.** For a product plan only: whether the product spec changed after the plan was made.
-- **Sample rows.** Nothing is read until you ask. The button runs the model's query against the warehouse for up to 20 rows, and that query has a cost. Before the rows leave the engine, it masks each classified column that a workspace-default `[mask]` strategy covers, and refuses the sample with `422` when it cannot build that mask. A tag with no default `[mask]` strategy, or one set only for another environment, masks nothing: those columns come back raw. A tag with no `[mask]` entry at all draws a `W004` compile warning, which does not stop the sample. A tag whose only entry is an environment override, such as `[mask.prod]`, draws no warning either, so that case has no signal at all. Check your `[mask]` block before you hand this page to someone who may not read a column's classification. The button appears only when the plan names exactly one model to sample.
+- **Sample rows.** Nothing is read until you ask. The button runs the model's query against the warehouse for up to 20 rows, and that query has a cost. The engine masks each classified column before the rows leave it, and refuses the whole sample rather than return a classified column it cannot mask. The refusal names every column and tag, and both ways out.
+
+  A tag is refused when nobody has answered it: no `[mask]` entry at all, or an entry only under `[mask.<env>]`, which this path does not read. Two answers are not refusals, because someone made the decision: a `[mask]` strategy masks the column, and `none` or `[classifications.allow_unmasked]` returns it raw on purpose.
+
+  The button appears only when the plan names exactly one model to sample.
 - **How to approve.** The command to copy.
 
 You approve in a terminal, not on the page. The approval marker records a git identity, and the page holds a read-only token:
