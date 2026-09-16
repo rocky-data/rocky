@@ -8,7 +8,7 @@ sidebar:
 Rocky reads one `rocky.toml` file for everything. You name your adapters (`[adapter.NAME]`) and your pipelines (`[pipeline.NAME]`), so one file can hold several sources, several warehouses, and several pipelines side by side.
 
 :::caution[A key that does not exist is usually an error, not a no-op]
-Rocky rejects an unrecognized key in most blocks. A typo (`tooken` for `token`, `retires` for `retries`) fails the config load with a message naming the key. This is deliberate: a silently ignored setting looks like it is working. Two blocks are exceptions. `[hook.*]` ignores an unknown event key silently, and `[adapter.NAME.extra]` passes every key through untouched. Check a key against this page before you add it.
+Rocky rejects an unrecognized key in most blocks. A typo (`tooken` for `token`, `retires` for `retries`) fails the config load with a message naming the key. This is deliberate: a silently ignored setting looks like it is working. The pipeline section is where this is weakest. `[hook.*]` ignores an unknown event key silently, and `[adapter.NAME.extra]` passes every key through untouched. A key written **directly under `[pipeline.NAME]`** is accepted and ignored, on every pipeline type: `strategyy = "x"` there loads and `rocky validate` reports the config valid. Two nested blocks are lenient as well: a check toggle such as `[pipeline.NAME.checks.row_count]` ignores an unknown key (`severty = "warning"` is dropped), and so does an `[[pipeline.NAME.checks.assertions]]` entry. `[pipeline.NAME.source]`, `[pipeline.NAME.target]` and `[pipeline.NAME.checks.quarantine]` do refuse one, naming the key. Check a key against this page before you add it. In the lenient blocks a clean `rocky validate` is not evidence that Rocky read your key.
 :::
 
 ## Config Inference and Defaults
@@ -187,7 +187,7 @@ Declare a unit of work: what it reads, where it writes, and how. Each `[pipeline
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `type` | string | No | `"replication"` | Pipeline type. One of `"replication"`, `"transformation"`, `"quality"`, `"snapshot"`, `"load"`. The remaining fields depend on the type; the fields below apply to `"replication"` (the default). |
-| `strategy` | string | No | `"incremental"` | Replication strategy: `"incremental"` or `"full_refresh"`. |
+| `strategy` | string | No | `"incremental"` | Replication strategy. The runner recognizes `"incremental"`, `"full_refresh"`, `"merge"`, `"view"`, `"materialized_view"` and `"dynamic_table"`. `"merge"` needs `merge_keys` (or `merge_keys_fallback`); without them the config load fails. `"dynamic_table"` is recognized but not usable here: the pipeline block exposes no `target_lag`, so a run errors and asks you to declare it on a transformation model's sidecar instead. Any other value is **not** an error. `rocky validate` warns (`V035`) and the run silently falls back to `full_refresh`. |
 | `timestamp_column` | string | No | `"_fivetran_synced"` | Watermark column for incremental strategy. |
 | `metadata_columns` | list | No | `[]` | Extra columns to add to copied data (see below). |
 
@@ -440,7 +440,7 @@ Declarative model-level assertions. Each block declares a `type` and type-specif
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `table` | string | (required) | Unqualified target table the assertion runs against. When assertions live in a model's sidecar TOML the table is implied; in pipeline-level `[[checks.assertions]]` blocks (shown below) it must be set explicitly. |
-| `name` | string | | Optional identifier used as the result's `name`; synthesized from `{kind}:{column}` when unset. Set it to disambiguate multiple assertions on the same table/kind/column. |
+| `name` | string | | Optional identifier used as the result's `name`; synthesized from `{kind}:{column}` when unset. Set it to disambiguate multiple assertions on the same table/kind/column. Four names are reserved for the engine's own results and refused at config load: `quarantine:compile`, `row_count`, `column_match` and `row_count_anomaly`, plus `freshness` when the pipeline declares `[checks.freshness]`. The comparison maps every non-alphanumeric character to `_` first, the way Dagster keys a check, so `quarantine_compile` and `quarantine.compile` are refused too. A `[[checks.custom]]` name is checked by the same rule. |
 | `type` | string | (required) | One of: `not_null`, `unique`, `unique_expr`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, `composite`, `not_in_future`, `older_than_n_days`. |
 | `column` | string | | Required for row-level column kinds (`not_null`, `unique`, `accepted_values`, `relationships`, `in_range`, `regex_match`, `not_in_future`, `older_than_n_days`). |
 | `severity` | string | `"error"` | `error` fails the pipeline (subject to `fail_on_error`); `warning` reports but never fails. |
@@ -458,7 +458,7 @@ Type-specific parameters:
 | `regex_match` | `pattern: String` (dialect-specific regex; no single quotes, backticks, or semicolons) |
 | `aggregate` | `op: sum\|count\|avg\|min\|max`, `cmp: lt\|lte\|gt\|gte\|eq\|ne`, `value: String` |
 | `composite` | `kind: "unique"`, `columns: [String]` (≥2) |
-| `unique_expr` | `key_expr: String` (derived SQL key, e.g. `md5(tenant \|\| '-' \|\| id)`; passed through as written, minus the statement-terminator refusal) |
+| `unique_expr` | `key_expr: String` (derived SQL key, e.g. `md5(tenant \|\| '-' \|\| id)`; one expression over the row, allowlisted functions only, and no volatile function or `COLLATE`; see [Per-assertion `filter`](/concepts/data-quality-checks/#per-assertion-filter)) |
 | `older_than_n_days` | `days: u32` |
 
 ```toml
@@ -537,7 +537,7 @@ For the cross-*table* case (the same business key arriving through two **sibling
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `keys` | list of strings | `[]` | Business-key columns whose shared value across sibling tables signals a duplicate. Mutually exclusive with `key_expr`. |
-| `key_expr` | string | | Derived business-key expression (e.g. `md5(a \|\| '-' \|\| b)`) for sources without a single natural key. Mutually exclusive with `keys`. Passed through verbatim. |
+| `key_expr` | string | | Derived business-key expression (e.g. `md5(a \|\| '-' \|\| b)`) for sources without a single natural key. Mutually exclusive with `keys`. Same gate as `unique_expr`'s `key_expr`: one expression over the row, allowlisted functions only, no volatile function and no `COLLATE`. |
 | `severity` | string | `"error"` | `error` fails the pipeline (subject to `fail_on_error`); `warning` reports but never fails. |
 | `max_overlap_rows` | integer | `0` | Overlap-key count above which the check fails. `0` means any overlap fails. |
 | `sample` | integer | `20` | Maximum overlapping keys attached to the result for triage. |
@@ -695,7 +695,7 @@ What it does not do is reconcile the two runs. You re-run the loser yourself. Ro
 
 It needs a backend with a durable object tier: `s3`, `gcs`, or `tiered`. On `local` and `valkey` it downgrades to `off` with a warning, because neither offers a conditional write. Turning it on also stops the mid-run periodic uploader on every backend. A crashed run then leaves the remote ledger at its last committed generation instead of a partial mid-run snapshot.
 
-**What `cas` does not yet cover.** It protects the end-of-run state upload and the `rocky policy freeze` / `unfreeze` ledger write, which retries onto the winner when it loses a race. The remaining single-record ledger seams — the state writes made by `gc apply` and `apply` — still upload unconditionally on every backend, so a concurrent `gc apply` can overwrite a run's committed state without raising a conflict and still exit zero. This is tracked as [issue #1228](https://github.com/rocky-data/rocky/issues/1228) and applies equally to `s3`, `gcs`, and `tiered`. Until it is closed, keep the orchestrator-level rule of one writer per `[state]` prefix for the seam commands.
+**What `cas` does not yet cover.** It protects the end-of-run state upload, the `rocky policy freeze` / `unfreeze` ledger write, which retries onto the winner when it loses a race, and `rocky gc`, which commits through the same seam. Two writers stay outside it. The **restore** path uploads unconditionally on every remote backend, after execution, including a failed one. That path is the same whether you reach it with `rocky restore` or by applying its plan with `rocky apply <plan-id>`, so a restore-shaped `rocky apply` is unconditional too. A **run-shaped** `rocky apply` uploads unconditionally only for the rows it writes when a `[policy]` rule sets `verify_after`. Either can overwrite a run's committed state without raising a conflict and still exit zero. This is tracked as [issue #1228](https://github.com/rocky-data/rocky/issues/1228) and applies equally to `s3`, `gcs`, and `tiered`. Until it is closed, keep the orchestrator-level rule of one writer per `[state]` prefix for `rocky restore` and `rocky apply`.
 
 **On `tiered`,** `cas` additionally makes the Valkey tier coherent with the durable object. The compare-and-swap runs against S3 first; only after it commits is the Valkey copy written, stored together with the generation it was committed at. A read may use the cached copy only after confirming that generation is still the durable object's — otherwise it reads S3. So a Valkey write that fails, a process that dies between the two, or a cache entry left over from an earlier run can no longer shadow durable state. Cached copies are held under a separate key from the `off` path's, so a fleet can move pods from `off` to `cas` one at a time.
 

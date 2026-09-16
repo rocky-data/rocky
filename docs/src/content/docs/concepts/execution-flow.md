@@ -243,7 +243,7 @@ Read the output like this. A successful materialization is one entry in `materia
 Exit code:
 - `0` — all models succeeded
 - `1` — hard failure (config error, adapter unreachable, compile error)
-- `2` — partial success — some models succeeded, some failed. **JSON is still valid and fully emitted.** The Dagster integration handles this via `allow_partial=True`.
+- `2` — partial success — some models succeeded and some failed, or the data landed and an error-severity check then failed (`check_gate_failed: true`). **JSON is still valid and fully emitted.** The Dagster integration handles this via `allow_partial=True`. A quality pipeline copies no data, so its failed check gate exits `1`.
 
 ## Checkpoint and resume
 

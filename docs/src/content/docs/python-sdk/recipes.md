@@ -64,7 +64,18 @@ if run.tables_failed:
     for err in run.errors:
         print(f"{'/'.join(err.asset_key)} failed: {err.error}")
     # decide: raise, alert, or proceed with the tables that did succeed
+if run.check_gate_failed:
+    for table in run.check_results:
+        for check in table.checks:
+            if not check.passed and check.severity == "error":
+                print(f"{'/'.join(table.asset_key)}: check {check.name} failed")
+    # the data has landed; a resume re-runs none of these checks
 ```
+
+Check both fields. `tables_failed` counts tables and models, never checks. A run
+that copied every table and then failed an error-severity check exits `2` with
+`tables_failed == 0` and `check_gate_failed == True`, so reading the count alone
+reports that run as clean.
 
 To make a non-zero run raise instead of returning a partial result, call the
 lower-level `run_cli(args, allow_partial=False)`. It raises

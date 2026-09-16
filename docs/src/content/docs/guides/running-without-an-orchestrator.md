@@ -57,12 +57,19 @@ Every recipe below keys off the process exit code. Rocky uses a distinct code pe
 |------|---------|------------|
 | `0` | Success | every command |
 | `1` | Generic hard failure (config error, unreadable state, or an error raised *after* some models already materialized — a budget breach, say). For `rocky tick`, also an unreadable webhook spool | most commands |
-| `2` | **Partial success** — some models materialized, some failed | `rocky run`, `rocky tick` |
-| `3` | A Critical health check | `rocky doctor` |
-| `4` | Compile and tests passed but advisory warnings were emitted | `rocky ci` |
+| `2` | **Partial success** — some models materialized, some failed, or an error-severity check failed on a run that had already copied its data. Also: `rocky fulfill` is blocked and needs a human, and `rocky product verify` failed | `rocky run`, `rocky tick`, `rocky fulfill`, `rocky product verify` |
+| `3` | A Critical health check. Also: `rocky fulfill` is parked at `applying_unknown` | `rocky doctor`, `rocky fulfill` |
+| `4` | `rocky fulfill` applied a plan whose output fails a check the product declared | `rocky fulfill` |
 | `130` | Interrupted by SIGINT or SIGTERM | `rocky run` |
 
-A scheduled `rocky run` returns `0`, `1`, `2`, or `130`. Codes `3` and `4` come from `rocky doctor` and `rocky ci`. Run those as a pre-flight (below) or in CI.
+A scheduled `rocky run` returns `0`, `1`, `2`, or `130`. A quality pipeline's failed check gate returns `1`, not `2`. Codes `3` and `4` come from `rocky doctor` and `rocky fulfill`. Run `rocky doctor` as a pre-flight (below) or in CI.
+
+**`rocky ci` does not return `4`.** It prints `"exit_code": 4` in its JSON when compile and the tests pass with advisory warnings, and then exits `0`. A CI step that wants to act on warnings must read that field:
+
+```bash
+code=$(rocky ci --output json | jq '.exit_code')
+[ "$code" = "4" ] && echo "advisory warnings"
+```
 
 **`rocky tick` and the webhook spool.** A tick that cannot read `.rocky/pending-demands` exits `1`, even when everything it did run succeeded. The scan fails only when something *is* at that path and cannot be read — a dangling symlink, a permission fault. A spool directory that does not exist yet reads as "no pending demand" and exits `0`, so this never fires on a project that has not used webhooks.
 
@@ -72,7 +79,7 @@ It is worth a page rather than a ticket. Nothing about it clears on its own, and
 
 Alert on any non-zero exit. Beyond that, one distinction deserves a channel of its own.
 
-**Give exit `2` its own channel.** A partial success means the run kept going. The models that worked produced real, current data, and a subset failed. That is a different operational situation from a hard failure.
+**Give exit `2` its own channel.** A partial success means the run kept going. The models that worked produced real, current data, and a subset failed. That is a different operational situation from a hard failure. Exit `2` also covers a second case: every table copied, and then an error-severity check failed. Read `check_gate_failed` and `check_results[]` in the JSON to tell the two apart. A resume does not help that one. The data has landed, so fix the source and re-run the pipeline.
 
 Exit `1` is generic. It often means nothing materialized, but it can also fire *after* some models landed — a budget breach, for one. So inspect the run's `--output json` result or `rocky history` rather than assume the estate is empty. Routing exit `1` and exit `2` to the same place trains people to ignore the alert. Treat a hard failure as a page. Treat a partial success as a ticket: the on-call looks at the failed models before the next run.
 
@@ -91,7 +98,7 @@ code=$?
 
 case "$code" in
   0)   ;;                                                   # success, stay quiet
-  2)   notify "#data-partial" "Rocky partial success (exit 2): some models failed, run continued" ;;
+  2)   notify "#data-partial" "Rocky partial success (exit 2): a model or a check failed, run continued" ;;
   130) ;;                                                   # interrupted, informational
   *)   notify "#data-oncall" "Rocky run FAILED (exit $code)" ;;
 esac
@@ -603,4 +610,4 @@ The point of the format is that whoever picks up the page, a human or an agent, 
 
 ---
 
-**On verification.** The commands on this page were exercised against the playground pipeline with the current engine build. A clean `rocky run` returns `0`. A run where one model fails while the others materialize returns `2`. `rocky doctor` returns `3` on a Critical check. `rocky validate`, `rocky hooks list`, and `rocky brief --output md` were run against the hook configuration shown above. Exit codes `1`, `4`, and `130` follow the CLI's documented convention. The systemd, GitHub Actions, and Databricks configurations are illustrative templates around those verified commands. Adapt them to your host and platform.
+**On verification.** The commands on this page were exercised against the playground pipeline with the current engine build. A clean `rocky run` returns `0`. A run where one model fails while the others materialize returns `2`, and so does a run that copied every table and then failed an error-severity check. `rocky doctor` returns `3` on a Critical check. `rocky validate`, `rocky hooks list`, and `rocky brief --output md` were run against the hook configuration shown above. Exit codes `1`, `4`, and `130` follow the CLI's documented convention. The systemd, GitHub Actions, and Databricks configurations are illustrative templates around those verified commands. Adapt them to your host and platform.
