@@ -12,7 +12,8 @@ start, the second for a skeleton that already runs.
    built-in scaffolder via the registered entry point. Writes a bare
    `defs.yaml`.
 2. **`init_rocky_project(target_dir)`**: Python helper that writes a complete
-   skeleton with `defs.yaml`, `rocky.toml`, `models/`, and a `README.md`.
+   skeleton with `defs.yaml`, `rocky.toml`, `.gitignore`, `models/`, and a
+   `README.md`.
 
 ## `dg scaffold` (canonical)
 
@@ -48,6 +49,7 @@ After running, `my_pipeline/` contains:
 my_pipeline/
 ├── defs.yaml          # type: dagster_rocky.RockyComponent + attributes
 ├── rocky.toml         # DuckDB-backed starter, freshness preconfigured
+├── .gitignore         # the DuckDB files and state the engine creates
 ├── models/            # empty, with .gitkeep
 │   └── .gitkeep
 └── README.md          # quickstart instructions
