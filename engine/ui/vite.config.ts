@@ -1,4 +1,5 @@
 /// <reference types="vitest/config" />
+import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
@@ -15,6 +16,13 @@ const generatedTypes = fileURLToPath(
 const capturedFixtures = fileURLToPath(
   new URL("../../integrations/dagster/tests/fixtures_generated", import.meta.url),
 );
+
+// Local development against a running `rocky serve`: the API keeps its origin
+// through this proxy, so the same-origin token flow works unchanged. The port
+// is read from ONE place — `ROCKY_API` — which `just ui-dev` (the root
+// justfile) sets from its own port, so the recipe and this proxy cannot
+// disagree. By hand, the default matches `rocky serve` on 8080.
+const apiTarget = process.env.ROCKY_API ?? "http://127.0.0.1:8080";
 
 // The SPA is served by `rocky serve --ui` under `/ui/`, from files embedded
 // in the binary at build time (`engine/crates/rocky-cli/src/ui.rs`). Every
@@ -35,9 +43,7 @@ export default defineConfig({
     rollupOptions: { output: { manualChunks: undefined } },
   },
   server: {
-    // Local development against a running `rocky serve`: the API keeps its
-    // origin, so the same-origin token flow works unchanged.
-    proxy: { "/api": "http://127.0.0.1:8080" },
+    proxy: { "/api": apiTarget },
   },
   test: {
     // `globals` lets testing-library register its per-test cleanup.

@@ -10830,8 +10830,11 @@ impl PreviewCostOutput {
 ///
 /// Stable codes emitted today: `engine_not_ready` (no compile available
 /// yet), `engine_busy` (state locked by a running job — retryable),
-/// `model_not_found`, `job_not_found`, `mutation_in_progress` (a `run`/`apply`
-/// job already holds the mutation permit — carries [`running_job_id`](Self::running_job_id)),
+/// `state_needs_migration` (`409`: the state store lacks tables this server
+/// reads and a read never creates them; one read-write command — a
+/// `rocky run` — migrates it; not retryable), `model_not_found`,
+/// `job_not_found`, `mutation_in_progress` (a `run`/`apply` job already holds
+/// the mutation permit — carries [`running_job_id`](Self::running_job_id)),
 /// `bad_request`, `unauthorized`, `internal_error`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorEnvelope {

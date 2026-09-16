@@ -1731,6 +1731,17 @@ enum Command {
         /// bind host are always accepted; any other `Host` is refused `421`.
         #[arg(long = "allowed-host", value_name = "HOST")]
         allowed_hosts: Vec<String>,
+        /// With `--ui`: open the printed address in the default browser once
+        /// the listener is bound — after the startup sweep, never before, so
+        /// the page lands on a server that answers. The address, token
+        /// included, is handed to the system opener (`open`, `xdg-open`,
+        /// `rundll32`) as an argument, so it is visible in the process list
+        /// while the opener runs — the same secret the terminal shows. A
+        /// missing opener, or one that exits non-zero, is a warning; the
+        /// server still starts and still prints the address. Refused without
+        /// `--ui`.
+        #[arg(long)]
+        open: bool,
         /// Run the resident scheduler alongside the API: a timer-driven loop
         /// that evaluates every pipeline's `[schedule]` and runs what is due,
         /// exactly like `rocky tick` on a cron, but in-process (experimental).
@@ -4388,6 +4399,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             allowed_origins,
             ui,
             allowed_hosts,
+            open,
             scheduler,
             poll_interval_seconds,
             drain_timeout_seconds,
@@ -4438,6 +4450,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 allowed_origins,
                 ui,
                 allowed_hosts,
+                open,
                 scheduler,
                 poll_interval_seconds,
                 drain_timeout_seconds,

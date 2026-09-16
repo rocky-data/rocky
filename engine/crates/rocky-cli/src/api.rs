@@ -442,6 +442,42 @@ impl ApiError {
         err
     }
 
+    /// `409` — the state store on disk lacks tables this server reads, and a
+    /// read never creates them (`StateStore::open_read_only` takes no write
+    /// transaction against a store that holds anything, #1978). Only a store
+    /// written by a Rocky older than schema v22 can be in this state.
+    ///
+    /// On a real `rocky serve` this is rare: the startup job sweep
+    /// ([`sweep_interrupted_jobs`]) opens the store read-write before the
+    /// router serves, and a read-write open creates every missing table and
+    /// re-stamps. So a store that is old at startup is migrated before the
+    /// first read. What reaches this arm is a store that CHANGED under a
+    /// running server (a file copied or restored over it), or a startup sweep
+    /// that could not open the store (it is best-effort under lock
+    /// contention). Either way one read-write open fixes it — restarting
+    /// `rocky serve`, or any read-write command such as `rocky run`.
+    ///
+    /// Deliberately not the retryable `503`: no amount of retrying migrates a
+    /// store, so a client must not back off and try again; it must tell an
+    /// operator.
+    fn state_needs_migration(found: Option<u32>, expected: u32, missing: &[String]) -> Self {
+        let stamp = found.map_or_else(|| "unversioned".to_string(), |v| format!("v{v}"));
+        let hint = format!(
+            "restart `rocky serve`, or run any read-write command such as `rocky run` \
+             against this project once, to migrate the store to v{expected}; reads never \
+             migrate it"
+        );
+        Self::new(
+            StatusCode::CONFLICT,
+            "state_needs_migration",
+            format!(
+                "the state store is stamped {stamp} and lacks tables this server reads ({})",
+                missing.join(", ")
+            ),
+            Some(hint.as_str()),
+        )
+    }
+
     /// `404` — the named model is not in the compiled graph.
     fn model_not_found(name: &str) -> Self {
         Self::new(
@@ -634,8 +670,11 @@ impl IntoResponse for ApiError {
 /// A redb lock contention ([`StateError::Busy`] / [`StateError::LockHeldByOther`]),
 /// which happens when a concurrent `rocky run` (or an API mutation job) holds
 /// the state flock, becomes a **retryable `503 engine_busy`** — never a `500`.
-/// An embedder must be able to tell "the engine broke" from "retry in a
-/// moment". Everything else is a genuine `500`.
+/// A store that lacks tables this server reads
+/// ([`StateError::ReadOnlyNeedsInit`]) becomes a **`409 state_needs_migration`**
+/// naming the tables — not retryable, and not a `500`. An embedder must be
+/// able to tell "the engine broke" from "retry in a moment" from "an operator
+/// has to run something once". Everything else is a genuine `500`.
 ///
 /// `running_job_id` is the mutation permit's current holder
 /// ([`MutationPermit::running_job`]); when this sidecar's own mutation job is
@@ -666,6 +705,15 @@ fn map_state_err(err: anyhow::Error, running_job_id: Option<String>) -> ApiError
         Ok(StateError::Busy { .. } | StateError::LockHeldByOther { .. }) => {
             ApiError::engine_busy(running_job_id)
         }
+        // A store a read cannot serve until a write-open migrates it: a
+        // `409`, not a `503` — retrying never migrates a store — and not a
+        // `500`, because nothing broke (#1978, C1-P1b).
+        Ok(StateError::ReadOnlyNeedsInit {
+            found,
+            expected,
+            missing,
+            ..
+        }) => ApiError::state_needs_migration(found, expected, &missing),
         Ok(other) => ApiError::internal(other.to_string()),
         Err(other) => ApiError::internal(other.to_string()),
     }
@@ -4899,14 +4947,43 @@ mod tests {
         assert_eq!(resp.status(), 200, "a client route gets the shell");
         assert_eq!(resp.headers()["content-type"], "text/html; charset=utf-8");
 
-        let resp = client
-            .get(format!("{base}/ui/assets/missing.js"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 404);
-        let err: ErrorEnvelope = resp.json().await.unwrap();
-        assert_eq!(err.code, "asset_not_found");
+        // A deep link whose last segment carries a dot is still a client
+        // route. The app produces two such links: custody for a dotted model
+        // name, and custody for a freeze plan id, whose timestamp carries
+        // fractional seconds. The old rule ("a dot means a file") answered
+        // 404 to both (C3-P0). The shell comes with the same headers as `/ui/`.
+        for route in [
+            "/ui/governor/custody/corp.prod.orders",
+            "/ui/governor/custody/freeze:global:2026-09-15T21:00:00.123Z",
+        ] {
+            let resp = client.get(format!("{base}{route}")).send().await.unwrap();
+            assert_eq!(
+                resp.status(),
+                200,
+                "{route}: a deep link with a dot gets the shell"
+            );
+            assert_eq!(
+                resp.headers()["content-type"],
+                "text/html; charset=utf-8",
+                "{route}"
+            );
+            assert_eq!(resp.headers()["cache-control"], "no-cache", "{route}");
+            assert!(
+                resp.headers().contains_key("content-security-policy"),
+                "{route}: the shell carries the security headers"
+            );
+        }
+
+        // Under the asset namespace a miss is a stale bundle: 404, never the
+        // shell — a page that got HTML for a script would fail less clearly.
+        // With an extension and without: the namespace decides, not the dot,
+        // so `assets/stale` is a 404 too (the old rule gave it the shell).
+        for stale in ["/ui/assets/missing.js", "/ui/assets/stale"] {
+            let resp = client.get(format!("{base}{stale}")).send().await.unwrap();
+            assert_eq!(resp.status(), 404, "{stale}");
+            let err: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(err.code, "asset_not_found", "{stale}");
+        }
 
         let resp = client.get(format!("{base}/ui")).send().await.unwrap();
         assert_eq!(resp.status(), 308);
@@ -7008,6 +7085,137 @@ mod tests {
         let other = map_state_err(anyhow::anyhow!("disk exploded"), None);
         assert_eq!(other.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(other.envelope.code, "internal_error");
+    }
+
+    /// A store a read cannot serve is a `409 state_needs_migration` naming the
+    /// stamp and the tables, with the migrating command in the hint — not the
+    /// retryable `503`, not a `500`, and never with a `Retry-After`.
+    #[test]
+    fn a_store_that_needs_migration_is_a_409_naming_the_tables() {
+        use rocky_core::state::StateError;
+
+        let needs_init = anyhow::Error::from(StateError::ReadOnlyNeedsInit {
+            path: "x".to_string(),
+            found: Some(18),
+            expected: 30,
+            missing: vec!["tombstones".to_string(), "schedule_state".to_string()],
+        });
+        let mapped = map_state_err(needs_init, Some("job-1".to_string()));
+        assert_eq!(mapped.status, StatusCode::CONFLICT);
+        assert_eq!(mapped.envelope.code, "state_needs_migration");
+        assert!(
+            mapped.envelope.message.contains("v18")
+                && mapped
+                    .envelope
+                    .message
+                    .contains("tombstones, schedule_state"),
+            "the message names the stamp and every missing table: {}",
+            mapped.envelope.message
+        );
+        let hint = mapped.envelope.remediation_hint.as_deref().unwrap_or("");
+        assert!(
+            hint.contains("rocky run") && hint.contains("rocky serve") && hint.contains("v30"),
+            "the hint names both remedies and the target version: {hint}"
+        );
+
+        // The read cores wrap the open in `.with_context(...)`; the funnel
+        // must still see the inner `StateError` through that wrapper.
+        let wrapped = anyhow::Error::from(StateError::ReadOnlyNeedsInit {
+            path: "x".to_string(),
+            found: Some(18),
+            expected: 30,
+            missing: vec!["tombstones".to_string()],
+        })
+        .context("opening the state store for the audit ledger");
+        assert_eq!(
+            map_state_err(wrapped, None).envelope.code,
+            "state_needs_migration",
+            "a context-wrapped ReadOnlyNeedsInit must still map"
+        );
+        assert!(
+            mapped.retry_after_seconds.is_none(),
+            "a migration is not something a client retries into"
+        );
+        assert!(
+            mapped.envelope.running_job_id.is_none(),
+            "a running job has nothing to do with a store that needs a migration"
+        );
+
+        // Unversioned reads as such, not as "v0" or "None".
+        let unversioned = anyhow::Error::from(StateError::ReadOnlyNeedsInit {
+            path: "x".to_string(),
+            found: None,
+            expected: 30,
+            missing: vec!["metadata".to_string()],
+        });
+        assert!(
+            map_state_err(unversioned, None)
+                .envelope
+                .message
+                .contains("stamped unversioned")
+        );
+    }
+
+    /// End to end: a store written by an older Rocky, missing a table this
+    /// server reads, answers `409 state_needs_migration` on a state-backed
+    /// read — not `500` — and `200` once one read-write open has migrated
+    /// it. The fixture is a real snapshot of a real store with one table left
+    /// out, so the shape is the one `StateStore::open_read_only` refuses, not
+    /// a hand-built error.
+    #[tokio::test]
+    async fn a_read_route_answers_409_until_a_write_open_migrates_the_store() {
+        use rocky_core::state::{StateStore, force_schema_version};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) =
+            crate::commands::product::tests::api_fixture_project(dir.path());
+        drop(StateStore::open(&state_path).expect("a current store"));
+        // Stamp FIRST: the stamp helper opens read-write, which would recreate
+        // the table the snapshot below leaves out.
+        force_schema_version(&state_path, "18");
+        let older = dir.path().join("older.redb");
+        StateStore::open_read_only(&state_path)
+            .expect("the stamped store still carries every table")
+            .snapshot_to_excluding(&older, &["tombstones"])
+            .expect("a snapshot without the tombstones table");
+        std::fs::rename(&older, &state_path).expect("replace the store with the older shape");
+
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config),
+            &state_path,
+        ))
+        .await;
+        let resp = reqwest::get(format!("{base}/api/v1/runs")).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            409,
+            "a store missing a table is a 409, not a 500"
+        );
+        let body: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(body.code, "state_needs_migration");
+        assert!(
+            body.message.contains("tombstones"),
+            "the envelope names the missing table: {}",
+            body.message
+        );
+        assert!(
+            body.remediation_hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("rocky run"),
+            "the hint names the migrating command"
+        );
+
+        // What migrates it on a real server: the startup job sweep, which
+        // `api::serve` runs before the router — a read-write open. This test
+        // drives the router directly, so it calls the sweep itself; a server
+        // started on this store would have migrated it before its first read.
+        let swept = sweep_interrupted_jobs(&state_path)
+            .expect("the startup sweep opens the store read-write and migrates it");
+        assert_eq!(swept, 0, "nothing to sweep, but the open migrated");
+        let resp = reqwest::get(format!("{base}/api/v1/runs")).await.unwrap();
+        assert_eq!(resp.status(), 200, "after the migration the read answers");
     }
 
     /// When this sidecar's own mutation job holds the permit, the `503
