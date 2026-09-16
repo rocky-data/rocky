@@ -229,37 +229,8 @@ fn only_a_transformation_node_is_servable_and_only_under_its_label() {
     let config = root.join("rocky.toml");
     widen_to_seven_kinds(&root, &config);
 
-    let port = TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port();
-    // No `--ui` and no `--token`: a loopback server with no token needs no
-    // auth, and the page this test never asks for is what needs the embed.
-    let child = rocky()
-        .current_dir(&root)
-        .args([
-            "--config",
-            config.to_str().unwrap(),
-            "serve",
-            "--port",
-            &port.to_string(),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn rocky serve");
-    let server = Server(child);
+    let (server, port) = serve_api(&root, &config);
     let _keep_alive = &server;
-    wait_for_health(port);
-    // `/health` and `/dag` both answer before the project has compiled:
-    // `health` is an unconditional handler and `full_dag` gates only on
-    // `config_path`, which is set at construction. The model routes gate on
-    // `compile_result`, and `serve` merely sleeps 100ms for the compile it
-    // spawned. So without this latch a slow compile answers the first model
-    // request `503 engine_not_ready`, which is neither the 200 nor the 404
-    // this test asserts, and every assertion below fails on timing alone.
-    wait_for_compiled_models(port);
 
     let (status, _, body) = http_get(port, "/api/v1/dag", "");
     assert!(status.contains("200"), "{status}: {body}");
@@ -328,23 +299,161 @@ fn only_a_transformation_node_is_servable_and_only_under_its_label() {
     // the SPA reads from this fixture is exactly these three fields.
     assert_eq!(
         kinds_seen,
-        nodes_in_ui_fixture(),
+        nodes_in_ui_fixture("dag-mixed-kinds.json"),
         "the live DAG and engine/ui/src/test/fixtures/dag-mixed-kinds.json \
          disagree about their nodes (kind, id, label); recapture the fixture \
          (its README says how) or fix the project this test builds"
     );
 }
 
-/// Every node in the capture the SPA's tests read, as (kind, id, label).
+/// The model list names exactly the DAG models the detail route can serve.
 ///
-/// The fixture is recorded by hand from a real `rocky serve` — no script
-/// regenerates it — so nothing but this comparison keeps it honest.
-fn nodes_in_ui_fixture() -> std::collections::BTreeSet<(String, String, String)> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../ui/src/test/fixtures/dag-mixed-kinds.json");
-    let raw =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    let dag: serde_json::Value = serde_json::from_str(&raw).expect("the fixture is JSON");
+/// This is what the estate screen's gate stands on (`nodeRoute.ts`). The DAG
+/// reads every transformation pipeline's own models directory, and the
+/// server compiles one. So a second pipeline with its models in `reporting/`
+/// puts `weekly_revenue` in the graph and not in the compile (#2011). The
+/// SPA marks a transformation node "not compiled" when its label is absent
+/// from `GET /api/v1/models`. That is right only if, for every such node,
+/// being listed is exactly a `200` from `GET /api/v1/models/{label}` and
+/// being absent is exactly a `404`. Both directions are asserted here,
+/// against the real server.
+///
+/// If the server starts compiling every pipeline's directory, the split
+/// goes away and the `weekly_revenue` assertion fails. Keep the equivalence,
+/// drop the split, and recapture the fixtures.
+#[test]
+fn the_model_list_names_exactly_the_dag_models_the_detail_route_serves() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("project");
+    let out = rocky()
+        .args(["playground", root.to_str().unwrap()])
+        .output()
+        .expect("spawn rocky playground");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let config = root.join("rocky.toml");
+    add_a_second_models_directory(&root, &config);
+
+    let (server, port) = serve_api(&root, &config);
+    let _keep_alive = &server;
+
+    let (status, _, body) = http_get(port, "/api/v1/models", "");
+    assert!(status.contains("200"), "{status}: {body}");
+    let list: serde_json::Value = serde_json::from_str(&body).expect("a JSON model list");
+    let listed: std::collections::BTreeSet<String> = list["models"]
+        .as_array()
+        .expect("models")
+        .iter()
+        .map(|m| m["name"].as_str().expect("a model name").to_string())
+        .collect();
+    // The SPA reads a list whose count disagrees with its entries as unknown.
+    // A real list must never be read that way.
+    assert_eq!(list["count"].as_u64(), Some(listed.len() as u64), "{body}");
+
+    let (status, _, body) = http_get(port, "/api/v1/dag", "");
+    assert!(status.contains("200"), "{status}: {body}");
+    let dag: serde_json::Value = serde_json::from_str(&body).expect("a JSON DAG");
+    let nodes = dag["nodes"].as_array().expect("nodes");
+    let mut drawn = std::collections::BTreeSet::new();
+    let mut live_nodes = std::collections::BTreeSet::new();
+    for node in nodes {
+        let field = |name: &str| node[name].as_str().expect("a node field").to_string();
+        live_nodes.insert((field("kind"), field("id"), field("label")));
+        let kind: NodeKind = serde_json::from_value(node["kind"].clone()).expect("a node kind");
+        if kind != NodeKind::Transformation {
+            continue;
+        }
+        let label = field("label");
+        let (status, _, body) = http_get(
+            port,
+            &format!("/api/v1/models/{}", percent_encode(&label)),
+            "",
+        );
+        if listed.contains(&label) {
+            assert!(
+                status.contains("200"),
+                "{label:?} is in the model list, so its detail must serve: {status}: {body}"
+            );
+        } else {
+            assert!(
+                status.contains("404"),
+                "{label:?} is not in the model list, so its detail must 404: {status}: {body}"
+            );
+        }
+        drawn.insert(label);
+    }
+
+    // Both branches above ran, and the split is the one #2011 describes.
+    assert!(
+        drawn.contains("weekly_revenue") && !listed.contains("weekly_revenue"),
+        "the DAG no longer draws a model the compile lacks; drawn {drawn:?}, listed {listed:?}"
+    );
+    assert!(
+        listed.is_subset(&drawn),
+        "every compiled model is a DAG node; drawn {drawn:?}, listed {listed:?}"
+    );
+
+    // The pair the SPA's tests read must still describe this server.
+    assert_eq!(
+        live_nodes,
+        nodes_in_ui_fixture("dag-two-pipelines.json"),
+        "the live DAG and engine/ui/src/test/fixtures/dag-two-pipelines.json disagree \
+         about their nodes (kind, id, label); recapture it (its README says how)"
+    );
+    assert_eq!(
+        listed,
+        models_in_ui_fixture("model-list-two-pipelines.json"),
+        "the live model list and engine/ui/src/test/fixtures/model-list-two-pipelines.json \
+         disagree; recapture it (its README says how)"
+    );
+}
+
+/// Start `rocky serve` on a free loopback port, and return once the project
+/// has compiled.
+///
+/// No `--ui` and no `--token`: a loopback server with no token needs no auth,
+/// and the page these tests never ask for is what needs the embed.
+fn serve_api(root: &std::path::Path, config: &std::path::Path) -> (Server, u16) {
+    let port = TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port();
+    let child = rocky()
+        .current_dir(root)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "serve",
+            "--port",
+            &port.to_string(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn rocky serve");
+    let server = Server(child);
+    wait_for_health(port);
+    // `/health` and `/dag` both answer before the project has compiled:
+    // `health` is an unconditional handler and `full_dag` gates only on
+    // `config_path`, which is set at construction. The model routes gate on
+    // `compile_result`, and `serve` merely sleeps 100ms for the compile it
+    // spawned. So without this latch a slow compile answers the first model
+    // request `503 engine_not_ready`, which is neither the 200 nor the 404
+    // the tests assert, and every assertion fails on timing alone.
+    wait_for_compiled_models(port);
+    (server, port)
+}
+
+/// Every node in a capture the SPA's tests read, as (kind, id, label).
+///
+/// The fixtures are recorded by hand from a real `rocky serve` — no script
+/// regenerates them — so nothing but this comparison keeps them honest.
+fn nodes_in_ui_fixture(file: &str) -> std::collections::BTreeSet<(String, String, String)> {
+    let dag = ui_fixture(file);
     dag["nodes"]
         .as_array()
         .expect("the fixture has nodes")
@@ -359,6 +468,74 @@ fn nodes_in_ui_fixture() -> std::collections::BTreeSet<(String, String, String)>
             (field("kind"), field("id"), field("label"))
         })
         .collect()
+}
+
+/// Every model name in a captured `GET /api/v1/models` the SPA's tests read.
+fn models_in_ui_fixture(file: &str) -> std::collections::BTreeSet<String> {
+    ui_fixture(file)["models"]
+        .as_array()
+        .expect("the fixture has models")
+        .iter()
+        .map(|m| {
+            m["name"]
+                .as_str()
+                .expect("every fixture model has a name")
+                .to_string()
+        })
+        .collect()
+}
+
+/// One JSON capture from `engine/ui/src/test/fixtures/`.
+fn ui_fixture(file: &str) -> serde_json::Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../ui/src/test/fixtures")
+        .join(file);
+    let raw =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    serde_json::from_str(&raw).expect("the fixture is JSON")
+}
+
+/// Grow `rocky playground` into a project whose DAG draws a model the server
+/// does not compile: a second transformation pipeline, its one model kept in
+/// `reporting/` rather than `models/`.
+fn add_a_second_models_directory(root: &std::path::Path, config: &std::path::Path) {
+    let mut toml = std::fs::OpenOptions::new()
+        .append(true)
+        .open(config)
+        .expect("open rocky.toml");
+    toml.write_all(
+        br#"
+[pipeline.reporting]
+type = "transformation"
+models = "reporting/**"
+
+[pipeline.reporting.target.governance]
+auto_create_schemas = true
+"#,
+    )
+    .expect("append a pipeline");
+
+    let reporting = root.join("reporting");
+    std::fs::create_dir_all(&reporting).expect("reporting dir");
+    std::fs::write(
+        reporting.join("weekly_revenue.sql"),
+        "SELECT 1 AS week, 2 AS revenue\n",
+    )
+    .expect("write the model");
+    std::fs::write(
+        reporting.join("weekly_revenue.toml"),
+        r#"name = "weekly_revenue"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "playground"
+schema = "main"
+table = "weekly_revenue"
+"#,
+    )
+    .expect("write the sidecar");
 }
 
 /// Which node kinds `GET /api/v1/models/{label}` can answer.
