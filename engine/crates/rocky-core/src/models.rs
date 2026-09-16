@@ -4556,16 +4556,82 @@ mod dsl_sidecar_tests {
         }
     }
 
-    /// A DSL model with no sidecar is skipped rather than parsed as SQL
-    /// frontmatter: `.rocky` files have no `---toml` convention, and reading
-    /// one as if they did would make the loader's behaviour depend on the
-    /// model body.
+    /// A DSL model with no sidecar contributes nothing, even when its body
+    /// would parse as SQL frontmatter. `.rocky` files have no `---toml`
+    /// convention — `docs/rocky-lang-spec.md` documents only the companion
+    /// `.toml` — so reading one as if they did would make the loader depend
+    /// on the model body.
+    ///
+    /// The fixture deliberately OPENS with `---toml` and declares both
+    /// blocks. An ordinary DSL body would exercise nothing: the frontmatter
+    /// fallback would find no marker, return `None` and skip the file anyway,
+    /// so the guard this test is named for could be deleted without the test
+    /// noticing.
     #[test]
     fn a_dsl_model_without_a_sidecar_contributes_nothing() {
+        const FRONTMATTER: &str = "---toml\n\
+             [[test]]\nname = \"frontmatter_test\"\n\n\
+             [[test.given]]\nref = \"raw_orders\"\nrows = [{ order_id = 1 }]\n\n\
+             [test.expect]\nrows = [{ order_id = 1 }]\n\n\
+             [[surrogate_key]]\nname = \"frontmatter_sk\"\ncolumns = [\"order_id\"]\n\
+             ---\n\
+             from raw_orders\ntake 1\n";
+
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("lonely.rocky"), "from raw_orders\ntake 1\n").unwrap();
-        assert!(load_unit_tests_from_dir(tmp.path()).unwrap().is_empty());
-        assert!(load_surrogate_keys_from_dir(tmp.path()).unwrap().is_empty());
+        std::fs::write(tmp.path().join("lonely.rocky"), FRONTMATTER).unwrap();
+        assert!(
+            load_unit_tests_from_dir(tmp.path()).unwrap().is_empty(),
+            "a `.rocky` body is never read as frontmatter"
+        );
+        assert!(
+            load_surrogate_keys_from_dir(tmp.path()).unwrap().is_empty(),
+            "a `.rocky` body is never read as frontmatter"
+        );
+
+        // The same bytes spelled `.sql` DO load, so the two assertions above
+        // are about the extension and not about the fixture being malformed.
+        let sql = tempfile::tempdir().unwrap();
+        std::fs::write(sql.path().join("lonely.sql"), FRONTMATTER).unwrap();
+        assert!(!load_unit_tests_from_dir(sql.path()).unwrap().is_empty());
+        assert!(!load_surrogate_keys_from_dir(sql.path()).unwrap().is_empty());
+    }
+
+    /// Production reads surrogate keys through
+    /// `load_surrogate_keys_from_tree_filtered` with a path predicate over the
+    /// selected models (`emit_sql.rs`, `plan.rs`, `run.rs`, `apply.rs`), not
+    /// through the flat loader the tests above call. A `.rocky` model's path
+    /// has to survive that predicate too, so this walks the entry point
+    /// production uses, from a nested directory.
+    #[test]
+    fn a_dsl_models_surrogate_key_survives_the_filtered_tree_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = tmp.path().join("marts");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(
+            deep.join("by_region.rocky"),
+            "from raw_orders\ngroup region {\n    n: count()\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            deep.join("by_region.toml"),
+            "[target]\ncatalog = \"w\"\nschema = \"s\"\n\n\
+             [[surrogate_key]]\nname = \"region_sk\"\ncolumns = [\"region\"]\n",
+        )
+        .unwrap();
+
+        let selected = deep.join("by_region.rocky");
+        let map = load_surrogate_keys_from_tree_filtered(tmp.path(), |p| p == selected.as_path())
+            .unwrap();
+        let specs = map
+            .get("by_region")
+            .unwrap_or_else(|| panic!("the selected DSL model has no surrogate keys: {map:?}"));
+        assert_eq!(specs[0].name, "region_sk");
+
+        // And the predicate still excludes: a path nobody selected stays out.
+        let none =
+            load_surrogate_keys_from_tree_filtered(tmp.path(), |p| p.ends_with("other.rocky"))
+                .unwrap();
+        assert!(none.is_empty(), "{none:?}");
     }
 }
 
