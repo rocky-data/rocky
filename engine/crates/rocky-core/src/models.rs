@@ -1705,7 +1705,12 @@ pub fn load_unit_tests_from_dir(
     }
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+        // `.rocky` DSL models carry the same companion `.toml` sidecar as
+        // `.sql` models; scanning only `.sql` meant every DSL model's
+        // `[[test]]` blocks were never loaded, so `rocky test` reported no
+        // unit tests at all and a wrong expectation passed (#2015).
+        let ext = path.extension().and_then(|e| e.to_str());
+        if ext != Some("sql") && ext != Some("rocky") {
             continue;
         }
         let stem = path
@@ -1717,6 +1722,10 @@ pub fn load_unit_tests_from_dir(
         let toml_path = path.with_extension("toml");
         let toml_src = if crate::path_presence::entry_is_present(&toml_path) {
             std::fs::read_to_string(&toml_path)?
+        } else if ext == Some("rocky") {
+            // DSL files have no `---toml` frontmatter convention; without a
+            // sidecar there is nowhere a `[[test]]` block could live.
+            continue;
         } else {
             let content = std::fs::read_to_string(&path)?;
             match split_frontmatter(&content) {
@@ -1888,7 +1897,11 @@ pub fn load_surrogate_keys_from_dir_filtered(
     }
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("sql") || !include(&path) {
+        // Same sidecar, same two extensions as the unit-test and column-doc
+        // loaders: a `.rocky` model's `[[surrogate_key]]` block was dropped
+        // here, so the key column was never added to the built table (#2015).
+        let ext = path.extension().and_then(|e| e.to_str());
+        if (ext != Some("sql") && ext != Some("rocky")) || !include(&path) {
             continue;
         }
         let stem = path
@@ -1899,6 +1912,10 @@ pub fn load_surrogate_keys_from_dir_filtered(
         let toml_path = path.with_extension("toml");
         let toml_src = if crate::path_presence::entry_is_present(&toml_path) {
             std::fs::read_to_string(&toml_path)?
+        } else if ext == Some("rocky") {
+            // DSL files have no `---toml` frontmatter convention; without a
+            // sidecar there is nowhere a `[[surrogate_key]]` block could live.
+            continue;
         } else {
             let content = std::fs::read_to_string(&path)?;
             match split_frontmatter(&content) {
@@ -4462,6 +4479,94 @@ pub fn load_column_docs_from_tree(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod dsl_sidecar_tests {
+    use super::*;
+
+    /// Write a `.rocky` or `.sql` model plus the SAME sidecar, and return the
+    /// directory. The two models compute the same thing, so any difference in
+    /// what the loaders return is the extension and nothing else.
+    fn model_dir_with(extension: &str, sidecar_block: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(
+            dir.join("raw_orders.sql"),
+            "SELECT * FROM (VALUES (1, 7)) AS t(order_id, customer_id)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("raw_orders.toml"),
+            "[target]\ncatalog = \"w\"\nschema = \"s\"\n",
+        )
+        .unwrap();
+        let body = match extension {
+            "rocky" => "from raw_orders\ngroup customer_id {\n    n: count()\n}\n",
+            _ => "SELECT customer_id, COUNT(*) AS n FROM raw_orders GROUP BY customer_id\n",
+        };
+        std::fs::write(dir.join(format!("totals.{extension}")), body).unwrap();
+        std::fs::write(
+            dir.join("totals.toml"),
+            format!("depends_on = [\"raw_orders\"]\n[target]\ncatalog = \"w\"\nschema = \"s\"\n\n{sidecar_block}"),
+        )
+        .unwrap();
+        tmp
+    }
+
+    const TEST_BLOCK: &str = "[[test]]\nname = \"totals_per_customer\"\n\n\
+         [[test.given]]\nref = \"raw_orders\"\nrows = [{ order_id = 1, customer_id = 7 }]\n\n\
+         [test.expect]\nrows = [{ customer_id = 7, n = 1 }]\n";
+
+    const KEY_BLOCK: &str =
+        "[[surrogate_key]]\nname = \"customer_sk\"\ncolumns = [\"customer_id\"]\n";
+
+    /// A `[[test]]` block on a DSL model reaches the loader. It did not: the
+    /// loader scanned `.sql` files only, so `rocky test` ran no unit test for
+    /// a `.rocky` model, printed no unit-test line, and exited 0 on an
+    /// expectation that was plainly wrong (#2015). A test that cannot fail is
+    /// worse than one that does not exist, so this asserts on the DSL model
+    /// directly rather than on the pair being equal.
+    #[test]
+    fn a_dsl_models_unit_test_block_is_loaded() {
+        for extension in ["rocky", "sql"] {
+            let tmp = model_dir_with(extension, TEST_BLOCK);
+            let map = load_unit_tests_from_dir(tmp.path()).unwrap();
+            let defs = map
+                .get("totals")
+                .unwrap_or_else(|| panic!("`totals.{extension}` has no unit tests: {map:?}"));
+            assert_eq!(defs.len(), 1, "{extension}");
+            assert_eq!(defs[0].name, "totals_per_customer", "{extension}");
+        }
+    }
+
+    /// The same gap in the surrogate-key loader: a `.rocky` model's
+    /// `[[surrogate_key]]` block was dropped, so the key column never reached
+    /// the built table (#2015).
+    #[test]
+    fn a_dsl_models_surrogate_key_block_is_loaded() {
+        for extension in ["rocky", "sql"] {
+            let tmp = model_dir_with(extension, KEY_BLOCK);
+            let map = load_surrogate_keys_from_dir(tmp.path()).unwrap();
+            let specs = map
+                .get("totals")
+                .unwrap_or_else(|| panic!("`totals.{extension}` has no surrogate keys: {map:?}"));
+            assert_eq!(specs.len(), 1, "{extension}");
+            assert_eq!(specs[0].name, "customer_sk", "{extension}");
+        }
+    }
+
+    /// A DSL model with no sidecar is skipped rather than parsed as SQL
+    /// frontmatter: `.rocky` files have no `---toml` convention, and reading
+    /// one as if they did would make the loader's behaviour depend on the
+    /// model body.
+    #[test]
+    fn a_dsl_model_without_a_sidecar_contributes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("lonely.rocky"), "from raw_orders\ntake 1\n").unwrap();
+        assert!(load_unit_tests_from_dir(tmp.path()).unwrap().is_empty());
+        assert!(load_surrogate_keys_from_dir(tmp.path()).unwrap().is_empty());
+    }
 }
 
 #[cfg(test)]
