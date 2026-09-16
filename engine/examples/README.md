@@ -1,6 +1,6 @@
 # Rocky Examples
 
-Self-contained example projects demonstrating Rocky's features. Each example uses DuckDB as the backend for local execution -- no external credentials needed.
+Self-contained example projects that show Rocky's features. The examples that run a pipeline use DuckDB for local execution, so they need no warehouse credentials. `ai-intent` is the exception for credentials: it calls the Anthropic API and needs `ANTHROPIC_API_KEY`.
 
 ## Examples
 
@@ -12,7 +12,7 @@ Self-contained example projects demonstrating Rocky's features. Each example use
 | [test-declarative/](test-declarative/) | Declarative `[[tests]]` in TOML sidecars |
 | [dbt-migration/](dbt-migration/) | Side-by-side dbt vs Rocky, showing how to migrate |
 | [dagster-integration/](dagster-integration/) | Orchestrating Rocky with Dagster using `dagster-rocky` |
-| [ai-intent/](ai-intent/) | AI-powered test generation using model intent fields |
+| [ai-intent/](ai-intent/) | AI test generation from model intent fields (needs `ANTHROPIC_API_KEY`) |
 | [multi-layer/](multi-layer/) | Bronze, Silver, Gold medallion architecture with contracts |
 | [snapshot/](snapshot/) | SCD Type 2 snapshots with `rocky snapshot` |
 | [watch-demo/](watch-demo/) | Auto-recompile on file changes with `rocky watch` |
@@ -20,10 +20,11 @@ Self-contained example projects demonstrating Rocky's features. Each example use
 | [docs-demo/](docs-demo/) | Generate HTML documentation catalog with `rocky docs` |
 | [compare-demo/](compare-demo/) | Shadow table validation with `rocky compare` |
 | [shell-demo/](shell-demo/) | Interactive SQL REPL with `rocky shell` |
+| [process-adapter-echo/](process-adapter-echo/) | A process adapter in one Python script, tested with `rocky test-adapter` |
 
 ## Running
 
-Each example includes a `rocky.toml` configured for DuckDB local execution:
+Most examples include a `rocky.toml` configured for DuckDB. Three do not: `fmt-demo` needs none, `dbt-migration` keeps its config in `rocky-project/`, and `process-adapter-echo` is an adapter, not a project. Each example's README gives its own commands. The paths below are relative to `engine/`, so run them from there:
 
 ```bash
 cd examples/quickstart
@@ -39,5 +40,5 @@ rocky playground
 
 ## Prerequisites
 
-- Rocky CLI installed (`cargo install rocky` or build from source)
-- No external services required -- all examples use DuckDB locally
+- The Rocky CLI. Install it with `engine/install.sh` (see the [engine README](../README.md#installation)) or build it from source. Rocky is not published on crates.io, so `cargo install rocky` does not install it.
+- No warehouse. The pipeline examples use DuckDB locally. `ai-intent` needs `ANTHROPIC_API_KEY`.
