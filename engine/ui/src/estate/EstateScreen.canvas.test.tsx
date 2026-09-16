@@ -105,6 +105,8 @@ describe("the open model pane", () => {
     await waitFor(() =>
       expect(screen.queryByRole("complementary", { name: "Model raw_orders" })).toBeNull(),
     );
-    expect(nodeElement(RAW).firstElementChild).toHaveClass("border-dashed");
+    // React Flow copies new node data into its own store in an effect, so the
+    // card can repaint a render after the pane has closed.
+    await waitFor(() => expect(nodeElement(RAW).firstElementChild).toHaveClass("border-dashed"));
   });
 });
