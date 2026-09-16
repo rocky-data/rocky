@@ -3,9 +3,7 @@
 A versioned, one-command **scorecard** for the Rocky MCP interface: does a
 frontier agent, given only Rocky's typed MCP tools, ground itself in the data
 and author a model that compiles first-try and stops at the human-review gate?
-The MCP surface is the interface 2027's primary users (agents) work through, so
-it is treated with API-grade rigor — regression-tested per release the way human
-UX is.
+Agents work through the MCP surface, so the suite tests it like an API.
 
 The suite drives a **scripted agent session** against a fresh `rocky mcp` server
 on a pinned DuckDB fixture, then scores the session with **deterministic
@@ -156,11 +154,15 @@ dispatch is also accepted only for `refs/heads/main`. See
 `.github/SECURITY_ENVIRONMENTS.md` for the required secret scope and deployment
 restriction.
 
-Run the live suite before any `rocky-mcp`-touching release. The per-release
-scorecard is published under `scorecards/` (the "Rocky vN completes X/Y
-authoring tasks unassisted" artifact). The live `results/` a run writes is
-gitignored; a run worth keeping is copied into
-`scorecards/<date>-<model>.{md,json}`.
+Run the live suite before any `rocky-mcp`-touching release. The live `results/`
+a run writes is gitignored. `engine-evals-live.yml` uploads each run's
+scorecard as a workflow artifact; it does not commit it. A run worth keeping is
+copied into `scorecards/<date>-<model>.{md,json}` by hand.
+
+Scorecards are not published per release. `scorecards/` holds one scorecard so
+far: `2026-07-08-claude-sonnet-4-5`, run against `rocky 1.57.0` with harness
+`0.4.0`. Treat it as a single past data point, not as the score of the current
+engine.
 
 ## Layout
 
@@ -179,7 +181,7 @@ engine/evals/
 │   ├── error_contract.py        creds-free structured-error contract check (rocky binary only)
 │   └── version.py               HARNESS_VERSION
 ├── fixtures/orders_trap/        the pinned DuckDB fixture (the reconcile trap)
-├── scorecards/                  committed per-release scorecards (the artifact)
+├── scorecards/                  committed scorecards (one so far, at 1.57.0)
 └── testdata/                    recorded transcript for --selftest
 ```
 
