@@ -62,6 +62,33 @@ struct PrunedTable {
 /// `excluded_tables` with reason `"unchanged_since_last_copy"` (the free-form
 /// reason field, so no schema change) and emits no materialization — the
 /// orchestrator's `satisfy_empty_outputs` stamps the 0-row continuity signal.
+/// Render a drift action's human-readable reason: one clause per drifted
+/// column, each reading `from → to`.
+///
+/// A `DriftedColumn` names the two sides by where they came from, not by
+/// direction: `target_type` is the type the existing table has, `source_type`
+/// is the type upstream now reports. The change always runs from the target's
+/// type to the source's, so `target_type` is the "from" side for every drift
+/// action.
+///
+/// The two call sites used to build this string inline and disagreed about
+/// which side came first, so the drop-and-recreate reason printed a column
+/// that went TIMESTAMP to DATE as "changed DATE → TIMESTAMP" while the ALTER
+/// reason beside it printed the same pair the right way round. One helper and
+/// one test, so the two cannot drift apart again.
+fn drift_reason(drifted_columns: &[DriftedColumn], verb: &str) -> String {
+    drifted_columns
+        .iter()
+        .map(|c| {
+            format!(
+                "column '{}' {verb} {} → {}",
+                c.name, c.target_type, c.source_type
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn record_pruned(output: &mut RunOutput, pruned: PrunedTable) {
     output.excluded_tables.push(ExcludedTableOutput {
         asset_key: pruned.asset_key,
@@ -13470,17 +13497,7 @@ async fn process_table(
                 .map_err(anyhow::Error::from)?;
             use_full_refresh = true;
 
-            let reason = drift_result
-                .drifted_columns
-                .iter()
-                .map(|c| {
-                    format!(
-                        "column '{}' changed {} → {}",
-                        c.name, c.source_type, c.target_type
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
+            let reason = drift_reason(&drift_result.drifted_columns, "changed");
             drift_action = Some(DriftActionOutput {
                 table: target_table.full_name(),
                 action: "drop_and_recreate".into(),
@@ -13525,17 +13542,7 @@ async fn process_table(
                         .map_err(anyhow::Error::from)?;
                 }
             }
-            let reason = drift_result
-                .drifted_columns
-                .iter()
-                .map(|c| {
-                    format!(
-                        "column '{}' widened {} → {}",
-                        c.name, c.target_type, c.source_type
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
+            let reason = drift_reason(&drift_result.drifted_columns, "widened");
             drift_action = Some(DriftActionOutput {
                 table: target_table.full_name(),
                 action: "alter_column_types".into(),
@@ -14654,6 +14661,42 @@ fn post_copy_column_match(
 
 #[cfg(test)]
 mod tests {
+
+    /// Both drift reasons read from the type the table HAS to the type
+    /// upstream now reports. The drop-and-recreate reason used to print the
+    /// pair the other way round, so a column that went TIMESTAMP to DATE was
+    /// reported as "changed DATE → TIMESTAMP" — the operator read the change
+    /// backwards, on the one action that drops their table.
+    ///
+    /// The assertion is on the rendered direction, not on the argument order,
+    /// so it survives the fields being renamed or reordered.
+    #[test]
+    fn a_drift_reason_reads_from_the_existing_type_to_the_new_one() {
+        let drifted = vec![
+            rocky_ir::DriftedColumn {
+                name: "created_at".into(),
+                target_type: "TIMESTAMP".into(),
+                source_type: "DATE".into(),
+            },
+            rocky_ir::DriftedColumn {
+                name: "amount".into(),
+                target_type: "INT".into(),
+                source_type: "BIGINT".into(),
+            },
+        ];
+
+        assert_eq!(
+            super::drift_reason(&drifted, "changed"),
+            "column 'created_at' changed TIMESTAMP → DATE, \
+             column 'amount' changed INT → BIGINT"
+        );
+        assert_eq!(
+            super::drift_reason(&drifted, "widened"),
+            "column 'created_at' widened TIMESTAMP → DATE, \
+             column 'amount' widened INT → BIGINT"
+        );
+        assert_eq!(super::drift_reason(&[], "changed"), "");
+    }
 
     // ---------------------------------------------------------------------
     // Governance seams, observed through a recording adapter (#1609)

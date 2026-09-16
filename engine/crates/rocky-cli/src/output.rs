@@ -7976,7 +7976,7 @@ pub struct ReviewQueueOutput {
     pub version: String,
     pub command: String,
     /// Human-readable description of the ordering, e.g.
-    /// `"blast_radius × classification × staleness"`.
+    /// `"blast_radius × change_class × staleness"`.
     pub ranking: String,
     /// Count of pending escalations in the queue.
     pub total: u64,
@@ -8052,7 +8052,7 @@ pub struct ReviewQueueEntry {
     pub blast_radius: Option<u64>,
     /// The change-class weight the ranking used (breaking > bare verb >
     /// additive / value-only).
-    pub classification_weight: u32,
+    pub change_class_weight: u32,
     /// How long the escalation has waited, in whole seconds.
     pub staleness_seconds: i64,
     /// The composite priority score. Higher sorts first. Reported so a
@@ -10830,8 +10830,11 @@ impl PreviewCostOutput {
 ///
 /// Stable codes emitted today: `engine_not_ready` (no compile available
 /// yet), `engine_busy` (state locked by a running job — retryable),
-/// `model_not_found`, `job_not_found`, `mutation_in_progress` (a `run`/`apply`
-/// job already holds the mutation permit — carries [`running_job_id`](Self::running_job_id)),
+/// `state_needs_migration` (`409`: the state store lacks tables this server
+/// reads and a read never creates them; one read-write command — a
+/// `rocky run` — migrates it; not retryable), `model_not_found`,
+/// `job_not_found`, `mutation_in_progress` (a `run`/`apply` job already holds
+/// the mutation permit — carries [`running_job_id`](Self::running_job_id)),
 /// `bad_request`, `unauthorized`, `internal_error`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorEnvelope {

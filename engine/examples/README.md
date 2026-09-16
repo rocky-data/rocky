@@ -27,8 +27,8 @@ Each example includes a `rocky.toml` configured for DuckDB local execution:
 
 ```bash
 cd examples/quickstart
-rocky plan --config rocky.toml
-rocky run --config rocky.toml
+rocky --config rocky.toml plan
+rocky --config rocky.toml run
 ```
 
 Or use the playground mode which sets up sample data automatically:
