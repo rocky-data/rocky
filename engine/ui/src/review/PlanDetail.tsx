@@ -84,6 +84,11 @@ export function previewTargetsOf(entries: ReviewQueueEntry[]): string[] {
   );
 }
 
+function recordedType(value: unknown): string | null {
+  if (value === undefined || value === null || value === "?") return null;
+  return String(value);
+}
+
 /** One breaking finding as a sentence, from the tagged union the engine emits. */
 export function describeFinding(finding: BreakingFinding): string {
   const change = finding.change as Record<string, unknown>;
@@ -95,16 +100,20 @@ export function describeFinding(finding: BreakingFinding): string {
       return `${model} is removed`;
     case "model_added":
       return `${model} is added`;
-    case "column_dropped":
-      return `${model}.${column} is dropped (was ${String(change.data_type)})`;
+    case "column_dropped": {
+      const dataType = recordedType(change.data_type);
+      return dataType === null
+        ? `${model}.${column} is dropped (type not recorded)`
+        : `${model}.${column} is dropped (was ${dataType})`;
+    }
     case "column_added":
-      return `${model}.${column} is added (${String(change.data_type)}${
+      return `${model}.${column} is added (${recordedType(change.data_type) ?? "type not recorded"}${
         change.nullable === false ? ", not null" : ""
       })`;
     case "column_type_changed":
-      return `${model}.${column} changes type, ${String(change.old_type)} to ${String(
-        change.new_type,
-      )}${change.narrowing === true ? " (narrowing)" : ""}`;
+      return `${model}.${column} changes type, ${recordedType(change.old_type) ?? "type not recorded"} to ${
+        recordedType(change.new_type) ?? "type not recorded"
+      }${change.narrowing === true ? " (narrowing)" : ""}`;
     case "column_nullability_changed":
       return `${model}.${column} becomes ${change.new_nullable === true ? "nullable" : "not null"}`;
     default:

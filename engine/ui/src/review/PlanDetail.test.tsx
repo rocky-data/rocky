@@ -686,6 +686,38 @@ describe("PlanDetail", () => {
         "orders.total is added (INT64, not null)",
       ],
       [
+        { kind: "column_dropped", model: "orders", column: "total", data_type: "?" },
+        "orders.total is dropped (type not recorded)",
+      ],
+      [
+        {
+          kind: "column_added",
+          model: "orders",
+          column: "total",
+          nullable: false,
+        },
+        "orders.total is added (type not recorded, not null)",
+      ],
+      [
+        {
+          kind: "column_type_changed",
+          model: "orders",
+          column: "total",
+          old_type: "?",
+          new_type: "STRING",
+        },
+        "orders.total changes type, type not recorded to STRING",
+      ],
+      [
+        {
+          kind: "column_type_changed",
+          model: "orders",
+          column: "total",
+          old_type: "INT64",
+        },
+        "orders.total changes type, INT64 to type not recorded",
+      ],
+      [
         {
           kind: "column_nullability_changed",
           model: "orders",
