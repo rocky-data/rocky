@@ -37,9 +37,21 @@ use crate::result_types::*;
 const INSTRUCTIONS: &str = include_str!("../../../../.claude/skills/rocky-ai-workflow/SKILL.md");
 
 /// What `rocky mcp` calls itself in the `initialize` result's
-/// `serverInfo.name`. The version beside it is this crate's
-/// `CARGO_PKG_VERSION`, which is the engine's (#1973).
+/// `serverInfo.name` (#1973).
 pub const SERVER_NAME: &str = "rocky";
+
+/// The version `rocky mcp` announces beside [`SERVER_NAME`].
+///
+/// This is `rocky-mcp`'s own crate version. Every crate in the workspace
+/// carries the engine's version as a literal in its `Cargo.toml` and a
+/// release bumps them by hand, so this can only be the engine's version for
+/// as long as the bump does not miss this crate. Three workspace crates have
+/// already fallen off the shared version that way, and the release check for
+/// it greps for the OLD version, which cannot see a crate that is already
+/// behind. So the lockstep is pinned from the binary side instead:
+/// `engine/rocky/tests/mcp_server_identity.rs` fails the build when this and
+/// `rocky --version` disagree.
+pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Prepended to the served `instructions` under the worker profile.
 ///
@@ -6375,7 +6387,7 @@ impl ServerHandler for RockyMcpServer {
         // "rmcp 3.3.0" to every client and moved the served-text golden on
         // every library bump for a reason that had nothing to do with Rocky
         // (#1973). This crate's version is the engine's.
-        .with_server_info(Implementation::new(SERVER_NAME, env!("CARGO_PKG_VERSION")))
+        .with_server_info(Implementation::new(SERVER_NAME, SERVER_VERSION))
         // The server's FALLBACK, not the wire version: rmcp echoes any
         // version a client names that still has an `initialize` handshake
         // and this server supports, and answers with this one otherwise.
@@ -10735,7 +10747,7 @@ database = ":memory:"
         ] {
             let info = server_with(profile).get_info().server_info;
             assert_eq!(info.name, SERVER_NAME, "{profile:?}");
-            assert_eq!(info.version, env!("CARGO_PKG_VERSION"), "{profile:?}");
+            assert_eq!(info.version, SERVER_VERSION, "{profile:?}");
             assert_ne!(
                 info.name, "rmcp",
                 "{profile:?} must not introduce itself as the library"
