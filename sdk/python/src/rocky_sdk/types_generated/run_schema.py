@@ -400,7 +400,7 @@ class QuarantineOutput(BaseModel):
     """
     error: str | None = None
     """
-    Error message from the first failing statement, if any.
+    The first failing statement's role and error, if any. For `mode = "split"`, a failure to drop the intermediate label table is appended after it.
     """
     mode: str
     """
@@ -408,7 +408,7 @@ class QuarantineOutput(BaseModel):
     """
     ok: bool
     """
-    `true` when every quarantine statement executed successfully. `false` means a partial failure — inspect `error` for details.
+    `true` when every quarantine statement executed successfully and, for `mode = "split"`, the intermediate label table was dropped. `false` also adds a failing `quarantine:execute` check, which fails the run unless `fail_on_error = false`; inspect `error` for details.
     """
     quarantine_table: str | None = None
     """

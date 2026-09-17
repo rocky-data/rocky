@@ -1464,10 +1464,14 @@ pub struct QuarantineOutput {
     /// can report it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quarantined_rows: Option<u64>,
-    /// `true` when every quarantine statement executed successfully.
-    /// `false` means a partial failure — inspect `error` for details.
+    /// `true` when every quarantine statement executed successfully and,
+    /// for `mode = "split"`, the intermediate label table was dropped.
+    /// `false` also adds a failing `quarantine:execute` check, which fails
+    /// the run unless `fail_on_error = false`; inspect `error` for details.
     pub ok: bool,
-    /// Error message from the first failing statement, if any.
+    /// The first failing statement's role and error, if any. For
+    /// `mode = "split"`, a failure to drop the intermediate label table is
+    /// appended after it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
