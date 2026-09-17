@@ -846,3 +846,50 @@ enabled = true
         "a failed split must still drop its intermediate label table"
     );
 }
+
+/// A source that already has a column named like a label still splits
+/// correctly.
+///
+/// `orders` carries `_error_not_null_name`, the label the `not_null(name)`
+/// assertion produces, as a quarantine table checked again would. DuckDB
+/// renames the second of two same-named columns in a CTAS. When the
+/// intermediate table held the label under its own name, the label became
+/// `_error_not_null_name_1`, and the split read the source's column instead:
+/// here every row carries a value there, so every row would have been
+/// quarantined, the passing ones included.
+#[test]
+fn a_source_column_named_like_a_label_does_not_steer_the_split() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
+    conn.execute_batch(
+        "CREATE TABLE main.orders AS SELECT * FROM (VALUES
+             (1, 'ada', 'old'),
+             (2, NULL, 'old')
+         ) AS t(id, name, _error_not_null_name);",
+    )
+    .expect("seed table");
+    drop(conn);
+    fs::write(
+        dir.join("rocky.toml"),
+        clean_config(
+            r#"
+[pipeline.dq.checks.quarantine]
+enabled = true
+"#,
+        ),
+    )
+    .expect("write config");
+
+    let run = rocky(dir, &["run"]);
+    let out = json(&run);
+    assert_eq!(out["quarantine"][0]["ok"], serde_json::json!(true), "{out}");
+
+    assert_eq!(ids(dir, "orders__valid"), [1], "{out}");
+    assert_eq!(ids(dir, "orders__quarantine"), [2], "{out}");
+    assert_eq!(
+        columns(dir, "orders__valid"),
+        ["id", "name", "_error_not_null_name"],
+        "the source's own column stays in the valid table"
+    );
+}

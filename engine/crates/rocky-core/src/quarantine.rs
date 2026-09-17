@@ -13,7 +13,7 @@
 //!
 //! ```text
 //!   source ──CTAS, predicates evaluated here only──▶ <table>__quarantine__labeled
-//!                                                     │  one _error_* column per assertion
+//!                                                     │  one label column per assertion
 //!            ┌────────────────────────────────────────┤
 //!            ▼ any label set                          ▼ no label set, labels left out
 //!   <table>__quarantine                        <table>__valid
@@ -210,8 +210,23 @@ pub fn compile_quarantine_sql(
     let mut drop_intermediate = None;
     match config.mode {
         QuarantineMode::Split => {
-            let labels: Vec<&str> = labeled.iter().map(|p| p.label.as_str()).collect();
-            let valid_columns = dialect.star_excluding(&labels).ok_or(
+            // In the intermediate table each label sits under a working name,
+            // not under its own. The source may already have a column called
+            // `_error_…` (a quarantine table checked again, say). DuckDB
+            // renames the second of two same-named CTAS columns, so a label
+            // under its own name would be `_error_…_1` and every WHERE below
+            // would read the source's column instead. The quarantine CTAS
+            // gives each label its real name back.
+            let working: Vec<String> = labeled
+                .iter()
+                .map(|p| {
+                    let name = format!("{}{LABEL_WORKING_SUFFIX}", p.label);
+                    validation::validate_identifier(&name)?;
+                    Ok::<_, QuarantineError>(name)
+                })
+                .collect::<Result<_, _>>()?;
+            let working: Vec<&str> = working.iter().map(String::as_str).collect();
+            let without_labels = dialect.star_excluding(&working).ok_or(
                 QuarantineError::SplitNeedsStarExclusion {
                     dialect: dialect.name(),
                 },
@@ -240,19 +255,22 @@ pub fn compile_quarantine_sql(
                 &intermediate_table,
                 &source_table,
                 &labeled,
+                &working,
                 dialect,
             ));
             statements.push(build_split_quarantine_ctas(
                 &quarantine_table,
                 &intermediate_table,
-                &labels,
+                &labeled,
+                &working,
+                &without_labels,
                 dialect,
             ));
             statements.push(build_split_valid_ctas(
                 &valid_table,
                 &intermediate_table,
-                &labels,
-                &valid_columns,
+                &working,
+                &without_labels,
                 dialect,
             ));
             drop_intermediate = Some(QuarantineStatement {
@@ -275,11 +293,13 @@ pub fn compile_quarantine_sql(
             ));
         }
         QuarantineMode::Tag => {
+            let names: Vec<&str> = labeled.iter().map(|p| p.label.as_str()).collect();
             statements.push(build_label_ctas(
                 StatementRole::Tag,
                 &source_table,
                 &source_table,
                 &labeled,
+                &names,
                 dialect,
             ));
         }
@@ -307,6 +327,10 @@ struct LabeledPredicate {
     label: String,
     valid_pred: String,
 }
+
+/// Appended to a label's name for its column in `split`'s intermediate
+/// table. See the `QuarantineMode::Split` arm of [`compile_quarantine_sql`].
+const LABEL_WORKING_SUFFIX: &str = "__labeled";
 
 /// Whether a test kind lowers cleanly to a row-level boolean predicate.
 ///
@@ -573,26 +597,31 @@ fn wrap_filter(
     }
 }
 
-/// CTAS that writes every source row plus one `_error_*` label column per
-/// assertion: the label's name when the row fails it, NULL when it passes.
+/// CTAS that writes every source row plus one label column per assertion:
+/// the label's name when the row fails it, NULL when it passes.
 ///
 /// `split` writes it to the intermediate table and `tag` over the source.
 /// Either way it is the only place a predicate is evaluated. Each predicate
 /// is total (TRUE or FALSE, never NULL), so a NULL label means the row
 /// passed that assertion.
+///
+/// `columns[i]` names the column for `labeled[i]`: the label itself for
+/// `tag`, a working name for `split`.
 fn build_label_ctas(
     role: StatementRole,
     target: &str,
     source: &str,
     labeled: &[LabeledPredicate],
+    columns: &[&str],
     dialect: &dyn SqlDialect,
 ) -> QuarantineStatement {
     let error_cols = labeled
         .iter()
-        .map(|p| {
+        .zip(columns)
+        .map(|(p, column)| {
             format!(
-                "CASE WHEN NOT ({}) THEN '{}' END AS {}",
-                p.valid_pred, p.label, p.label
+                "CASE WHEN NOT ({}) THEN '{}' END AS {column}",
+                p.valid_pred, p.label
             )
         })
         .collect::<Vec<_>>()
@@ -605,19 +634,29 @@ fn build_label_ctas(
     }
 }
 
-/// `split`: the rows with at least one label set, labels included.
+/// `split`: the rows with at least one label set, with each label under its
+/// own name after the source's columns.
 fn build_split_quarantine_ctas(
     target: &str,
     intermediate: &str,
-    labels: &[&str],
+    labeled: &[LabeledPredicate],
+    working: &[&str],
+    without_labels: &str,
     dialect: &dyn SqlDialect,
 ) -> QuarantineStatement {
-    let any_failed = labels
+    let renamed = labeled
         .iter()
-        .map(|l| format!("{l} IS NOT NULL"))
+        .zip(working)
+        .map(|(p, w)| format!("{w} AS {}", p.label))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let any_failed = working
+        .iter()
+        .map(|w| format!("{w} IS NOT NULL"))
         .collect::<Vec<_>>()
         .join(" OR ");
-    let select = format!("SELECT * FROM {intermediate} WHERE {any_failed}");
+    let select =
+        format!("SELECT {without_labels}, {renamed} FROM {intermediate} WHERE {any_failed}");
     QuarantineStatement {
         role: StatementRole::Quarantine,
         target: target.to_string(),
@@ -630,16 +669,16 @@ fn build_split_quarantine_ctas(
 fn build_split_valid_ctas(
     target: &str,
     intermediate: &str,
-    labels: &[&str],
-    valid_columns: &str,
+    working: &[&str],
+    without_labels: &str,
     dialect: &dyn SqlDialect,
 ) -> QuarantineStatement {
-    let none_failed = labels
+    let none_failed = working
         .iter()
-        .map(|l| format!("{l} IS NULL"))
+        .map(|w| format!("{w} IS NULL"))
         .collect::<Vec<_>>()
         .join(" AND ");
-    let select = format!("SELECT {valid_columns} FROM {intermediate} WHERE {none_failed}");
+    let select = format!("SELECT {without_labels} FROM {intermediate} WHERE {none_failed}");
     QuarantineStatement {
         role: StatementRole::Valid,
         target: target.to_string(),
@@ -878,15 +917,17 @@ mod unit_tests {
             [
                 "CREATE OR REPLACE TABLE poc.staging__orders.orders__quarantine__labeled AS\n\
                  SELECT *, CASE WHEN NOT (customer_id IS NOT NULL) \
-                 THEN '_error_not_null_customer_id' END AS _error_not_null_customer_id \
+                 THEN '_error_not_null_customer_id' END AS _error_not_null_customer_id__labeled \
                  FROM poc.staging__orders.orders",
                 "CREATE OR REPLACE TABLE poc.staging__orders.orders__quarantine AS\n\
-                 SELECT * FROM poc.staging__orders.orders__quarantine__labeled \
-                 WHERE _error_not_null_customer_id IS NOT NULL",
-                "CREATE OR REPLACE TABLE poc.staging__orders.orders__valid AS\n\
-                 SELECT * EXCLUDE (_error_not_null_customer_id) \
+                 SELECT * EXCLUDE (_error_not_null_customer_id__labeled), \
+                 _error_not_null_customer_id__labeled AS _error_not_null_customer_id \
                  FROM poc.staging__orders.orders__quarantine__labeled \
-                 WHERE _error_not_null_customer_id IS NULL",
+                 WHERE _error_not_null_customer_id__labeled IS NOT NULL",
+                "CREATE OR REPLACE TABLE poc.staging__orders.orders__valid AS\n\
+                 SELECT * EXCLUDE (_error_not_null_customer_id__labeled) \
+                 FROM poc.staging__orders.orders__quarantine__labeled \
+                 WHERE _error_not_null_customer_id__labeled IS NULL",
             ]
         );
     }
@@ -1146,19 +1187,29 @@ mod unit_tests {
             .unwrap()
             .unwrap();
         // Split combines the labels: any set goes to quarantine, none set to valid.
-        let labels = "_error_not_null_customer_id, _error_accepted_values_status";
-        assert!(plan.statements[1].sql.ends_with(
-            "WHERE _error_not_null_customer_id IS NOT NULL \
-             OR _error_accepted_values_status IS NOT NULL"
+        let working =
+            "_error_not_null_customer_id__labeled, _error_accepted_values_status__labeled";
+        let quarantine_sql = &plan.statements[1].sql;
+        assert!(
+            quarantine_sql.contains(&format!(
+                "SELECT * EXCLUDE ({working}), \
+                 _error_not_null_customer_id__labeled AS _error_not_null_customer_id, \
+                 _error_accepted_values_status__labeled AS _error_accepted_values_status "
+            )),
+            "{quarantine_sql}"
+        );
+        assert!(quarantine_sql.ends_with(
+            "WHERE _error_not_null_customer_id__labeled IS NOT NULL \
+             OR _error_accepted_values_status__labeled IS NOT NULL"
         ));
         let valid_sql = &plan.statements[2].sql;
         assert!(
-            valid_sql.contains(&format!("SELECT * EXCLUDE ({labels})")),
+            valid_sql.contains(&format!("SELECT * EXCLUDE ({working}) FROM")),
             "{valid_sql}"
         );
         assert!(valid_sql.ends_with(
-            "WHERE _error_not_null_customer_id IS NULL \
-             AND _error_accepted_values_status IS NULL"
+            "WHERE _error_not_null_customer_id__labeled IS NULL \
+             AND _error_accepted_values_status__labeled IS NULL"
         ));
 
         // Drop has no labels; it ANDs the predicates in its one statement.
@@ -1355,9 +1406,10 @@ mod unit_tests {
         let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
             .unwrap()
             .unwrap();
-        let sql = &plan.statements[0].sql;
-        assert!(sql.contains("AS _error_not_null_customer_id,"));
-        assert!(sql.contains("AS _error_not_null_customer_id_2"));
+        // The quarantine table is where the labels carry their own names.
+        let sql = &plan.statements[1].sql;
+        assert!(sql.contains("AS _error_not_null_customer_id,"), "{sql}");
+        assert!(sql.contains("AS _error_not_null_customer_id_2 "), "{sql}");
     }
 
     #[test]
