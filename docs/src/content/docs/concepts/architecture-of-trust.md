@@ -215,16 +215,19 @@ source column becomes `ALTER TABLE ADD COLUMN`. A safe type widening becomes
 and rebuilds it with a full refresh.
 
 Set `auto_apply_additive_drift = true` under `[resilience]` to route drift through
-the policy plane instead. The run then applies only a nullable new column, on a
-model with no contract, that a `[policy]` rule allows. It refuses every other
-change before it touches the target, including a safe widening.
+the policy plane instead. The run then applies only a nullable new column, and
+only when policy resolves to `allow` for `schema_change.additive`. A matching rule
+can grant that, and so can `default_agent_effect = "allow"`. With no `[policy]`
+block, nothing is granted. Every other change is refused before it touches the
+target, including a safe widening.
 
 Three limits matter. The drop happens in the same run that finds the change: no
 grace period runs first. Rocky does not detect a column that disappeared from the
-source. And the run's `drift` output lists an action only for a table that
-finished. If the rebuild fails after the drop, the run reports the table as
-failed, and the drop is missing from `drift`. See
-[Failure modes](/advanced/failure-modes/) for each action and its recovery.
+source. And the run's `drift` output lists only the actions of an attempt that
+finished. If the rebuild fails after the drop, that entry is lost. A retry, one by
+default, can then rebuild the table and report it as materialized, with no sign of
+the drop. See [Failure modes](/advanced/failure-modes/) for each action and its
+recovery.
 
 **Shipped.**
 
@@ -307,7 +310,7 @@ surprised.
 | Compile-time column-level types and diagnostics (`E###` errors) | Shipped | Compilation fails on any error-level diagnostic. |
 | Compile-time column-level lineage + `lineage-diff` blast radius | Shipped | Intra-project; computed at compile time. |
 | Compile-time contracts (`E010`–`E013`) | Shipped | Intra-project contract validation against inferred schema. |
-| Schema drift handling (add column / safe widen / drop-and-recreate) | Shipped | Graded response, applied in the run that detects it by default; `auto_apply_additive_drift` applies only policy-allowed nullable additions. No grace period before a drop. A column removed from the source is not detected. A drop followed by a failed rebuild is missing from the `drift` output. |
+| Schema drift handling (add column / safe widen / drop-and-recreate) | Shipped | Graded response, applied in the run that detects it by default; with `auto_apply_additive_drift`, only a nullable addition that policy resolves to `allow`. No grace period before a drop. A column removed from the source is not detected. The `drift` output can omit a drop whose first rebuild failed. |
 | Dialect-divergence lint (`P001`) | Shipped | Opt-in via `--target-dialect`; error severity. |
 | VS Code trust overlays | Shipped | Exactly four: Drift, Breaking, Replay, Governance. |
 | Branches | Partial | Schema-prefix isolation with promotion. The approval gate is opt-in (`[branch.approval] required = true`) and checks an unkeyed digest: an integrity checksum, not a tamper boundary, and it authenticates nobody. No warehouse-native zero-copy clones yet. |
