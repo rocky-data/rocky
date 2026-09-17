@@ -84,8 +84,8 @@ pub struct ModelStats {
 ///   downstream consumers, fast execution (< 10s).
 /// - **Table**: Multiple downstream consumers benefit from pre-materialized data.
 ///   Higher storage cost justified by reduced total compute across consumers.
-/// - **Ephemeral**: Very fast execution (< 2s), single downstream consumer.
-///   Inlined into the consumer's query to avoid materialization overhead.
+///   A view is also what a very fast (< 2s) single-consumer model gets: it
+///   stores nothing, and recomputing it on read costs little.
 pub fn recommend_strategy(stats: &ModelStats, config: &CostConfig) -> MaterializationCost {
     let compute_cost_per_run = stats.avg_duration_seconds * config.compute_cost_per_second;
     let storage_cost_per_month = stats.estimated_size_gb * config.storage_cost_per_gb_month;
@@ -110,13 +110,15 @@ pub fn recommend_strategy(stats: &ModelStats, config: &CostConfig) -> Materializ
 
     let (recommended, reasoning, savings) =
         if stats.avg_duration_seconds < 2.0 && stats.downstream_references <= 1 {
-            // Ephemeral: fast single-consumer model, inline it
+            // A view: recomputing a fast model for one consumer beats
+            // storing it. `ephemeral` used to be recommended here and is now
+            // a compile error — it is never inlined (E038, #1996).
             let savings = storage_cost_per_month;
             (
-                "ephemeral".to_string(),
+                "view".to_string(),
                 format!(
                     "fast execution ({:.1}s) with {} downstream consumer(s); \
-                 inline into consumer query to eliminate materialization overhead",
+                 recompute on read instead of storing a table",
                     stats.avg_duration_seconds, stats.downstream_references
                 ),
                 savings,
@@ -203,8 +205,11 @@ mod tests {
         CostConfig::default()
     }
 
+    /// A fast single-consumer model gets `view`, never `ephemeral`:
+    /// `ephemeral` is a compile error (E038, #1996), so recommending it would
+    /// point at a strategy the project cannot compile.
     #[test]
-    fn test_ephemeral_fast_single_consumer() {
+    fn test_view_for_a_fast_single_consumer_model() {
         let stats = ModelStats {
             model_name: "staging_orders".into(),
             current_strategy: "table".into(),
@@ -215,7 +220,7 @@ mod tests {
             runs_per_month: 30.0,
         };
         let result = recommend_strategy(&stats, &default_config());
-        assert_eq!(result.recommended_strategy, "ephemeral");
+        assert_eq!(result.recommended_strategy, "view");
         assert!(result.estimated_monthly_savings > 0.0);
         assert!(result.reasoning.contains("fast execution"));
     }
@@ -276,7 +281,7 @@ mod tests {
     fn test_no_savings_when_already_optimal() {
         let stats = ModelStats {
             model_name: "already_optimal".into(),
-            current_strategy: "ephemeral".into(),
+            current_strategy: "view".into(),
             avg_duration_seconds: 0.5,
             estimated_size_gb: 0.01,
             downstream_references: 1,
@@ -284,7 +289,7 @@ mod tests {
             runs_per_month: 30.0,
         };
         let result = recommend_strategy(&stats, &default_config());
-        assert_eq!(result.recommended_strategy, "ephemeral");
+        assert_eq!(result.recommended_strategy, "view");
         assert_eq!(result.estimated_monthly_savings, 0.0);
     }
 
@@ -341,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ephemeral_zero_consumers() {
+    fn test_view_for_a_model_with_no_consumers() {
         let stats = ModelStats {
             model_name: "leaf_model".into(),
             current_strategy: "table".into(),
@@ -352,6 +357,39 @@ mod tests {
             runs_per_month: 30.0,
         };
         let result = recommend_strategy(&stats, &default_config());
-        assert_eq!(result.recommended_strategy, "ephemeral");
+        assert_eq!(result.recommended_strategy, "view");
+    }
+
+    /// No branch may recommend a strategy `rocky compile` refuses. `ephemeral`
+    /// is E038 (#1996) and `incremental` is E037 (#1990).
+    #[test]
+    fn no_recommendation_names_a_refused_strategy() {
+        for (duration, size, refs, runs) in [
+            (0.3_f64, 0.01_f64, 0_usize, 10_usize),
+            (1.5, 0.5, 1, 10),
+            (5.0, 0.1, 3, 10),
+            (120.0, 0.1, 1, 10),
+            (0.5, 50.0, 1, 10),
+            (1.0, 1.0, 2, 2),
+        ] {
+            let stats = ModelStats {
+                model_name: "m".into(),
+                current_strategy: "table".into(),
+                avg_duration_seconds: duration,
+                estimated_size_gb: size,
+                downstream_references: refs,
+                history_runs: runs,
+                runs_per_month: 30.0,
+            };
+            let result = recommend_strategy(&stats, &default_config());
+            assert!(
+                !matches!(
+                    result.recommended_strategy.as_str(),
+                    "ephemeral" | "incremental"
+                ),
+                "{duration}s/{size}GB/{refs} consumers recommended a refused strategy: {}",
+                result.recommended_strategy
+            );
+        }
     }
 }
