@@ -1113,6 +1113,12 @@ pub fn plan_preview_output(
                     error = %e,
                     "plan_preview: skipping model whose SQL cannot be rendered offline"
                 );
+                // The debug log was the only trace this left, so a refused
+                // or unrenderable model previewed as nothing at all (#1996).
+                output.skipped.push(crate::output::SkippedModel {
+                    model: model_name.to_string(),
+                    reason: e.to_string(),
+                });
             }
         }
     }
@@ -3165,6 +3171,51 @@ table = "users"
         assert!(out.retention_actions.is_empty());
         assert!(out.plan_id.is_none());
         assert!(out.execution_layers.is_empty());
+    }
+
+    /// #1996: an ephemeral model renders no statement, and the preview used
+    /// to drop it into a `debug!` log. An ephemeral-only project previewed as
+    /// an empty plan with exit 0 — the same silence that let the strategy
+    /// look like it worked. The model is now named in `skipped`, with the
+    /// refusal as its reason.
+    #[test]
+    fn plan_preview_names_a_model_it_could_not_render() {
+        let tmp = TempDir::new().unwrap();
+        let (cfg_path, models_dir) = write_project(
+            &tmp,
+            r#"
+[adapter.default]
+type = "duckdb"
+database = ":memory:"
+"#,
+            &[(
+                "stg_users",
+                r#"name = "stg_users"
+
+[strategy]
+type = "ephemeral"
+
+[target]
+catalog = "c"
+schema = "s"
+table = "stg_users"
+"#,
+            )],
+        );
+
+        let out = plan_preview_output(Some(&cfg_path), &models_dir, None, None).unwrap();
+        assert!(
+            out.statements.is_empty(),
+            "an ephemeral model renders nothing: {:?}",
+            out.statements
+        );
+        assert_eq!(out.skipped.len(), 1, "got {:?}", out.skipped);
+        assert_eq!(out.skipped[0].model, "stg_users");
+        assert!(
+            out.skipped[0].reason.contains("E038") && out.skipped[0].reason.contains("view"),
+            "the reason names the refusal and the strategy that works: {}",
+            out.skipped[0].reason
+        );
     }
 
     /// The `filter` arg narrows the preview to a single model by name and is

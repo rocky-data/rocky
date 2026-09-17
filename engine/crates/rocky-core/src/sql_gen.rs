@@ -528,6 +528,11 @@ pub fn generate_time_interval_bootstrap_sql(
     ) {
         return Err(incremental_transformation_refused(model_ir));
     }
+    // An `ephemeral` model must never get a table (#1996). Refused here too,
+    // so a caller that skips the compile gate cannot create one.
+    if matches!(model_ir.materialization, MaterializationStrategy::Ephemeral) {
+        return Err(ephemeral_refused(model_ir));
+    }
     let target = dialect.format_table_ref(
         &model_ir.target.catalog,
         &model_ir.target.schema,
@@ -606,6 +611,11 @@ pub fn generate_transformation_initial_ddl(
         MaterializationStrategy::Incremental { .. }
     ) {
         return Err(incremental_transformation_refused(model_ir));
+    }
+    // Same for `ephemeral` (#1996): this DDL would give a model that must
+    // never be materialized a physical table.
+    if matches!(model_ir.materialization, MaterializationStrategy::Ephemeral) {
+        return Err(ephemeral_refused(model_ir));
     }
     let target = dialect.format_table_ref(
         &model_ir.target.catalog,
@@ -1717,12 +1727,23 @@ mod tests {
             None,
             None,
         );
-        let err = generate_transformation_sql(&ir, &dialect())
-            .expect_err("an ephemeral model must not produce SQL");
-        let msg = err.to_string();
-        assert!(matches!(err, SqlGenError::InvalidRequest(_)), "{msg}");
-        assert!(msg.contains("stg_orders"), "the model is named: {msg}");
-        assert!(msg.contains("E038") && msg.contains("view"), "{msg}");
+        // Every public transformation entry refuses it, not just the
+        // dispatcher: a caller that skips the compile gate must not be able
+        // to create the table either.
+        let errors: Vec<SqlGenError> = vec![
+            generate_transformation_sql(&ir, &dialect())
+                .expect_err("an ephemeral model must not produce SQL"),
+            generate_transformation_initial_ddl(&ir, &dialect())
+                .expect_err("an ephemeral model must not get initial DDL"),
+            generate_time_interval_bootstrap_sql(&ir, &dialect())
+                .expect_err("an ephemeral model must not bootstrap a table"),
+        ];
+        for err in errors {
+            let msg = err.to_string();
+            assert!(matches!(err, SqlGenError::InvalidRequest(_)), "{msg}");
+            assert!(msg.contains("stg_orders"), "the model is named: {msg}");
+            assert!(msg.contains("E038") && msg.contains("view"), "{msg}");
+        }
     }
 
     /// #1990: a transformation `incremental` model has no watermark to apply,
