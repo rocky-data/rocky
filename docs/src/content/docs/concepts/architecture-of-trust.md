@@ -130,6 +130,18 @@ re-hashed. It authenticates nobody: the approver's email is a self-asserted git
 identity hashed with the rest of the artifact, and a writer can set it to
 anything.
 
+The plans directory, `.rocky/plans/`, is a trusted input for the same reason. A
+plan's id is the blake3 digest of its kind and payload. Rocky recomputes that
+digest on every read and refuses a plan that no longer matches its own id. The id
+is unkeyed, so it catches a file changed without re-hashing, not a plan written
+whole. A promote plan runs the SQL statement it records. The checks at apply read
+the table names recorded beside it, not names parsed from the SQL. The
+`AiAuthored` review marker is unsigned too. Anyone who can write `.rocky/plans/`
+can therefore author a plan that `rocky apply` runs with the applier's warehouse
+credentials. For a promote plan, the policy gate still runs at apply, against
+the principal applying it. Rocky keeps `.rocky/` out of git, so a plan gets no
+code review. Protect write access to it as you would the project itself.
+
 What you get today is schema-prefix isolation, not a warehouse-native zero-copy
 clone. Delta `SHALLOW CLONE` and Snowflake zero-copy `CLONE` would make branch
 creation near-instant and free of storage cost. That integration is a follow-up,

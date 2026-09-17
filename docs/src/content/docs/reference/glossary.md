@@ -161,7 +161,7 @@ A deterministic, reviewable record of what a run will do: compiled SQL, drift ac
 
 ### Plan store
 
-Where Rocky keeps built plans between `rocky plan` and `rocky apply`, so a plan can be reviewed, approved, and applied later. `rocky plan` writes each one to `.rocky/plans/<plan-id>.json`, and `rocky apply` reads it back. See [Plan store v1 to v2](/concepts/plan-store-v1-to-v2/).
+Where Rocky keeps built plans between `rocky plan` and `rocky apply`, so a plan can be reviewed, approved, and applied later. `rocky plan` writes each one to `.rocky/plans/<plan-id>.json`, and `rocky apply` reads it back. The directory is a trusted input: anyone who can write it can author a plan that `rocky apply` runs. See [Branches](/concepts/architecture-of-trust/#branches) for why, and [Plan store v1 to v2](/concepts/plan-store-v1-to-v2/).
 
 ### Provenance
 
