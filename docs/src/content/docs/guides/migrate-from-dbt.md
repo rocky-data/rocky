@@ -979,7 +979,11 @@ Rocky has no append strategy for transformation models. It refuses `type = "incr
 
 Each one appears as a warning. To keep incremental behaviour, give the model a `unique_key` and set `incremental_strategy` to `'merge'` or leave it unset. It then maps to `merge`. Otherwise, rewrite it as a [`time_interval`](/concepts/time-interval/) model with `@start_date` and `@end_date`.
 
-Any of these is refused rather than imported when its dbt SQL uses `is_incremental()`. dbt compiles that branch as true against an existing table. The compiled SQL can then keep a filter such as `WHERE updated_at > '2026-09-01'`. As `full_refresh`, every run would replace the table with only those recent rows. So the importer lists that model as a failed import instead, and names the same two ways out.
+Any of these is refused rather than imported when its dbt SQL uses `is_incremental()`. dbt compiles that branch as true against an existing table. The compiled SQL can then keep a filter such as `WHERE updated_at > '2026-09-01'`. As `full_refresh`, every run would replace the table with only those recent rows. So the importer lists that model as a failed import instead. Rewrite it by hand: remove the `is_incremental()` filter, then use `merge` with a `unique_key` or a `time_interval` model.
+
+:::caution[Remove the filter before you rely on merge]
+A keyed model is imported as `merge` from the same compiled SQL, and the importer does not refuse it. `merge` creates its table from that SQL on the first run. If the SQL kept an `is_incremental()` filter, that first run loads only the recent rows. If the filter reads the model's own table, the run fails instead ([#2059](https://github.com/rocky-data/rocky/issues/2059)). Check every imported `merge` model whose dbt SQL used `is_incremental()`, and remove the filter first.
+:::
 
 The raw and no-manifest importer still refuses unresolved Jinja that calls `is_incremental()`, rather than deleting bounded logic silently.
 
