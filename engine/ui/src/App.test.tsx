@@ -96,6 +96,26 @@ describe("App", () => {
   /** The sidebar's nav, so a Governor tab link of the same name never matches. */
   const areas = () => within(screen.getByRole("navigation", { name: "Areas" }));
 
+  it("shows the Rocky mark beside the name, and says nothing twice", () => {
+    window.history.pushState(null, "", "/ui/estate");
+    const { container } = render(<App token="t" {...slots} />);
+    // Two wordmarks in the page: the narrow header's and the sidebar's. CSS
+    // shows one at a time; both carry the mark.
+    const marks = container.querySelectorAll("img");
+    expect(marks).toHaveLength(2);
+    for (const mark of marks) {
+      // Decorative: the name beside it is the text a screen reader reads.
+      expect(mark).toHaveAttribute("alt", "");
+      // The build inlines a mark this small as a data URI and emits larger
+      // ones under `assets/`. Either is same-origin; nothing may be remote,
+      // which the page's CSP would refuse anyway.
+      const src = mark.getAttribute("src") ?? "";
+      expect(src).toMatch(/^data:image\/svg\+xml|rocky-logo.*\.svg$/);
+      expect(src).not.toMatch(/^https?:/);
+      expect(mark.closest("span")?.textContent).toBe("Rocky");
+    }
+  });
+
   it("renders the eleven areas: five links, six disabled with their reasons", () => {
     window.history.pushState(null, "", "/ui/estate");
     render(<App token="t" {...slots} />);

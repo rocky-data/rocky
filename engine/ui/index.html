@@ -4,6 +4,15 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light dark" />
+    <!--
+      The mark, from `src/assets/` rather than `public/`: a file Vite copies to
+      the root of `dist` would break the layout `rocky serve --ui` trusts
+      (`index.html` plus `assets/`, pinned by `scripts/check-no-external.mjs`).
+      Referenced relatively, so the build emits it into `assets/` with a hash
+      and rewrites this href. It is the same file as the docs site's favicon,
+      which `src/assets/rocky-logo.test.ts` keeps true.
+    -->
+    <link rel="icon" type="image/svg+xml" href="./src/assets/rocky-logo.svg" />
     <title>Rocky</title>
   </head>
   <body>

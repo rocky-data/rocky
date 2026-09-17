@@ -9,6 +9,7 @@ import {
 import type { MetaOutput } from "@rocky-types/meta";
 import { ApiError, apiGet } from "./api";
 import { AREAS, areaFromPath, areaHasTabs, type AreaId } from "./areas";
+import markUrl from "./assets/rocky-logo.svg";
 import { EmptyState, StatusCard } from "./components";
 import { EstateScreen } from "./estate/EstateScreen";
 import { GovernorScreen } from "./governor/GovernorScreen";
@@ -199,6 +200,24 @@ function LaneScreen({
 const SIDEBAR_ID = "shell-sidebar";
 
 /**
+ * The mark and the name. The mark is the same file the docs site serves as
+ * its favicon, bundled with the page — nothing loads from another host.
+ *
+ * `alt=""`, because the mark says nothing the name beside it does not: a
+ * screen reader that announced both would say "Rocky" twice. The caller
+ * passes the display class, so the sidebar can hide it under `md` while the
+ * narrow header shows it.
+ */
+function Wordmark({ className }: { className: string }) {
+  return (
+    <span className={`items-center gap-2 text-base font-semibold tracking-tight ${className}`}>
+      <img src={markUrl} alt="" width={20} height={20} className="rounded-[5px]" />
+      Rocky
+    </span>
+  );
+}
+
+/**
  * The eleven areas. A link for an area with a screen; for one without, its
  * name and the reason as plain text — not a link, not in the tab order, and
  * marked disabled for assistive technology.
@@ -294,7 +313,7 @@ export function App({
     <ErrorBoundary>
       <div className="min-h-screen bg-zinc-50 text-zinc-900 md:flex dark:bg-zinc-950 dark:text-zinc-100">
         <header className="flex items-center justify-between border-b border-zinc-200 bg-white px-4 py-3 md:hidden dark:border-zinc-800 dark:bg-zinc-900">
-          <span className="text-base font-semibold tracking-tight">Rocky</span>
+          <Wordmark className="flex" />
           <button
             ref={menuButton}
             type="button"
@@ -310,7 +329,7 @@ export function App({
           id={SIDEBAR_ID}
           className={`${menuOpen ? "flex" : "hidden"} flex-col gap-4 border-b border-zinc-200 bg-white px-3 py-4 md:sticky md:top-0 md:flex md:h-screen md:w-60 md:shrink-0 md:overflow-y-auto md:border-r md:border-b-0 dark:border-zinc-800 dark:bg-zinc-900`}
         >
-          <span className="hidden px-2 text-base font-semibold tracking-tight md:block">Rocky</span>
+          <Wordmark className="hidden px-2 md:flex" />
           <AreaNav current={area} />
           {token !== null && (
             <section aria-label="Engine" className="mt-auto border-t border-zinc-200 px-2 pt-3 dark:border-zinc-800">
