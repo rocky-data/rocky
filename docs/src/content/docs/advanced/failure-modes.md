@@ -134,6 +134,8 @@ A passing contract is what lets you refactor a model's internals without breakin
 
 Rocky applies each action during the run that reports it. The entry records what already happened. It is not a plan for the next run.
 
+The list is complete only for tables that finished. Rocky records the entry after the table's copy succeeds. If the rebuild after a `drop_and_recreate` fails, the run reports the table as failed, and the entry is missing, although the drop already ran. For a failed table, check the target itself.
+
 Each entry's `reason` names the columns behind the action, one phrase per column. The JSON carries no other column-level detail.
 
 Rocky does not detect a column that disappeared from the source. No action covers a removed column, and no grace period runs today.
