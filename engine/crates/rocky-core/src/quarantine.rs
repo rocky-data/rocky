@@ -68,6 +68,18 @@ pub enum QuarantineError {
          written as `SELECT * EXCEPT (<labels>)`, and {dialect} has no such form"
     )]
     SplitNeedsStarExclusion { dialect: &'static str },
+
+    /// Two tables a mode writes, or one it writes and the source it reads,
+    /// resolve to the same name.
+    #[error(
+        "quarantine would write the {first} table and the {second} table under one name, \
+         '{name}': give suffix_valid and suffix_quarantine distinct, non-empty values"
+    )]
+    TableNameCollision {
+        name: String,
+        first: &'static str,
+        second: &'static str,
+    },
 }
 
 impl From<AdapterError> for QuarantineError {
@@ -226,6 +238,7 @@ fn compile_with_token(
 
     let valid_name = suffixed_table_name(&table_ref.table, &config.suffix_valid)?;
     let quarantine_name = suffixed_table_name(&table_ref.table, &config.suffix_quarantine)?;
+    refuse_colliding_names(config.mode, &table_ref.table, &valid_name, &quarantine_name)?;
     let valid_table =
         dialect.format_table_ref(&table_ref.catalog, &table_ref.schema, &valid_name)?;
     let quarantine_table =
@@ -735,6 +748,44 @@ fn build_valid_ctas(
     }
 }
 
+/// Refuse suffixes that give two tables one name.
+///
+/// An empty `suffix_valid` names the valid table after the source, so the
+/// valid CTAS replaces the source with its passing rows. Equal suffixes name
+/// the valid and quarantine tables alike, so the valid CTAS replaces the
+/// quarantined rows and they land in neither output. Both are checked
+/// case-insensitively: Snowflake folds unquoted names to upper case, and
+/// DuckDB and Databricks compare them without case.
+///
+/// Only the tables a mode writes are compared. `drop` writes no quarantine
+/// table, so its suffix is free; `tag` rewrites the source by design.
+fn refuse_colliding_names(
+    mode: QuarantineMode,
+    source: &str,
+    valid: &str,
+    quarantine: &str,
+) -> Result<(), QuarantineError> {
+    let pairs: Vec<(&str, &'static str, &str, &'static str)> = match mode {
+        QuarantineMode::Split => vec![
+            (valid, "valid", source, "source"),
+            (quarantine, "quarantine", source, "source"),
+            (valid, "valid", quarantine, "quarantine"),
+        ],
+        QuarantineMode::Drop => vec![(valid, "valid", source, "source")],
+        QuarantineMode::Tag => vec![],
+    };
+    for (a, first, b, second) in pairs {
+        if a.eq_ignore_ascii_case(b) {
+            return Err(QuarantineError::TableNameCollision {
+                name: a.to_string(),
+                first,
+                second,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn suffixed_table_name(table: &str, suffix: &str) -> Result<String, QuarantineError> {
     validation::validate_identifier(table)?;
     let candidate = format!("{table}{suffix}");
@@ -1205,6 +1256,60 @@ mod unit_tests {
             "{}",
             plan.statements[0].sql
         );
+    }
+
+    /// Suffixes that give two written tables one name are refused, in the
+    /// modes that write both, and only there.
+    ///
+    /// An empty `suffix_valid` made the valid CTAS replace the source; equal
+    /// suffixes made the valid CTAS replace the quarantined rows. Both ran
+    /// without complaint, and the second put failing rows in neither output.
+    #[test]
+    fn suffixes_that_name_two_tables_alike_are_refused() {
+        let assertions = vec![assertion(
+            None,
+            TestType::NotNull,
+            Some("customer_id"),
+            TestSeverity::Error,
+        )];
+        let compile = |mode, valid: &str, quarantine: &str| {
+            let cfg = QuarantineConfig {
+                mode,
+                suffix_valid: valid.into(),
+                suffix_quarantine: quarantine.into(),
+                ..split_config()
+            };
+            compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        };
+        let collision = |r: Result<Option<QuarantinePlan>, QuarantineError>| {
+            matches!(r, Err(QuarantineError::TableNameCollision { .. }))
+        };
+
+        use QuarantineMode::{Drop, Split, Tag};
+        for (mode, valid, quarantine, why) in [
+            (Split, "", "__quarantine", "valid replaces the source"),
+            (Split, "__valid", "", "quarantine replaces the source"),
+            (Split, "__out", "__out", "valid replaces quarantine"),
+            (Split, "__OUT", "__out", "the same name without case"),
+            (Drop, "", "__quarantine", "valid replaces the source"),
+        ] {
+            assert!(
+                collision(compile(mode, valid, quarantine)),
+                "{mode:?} {valid:?}/{quarantine:?}: {why}"
+            );
+        }
+
+        // Controls: tables a mode does not write do not collide.
+        for (mode, valid, quarantine) in [
+            (Split, "__valid", "__quarantine"),
+            (Drop, "__out", "__out"),
+            (Drop, "__valid", ""),
+            (Tag, "", ""),
+        ] {
+            compile(mode, valid, quarantine)
+                .unwrap_or_else(|e| panic!("{mode:?} {valid:?}/{quarantine:?}: {e}"))
+                .expect("a plan");
+        }
     }
 
     #[test]
