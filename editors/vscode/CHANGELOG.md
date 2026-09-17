@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+
+- **The `strategy-incremental` snippet, and `incremental` from the bundled sidecar schema.** The engine now refuses `type = "incremental"` on a transformation model (E037), because it appended every row again on each run. The snippet is gone, and `schemas/rocky-config.schema.json` no longer lists `incremental`. That schema is registered for JSON validation only, so it does not check `.toml` sidecars in the editor; `rocky compile` reports E037. (#1990)
+
 ## [1.41.0] — 2026-09-12
 
 Pairs with engine 1.74.0.

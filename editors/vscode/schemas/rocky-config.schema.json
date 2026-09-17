@@ -96,22 +96,6 @@
         },
         {
           "type": "object",
-          "description": "Incremental — append rows past a watermark column",
-          "required": ["type", "timestamp_column"],
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "incremental"
-            },
-            "timestamp_column": {
-              "type": "string",
-              "description": "Column used for incremental watermark"
-            }
-          },
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
           "description": "Merge (upsert) — match on unique key, update or insert",
           "required": ["type", "unique_key"],
           "properties": {

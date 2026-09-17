@@ -21458,7 +21458,7 @@ timestamp_column = "ts"
     ///
     /// Sibling of the replication regression above, for the second of the three
     /// executor bootstrap paths. A strategy that mutates an existing target
-    /// (here `incremental`) probes the target with `describe_table` and, if it
+    /// (here `microbatch`) probes the target with `describe_table` and, if it
     /// reads as absent, bootstraps via the non-replacing
     /// `generate_transformation_initial_ddl` CTAS. When that probe *misfires*
     /// against a live target, the bootstrap must fail closed ("already exists")
@@ -21493,8 +21493,9 @@ timestamp_column = "ts"
 name = "fct_events"
 
 [strategy]
-type = "incremental"
+type = "microbatch"
 timestamp_column = "id"
+granularity = "hour"
 
 [target]
 catalog = ""
@@ -21828,8 +21829,9 @@ table = "fct_daily"
 name = "fct_events"
 
 [strategy]
-type = "incremental"
+type = "microbatch"
 timestamp_column = "id"
+granularity = "hour"
 
 [target]
 catalog = ""
@@ -21949,8 +21951,9 @@ table = "fct_events"
 name = "fct_events"
 
 [strategy]
-type = "incremental"
+type = "microbatch"
 timestamp_column = "id"
+granularity = "hour"
 
 [target]
 catalog = ""
@@ -22047,8 +22050,9 @@ table = "fct_events"
 name = "fct_events"
 
 [strategy]
-type = "incremental"
+type = "microbatch"
 timestamp_column = "id"
+granularity = "hour"
 
 [target]
 catalog = ""
@@ -29862,11 +29866,13 @@ auto_create_schemas = true
                 .await
                 .unwrap();
         }
-        // Incremental strategy so the gate tracks `ts` for the MAX(ts) probe.
+        // A timestamp-tracking strategy so the gate tracks `ts` for the
+        // MAX(ts) probe. `microbatch`, because `incremental` is refused on
+        // transformation models (#1990).
         std::fs::write(models_dir.join("agg.sql"), "SELECT id, ts FROM main.ev\n").unwrap();
         std::fs::write(
             models_dir.join("agg.toml"),
-            "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"agg\"\n",
+            "[strategy]\ntype = \"microbatch\"\ntimestamp_column = \"ts\"\ngranularity = \"hour\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"agg\"\n",
         )
         .unwrap();
 
@@ -30320,6 +30326,174 @@ auto_create_schemas = true
         );
     }
 
+    /// #1990 end to end through `execute_models`: an `incremental`
+    /// transformation model fails compile with E037 and is excluded from the
+    /// run, which records it as a failed table. It never loads, so the
+    /// duplication it caused cannot recur.
+    ///
+    /// Its dependent follows the existing compile-error policy (#1291), which
+    /// excludes only the failing model; downstream containment is opt-in. So
+    /// the dependent fails when the upstream table was never created, and
+    /// builds from the old table when one exists. This pins that policy for
+    /// E037 on purpose: changing it should be a deliberate edit here.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn an_e037_model_is_excluded_from_run_and_its_dependent_follows_policy() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        for upstream_exists in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).unwrap();
+            let db = tmp.path().join("e037.duckdb");
+            let state = StateStore::open(&tmp.path().join("state")).unwrap();
+            {
+                let s = DuckDbWarehouseAdapter::open(&db).unwrap();
+                s.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
+                    .await
+                    .unwrap();
+                s.execute_statement(
+                    "CREATE TABLE main.ev AS SELECT * FROM (VALUES \
+                     (1, TIMESTAMP '2024-01-01 00:00:00'), \
+                     (2, TIMESTAMP '2024-01-02 00:00:00')) AS t(id, ts)",
+                )
+                .await
+                .unwrap();
+                if upstream_exists {
+                    // Left by an earlier run: one old row the run must not touch.
+                    s.execute_statement(
+                        "CREATE TABLE main.up AS SELECT 99 AS id, \
+                         TIMESTAMP '2023-01-01 00:00:00' AS ts",
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            std::fs::write(models_dir.join("up.sql"), "SELECT id, ts FROM main.ev\n").unwrap();
+            std::fs::write(
+                models_dir.join("up.toml"),
+                "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"up\"\n",
+            )
+            .unwrap();
+            std::fs::write(models_dir.join("down.sql"), "SELECT id FROM main.up\n").unwrap();
+            std::fs::write(
+                models_dir.join("down.toml"),
+                "depends_on = [\"up\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"down\"\n",
+            )
+            .unwrap();
+
+            let adapter = DuckDbWarehouseAdapter::open(&db).expect("open duckdb");
+            let mut output = RunOutput::new(String::new(), 0, 1);
+            let gate_off = SkipGateConfig {
+                feature_enabled: false,
+                force_rebuild: false,
+                rowcount_fallback: false,
+                lag_tolerance_seconds: 0,
+                shadow_or_branch: false,
+            };
+            // Both outcomes are asserted below: the exclusion lands in `output`
+            // either way, and the Result says whether the dependent could run.
+            let res = super::execute_models(
+                &models_dir,
+                None,
+                &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+                Some(&state),
+                &PartitionRunOptions::default(),
+                "run-e037",
+                None,
+                None,
+                &mut output,
+                None,
+                None,
+                &rocky_core::config::SchemaCacheConfig::default(),
+                false,
+                None,
+                &DeferOptions::default(),
+                gate_off,
+                false,
+                false,
+                &rocky_core::run_vars::RunVars::new(),
+                rocky_core::config::ResilienceConfig::default(),
+                false,
+                true,
+                None,
+                None,
+                false,
+            )
+            .await;
+            drop(adapter);
+
+            let case = if upstream_exists {
+                "old upstream table"
+            } else {
+                "no upstream table"
+            };
+            assert!(
+                output
+                    .errors
+                    .iter()
+                    .any(|e| e.asset_key == vec!["up".to_string()] && e.error.contains("[E037]")),
+                "{case}: the run must report E037 on `up`: {:?}",
+                output.errors
+            );
+            assert!(
+                output.tables_failed >= 1,
+                "{case}: the E037 model counts as failed"
+            );
+            assert_ne!(
+                output.derive_run_status(),
+                rocky_core::state::RunStatus::Success,
+                "{case}: a run with an E037 model must not report success"
+            );
+            assert!(
+                !output
+                    .materializations
+                    .iter()
+                    .any(|m| m.asset_key.last().map(String::as_str) == Some("up")),
+                "{case}: `up` must not materialize"
+            );
+
+            if upstream_exists {
+                assert!(
+                    res.is_ok(),
+                    "with an old upstream table the run completes: {:?}",
+                    res.as_ref().err()
+                );
+                assert_eq!(
+                    count_rows(&db, "up").await,
+                    1,
+                    "the old `up` table is untouched: no bootstrap, no append"
+                );
+                assert_eq!(
+                    count_rows(&db, "down").await,
+                    1,
+                    "policy (#1291): the dependent builds from the old upstream table"
+                );
+            } else {
+                // The dependent fails for the right reason: the excluded model
+                // never created its table. Not silently skipped, not aborted early.
+                let err = format!(
+                    "{:#}",
+                    res.expect_err("with no upstream table the dependent must fail the run")
+                );
+                assert!(
+                    err.contains("model 'down' failed") && err.contains("does not exist"),
+                    "the failure names `down` and the missing upstream table: {err}"
+                );
+                assert!(
+                    !output
+                        .materializations
+                        .iter()
+                        .any(|m| m.asset_key.last().map(String::as_str) == Some("down")),
+                    "with no upstream table the dependent cannot build"
+                );
+            }
+        }
+    }
+
     /// `lag_tolerance_seconds`: a sub-tolerance MAX(ts) movement is treated as
     /// unchanged (SKIP) only when a tolerance is configured; an above-tolerance
     /// movement always builds; the default tolerance 0 builds on any movement.
@@ -30355,7 +30529,7 @@ auto_create_schemas = true
             std::fs::write(models_dir.join("agg.sql"), "SELECT id, ts FROM main.ev\n").unwrap();
             std::fs::write(
                 models_dir.join("agg.toml"),
-                "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"agg\"\n",
+                "[strategy]\ntype = \"microbatch\"\ntimestamp_column = \"ts\"\ngranularity = \"hour\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"agg\"\n",
             )
             .unwrap();
         }
@@ -33136,7 +33310,7 @@ auto_create_schemas = true
         }
     }
 
-    /// Runtime regression: a first run of an incremental transformation
+    /// Runtime regression: a first run of an append-strategy transformation
     /// model against a missing target must bootstrap the table (via
     /// `generate_transformation_initial_ddl`) and load the source **exactly
     /// once** — the populated CTAS is the load, so the subsequent `INSERT INTO`
@@ -33146,13 +33320,15 @@ auto_create_schemas = true
     /// runtime path on in-memory DuckDB (format = None, so dialect-independent
     /// of the lakehouse DDL — what's proven here is the skip, not the format).
     ///
-    /// The model SQL carries no watermark filter (transformation incrementals
-    /// own their own filtering), so a second run re-selects the full source and
-    /// appends it — proving the table is reused, not recreated, and that the
-    /// skip only fires on the bootstrap run.
+    /// The second-run assertion PINS A DEFECT, not a contract. The model SQL
+    /// carries no watermark filter and nothing adds one, so a second run
+    /// re-selects the full source and appends it again. `incremental` used to
+    /// take this path and is now refused (#1990, E037); `microbatch` still
+    /// takes it and is pending its own ruling (#2054). When #2054 is decided,
+    /// this assertion changes with it.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
-    async fn incremental_transformation_first_run_loads_source_once_then_appends() {
+    async fn append_transformation_first_run_loads_source_once_then_appends() {
         use std::time::Instant;
 
         use rocky_core::models::load_model_pair;
@@ -33181,8 +33357,9 @@ auto_create_schemas = true
 name = "fct_events"
 
 [strategy]
-type = "incremental"
+type = "microbatch"
 timestamp_column = "id"
+granularity = "hour"
 
 [target]
 catalog = ""
