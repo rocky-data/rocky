@@ -70,6 +70,7 @@ _LAZY: dict[str, tuple[str, str]] = {
     "AiTestAssertion": ("ai_test_schema", "AiTestAssertion"),
     "AiTestModelResult": ("ai_test_schema", "AiTestModelResult"),
     "AiTestOutput": ("ai_test_schema", "AiTestOutput"),
+    "AnomalyEvaluationOutput": ("run_schema", "AnomalyEvaluationOutput"),
     "AnomalyOutput": ("run_schema", "AnomalyOutput"),
     "ApplyOutput": ("apply_schema", "ApplyOutput"),
     "ApprovalArtifact": ("branch_approve_schema", "ApprovalArtifact"),
@@ -524,6 +525,7 @@ if TYPE_CHECKING:
         PlanOutput,
     )
     from .run_schema import (
+        AnomalyEvaluationOutput,
         AnomalyOutput,
         BudgetBreachOutput,
         ContainedModelOutput,
@@ -941,6 +943,7 @@ __all__ = [
     "TableCheckOutput",
     "PermissionSummary",
     "ExecutionSummary",
+    "AnomalyEvaluationOutput",
     "AnomalyOutput",
     "TableErrorOutput",
     "MetricsSnapshot",

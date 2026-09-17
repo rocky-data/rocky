@@ -120,6 +120,10 @@ export type RunStatus = ("Success" | "PartialFailure" | "Failure") | "SkippedIde
 export interface RunOutput {
   anomalies?: AnomalyOutput[];
   /**
+   * One entry per table the run considered for row-count anomaly detection, saying whether the detector evaluated it. Empty for a run with no batched checks. See [`AnomalyEvaluationOutput`] — without it, an empty `anomalies` list means both "nothing anomalous" and "nothing was looked at" (#1790).
+   */
+  anomaly_evaluated?: AnomalyEvaluationOutput[];
+  /**
    * Budget breaches detected at end of run. Empty when no `[budget]` block is configured or all configured limits were respected. Each breach is also emitted as a `budget_breach` [`rocky_observe::events::PipelineEvent`] and fires the `on_budget_breach` hook so subscribers see them live.
    */
   budget_breaches?: BudgetBreachOutput[];
@@ -243,6 +247,28 @@ export interface AnomalyOutput {
   current_count: number;
   deviation_pct: number;
   reason: string;
+  table: string;
+  [k: string]: unknown;
+}
+/**
+ * Whether the row-count anomaly detector evaluated one table.
+ *
+ * One entry per table in the run's batches, whatever happened. A consumer reading [`RunOutput::anomalies`] alone cannot tell "the detector ran and found nothing" from "the detector never ran": both are an empty list (#1790). Dagster read the empty list as a pass, so a run with `row_count = false` showed a green anomaly check for a detector that had not run.
+ *
+ * The detector runs only when row-count checks are on, the run has a state store, the table's row count was measured, and its history could be read. `not_evaluated_reason` names which of those was missing, because the remedy differs: one is a config line, another is how the run was invoked.
+ */
+export interface AnomalyEvaluationOutput {
+  /**
+   * `true` when the detector compared this table's count against its history. An anomaly, if any, is in [`RunOutput::anomalies`].
+   */
+  evaluated: boolean;
+  /**
+   * Why the detector did not evaluate this table. Set exactly when `evaluated` is `false`.
+   */
+  not_evaluated_reason?: string | null;
+  /**
+   * Fully-qualified table the entry is about, the same key [`AnomalyOutput::table`] uses.
+   */
   table: string;
   [k: string]: unknown;
 }

@@ -10,12 +10,14 @@ from dagster_rocky.observability import (
     COMPLIANCE_FALLBACK_ASSET_KEY,
     RETENTION_OBSERVATION_NAME,
     anomaly_check_results,
+    anomaly_evaluation_results,
     compliance_check_results,
     drift_observations,
     optimize_metadata_for_keys,
     retention_observations,
 )
 from dagster_rocky.types import (
+    AnomalyEvaluation,
     AnomalyResult,
     ComplianceOutput,
     DriftAction,
@@ -37,6 +39,7 @@ def _build_run_result(
     *,
     drift: DriftInfo | None = None,
     anomalies: list[AnomalyResult] | None = None,
+    anomaly_evaluated: list[AnomalyEvaluation] | None = None,
 ) -> RunResult:
     return RunResult(
         version="0.3.0",
@@ -53,6 +56,7 @@ def _build_run_result(
         ),
         drift=drift or DriftInfo(tables_checked=0, tables_drifted=0, actions_taken=[]),
         anomalies=anomalies or [],
+        anomaly_evaluated=anomaly_evaluated or [],
     )
 
 
@@ -152,6 +156,71 @@ def test_anomaly_check_results_yields_warn_severity():
     assert r.metadata["rocky/baseline_avg"].value == 1500.0
     assert r.metadata["rocky/deviation_pct"].value == 40.0
     assert "below baseline" in r.metadata["rocky/reason"].value
+
+
+def test_an_evaluated_table_with_no_anomaly_passes():
+    """#1790: the detector ran and found nothing — an honest green."""
+    run = _build_run_result(anomaly_evaluated=[AnomalyEvaluation(table="orders", evaluated=True)])
+    resolver = _resolver({"orders": dg.AssetKey(["fivetran", "acme", "orders"])})
+
+    results = list(anomaly_evaluation_results(run, key_resolver=resolver))
+
+    assert len(results) == 1
+    r = results[0]
+    assert r.check_name == ANOMALY_CHECK_NAME
+    assert r.passed is True
+    assert "no anomaly" in r.metadata["status"].value
+
+
+def test_a_table_the_detector_skipped_is_not_a_pass():
+    """#1790: the defect. `row_count = false` meant no detector ran at all,
+    and the pass-by-absence placeholder badged the check green.
+
+    The engine's own reason is carried through, because the remedies differ:
+    a config line, a missing state store, and an unmeasured count send the
+    operator to three different places.
+    """
+    run = _build_run_result(
+        anomaly_evaluated=[
+            AnomalyEvaluation(
+                table="orders",
+                evaluated=False,
+                not_evaluated_reason=(
+                    "row-count checks are off for this pipeline "
+                    "(`row_count = false` under `[pipeline.<name>.checks]`), "
+                    "so the anomaly detector did not run"
+                ),
+            )
+        ]
+    )
+    resolver = _resolver({"orders": dg.AssetKey(["fivetran", "acme", "orders"])})
+
+    results = list(anomaly_evaluation_results(run, key_resolver=resolver))
+
+    assert len(results) == 1
+    r = results[0]
+    assert r.check_name == ANOMALY_CHECK_NAME
+    assert r.passed is False
+    assert r.severity == dg.AssetCheckSeverity.WARN
+    assert r.metadata["status"].value == "not_evaluated"
+    assert "row_count = false" in r.metadata["rocky/reason"].value
+
+
+def test_an_evaluation_without_a_reason_still_reports_not_evaluated():
+    """A missing reason must not turn a not-evaluated verdict into a pass."""
+    run = _build_run_result(anomaly_evaluated=[AnomalyEvaluation(table="orders", evaluated=False)])
+    resolver = _resolver({"orders": dg.AssetKey(["fivetran", "acme", "orders"])})
+
+    results = list(anomaly_evaluation_results(run, key_resolver=resolver))
+
+    assert len(results) == 1
+    assert results[0].passed is False
+    assert results[0].metadata["rocky/reason"].value
+
+
+def test_anomaly_evaluation_results_skips_unresolved_tables():
+    run = _build_run_result(anomaly_evaluated=[AnomalyEvaluation(table="ghost", evaluated=True)])
+    assert list(anomaly_evaluation_results(run, key_resolver=_resolver({}))) == []
 
 
 def test_anomaly_check_results_skips_unresolved_tables():
