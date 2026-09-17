@@ -101,8 +101,9 @@ import path refuses it. For a model named `stg_events` the line reads:
 The message names both ways out. Compile dbt in an incremental context and
 import that manifest. Or rewrite the model with a Rocky strategy. A
 transformation model cannot use `incremental`: Rocky refuses it with `E037`,
-because it would append every row again on each run. Use `merge` with a
-`unique_key`, or `time_interval` with `@start_date` and `@end_date` in the SQL:
+because it would append every row again on each run. Remove the
+`is_incremental()` filter, then use `merge` with a `unique_key`, or
+`time_interval` with `@start_date` and `@end_date` in the SQL:
 
 ```toml
 [strategy]
