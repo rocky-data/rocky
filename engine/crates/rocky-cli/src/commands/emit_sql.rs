@@ -859,13 +859,17 @@ mod tests {
         .models;
         assert_eq!(emitted.len(), 1);
         // A merge emits a statement operating on an existing target, so it is
-        // flagged and the written file carries the bootstrap/watermark caveat.
+        // flagged and the written file carries the existing-target note.
         assert!(emitted[0].assumes_existing_target);
         assert!(emitted[0].sql.starts_with("MERGE INTO"));
         let body = file_body(&emitted[0]);
         assert!(
-            body.contains("-- NOTE: incremental/merge"),
+            body.contains("-- NOTE: merge/delete_insert statement"),
             "merge file must carry the existing-target note:\n{body}"
+        );
+        assert!(
+            !body.contains("watermark"),
+            "no watermark applies to merge or delete_insert:\n{body}"
         );
     }
 
