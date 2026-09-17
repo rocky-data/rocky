@@ -309,9 +309,9 @@ rocky optimize
     {
       "model_name": "stg_events",
       "current_strategy": "table",
-      "recommended_strategy": "ephemeral",
+      "recommended_strategy": "view",
       "estimated_monthly_savings": 0.0023,
-      "reasoning": "fast execution (1.4s) with 1 downstream consumer(s); inline into consumer query to eliminate materialization overhead",
+      "reasoning": "fast execution (1.4s) with 1 downstream consumer(s); recompute on read instead of storing a table",
       "compute_cost_per_run": 0.0028,
       "storage_cost_per_month": 0.0023,
       "downstream_references": 1
@@ -341,7 +341,7 @@ rocky optimize
 }
 ```
 
-`rocky optimize` recommends `ephemeral`, `table` or `view`. A model needs at least 5 recorded runs; with fewer, it keeps its current strategy.
+`rocky optimize` recommends `table` or `view`. A model needs at least 5 recorded runs; with fewer, it keeps its current strategy.
 
 Two inputs are fixed rather than read from your project ([#2056](https://github.com/rocky-data/rocky/issues/2056)):
 

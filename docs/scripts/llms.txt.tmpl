@@ -113,8 +113,7 @@ Scope on the ELT spectrum:
 - `merge` — `MERGE INTO ... USING ON key`
 - `delete_insert` — delete the affected partitions, then insert
 - `time_interval` / `microbatch` — Partition-keyed processing
-- `view` — a warehouse view
-- `view` — a view object: an intermediate other models read, with no copied data. `ephemeral` is refused (`E038`)
+- `view` — a warehouse view: an intermediate other models read, with no copied data. `ephemeral` is refused (`E038`)
 - `materialized_view` — warehouse-managed materialized views (Databricks, Snowflake, BigQuery)
 - `dynamic_table` — Snowflake dynamic tables with target lag
 - `content_addressed` — hash-addressed Parquet written to a Delta UniForm table

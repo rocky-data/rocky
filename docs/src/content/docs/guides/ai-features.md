@@ -88,7 +88,7 @@ GROUP BY DATE_TRUNC('month', o.order_date), p.category
 
 ### Pick a materialization + target
 
-`--materialization` takes `full_refresh` (the default), `merge` or `ephemeral`. Pair `merge` with `--unique-key`, the columns that identify a row. Add `--target` to land the output in a real catalog and schema instead of the `generated.ai.*` default:
+`--materialization` takes `full_refresh` (the default) or `merge`. `incremental` and `ephemeral` fail before any LLM call, with `E037` and `E038`. Pair `merge` with `--unique-key`, the columns that identify a row. Add `--target` to land the output in a real catalog and schema instead of the `generated.ai.*` default:
 
 ```bash
 rocky ai "daily order facts from stg_orders" \

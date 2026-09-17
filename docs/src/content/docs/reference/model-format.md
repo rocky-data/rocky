@@ -67,7 +67,7 @@ The `.toml` file names the model, lists what it depends on, picks a materializat
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"merge"`, `"time_interval"`, `"view"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`. Two are refused: `"incremental"` on a transformation model (`E037`, see [Incremental](#incremental)), and `"ephemeral"` outright (`E038`, see [Ephemeral](#ephemeral)). |
+| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"merge"`, `"time_interval"`, `"view"`, `"materialized_view"`, `"dynamic_table"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`. Two are refused: `"incremental"` on a transformation model (`E037`, see [Incremental](#incremental)), and `"ephemeral"` outright (`E038`, see [Ephemeral](#ephemeral)). |
 | `timestamp_column` | string | | Column used as the incremental watermark. Required when `type = "microbatch"`. |
 | `unique_key` | list of strings | | Key columns for merge matching. Required when `type = "merge"`. |
 | `update_columns` | list of strings | | Columns to update on merge match. Defaults to all non-key columns if omitted. |

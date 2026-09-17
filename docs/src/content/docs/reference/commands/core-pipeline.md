@@ -676,7 +676,7 @@ rocky compare --filter client=acme
 Shadow mode is only useful if it truly isolates the run from production. Rocky refuses the run rather than write a target it cannot isolate. A shadow or branch run fails closed in any of these cases.
 
 - The selected transformation set contains a `content_addressed` or `time_interval` model. Both need extra storage or partition-state isolation that shadow mode does not give them.
-- The selected set contains an `ephemeral` model. That strategy is refused at compile time (`E038`), so the run stops before shadow mode sees it.
+- The selected set contains an `ephemeral` model. Compile already reports it as `E038`, and the shadow path refuses it again by name. A consumer would read the production table, because Rocky neither materializes nor inlines it.
 - The chosen suffix or schema would collide with a production target, or with another selected shadow target.
 - All three of the following hold at once:
   - the dialect treats identifier case as part of object identity (Snowflake and BigQuery);
