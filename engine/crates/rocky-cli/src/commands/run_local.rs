@@ -578,6 +578,7 @@ pub async fn run_quality(
     // length is not a table count (#1811 round one). Counted here instead.
     let mut tables_checked = 0usize;
     let mut targets_unexpanded = 0usize;
+    let mut quarantine_writes_failed = 0usize;
 
     if !pipeline.checks.enabled {
         warn!("quality pipeline checks are disabled — nothing to do");
@@ -769,11 +770,20 @@ pub async fn run_quality(
                             )
                             .await;
                             // A statement that failed is a split that did not
-                            // happen, so it fails the run the way a compile
-                            // failure does (#2052). `ok: false` on its own
-                            // reached the JSON and nothing that decides the
-                            // exit code.
+                            // happen, or happened halfway (#2052). `ok: false`
+                            // on its own reached the JSON and nothing that
+                            // decides the exit code.
+                            //
+                            // Two records, for two readers. The check carries
+                            // the reason to the JSON and Dagster, as
+                            // `quarantine:compile` does. The failed table fails
+                            // the run whatever `fail_on_error` says: that knob
+                            // lets a failed CHECK pass, and this is a write
+                            // that did not complete, which may have left the
+                            // quarantine table new and the valid table stale.
                             if !q_output.ok {
+                                output.tables_failed += 1;
+                                quarantine_writes_failed += 1;
                                 output.check_results.push(TableCheckOutput {
                                     asset_key: asset_key.clone(),
                                     checks: vec![rocky_core::checks::quarantine_not_evaluated(
@@ -891,7 +901,9 @@ pub async fn run_quality(
         Some(pipeline_name),
     );
 
-    if error_failures > 0 && pipeline.checks.fail_on_error {
+    // A quarantine write that did not complete fails the run with the check
+    // gate off too. Its `quarantine:execute` check is among `error_failures`.
+    if error_failures > 0 && (pipeline.checks.fail_on_error || quarantine_writes_failed > 0) {
         if !recorded {
             // The gate failed AND the record did not land. The typed error
             // below is the dispatcher's proof that the record is persisted and
@@ -1196,10 +1208,11 @@ fn classify_assertion(
 /// captured via `SELECT COUNT(*)` against the written tables; adapters
 /// that cannot count leave the fields as `None`.
 ///
-/// `split` drops its intermediate label table afterwards, whether the
-/// statements succeeded or not. A drop that fails also sets `ok: false`: the
-/// caller fails the run on it, because a table Rocky wrote would otherwise
-/// stay in the schema with nothing saying so.
+/// `split` drops its intermediate label table afterwards, whether the later
+/// statements succeeded or not, once its own label statement created it. A
+/// drop that fails also sets `ok: false`: the caller fails the run on it,
+/// because a table Rocky wrote would otherwise stay in the schema with
+/// nothing saying so.
 async fn execute_quarantine_plan(
     warehouse: &dyn rocky_core::traits::WarehouseAdapter,
     asset_key: Vec<String>,
@@ -1222,23 +1235,32 @@ async fn execute_quarantine_plan(
     };
 
     let mut errors: Vec<String> = Vec::new();
+    let mut created_intermediate = false;
     for stmt in &plan.statements {
-        if let Err(e) = warehouse.execute_statement(&stmt.sql).await {
-            errors.push(format!("{}: {}", role_label(stmt.role), e));
-            warn!(
-                role = role_label(stmt.role),
-                target = stmt.target.as_str(),
-                error = %e,
-                "quarantine statement failed"
-            );
-            break;
+        match warehouse.execute_statement(&stmt.sql).await {
+            Ok(_) => {
+                created_intermediate |= stmt.role == rocky_core::quarantine::StatementRole::Label;
+            }
+            Err(e) => {
+                errors.push(format!("{}: {}", role_label(stmt.role), e));
+                warn!(
+                    role = role_label(stmt.role),
+                    target = stmt.target.as_str(),
+                    error = %e,
+                    "quarantine statement failed"
+                );
+                break;
+            }
         }
     }
 
     // After the loop, not inside it: the drop has to run on the failure path
-    // too. `DROP TABLE IF EXISTS`, so a label statement that failed before
-    // creating the table is not a second error.
-    if let Some(stmt) = &plan.drop_intermediate
+    // too. Only once this run's label statement has created the table,
+    // though. That statement is a plain CREATE TABLE, so when it fails the
+    // name may belong to a table this run did not create, and dropping it
+    // would destroy someone else's table.
+    if created_intermediate
+        && let Some(stmt) = &plan.drop_intermediate
         && let Err(e) = warehouse.execute_statement(&stmt.sql).await
     {
         errors.push(format!(
@@ -3537,6 +3559,134 @@ auto_create_schemas = true
         assert_eq!(
             built, 0,
             "nothing may materialize on an Absent decision, even with the dir on disk"
+        );
+    }
+
+    /// A DuckDB adapter that records every statement and fails the one
+    /// `fail` matches.
+    struct FailOneStatement {
+        inner: DuckDbWarehouseAdapter,
+        fail: fn(&str) -> bool,
+        executed: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WarehouseAdapter for FailOneStatement {
+        fn dialect(&self) -> &dyn rocky_core::traits::SqlDialect {
+            self.inner.dialect()
+        }
+
+        async fn execute_statement(&self, sql: &str) -> rocky_core::traits::AdapterResult<()> {
+            self.executed.lock().unwrap().push(sql.to_string());
+            if (self.fail)(sql) {
+                return Err(rocky_core::traits::AdapterError::msg("injected failure"));
+            }
+            self.inner.execute_statement(sql).await
+        }
+
+        async fn execute_query(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::QueryResult> {
+            self.inner.execute_query(sql).await
+        }
+
+        async fn describe_table(
+            &self,
+            table: &rocky_ir::TableRef,
+        ) -> rocky_core::traits::AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+            self.inner.describe_table(table).await
+        }
+    }
+
+    /// `split` drops its intermediate table only when its own label statement
+    /// created it.
+    ///
+    /// The label statement is a plain `CREATE TABLE`, so when it fails, the
+    /// name may belong to a table this run did not create. Dropping on that
+    /// path would destroy it. Once the label statement has succeeded, a later
+    /// failure still drops the table, which is the control: without it, a
+    /// change that never dropped at all would pass the first half.
+    #[tokio::test]
+    async fn split_drops_its_intermediate_table_only_after_creating_it() {
+        async fn run(fail: fn(&str) -> bool) -> (super::QuarantineOutput, Vec<String>) {
+            let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
+            inner
+                .execute_statement("CREATE TABLE main.orders AS SELECT 1 AS id, 'ada' AS name")
+                .await
+                .unwrap();
+            let adapter = FailOneStatement {
+                inner,
+                fail,
+                executed: std::sync::Mutex::new(Vec::new()),
+            };
+            let assertions = vec![rocky_core::config::QualityAssertion {
+                table: "orders".into(),
+                name: None,
+                test: rocky_core::tests::TestDecl {
+                    test_type: rocky_core::tests::TestType::NotNull,
+                    column: Some("name".into()),
+                    severity: rocky_core::tests::TestSeverity::Error,
+                    filter: None,
+                },
+            }];
+            let plan = rocky_core::quarantine::compile_quarantine_sql(
+                &assertions,
+                "orders",
+                &rocky_ir::TableRef {
+                    catalog: String::new(),
+                    schema: "main".into(),
+                    table: "orders".into(),
+                },
+                adapter.dialect(),
+                &rocky_core::config::QuarantineConfig {
+                    enabled: true,
+                    mode: rocky_core::config::QuarantineMode::Split,
+                    suffix_valid: "__valid".into(),
+                    suffix_quarantine: "__quarantine".into(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+            let out = super::execute_quarantine_plan(&adapter, vec!["orders".into()], plan).await;
+            let executed = adapter.executed.lock().unwrap().clone();
+            (out, executed)
+        }
+        let is_label = |sql: &str| sql.starts_with("CREATE TABLE") && sql.contains("__labeled_");
+        let is_drop = |sql: &String| sql.starts_with("DROP TABLE");
+
+        let (out, executed) =
+            run(|sql| sql.starts_with("CREATE TABLE") && sql.contains("__labeled_")).await;
+        assert!(!out.ok, "{out:?}");
+        assert!(
+            out.error
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("label: "),
+            "{out:?}"
+        );
+        assert!(
+            executed.iter().any(|s| is_label(s)),
+            "precondition: the label statement ran: {executed:#?}"
+        );
+        assert!(
+            !executed.iter().any(is_drop),
+            "a failed label statement must not be followed by a drop: {executed:#?}"
+        );
+
+        let (out, executed) = run(|sql| sql.contains("__valid AS")).await;
+        assert!(!out.ok, "{out:?}");
+        assert!(
+            out.error
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("valid: "),
+            "{out:?}"
+        );
+        assert_eq!(
+            executed.iter().filter(|s| is_drop(s)).count(),
+            1,
+            "a label table this run created is dropped after a later failure: {executed:#?}"
         );
     }
 }

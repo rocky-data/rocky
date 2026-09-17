@@ -12,7 +12,7 @@
 //! outputs from those labels (#1937):
 //!
 //! ```text
-//!   source ──CTAS, predicates evaluated here only──▶ <table>__quarantine__labeled
+//!   source ──CTAS, predicates evaluated here only──▶ <table>__quarantine__labeled_<token>
 //!                                                     │  one label column per assertion
 //!            ┌────────────────────────────────────────┤
 //!            ▼ any label set                          ▼ no label set, labels left out
@@ -68,15 +68,6 @@ pub enum QuarantineError {
          written as `SELECT * EXCEPT (<labels>)`, and {dialect} has no such form"
     )]
     SplitNeedsStarExclusion { dialect: &'static str },
-
-    /// The intermediate table's name matches an output table's name, so
-    /// dropping it would drop that output.
-    #[error(
-        "quarantine table name '{name}' is used twice: `split` writes its labels to \
-         '{name}' and drops it afterwards, so it must differ from the valid and \
-         quarantine tables; change suffix_valid or suffix_quarantine"
-    )]
-    TableNameCollision { name: String },
 }
 
 impl From<AdapterError> for QuarantineError {
@@ -107,15 +98,19 @@ pub struct QuarantinePlan {
     /// valid table downstream pipelines might read.
     pub statements: Vec<QuarantineStatement>,
     /// `split` only: the statement that drops the intermediate label table.
+    /// `None` for `drop` and `tag`, which write no intermediate table.
     ///
-    /// The runtime runs it after [`Self::statements`] whether they succeeded
-    /// or not, because a failed statement must not leave the intermediate
-    /// table behind (#2052). `None` for `drop` and `tag`, which write no
-    /// intermediate table.
+    /// The runtime runs it after [`Self::statements`] once the
+    /// [`StatementRole::Label`] statement has succeeded, whether the later
+    /// statements succeeded or not, because a failed statement must not leave
+    /// the intermediate table behind (#1937, #2052). It does NOT run when the
+    /// label statement failed: then the table is not this run's to drop.
     ///
-    /// The table is named `<table><suffix_quarantine>__labeled`. Rocky
-    /// replaces and then drops any table of that name, the same way it
-    /// replaces `<table><suffix_quarantine>`.
+    /// The table is named `<table><suffix_quarantine>__labeled_<token>`, with
+    /// a random token per plan, and created with a plain `CREATE TABLE`. So
+    /// it cannot replace a table someone else owns, and two runs of the same
+    /// pipeline do not share it. A process killed between the label statement
+    /// and the drop leaves the table behind under that name.
     pub drop_intermediate: Option<QuarantineStatement>,
 }
 
@@ -160,12 +155,41 @@ pub enum StatementRole {
 /// `assertions` should be the full list of assertions attached to the
 /// pipeline's [`crate::config::ChecksConfig`]. Filtering by target table
 /// happens here; filtering by severity and kind also happens here.
+///
+/// Not deterministic for `split`: each call draws a new token for the
+/// intermediate table and its label columns. See
+/// [`QuarantinePlan::drop_intermediate`].
 pub fn compile_quarantine_sql(
     assertions: &[QualityAssertion],
     unqualified_table: &str,
     table_ref: &TableRef,
     dialect: &dyn SqlDialect,
     config: &QuarantineConfig,
+) -> Result<Option<QuarantinePlan>, QuarantineError> {
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    compile_with_token(
+        assertions,
+        unqualified_table,
+        table_ref,
+        dialect,
+        config,
+        &token[..SPLIT_TOKEN_LEN],
+    )
+}
+
+/// Hex digits of the per-plan token `split` names its working objects with.
+/// 48 bits: two concurrent plans for one table do not draw the same token.
+const SPLIT_TOKEN_LEN: usize = 12;
+
+/// [`compile_quarantine_sql`] with the `split` token supplied, so tests can
+/// pin the exact SQL.
+fn compile_with_token(
+    assertions: &[QualityAssertion],
+    unqualified_table: &str,
+    table_ref: &TableRef,
+    dialect: &dyn SqlDialect,
+    config: &QuarantineConfig,
+    token: &str,
 ) -> Result<Option<QuarantinePlan>, QuarantineError> {
     if !config.enabled {
         return Ok(None);
@@ -210,17 +234,19 @@ pub fn compile_quarantine_sql(
     let mut drop_intermediate = None;
     match config.mode {
         QuarantineMode::Split => {
-            // In the intermediate table each label sits under a working name,
-            // not under its own. The source may already have a column called
-            // `_error_…` (a quarantine table checked again, say). DuckDB
-            // renames the second of two same-named CTAS columns, so a label
-            // under its own name would be `_error_…_1` and every WHERE below
-            // would read the source's column instead. The quarantine CTAS
-            // gives each label its real name back.
+            // In the intermediate table each label sits under a working name
+            // that carries this plan's token, not under its own name. The
+            // source may already have a column called `_error_…` (a quarantine
+            // table checked again, say). DuckDB renames the second of two
+            // same-named CTAS columns, so a label under a name the source
+            // also has would be read as the source's column by every WHERE
+            // below. A fixed suffix only moves that collision; a per-plan
+            // token is a name no existing column was given. The quarantine
+            // CTAS gives each label its real name back.
             let working: Vec<String> = labeled
                 .iter()
                 .map(|p| {
-                    let name = format!("{}{LABEL_WORKING_SUFFIX}", p.label);
+                    let name = format!("{}__{token}", p.label);
                     validation::validate_identifier(&name)?;
                     Ok::<_, QuarantineError>(name)
                 })
@@ -234,16 +260,8 @@ pub fn compile_quarantine_sql(
 
             let intermediate_name = suffixed_table_name(
                 &table_ref.table,
-                &format!("{}__labeled", config.suffix_quarantine),
+                &format!("{}__labeled_{token}", config.suffix_quarantine),
             )?;
-            // Dropping the intermediate table must never drop an output.
-            for output in [&valid_name, &quarantine_name] {
-                if output.eq_ignore_ascii_case(&intermediate_name) {
-                    return Err(QuarantineError::TableNameCollision {
-                        name: intermediate_name,
-                    });
-                }
-            }
             let intermediate_table = dialect.format_table_ref(
                 &table_ref.catalog,
                 &table_ref.schema,
@@ -327,10 +345,6 @@ struct LabeledPredicate {
     label: String,
     valid_pred: String,
 }
-
-/// Appended to a label's name for its column in `split`'s intermediate
-/// table. See the `QuarantineMode::Split` arm of [`compile_quarantine_sql`].
-const LABEL_WORKING_SUFFIX: &str = "__labeled";
 
 /// Whether a test kind lowers cleanly to a row-level boolean predicate.
 ///
@@ -627,10 +641,17 @@ fn build_label_ctas(
         .collect::<Vec<_>>()
         .join(", ");
     let select = format!("SELECT *, {error_cols} FROM {source}");
+    // `split`'s intermediate table must be new: replacing an existing table
+    // would destroy something this run does not own, and the drop after it
+    // would finish the job. `tag` replaces its source by design.
+    let sql = match role {
+        StatementRole::Label => dialect.create_table_as_new(target, &select),
+        _ => dialect.create_table_as(target, &select),
+    };
     QuarantineStatement {
         role,
         target: target.to_string(),
-        sql: dialect.create_table_as(target, &select),
+        sql,
     }
 }
 
@@ -870,7 +891,7 @@ mod unit_tests {
             Some("customer_id"),
             TestSeverity::Error,
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let plan = compile_with_token(&assertions, "orders", &table(), &TestDialect, &cfg, "t0k3n")
             .unwrap()
             .unwrap();
         let roles: Vec<StatementRole> = plan.statements.iter().map(|s| s.role).collect();
@@ -887,7 +908,7 @@ mod unit_tests {
             plan.quarantine_table,
             "poc.staging__orders.orders__quarantine"
         );
-        let intermediate = "poc.staging__orders.orders__quarantine__labeled";
+        let intermediate = "poc.staging__orders.orders__quarantine__labeled_t0k3n";
         assert_eq!(plan.statements[0].target, intermediate);
         let drop = plan
             .drop_intermediate
@@ -908,26 +929,28 @@ mod unit_tests {
             Some("customer_id"),
             TestSeverity::Error,
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let plan = compile_with_token(&assertions, "orders", &table(), &TestDialect, &cfg, "t0k3n")
             .unwrap()
             .unwrap();
         let sql: Vec<&str> = plan.statements.iter().map(|s| s.sql.as_str()).collect();
         assert_eq!(
             sql,
             [
-                "CREATE OR REPLACE TABLE poc.staging__orders.orders__quarantine__labeled AS\n\
+                // A plain CREATE TABLE: it fails rather than replace a table
+                // that already has this name.
+                "CREATE TABLE poc.staging__orders.orders__quarantine__labeled_t0k3n AS\n\
                  SELECT *, CASE WHEN NOT (customer_id IS NOT NULL) \
-                 THEN '_error_not_null_customer_id' END AS _error_not_null_customer_id__labeled \
+                 THEN '_error_not_null_customer_id' END AS _error_not_null_customer_id__t0k3n \
                  FROM poc.staging__orders.orders",
                 "CREATE OR REPLACE TABLE poc.staging__orders.orders__quarantine AS\n\
-                 SELECT * EXCLUDE (_error_not_null_customer_id__labeled), \
-                 _error_not_null_customer_id__labeled AS _error_not_null_customer_id \
-                 FROM poc.staging__orders.orders__quarantine__labeled \
-                 WHERE _error_not_null_customer_id__labeled IS NOT NULL",
+                 SELECT * EXCLUDE (_error_not_null_customer_id__t0k3n), \
+                 _error_not_null_customer_id__t0k3n AS _error_not_null_customer_id \
+                 FROM poc.staging__orders.orders__quarantine__labeled_t0k3n \
+                 WHERE _error_not_null_customer_id__t0k3n IS NOT NULL",
                 "CREATE OR REPLACE TABLE poc.staging__orders.orders__valid AS\n\
-                 SELECT * EXCLUDE (_error_not_null_customer_id__labeled) \
-                 FROM poc.staging__orders.orders__quarantine__labeled \
-                 WHERE _error_not_null_customer_id__labeled IS NULL",
+                 SELECT * EXCLUDE (_error_not_null_customer_id__t0k3n) \
+                 FROM poc.staging__orders.orders__quarantine__labeled_t0k3n \
+                 WHERE _error_not_null_customer_id__t0k3n IS NULL",
             ]
         );
     }
@@ -1078,25 +1101,54 @@ mod unit_tests {
         }
     }
 
-    /// The intermediate table is dropped after the split, so its name must
-    /// not be an output's name.
+    /// Two plans for the same table name different working objects, and the
+    /// public entry point uses a token of the documented shape.
+    ///
+    /// A fixed name let a run replace and then drop a table that happened to
+    /// carry it, let two runs of one pipeline share (and drop) one
+    /// intermediate table, and let a source column with the fixed working
+    /// name steer the split.
     #[test]
-    fn split_refuses_an_intermediate_name_that_is_an_output() {
+    fn each_split_plan_names_its_working_objects_with_a_fresh_token() {
         let assertions = vec![assertion(
             None,
             TestType::NotNull,
             Some("customer_id"),
             TestSeverity::Error,
         )];
-        let cfg = QuarantineConfig {
-            suffix_valid: "__QUARANTINE__labeled".into(),
-            ..split_config()
+        let plan = || {
+            compile_quarantine_sql(
+                &assertions,
+                "orders",
+                &table(),
+                &TestDialect,
+                &split_config(),
+            )
+            .unwrap()
+            .unwrap()
         };
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .unwrap_err();
+        let (a, b) = (plan(), plan());
+        let target = |p: &QuarantinePlan| p.statements[0].target.clone();
+        assert_ne!(target(&a), target(&b), "two plans must not share a table");
+
+        let prefix = "poc.staging__orders.orders__quarantine__labeled_";
+        let token = target(&a)
+            .strip_prefix(prefix)
+            .unwrap_or_else(|| panic!("{}", target(&a)))
+            .to_string();
+        assert_eq!(token.len(), SPLIT_TOKEN_LEN, "{token}");
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()), "{token}");
         assert!(
-            matches!(err, QuarantineError::TableNameCollision { ref name } if name == "orders__quarantine__labeled"),
-            "{err:?}"
+            a.statements[0]
+                .sql
+                .contains(&format!("AS _error_not_null_customer_id__{token} ")),
+            "the label columns carry the same token: {}",
+            a.statements[0].sql
+        );
+        assert_eq!(
+            a.drop_intermediate.as_ref().map(|d| d.target.clone()),
+            Some(target(&a)),
+            "the drop names the table this plan creates"
         );
     }
 
@@ -1183,24 +1235,23 @@ mod unit_tests {
                 TestSeverity::Error,
             ),
         ];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let plan = compile_with_token(&assertions, "orders", &table(), &TestDialect, &cfg, "t0k3n")
             .unwrap()
             .unwrap();
         // Split combines the labels: any set goes to quarantine, none set to valid.
-        let working =
-            "_error_not_null_customer_id__labeled, _error_accepted_values_status__labeled";
+        let working = "_error_not_null_customer_id__t0k3n, _error_accepted_values_status__t0k3n";
         let quarantine_sql = &plan.statements[1].sql;
         assert!(
             quarantine_sql.contains(&format!(
                 "SELECT * EXCLUDE ({working}), \
-                 _error_not_null_customer_id__labeled AS _error_not_null_customer_id, \
-                 _error_accepted_values_status__labeled AS _error_accepted_values_status "
+                 _error_not_null_customer_id__t0k3n AS _error_not_null_customer_id, \
+                 _error_accepted_values_status__t0k3n AS _error_accepted_values_status "
             )),
             "{quarantine_sql}"
         );
         assert!(quarantine_sql.ends_with(
-            "WHERE _error_not_null_customer_id__labeled IS NOT NULL \
-             OR _error_accepted_values_status__labeled IS NOT NULL"
+            "WHERE _error_not_null_customer_id__t0k3n IS NOT NULL \
+             OR _error_accepted_values_status__t0k3n IS NOT NULL"
         ));
         let valid_sql = &plan.statements[2].sql;
         assert!(
@@ -1208,8 +1259,8 @@ mod unit_tests {
             "{valid_sql}"
         );
         assert!(valid_sql.ends_with(
-            "WHERE _error_not_null_customer_id__labeled IS NULL \
-             AND _error_accepted_values_status__labeled IS NULL"
+            "WHERE _error_not_null_customer_id__t0k3n IS NULL \
+             AND _error_accepted_values_status__t0k3n IS NULL"
         ));
 
         // Drop has no labels; it ANDs the predicates in its one statement.

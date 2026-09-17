@@ -16086,7 +16086,7 @@
             "type": "string"
           },
           "ok": {
-            "description": "`true` when every quarantine statement executed successfully and, for `mode = \"split\"`, the intermediate label table was dropped. `false` also adds a failing `quarantine:execute` check, which fails the run unless `fail_on_error = false`; inspect `error` for details.",
+            "description": "`true` when every quarantine statement executed successfully and, for `mode = \"split\"`, the intermediate label table was dropped. `false` also adds a failing `quarantine:execute` check and counts the table in `tables_failed`, so the run fails whatever `fail_on_error` says; inspect `error` for details.",
             "type": "boolean"
           },
           "quarantine_table": {

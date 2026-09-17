@@ -1466,8 +1466,9 @@ pub struct QuarantineOutput {
     pub quarantined_rows: Option<u64>,
     /// `true` when every quarantine statement executed successfully and,
     /// for `mode = "split"`, the intermediate label table was dropped.
-    /// `false` also adds a failing `quarantine:execute` check, which fails
-    /// the run unless `fail_on_error = false`; inspect `error` for details.
+    /// `false` also adds a failing `quarantine:execute` check and counts the
+    /// table in `tables_failed`, so the run fails whatever `fail_on_error`
+    /// says; inspect `error` for details.
     pub ok: bool,
     /// The first failing statement's role and error, if any. For
     /// `mode = "split"`, a failure to drop the intermediate label table is

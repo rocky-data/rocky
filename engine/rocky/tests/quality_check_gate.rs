@@ -653,6 +653,20 @@ fn ids(dir: &Path, table: &str) -> Vec<i32> {
         .collect()
 }
 
+/// Whether any table's name starts with `prefix`. `split` names its
+/// intermediate table `orders__quarantine__labeled_<token>`, with a random
+/// token, so the tests look for the prefix.
+fn any_table_starts_with(dir: &Path, prefix: &str) -> bool {
+    let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
+    let mut stmt = conn
+        .prepare("SELECT table_name FROM information_schema.tables")
+        .expect("prepare");
+    stmt.query_map([], |r| r.get::<_, String>(0))
+        .expect("query")
+        .map(|r| r.expect("row"))
+        .any(|name| name.starts_with(prefix))
+}
+
 fn table_exists(dir: &Path, table: &str) -> bool {
     let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
     let n: i64 = conn
@@ -764,8 +778,33 @@ column = "created_at"
         "the quarantine table keeps one label column per assertion"
     );
     assert!(
-        !table_exists(dir, "orders__quarantine__labeled"),
+        !any_table_starts_with(dir, "orders__quarantine__labeled"),
         "the intermediate label table must be dropped after a split"
+    );
+
+    // Each quarantined row names exactly the assertions it failed.
+    let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, _error_accepted_values_status, _error_not_in_future_created_at, \
+             _error_not_null_name FROM main.orders__quarantine ORDER BY id",
+        )
+        .expect("prepare");
+    // id, then the three label columns in declaration order.
+    type LabelRow = (i32, Option<String>, Option<String>, Option<String>);
+    let labels: Vec<LabelRow> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .expect("query")
+        .map(|r| r.expect("row"))
+        .collect();
+    let some = |s: &str| Some(s.to_string());
+    assert_eq!(
+        labels,
+        [
+            (2, None, None, some("_error_not_null_name")),
+            (3, some("_error_accepted_values_status"), None, None),
+            (4, None, some("_error_not_in_future_created_at"), None),
+        ]
     );
 }
 
@@ -842,9 +881,61 @@ enabled = true
         "precondition: the statements before the failure ran"
     );
     assert!(
-        !table_exists(dir, "orders__quarantine__labeled"),
+        !any_table_starts_with(dir, "orders__quarantine__labeled"),
         "a failed split must still drop its intermediate label table"
     );
+    assert_eq!(out["tables_failed"], serde_json::json!(1), "{out}");
+}
+
+/// A failed quarantine statement fails the run with the check gate off too.
+///
+/// `fail_on_error = false` lets a failed CHECK pass. A quarantine write that
+/// did not complete is not a check result: it can leave the quarantine table
+/// new and the valid table stale. The ruling on #1937 says it must fail the
+/// run, so it counts as a failed table, which no gate setting lets through.
+#[test]
+fn a_failed_quarantine_statement_fails_the_run_with_the_gate_off() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    seed_clean_db(dir);
+    let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
+    conn.execute_batch("CREATE VIEW main.orders__valid AS SELECT 1 AS x;")
+        .expect("seed view");
+    drop(conn);
+    fs::write(
+        dir.join("rocky.toml"),
+        clean_config(
+            r#"
+fail_on_error = false
+
+[pipeline.dq.checks.quarantine]
+enabled = true
+"#,
+        ),
+    )
+    .expect("write config");
+
+    let run = rocky(dir, &["run"]);
+    let out = json(&run);
+    assert_eq!(
+        out["quarantine"][0]["ok"],
+        serde_json::json!(false),
+        "precondition: the valid statement must fail: {out}"
+    );
+    assert_ne!(
+        out["check_gate_failed"],
+        serde_json::json!(true),
+        "precondition: the gate is off (the field is omitted when false): {out}"
+    );
+
+    assert_eq!(
+        run.status.code(),
+        Some(1),
+        "a failed quarantine write must fail the run with the gate off; stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(out["tables_failed"], serde_json::json!(1), "{out}");
+    assert_eq!(out["status"], "Failure", "{out}");
 }
 
 /// A source that already has a column named like a label still splits
@@ -852,11 +943,12 @@ enabled = true
 ///
 /// `orders` carries `_error_not_null_name`, the label the `not_null(name)`
 /// assertion produces, as a quarantine table checked again would. DuckDB
-/// renames the second of two same-named columns in a CTAS. When the
-/// intermediate table held the label under its own name, the label became
-/// `_error_not_null_name_1`, and the split read the source's column instead:
-/// here every row carries a value there, so every row would have been
-/// quarantined, the passing ones included.
+/// renames the second of two same-named columns in a CTAS. If the
+/// intermediate table held the label under its own name, the label would
+/// become `_error_not_null_name_1`, and the split would read the source's
+/// column instead: here every row carries a value there, so every row would
+/// be quarantined, the passing ones included. The intermediate table holds
+/// each label under a name with a per-run token, which no source column has.
 #[test]
 fn a_source_column_named_like_a_label_does_not_steer_the_split() {
     let tmp = tempfile::tempdir().expect("tempdir");
