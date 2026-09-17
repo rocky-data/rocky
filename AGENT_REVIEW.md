@@ -126,8 +126,6 @@ it. That is the property to **preserve**, and it means the finding to look for i
   surface is the **`reference_map` seeding**: a mis-seeded or retained entry from an edited file makes the
   incremental run diverge from a from-scratch run. Invariant to hold: incremental output == from-scratch
   output for the same final state.
-  *(Note: `incrementality.rs` is unrelated — it is inferred-incrementality **detection** that recommends a
-  materialization strategy + watermark column. It is not a compilation-caching surface.)*
 
 ### Executor (`rocky-core/src/{dag_executor.rs, unified_dag.rs, state.rs}`, `rocky-cli/src/commands/{run.rs, run_content_addressed.rs}`)
 - Execution respects the dependency DAG **topologically**; no node runs before its inputs

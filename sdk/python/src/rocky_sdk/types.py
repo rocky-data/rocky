@@ -715,9 +715,6 @@ class ModelDetail(BaseModel):
     #: a loose ``dict`` — the nested shape lives on the generated
     #: ``ModelDetail.cost_hint``. ``None`` when not computed.
     cost_hint: dict | None = None
-    #: Hint that a ``full_refresh`` model could benefit from incremental
-    #: materialization. Loose ``dict``; ``None`` when not applicable.
-    incrementality_hint: dict | None = None
     #: Model-level governance tags — the model's own ``[tags]`` block merged
     #: over any config-group ``[tags]`` baseline (sidecar > group). Free-form
     #: ``{key: value}`` strings describing the model as a whole (``domain``,
@@ -956,8 +953,6 @@ class OptimizeResult(BaseModel):
     #: Human-readable status message (e.g. "no models to analyze"). ``None``
     #: when recommendations are present.
     message: str | None = None
-    #: Advisory note on incrementality opportunities. ``None`` when not emitted.
-    incrementality_note: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1405,8 +1400,7 @@ TickResult = TickOutput
 # `rocky run` started persisting run records. The generated types are the
 # source of truth; keep the Result names as exports so external consumers
 # don't break. (``OptimizeResult`` is NOT swapped — it stays a hand-written
-# model above, now backfilled with the ``message`` / ``incrementality_note``
-# fields the wire carries.)
+# model above, now backfilled with the ``message`` field the wire carries.)
 HistoryResult = HistoryOutput
 ModelHistoryResult = ModelHistoryOutput
 

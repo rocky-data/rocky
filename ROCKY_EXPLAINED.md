@@ -1117,8 +1117,6 @@ top_customers                  table        ephemeral      $0.0023      fast exe
 
 Total estimated monthly savings: $0.01
 Models analyzed: 5
-
-Tip: Run `rocky compile --output json` for inferred incrementality hints on full_refresh models.
 ```
 
 Read `CURRENT` with care. The command does not read each model's declared strategy; it reports `table` for every model. What the `ephemeral` strategy does at execution time is under review: see [issue #1996](https://github.com/rocky-data/rocky/issues/1996).
