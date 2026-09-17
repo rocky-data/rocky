@@ -7127,6 +7127,17 @@ async fn run_batched_checks(
              against"
                 .to_string(),
         )
+    } else if pipeline.checks.anomaly_threshold_pct <= 0.0 {
+        // `anomaly_threshold_pct = 0` is the documented off switch
+        // (`detect_anomaly` returns "detection is disabled"). Calling the
+        // detector anyway and recording the table as evaluated would report
+        // a green check for a detector that is switched off — the same
+        // false green this field exists to stop.
+        Some(format!(
+            "anomaly detection is disabled for this pipeline \
+             (`anomaly_threshold_pct = {}` under `[pipeline.<name>.checks]`)",
+            pipeline.checks.anomaly_threshold_pct
+        ))
     } else {
         None
     };
@@ -34650,6 +34661,38 @@ table = "fct_events"
             .as_deref()
             .expect("a reason");
         assert!(reason.contains("no row count was measured"), "{reason}");
+
+        // (e) `anomaly_threshold_pct = 0` is the documented off switch, and
+        // `detect_anomaly` honours it by returning "detection is disabled".
+        // Calling it anyway and recording the table as evaluated would put an
+        // honest-looking green on a detector that is switched off.
+        let disabled = BatchedCheckFixture::new("row_count = true\nanomaly_threshold_pct = 0.0");
+        let (_, anomalies, evaluated) = disabled.run(&inner, None, Some(&store)).await;
+        assert!(anomalies.is_empty(), "{anomalies:?}");
+        assert_eq!(evaluated.len(), 1, "{evaluated:?}");
+        assert!(!evaluated[0].evaluated, "{evaluated:?}");
+        let reason = evaluated[0]
+            .not_evaluated_reason
+            .as_deref()
+            .expect("a reason");
+        assert!(reason.contains("anomaly detection is disabled"), "{reason}");
+
+        // (f) An empty row-count batch: nothing was counted, so nothing can
+        // be compared.
+        let mut empty_batch = BatchedCheckFixture::new("row_count = true");
+        empty_batch.source_refs = Vec::new();
+        let (_, _, evaluated) = empty_batch.run(&inner, None, Some(&store)).await;
+        assert_eq!(evaluated.len(), 1, "{evaluated:?}");
+        assert!(!evaluated[0].evaluated, "{evaluated:?}");
+        let reason = evaluated[0]
+            .not_evaluated_reason
+            .as_deref()
+            .expect("a reason");
+        assert!(reason.contains("no table in this batch"), "{reason}");
+
+        // The one branch with no seam here is an unreadable history:
+        // `StateStore` is concrete and `get_check_history` cannot be made to
+        // fail through this fixture. It is covered by reading, not by a test.
     }
 
     /// The anomaly baseline is built from the target counts. A failed target
