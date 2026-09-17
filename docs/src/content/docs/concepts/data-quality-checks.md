@@ -307,23 +307,21 @@ Before that, Rocky refuses a fragment that could end the query it is building, o
 
 Comparisons, `CASE`, `CAST`, `BETWEEN`, `IN (...)` with literals, and functions such as `coalesce`, `nullif`, `abs`, `round`, `length`, `lower`, `upper`, `trim`, `regexp_like`, `md5` and `date_trunc` pass. Functions that read a file, a secret, a session variable or a remote endpoint do not, whatever their name looks like — DuckDB's `read_text`, Snowflake's `GETVARIABLE` and Databricks' `secret` all sit in ordinary scalar position and are refused by name.
 
-Two positions add a rule, because the expression is used differently there:
+One position adds a rule, because the expression is used differently there:
 
 | Position | Extra rule |
 |---|---|
 | `unique_expr` `key_expr`, `cross_source_overlap` `key_expr` | No clock function (`now()`, `current_timestamp`), and no `COLLATE`. A value that changes between evaluations is not a key, and a collation changes what equality means. |
-| A quarantine `expression` or `filter` under `mode = "split"` | No clock function. Split runs two statements, so `created_at <= now()` can put one boundary row in both outputs. `drop` and `tag` run one statement each and accept a clock function, as an ordinary check `filter` does. |
+A quarantine `expression` or `filter` accepts a clock function such as `now()` in every mode, as an ordinary check `filter` does. So do `not_in_future` and `older_than_n_days` assertions. `split` evaluates each predicate once, so a clock read cannot put a row in both outputs.
 
 `random()` and `uuid()` need no rule here. Neither is on the allowlist, so both are refused in every position.
-
-Split mode refuses one more thing for the same reason: an **error-severity** `not_in_future` or `older_than_n_days` assertion on the split table. Rocky generates the same clock comparison for those two kinds. Both work under `drop` and `tag`, and a warning-severity one never lowers into the split, so it is unaffected.
 
 The gate runs before anything executes, and how a refusal reaches you depends on the field:
 
 | Field | What a refusal does |
 |---|---|
 | An assertion `filter` or `expression`, a `key_expr` | The check is reported as failing at error severity, with a `not_evaluated` reason naming the field, the table and the construct to remove. |
-| A quarantine `expression` or `filter` | Reported the same way under the name `quarantine:compile`. The table is materialized and left unsplit. |
+| A quarantine `expression` or `filter` | Reported the same way under the name `quarantine:compile`. No quarantine table is written, and the run fails, whatever `fail_on_error` says. |
 | `metadata_columns[].value` | The config load fails, so no command runs. |
 | The `draft_check` MCP tool | The tool refuses the write, so the bad check is never saved. |
 
@@ -339,13 +337,22 @@ mode = "split"   # or "tag" or "drop"
 
 | Mode | Behavior |
 |---|---|
-| `split` | Rocky materializes two new tables: `<target>__valid` with the passing rows and `<target>__quarantine` with the failing rows (plus per-assertion `_error_<name>` label columns marking which assertion each row failed). The original `<target>` is left untouched; point downstream models at `<target>__valid`. |
+| `split` | Rocky materializes two new tables: `<target>__valid` with the passing rows and `<target>__quarantine` with the failing rows (plus per-assertion `_error_<name>` label columns marking which assertion each row failed). When the run completes, and the two suffixes name two different tables in your warehouse, each row lands in exactly one of them. The original `<target>` is left untouched; point downstream models at `<target>__valid`. Not available on Trino. |
 | `tag` | Rocky rewrites `<target>` in place, adding a per-assertion `_error_<name>` column populated on failing rows (NULL on passing rows). Every row stays in the table. Useful for observation without a second table — rewrites the source, so use with care on a raw replication target. |
 | `drop` | Only `<target>__valid` (the passing rows) is written; failing rows are discarded. Quarantine count is still reported in `check_results[]`. |
 
 Set-based, table-level, and referential assertions are never quarantinable. They run as after-the-fact checks whatever the mode.
 
 Rocky builds the quarantine predicate from every quarantinable assertion, combined with AND. A filter composes into it as `CASE WHEN (filter) THEN base_valid_pred ELSE TRUE END`. An out-of-scope row therefore stays on the valid side, even when the base predicate would fail it.
+
+`split` evaluates that predicate once. It writes the source rows, plus one label column per assertion, to a new table in the source's schema named `_quarantine_labels_<token>`. It builds `__valid` and `__quarantine` from those labels, then drops the label table. The token is a random UUID for each run, so two runs never share a label table. A run killed between those statements leaves the label table behind. Two runs of one pipeline at the same time can still overwrite each other's `__valid` and `__quarantine` tables.
+
+`__valid` keeps exactly the source's columns. Rocky writes it with `SELECT * EXCLUDE (...)` on DuckDB and Snowflake, and `SELECT * EXCEPT (...)` on Databricks and BigQuery. A dialect with no such form refuses `split` with a `quarantine:compile` check. Trino is one, and so is any adapter whose dialect does not provide it.
+
+A quarantine that fails or is refused fails the run, whatever `fail_on_error` says. The table counts in `tables_failed` and is listed in `errors`. What the failure leaves behind depends on when it happened:
+
+- **Refused** (`quarantine:compile`): nothing runs, so no table is written. Downstream reads the previous run's rows.
+- **Failed at the warehouse** (`quarantine:execute`): the check names the statement's role and the warehouse error. `split` runs its statements in order: the label table, then `__quarantine`, then `__valid`, then the drop. Statements that already finished keep what they wrote, so `__quarantine` can be new while `__valid` is the previous run's. Rocky still tries to drop the label table after a failure, so it is normally gone. A failed drop leaves it behind. A statement that times out may still have committed.
 
 ### Output
 
