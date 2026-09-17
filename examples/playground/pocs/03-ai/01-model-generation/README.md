@@ -33,9 +33,10 @@ The POC runs `rocky ai` twice to cover both flag paths:
 - **Self-correcting AI** — the compile-verify loop closes the gap between
   "model that looks right" and "model that actually works".
 - **No copy-paste step** — body + sidecar land on disk, ready to `rocky run`.
-- **Materializations on one flag surface** — `full_refresh`, `merge`
-  (+ `--unique-key`), `ephemeral`. `incremental` is refused: on a
-  transformation model it re-inserts every row on each run (E037).
+- **Materializations on one flag surface** — `full_refresh` and `merge`
+  (+ `--unique-key`). `incremental` is refused: on a transformation model it
+  re-inserts every row on each run (E037). `ephemeral` is refused too: it is
+  never inlined into its consumers (E038).
 - Different from `engine/examples/ai-intent` (which ships pre-generated tests).
   This POC generates fresh models live.
 

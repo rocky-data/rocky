@@ -98,7 +98,7 @@ How Rocky catches bad data. These POCs cover contracts, inline checks, named and
 
 ### 02 — Performance (14 POCs · DuckDB)
 
-How Rocky avoids rebuilding what has not changed. These POCs cover the incremental, merge, ephemeral, and delete_insert strategies, plus schema drift, cost controls, and concurrency.
+How Rocky avoids rebuilding what has not changed. These POCs cover the incremental, merge, view, and delete_insert strategies, plus schema drift, cost controls, and concurrency.
 
 | POC | Feature |
 |---|---|

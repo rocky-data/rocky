@@ -61,7 +61,7 @@ For full-refresh models this path is exact. A CI test emits the SQL and executes
 
 Replication pipelines are incremental source-to-target copies driven by the engine's watermark state. Their SQL preview lives behind the live `rocky plan` path instead.
 
-Some models produce no standalone statement. Rocky reports those on stderr rather than dropping them silently. Two cases produce no statement. One is an ephemeral model, which is inlined as a CTE. The other is a strategy that needs a live connection to render. A Snowflake dynamic table is one example: it resolves its compute-warehouse name at runtime.
+Some models produce no standalone statement. Rocky reports those on stderr rather than dropping them silently. That happens when a strategy needs a live connection to render. A Snowflake dynamic table is one example: it resolves its compute-warehouse name at runtime.
 
 ## Related
 

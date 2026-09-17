@@ -710,7 +710,7 @@ When `update_columns` is omitted, Rocky updates all non-key columns.
 
 > model 'stg_recent_orders' uses `type = "ephemeral"`, which is not supported: an ephemeral model is not materialized and is not inlined into its consumers, so a consumer reads whatever table already carries the name
 
-Rocky never inlined such a model. Nothing rewrote a consumer's `FROM <model>` into a `WITH` clause, so the consumer read whatever physical table already carried that name: an error when none existed, and an unrelated table when one did.
+Rocky never inlined such a model. Nothing rewrote a consumer's `FROM <model>` into a `WITH` clause. So the consumer read whatever physical table already carried that name: an error when none existed, an unrelated table when one did.
 
 Two strategies cover what it was for:
 

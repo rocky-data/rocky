@@ -309,7 +309,7 @@ The checker, named branches, replay, column lineage, rule enforcement and per-mo
 
 Three limits to know:
 
-- **Some models produce no standalone SQL.** Rocky inlines an ephemeral model as a CTE. Others need a live warehouse to render, such as a Snowflake dynamic table. Rocky lists what it skipped on stderr.
+- **Some models produce no standalone SQL.** A strategy can need a live warehouse to render, such as a Snowflake dynamic table. Rocky lists what it skipped on stderr.
 - **An incremental model exports only its steady-state `INSERT` or `MERGE`.** That statement assumes the table already exists. Rocky prefixes it with a note saying so.
 - **Every model renders in one dialect.** Rocky picks one dialect for the whole project. With no config it uses DuckDB.
 

@@ -522,9 +522,9 @@ Full-refresh models emit a complete `CREATE OR REPLACE TABLE … AS …` that ru
 MERGE INTO ...
 ```
 
-`emit-sql` refuses a project with any compile error, before it filters by model. One transformation model with `type = "incremental"` fails with `E037`, so it stops the whole export, even when `--model` names a different model.
+`emit-sql` refuses a project with any compile error, before it filters by model. `type = "incremental"` on a transformation model fails with `E037`, and `type = "ephemeral"` fails with `E038`. Either stops the whole export, even when `--model` names a different model.
 
-Models that produce no standalone SQL are reported on stderr rather than silently dropped, so you never mistake the emitted set for the complete project. Two cases are skipped this way: ephemeral models (inlined as CTEs upstream, so they have no statement of their own) and strategies that cannot render offline, such as a Snowflake dynamic table that needs a live compute-warehouse name.
+A model whose SQL cannot be rendered offline is reported on stderr rather than silently dropped. So you never mistake the emitted set for the complete project. A Snowflake dynamic table is one: it needs a live compute-warehouse name.
 
 ### Examples
 
@@ -565,7 +565,7 @@ When some models cannot be emitted as standalone SQL, the skip report goes to st
 
 ```text
 emit-sql: 1 model(s) not emitted:
-  - dim_session (ephemeral — inlined as a CTE)
+  - dim_session (cannot render offline: <the dialect's reason>)
 ```
 
 ### Related Commands
