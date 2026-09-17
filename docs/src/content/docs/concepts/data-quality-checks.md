@@ -312,18 +312,16 @@ Two positions add a rule, because the expression is used differently there:
 | Position | Extra rule |
 |---|---|
 | `unique_expr` `key_expr`, `cross_source_overlap` `key_expr` | No clock function (`now()`, `current_timestamp`), and no `COLLATE`. A value that changes between evaluations is not a key, and a collation changes what equality means. |
-| A quarantine `expression` or `filter` under `mode = "split"` | No clock function. Split runs two statements, so `created_at <= now()` can put one boundary row in both outputs. `drop` and `tag` run one statement each and accept a clock function, as an ordinary check `filter` does. |
+A quarantine `expression` or `filter` accepts a clock function such as `now()` in every mode, as an ordinary check `filter` does. So do `not_in_future` and `older_than_n_days` assertions. `split` evaluates each predicate once, so a clock read cannot put a row in both outputs.
 
 `random()` and `uuid()` need no rule here. Neither is on the allowlist, so both are refused in every position.
-
-Split mode refuses one more thing for the same reason: an **error-severity** `not_in_future` or `older_than_n_days` assertion on the split table. Rocky generates the same clock comparison for those two kinds. Both work under `drop` and `tag`, and a warning-severity one never lowers into the split, so it is unaffected.
 
 The gate runs before anything executes, and how a refusal reaches you depends on the field:
 
 | Field | What a refusal does |
 |---|---|
 | An assertion `filter` or `expression`, a `key_expr` | The check is reported as failing at error severity, with a `not_evaluated` reason naming the field, the table and the construct to remove. |
-| A quarantine `expression` or `filter` | Reported the same way under the name `quarantine:compile`. The table is materialized and left unsplit. |
+| A quarantine `expression` or `filter` | Reported the same way under the name `quarantine:compile`. No quarantine table is written, and the run fails, whatever `fail_on_error` says. |
 | `metadata_columns[].value` | The config load fails, so no command runs. |
 | The `draft_check` MCP tool | The tool refuses the write, so the bad check is never saved. |
 
@@ -339,13 +337,19 @@ mode = "split"   # or "tag" or "drop"
 
 | Mode | Behavior |
 |---|---|
-| `split` | Rocky materializes two new tables: `<target>__valid` with the passing rows and `<target>__quarantine` with the failing rows (plus per-assertion `_error_<name>` label columns marking which assertion each row failed). The original `<target>` is left untouched; point downstream models at `<target>__valid`. |
+| `split` | Rocky materializes two new tables: `<target>__valid` with the passing rows and `<target>__quarantine` with the failing rows (plus per-assertion `_error_<name>` label columns marking which assertion each row failed). Each row lands in exactly one of them. The original `<target>` is left untouched; point downstream models at `<target>__valid`. Not available on Trino. |
 | `tag` | Rocky rewrites `<target>` in place, adding a per-assertion `_error_<name>` column populated on failing rows (NULL on passing rows). Every row stays in the table. Useful for observation without a second table — rewrites the source, so use with care on a raw replication target. |
 | `drop` | Only `<target>__valid` (the passing rows) is written; failing rows are discarded. Quarantine count is still reported in `check_results[]`. |
 
 Set-based, table-level, and referential assertions are never quarantinable. They run as after-the-fact checks whatever the mode.
 
 Rocky builds the quarantine predicate from every quarantinable assertion, combined with AND. A filter composes into it as `CASE WHEN (filter) THEN base_valid_pred ELSE TRUE END`. An out-of-scope row therefore stays on the valid side, even when the base predicate would fail it.
+
+`split` evaluates that predicate once. It writes the source rows, plus one label column per assertion, to a new table in the source's schema named `_quarantine_labels_<token>`. It builds `__valid` and `__quarantine` from those labels, then drops the label table. The token is a random UUID for each run, so two runs never share a label table. A run killed between those statements leaves the label table behind. Two runs of one pipeline at the same time can still overwrite each other's `__valid` and `__quarantine` tables.
+
+`__valid` keeps exactly the source's columns. Rocky writes it with `SELECT * EXCLUDE (...)` on DuckDB and Snowflake, and `SELECT * EXCEPT (...)` on Databricks and BigQuery. Trino has no such form, so a `split` there is refused with a `quarantine:compile` check.
+
+A quarantine that fails or is refused fails the run, whatever `fail_on_error` says. The valid table was not rewritten, so downstream would read the previous run's rows. A statement that fails at the warehouse adds a failing `quarantine:execute` check, naming the statement's role and the warehouse error. Either way the table counts in `tables_failed` and is listed in `errors`.
 
 ### Output
 

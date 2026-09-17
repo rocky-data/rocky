@@ -440,7 +440,7 @@ Declarative model-level assertions. Each block declares a `type` and type-specif
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `table` | string | (required) | Unqualified target table the assertion runs against. When assertions live in a model's sidecar TOML the table is implied; in pipeline-level `[[checks.assertions]]` blocks (shown below) it must be set explicitly. |
-| `name` | string | | Optional identifier used as the result's `name`; synthesized from `{kind}:{column}` when unset. Set it to disambiguate multiple assertions on the same table/kind/column. Four names are reserved for the engine's own results and refused at config load: `quarantine:compile`, `row_count`, `column_match` and `row_count_anomaly`, plus `freshness` when the pipeline declares `[checks.freshness]`. The comparison maps every non-alphanumeric character to `_` first, the way Dagster keys a check, so `quarantine_compile` and `quarantine.compile` are refused too. A `[[checks.custom]]` name is checked by the same rule. |
+| `name` | string | | Optional identifier used as the result's `name`; synthesized from `{kind}:{column}` when unset. Set it to disambiguate multiple assertions on the same table/kind/column. Five names are reserved for the engine's own results and refused at config load: `quarantine:compile`, `quarantine:execute`, `row_count`, `column_match` and `row_count_anomaly`, plus `freshness` when the pipeline declares `[checks.freshness]`. The comparison maps every non-alphanumeric character to `_` first, the way Dagster keys a check, so `quarantine_compile` and `quarantine.execute` are refused too. A `[[checks.custom]]` name is checked by the same rule. |
 | `type` | string | (required) | One of: `not_null`, `unique`, `unique_expr`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, `composite`, `not_in_future`, `older_than_n_days`. |
 | `column` | string | | Required for row-level column kinds (`not_null`, `unique`, `accepted_values`, `relationships`, `in_range`, `regex_match`, `not_in_future`, `older_than_n_days`). |
 | `severity` | string | `"error"` | `error` fails the pipeline (subject to `fail_on_error`); `warning` reports but never fails. |
@@ -522,11 +522,11 @@ mode = "split"
 
 | Mode | Behavior |
 |---|---|
-| `split` | Writes `<table>__valid` with the passing rows and `<table>__quarantine` with the failing rows. Each failing row carries an `_error_<name>` column per assertion. The original `<table>` stays as it is. Point downstream models at `<table>__valid`. |
+| `split` | Writes `<table>__valid` with the passing rows and `<table>__quarantine` with the failing rows. Each row lands in exactly one of them. Each failing row carries an `_error_<name>` column per assertion. The original `<table>` stays as it is. Point downstream models at `<table>__valid`. Refused on Trino, which has no `SELECT * EXCEPT` form. |
 | `tag` | Rewrites `<table>` in place and adds an `_error_<name>` column per assertion, set on the failing rows. Every row stays. This rewrites the source, so take care on a raw replication target. |
 | `drop` | Writes only `<table>__valid`. Rocky discards the failing rows. |
 
-Only these row-level kinds are quarantined: `not_null`, `accepted_values`, `expression`, `in_range`, `regex_match`, `not_in_future` and `older_than_n_days`. The last two work in `tag` and `drop` only. `split` re-evaluates its predicate, so it refuses a clock-dependent one, and the run fails with a `quarantine:compile` result rather than writing either table. The same refusal covers a clock-dependent `expression` or `filter` under `split`. Set-based, table-level and referential assertions (`unique`, `unique_expr`, `composite`, `relationships`, `row_count_range`, `aggregate`) run as ordinary checks whatever the mode.
+Only these row-level kinds are quarantined: `not_null`, `accepted_values`, `expression`, `in_range`, `regex_match`, `not_in_future` and `older_than_n_days`. All three modes accept all of them, and a clock function in an `expression` or `filter`: `split` evaluates each predicate once. A quarantine that is refused (`quarantine:compile`) or fails at the warehouse (`quarantine:execute`) fails the run, whatever `fail_on_error` says. Set-based, table-level and referential assertions (`unique`, `unique_expr`, `composite`, `relationships`, `row_count_range`, `aggregate`) run as ordinary checks whatever the mode.
 
 #### Cross-source duplicate detection
 
