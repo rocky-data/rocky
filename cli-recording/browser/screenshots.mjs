@@ -33,7 +33,10 @@ fs.mkdirSync(outDir, { recursive: true });
 const browser = await chromium.launch({ headless: true });
 const context = await browser.newContext({
   viewport: { width: 1440, height: 900 },
-  colorScheme: "light",
+  // The UI serves one theme per the viewer's preference. Pin it, so two
+  // captures on two machines match, and pin it to dark: that is the theme
+  // the docs show.
+  colorScheme: "dark",
 });
 const page = await context.newPage();
 const errors = [];
