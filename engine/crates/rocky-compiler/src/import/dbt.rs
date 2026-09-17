@@ -1163,7 +1163,7 @@ fn map_manifest_strategy(
                     "materialized='{other}' not recognized by Rocky — using full_refresh"
                 ),
                 suggestion: Some(
-                    "set `type` in the emitted strategy block to a Rocky-supported value (full_refresh / incremental / merge / view / materialized_view / dynamic_table / time_interval / delete_insert / microbatch)".to_string(),
+                    "set `type` in the emitted strategy block to a Rocky-supported value (full_refresh / merge / view / materialized_view / dynamic_table / time_interval / delete_insert / microbatch)".to_string(),
                 ),
             });
             structured.push(ImportDbtStructuredWarning::UnsupportedMaterialization {
@@ -1245,6 +1245,7 @@ fn map_incremental_strategy(
                         "add unique_key to the model config so it maps to merge".to_string(),
                     ),
                 });
+                push_append_fallback(structured, model_name, "incremental (merge, no unique_key)");
                 StrategyConfig::FullRefresh
             }
         },
@@ -1257,6 +1258,7 @@ fn map_incremental_strategy(
                 ),
                 suggestion: Some(APPEND_SUGGESTION.to_string()),
             });
+            push_append_fallback(structured, model_name, "incremental (append)");
             StrategyConfig::FullRefresh
         }
         "delete+insert" | "delete_insert" => {
@@ -1331,9 +1333,27 @@ fn map_incremental_strategy(
                         .to_string(),
                 ),
             });
+            push_append_fallback(structured, model_name, &format!("incremental ({other})"));
             StrategyConfig::FullRefresh
         }
     }
+}
+
+/// Record a model whose dbt `incremental` config fell back to `full_refresh`
+/// as a structured `UnsupportedMaterialization`, the same shape the
+/// `ephemeral` and unrecognised-materialization fallbacks use, so it lands in
+/// MIGRATION-NOTES.md's "Items to translate manually" list and not only among
+/// the flat warnings.
+fn push_append_fallback(
+    structured: &mut Vec<ImportDbtStructuredWarning>,
+    model_name: &str,
+    dbt_materialization: &str,
+) {
+    structured.push(ImportDbtStructuredWarning::UnsupportedMaterialization {
+        model: model_name.to_string(),
+        dbt_materialization: dbt_materialization.to_string(),
+        action: "fell back to full_refresh".to_string(),
+    });
 }
 
 /// Why an append-style dbt model cannot keep its semantics in Rocky (#1990).
@@ -3935,6 +3955,15 @@ FROM {{ ref('stg_events') }}
                 .any(|w| w.model == "events_append" && w.message.contains("E037")),
             "the append mapping must warn with the reason: {:?}",
             result.warnings
+        );
+        // Structured too, so MIGRATION-NOTES.md lists it under the models to
+        // translate by hand, like the `ephemeral` fallback.
+        assert!(
+            result.structured_warnings.iter().any(|w| matches!(w,
+                ImportDbtStructuredWarning::UnsupportedMaterialization { model, action, .. }
+                    if model == "events_append" && action == "fell back to full_refresh")),
+            "the append fallback must be a structured UnsupportedMaterialization: {:?}",
+            result.structured_warnings
         );
     }
 

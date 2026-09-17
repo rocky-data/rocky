@@ -30361,7 +30361,7 @@ auto_create_schemas = true
             std::fs::write(models_dir.join("agg.sql"), "SELECT id, ts FROM main.ev\n").unwrap();
             std::fs::write(
                 models_dir.join("agg.toml"),
-                "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"agg\"\n",
+                "[strategy]\ntype = \"microbatch\"\ntimestamp_column = \"ts\"\ngranularity = \"hour\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"agg\"\n",
             )
             .unwrap();
         }
