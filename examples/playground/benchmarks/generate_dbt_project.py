@@ -295,9 +295,10 @@ def generate_rocky_project(models: list[dict], output_dir: Path):
 
 
 def _strategy_toml(strategy: str) -> str:
-    if strategy == "incremental":
-        return 'type = "incremental"\ntimestamp_column = "updated_at"'
-    if strategy == "merge":
+    # The dbt side keeps `incremental`. The Rocky side cannot: `type =
+    # "incremental"` on a transformation model is a compile error (E037), so
+    # those models get the idempotent equivalent, a merge on `id`.
+    if strategy in ("incremental", "merge"):
         return 'type = "merge"\nunique_key = ["id"]'
     return 'type = "full_refresh"'
 
