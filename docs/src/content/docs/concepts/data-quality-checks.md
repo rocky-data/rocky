@@ -307,7 +307,7 @@ Before that, Rocky refuses a fragment that could end the query it is building, o
 
 Comparisons, `CASE`, `CAST`, `BETWEEN`, `IN (...)` with literals, and functions such as `coalesce`, `nullif`, `abs`, `round`, `length`, `lower`, `upper`, `trim`, `regexp_like`, `md5` and `date_trunc` pass. Functions that read a file, a secret, a session variable or a remote endpoint do not, whatever their name looks like — DuckDB's `read_text`, Snowflake's `GETVARIABLE` and Databricks' `secret` all sit in ordinary scalar position and are refused by name.
 
-Two positions add a rule, because the expression is used differently there:
+One position adds a rule, because the expression is used differently there:
 
 | Position | Extra rule |
 |---|---|
@@ -337,7 +337,7 @@ mode = "split"   # or "tag" or "drop"
 
 | Mode | Behavior |
 |---|---|
-| `split` | Rocky materializes two new tables: `<target>__valid` with the passing rows and `<target>__quarantine` with the failing rows (plus per-assertion `_error_<name>` label columns marking which assertion each row failed). Each row lands in exactly one of them. The original `<target>` is left untouched; point downstream models at `<target>__valid`. Not available on Trino. |
+| `split` | Rocky materializes two new tables: `<target>__valid` with the passing rows and `<target>__quarantine` with the failing rows (plus per-assertion `_error_<name>` label columns marking which assertion each row failed). When the run completes and the two suffixes differ, each row lands in exactly one of them. The original `<target>` is left untouched; point downstream models at `<target>__valid`. Not available on Trino. |
 | `tag` | Rocky rewrites `<target>` in place, adding a per-assertion `_error_<name>` column populated on failing rows (NULL on passing rows). Every row stays in the table. Useful for observation without a second table — rewrites the source, so use with care on a raw replication target. |
 | `drop` | Only `<target>__valid` (the passing rows) is written; failing rows are discarded. Quarantine count is still reported in `check_results[]`. |
 
@@ -347,9 +347,12 @@ Rocky builds the quarantine predicate from every quarantinable assertion, combin
 
 `split` evaluates that predicate once. It writes the source rows, plus one label column per assertion, to a new table in the source's schema named `_quarantine_labels_<token>`. It builds `__valid` and `__quarantine` from those labels, then drops the label table. The token is a random UUID for each run, so two runs never share a label table. A run killed between those statements leaves the label table behind. Two runs of one pipeline at the same time can still overwrite each other's `__valid` and `__quarantine` tables.
 
-`__valid` keeps exactly the source's columns. Rocky writes it with `SELECT * EXCLUDE (...)` on DuckDB and Snowflake, and `SELECT * EXCEPT (...)` on Databricks and BigQuery. Trino has no such form, so a `split` there is refused with a `quarantine:compile` check.
+`__valid` keeps exactly the source's columns. Rocky writes it with `SELECT * EXCLUDE (...)` on DuckDB and Snowflake, and `SELECT * EXCEPT (...)` on Databricks and BigQuery. A dialect with no such form refuses `split` with a `quarantine:compile` check. Trino is one, and so is any adapter whose dialect does not provide it.
 
-A quarantine that fails or is refused fails the run, whatever `fail_on_error` says. The valid table was not rewritten, so downstream would read the previous run's rows. A statement that fails at the warehouse adds a failing `quarantine:execute` check, naming the statement's role and the warehouse error. Either way the table counts in `tables_failed` and is listed in `errors`.
+A quarantine that fails or is refused fails the run, whatever `fail_on_error` says. The table counts in `tables_failed` and is listed in `errors`. What the failure leaves behind depends on when it happened:
+
+- **Refused** (`quarantine:compile`): nothing runs, so no table is written. Downstream reads the previous run's rows.
+- **Failed at the warehouse** (`quarantine:execute`): the check names the statement's role and the warehouse error. `split` runs its statements in order: the label table, then `__quarantine`, then `__valid`, then the drop. A failure keeps what earlier statements wrote. If only the drop fails, both outputs are new and the label table stays. A statement that times out may still have committed.
 
 ### Output
 

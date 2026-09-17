@@ -383,7 +383,7 @@ min = 1
 
 `expression` is bounded. Rocky parses it under the target dialect and refuses anything that is not one boolean expression over the model's own columns: a subquery, a qualified function name (`schema.fn(...)`), or a function outside its allowlist of pure scalar functions is refused when the test SQL is generated, before anything runs. Comparisons, `CASE`, `CAST`, and functions such as `coalesce`, `length`, `lower` and `date_trunc` pass; anything that can read a file, a secret, session state or a remote endpoint does not. The refusal names the function.
 
-`filter` is bounded by the same gate. A subquery, a qualified function name or an off-allowlist function is refused when the test SQL is generated, and the refusal names the field and the table. See [Per-assertion `filter`](/concepts/data-quality-checks/#per-assertion-filter) for the full rule, including the two extra rules that apply to a key expression and to quarantine's split mode.
+`filter` is bounded by the same gate. A subquery, a qualified function name or an off-allowlist function is refused when the test SQL is generated. The refusal names the field and the table. See [Per-assertion `filter`](/concepts/data-quality-checks/#per-assertion-filter) for the full rule, including the extra rule for a key expression.
 
 ### `[[use_test]]`
 
