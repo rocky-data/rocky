@@ -100,17 +100,19 @@ pub struct QuarantinePlan {
     /// `split` only: the statement that drops the intermediate label table.
     /// `None` for `drop` and `tag`, which write no intermediate table.
     ///
-    /// The runtime runs it after [`Self::statements`] once the
-    /// [`StatementRole::Label`] statement has succeeded, whether the later
-    /// statements succeeded or not, because a failed statement must not leave
-    /// the intermediate table behind (#1937, #2052). It does NOT run when the
-    /// label statement failed: then the table is not this run's to drop.
+    /// The runtime runs it after [`Self::statements`] whatever they
+    /// reported, the label statement included, because a failed statement
+    /// must not leave the intermediate table behind (#1937, #2052). A CTAS
+    /// can commit while the client sees a timeout, so a reported failure is
+    /// not proof that nothing was created.
     ///
     /// The table is named `<table><suffix_quarantine>__labeled_<token>`, with
     /// a random token per plan, and created with a plain `CREATE TABLE`. So
-    /// it cannot replace a table someone else owns, and two runs of the same
-    /// pipeline do not share it. A process killed between the label statement
-    /// and the drop leaves the table behind under that name.
+    /// it cannot replace a table someone else owns, two runs of the same
+    /// pipeline do not share it, and whatever sits under that name is this
+    /// plan's to drop. A process killed between the label statement and the
+    /// drop leaves the table behind under that name: no later run can tell
+    /// it from another run's table still in use.
     pub drop_intermediate: Option<QuarantineStatement>,
 }
 

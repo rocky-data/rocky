@@ -408,7 +408,7 @@ class QuarantineOutput(BaseModel):
     """
     ok: bool
     """
-    `true` when every quarantine statement executed successfully and, for `mode = "split"`, the intermediate label table was dropped. `false` also adds a failing `quarantine:execute` check and counts the table in `tables_failed`, so the run fails whatever `fail_on_error` says; inspect `error` for details.
+    `true` when every quarantine statement executed successfully and, for `mode = "split"`, the intermediate label table was dropped. `false` also adds a failing `quarantine:execute` check, counts the table in `tables_failed` and itemises it in `errors`, so the run fails whatever `fail_on_error` says; inspect `error` for details.
     """
     quarantine_table: str | None = None
     """

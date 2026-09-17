@@ -885,6 +885,26 @@ enabled = true
         "a failed split must still drop its intermediate label table"
     );
     assert_eq!(out["tables_failed"], serde_json::json!(1), "{out}");
+    let errors = out["errors"]
+        .as_array()
+        .expect("errors itemise the failed table");
+    assert_eq!(
+        errors.len(),
+        1,
+        "tables_failed and errors must agree; consumers pair them: {out}"
+    );
+    assert_eq!(
+        errors[0]["asset_key"],
+        serde_json::json!(["fixture", "main", "orders"]),
+        "{out}"
+    );
+    assert!(
+        errors[0]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("valid: "),
+        "the error names the statement that failed: {out}"
+    );
 }
 
 /// A failed quarantine statement fails the run with the check gate off too.
@@ -935,6 +955,26 @@ enabled = true
         String::from_utf8_lossy(&run.stderr)
     );
     assert_eq!(out["tables_failed"], serde_json::json!(1), "{out}");
+    let errors = out["errors"]
+        .as_array()
+        .expect("errors itemise the failed table");
+    assert_eq!(
+        errors.len(),
+        1,
+        "tables_failed and errors must agree; consumers pair them: {out}"
+    );
+    assert_eq!(
+        errors[0]["asset_key"],
+        serde_json::json!(["fixture", "main", "orders"]),
+        "{out}"
+    );
+    assert!(
+        errors[0]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("valid: "),
+        "the error names the statement that failed: {out}"
+    );
     assert_eq!(out["status"], "Failure", "{out}");
 }
 
