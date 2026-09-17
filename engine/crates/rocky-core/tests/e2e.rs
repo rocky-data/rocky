@@ -621,13 +621,11 @@ fn test_transformation_incremental() {
         None,
     );
 
-    let stmts = sql_gen::generate_transformation_sql(&plan, &dialect).unwrap();
-    assert_eq!(stmts.len(), 1);
-    let sql = &stmts[0];
-    assert!(
-        sql.starts_with("INSERT INTO cat.silver.fct_events"),
-        "expected INSERT INTO: {sql}"
-    );
+    // #1990: refused, because a transformation model has no watermark and the
+    // only possible SQL is an unfiltered INSERT that duplicates every run.
+    let err = sql_gen::generate_transformation_sql(&plan, &dialect)
+        .expect_err("an incremental transformation model must not produce SQL");
+    assert!(err.to_string().contains("E037"), "{err}");
 }
 
 #[test]

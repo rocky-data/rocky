@@ -1031,6 +1031,28 @@ fn import_manifest_node(
         warnings: strategy_warnings,
         structured,
     } = map_manifest_strategy(&node.config, &node.name, microbatch_mode);
+
+    // #1990: an incremental dbt model with no Rocky append equivalent falls
+    // back to `full_refresh`. That is safe only when the SQL has no dbt
+    // incremental branch. dbt compiles `is_incremental()` as true against an
+    // existing target, so `compiled_code` can keep a delta filter such as
+    // `WHERE updated_at > '<last load>'`; run as `full_refresh`, that would
+    // replace the table with only the recent rows on every run. Refuse it
+    // instead, before any warning claims a mapping.
+    if matches!(strategy, StrategyConfig::FullRefresh)
+        && matches!(
+            node.config.materialized.as_str(),
+            "incremental" | "microbatch"
+        )
+        && contains_unresolved_is_incremental(&node.raw_code)
+    {
+        result.failed.push(ImportFailure {
+            name: node.name.clone(),
+            reason: INCREMENTAL_FALLBACK_REFUSED.to_string(),
+        });
+        return;
+    }
+
     result.warnings.extend(strategy_warnings);
     result.structured_warnings.extend(structured);
 
@@ -1163,7 +1185,7 @@ fn map_manifest_strategy(
                     "materialized='{other}' not recognized by Rocky — using full_refresh"
                 ),
                 suggestion: Some(
-                    "set `type` in the emitted strategy block to a Rocky-supported value (full_refresh / incremental / merge / view / materialized_view / dynamic_table / time_interval / delete_insert / microbatch)".to_string(),
+                    "set `type` in the emitted strategy block to a Rocky-supported value (full_refresh / merge / view / materialized_view / dynamic_table / time_interval / delete_insert / microbatch)".to_string(),
                 ),
             });
             structured.push(ImportDbtStructuredWarning::UnsupportedMaterialization {
@@ -1238,19 +1260,29 @@ fn map_incremental_strategy(
                 warnings.push(ImportWarning {
                     model: model_name.to_string(),
                     category: WarningCategory::UnsupportedMaterialization,
-                    message: "incremental_strategy='merge' requires unique_key — falling back to incremental(updated_at)".to_string(),
+                    message: format!(
+                        "incremental_strategy='merge' requires unique_key — falling back to full_refresh. {NO_APPEND_EQUIVALENT}"
+                    ),
                     suggestion: Some(
-                        "add unique_key to the model config or pick a non-merge incremental_strategy".to_string(),
+                        "add unique_key to the model config so it maps to merge".to_string(),
                     ),
                 });
-                StrategyConfig::Incremental {
-                    timestamp_column: "updated_at".to_string(),
-                }
+                push_append_fallback(structured, model_name, "incremental (merge, no unique_key)");
+                StrategyConfig::FullRefresh
             }
         },
-        "append" => StrategyConfig::Incremental {
-            timestamp_column: "updated_at".to_string(),
-        },
+        "append" => {
+            warnings.push(ImportWarning {
+                model: model_name.to_string(),
+                category: WarningCategory::UnsupportedMaterialization,
+                message: format!(
+                    "incremental_strategy='append' mapped to full_refresh. {NO_APPEND_EQUIVALENT}"
+                ),
+                suggestion: Some(APPEND_SUGGESTION.to_string()),
+            });
+            push_append_fallback(structured, model_name, "incremental (append)");
+            StrategyConfig::FullRefresh
+        }
         "delete+insert" | "delete_insert" => {
             let partition_by = config.partition_by.clone().or_else(|| unique_keys.clone());
             match partition_by {
@@ -1316,18 +1348,62 @@ fn map_incremental_strategy(
                 model: model_name.to_string(),
                 category: WarningCategory::UnsupportedMaterialization,
                 message: format!(
-                    "incremental_strategy='{other}' not recognized — falling back to incremental(updated_at)"
+                    "incremental_strategy='{other}' not recognized — falling back to full_refresh"
                 ),
                 suggestion: Some(
-                    "use one of: append, merge, delete+insert, insert_overwrite, microbatch".to_string(),
+                    "use one of: append, merge, delete+insert, insert_overwrite, microbatch"
+                        .to_string(),
                 ),
             });
-            StrategyConfig::Incremental {
-                timestamp_column: "updated_at".to_string(),
-            }
+            push_append_fallback(structured, model_name, &format!("incremental ({other})"));
+            StrategyConfig::FullRefresh
         }
     }
 }
+
+/// Record a model whose dbt `incremental` config fell back to `full_refresh`
+/// as a structured `UnsupportedMaterialization`, the same shape the
+/// `ephemeral` and unrecognised-materialization fallbacks use, so it lands in
+/// MIGRATION-NOTES.md's "Items to translate manually" list and not only among
+/// the flat warnings.
+fn push_append_fallback(
+    structured: &mut Vec<ImportDbtStructuredWarning>,
+    model_name: &str,
+    dbt_materialization: &str,
+) {
+    structured.push(ImportDbtStructuredWarning::UnsupportedMaterialization {
+        model: model_name.to_string(),
+        dbt_materialization: dbt_materialization.to_string(),
+        action: "fell back to full_refresh".to_string(),
+    });
+}
+
+/// Why an append-style dbt model cannot keep its semantics in Rocky (#1990).
+///
+/// Rocky refuses `type = "incremental"` on transformation models (E037): with
+/// no watermark to apply, it would re-insert every row on each run. The
+/// importer therefore never emits it, and maps append semantics to
+/// `full_refresh`, which rebuilds from the model SQL and cannot duplicate.
+const NO_APPEND_EQUIVALENT: &str = "Rocky has no append strategy for transformation models: \
+     an unfiltered append re-inserts every row on each run, so `incremental` is refused (E037) \
+     and the model is imported as `full_refresh`, which replaces the table with the model SQL's \
+     result on every run";
+
+/// Why an incremental dbt model whose SQL uses `is_incremental()` is not
+/// imported at all when it would fall back to `full_refresh` (#1990).
+const INCREMENTAL_FALLBACK_REFUSED: &str = "is an incremental dbt model with no Rocky append \
+     equivalent, and its SQL uses `is_incremental()`. dbt compiles that branch as true against an \
+     existing table, so the compiled SQL can keep an incremental filter; imported as \
+     `full_refresh`, it would replace the table with only the recent rows on every run. Rewrite \
+     it by hand: remove the `is_incremental()` filter, then use merge with a unique_key or a \
+     time_interval model with @start_date/@end_date";
+
+/// An explicit `incremental_strategy` wins over `unique_key` in
+/// `map_incremental_strategy`, so adding a key alone does not change an
+/// explicit `'append'`: the strategy must be `'merge'` or unset as well.
+const APPEND_SUGGESTION: &str = "add a unique_key and set incremental_strategy to 'merge' (or \
+     leave it unset) so the model maps to merge, or hand-author a time_interval model with \
+     @start_date/@end_date";
 
 /// Map `materialized='microbatch'` (or `incremental_strategy='microbatch'`)
 /// to a Rocky strategy. Emits a
@@ -1439,22 +1515,22 @@ fn map_microbatch_strategy(
             warnings.push(ImportWarning {
                 model: model_name.to_string(),
                 category: WarningCategory::UnsupportedMaterialization,
-                message: "dbt microbatch without a unique_key maps to an append-only incremental strategy — it re-inserts the lookback window on every run".to_string(),
+                message: format!(
+                    "dbt microbatch without a unique_key mapped to full_refresh. {NO_APPEND_EQUIVALENT}"
+                ),
                 suggestion: Some(
                     "add a unique_key (dbt microbatch normally has one) so it maps to an idempotent merge, or convert to a time-interval strategy with @start_date/@end_date".to_string(),
                 ),
             });
             structured.push(ImportDbtStructuredWarning::MicrobatchMapped {
                 model: model_name.to_string(),
-                mapped_to: "incremental_append".to_string(),
+                mapped_to: "full_refresh".to_string(),
             });
-            // Emit `incremental`, not `microbatch`: both lower to an
-            // append-only INSERT (sql_gen), but `microbatch` misleadingly
-            // implies dbt's idempotent partition-replace. `incremental` is
-            // honest about the append semantics.
-            StrategyConfig::Incremental {
-                timestamp_column: event_time,
-            }
+            // Neither `incremental` (refused, #1990) nor `microbatch` (the
+            // same unfiltered append, #2054): both would re-insert every row
+            // on each run. A full rebuild is the one mapping that cannot
+            // duplicate.
+            StrategyConfig::FullRefresh
         }
     }
 }
@@ -2028,9 +2104,15 @@ fn import_single_model(
         {
             match resolved.materialized.as_str() {
                 "incremental" => {
-                    strategy = StrategyConfig::Incremental {
-                        timestamp_column: "updated_at".to_string(),
-                    };
+                    // Stays `full_refresh` (#1990): see `NO_APPEND_EQUIVALENT`.
+                    warnings.push(ImportWarning {
+                        model: name.to_string(),
+                        category: WarningCategory::UnsupportedMaterialization,
+                        message: format!(
+                            "project config materialized='incremental' mapped to full_refresh. {NO_APPEND_EQUIVALENT}"
+                        ),
+                        suggestion: Some(APPEND_SUGGESTION.to_string()),
+                    });
                 }
                 "view" => {
                     strategy = StrategyConfig::View;
@@ -2735,14 +2817,14 @@ mod tests {
         // happen anymore.
         let input = "{{ config(materialized='incremental', incremental_strategy='merge') }}";
         let (strategy, _) = extract_dbt_config(input);
-        // Without unique_key, this should fall back to Incremental(updated_at)
-        // because merge requires unique_key — but the timestamp must not be 'merge'.
-        if let StrategyConfig::Incremental { timestamp_column } = strategy {
-            assert_ne!(
-                timestamp_column, "merge",
-                "BUG REGRESSION: incremental_strategy must NOT be parsed as a timestamp column"
-            );
-        }
+        // Without unique_key, merge cannot apply, and the append fallback is
+        // `full_refresh` (#1990: `incremental` is refused on transformation
+        // models). The old failure mode was 'merge' landing in a timestamp
+        // column; no strategy that carries one is emitted any more.
+        assert!(
+            matches!(strategy, StrategyConfig::FullRefresh),
+            "merge without unique_key falls back to FullRefresh, got {strategy:?}"
+        );
     }
 
     #[test]
@@ -3721,7 +3803,7 @@ FROM {{ ref('stg_events') }}
     }
 
     #[test]
-    fn test_manifest_microbatch_without_key_maps_to_incremental() {
+    fn test_manifest_microbatch_without_key_maps_to_full_refresh() {
         let manifest = serde_json::json!({
             "metadata": { "project_name": "p" },
             "nodes": {
@@ -3744,15 +3826,28 @@ FROM {{ ref('stg_events') }}
         });
         let result = import_from_manifest_json(&manifest);
         assert_eq!(result.imported.len(), 1);
-        // A microbatch without a unique_key maps to an append-only
-        // `incremental` (not `microbatch`) — both lower to a bare INSERT, but
-        // `incremental` doesn't misleadingly imply dbt's idempotent semantics.
-        match &result.imported[0].config.strategy {
-            StrategyConfig::Incremental { timestamp_column } => {
-                assert_eq!(timestamp_column, "event_ts");
-            }
-            other => panic!("expected Incremental, got {other:?}"),
-        }
+        // A microbatch without a unique_key has no append mapping: `incremental`
+        // is refused on transformation models (#1990) and `microbatch` is the
+        // same unfiltered INSERT (#2054). It rebuilds in full, loudly.
+        assert!(
+            matches!(
+                result.imported[0].config.strategy,
+                StrategyConfig::FullRefresh
+            ),
+            "expected FullRefresh, got {:?}",
+            result.imported[0].config.strategy
+        );
+        assert!(
+            result.structured_warnings.iter().any(|w| matches!(w,
+                ImportDbtStructuredWarning::MicrobatchMapped { mapped_to, .. } if mapped_to == "full_refresh")),
+            "the structured warning must say what it mapped to: {:?}",
+            result.structured_warnings
+        );
+        assert!(
+            result.warnings.iter().any(|w| w.message.contains("E037")),
+            "the warning must say why there is no append mapping: {:?}",
+            result.warnings
+        );
     }
 
     #[test]
@@ -3858,7 +3953,7 @@ FROM {{ ref('stg_events') }}
     }
 
     #[test]
-    fn test_incremental_strategy_append_maps_to_incremental() {
+    fn test_incremental_strategy_append_maps_to_full_refresh_with_a_warning() {
         let manifest = serde_json::json!({
             "metadata": { "project_name": "p" },
             "nodes": {
@@ -3879,13 +3974,128 @@ FROM {{ ref('stg_events') }}
             "sources": {}
         });
         let result = import_from_manifest_json(&manifest);
-        match &result.imported[0].config.strategy {
-            StrategyConfig::Incremental { timestamp_column } => {
-                assert_ne!(timestamp_column, "merge");
-                assert_ne!(timestamp_column, "append");
-            }
-            other => panic!("expected Incremental, got {other:?}"),
-        }
+        // #1990: an emitted `incremental` sidecar would fail `rocky compile`
+        // with E037, so an append model rebuilds in full and says why.
+        assert!(
+            matches!(
+                result.imported[0].config.strategy,
+                StrategyConfig::FullRefresh
+            ),
+            "expected FullRefresh, got {:?}",
+            result.imported[0].config.strategy
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.model == "events_append" && w.message.contains("E037")),
+            "the append mapping must warn with the reason: {:?}",
+            result.warnings
+        );
+        // Structured too, so MIGRATION-NOTES.md lists it under the models to
+        // translate by hand, like the `ephemeral` fallback.
+        assert!(
+            result.structured_warnings.iter().any(|w| matches!(w,
+                ImportDbtStructuredWarning::UnsupportedMaterialization { model, action, .. }
+                    if model == "events_append" && action == "fell back to full_refresh")),
+            "the append fallback must be a structured UnsupportedMaterialization: {:?}",
+            result.structured_warnings
+        );
+    }
+
+    /// #1990: dbt compiles `is_incremental()` as true against an existing
+    /// table, so the compiled SQL keeps the delta filter. Imported as the
+    /// `full_refresh` fallback, every run would replace the table with only
+    /// the recent rows. The model is refused, not imported, and says why.
+    #[test]
+    fn test_append_model_using_is_incremental_is_refused_not_full_refreshed() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.events_append": {
+                    "unique_id": "model.p.events_append",
+                    "name": "events_append",
+                    "resource_type": "model",
+                    "raw_code": "SELECT * FROM {{ ref('raw_events') }}\n{% if is_incremental() %}\nWHERE updated_at > (SELECT MAX(updated_at) FROM {{ this }})\n{% endif %}",
+                    "compiled_code": "SELECT * FROM raw_events\nWHERE updated_at > '2026-09-01 00:00:00'",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": { "materialized": "incremental" },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert!(
+            result.imported.iter().all(|m| m.name != "events_append"),
+            "a delta-filtered model must not be imported as full_refresh: {:?}",
+            result
+                .imported
+                .iter()
+                .map(|m| (&m.name, &m.config.strategy))
+                .collect::<Vec<_>>()
+        );
+        let failure = result
+            .failed
+            .iter()
+            .find(|f| f.name == "events_append")
+            .expect("the model is reported as a failed import");
+        assert!(
+            failure.reason.contains("is_incremental()") && failure.reason.contains("merge"),
+            "the refusal names the cause and the way out: {}",
+            failure.reason
+        );
+        // Adding a key alone would import it as merge from the same compiled
+        // delta SQL, whose first run loads only recent rows (#2059).
+        assert!(
+            failure
+                .reason
+                .contains("remove the `is_incremental()` filter")
+                && !failure.reason.to_lowercase().contains("add a unique_key"),
+            "the refusal must not steer into the keyed cold-start defect: {}",
+            failure.reason
+        );
+        assert!(
+            !result.warnings.iter().any(|w| w.model == "events_append"
+                && w.message.contains("mapped to full_refresh")),
+            "no warning may claim a full_refresh mapping for a refused model: {:?}",
+            result.warnings
+        );
+    }
+
+    /// The boundary of #2058's refusal: the same model WITH a unique_key is
+    /// still imported as merge. This PINS CURRENT BEHAVIOUR, NOT A CONTRACT:
+    /// merge's first run builds the table from the compiled delta SQL, so it
+    /// loads only recent rows (#2059). When #2059 is ruled, this test changes.
+    #[test]
+    fn test_append_model_using_is_incremental_with_unique_key_still_maps_to_merge() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.events_keyed": {
+                    "unique_id": "model.p.events_keyed",
+                    "name": "events_keyed",
+                    "resource_type": "model",
+                    "raw_code": "SELECT * FROM {{ ref('raw_events') }}\n{% if is_incremental() %}\nWHERE updated_at > (SELECT MAX(updated_at) FROM {{ this }})\n{% endif %}",
+                    "compiled_code": "SELECT * FROM raw_events\nWHERE updated_at > '2026-09-01 00:00:00'",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": { "materialized": "incremental", "unique_key": "id" },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        let model = result
+            .imported
+            .iter()
+            .find(|m| m.name == "events_keyed")
+            .expect("a keyed incremental model is imported");
+        assert!(
+            matches!(model.config.strategy, StrategyConfig::Merge { .. }),
+            "expected Merge, got {:?}",
+            model.config.strategy
+        );
     }
 
     #[test]

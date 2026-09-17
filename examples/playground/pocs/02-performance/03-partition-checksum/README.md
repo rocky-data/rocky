@@ -93,7 +93,11 @@ computed.
 
 ## How `time_interval` differs from `incremental`
 
-| Aspect | `[strategy] type = "incremental"` | `[strategy] type = "time_interval"` |
+`incremental` here means a replication pipeline's watermarked copy. On a
+transformation model, `type = "incremental"` is refused at compile time
+(E037), because it has no watermark to apply.
+
+| Aspect | replication `strategy = "incremental"` | `[strategy] type = "time_interval"` |
 |---|---|---|
 | State | Single watermark per table | Per-partition records in the `PARTITIONS` redb table |
 | Filter | `WHERE ts > MAX(ts_in_target)` | `WHERE ts >= @start_date AND ts < @end_date` |

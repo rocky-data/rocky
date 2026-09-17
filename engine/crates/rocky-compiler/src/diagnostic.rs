@@ -137,6 +137,17 @@ pub const E034: &str = "E034";
 /// can never drift. (FR-044)
 pub const E035: &str = "E035";
 
+/// A transformation model declares `type = "incremental"`.
+///
+/// Emitted by `rocky compile` (`check_incremental_strategy` in `typecheck.rs`).
+/// On a transformation model the strategy lowers to a plain
+/// `INSERT INTO <target> <model SQL>` with no watermark filter, so every run
+/// after the first appends the whole result again (#1990). Replication
+/// pipelines are unaffected: their `incremental` copy does apply a watermark.
+/// The error names the strategies that work instead. `E036` is taken by the
+/// target-collision check in `compile.rs`, which emits it as a literal.
+pub const E037: &str = "E037";
+
 // Warnings
 /// Unused model (no downstream consumers).
 pub const W001: &str = "W001";

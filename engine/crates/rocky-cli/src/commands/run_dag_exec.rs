@@ -2207,8 +2207,9 @@ mod tests {
             models.join("a.toml"),
             "name = \"a\"\n\n\
              [strategy]\n\
-             type = \"incremental\"\n\
-             timestamp_column = \"ts\"\n\n\
+             type = \"microbatch\"\n\
+             timestamp_column = \"ts\"\n\
+             granularity = \"hour\"\n\n\
              [target]\n\
              catalog = \"proj\"\n\
              schema = \"silver\"\n\
@@ -2222,8 +2223,9 @@ mod tests {
             "name = \"b\"\n\
              depends_on = [\"a\"]\n\n\
              [strategy]\n\
-             type = \"incremental\"\n\
-             timestamp_column = \"ts\"\n\n\
+             type = \"microbatch\"\n\
+             timestamp_column = \"ts\"\n\
+             granularity = \"hour\"\n\n\
              [target]\n\
              catalog = \"proj\"\n\
              schema = \"silver\"\n\

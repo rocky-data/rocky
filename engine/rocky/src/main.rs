@@ -1489,19 +1489,14 @@ enum Command {
         /// Materialization strategy for the generated model. Written into
         /// the emitted `.toml` sidecar's `[strategy]` block.
         ///
-        /// Accepted: `full_refresh` (default), `incremental`, `merge`,
-        /// `ephemeral`. Other strategies in `StrategyConfig`
+        /// Accepted: `full_refresh` (default), `merge`, `ephemeral`.
+        /// `incremental` is refused: on a transformation model it re-inserts
+        /// every row on each run (E037). Other strategies in `StrategyConfig`
         /// (`time_interval`, `delete_insert`, `microbatch`) require richer
         /// flag plumbing and are deliberately out of scope for this first
         /// cut.
         #[arg(long, default_value = "full_refresh")]
         materialization: String,
-        /// Watermark column for `--materialization=incremental`. Maps to
-        /// `[strategy] timestamp_column` in the emitted sidecar TOML.
-        /// Required when materialization is `incremental`; ignored
-        /// otherwise.
-        #[arg(long)]
-        watermark: Option<String>,
         /// Required for `--materialization merge`. Columns that uniquely
         /// identify a row for upsert. Maps to `[strategy] unique_key` in
         /// the emitted sidecar TOML.
@@ -4234,7 +4229,6 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             format,
             models,
             materialization,
-            watermark,
             unique_key,
             target,
             overwrite,
@@ -4257,7 +4251,6 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 json,
                 cli.cache_ttl,
                 &materialization,
-                watermark.as_deref(),
                 unique_key,
                 target.as_deref(),
                 overwrite,

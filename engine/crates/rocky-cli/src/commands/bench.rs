@@ -105,10 +105,10 @@ pub fn generate_synthetic_project(size: usize, dir: &Path) {
         let dep = &source_names[i % source_names.len()];
         let use_rocky = i % 5 == 0; // 20% Rocky DSL
 
-        // Vary strategy: 80% full_refresh, 15% incremental, 5% merge
+        // Vary strategy: 80% full_refresh, 20% merge. No `incremental`: it is a
+        // compile error on transformation models (E037, #1990).
         let strategy_toml = match model_idx % 20 {
             0..=15 => "type = \"full_refresh\"".to_string(),
-            16..=18 => "type = \"incremental\"\ntimestamp_column = \"updated_at\"".to_string(),
             _ => "type = \"merge\"\nunique_key = [\"id\"]".to_string(),
         };
 
@@ -149,7 +149,6 @@ pub fn generate_synthetic_project(size: usize, dir: &Path) {
 
         let strategy_toml = match model_idx % 20 {
             0..=15 => "type = \"full_refresh\"".to_string(),
-            16..=18 => "type = \"incremental\"\ntimestamp_column = \"updated_at\"".to_string(),
             _ => "type = \"merge\"\nunique_key = [\"id\"]".to_string(),
         };
 

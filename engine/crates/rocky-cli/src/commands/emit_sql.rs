@@ -13,11 +13,11 @@
 //! Full-refresh models emit a complete `CREATE OR REPLACE TABLE … AS …` that
 //! runs as-is against a fresh warehouse and matches what a run executes in the
 //! resolved dialect (see the dialect note below).
-//! Incremental and merge models emit their **steady-state** statement (a bare
-//! `INSERT` / `MERGE` that operates on an existing target); `rocky run`
-//! bootstraps the target table on first build and threads the incremental
-//! watermark from state, neither of which a static emit can reproduce. Those
-//! files carry a leading note to that effect.
+//! Merge and delete_insert models emit their **steady-state** statement (a bare
+//! `MERGE` / `DELETE` + `INSERT` that operates on an existing target); `rocky
+//! run` creates the target table on first build, which a static emit cannot
+//! reproduce. Those files carry a leading note to that effect. (`incremental`
+//! is refused on transformation models, E037, and never reaches this file.)
 //!
 //! The dialect is the project's configured target adapter type (resolved from
 //! `rocky.toml` without credentials); with no project file at all it defaults
@@ -66,11 +66,10 @@ fn resolve_dialect(
 struct EmittedModel {
     name: String,
     sql: String,
-    /// `true` for incremental/merge-style statements that operate on an
-    /// existing target (bare `INSERT`/`MERGE`). `rocky run` bootstraps the
-    /// target table on first build and threads the incremental watermark from
-    /// state — neither of which a static emit reproduces — so this SQL is the
-    /// steady-state operation, not a from-scratch build.
+    /// `true` for merge/delete_insert statements that operate on an existing
+    /// target. `rocky run` creates the target table on first build, which a
+    /// static emit does not reproduce, so this SQL is the steady-state
+    /// operation, not a from-scratch build.
     assumes_existing_target: bool,
 }
 
@@ -361,16 +360,16 @@ pub fn run_emit_sql(
     Ok(())
 }
 
-/// The SQL written for one model, prefixed with a note for incremental/merge
-/// statements that operate on an existing target (so a reader running the file
-/// against a fresh warehouse understands why a bare `INSERT`/`MERGE` expects the
-/// table to already exist).
+/// The SQL written for one model, prefixed with a note for merge and
+/// delete_insert statements that operate on an existing target (so a reader
+/// running the file against a fresh warehouse understands why a bare
+/// `MERGE`/`DELETE` expects the table to already exist). `incremental` never
+/// reaches here: it is refused on transformation models (#1990).
 fn file_body(m: &EmittedModel) -> String {
     if m.assumes_existing_target {
         format!(
-            "-- NOTE: incremental/merge statement — operates on an existing target.\n\
-             -- `rocky run` bootstraps the table on first build and threads the\n\
-             -- incremental watermark from state; this static SQL does neither.\n{}",
+            "-- NOTE: merge/delete_insert statement — operates on an existing target.\n\
+             -- `rocky run` creates the table on first build; this static SQL does not.\n{}",
             m.sql
         )
     } else {
@@ -860,13 +859,17 @@ mod tests {
         .models;
         assert_eq!(emitted.len(), 1);
         // A merge emits a statement operating on an existing target, so it is
-        // flagged and the written file carries the bootstrap/watermark caveat.
+        // flagged and the written file carries the existing-target note.
         assert!(emitted[0].assumes_existing_target);
         assert!(emitted[0].sql.starts_with("MERGE INTO"));
         let body = file_body(&emitted[0]);
         assert!(
-            body.contains("-- NOTE: incremental/merge"),
+            body.contains("-- NOTE: merge/delete_insert statement"),
             "merge file must carry the existing-target note:\n{body}"
+        );
+        assert!(
+            !body.contains("watermark"),
+            "no watermark applies to merge or delete_insert:\n{body}"
         );
     }
 
