@@ -511,8 +511,8 @@ Keep the bad rows out of the clean table instead of only counting them. Rocky ta
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Turn quarantine on. Without `enabled = true`, the block does nothing. |
 | `mode` | `"split"` \| `"tag"` \| `"drop"` | `"split"` | What Rocky does with the failing rows. See the table below. |
-| `suffix_valid` | string | `"__valid"` | Suffix for the table of passing rows. `split` and `drop` refuse a suffix that makes this name match the source table, ignoring case, so an empty suffix is refused. |
-| `suffix_quarantine` | string | `"__quarantine"` | Suffix for the table of failing rows. `split` refuses a suffix that makes this name match the source table or the valid table, ignoring case. `drop` writes no quarantine table, so it does not check this one. |
+| `suffix_valid` | string | `"__valid"` | Suffix for the table of passing rows. `split` and `drop` refuse a suffix that makes this name match the source table, so an empty suffix is refused. Names are compared exactly. |
+| `suffix_quarantine` | string | `"__quarantine"` | Suffix for the table of failing rows. `split` refuses a suffix that makes this name match the source table or the valid table. `drop` writes no quarantine table, so it does not check this one. Names are compared exactly, so suffixes that differ only in case are not refused. On DuckDB and Databricks such names are one table. |
 
 ```toml
 [pipeline.dq.checks.quarantine]
