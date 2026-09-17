@@ -1686,7 +1686,10 @@ mod tests {
             .expect_err("an incremental transformation model must not produce SQL");
         let msg = err.to_string();
         assert!(matches!(err, SqlGenError::InvalidRequest(_)), "{msg}");
-        assert!(msg.contains("E037"), "the error names the compile diagnostic: {msg}");
+        assert!(
+            msg.contains("E037"),
+            "the error names the compile diagnostic: {msg}"
+        );
     }
 
     #[test]

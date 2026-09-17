@@ -1327,7 +1327,8 @@ fn map_incremental_strategy(
                     "incremental_strategy='{other}' not recognized — falling back to full_refresh"
                 ),
                 suggestion: Some(
-                    "use one of: append, merge, delete+insert, insert_overwrite, microbatch".to_string(),
+                    "use one of: append, merge, delete+insert, insert_overwrite, microbatch"
+                        .to_string(),
                 ),
             });
             StrategyConfig::FullRefresh
@@ -2760,14 +2761,14 @@ mod tests {
         // happen anymore.
         let input = "{{ config(materialized='incremental', incremental_strategy='merge') }}";
         let (strategy, _) = extract_dbt_config(input);
-        // Without unique_key, this should fall back to Incremental(updated_at)
-        // because merge requires unique_key — but the timestamp must not be 'merge'.
-        if let StrategyConfig::Incremental { timestamp_column } = strategy {
-            assert_ne!(
-                timestamp_column, "merge",
-                "BUG REGRESSION: incremental_strategy must NOT be parsed as a timestamp column"
-            );
-        }
+        // Without unique_key, merge cannot apply, and the append fallback is
+        // `full_refresh` (#1990: `incremental` is refused on transformation
+        // models). The old failure mode was 'merge' landing in a timestamp
+        // column; no strategy that carries one is emitted any more.
+        assert!(
+            matches!(strategy, StrategyConfig::FullRefresh),
+            "merge without unique_key falls back to FullRefresh, got {strategy:?}"
+        );
     }
 
     #[test]
@@ -3746,7 +3747,7 @@ FROM {{ ref('stg_events') }}
     }
 
     #[test]
-    fn test_manifest_microbatch_without_key_maps_to_incremental() {
+    fn test_manifest_microbatch_without_key_maps_to_full_refresh() {
         let manifest = serde_json::json!({
             "metadata": { "project_name": "p" },
             "nodes": {
@@ -3769,15 +3770,28 @@ FROM {{ ref('stg_events') }}
         });
         let result = import_from_manifest_json(&manifest);
         assert_eq!(result.imported.len(), 1);
-        // A microbatch without a unique_key maps to an append-only
-        // `incremental` (not `microbatch`) — both lower to a bare INSERT, but
-        // `incremental` doesn't misleadingly imply dbt's idempotent semantics.
-        match &result.imported[0].config.strategy {
-            StrategyConfig::Incremental { timestamp_column } => {
-                assert_eq!(timestamp_column, "event_ts");
-            }
-            other => panic!("expected Incremental, got {other:?}"),
-        }
+        // A microbatch without a unique_key has no append mapping: `incremental`
+        // is refused on transformation models (#1990) and `microbatch` is the
+        // same unfiltered INSERT (#2054). It rebuilds in full, loudly.
+        assert!(
+            matches!(
+                result.imported[0].config.strategy,
+                StrategyConfig::FullRefresh
+            ),
+            "expected FullRefresh, got {:?}",
+            result.imported[0].config.strategy
+        );
+        assert!(
+            result.structured_warnings.iter().any(|w| matches!(w,
+                ImportDbtStructuredWarning::MicrobatchMapped { mapped_to, .. } if mapped_to == "full_refresh")),
+            "the structured warning must say what it mapped to: {:?}",
+            result.structured_warnings
+        );
+        assert!(
+            result.warnings.iter().any(|w| w.message.contains("E037")),
+            "the warning must say why there is no append mapping: {:?}",
+            result.warnings
+        );
     }
 
     #[test]
@@ -3883,7 +3897,7 @@ FROM {{ ref('stg_events') }}
     }
 
     #[test]
-    fn test_incremental_strategy_append_maps_to_incremental() {
+    fn test_incremental_strategy_append_maps_to_full_refresh_with_a_warning() {
         let manifest = serde_json::json!({
             "metadata": { "project_name": "p" },
             "nodes": {
@@ -3904,13 +3918,24 @@ FROM {{ ref('stg_events') }}
             "sources": {}
         });
         let result = import_from_manifest_json(&manifest);
-        match &result.imported[0].config.strategy {
-            StrategyConfig::Incremental { timestamp_column } => {
-                assert_ne!(timestamp_column, "merge");
-                assert_ne!(timestamp_column, "append");
-            }
-            other => panic!("expected Incremental, got {other:?}"),
-        }
+        // #1990: an emitted `incremental` sidecar would fail `rocky compile`
+        // with E037, so an append model rebuilds in full and says why.
+        assert!(
+            matches!(
+                result.imported[0].config.strategy,
+                StrategyConfig::FullRefresh
+            ),
+            "expected FullRefresh, got {:?}",
+            result.imported[0].config.strategy
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.model == "events_append" && w.message.contains("E037")),
+            "the append mapping must warn with the reason: {:?}",
+            result.warnings
+        );
     }
 
     #[test]

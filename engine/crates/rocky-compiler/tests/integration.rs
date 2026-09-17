@@ -922,7 +922,11 @@ fn write_strategy_project(dir: &std::path::Path, leaf_strategy: &str) {
         "name = \"src\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"s\"\ntable = \"src\"\n",
     )
     .unwrap();
-    fs::write(models_dir.join("leaf.sql"), "SELECT id, updated_at FROM src").unwrap();
+    fs::write(
+        models_dir.join("leaf.sql"),
+        "SELECT id, updated_at FROM src",
+    )
+    .unwrap();
     fs::write(
         models_dir.join("leaf.toml"),
         format!(
@@ -958,13 +962,27 @@ fn an_incremental_transformation_model_is_refused_with_e037() {
         .iter()
         .filter(|d| &*d.code == "E037")
         .collect();
-    assert_eq!(e037.len(), 1, "exactly one E037, got: {:?}", result.diagnostics);
+    assert_eq!(
+        e037.len(),
+        1,
+        "exactly one E037, got: {:?}",
+        result.diagnostics
+    );
     let d = e037[0];
-    assert!(d.is_error(), "E037 must be an error so the model is excluded from execution");
-    assert_eq!(d.model, "leaf", "the diagnostic names the model that declares the strategy");
+    assert!(
+        d.is_error(),
+        "E037 must be an error so the model is excluded from execution"
+    );
+    assert_eq!(
+        d.model, "leaf",
+        "the diagnostic names the model that declares the strategy"
+    );
     let suggestion = d.suggestion.as_deref().unwrap_or_default();
     for working in ["merge", "delete_insert", "time_interval", "full_refresh"] {
-        assert!(suggestion.contains(working), "suggestion names `{working}`: {suggestion}");
+        assert!(
+            suggestion.contains(working),
+            "suggestion names `{working}`: {suggestion}"
+        );
     }
     assert!(
         !suggestion.contains("microbatch"),

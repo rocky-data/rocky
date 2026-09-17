@@ -19,8 +19,7 @@ use sqlparser::parser::Parser;
 use crate::compile::default_type_mapper;
 use crate::diagnostic::{
     Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E037, I001, I002, SourceSpan,
-    W001,
-    W002, W003, W004, W005, W006,
+    W001, W002, W003, W004, W005, W006,
 };
 use crate::semantic::{ModelSchema, SemanticGraph};
 use crate::types::{RockyType, TypedColumn};
