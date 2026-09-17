@@ -1,0 +1,7 @@
+# Full refresh — reads the stg_events view, which stores no rows of its own.
+# The body names the view by its schema (`analytics.stg_events`): Rocky does
+# not rewrite a `.sql` model's references, so they must resolve as written.
+depends_on = ["stg_events"]
+
+[strategy]
+type = "full_refresh"

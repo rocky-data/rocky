@@ -386,7 +386,7 @@
           "type": "object"
         },
         {
-          "description": "Ephemeral model — inlined as CTE in downstream queries, no table created.",
+          "description": "Ephemeral model — refused at compile time (E038). No table is created and no consumer inlines it, so it is kept only to name the refusal.",
           "properties": {
             "type": {
               "enum": [

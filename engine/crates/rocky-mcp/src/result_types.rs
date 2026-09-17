@@ -59,13 +59,23 @@ pub struct PlannedStatementLite {
     pub sql: String,
 }
 
+/// One model `plan_preview` could not render, and why.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SkippedModelLite {
+    /// The model's name.
+    pub model: String,
+    /// Why no statement was rendered for it — a strategy that needs a live
+    /// warehouse, or one Rocky refuses outright such as `ephemeral` (E038).
+    pub reason: String,
+}
+
 /// `plan_preview` result — the SQL that renders offline for the model(s).
 ///
 /// NOT the whole plan, and the distinction is the whole reason this doc
 /// comment is worded carefully. `commands::plan_preview_output` renders with
-/// no warehouse and SKIPS any model `sql_gen` cannot render that way; there
-/// is no field here that names one, so a skipped model leaves no trace and a
-/// short `statements` list is not a short plan.
+/// no warehouse and SKIPS any model `sql_gen` cannot render that way. Such a
+/// model is named in `skipped` with its reason, so a short `statements` list
+/// is still not a short plan — read both fields.
 ///
 /// This is not served text today — rmcp emits no `output_schema`, and
 /// `worker_result_text_names_no_excluded_tool` pins that absence — but it is
@@ -74,8 +84,12 @@ pub struct PlannedStatementLite {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PlanPreviewResult {
     /// Statements Rocky could render offline, in execution order. A model
-    /// whose SQL needs a live warehouse is absent and unnamed.
+    /// whose SQL needs a live warehouse is absent from this list and named
+    /// in `skipped`.
     pub statements: Vec<PlannedStatementLite>,
+    /// Models that rendered no statement, with the reason for each. Empty
+    /// when every model in scope rendered.
+    pub skipped: Vec<SkippedModelLite>,
 }
 
 /// One lineage edge (column → column with a transform label).

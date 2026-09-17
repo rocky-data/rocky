@@ -1,4 +1,4 @@
-# Ephemeral materialization — CTE inlining vs table persistence
+# A view as a shared intermediate — no copied data, always-fresh reads.
 
 [adapter]
 type = "duckdb"

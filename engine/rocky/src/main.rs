@@ -1489,12 +1489,13 @@ enum Command {
         /// Materialization strategy for the generated model. Written into
         /// the emitted `.toml` sidecar's `[strategy]` block.
         ///
-        /// Accepted: `full_refresh` (default), `merge`, `ephemeral`.
+        /// Accepted: `full_refresh` (default), `merge`.
         /// `incremental` is refused: on a transformation model it re-inserts
-        /// every row on each run (E037). Other strategies in `StrategyConfig`
-        /// (`time_interval`, `delete_insert`, `microbatch`) require richer
-        /// flag plumbing and are deliberately out of scope for this first
-        /// cut.
+        /// every row on each run (E037). `ephemeral` is refused: it is not
+        /// materialized and not inlined into its consumers (E038). Other
+        /// strategies in `StrategyConfig` (`time_interval`, `delete_insert`,
+        /// `microbatch`) require richer flag plumbing and are deliberately
+        /// out of scope for this first cut.
         #[arg(long, default_value = "full_refresh")]
         materialization: String,
         /// Required for `--materialization merge`. Columns that uniquely

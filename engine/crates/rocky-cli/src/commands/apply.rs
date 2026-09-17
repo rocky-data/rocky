@@ -3267,9 +3267,10 @@ pub(crate) fn model_target_fqns(
     }
     let mut by_name = BTreeMap::new();
     for m in &models {
-        // An ephemeral model is inlined as a CTE and materializes nothing, so
-        // it has no table to compact or archive. Same exclusion the gate
-        // makes (#1815, review round seven).
+        // An ephemeral model materializes nothing, so it has no table to
+        // compact or archive. Same exclusion the gate makes (#1815, review
+        // round seven). E038 refuses the strategy outright, so this is now
+        // unreachable through a compiling project.
         if matches!(
             m.config.strategy,
             rocky_core::models::StrategyConfig::Ephemeral
@@ -3345,7 +3346,7 @@ pub(crate) fn resolve_touched_apply_targets(
     }
     for m in &models {
         names.insert(m.config.name.clone());
-        // An ephemeral model is inlined as a CTE and materializes nothing:
+        // An ephemeral model materializes nothing:
         // its `[target]` is a phantom the compiler excludes from ownership
         // too (`project.rs`). Indexing it here let a scratch model's policy
         // govern a real table it never owned (#1815, review round seven).
@@ -5419,7 +5420,7 @@ mod tests {
         assert!(targets.touched.contains_key("x.y.z"));
     }
 
-    /// An ephemeral model is inlined and materializes nothing; its `[target]`
+    /// An ephemeral model materializes nothing; its `[target]`
     /// is a phantom the compiler excludes from ownership. Indexed as an owner
     /// here, a scratch model's `allow` rule governed a real table it never
     /// owned, and beside the real owner it raised a false two-owner refusal

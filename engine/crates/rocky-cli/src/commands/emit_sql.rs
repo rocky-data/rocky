@@ -17,7 +17,8 @@
 //! `MERGE` / `DELETE` + `INSERT` that operates on an existing target); `rocky
 //! run` creates the target table on first build, which a static emit cannot
 //! reproduce. Those files carry a leading note to that effect. (`incremental`
-//! is refused on transformation models, E037, and never reaches this file.)
+//! is refused on transformation models, E037, and `ephemeral` is refused
+//! outright, E038; neither reaches this file.)
 //!
 //! The dialect is the project's configured target adapter type (resolved from
 //! `rocky.toml` without credentials); with no project file at all it defaults
@@ -27,10 +28,9 @@
 //! `rocky run` only for the models whose target uses that dialect. Output is
 //! one `<model>.sql` file per model when `--out-dir` is given,
 //! otherwise the concatenated SQL is printed to stdout, both in dependency
-//! order. Models that produce no standalone SQL — ephemeral (inlined as CTEs)
-//! or strategies that cannot render offline (e.g. Snowflake `DynamicTable`,
-//! which needs a live compute-warehouse name) — are reported on stderr rather
-//! than silently dropped.
+//! order. Models whose SQL cannot be rendered offline (e.g. Snowflake
+//! `DynamicTable`, which needs a live compute-warehouse name) are reported on
+//! stderr rather than silently dropped.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -74,7 +74,7 @@ struct EmittedModel {
 }
 
 /// The result of an emit: the rendered models plus any that produced no
-/// standalone SQL (ephemeral, or strategies that cannot render offline), so the
+/// standalone SQL (strategies that cannot render offline), so the
 /// caller can surface what was *not* written rather than silently dropping it.
 struct EmitResult {
     models: Vec<EmittedModel>,
@@ -241,14 +241,6 @@ fn emit_models(
 
         match sql_gen::generate_transformation_sql_with_warehouse(&model_ir, dialect.as_ref(), None)
         {
-            Ok(stmts) if stmts.is_empty() => {
-                // Ephemeral models inline as CTEs — no standalone statement.
-                debug!(
-                    model = model_name,
-                    "emit-sql: no standalone statement (ephemeral)"
-                );
-                skipped.push(format!("{model_name} (ephemeral — inlined as a CTE)"));
-            }
             Ok(stmts) => {
                 // Join multi-statement strategies (e.g. predrop + CTAS) into one
                 // runnable script, each statement terminated with `;`.

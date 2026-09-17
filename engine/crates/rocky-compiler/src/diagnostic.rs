@@ -148,6 +148,18 @@ pub const E035: &str = "E035";
 /// target-collision check in `compile.rs`, which emits it as a literal.
 pub const E037: &str = "E037";
 
+/// A model declares `type = "ephemeral"`.
+///
+/// Emitted by `rocky compile` (`check_ephemeral_strategy` in `typecheck.rs`).
+/// An ephemeral model is never materialized, and nothing inlines it: no pass
+/// in `rocky-compiler` or `rocky-sql` rewrites a consumer's `FROM <model>`
+/// into a CTE (#1996). A consumer therefore reads whatever physical table
+/// happens to carry that name — a catalog error when none exists, a silent
+/// read of a stale or unrelated table when one does. The error names
+/// `type = "view"`, which gives the same always-fresh reads with no copied
+/// data, on every dialect.
+pub const E038: &str = "E038";
+
 // Warnings
 /// Unused model (no downstream consumers).
 pub const W001: &str = "W001";

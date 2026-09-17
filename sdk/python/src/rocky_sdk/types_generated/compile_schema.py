@@ -122,7 +122,7 @@ class Type4(StrEnum):
 
 class StrategyConfig5(BaseModel):
     """
-    Ephemeral model — inlined as CTE in downstream queries, no table created.
+    Ephemeral model — refused at compile time (E038). No table is created and no consumer inlines it, so it is kept only to name the refusal.
     """
 
     type: Type4

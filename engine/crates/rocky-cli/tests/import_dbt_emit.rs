@@ -17,7 +17,6 @@
 //! - The translated models pass `rocky-core` model loading (the closest "compiles"
 //!   signal we get without spinning up DuckDB, and what `rocky compile` walks first).
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use rocky_compiler::import::{
@@ -82,7 +81,6 @@ fn emit_runnable_repo_from_rich_fixture() {
         default_catalog: &default_target.catalog,
         default_schema: &default_target.schema,
         import: &result,
-        view_models_to_make_ephemeral: BTreeSet::new(),
         adapter_override_label: None,
     })
     .expect("emit_repo writes a runnable repo");
