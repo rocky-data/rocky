@@ -979,6 +979,10 @@ Rocky has no append strategy for transformation models. It refuses `type = "incr
 
 Each one appears as a warning. To keep incremental behaviour, give the model a `unique_key` and set `incremental_strategy` to `'merge'` or leave it unset. It then maps to `merge`. Otherwise, rewrite it as a [`time_interval`](/concepts/time-interval/) model with `@start_date` and `@end_date`.
 
+:::caution[Read the SQL before the first run]
+A manifest import keeps dbt's compiled SQL. If dbt compiled the model against a table that already existed, that SQL can still carry the incremental filter, such as `WHERE updated_at > '2026-09-01'`. As `full_refresh`, every run then replaces the whole table with only the filtered rows, and the older rows are gone. Remove the filter, or rewrite the model, before you run it.
+:::
+
 The raw and no-manifest importer still refuses unresolved Jinja that calls `is_incremental()`, rather than deleting bounded logic silently.
 
 ### Environment-specific logic

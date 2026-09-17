@@ -756,7 +756,8 @@ rocky emit-sql --model stg_orders --out-dir sql/ # Emit a single model
 - Compiles the project offline and generates SQL through the same path `rocky run` uses, including declared surrogate-key columns, so the emitted statements match what a run executes.
 - The dialect is the project's configured target adapter type, resolved from `rocky.toml` without credentials. With no resolvable config it defaults to DuckDB. All models render in this one resolved dialect, so for a project whose models target more than one adapter, the emitted SQL matches `rocky run` only for the models whose target uses that dialect.
 - **Full-refresh models.** Emit a complete `CREATE OR REPLACE TABLE … AS …` that runs as-is against a fresh warehouse and matches what a run executes in the resolved dialect.
-- **Incremental and merge models.** Emit their steady-state statement (a bare `INSERT` / `MERGE` against an existing target). `rocky run` bootstraps the target table on first build and threads the incremental watermark from state, neither of which a static emit can reproduce, so each such file carries a leading `-- NOTE:` comment to that effect.
+- **Merge and `delete_insert` models.** Emit their steady-state statement against an existing target. `rocky run` bootstraps the target table on first build, which a static emit cannot reproduce, so each such file carries a leading `-- NOTE:` comment.
+- **Compile errors.** Any error stops the whole export, before `--model` filters. A transformation model with `type = "incremental"` fails with `E037`, so it blocks every model.
 - Models that produce no standalone SQL are reported on stderr rather than silently dropped. This covers ephemeral models (inlined as CTEs) and strategies that cannot render offline, such as Snowflake dynamic tables, which need a live compute-warehouse name.
 
 This command prints SQL or writes files; it has no JSON output mode.

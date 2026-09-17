@@ -620,6 +620,8 @@ A transformation model cannot use `type = "incremental"`. Rocky has no watermark
 
 `rocky test`, `rocky ci` and `rocky emit-sql` fail on the same error. The SQL generator refuses the model too, so `rocky plan --model` and `rocky estimate` cannot produce SQL for it.
 
+`rocky run` records the model as a failed table and leaves its existing table alone. If an earlier run built that table, it keeps the rows those runs appended again. By default, a model downstream still builds from it. Set `contain_failures = true` under `[resilience]` to hold back everything downstream of the failed model instead. Rebuild the table before you trust it, for example with one `full_refresh` run.
+
 Pick the strategy that matches what you need. These are the four the error names:
 
 | You need | Use |

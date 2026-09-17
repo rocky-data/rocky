@@ -76,7 +76,7 @@ fct_hourly_metrics.toml   time_interval,   →  rocky_models_hourly
                           hourly              (HourlyPartitionsDefinition)
 
 dim_customers.toml        full_refresh     →  rocky_models_unpartitioned
-dim_products.toml         incremental      →  rocky_models_unpartitioned
+dim_products.toml         merge            →  rocky_models_unpartitioned
                                               (no partition definition)
 ```
 
