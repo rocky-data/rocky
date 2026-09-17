@@ -154,10 +154,6 @@ pub fn run_optimize(
     println!();
     println!("Total estimated monthly savings: ${total_savings:.2}");
     println!("Models analyzed: {}", output.recommendations.len());
-    println!();
-    println!(
-        "Tip: Run `rocky compile --output json` for inferred incrementality hints on full_refresh models."
-    );
 
     Ok(())
 }

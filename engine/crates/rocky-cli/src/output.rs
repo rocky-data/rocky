@@ -1798,12 +1798,6 @@ pub struct ModelDetail {
     /// `"explicit"` (via `--contracts` flag), or absent when no contract.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contract_source: Option<String>,
-    /// When the model uses `full_refresh` and has columns that look monotonic,
-    /// this hint suggests switching to incremental materialization. `None`
-    /// when the model already uses an incremental strategy or no candidates
-    /// were found.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub incrementality_hint: Option<rocky_compiler::incrementality::IncrementalityHint>,
     /// DAG-propagated cost estimate for this model. Populated at compile
     /// time using heuristic cardinality propagation (no warehouse round-trip).
     /// `None` when no upstream table statistics are available.
@@ -2207,12 +2201,6 @@ pub struct OptimizeOutput {
     pub total_models_analyzed: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    /// Hint pointing users to `rocky compile --output json` for
-    /// inferred incrementality recommendations on `full_refresh` models.
-    /// Only populated when the optimize command detects that compile-time
-    /// analysis could provide additional optimization opportunities.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub incrementality_note: Option<String>,
 }
 
 /// One materialization-strategy recommendation. Mirrors
@@ -2247,11 +2235,6 @@ impl OptimizeOutput {
             recommendations,
             total_models_analyzed: count,
             message: None,
-            incrementality_note: Some(
-                "Run `rocky compile --output json` for inferred incrementality \
-                 hints on full_refresh models"
-                    .to_string(),
-            ),
         }
     }
 
@@ -2262,7 +2245,6 @@ impl OptimizeOutput {
             recommendations: vec![],
             total_models_analyzed: 0,
             message: Some(message.into()),
-            incrementality_note: None,
         }
     }
 }

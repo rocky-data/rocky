@@ -13,6 +13,5 @@
       "downstream_references": 0
     }
   ],
-  "total_models_analyzed": 1,
-  "incrementality_note": "Run `rocky compile --output json` for inferred incrementality hints on full_refresh models"
+  "total_models_analyzed": 1
 }

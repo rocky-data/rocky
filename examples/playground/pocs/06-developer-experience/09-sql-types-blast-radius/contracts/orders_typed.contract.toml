@@ -1,0 +1,18 @@
+# A typed contract the compiler can only check once it knows the source types.
+#
+# Without --with-seed every column of raw__orders.orders is `Unknown`, so the
+# type check cannot run and each typed column below reports I003. With
+# --with-seed the columns resolve from data/seed.sql and the check runs.
+
+[[columns]]
+name = "order_id"
+type = "Int32"
+nullable = true
+
+[[columns]]
+name = "amount"
+type = "Decimal"
+nullable = true
+
+[rules]
+required = ["order_id", "amount"]

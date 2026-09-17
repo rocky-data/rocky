@@ -8,30 +8,6 @@ from enum import StrEnum
 from pydantic import BaseModel, Field, conint
 
 
-class Confidence1(StrEnum):
-    """
-    Multiple strong signals (name + type + SQL context).
-    """
-
-    high = "high"
-
-
-class Confidence2(StrEnum):
-    """
-    Two signals (e.g., name + type, or name + SQL context).
-    """
-
-    medium = "medium"
-
-
-class Confidence3(StrEnum):
-    """
-    Single signal (e.g., name pattern only).
-    """
-
-    low = "low"
-
-
 class CostHint(BaseModel):
     """
     Heuristic cost estimate derived from DAG-aware cardinality propagation.
@@ -54,31 +30,6 @@ class CostHint(BaseModel):
     estimated_rows: conint(ge=0)
     """
     Estimated number of output rows.
-    """
-
-
-class IncrementalityHint(BaseModel):
-    """
-    A hint that a model could benefit from incremental materialization.
-
-    Returned by [`infer_incrementality`] when a `full_refresh` model has columns that look monotonic. Surfaced in `rocky compile --output json` as part of each model's detail.
-    """
-
-    confidence: Confidence1 | Confidence2 | Confidence3
-    """
-    How confident the detector is in this recommendation.
-    """
-    is_candidate: bool
-    """
-    Whether the model is a candidate for incremental materialization.
-    """
-    recommended_column: str
-    """
-    The column recommended as the watermark / timestamp column.
-    """
-    signals: list[str]
-    """
-    Human-readable reasons why this column was chosen.
     """
 
 
@@ -422,10 +373,6 @@ class ModelDetail(BaseModel):
     freshness: ModelFreshnessConfig | None = None
     """
     Per-model freshness expectation, when declared in the model's TOML frontmatter. `None` when not configured.
-    """
-    incrementality_hint: IncrementalityHint | None = None
-    """
-    When the model uses `full_refresh` and has columns that look monotonic, this hint suggests switching to incremental materialization. `None` when the model already uses an incremental strategy or no candidates were found.
     """
     name: str
     strategy: (

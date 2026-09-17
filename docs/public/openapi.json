@@ -5420,32 +5420,6 @@
         ],
         "description": "Concurrency strategy: the literal `\"adaptive\"` for AIMD-based throttling, or a positive integer for fixed concurrency."
       },
-      "Confidence": {
-        "description": "Confidence level for an incrementality recommendation.",
-        "oneOf": [
-          {
-            "description": "Multiple strong signals (name + type + SQL context).",
-            "enum": [
-              "high"
-            ],
-            "type": "string"
-          },
-          {
-            "description": "Two signals (e.g., name + type, or name + SQL context).",
-            "enum": [
-              "medium"
-            ],
-            "type": "string"
-          },
-          {
-            "description": "Single signal (e.g., name pattern only).",
-            "enum": [
-              "low"
-            ],
-            "type": "string"
-          }
-        ]
-      },
       "ConfigStatus": {
         "description": "What happened when `rocky.toml` was read at server start.",
         "oneOf": [
@@ -9613,41 +9587,6 @@
         ],
         "type": "object"
       },
-      "IncrementalityHint": {
-        "description": "A hint that a model could benefit from incremental materialization.\n\nReturned by [`infer_incrementality`] when a `full_refresh` model has columns that look monotonic. Surfaced in `rocky compile --output json` as part of each model's detail.",
-        "properties": {
-          "confidence": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/Confidence"
-              }
-            ],
-            "description": "How confident the detector is in this recommendation."
-          },
-          "is_candidate": {
-            "description": "Whether the model is a candidate for incremental materialization.",
-            "type": "boolean"
-          },
-          "recommended_column": {
-            "description": "The column recommended as the watermark / timestamp column.",
-            "type": "string"
-          },
-          "signals": {
-            "description": "Human-readable reasons why this column was chosen.",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "confidence",
-          "is_candidate",
-          "recommended_column",
-          "signals"
-        ],
-        "type": "object"
-      },
       "IsolationConfig": {
         "additionalProperties": false,
         "description": "Workspace isolation configuration (Databricks-specific).\n\n```toml [governance.isolation] enabled = true\n\n[[governance.isolation.workspace_ids]] id = 7474656540609532 binding_type = \"READ_WRITE\"\n\n[[governance.isolation.workspace_ids]] id = 7474647537929812 binding_type = \"READ_ONLY\" ```",
@@ -11277,17 +11216,6 @@
             ],
             "description": "Per-model freshness expectation, when declared in the model's TOML frontmatter. `None` when not configured."
           },
-          "incrementality_hint": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/IncrementalityHint"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "When the model uses `full_refresh` and has columns that look monotonic, this hint suggests switching to incremental materialization. `None` when the model already uses an incremental strategy or no candidates were found."
-          },
           "name": {
             "type": "string"
           },
@@ -11853,13 +11781,6 @@
         "properties": {
           "command": {
             "type": "string"
-          },
-          "incrementality_note": {
-            "description": "Hint pointing users to `rocky compile --output json` for inferred incrementality recommendations on `full_refresh` models. Only populated when the optimize command detects that compile-time analysis could provide additional optimization opportunities.",
-            "type": [
-              "string",
-              "null"
-            ]
           },
           "message": {
             "type": [

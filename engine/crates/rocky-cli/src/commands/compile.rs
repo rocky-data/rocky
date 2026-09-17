@@ -8,7 +8,6 @@ use anyhow::{Context, Result};
 use rocky_compiler::compile::{self, CompilerConfig, default_type_mapper};
 use rocky_compiler::cost_check;
 use rocky_compiler::diagnostic::{self, Diagnostic, Severity};
-use rocky_compiler::incrementality;
 use rocky_compiler::types::TypedColumn;
 use rocky_core::config as rocky_config;
 use rocky_core::macros::{expand_macros, load_macros_from_dir};
@@ -308,18 +307,6 @@ fn compile_inner(
         .iter()
         .filter(|model| in_scope(&model.config.name))
         .map(|model| {
-            let typed_cols = result
-                .type_check
-                .typed_models
-                .get(&model.config.name)
-                .map(std::vec::Vec::as_slice)
-                .unwrap_or_default();
-            let incrementality_hint = incrementality::infer_incrementality(
-                &model.config.name,
-                typed_cols,
-                &model.sql,
-                &model.config.strategy,
-            );
             let cost_hint = cost_estimates.get(&model.config.name).map(|est| CostHint {
                 estimated_rows: est.estimated_rows,
                 estimated_bytes: est.estimated_bytes,
@@ -336,7 +323,6 @@ fn compile_inner(
                 target: model.config.target.clone(),
                 freshness: model.config.freshness.clone(),
                 contract_source: model.contract_path.as_ref().map(|_| "auto".to_string()),
-                incrementality_hint,
                 cost_hint,
                 depends_on: model.config.depends_on.clone(),
                 tags: model.config.tags.clone(),
