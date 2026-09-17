@@ -280,7 +280,7 @@ discriminator into a Dagster `DailyPartitionsDefinition`, or `Hourly`,
 
 ## Comparison with `incremental`
 
-There is no choice to make on a transformation model. `rocky compile` refuses `type = "incremental"` there with `E037`, because Rocky has no watermark to apply to the model's SQL and the strategy would append every row again on each run. `time_interval` is the strategy for time-windowed reprocessing of a model.
+There is no choice to make on a transformation model. `rocky compile` refuses `type = "incremental"` there with `E037`. Rocky has no watermark to apply to the model's SQL, so the strategy would append every row again on each run. `time_interval` is the strategy for time-windowed reprocessing of a model.
 
 `incremental` remains a [replication](/concepts/incremental/) strategy, where Rocky filters each copy of a source table on a stored watermark.
 

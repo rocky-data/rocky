@@ -261,7 +261,7 @@ The second error is the E012 for the same column, left out here: the contract al
 
 Every diagnostic has: `code`, `severity` (Error/Warning/Info), `message`, `span` (file + line + col, and `null` when the emitter has no span), `model`, and `suggestion`.
 
-The full set spans E001–E037, W001–W031, D011–D012, P001–P002, and I001–I003. Those ranges have gaps, so not every number in them is in use. Not all of them come from the compiler either: the budget ceiling (E027), the import family (E030–E034, W012, W030, W031) and the portability lint (P001) are added by the `rocky compile` command itself, so `rocky test`, `rocky ci`, the LSP and `rocky serve` never report them. The codes you meet most often:
+The full set spans E001–E037, W001–W031, D011–D012, P001–P002, and I001–I003. Those ranges have gaps, so not every number in them is in use. Not all of them come from the compiler either. The `rocky compile` command itself adds the budget ceiling (E027), the import family (E030–E034, W012, W030, W031) and the portability lint (P001). So `rocky test`, `rocky ci`, the LSP and `rocky serve` never report them. The codes you meet most often:
 - `E001` — join key with no common type between two upstream models
 - `E010`–`E014` — contract violations (missing / retyped / nullability / protected-column removed / a new nullable column under `no_new_nullable`)
 - `E020`–`E028` — time-interval placeholders, the budget ceiling, and an unsupplied `@var(name)`

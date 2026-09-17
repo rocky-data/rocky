@@ -312,7 +312,7 @@ rocky optimize
       "recommended_strategy": "ephemeral",
       "estimated_monthly_savings": 0.0023,
       "reasoning": "fast execution (1.4s) with 1 downstream consumer(s); inline into consumer query to eliminate materialization overhead",
-      "compute_cost_per_run": 0.0014,
+      "compute_cost_per_run": 0.0028,
       "storage_cost_per_month": 0.0023,
       "downstream_references": 1
     },
@@ -321,8 +321,8 @@ rocky optimize
       "current_strategy": "table",
       "recommended_strategy": "table",
       "estimated_monthly_savings": 0.0,
-      "reasoning": "3 downstream consumers; materializing once ($0.5665/mo) is cheaper than recomputing for each ($1.6650/mo)",
-      "compute_cost_per_run": 0.0185,
+      "reasoning": "3 downstream consumers; materializing once ($1.1215/mo) is cheaper than recomputing for each ($3.3300/mo)",
+      "compute_cost_per_run": 0.037,
       "storage_cost_per_month": 0.0115,
       "downstream_references": 3
     },
@@ -330,10 +330,10 @@ rocky optimize
       "model_name": "fct_revenue",
       "current_strategy": "table",
       "recommended_strategy": "view",
-      "estimated_monthly_savings": 0.046,
-      "reasoning": "compute cost ($0.0690/mo) is less than storage ($0.1150/mo); recompute on read instead of materializing",
-      "compute_cost_per_run": 0.0023,
-      "storage_cost_per_month": 0.115,
+      "estimated_monthly_savings": 0.092,
+      "reasoning": "compute cost ($0.1380/mo) is less than storage ($0.2300/mo); recompute on read instead of materializing",
+      "compute_cost_per_run": 0.0046,
+      "storage_cost_per_month": 0.23,
       "downstream_references": 0
     }
   ],
@@ -342,7 +342,12 @@ rocky optimize
 }
 ```
 
-`rocky optimize` recommends `ephemeral`, `table` or `view`. `current_strategy` is always `"table"` ([#2056](https://github.com/rocky-data/rocky/issues/2056)), and a model with too little run history keeps that recommendation. Rocky assumes it rather than reading the strategy the model declares, so `estimated_monthly_savings` is `0.0` whenever the recommendation is `table`.
+`rocky optimize` recommends `ephemeral`, `table` or `view`. A model needs at least 5 recorded runs; with fewer, it keeps its current strategy.
+
+Two inputs are fixed rather than read from your project ([#2056](https://github.com/rocky-data/rocky/issues/2056)):
+
+- `current_strategy` is always `"table"`. Rocky assumes it rather than reading the strategy the model declares, so `estimated_monthly_savings` is `0.0` whenever the recommendation is `table`.
+- The prices are $0.002 per second of compute and $0.023 per GB-month of storage. The `[cost]` block does not change them.
 
 Analyze a single model:
 

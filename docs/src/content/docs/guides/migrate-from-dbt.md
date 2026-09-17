@@ -972,11 +972,12 @@ The importer names each model after its SQL file's stem, so `stg_orders.sql` bec
 Rocky has no append strategy for transformation models. It refuses `type = "incremental"` there with `E037`, because it would re-insert every row on each run. So the importer maps an append-style dbt model to `full_refresh`, which rebuilds from the model SQL and cannot duplicate rows:
 
 - an `incremental` model with no `unique_key`
+- `incremental_strategy = 'append'`, even with a `unique_key`
 - `incremental_strategy = 'merge'` with no `unique_key`
 - an `incremental_strategy` the importer does not recognise
 - a `microbatch` model with no `unique_key`
 
-Each one appears as a warning. To keep incremental behaviour, add a `unique_key` so the model maps to `merge`, or rewrite it as a [`time_interval`](/concepts/time-interval/) model with `@start_date` and `@end_date`.
+Each one appears as a warning. To keep incremental behaviour, give the model a `unique_key` and set `incremental_strategy` to `'merge'` or leave it unset. It then maps to `merge`. Otherwise, rewrite it as a [`time_interval`](/concepts/time-interval/) model with `@start_date` and `@end_date`.
 
 The raw and no-manifest importer still refuses unresolved Jinja that calls `is_incremental()`, rather than deleting bounded logic silently.
 

@@ -83,7 +83,7 @@ The `.toml` file names the model, lists what it depends on, picks a materializat
 :::note[Lakehouse formats]
 Warehouse-managed table shapes (**Delta tables**, **Iceberg tables**, **materialized views**, **streaming tables**, **plain views**) are modeled as a separate `format` axis (a top-level `format = "delta_table"` / `"iceberg_table"` key plus an optional `[format_options]` block for partitioning, clustering, table properties, and a comment). `[strategy]` controls how Rocky writes data into the table; `format` controls the physical table shape. The two are orthogonal. The engine-side DDL generator (`rocky-core::lakehouse::generate_lakehouse_ddl`) handles each format; end-to-end TOML wiring varies by adapter, so consult the per-adapter guides before committing to one.
 
-The chosen `format` and `format_options` are now applied on the **first** materialization of incremental-family models (`delete_insert`, `microbatch`, `time_interval`), not just on full-create strategies — so the table that bootstraps an incremental model is created as the requested Delta or Iceberg shape from the start, rather than as a plain table that only later gains the format.
+The chosen `format` and `format_options` apply on the **first** materialization of incremental-family models (`delete_insert`, `microbatch`, `time_interval`), not only on full-create strategies. The table that bootstraps such a model is created in the requested Delta or Iceberg shape from the start. It is not a plain table that gains the format later.
 :::
 
 **`[target]`** -- Output table:
@@ -618,7 +618,7 @@ A transformation model cannot use `type = "incremental"`. Rocky has no watermark
 
 > model 'fct_orders' uses `type = "incremental"`, which is not supported on transformation models: it emits an unfiltered INSERT and appends every row again on each run
 
-`rocky test`, `rocky ci` and `rocky emit-sql` fail on the same error. The SQL generator refuses the model too, so `rocky plan --model` and `rocky estimate` cannot print or run its `INSERT` either.
+`rocky test`, `rocky ci` and `rocky emit-sql` fail on the same error. The SQL generator refuses the model too, so `rocky plan --model` and `rocky estimate` cannot produce SQL for it.
 
 Pick the strategy that matches what you need. These are the four the error names:
 

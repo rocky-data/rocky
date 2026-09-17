@@ -130,7 +130,16 @@ The importer never inlines a connection secret. Passwords, API tokens, and servi
 | `microbatch` | `merge`, or `time_interval` when you pass `--microbatch-as time_interval`. Without a `unique_key`, `full_refresh` with a warning |
 | anything else | `full_refresh`, plus a TODO line in `MIGRATION-NOTES.md` |
 
-Rocky has no append strategy for transformation models: `incremental` is refused there with `E037`, because it would re-insert every row on each run. The importer never emits it. An append-style dbt model falls back to `full_refresh`, which cannot duplicate rows. That covers `incremental` with no `unique_key`, `incremental_strategy = 'merge'` with no `unique_key`, and an `incremental_strategy` the importer does not recognise. Each of those three is listed in `MIGRATION-NOTES.md` under "Items to translate manually". On the no-manifest path, a model with no `config()` block that inherits `materialized = 'incremental'` from `dbt_project.yml` falls back the same way, but appears only in the notes' "Warnings" list.
+Rocky has no append strategy for transformation models: `incremental` is refused there with `E037`, because it would re-insert every row on each run. The importer never emits it. An append-style dbt model falls back to `full_refresh`, which cannot duplicate rows. The fallback covers four cases:
+
+- `incremental` with no `unique_key`
+- `incremental_strategy = 'append'`, even with a `unique_key`
+- `incremental_strategy = 'merge'` with no `unique_key`
+- an `incremental_strategy` the importer does not recognise, even with a `unique_key`
+
+A `unique_key` maps a model to `merge` only when `incremental_strategy` is unset or `'merge'`. An explicit `'append'` keeps the fallback.
+
+Where the fallback is reported depends on the import path. From a manifest, each model is listed in `MIGRATION-NOTES.md` under "Items to translate manually", and under "Warnings". With `--no-manifest`, the importer keeps only the warning text, so the model appears under "Warnings" alone. That includes a model with no `config()` block that inherits `materialized = 'incremental'` from `dbt_project.yml`.
 
 Rocky refuses a model whose raw Jinja calls `is_incremental()` on either raw-SQL path: `--no-manifest`, or a manifest node with no `compiled_code`. Without compiled SQL, Rocky cannot preserve dbt's first-run versus later-run distinction. Each refused model is listed under `failed_details`.
 
