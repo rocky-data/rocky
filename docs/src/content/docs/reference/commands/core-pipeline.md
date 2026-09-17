@@ -408,7 +408,7 @@ A model the preview could not render is listed in `skipped`, rather than left ou
   "skipped": [
     {
       "model": "stg_events",
-      "reason": "model 'stg_events': `type = \"ephemeral\"` is not supported (E038) — an ephemeral model is not materialized and is not inlined into its consumers; use `type = \"view\"`"
+      "reason": "invalid SQL generation request: model 'stg_events': `type = \"ephemeral\"` is not supported (E038) — an ephemeral model is not materialized and is not inlined into its consumers; use `type = \"view\"`"
     }
   ]
 ```
