@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MetaOutput } from "@rocky-types/meta";
 import { ApiError } from "./api";
@@ -82,6 +83,64 @@ describe("EnginePanel", () => {
   it("explains the missing token instead of calling the engine", () => {
     render(<EnginePanel token={null} />);
     expect(screen.getByText("No token for this tab")).toBeInTheDocument();
+  });
+
+  describe("how often it asks", () => {
+    // These render the PRODUCTION seam: `<EnginePanel />` with no loader, the
+    // way `App` renders it. A test that passes its own loader pins a stable
+    // function and cannot see the defect — an idle tab asked the engine about
+    // 15 times a second, for as long as it was open (#2075).
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      window.sessionStorage.clear();
+    });
+
+    function countingFetch() {
+      const calls: string[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL) => {
+          calls.push(String(input));
+          return new Response(JSON.stringify(META), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }),
+      );
+      return calls;
+    }
+
+    it("asks once, and does not ask again while the tab sits there", async () => {
+      window.sessionStorage.setItem(TOKEN_STORAGE_KEY, "t");
+      const calls = countingFetch();
+      render(<EnginePanel />);
+
+      await waitFor(() => expect(screen.getByText("rocky 1.74.0")).toBeInTheDocument());
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(calls.filter((url) => url.includes("/api/v1/meta"))).toHaveLength(1);
+    });
+
+    it("does not ask again when the page around it renders", async () => {
+      window.sessionStorage.setItem(TOKEN_STORAGE_KEY, "t");
+      const calls = countingFetch();
+      function Around() {
+        const [tick, setTick] = useState(0);
+        return (
+          <>
+            <button type="button" onClick={() => setTick((t) => t + 1)}>
+              render again ({tick})
+            </button>
+            <EnginePanel />
+          </>
+        );
+      }
+      render(<Around />);
+      await waitFor(() => expect(screen.getByText("rocky 1.74.0")).toBeInTheDocument());
+
+      for (let i = 0; i < 3; i++) fireEvent.click(screen.getByRole("button", { name: /render again/ }));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(calls.filter((url) => url.includes("/api/v1/meta"))).toHaveLength(1);
+    });
   });
 });
 
