@@ -52,12 +52,6 @@ rocky compile
       "target": { "catalog": "acme_warehouse", "schema": "gold", "table": "fct_revenue" },
       "freshness": { "max_lag_seconds": 86400, "time_column": "order_date", "severity": "warning" },
       "contract_source": "auto",
-      "incrementality_hint": {
-        "is_candidate": true,
-        "recommended_column": "order_date",
-        "confidence": "medium",
-        "signals": ["column name 'order_date' ends with '_date' (timestamp pattern)"]
-      },
       "cost_hint": {
         "estimated_rows": 10000,
         "estimated_bytes": 2560000,
@@ -74,11 +68,10 @@ rocky compile
 
 `models_detail` carries each compiled model's declarative shape. Four fields are always there: `name`, the materialization `strategy` (wire form `{"type": "..."}`), the `target` coordinates, and the direct `depends_on` list.
 
-Four more appear only when they apply:
+Three more appear only when they apply:
 
 - `freshness` — the model's freshness expectation.
 - `contract_source` — `"auto"` for a sibling `.contract.toml`, `"explicit"` for one passed via `--contracts`.
-- `incrementality_hint` — set on a `full_refresh` model that has a monotonic-looking column.
 - `cost_hint` — set when the upstream statistics support an estimate.
 
 The `tags` object holds the model's `[tags]` merged over any config-group baseline, with the sidecar winning. Rocky omits an empty `tags`, an empty `depends_on`, and any absent optional field.
@@ -193,7 +186,7 @@ Compile with seeded source schemas so leaf `.sql` models pick up real types:
 rocky compile --with-seed
 ```
 
-`--with-seed` looks for `data/seed.sql` relative to the project root (one level up from `--models`). It opens an in-memory DuckDB, runs the seed, and feeds the resulting `information_schema.columns` back into the compiler so downstream incrementality and type-inference get concrete types instead of `RockyType::Unknown`. Bails if `data/seed.sql` is missing or fails to execute.
+`--with-seed` looks for `data/seed.sql` relative to the project root (one level up from `--models`). It opens an in-memory DuckDB, runs the seed, and feeds the resulting `information_schema.columns` back into the compiler so type inference gets concrete types instead of `RockyType::Unknown`. Bails if `data/seed.sql` is missing or fails to execute.
 
 ### Related Commands
 
