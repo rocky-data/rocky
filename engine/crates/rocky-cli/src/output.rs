@@ -805,6 +805,29 @@ pub fn classify_anyhow_error_with_cooldown(err: &anyhow::Error) -> (FailureKind,
     (FailureKind::Unknown, None)
 }
 
+/// [`classify_anyhow_error_with_cooldown`] for a bare
+/// [`rocky_core::traits::AdapterError`], as `WarehouseAdapter` methods return.
+///
+/// The anyhow walks above cannot see a typed connector error inside one. They
+/// unwrap `rocky_adapter_sdk::AdapterError`, a different type, and
+/// `rocky_core`'s `AdapterError::source()` returns its inner error's source,
+/// skipping the inner error itself. This starts at [`inner`] and walks
+/// `source()` from there.
+///
+/// [`inner`]: rocky_core::traits::AdapterError::inner
+pub fn classify_adapter_error_with_cooldown(
+    err: &rocky_core::traits::AdapterError,
+) -> (FailureKind, Option<u64>) {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(err.inner());
+    while let Some(c) = cause {
+        if let Some(pair) = classify_cause_with_cooldown(c) {
+            return pair;
+        }
+        cause = c.source();
+    }
+    (FailureKind::Unknown, None)
+}
+
 /// Recover the HTTP status from a single error link if it is a Databricks
 /// or Snowflake `ConnectorError::ApiError`.
 fn api_status_from_cause(cause: &(dyn std::error::Error + 'static)) -> Option<u16> {
@@ -11673,6 +11696,34 @@ mod failure_kind_tests {
     }
 
     // ---- classify_anyhow_error_with_cooldown chain walk ------------------
+
+    /// A typed breaker error inside a `rocky_core` `AdapterError`, as a
+    /// warehouse adapter returns it, keeps its kind and cooldown.
+    #[test]
+    fn classify_adapter_error_with_cooldown_sees_the_connector_error_inside() {
+        let err = rocky_core::traits::AdapterError::new(DbE::CircuitBreakerOpen {
+            consecutive_failures: 5,
+            cooldown_seconds: Some(180),
+        });
+        assert_eq!(
+            classify_adapter_error_with_cooldown(&err),
+            (FailureKind::QuotaExceeded, Some(180)),
+        );
+        // Control: the anyhow walk does not see it, which is why this exists.
+        assert_eq!(
+            classify_anyhow_error_with_cooldown(&anyhow::Error::new(
+                rocky_core::traits::AdapterError::new(DbE::CircuitBreakerOpen {
+                    consecutive_failures: 5,
+                    cooldown_seconds: Some(180),
+                })
+            )),
+            (FailureKind::Unknown, None),
+        );
+        assert_eq!(
+            classify_adapter_error_with_cooldown(&rocky_core::traits::AdapterError::msg("boom")),
+            (FailureKind::Unknown, None),
+        );
+    }
 
     #[test]
     fn classify_anyhow_with_cooldown_extracts_databricks_breaker_cooldown() {

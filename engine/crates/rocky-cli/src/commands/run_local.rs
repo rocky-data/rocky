@@ -763,7 +763,7 @@ pub async fn run_quality(
                         q_cfg,
                     ) {
                         Ok(Some(plan)) => {
-                            let q_output = execute_quarantine_plan(
+                            let (q_output, write_error) = execute_quarantine_plan(
                                 warehouse_adapter.as_ref(),
                                 asset_key.clone(),
                                 plan,
@@ -784,18 +784,10 @@ pub async fn run_quality(
                             // CHECK pass, and this is a write that did not
                             // complete, which may have left the quarantine
                             // table new and the valid table stale.
-                            if !q_output.ok {
+                            if let Some(write_error) = write_error {
                                 output.tables_failed += 1;
                                 quarantine_writes_failed += 1;
-                                output.errors.push(TableErrorOutput {
-                                    asset_key: asset_key.clone(),
-                                    error: format!(
-                                        "quarantine write did not complete: {}",
-                                        q_output.error.as_deref().unwrap_or("unknown error")
-                                    ),
-                                    failure_kind: FailureKind::Unknown,
-                                    cooldown_seconds: None,
-                                });
+                                output.errors.push(write_error);
                                 output.check_results.push(TableCheckOutput {
                                     asset_key: asset_key.clone(),
                                     checks: vec![rocky_core::checks::quarantine_not_evaluated(
@@ -1212,7 +1204,12 @@ fn classify_assertion(
 }
 
 /// Execute a compiled [`rocky_core::quarantine::QuarantinePlan`] against
-/// the warehouse and return a [`QuarantineOutput`] summarizing the result.
+/// the warehouse and return a [`QuarantineOutput`] summarizing the result,
+/// plus the run-level error entry when `ok` is false.
+///
+/// The error entry is built here, while the warehouse error is still typed,
+/// so its `failure_kind` and `cooldown_seconds` come from the adapter (a
+/// tripped circuit breaker, say) rather than from a string.
 ///
 /// Statements execute in plan order — quarantine before valid for `split`
 /// mode, so a partial failure leaves a stray quarantine table rather than a
@@ -1228,7 +1225,7 @@ async fn execute_quarantine_plan(
     warehouse: &dyn rocky_core::traits::WarehouseAdapter,
     asset_key: Vec<String>,
     plan: rocky_core::quarantine::QuarantinePlan,
-) -> QuarantineOutput {
+) -> (QuarantineOutput, Option<TableErrorOutput>) {
     let mode_str = match plan.mode {
         rocky_core::config::QuarantineMode::Split => "split",
         rocky_core::config::QuarantineMode::Tag => "tag",
@@ -1246,8 +1243,11 @@ async fn execute_quarantine_plan(
     };
 
     let mut errors: Vec<String> = Vec::new();
+    // The first failure's classification: it is the one that stopped the plan.
+    let mut classified: Option<(FailureKind, Option<u64>)> = None;
     for stmt in &plan.statements {
         if let Err(e) = warehouse.execute_statement(&stmt.sql).await {
+            classified.get_or_insert_with(|| classify_adapter_error_with_cooldown(&e));
             errors.push(format!("{}: {}", role_label(stmt.role), e));
             warn!(
                 role = role_label(stmt.role),
@@ -1269,6 +1269,7 @@ async fn execute_quarantine_plan(
     if let Some(stmt) = &plan.drop_intermediate
         && let Err(e) = warehouse.execute_statement(&stmt.sql).await
     {
+        classified.get_or_insert_with(|| classify_adapter_error_with_cooldown(&e));
         errors.push(format!(
             "{}: could not drop {}: {}",
             role_label(stmt.role),
@@ -1283,9 +1284,17 @@ async fn execute_quarantine_plan(
     }
 
     if !errors.is_empty() {
+        let message = errors.join("; ");
+        let (failure_kind, cooldown_seconds) = classified.unwrap_or((FailureKind::Unknown, None));
+        let write_error = TableErrorOutput {
+            asset_key: out.asset_key.clone(),
+            error: format!("quarantine write did not complete: {message}"),
+            failure_kind,
+            cooldown_seconds,
+        };
         out.ok = false;
-        out.error = Some(errors.join("; "));
-        return out;
+        out.error = Some(message);
+        return (out, Some(write_error));
     }
 
     if !plan.valid_table.is_empty() {
@@ -1295,7 +1304,7 @@ async fn execute_quarantine_plan(
         out.quarantined_rows = count_rows(warehouse, &plan.quarantine_table).await;
     }
 
-    out
+    (out, None)
 }
 
 fn role_label(role: rocky_core::quarantine::StatementRole) -> &'static str {
@@ -3569,13 +3578,14 @@ auto_create_schemas = true
     }
 
     /// A DuckDB adapter that records every statement and fails the one
-    /// `fail` matches. With `run_first`, it executes that statement for real
-    /// and THEN reports failure: a CTAS that committed on the warehouse while
-    /// the client saw a timeout.
+    /// `fail` matches, with the error `error` builds. With `run_first`, it
+    /// executes that statement for real and THEN reports failure: a CTAS that
+    /// committed on the warehouse while the client saw a timeout.
     struct FailOneStatement {
         inner: DuckDbWarehouseAdapter,
         fail: fn(&str) -> bool,
         run_first: bool,
+        error: fn() -> rocky_core::traits::AdapterError,
         executed: std::sync::Mutex<Vec<String>>,
     }
 
@@ -3591,7 +3601,7 @@ auto_create_schemas = true
                 if self.run_first {
                     self.inner.execute_statement(sql).await?;
                 }
-                return Err(rocky_core::traits::AdapterError::msg("injected failure"));
+                return Err((self.error)());
             }
             self.inner.execute_statement(sql).await
         }
@@ -3617,7 +3627,13 @@ auto_create_schemas = true
     async fn split_with(
         fail: fn(&str) -> bool,
         run_first: bool,
-    ) -> (super::QuarantineOutput, Vec<String>, Vec<String>) {
+        error: fn() -> rocky_core::traits::AdapterError,
+    ) -> (
+        super::QuarantineOutput,
+        Option<super::TableErrorOutput>,
+        Vec<String>,
+        Vec<String>,
+    ) {
         let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
         inner
             .execute_statement("CREATE TABLE main.orders AS SELECT 1 AS id, 'ada' AS name")
@@ -3627,6 +3643,7 @@ auto_create_schemas = true
             inner,
             fail,
             run_first,
+            error,
             executed: std::sync::Mutex::new(Vec::new()),
         };
         let assertions = vec![rocky_core::config::QualityAssertion {
@@ -3657,7 +3674,8 @@ auto_create_schemas = true
         )
         .unwrap()
         .unwrap();
-        let out = super::execute_quarantine_plan(&adapter, vec!["orders".into()], plan).await;
+        let (out, write_error) =
+            super::execute_quarantine_plan(&adapter, vec!["orders".into()], plan).await;
         let executed = adapter.executed.lock().unwrap().clone();
         let left = adapter
             .inner
@@ -3671,7 +3689,11 @@ auto_create_schemas = true
             .into_iter()
             .map(|r| r[0].as_str().unwrap_or_default().to_string())
             .collect();
-        (out, executed, left)
+        (out, write_error, executed, left)
+    }
+
+    fn injected() -> rocky_core::traits::AdapterError {
+        rocky_core::traits::AdapterError::msg("injected failure")
     }
 
     fn is_label(sql: &str) -> bool {
@@ -3687,7 +3709,7 @@ auto_create_schemas = true
     /// drop the intermediate table (#1937).
     #[tokio::test]
     async fn a_label_table_that_committed_behind_a_reported_failure_is_dropped() {
-        let (out, executed, left) = split_with(is_label, true).await;
+        let (out, _, executed, left) = split_with(is_label, true, injected).await;
         assert!(!out.ok, "{out:?}");
         assert!(
             out.error
@@ -3710,7 +3732,8 @@ auto_create_schemas = true
     /// later statement fails, and the table is still dropped.
     #[tokio::test]
     async fn a_label_table_is_dropped_after_a_later_statement_fails() {
-        let (out, executed, left) = split_with(|sql| sql.contains("__valid AS"), false).await;
+        let (out, _, executed, left) =
+            split_with(|sql| sql.contains("__valid AS"), false, injected).await;
         assert!(!out.ok, "{out:?}");
         assert!(
             out.error
@@ -3724,5 +3747,43 @@ auto_create_schemas = true
             "precondition: the label statement ran: {executed:#?}"
         );
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// A quarantine write that failed on a tripped warehouse circuit breaker
+    /// keeps the breaker's kind and cooldown on its `errors` entry.
+    ///
+    /// Dagster reads both to schedule a delayed retry. The first version of
+    /// the entry was built from the stringified error, so it always said
+    /// `unknown` with no cooldown.
+    #[tokio::test]
+    async fn a_failed_quarantine_write_keeps_the_adapter_failure_kind() {
+        fn breaker() -> rocky_core::traits::AdapterError {
+            rocky_core::traits::AdapterError::new(
+                rocky_databricks::connector::ConnectorError::CircuitBreakerOpen {
+                    consecutive_failures: 5,
+                    cooldown_seconds: Some(180),
+                },
+            )
+        }
+        let (out, write_error, _, _) =
+            split_with(|sql| sql.contains("__valid AS"), false, breaker).await;
+        assert!(!out.ok, "{out:?}");
+        let write_error = write_error.expect("a failed write returns its error entry");
+        assert_eq!(write_error.asset_key, vec!["orders".to_string()]);
+        assert!(
+            write_error.error.contains("valid: "),
+            "{}",
+            write_error.error
+        );
+        assert_eq!(write_error.failure_kind, super::FailureKind::QuotaExceeded);
+        assert_eq!(write_error.cooldown_seconds, Some(180));
+
+        // Control: a plain error stays `unknown`, so the kind above is read
+        // from the error rather than assumed.
+        let (_, write_error, _, _) =
+            split_with(|sql| sql.contains("__valid AS"), false, injected).await;
+        let write_error = write_error.expect("a failed write returns its error entry");
+        assert_eq!(write_error.failure_kind, super::FailureKind::Unknown);
+        assert_eq!(write_error.cooldown_seconds, None);
     }
 }

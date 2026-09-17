@@ -179,9 +179,11 @@ pub fn compile_quarantine_sql(
     )
 }
 
-/// Hex digits of the per-plan token `split` names its working objects with.
-/// 48 bits: two concurrent plans for one table do not draw the same token.
-const SPLIT_TOKEN_LEN: usize = 12;
+/// Hex digits of the per-plan token `split` names its working objects with:
+/// a whole v4 UUID. The token is the ownership mark. The drop after a failed
+/// label statement trusts that no other plan drew the same one, so it gets
+/// every random bit the UUID has rather than a truncation of them.
+const SPLIT_TOKEN_LEN: usize = 32;
 
 /// [`compile_quarantine_sql`] with the `split` token supplied, so tests can
 /// pin the exact SQL.
