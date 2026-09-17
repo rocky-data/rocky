@@ -21,7 +21,6 @@
 //! `[[tests]]` blocks. The goal is a `rocky compile`-clean repo, not a
 //! line-for-line dbt clone.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use rocky_core::models::{ModelConfig, StrategyConfig};
@@ -70,13 +69,6 @@ pub struct EmitInputs<'a> {
     pub default_catalog: &'a str,
     pub default_schema: &'a str,
     pub import: &'a ImportResult,
-    /// Legacy: extra models whose `view` materialization was flattened to
-    /// `full_refresh` by an older version of the importer. The Wave 2
-    /// `view → StrategyConfig::View` mapping eliminates this code path
-    /// for new imports, but the field is retained as the BTreeSet
-    /// surface for callers that still pass it (always empty in
-    /// post-Wave-2 callers).
-    pub view_models_to_make_ephemeral: BTreeSet<String>,
     /// Adapter override applied via `--target-adapter`, if any. Drives
     /// MIGRATION-NOTES wording.
     pub adapter_override_label: Option<String>,
@@ -94,10 +86,7 @@ pub fn emit_repo(inputs: &EmitInputs<'_>) -> Result<EmissionResult, String> {
     let mut translated = 0usize;
 
     for model in &inputs.import.imported {
-        let mut model = clone_model(model);
-        if inputs.view_models_to_make_ephemeral.contains(&model.name) {
-            model.config.strategy = StrategyConfig::Ephemeral;
-        }
+        let model = clone_model(model);
         // Strategy classification — dbt's `materialized` keys we don't map
         // 1:1 (e.g. `materialized_view`, `dynamic_table`, `seed`) all
         // arrive here as `FullRefresh`. We can detect them by walking the
@@ -1140,7 +1129,6 @@ mod tests {
             default_catalog: "warehouse",
             default_schema: "main",
             import: &result,
-            view_models_to_make_ephemeral: BTreeSet::new(),
             adapter_override_label: None,
         })
         .unwrap();
@@ -1227,22 +1215,22 @@ mod tests {
         }
     }
 
+    /// The emitter writes each model's strategy as the importer mapped it.
+    ///
+    /// It used to rewrite a listed model to `ephemeral` at write time, a
+    /// leftover of the pre-Wave-2 `view → ephemeral` mapping whose only
+    /// caller passed an empty list. `ephemeral` does not compile at all now
+    /// (E038, #1996), so an emitted sidecar must never carry it.
     #[test]
-    fn view_models_get_rewritten_to_ephemeral() {
+    fn an_emitted_sidecar_never_carries_ephemeral() {
         let dbt_dir = tempfile::TempDir::new().unwrap();
         let out_dir = tempfile::TempDir::new().unwrap();
-        // Importer flattens `view` to FullRefresh and surfaces a warning;
-        // emit re-applies the `view → ephemeral` mapping at write time.
-        let imported = vec![make_model(
-            "v_users",
-            StrategyConfig::FullRefresh,
-            "SELECT 1",
-        )];
+        let imported = vec![
+            make_model("v_users", StrategyConfig::View, "SELECT 1"),
+            make_model("t_users", StrategyConfig::FullRefresh, "SELECT 1"),
+        ];
         let result = empty_result(imported);
         let profile = resolution_for_kind(AdapterKind::DuckDb, "duckdb");
-
-        let mut view_set = BTreeSet::new();
-        view_set.insert("v_users".to_string());
 
         emit_repo(&EmitInputs {
             dbt_project_dir: dbt_dir.path(),
@@ -1252,13 +1240,19 @@ mod tests {
             default_catalog: "warehouse",
             default_schema: "main",
             import: &result,
-            view_models_to_make_ephemeral: view_set,
             adapter_override_label: None,
         })
         .unwrap();
 
-        let body = std::fs::read_to_string(out_dir.path().join("models/v_users.toml")).unwrap();
-        assert!(body.contains("type = \"ephemeral\""));
+        for (model, expected) in [("v_users", "view"), ("t_users", "full_refresh")] {
+            let body = std::fs::read_to_string(out_dir.path().join(format!("models/{model}.toml")))
+                .unwrap();
+            assert!(
+                body.contains(&format!("type = \"{expected}\"")),
+                "{model}: {body}"
+            );
+            assert!(!body.contains("ephemeral"), "{model}: {body}");
+        }
     }
 
     #[test]
@@ -1279,7 +1273,6 @@ mod tests {
             default_catalog: "warehouse",
             default_schema: "main",
             import: &result,
-            view_models_to_make_ephemeral: BTreeSet::new(),
             adapter_override_label: None,
         })
         .unwrap();
@@ -1320,7 +1313,6 @@ mod tests {
             default_catalog: "warehouse",
             default_schema: "main",
             import: &result,
-            view_models_to_make_ephemeral: BTreeSet::new(),
             adapter_override_label: None,
         })
         .unwrap();
@@ -1346,7 +1338,6 @@ mod tests {
             default_catalog: "warehouse",
             default_schema: "main",
             import: &result,
-            view_models_to_make_ephemeral: BTreeSet::new(),
             adapter_override_label: None,
         })
         .unwrap_err();
@@ -1374,7 +1365,6 @@ mod tests {
             default_catalog: "warehouse",
             default_schema: "main",
             import: &result,
-            view_models_to_make_ephemeral: BTreeSet::new(),
             adapter_override_label: None,
         })
         .unwrap();
@@ -1398,7 +1388,6 @@ mod tests {
             default_catalog: "analytics",
             default_schema: "marts",
             import: &result,
-            view_models_to_make_ephemeral: BTreeSet::new(),
             adapter_override_label: None,
         })
         .unwrap();
@@ -1445,7 +1434,6 @@ mod tests {
             default_catalog: "warehouse",
             default_schema: "main",
             import: &result,
-            view_models_to_make_ephemeral: BTreeSet::new(),
             adapter_override_label: None,
         })
         .unwrap();
@@ -1593,7 +1581,6 @@ mod tests {
             default_catalog: "warehouse",
             default_schema: "main",
             import: &result,
-            view_models_to_make_ephemeral: BTreeSet::new(),
             adapter_override_label: None,
         })
         .unwrap();
