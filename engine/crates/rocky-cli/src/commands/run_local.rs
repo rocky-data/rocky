@@ -578,7 +578,7 @@ pub async fn run_quality(
     // length is not a table count (#1811 round one). Counted here instead.
     let mut tables_checked = 0usize;
     let mut targets_unexpanded = 0usize;
-    let mut quarantine_writes_failed = 0usize;
+    let mut quarantines_not_applied = 0usize;
 
     if !pipeline.checks.enabled {
         warn!("quality pipeline checks are disabled — nothing to do");
@@ -786,7 +786,7 @@ pub async fn run_quality(
                             // table new and the valid table stale.
                             if let Some(write_error) = write_error {
                                 output.tables_failed += 1;
-                                quarantine_writes_failed += 1;
+                                quarantines_not_applied += 1;
                                 output.errors.push(write_error);
                                 output.check_results.push(TableCheckOutput {
                                     asset_key: asset_key.clone(),
@@ -808,21 +808,33 @@ pub async fn run_quality(
                         // `RunOutput` saying the split never happened.
                         //
                         // Recorded as a failing error-severity check instead,
-                        // the way #1820 records a refused assertion: the gate
-                        // trips, the run exits non-zero, and the reason
-                        // reaches the JSON and Dagster rather than a log line.
+                        // the way #1820 records a refused assertion, so the
+                        // reason reaches the JSON and Dagster rather than a
+                        // log line. And as a failed table, the way a failed
+                        // quarantine write is above, so the run fails whatever
+                        // `fail_on_error` says: the valid table was not
+                        // rewritten, so downstream reads the previous run's.
+                        // `split` on a warehouse without star exclusion
+                        // (Trino) lands here too.
                         //
                         // Not a hard abort: the compile runs BEFORE any
                         // quarantine statement executes, so nothing is
                         // half-written and there is no partial split to
-                        // unwind. The table is materialized and unsplit, which
-                        // the failing check now says out loud.
+                        // unwind. The other tables still run.
                         Err(e) => {
                             warn!(
                                 error = %e,
                                 table = %full_table,
                                 "failed to compile quarantine SQL"
                             );
+                            output.tables_failed += 1;
+                            quarantines_not_applied += 1;
+                            output.errors.push(TableErrorOutput {
+                                asset_key: asset_key.clone(),
+                                error: format!("quarantine did not run: {e}"),
+                                failure_kind: FailureKind::CompileError,
+                                cooldown_seconds: None,
+                            });
                             output.check_results.push(TableCheckOutput {
                                 asset_key: asset_key.clone(),
                                 // Namespaced with a colon so it cannot
@@ -905,9 +917,10 @@ pub async fn run_quality(
         Some(pipeline_name),
     );
 
-    // A quarantine write that did not complete fails the run with the check
-    // gate off too. Its `quarantine:execute` check is among `error_failures`.
-    if error_failures > 0 && (pipeline.checks.fail_on_error || quarantine_writes_failed > 0) {
+    // A quarantine that was refused or did not complete fails the run with the
+    // check gate off too. Its `quarantine:compile` or `quarantine:execute`
+    // check is among `error_failures`.
+    if error_failures > 0 && (pipeline.checks.fail_on_error || quarantines_not_applied > 0) {
         if !recorded {
             // The gate failed AND the record did not land. The typed error
             // below is the dispatcher's proof that the record is persisted and
@@ -3681,7 +3694,7 @@ auto_create_schemas = true
             .inner
             .execute_query(
                 "SELECT table_name FROM information_schema.tables \
-                 WHERE table_name LIKE 'orders__quarantine__labeled%'",
+                 WHERE starts_with(table_name, '_quarantine_labels_')",
             )
             .await
             .unwrap()
@@ -3697,7 +3710,7 @@ auto_create_schemas = true
     }
 
     fn is_label(sql: &str) -> bool {
-        sql.starts_with("CREATE TABLE") && sql.contains("__labeled_")
+        sql.starts_with("CREATE TABLE") && sql.contains("._quarantine_labels_")
     }
 
     /// A label statement that committed but reported failure still has its

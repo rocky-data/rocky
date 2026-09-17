@@ -504,6 +504,66 @@ suffix_valid = "not a valid identifier"
         check["not_evaluated"].as_str().is_some(),
         "the reason must be carried, not dropped: {out}"
     );
+    assert_eq!(out["tables_failed"], serde_json::json!(1), "{out}");
+    let errors = out["errors"].as_array().expect("errors itemise the table");
+    assert_eq!(
+        errors.len(),
+        1,
+        "tables_failed and errors must agree: {out}"
+    );
+    assert_eq!(
+        errors[0]["failure_kind"],
+        serde_json::json!("compile-error"),
+        "{out}"
+    );
+}
+
+/// A refused quarantine plan fails the run with the check gate off too.
+///
+/// Nothing was split, so the valid table still holds the previous run's rows.
+/// `fail_on_error = false` lets a failed check pass; it does not let the
+/// quarantine silently not happen. This is also what `split` on a warehouse
+/// without star exclusion (Trino) reaches.
+#[test]
+fn a_quarantine_compile_failure_fails_the_run_with_the_gate_off() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    seed_clean_db(dir);
+    fs::write(
+        dir.join("rocky.toml"),
+        clean_config(
+            r#"
+fail_on_error = false
+
+[pipeline.dq.checks.quarantine]
+enabled = true
+suffix_valid = "not a valid identifier"
+"#,
+        ),
+    )
+    .expect("write config");
+
+    let run = rocky(dir, &["run"]);
+    let out = json(&run);
+    assert!(
+        failed_checks(&out)
+            .iter()
+            .any(|n| n == "quarantine:compile"),
+        "precondition: the plan was refused: {out}"
+    );
+    assert_ne!(
+        out["check_gate_failed"],
+        serde_json::json!(true),
+        "precondition: the gate is off (the field is omitted when false): {out}"
+    );
+    assert_eq!(
+        run.status.code(),
+        Some(1),
+        "a refused quarantine must fail the run with the gate off; stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(out["tables_failed"], serde_json::json!(1), "{out}");
+    assert_eq!(out["status"], "Failure", "{out}");
 }
 
 /// A refused quarantine EXPRESSION is refused twice, on both paths, and both
@@ -654,7 +714,7 @@ fn ids(dir: &Path, table: &str) -> Vec<i32> {
 }
 
 /// Whether any table's name starts with `prefix`. `split` names its
-/// intermediate table `orders__quarantine__labeled_<token>`, with a random
+/// intermediate table `_quarantine_labels_<token>`, with a random
 /// token, so the tests look for the prefix.
 fn any_table_starts_with(dir: &Path, prefix: &str) -> bool {
     let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
@@ -778,7 +838,7 @@ column = "created_at"
         "the quarantine table keeps one label column per assertion"
     );
     assert!(
-        !any_table_starts_with(dir, "orders__quarantine__labeled"),
+        !any_table_starts_with(dir, "_quarantine_labels_"),
         "the intermediate label table must be dropped after a split"
     );
 
@@ -881,7 +941,7 @@ enabled = true
         "precondition: the statements before the failure ran"
     );
     assert!(
-        !any_table_starts_with(dir, "orders__quarantine__labeled"),
+        !any_table_starts_with(dir, "_quarantine_labels_"),
         "a failed split must still drop its intermediate label table"
     );
     assert_eq!(out["tables_failed"], serde_json::json!(1), "{out}");

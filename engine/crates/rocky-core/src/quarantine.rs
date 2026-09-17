@@ -12,7 +12,7 @@
 //! outputs from those labels (#1937):
 //!
 //! ```text
-//!   source ──CTAS, predicates evaluated here only──▶ <table>__quarantine__labeled_<token>
+//!   source ──CTAS, predicates evaluated here only──▶ _quarantine_labels_<token>
 //!                                                     │  one label column per assertion
 //!            ┌────────────────────────────────────────┤
 //!            ▼ any label set                          ▼ no label set, labels left out
@@ -106,13 +106,16 @@ pub struct QuarantinePlan {
     /// can commit while the client sees a timeout, so a reported failure is
     /// not proof that nothing was created.
     ///
-    /// The table is named `<table><suffix_quarantine>__labeled_<token>`, with
+    /// The table is `_quarantine_labels_<token>` in the source's schema, with
     /// a random token per plan, and created with a plain `CREATE TABLE`. So
     /// it cannot replace a table someone else owns, two runs of the same
     /// pipeline do not share it, and whatever sits under that name is this
     /// plan's to drop. A process killed between the label statement and the
     /// drop leaves the table behind under that name: no later run can tell
     /// it from another run's table still in use.
+    ///
+    /// The name does not contain the source table's name, so its length is
+    /// fixed (51 characters) however long the source's name is.
     pub drop_intermediate: Option<QuarantineStatement>,
 }
 
@@ -185,6 +188,14 @@ pub fn compile_quarantine_sql(
 /// every random bit the UUID has rather than a truncation of them.
 const SPLIT_TOKEN_LEN: usize = 32;
 
+/// `split`'s intermediate table is this prefix plus the token.
+///
+/// Neither working name is built from a user-controlled name. A 210-character
+/// table name leaves `<table>__valid` inside the 255-character identifier
+/// limit of Snowflake and Databricks; appending a suffix and a 32-digit token
+/// to it would not.
+const SPLIT_TABLE_PREFIX: &str = "_quarantine_labels_";
+
 /// [`compile_quarantine_sql`] with the `split` token supplied, so tests can
 /// pin the exact SQL.
 fn compile_with_token(
@@ -238,19 +249,18 @@ fn compile_with_token(
     let mut drop_intermediate = None;
     match config.mode {
         QuarantineMode::Split => {
-            // In the intermediate table each label sits under a working name
-            // that carries this plan's token, not under its own name. The
-            // source may already have a column called `_error_…` (a quarantine
-            // table checked again, say). DuckDB renames the second of two
-            // same-named CTAS columns, so a label under a name the source
-            // also has would be read as the source's column by every WHERE
-            // below. A fixed suffix only moves that collision; a per-plan
-            // token is a name no existing column was given. The quarantine
-            // CTAS gives each label its real name back.
-            let working: Vec<String> = labeled
-                .iter()
-                .map(|p| {
-                    let name = format!("{}__{token}", p.label);
+            // In the intermediate table each label sits under a working name,
+            // `_ql<ordinal>_<token>`, not under its own name. The source may
+            // already have a column called `_error_…` (a quarantine table
+            // checked again, say). DuckDB renames the second of two same-named
+            // CTAS columns, so a label under a name the source also has would
+            // be read as the source's column by every WHERE below. A per-plan
+            // token is a name no existing column was given, and the ordinal
+            // keeps the name's length fixed whatever the label's length. The
+            // quarantine CTAS gives each label its real name back.
+            let working: Vec<String> = (0..labeled.len())
+                .map(|i| {
+                    let name = format!("_ql{i}_{token}");
                     validation::validate_identifier(&name)?;
                     Ok::<_, QuarantineError>(name)
                 })
@@ -262,10 +272,8 @@ fn compile_with_token(
                 },
             )?;
 
-            let intermediate_name = suffixed_table_name(
-                &table_ref.table,
-                &format!("{}__labeled_{token}", config.suffix_quarantine),
-            )?;
+            let intermediate_name = format!("{SPLIT_TABLE_PREFIX}{token}");
+            validation::validate_identifier(&intermediate_name)?;
             let intermediate_table = dialect.format_table_ref(
                 &table_ref.catalog,
                 &table_ref.schema,
@@ -912,7 +920,7 @@ mod unit_tests {
             plan.quarantine_table,
             "poc.staging__orders.orders__quarantine"
         );
-        let intermediate = "poc.staging__orders.orders__quarantine__labeled_t0k3n";
+        let intermediate = "poc.staging__orders._quarantine_labels_t0k3n";
         assert_eq!(plan.statements[0].target, intermediate);
         let drop = plan
             .drop_intermediate
@@ -942,19 +950,19 @@ mod unit_tests {
             [
                 // A plain CREATE TABLE: it fails rather than replace a table
                 // that already has this name.
-                "CREATE TABLE poc.staging__orders.orders__quarantine__labeled_t0k3n AS\n\
+                "CREATE TABLE poc.staging__orders._quarantine_labels_t0k3n AS\n\
                  SELECT *, CASE WHEN NOT (customer_id IS NOT NULL) \
-                 THEN '_error_not_null_customer_id' END AS _error_not_null_customer_id__t0k3n \
+                 THEN '_error_not_null_customer_id' END AS _ql0_t0k3n \
                  FROM poc.staging__orders.orders",
                 "CREATE OR REPLACE TABLE poc.staging__orders.orders__quarantine AS\n\
-                 SELECT * EXCLUDE (_error_not_null_customer_id__t0k3n), \
-                 _error_not_null_customer_id__t0k3n AS _error_not_null_customer_id \
-                 FROM poc.staging__orders.orders__quarantine__labeled_t0k3n \
-                 WHERE _error_not_null_customer_id__t0k3n IS NOT NULL",
+                 SELECT * EXCLUDE (_ql0_t0k3n), \
+                 _ql0_t0k3n AS _error_not_null_customer_id \
+                 FROM poc.staging__orders._quarantine_labels_t0k3n \
+                 WHERE _ql0_t0k3n IS NOT NULL",
                 "CREATE OR REPLACE TABLE poc.staging__orders.orders__valid AS\n\
-                 SELECT * EXCLUDE (_error_not_null_customer_id__t0k3n) \
-                 FROM poc.staging__orders.orders__quarantine__labeled_t0k3n \
-                 WHERE _error_not_null_customer_id__t0k3n IS NULL",
+                 SELECT * EXCLUDE (_ql0_t0k3n) \
+                 FROM poc.staging__orders._quarantine_labels_t0k3n \
+                 WHERE _ql0_t0k3n IS NULL",
             ]
         );
     }
@@ -1135,7 +1143,7 @@ mod unit_tests {
         let target = |p: &QuarantinePlan| p.statements[0].target.clone();
         assert_ne!(target(&a), target(&b), "two plans must not share a table");
 
-        let prefix = "poc.staging__orders.orders__quarantine__labeled_";
+        let prefix = "poc.staging__orders._quarantine_labels_";
         let token = target(&a)
             .strip_prefix(prefix)
             .unwrap_or_else(|| panic!("{}", target(&a)))
@@ -1143,9 +1151,7 @@ mod unit_tests {
         assert_eq!(token.len(), SPLIT_TOKEN_LEN, "{token}");
         assert!(token.chars().all(|c| c.is_ascii_hexdigit()), "{token}");
         assert!(
-            a.statements[0]
-                .sql
-                .contains(&format!("AS _error_not_null_customer_id__{token} ")),
+            a.statements[0].sql.contains(&format!("AS _ql0_{token} ")),
             "the label columns carry the same token: {}",
             a.statements[0].sql
         );
@@ -1153,6 +1159,51 @@ mod unit_tests {
             a.drop_intermediate.as_ref().map(|d| d.target.clone()),
             Some(target(&a)),
             "the drop names the table this plan creates"
+        );
+    }
+
+    /// The working names do not grow with the source's names.
+    ///
+    /// A 210-character table and a 200-character column are legal on
+    /// Snowflake and Databricks (255-character limit). Names built by
+    /// appending a suffix and a 32-digit token to them would not be.
+    #[test]
+    fn split_working_names_have_a_fixed_length() {
+        let long_table = "t".repeat(210);
+        let long_column = "c".repeat(200);
+        let table_ref = TableRef {
+            catalog: "poc".into(),
+            schema: "staging__orders".into(),
+            table: long_table.clone(),
+        };
+        let mut a = assertion(
+            None,
+            TestType::NotNull,
+            Some(&long_column),
+            TestSeverity::Error,
+        );
+        a.table = long_table.clone();
+        let plan =
+            compile_quarantine_sql(&[a], &long_table, &table_ref, &TestDialect, &split_config())
+                .unwrap()
+                .unwrap();
+        let intermediate = plan.statements[0]
+            .target
+            .strip_prefix("poc.staging__orders.")
+            .expect("schema-qualified");
+        assert_eq!(
+            intermediate.len(),
+            SPLIT_TABLE_PREFIX.len() + SPLIT_TOKEN_LEN,
+            "{intermediate}"
+        );
+        assert!(intermediate.len() <= 255, "{intermediate}");
+        let token = &intermediate[SPLIT_TABLE_PREFIX.len()..];
+        assert!(
+            plan.statements[0]
+                .sql
+                .contains(&format!("END AS _ql0_{token} ")),
+            "{}",
+            plan.statements[0].sql
         );
     }
 
@@ -1243,19 +1294,19 @@ mod unit_tests {
             .unwrap()
             .unwrap();
         // Split combines the labels: any set goes to quarantine, none set to valid.
-        let working = "_error_not_null_customer_id__t0k3n, _error_accepted_values_status__t0k3n";
+        let working = "_ql0_t0k3n, _ql1_t0k3n";
         let quarantine_sql = &plan.statements[1].sql;
         assert!(
             quarantine_sql.contains(&format!(
                 "SELECT * EXCLUDE ({working}), \
-                 _error_not_null_customer_id__t0k3n AS _error_not_null_customer_id, \
-                 _error_accepted_values_status__t0k3n AS _error_accepted_values_status "
+                 _ql0_t0k3n AS _error_not_null_customer_id, \
+                 _ql1_t0k3n AS _error_accepted_values_status "
             )),
             "{quarantine_sql}"
         );
         assert!(quarantine_sql.ends_with(
-            "WHERE _error_not_null_customer_id__t0k3n IS NOT NULL \
-             OR _error_accepted_values_status__t0k3n IS NOT NULL"
+            "WHERE _ql0_t0k3n IS NOT NULL \
+             OR _ql1_t0k3n IS NOT NULL"
         ));
         let valid_sql = &plan.statements[2].sql;
         assert!(
@@ -1263,8 +1314,8 @@ mod unit_tests {
             "{valid_sql}"
         );
         assert!(valid_sql.ends_with(
-            "WHERE _error_not_null_customer_id__t0k3n IS NULL \
-             AND _error_accepted_values_status__t0k3n IS NULL"
+            "WHERE _ql0_t0k3n IS NULL \
+             AND _ql1_t0k3n IS NULL"
         ));
 
         // Drop has no labels; it ANDs the predicates in its one statement.
