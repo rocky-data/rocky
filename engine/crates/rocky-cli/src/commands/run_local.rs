@@ -764,10 +764,26 @@ pub async fn run_quality(
                         Ok(Some(plan)) => {
                             let q_output = execute_quarantine_plan(
                                 warehouse_adapter.as_ref(),
-                                asset_key,
+                                asset_key.clone(),
                                 plan,
                             )
                             .await;
+                            // A statement that failed is a split that did not
+                            // happen, so it fails the run the way a compile
+                            // failure does (#2052). `ok: false` on its own
+                            // reached the JSON and nothing that decides the
+                            // exit code.
+                            if !q_output.ok {
+                                output.check_results.push(TableCheckOutput {
+                                    asset_key: asset_key.clone(),
+                                    checks: vec![rocky_core::checks::quarantine_not_evaluated(
+                                        "quarantine:execute",
+                                        q_output.error.clone().unwrap_or_else(|| {
+                                            "a quarantine statement failed".to_string()
+                                        }),
+                                    )],
+                                });
+                            }
                             output.quarantine.push(q_output);
                         }
                         Ok(None) => {} // no quarantinable assertions
@@ -1174,11 +1190,16 @@ fn classify_assertion(
 /// Execute a compiled [`rocky_core::quarantine::QuarantinePlan`] against
 /// the warehouse and return a [`QuarantineOutput`] summarizing the result.
 ///
-/// Statements execute in plan order — quarantine-first for `split` mode
-/// so a partial failure leaves a stray quarantine table rather than a
+/// Statements execute in plan order — quarantine before valid for `split`
+/// mode, so a partial failure leaves a stray quarantine table rather than a
 /// stale valid table downstream pipelines might read. Row counts are
 /// captured via `SELECT COUNT(*)` against the written tables; adapters
 /// that cannot count leave the fields as `None`.
+///
+/// `split` drops its intermediate label table afterwards, whether the
+/// statements succeeded or not. A drop that fails also sets `ok: false`: the
+/// caller fails the run on it, because a table Rocky wrote would otherwise
+/// stay in the schema with nothing saying so.
 async fn execute_quarantine_plan(
     warehouse: &dyn rocky_core::traits::WarehouseAdapter,
     asset_key: Vec<String>,
@@ -1200,18 +1221,43 @@ async fn execute_quarantine_plan(
         error: None,
     };
 
+    let mut errors: Vec<String> = Vec::new();
     for stmt in &plan.statements {
         if let Err(e) = warehouse.execute_statement(&stmt.sql).await {
-            out.ok = false;
-            out.error = Some(format!("{}: {}", role_label(stmt.role), e));
+            errors.push(format!("{}: {}", role_label(stmt.role), e));
             warn!(
                 role = role_label(stmt.role),
                 target = stmt.target.as_str(),
                 error = %e,
                 "quarantine statement failed"
             );
-            return out;
+            break;
         }
+    }
+
+    // After the loop, not inside it: the drop has to run on the failure path
+    // too. `DROP TABLE IF EXISTS`, so a label statement that failed before
+    // creating the table is not a second error.
+    if let Some(stmt) = &plan.drop_intermediate
+        && let Err(e) = warehouse.execute_statement(&stmt.sql).await
+    {
+        errors.push(format!(
+            "{}: could not drop {}: {}",
+            role_label(stmt.role),
+            stmt.target,
+            e
+        ));
+        warn!(
+            target = stmt.target.as_str(),
+            error = %e,
+            "quarantine intermediate table was not dropped"
+        );
+    }
+
+    if !errors.is_empty() {
+        out.ok = false;
+        out.error = Some(errors.join("; "));
+        return out;
     }
 
     if !plan.valid_table.is_empty() {
@@ -1227,9 +1273,11 @@ async fn execute_quarantine_plan(
 fn role_label(role: rocky_core::quarantine::StatementRole) -> &'static str {
     use rocky_core::quarantine::StatementRole;
     match role {
+        StatementRole::Label => "label",
         StatementRole::Quarantine => "quarantine",
         StatementRole::Valid => "valid",
         StatementRole::Tag => "tag",
+        StatementRole::DropLabels => "drop_labels",
     }
 }
 

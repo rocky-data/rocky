@@ -315,6 +315,11 @@ impl SqlDialect for SnowflakeSqlDialect {
         format!("\"{name}\"")
     }
 
+    /// `* EXCLUDE (a, b)`.
+    fn star_excluding(&self, columns: &[&str]) -> Option<String> {
+        Some(format!("* EXCLUDE ({})", columns.join(", ")))
+    }
+
     fn materialized_view_ddl(&self, target: &str, select_sql: &str) -> AdapterResult<String> {
         Ok(format!(
             "CREATE OR REPLACE MATERIALIZED VIEW {target} AS\n{select_sql}"

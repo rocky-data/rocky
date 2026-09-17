@@ -1,11 +1,23 @@
 //! Row-quarantine SQL compilation for the quality pipeline.
 //!
 //! Lowers a subset of row-level
-//! [`crate::tests::TestType`] assertions into a single boolean predicate
-//! per target table, and emits CTAS statements that split the source into
-//! `<table>__valid` (passing rows) and `<table>__quarantine` (failing
-//! rows with per-assertion `_error_*` label columns), or one of the
-//! variants described by [`crate::config::QuarantineMode`].
+//! [`crate::tests::TestType`] assertions into one boolean predicate each,
+//! and emits CTAS statements that split the source into `<table>__valid`
+//! (passing rows) and `<table>__quarantine` (failing rows with
+//! per-assertion `_error_*` label columns), or one of the variants
+//! described by [`crate::config::QuarantineMode`].
+//!
+//! Every mode evaluates each predicate once, in one statement. `split`
+//! writes the labels to an intermediate table first, then derives both
+//! outputs from those labels (#1937):
+//!
+//! ```text
+//!   source ──CTAS, predicates evaluated here only──▶ <table>__quarantine__labeled
+//!                                                     │  one _error_* column per assertion
+//!            ┌────────────────────────────────────────┤
+//!            ▼ any label set                          ▼ no label set, labels left out
+//!   <table>__quarantine                        <table>__valid
+//! ```
 //!
 //! Only **error-severity** assertions of kind `not_null`,
 //! `accepted_values`, and `expression` are lowered. Aggregate / set-based
@@ -48,6 +60,23 @@ pub enum QuarantineError {
 
     #[error("regex_match assertion '{name}' contains an unsafe pattern")]
     UnsafeRegexPattern { name: String },
+
+    /// `split` keeps its label columns out of the valid table with the
+    /// warehouse's star-exclusion form, and this warehouse has none.
+    #[error(
+        "quarantine mode = \"split\" is not supported on {dialect}: the valid table is \
+         written as `SELECT * EXCEPT (<labels>)`, and {dialect} has no such form"
+    )]
+    SplitNeedsStarExclusion { dialect: &'static str },
+
+    /// The intermediate table's name matches an output table's name, so
+    /// dropping it would drop that output.
+    #[error(
+        "quarantine table name '{name}' is used twice: `split` writes its labels to \
+         '{name}' and drops it afterwards, so it must differ from the valid and \
+         quarantine tables; change suffix_valid or suffix_quarantine"
+    )]
+    TableNameCollision { name: String },
 }
 
 impl From<AdapterError> for QuarantineError {
@@ -70,18 +99,32 @@ pub struct QuarantinePlan {
     /// [`QuarantineMode::Drop`] (failing rows are discarded).
     pub quarantine_table: String,
     /// SQL statements to execute, in order. The runtime executes them
-    /// sequentially and counts row effects per statement. Quarantine
-    /// CTAS runs before the valid CTAS so a partial failure leaves a
-    /// stray quarantine table (cheap to inspect) rather than a stale
+    /// sequentially and counts row effects per statement.
+    ///
+    /// For `split`: the label CTAS, then the quarantine CTAS, then the
+    /// valid CTAS. Quarantine runs before valid so a partial failure leaves
+    /// a stray quarantine table (cheap to inspect) rather than a stale
     /// valid table downstream pipelines might read.
     pub statements: Vec<QuarantineStatement>,
+    /// `split` only: the statement that drops the intermediate label table.
+    ///
+    /// The runtime runs it after [`Self::statements`] whether they succeeded
+    /// or not, because a failed statement must not leave the intermediate
+    /// table behind (#2052). `None` for `drop` and `tag`, which write no
+    /// intermediate table.
+    ///
+    /// The table is named `<table><suffix_quarantine>__labeled`. Rocky
+    /// replaces and then drops any table of that name, the same way it
+    /// replaces `<table><suffix_quarantine>`.
+    pub drop_intermediate: Option<QuarantineStatement>,
 }
 
 /// A single SQL statement produced by [`compile_quarantine_sql`].
 #[derive(Debug, Clone)]
 pub struct QuarantineStatement {
-    /// Human-readable role of this statement (`"quarantine"`, `"valid"`,
-    /// `"tag"`). Used for logging and row-effect attribution.
+    /// Human-readable role of this statement (`"label"`, `"quarantine"`,
+    /// `"valid"`, `"tag"`, `"drop_labels"`). Used for logging and row-effect
+    /// attribution.
     pub role: StatementRole,
     /// Fully-qualified table name this statement writes to.
     pub target: String,
@@ -92,12 +135,19 @@ pub struct QuarantineStatement {
 /// Role of a statement inside a [`QuarantinePlan`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatementRole {
+    /// `split` only: CTAS that writes the source rows plus one `_error_*`
+    /// label column per assertion. The only statement that evaluates the
+    /// predicates.
+    Label,
     /// CTAS that writes the `__quarantine` table.
     Quarantine,
     /// CTAS that writes the `__valid` table.
     Valid,
     /// CTAS that rewrites the source table in-place with `_error_*` tags.
     Tag,
+    /// `split` only: drops the intermediate table the [`Self::Label`]
+    /// statement wrote.
+    DropLabels,
 }
 
 /// Compile a quarantine plan for one table.
@@ -142,16 +192,6 @@ pub fn compile_quarantine_sql(
     let quarantine_table =
         dialect.format_table_ref(&table_ref.catalog, &table_ref.schema, &quarantine_name)?;
 
-    // Only `split` emits two statements (the quarantine CTAS and the valid
-    // CTAS below), so only `split` can have two evaluations of one predicate
-    // disagree. `drop` and `tag` emit exactly one statement each, where a
-    // clock function is as legitimate as it is in an ordinary check —
-    // refusing it there would be a false refusal that breaks working configs.
-    let expression_use = match config.mode {
-        QuarantineMode::Split => ExpressionUse::ReevaluatedPredicate,
-        QuarantineMode::Drop | QuarantineMode::Tag => ExpressionUse::SinglePredicate,
-    };
-
     let mut names: HashSet<String> = HashSet::new();
     let mut labeled: Vec<LabeledPredicate> = Vec::with_capacity(quarantinable.len());
     for assertion in &quarantinable {
@@ -161,42 +201,72 @@ pub fn compile_quarantine_sql(
             &assertion.test.column,
             &label,
             dialect,
-            expression_use,
         )?;
-        let valid_pred = wrap_filter(
-            &assertion.test.filter,
-            &base_pred,
-            &label,
-            dialect,
-            expression_use,
-        )?;
+        let valid_pred = wrap_filter(&assertion.test.filter, &base_pred, &label, dialect)?;
         labeled.push(LabeledPredicate { label, valid_pred });
     }
 
-    let valid_where = labeled
-        .iter()
-        .map(|p| p.valid_pred.clone())
-        .collect::<Vec<_>>()
-        .join(" AND ");
-
-    let mut statements = Vec::with_capacity(2);
+    let mut statements = Vec::with_capacity(3);
+    let mut drop_intermediate = None;
     match config.mode {
         QuarantineMode::Split => {
-            statements.push(build_quarantine_ctas(
-                &quarantine_table,
+            let labels: Vec<&str> = labeled.iter().map(|p| p.label.as_str()).collect();
+            let valid_columns = dialect.star_excluding(&labels).ok_or(
+                QuarantineError::SplitNeedsStarExclusion {
+                    dialect: dialect.name(),
+                },
+            )?;
+
+            let intermediate_name = suffixed_table_name(
+                &table_ref.table,
+                &format!("{}__labeled", config.suffix_quarantine),
+            )?;
+            // Dropping the intermediate table must never drop an output.
+            for output in [&valid_name, &quarantine_name] {
+                if output.eq_ignore_ascii_case(&intermediate_name) {
+                    return Err(QuarantineError::TableNameCollision {
+                        name: intermediate_name,
+                    });
+                }
+            }
+            let intermediate_table = dialect.format_table_ref(
+                &table_ref.catalog,
+                &table_ref.schema,
+                &intermediate_name,
+            )?;
+
+            statements.push(build_label_ctas(
+                StatementRole::Label,
+                &intermediate_table,
                 &source_table,
                 &labeled,
-                &valid_where,
                 dialect,
             ));
-            statements.push(build_valid_ctas(
+            statements.push(build_split_quarantine_ctas(
+                &quarantine_table,
+                &intermediate_table,
+                &labels,
+                dialect,
+            ));
+            statements.push(build_split_valid_ctas(
                 &valid_table,
-                &source_table,
-                &valid_where,
+                &intermediate_table,
+                &labels,
+                &valid_columns,
                 dialect,
             ));
+            drop_intermediate = Some(QuarantineStatement {
+                role: StatementRole::DropLabels,
+                sql: dialect.drop_table_sql(&intermediate_table),
+                target: intermediate_table,
+            });
         }
         QuarantineMode::Drop => {
+            let valid_where = labeled
+                .iter()
+                .map(|p| p.valid_pred.as_str())
+                .collect::<Vec<_>>()
+                .join(" AND ");
             statements.push(build_valid_ctas(
                 &valid_table,
                 &source_table,
@@ -205,7 +275,13 @@ pub fn compile_quarantine_sql(
             ));
         }
         QuarantineMode::Tag => {
-            statements.push(build_tag_ctas(&source_table, &labeled, dialect));
+            statements.push(build_label_ctas(
+                StatementRole::Tag,
+                &source_table,
+                &source_table,
+                &labeled,
+                dialect,
+            ));
         }
     }
 
@@ -223,6 +299,7 @@ pub fn compile_quarantine_sql(
             String::new()
         },
         statements,
+        drop_intermediate,
     }))
 }
 
@@ -319,46 +396,11 @@ fn synthesize_label(test_type: &TestType, column: Option<&str>) -> String {
 ///
 /// The returned predicate is total — it evaluates to `TRUE` or `FALSE`,
 /// never NULL — so the top-level `AND` and `NOT` cannot propagate NULL.
-/// Refuse an assertion kind whose GENERATED predicate reads a clock, in the
-/// one mode where the predicate is evaluated twice.
-///
-/// `not_in_future` lowers to `col <= <current_timestamp>` and
-/// `older_than_n_days` to a `<current_date>` comparison. Neither passes
-/// through [`rocky_sql::check_expression::validate_check_expression`],
-/// because that gate is for user-written fragments — so the engine was
-/// refusing a user's `created_at <= now()` in split mode while generating
-/// the same predicate itself for `not_in_future`.
-///
-/// In split the predicate is spliced into the quarantine CTAS and again into
-/// the valid CTAS. A row whose timestamp falls between the two executions is
-/// invalid in the first and valid in the second, landing in BOTH outputs —
-/// `older_than_n_days` has the equivalent midnight boundary.
-///
-/// `drop` and `tag` emit one statement, so both kinds stay available there.
-/// That is the whole point of refusing on the MODE rather than on the kind.
-fn reject_generated_clock_in_split(
-    expression_use: ExpressionUse,
-    label: &str,
-    kind: &str,
-) -> Result<(), QuarantineError> {
-    if matches!(expression_use, ExpressionUse::ReevaluatedPredicate) {
-        return Err(QuarantineError::Validation(
-            ValidationError::ExpressionFunctionNotAllowed {
-                context: format!("quarantine assertion '{label}' ({kind}) with mode = \"split\""),
-                function: "the generated clock comparison".to_string(),
-                use_: expression_use,
-            },
-        ));
-    }
-    Ok(())
-}
-
 fn lower_valid_predicate(
     test_type: &TestType,
     column: &Option<String>,
     label: &str,
     dialect: &dyn SqlDialect,
-    expression_use: ExpressionUse,
 ) -> Result<String, QuarantineError> {
     match test_type {
         TestType::NotNull => {
@@ -387,9 +429,7 @@ fn lower_valid_predicate(
             }
             // Expression is user-supplied SQL (same contract as
             // `generate_test_sql`) — refuse anything that could end the CTAS
-            // and start another statement. The predicate is spliced twice into
-            // the quarantine CTAS (error-label column + WHERE), so the
-            // balanced-quote rule matters here too.
+            // and start another statement.
             let context = format!("quarantine assertion '{label}' `expression`");
             validation::reject_statement_terminator(&context, expression)?;
             // The terminator check stops a predicate ENDING the statement. It
@@ -401,9 +441,9 @@ fn lower_valid_predicate(
             // whatever it is pointed at.
             //
             // #1820 closed that on the CHECKS path (`tests.rs`, before the
-            // `NOT (...)` splice). This predicate is spliced TWICE into a CTAS
-            // that runs with warehouse credentials, so it needs the same gate
-            // — parse under the target dialect, then allowlist the functions.
+            // `NOT (...)` splice). This predicate is spliced into a CTAS that
+            // runs with warehouse credentials, so it needs the same gate —
+            // parse under the target dialect, then allowlist the functions.
             // Same validator, same dialect mapping, so the two paths cannot
             // drift into disagreeing about what is allowed.
             let sql_dialect = rocky_sql::check_expression::dialect_for(dialect.name());
@@ -411,10 +451,11 @@ fn lower_valid_predicate(
                 &context,
                 expression,
                 sql_dialect.as_ref(),
-                // Spliced into the quarantine CTAS AND the valid-table CTAS
-                // that follows it, so two evaluations can disagree and put
-                // one row in both outputs.
-                expression_use,
+                // Every mode evaluates the predicate once, in one statement.
+                // `split` used to evaluate it in two, and refused a clock
+                // function for that reason (#1922); it now reads labels
+                // written once (#1937).
+                ExpressionUse::SinglePredicate,
             )?;
             // Wrap in COALESCE so NULL expressions count as passing — matches
             // the existing `WHERE NOT (expression)` semantic.
@@ -454,7 +495,6 @@ fn lower_valid_predicate(
         TestType::NotInFuture => {
             let col = required_column(column, label)?;
             validation::validate_identifier(col)?;
-            reject_generated_clock_in_split(expression_use, label, "not_in_future")?;
             let now = dialect.current_timestamp_expr();
             // NULL-permissive: (col IS NULL OR col <= <now>)
             Ok(format!("({col} IS NULL OR {col} <= {now})"))
@@ -462,7 +502,6 @@ fn lower_valid_predicate(
         TestType::OlderThanNDays { days } => {
             let col = required_column(column, label)?;
             validation::validate_identifier(col)?;
-            reject_generated_clock_in_split(expression_use, label, "older_than_n_days")?;
             if *days == 0 {
                 return Err(QuarantineError::InvalidInRangeBound { value: "0".into() });
             }
@@ -511,7 +550,6 @@ fn wrap_filter(
     base_pred: &str,
     label: &str,
     dialect: &dyn SqlDialect,
-    expression_use: ExpressionUse,
 ) -> Result<String, QuarantineError> {
     match filter.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(f) => {
@@ -525,7 +563,7 @@ fn wrap_filter(
                 &context,
                 f,
                 sql_dialect.as_ref(),
-                expression_use,
+                ExpressionUse::SinglePredicate,
             )?;
             Ok(format!(
                 "(CASE WHEN ({f}) THEN ({base_pred}) ELSE TRUE END)"
@@ -535,46 +573,16 @@ fn wrap_filter(
     }
 }
 
-fn build_quarantine_ctas(
+/// CTAS that writes every source row plus one `_error_*` label column per
+/// assertion: the label's name when the row fails it, NULL when it passes.
+///
+/// `split` writes it to the intermediate table and `tag` over the source.
+/// Either way it is the only place a predicate is evaluated. Each predicate
+/// is total (TRUE or FALSE, never NULL), so a NULL label means the row
+/// passed that assertion.
+fn build_label_ctas(
+    role: StatementRole,
     target: &str,
-    source: &str,
-    labeled: &[LabeledPredicate],
-    valid_where: &str,
-    dialect: &dyn SqlDialect,
-) -> QuarantineStatement {
-    let error_cols = labeled
-        .iter()
-        .map(|p| {
-            format!(
-                "CASE WHEN NOT ({}) THEN '{}' END AS {}",
-                p.valid_pred, p.label, p.label
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let select = format!("SELECT *, {error_cols} FROM {source} WHERE NOT ({valid_where})");
-    QuarantineStatement {
-        role: StatementRole::Quarantine,
-        target: target.to_string(),
-        sql: dialect.create_table_as(target, &select),
-    }
-}
-
-fn build_valid_ctas(
-    target: &str,
-    source: &str,
-    valid_where: &str,
-    dialect: &dyn SqlDialect,
-) -> QuarantineStatement {
-    let select = format!("SELECT * FROM {source} WHERE {valid_where}");
-    QuarantineStatement {
-        role: StatementRole::Valid,
-        target: target.to_string(),
-        sql: dialect.create_table_as(target, &select),
-    }
-}
-
-fn build_tag_ctas(
     source: &str,
     labeled: &[LabeledPredicate],
     dialect: &dyn SqlDialect,
@@ -591,9 +599,67 @@ fn build_tag_ctas(
         .join(", ");
     let select = format!("SELECT *, {error_cols} FROM {source}");
     QuarantineStatement {
-        role: StatementRole::Tag,
-        target: source.to_string(),
-        sql: dialect.create_table_as(source, &select),
+        role,
+        target: target.to_string(),
+        sql: dialect.create_table_as(target, &select),
+    }
+}
+
+/// `split`: the rows with at least one label set, labels included.
+fn build_split_quarantine_ctas(
+    target: &str,
+    intermediate: &str,
+    labels: &[&str],
+    dialect: &dyn SqlDialect,
+) -> QuarantineStatement {
+    let any_failed = labels
+        .iter()
+        .map(|l| format!("{l} IS NOT NULL"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let select = format!("SELECT * FROM {intermediate} WHERE {any_failed}");
+    QuarantineStatement {
+        role: StatementRole::Quarantine,
+        target: target.to_string(),
+        sql: dialect.create_table_as(target, &select),
+    }
+}
+
+/// `split`: the rows with no label set, without the label columns, so the
+/// valid table has exactly the source's columns.
+fn build_split_valid_ctas(
+    target: &str,
+    intermediate: &str,
+    labels: &[&str],
+    valid_columns: &str,
+    dialect: &dyn SqlDialect,
+) -> QuarantineStatement {
+    let none_failed = labels
+        .iter()
+        .map(|l| format!("{l} IS NULL"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let select = format!("SELECT {valid_columns} FROM {intermediate} WHERE {none_failed}");
+    QuarantineStatement {
+        role: StatementRole::Valid,
+        target: target.to_string(),
+        sql: dialect.create_table_as(target, &select),
+    }
+}
+
+/// `drop`: the rows that pass every assertion. One statement, so the
+/// predicates are evaluated once without an intermediate table.
+fn build_valid_ctas(
+    target: &str,
+    source: &str,
+    valid_where: &str,
+    dialect: &dyn SqlDialect,
+) -> QuarantineStatement {
+    let select = format!("SELECT * FROM {source} WHERE {valid_where}");
+    QuarantineStatement {
+        role: StatementRole::Valid,
+        target: target.to_string(),
+        sql: dialect.create_table_as(target, &select),
     }
 }
 
@@ -680,6 +746,9 @@ mod unit_tests {
         fn regex_match_predicate(&self, column: &str, pattern: &str) -> AdapterResult<String> {
             Ok(format!("regexp_matches({column}, '{pattern}')"))
         }
+        fn star_excluding(&self, columns: &[&str]) -> Option<String> {
+            Some(format!("* EXCLUDE ({})", columns.join(", ")))
+        }
     }
 
     fn table() -> TableRef {
@@ -754,7 +823,7 @@ mod unit_tests {
     }
 
     #[test]
-    fn split_mode_produces_two_statements() {
+    fn split_mode_produces_three_statements_and_a_drop() {
         let cfg = split_config();
         let assertions = vec![assertion(
             None,
@@ -765,18 +834,34 @@ mod unit_tests {
         let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
             .unwrap()
             .unwrap();
-        assert_eq!(plan.statements.len(), 2);
-        assert_eq!(plan.statements[0].role, StatementRole::Quarantine);
-        assert_eq!(plan.statements[1].role, StatementRole::Valid);
+        let roles: Vec<StatementRole> = plan.statements.iter().map(|s| s.role).collect();
+        assert_eq!(
+            roles,
+            [
+                StatementRole::Label,
+                StatementRole::Quarantine,
+                StatementRole::Valid
+            ]
+        );
         assert_eq!(plan.valid_table, "poc.staging__orders.orders__valid");
         assert_eq!(
             plan.quarantine_table,
             "poc.staging__orders.orders__quarantine"
         );
+        let intermediate = "poc.staging__orders.orders__quarantine__labeled";
+        assert_eq!(plan.statements[0].target, intermediate);
+        let drop = plan
+            .drop_intermediate
+            .expect("split drops its intermediate");
+        assert_eq!(drop.role, StatementRole::DropLabels);
+        assert_eq!(drop.target, intermediate);
+        assert_eq!(drop.sql, format!("DROP TABLE IF EXISTS {intermediate}"));
     }
 
+    /// The whole statement text for one assertion, so the three statements
+    /// can be read side by side.
     #[test]
-    fn not_null_predicate_shape() {
+    fn not_null_split_shape() {
         let cfg = split_config();
         let assertions = vec![assertion(
             None,
@@ -787,23 +872,190 @@ mod unit_tests {
         let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
             .unwrap()
             .unwrap();
-        // Valid CTAS contains: WHERE customer_id IS NOT NULL
-        assert!(
-            plan.statements[1]
-                .sql
-                .contains("WHERE customer_id IS NOT NULL")
+        let sql: Vec<&str> = plan.statements.iter().map(|s| s.sql.as_str()).collect();
+        assert_eq!(
+            sql,
+            [
+                "CREATE OR REPLACE TABLE poc.staging__orders.orders__quarantine__labeled AS\n\
+                 SELECT *, CASE WHEN NOT (customer_id IS NOT NULL) \
+                 THEN '_error_not_null_customer_id' END AS _error_not_null_customer_id \
+                 FROM poc.staging__orders.orders",
+                "CREATE OR REPLACE TABLE poc.staging__orders.orders__quarantine AS\n\
+                 SELECT * FROM poc.staging__orders.orders__quarantine__labeled \
+                 WHERE _error_not_null_customer_id IS NOT NULL",
+                "CREATE OR REPLACE TABLE poc.staging__orders.orders__valid AS\n\
+                 SELECT * EXCLUDE (_error_not_null_customer_id) \
+                 FROM poc.staging__orders.orders__quarantine__labeled \
+                 WHERE _error_not_null_customer_id IS NULL",
+            ]
         );
-        // Quarantine CTAS contains: WHERE NOT (customer_id IS NOT NULL)
+    }
+
+    /// #1937: each predicate text appears in exactly one statement of the
+    /// plan, whatever the mode and whatever the assertion kind.
+    ///
+    /// `split` used to splice the predicate into the quarantine CTAS and
+    /// again into the valid CTAS. The two statements ran separately, so a
+    /// source row written between them, or a clock read, could put one row
+    /// in both outputs or in neither.
+    #[test]
+    fn every_predicate_is_evaluated_in_exactly_one_statement() {
+        let mut filtered = assertion(None, TestType::NotNull, Some("email"), TestSeverity::Error);
+        filtered.test.filter = Some("region = 'US'".into());
+        let assertions = vec![
+            assertion(
+                Some("nn"),
+                TestType::NotNull,
+                Some("customer_id"),
+                TestSeverity::Error,
+            ),
+            assertion(
+                None,
+                TestType::AcceptedValues {
+                    values: vec!["pending".into()],
+                },
+                Some("status"),
+                TestSeverity::Error,
+            ),
+            assertion(
+                None,
+                TestType::Expression {
+                    expression: "amount >= 0".into(),
+                },
+                None,
+                TestSeverity::Error,
+            ),
+            assertion(
+                None,
+                TestType::InRange {
+                    min: Some("0".into()),
+                    max: Some("10".into()),
+                },
+                Some("qty"),
+                TestSeverity::Error,
+            ),
+            assertion(
+                None,
+                TestType::RegexMatch {
+                    pattern: "^[a-z]+$".into(),
+                },
+                Some("code"),
+                TestSeverity::Error,
+            ),
+            assertion(
+                None,
+                TestType::NotInFuture,
+                Some("created_at"),
+                TestSeverity::Error,
+            ),
+            assertion(
+                None,
+                TestType::OlderThanNDays { days: 7 },
+                Some("updated_at"),
+                TestSeverity::Error,
+            ),
+            filtered,
+        ];
+        // One fragment per assertion that only its predicate contains. The
+        // first assertion is named so its label, which the split's WHERE
+        // clauses repeat, does not contain `customer_id IS NOT NULL`.
+        let fragments = [
+            "customer_id IS NOT NULL",
+            "status IN ('pending')",
+            "amount >= 0",
+            "qty < 0",
+            "regexp_matches(code",
+            "created_at <=",
+            "updated_at <=",
+            "region = 'US'",
+        ];
+        for mode in [
+            QuarantineMode::Split,
+            QuarantineMode::Drop,
+            QuarantineMode::Tag,
+        ] {
+            let cfg = QuarantineConfig {
+                mode,
+                ..split_config()
+            };
+            let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+                .unwrap_or_else(|e| panic!("{mode:?}: {e:?}"))
+                .expect("a plan");
+            for fragment in fragments {
+                let total: usize = plan
+                    .statements
+                    .iter()
+                    .map(|s| s.sql.matches(fragment).count())
+                    .sum();
+                assert_eq!(
+                    total, 1,
+                    "{mode:?}: `{fragment}` must be evaluated exactly once, in one statement; \
+                     plan: {:#?}",
+                    plan.statements
+                );
+            }
+        }
+    }
+
+    /// A `split` on a warehouse with no star exclusion is refused before any
+    /// SQL is produced, and the refusal names the warehouse.
+    ///
+    /// The valid table is written as the intermediate table minus its label
+    /// columns. Without star exclusion the only other way is a column list,
+    /// and that needs a round trip to read the columns first.
+    #[test]
+    fn split_is_refused_on_a_dialect_without_star_exclusion() {
+        use crate::traits::LiteralEscape;
+        use crate::traits::test_dialects::StubDialect;
+
+        let assertions = vec![assertion(
+            None,
+            TestType::NotNull,
+            Some("customer_id"),
+            TestSeverity::Error,
+        )];
+        let dialect = StubDialect(LiteralEscape::Standard);
+        assert!(dialect.star_excluding(&["x"]).is_none(), "precondition");
+
+        let err =
+            compile_quarantine_sql(&assertions, "orders", &table(), &dialect, &split_config())
+                .unwrap_err();
         assert!(
-            plan.statements[0]
-                .sql
-                .contains("WHERE NOT (customer_id IS NOT NULL)")
+            matches!(err, QuarantineError::SplitNeedsStarExclusion { .. }),
+            "{err:?}"
         );
-        // Error label column is present.
+
+        // `drop` and `tag` never needed it.
+        for mode in [QuarantineMode::Drop, QuarantineMode::Tag] {
+            let cfg = QuarantineConfig {
+                mode,
+                ..split_config()
+            };
+            compile_quarantine_sql(&assertions, "orders", &table(), &dialect, &cfg)
+                .unwrap_or_else(|e| panic!("{mode:?} does not exclude columns: {e:?}"))
+                .expect("a plan");
+        }
+    }
+
+    /// The intermediate table is dropped after the split, so its name must
+    /// not be an output's name.
+    #[test]
+    fn split_refuses_an_intermediate_name_that_is_an_output() {
+        let assertions = vec![assertion(
+            None,
+            TestType::NotNull,
+            Some("customer_id"),
+            TestSeverity::Error,
+        )];
+        let cfg = QuarantineConfig {
+            suffix_valid: "__QUARANTINE__labeled".into(),
+            ..split_config()
+        };
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            .unwrap_err();
         assert!(
-            plan.statements[0]
-                .sql
-                .contains("_error_not_null_customer_id")
+            matches!(err, QuarantineError::TableNameCollision { ref name } if name == "orders__quarantine__labeled"),
+            "{err:?}"
         );
     }
 
@@ -825,7 +1077,7 @@ mod unit_tests {
             .unwrap();
         // Valid predicate: NULL or in list.
         assert!(
-            plan.statements[1]
+            plan.statements[0]
                 .sql
                 .contains("(status IS NULL OR status IN ('pending', 'shipped'))")
         );
@@ -845,7 +1097,7 @@ mod unit_tests {
         let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
             .unwrap()
             .unwrap();
-        assert!(plan.statements[1].sql.contains("'it''s'"));
+        assert!(plan.statements[0].sql.contains("'it''s'"));
     }
 
     #[test]
@@ -865,7 +1117,7 @@ mod unit_tests {
         // COALESCE makes NULL `amount >= 0` resolve to TRUE (preserves
         // existing `WHERE NOT (expr)` semantic that excludes NULL).
         assert!(
-            plan.statements[1]
+            plan.statements[0]
                 .sql
                 .contains("COALESCE((amount >= 0), TRUE)")
         );
@@ -893,153 +1145,122 @@ mod unit_tests {
         let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
             .unwrap()
             .unwrap();
-        let valid_sql = &plan.statements[1].sql;
+        // Split combines the labels: any set goes to quarantine, none set to valid.
+        let labels = "_error_not_null_customer_id, _error_accepted_values_status";
+        assert!(plan.statements[1].sql.ends_with(
+            "WHERE _error_not_null_customer_id IS NOT NULL \
+             OR _error_accepted_values_status IS NOT NULL"
+        ));
+        let valid_sql = &plan.statements[2].sql;
+        assert!(
+            valid_sql.contains(&format!("SELECT * EXCLUDE ({labels})")),
+            "{valid_sql}"
+        );
+        assert!(valid_sql.ends_with(
+            "WHERE _error_not_null_customer_id IS NULL \
+             AND _error_accepted_values_status IS NULL"
+        ));
+
+        // Drop has no labels; it ANDs the predicates in its one statement.
+        let drop_cfg = QuarantineConfig {
+            mode: QuarantineMode::Drop,
+            ..split_config()
+        };
+        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &drop_cfg)
+            .unwrap()
+            .unwrap();
+        let valid_sql = &plan.statements[0].sql;
         assert!(valid_sql.contains("customer_id IS NOT NULL AND"));
         assert!(valid_sql.contains("status IS NULL OR status IN ('pending')"));
     }
 
-    /// A clock function is refused in `split` and ACCEPTED in `drop` and
-    /// `tag`.
+    /// A clock is accepted in every mode, `split` included: in the
+    /// expression, in the filter, and in the predicates Rocky generates for
+    /// `not_in_future` and `older_than_n_days`.
     ///
-    /// `split` emits two statements, so one predicate is evaluated twice and
-    /// a boundary row can be called invalid by the first and valid by the
-    /// second — landing in both outputs. `drop` and `tag` emit ONE statement
-    /// each, where the same expression is as legitimate as it is in an
-    /// ordinary check.
-    ///
-    /// The first version of this change refused all three modes. That was a
-    /// FALSE REFUSAL: it broke working `drop` and `tag` configs to close a
-    /// bug that only exists in `split`.
+    /// `split` refused all four while it evaluated each predicate in two
+    /// statements, where a boundary row could be called invalid by the first
+    /// and valid by the second (#1922). It now evaluates each predicate once,
+    /// in the label statement (#1937), so the refusal would be a false one.
+    /// `every_predicate_is_evaluated_in_exactly_one_statement` pins the
+    /// reason; this pins the consequence.
     #[test]
-    fn a_clock_predicate_is_refused_only_in_split_mode() {
-        let volatile = vec![assertion(
+    fn a_clock_is_accepted_in_every_mode() {
+        let mut clock_filter = assertion(
             None,
-            TestType::Expression {
-                expression: "created_at <= now()".to_string(),
-            },
-            None,
+            TestType::NotNull,
+            Some("customer_id"),
             TestSeverity::Error,
-        )];
-
-        let split =
-            compile_quarantine_sql(&volatile, "orders", &table(), &TestDialect, &split_config());
-        assert!(
-            split.is_err(),
-            "split evaluates the predicate twice, so a clock function must be refused"
         );
-
-        for mode in [QuarantineMode::Drop, QuarantineMode::Tag] {
-            let cfg = QuarantineConfig {
-                mode,
-                ..split_config()
-            };
-            compile_quarantine_sql(&volatile, "orders", &table(), &TestDialect, &cfg)
-                .unwrap_or_else(|e| {
-                    panic!("{mode:?} emits one statement; a clock function is legal there: {e:?}")
-                })
-                .expect("a quarantinable assertion produces a plan");
-        }
-    }
-
-    /// The engine's OWN generated clock predicates take the same rule.
-    ///
-    /// `not_in_future` lowers to `col <= <current_timestamp>` and
-    /// `older_than_n_days` to a `<current_date>` comparison, neither of which
-    /// passes through the expression validator — that gate only sees
-    /// user-written fragments. So split mode was refusing a user's
-    /// `created_at <= now()` while generating the identical predicate itself.
-    #[test]
-    fn a_generated_clock_predicate_is_refused_only_in_split_mode() {
-        for test_type in [TestType::NotInFuture, TestType::OlderThanNDays { days: 7 }] {
-            let assertions = vec![assertion(
+        clock_filter.test.filter = Some("created_at <= now()".to_string());
+        let cases = [
+            assertion(
                 None,
-                test_type.clone(),
+                TestType::Expression {
+                    expression: "created_at <= now()".to_string(),
+                },
+                None,
+                TestSeverity::Error,
+            ),
+            clock_filter,
+            assertion(
+                None,
+                TestType::NotInFuture,
                 Some("created_at"),
                 TestSeverity::Error,
-            )];
-
-            assert!(
-                compile_quarantine_sql(
-                    &assertions,
-                    "orders",
-                    &table(),
-                    &TestDialect,
-                    &split_config()
-                )
-                .is_err(),
-                "{test_type:?} reads a clock and split evaluates it twice"
-            );
-
-            for mode in [QuarantineMode::Drop, QuarantineMode::Tag] {
+            ),
+            assertion(
+                None,
+                TestType::OlderThanNDays { days: 7 },
+                Some("created_at"),
+                TestSeverity::Error,
+            ),
+        ];
+        for case in cases {
+            for mode in [
+                QuarantineMode::Split,
+                QuarantineMode::Drop,
+                QuarantineMode::Tag,
+            ] {
                 let cfg = QuarantineConfig {
                     mode,
                     ..split_config()
                 };
-                compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-                    .unwrap_or_else(|e| {
-                        panic!("{mode:?} emits one statement, so {test_type:?} is legal: {e:?}")
-                    })
-                    .expect("a quarantinable assertion produces a plan");
+                compile_quarantine_sql(
+                    std::slice::from_ref(&case),
+                    "orders",
+                    &table(),
+                    &TestDialect,
+                    &cfg,
+                )
+                .unwrap_or_else(|e| panic!("{mode:?} must accept {:?}: {e:?}", case.test))
+                .expect("a quarantinable assertion produces a plan");
             }
         }
     }
 
-    /// Control: a kind with no clock in its generated predicate is accepted
-    /// in every mode, including split.
-    ///
-    /// Without this, a validator that refused every assertion in split would
-    /// pass the test above.
+    /// Control for the test above: `split` still refuses what every mode
+    /// refuses. Without it, a change that stopped validating split
+    /// predicates altogether would pass the test above.
     #[test]
-    fn a_clockless_generated_predicate_is_accepted_in_every_mode() {
+    fn split_still_refuses_a_disallowed_function() {
         let assertions = vec![assertion(
             None,
-            TestType::NotNull,
-            Some("customer_id"),
+            TestType::Expression {
+                expression: "my_udf(created_at) IS NOT NULL".to_string(),
+            },
+            None,
             TestSeverity::Error,
         )];
-        for mode in [
-            QuarantineMode::Split,
-            QuarantineMode::Drop,
-            QuarantineMode::Tag,
-        ] {
-            let cfg = QuarantineConfig {
-                mode,
-                ..split_config()
-            };
-            compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-                .unwrap_or_else(|e| panic!("not_null reads no clock; {mode:?} must accept: {e:?}"))
-                .expect("a quarantinable assertion produces a plan");
-        }
-    }
-
-    /// The same split, for a `filter` rather than the predicate body — the
-    /// filter reaches exactly as far and takes the same mode.
-    #[test]
-    fn a_clock_filter_is_refused_only_in_split_mode() {
-        let mut a = assertion(
-            None,
-            TestType::NotNull,
-            Some("customer_id"),
-            TestSeverity::Error,
-        );
-        a.test.filter = Some("created_at <= now()".to_string());
-        let volatile = vec![a];
-
-        assert!(
-            compile_quarantine_sql(&volatile, "orders", &table(), &TestDialect, &split_config())
-                .is_err(),
-            "a clock filter is re-evaluated in split mode too"
-        );
-
-        for mode in [QuarantineMode::Drop, QuarantineMode::Tag] {
-            let cfg = QuarantineConfig {
-                mode,
-                ..split_config()
-            };
-            compile_quarantine_sql(&volatile, "orders", &table(), &TestDialect, &cfg)
-                .unwrap_or_else(|e| panic!("{mode:?} must accept a clock filter: {e:?}"))
-                .expect("a quarantinable assertion produces a plan");
-        }
+        let err = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &split_config(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("my_udf"), "{err}");
     }
 
     #[test]
@@ -1151,10 +1372,10 @@ mod unit_tests {
         let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
             .unwrap()
             .unwrap();
-        // Quarantine runs first so a partial failure leaves a stray
+        // Quarantine runs before valid so a partial failure leaves a stray
         // quarantine table rather than a stale valid table.
-        assert_eq!(plan.statements[0].role, StatementRole::Quarantine);
-        assert_eq!(plan.statements[1].role, StatementRole::Valid);
+        assert_eq!(plan.statements[1].role, StatementRole::Quarantine);
+        assert_eq!(plan.statements[2].role, StatementRole::Valid);
     }
 
     #[test]
@@ -1220,9 +1441,9 @@ mod unit_tests {
         let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
             .unwrap()
             .unwrap();
-        // Valid CTAS: (amount IS NULL OR NOT (amount < 0 OR amount > 1000))
+        // Label CTAS: (amount IS NULL OR NOT (amount < 0 OR amount > 1000))
         assert!(
-            plan.statements[1]
+            plan.statements[0]
                 .sql
                 .contains("(amount IS NULL OR NOT (amount < 0 OR amount > 1000))")
         );
@@ -1242,9 +1463,9 @@ mod unit_tests {
         let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
             .unwrap()
             .unwrap();
-        // Valid CTAS: (email IS NULL OR regexp_matches(email, '^[a-z]+$'))
+        // Label CTAS: (email IS NULL OR regexp_matches(email, '^[a-z]+$'))
         assert!(
-            plan.statements[1]
+            plan.statements[0]
                 .sql
                 .contains("(email IS NULL OR regexp_matches(email, '^[a-z]+$'))")
         );
@@ -1264,7 +1485,7 @@ mod unit_tests {
         // Out-of-scope rows (filter false/null) pass unconditionally:
         // (CASE WHEN (region = 'US') THEN (customer_id IS NOT NULL) ELSE TRUE END)
         assert!(
-            plan.statements[1]
+            plan.statements[0]
                 .sql
                 .contains("CASE WHEN (region = 'US') THEN (customer_id IS NOT NULL) ELSE TRUE END")
         );
@@ -1343,7 +1564,12 @@ mod unit_tests {
         use crate::traits::LiteralEscape;
         use crate::traits::test_dialects::StubDialect;
 
-        let cfg = split_config();
+        // `drop`, because `StubDialect` has no star exclusion and so cannot
+        // `split`. The encoding under test is in the predicate either way.
+        let cfg = QuarantineConfig {
+            mode: QuarantineMode::Drop,
+            ..split_config()
+        };
         let assertions = vec![assertion(
             None,
             TestType::AcceptedValues {
@@ -1362,7 +1588,7 @@ mod unit_tests {
         )
         .unwrap()
         .unwrap();
-        let sql = &standard.statements[1].sql;
+        let sql = &standard.statements[0].sql;
         assert!(
             sql.contains(r"(status IS NULL OR status IN ('ok', 'trailing\', 'it''s'))"),
             "{sql}"
@@ -1377,7 +1603,7 @@ mod unit_tests {
         )
         .unwrap()
         .unwrap();
-        let sql = &backslash.statements[1].sql;
+        let sql = &backslash.statements[0].sql;
         assert!(
             sql.contains(r"(status IS NULL OR status IN ('ok', 'trailing\\', 'it\'s'))"),
             "{sql}"
@@ -1408,7 +1634,7 @@ mod unit_tests {
     /// warehouse credentials. #1820 gave the CHECKS path a parse-and-allowlist
     /// gate (`validate_check_expression`, called at `tests.rs` before the
     /// `NOT (...)` splice) so a predicate cannot call a content-reading
-    /// function. Quarantine spliced the same user SQL twice with only the
+    /// function. Quarantine spliced the same user SQL with only the
     /// terminator check, so the same predicate was still reachable here.
     ///
     /// A function off the allowlist sits in scalar position and is refused by
@@ -1530,6 +1756,12 @@ mod unit_tests {
         }
         fn tablesample_clause(&self, a: u32) -> Option<String> {
             TestDialect.tablesample_clause(a)
+        }
+        // Delegated too. Without it `split` would refuse this dialect for
+        // having no star exclusion, and the refusals below would pass
+        // whatever the parser did.
+        fn star_excluding(&self, columns: &[&str]) -> Option<String> {
+            TestDialect.star_excluding(columns)
         }
         fn insert_overwrite_partition(
             &self,
@@ -1655,9 +1887,8 @@ mod unit_tests {
 
     #[test]
     fn quarantine_expression_refuses_an_unbalanced_quote() {
-        // The lowered predicate is spliced into the quarantine CTAS twice —
-        // the error-label column and the WHERE — so an odd quote count could
-        // pair across the two copies.
+        // An odd quote count in the predicate could pair with a quote later
+        // in the same statement, such as the label literal after it.
         let cfg = split_config();
         let assertions = vec![assertion(
             None,
@@ -1684,9 +1915,9 @@ mod unit_tests {
             .unwrap()
             .unwrap();
         assert!(
-            plan.statements[1].sql.contains("region = 'US;CA'"),
+            plan.statements[0].sql.contains("region = 'US;CA'"),
             "{}",
-            plan.statements[1].sql
+            plan.statements[0].sql
         );
     }
 }

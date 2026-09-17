@@ -266,26 +266,17 @@ pub enum ExpressionUse {
     /// ONLY here: it changes what equality MEANS, so the grouping is no
     /// longer the one the key describes.
     GroupingKey,
-
-    /// A predicate spliced into MORE THAN ONE statement, where two
-    /// evaluations can disagree.
-    ///
-    /// Only quarantine `split` mode reaches this: it evaluates the predicate
-    /// in the quarantine CTAS and again in the valid-table CTAS that follows,
-    /// so `created_at <= now()` can call a boundary row invalid in the first
-    /// and valid in the second, putting it in both outputs. See the issue
-    /// linked from #1922.
-    ///
-    /// `drop` and `tag` emit ONE statement each and use
-    /// [`ExpressionUse::SinglePredicate`] instead — refusing a clock function
-    /// there would be a false refusal.
-    ReevaluatedPredicate,
+    // There was a fourth mode, for a predicate evaluated in two statements.
+    // Only quarantine `split` used it, and `split` now evaluates each
+    // predicate once (#1937). If a caller ever evaluates a user expression in
+    // more than one statement again, a volatile function can disagree with
+    // itself there, and that caller needs a mode that refuses one.
 }
 
 impl ExpressionUse {
     /// Whether a value that can change between evaluations is acceptable.
     ///
-    /// True exactly when the expression is evaluated once, in one statement.
+    /// False only for a grouping key, where the value must come from the row.
     fn tolerates_volatility(self) -> bool {
         matches!(
             self,
@@ -296,10 +287,10 @@ impl ExpressionUse {
     /// Whether `COLLATE` is refused.
     ///
     /// Deliberately NOT derived from [`Self::tolerates_volatility`]. An
-    /// explicit collation is deterministic — two evaluations of it agree — so
-    /// it is harmless in a re-evaluated predicate. What it changes is the
-    /// meaning of equality, which matters only where the expression's value
-    /// is compared against other rows' values to form groups.
+    /// explicit collation is deterministic, so it is not a volatility
+    /// question. What it changes is the meaning of equality, which matters
+    /// only where the expression's value is compared against other rows'
+    /// values to form groups.
     fn refuses_collate(self) -> bool {
         matches!(self, ExpressionUse::GroupingKey)
     }
@@ -322,9 +313,7 @@ impl ExpressionUse {
     /// right for it; only the noun is off. Tracked separately (#1971).
     pub(crate) fn noun(self) -> &'static str {
         match self {
-            ExpressionUse::SinglePredicate | ExpressionUse::ReevaluatedPredicate => {
-                "An expression check"
-            }
+            ExpressionUse::SinglePredicate => "An expression check",
             ExpressionUse::ScalarProjection => "A metadata column value",
             ExpressionUse::GroupingKey => "A key expression",
         }
@@ -333,9 +322,7 @@ impl ExpressionUse {
     /// [`Self::noun`], mid-sentence.
     pub(crate) fn noun_lowercase(self) -> &'static str {
         match self {
-            ExpressionUse::SinglePredicate | ExpressionUse::ReevaluatedPredicate => {
-                "an expression check"
-            }
+            ExpressionUse::SinglePredicate => "an expression check",
             ExpressionUse::ScalarProjection => "a metadata column value",
             ExpressionUse::GroupingKey => "a key expression",
         }
@@ -350,7 +337,7 @@ impl ExpressionUse {
     /// is any expression over the row that rows can be grouped by.
     pub(crate) fn accepted_shape(self) -> &'static str {
         match self {
-            ExpressionUse::SinglePredicate | ExpressionUse::ReevaluatedPredicate => {
+            ExpressionUse::SinglePredicate => {
                 "one boolean expression over the model's columns, e.g. `amount >= 0`"
             }
             ExpressionUse::ScalarProjection => {
@@ -367,9 +354,7 @@ impl ExpressionUse {
     /// predicate wording of that refusal stays exactly what it was.
     pub(crate) fn single_kind(self) -> &'static str {
         match self {
-            ExpressionUse::SinglePredicate | ExpressionUse::ReevaluatedPredicate => {
-                "boolean expression"
-            }
+            ExpressionUse::SinglePredicate => "boolean expression",
             ExpressionUse::ScalarProjection => "scalar expression",
             ExpressionUse::GroupingKey => "key expression",
         }
@@ -597,13 +582,6 @@ mod tests {
         check("email COLLATE NOCASE = 'a'").expect("a collated predicate is fine");
         validate_check_expression(
             CTX,
-            "email COLLATE NOCASE = 'a'",
-            &GenericDialect,
-            ExpressionUse::ReevaluatedPredicate,
-        )
-        .expect("deterministic, so it agrees with itself across two statements");
-        validate_check_expression(
-            CTX,
             "email COLLATE NOCASE",
             &GenericDialect,
             ExpressionUse::ScalarProjection,
@@ -675,11 +653,6 @@ mod tests {
             ),
             "{predicate}"
         );
-        let split = refuse("1 +", ExpressionUse::ReevaluatedPredicate);
-        assert!(
-            split.contains("An expression check is one boolean"),
-            "{split}"
-        );
         let trailing_check = refuse("1, 2", ExpressionUse::SinglePredicate);
         assert!(
             trailing_check.contains(
@@ -738,7 +711,7 @@ mod tests {
     /// name missing from `VOLATILE_FUNCTIONS` was still safe THERE. This
     /// module has its own allowlist, so that fallback does not cover it: a
     /// name on the allowlist but absent from `VOLATILE_FUNCTIONS` is accepted
-    /// as a grouping key and as a re-evaluated predicate. `localtime` was
+    /// as a grouping key. `localtime` was
     /// exactly that — allowlisted here, absent there, while `localtimestamp`
     /// sat on both lists.
     ///
@@ -773,18 +746,17 @@ mod tests {
             assert!(
                 crate::determinism::VOLATILE_FUNCTIONS.contains(&name.to_uppercase().as_str()),
                 "{name} is allowlisted and clock-shaped but missing from \
-                 VOLATILE_FUNCTIONS, so it passes GroupingKey and \
-                 ReevaluatedPredicate"
+                 VOLATILE_FUNCTIONS, so it passes GroupingKey"
             );
         }
     }
 
-    /// Each clock name is refused in both restricted positions.
+    /// Each clock name is refused as a grouping key.
     ///
     /// The matrix below previously tested `localtimestamp()` and never
     /// `localtime()`, which is why the gap survived review.
     #[test]
-    fn every_clock_name_is_refused_as_a_key_and_when_reevaluated() {
+    fn every_clock_name_is_refused_as_a_key() {
         for expr in [
             "now()",
             "current_timestamp()",
@@ -794,13 +766,6 @@ mod tests {
             "localtimestamp()",
         ] {
             check_key(expr).expect_err(&format!("{expr} must not pass as a grouping key"));
-            validate_check_expression(
-                CTX,
-                expr,
-                &GenericDialect,
-                ExpressionUse::ReevaluatedPredicate,
-            )
-            .expect_err(&format!("{expr} must not pass when re-evaluated"));
             // ...and is still fine where it is evaluated once.
             check(expr).unwrap_or_else(|e| panic!("{expr} must stay legal in a predicate: {e:?}"));
         }
