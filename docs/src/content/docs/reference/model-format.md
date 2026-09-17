@@ -67,7 +67,7 @@ The `.toml` file names the model, lists what it depends on, picks a materializat
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"merge"`, `"time_interval"`, `"ephemeral"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`. `"incremental"` is refused on a transformation model (`E037`): see [Incremental](#incremental). |
+| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"merge"`, `"time_interval"`, `"view"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`. Two are refused: `"incremental"` on a transformation model (`E037`, see [Incremental](#incremental)), and `"ephemeral"` outright (`E038`, see [Ephemeral](#ephemeral)). |
 | `timestamp_column` | string | | Column used as the incremental watermark. Required when `type = "microbatch"`. |
 | `unique_key` | list of strings | | Key columns for merge matching. Required when `type = "merge"`. |
 | `update_columns` | list of strings | | Columns to update on merge match. Defaults to all non-key columns if omitted. |
@@ -706,24 +706,18 @@ When `update_columns` is omitted, Rocky updates all non-key columns.
 
 ### Ephemeral
 
-An [ephemeral](/reference/glossary/#ephemeral) model never becomes a table. Rocky inlines it as a [CTE](/reference/glossary/#cte-common-table-expression) — a named subquery in a `WITH` clause — inside every model that reads it. Use it for a small intermediate step you do not want to keep.
+`type = "ephemeral"` is refused. `rocky compile` reports the model as error `E038`, with this message:
 
-**Config** (`models/stg_recent_orders.toml`):
+> model 'stg_recent_orders' uses `type = "ephemeral"`, which is not supported: an ephemeral model is not materialized and is not inlined into its consumers, so a consumer reads whatever table already carries the name
 
-```toml
-name = "stg_recent_orders"
-depends_on = []
+Rocky never inlined such a model. Nothing rewrote a consumer's `FROM <model>` into a `WITH` clause, so the consumer read whatever physical table already carried that name: an error when none existed, and an unrelated table when one did.
 
-[strategy]
-type = "ephemeral"
+Two strategies cover what it was for:
 
-[target]
-catalog = "analytics"
-schema = "staging"
-table = "stg_recent_orders"
-```
-
-No DDL runs for ephemeral models. The SQL body is injected as a `WITH stg_recent_orders AS (…)` CTE wherever the model is referenced.
+| You want | Use |
+|---|---|
+| An intermediate that several models read | `type = "view"`. No copied data, always-fresh reads, one view object per model, on every dialect. |
+| An intermediate only one model reads | An earlier step of that model, in a [`.rocky` file](/concepts/rocky-dsl/). The step folds into the later ones when Rocky lowers the model. |
 
 ---
 
