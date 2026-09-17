@@ -52,12 +52,6 @@ rocky compile
       "target": { "catalog": "acme_warehouse", "schema": "gold", "table": "fct_revenue" },
       "freshness": { "max_lag_seconds": 86400, "time_column": "order_date", "severity": "warning" },
       "contract_source": "auto",
-      "incrementality_hint": {
-        "is_candidate": true,
-        "recommended_column": "order_date",
-        "confidence": "medium",
-        "signals": ["column name 'order_date' ends with '_date' (timestamp pattern)"]
-      },
       "cost_hint": {
         "estimated_rows": 10000,
         "estimated_bytes": 2560000,
@@ -74,11 +68,10 @@ rocky compile
 
 `models_detail` carries each compiled model's declarative shape. Four fields are always there: `name`, the materialization `strategy` (wire form `{"type": "..."}`), the `target` coordinates, and the direct `depends_on` list.
 
-Four more appear only when they apply:
+Three more appear only when they apply:
 
 - `freshness` — the model's freshness expectation.
 - `contract_source` — `"auto"` for a sibling `.contract.toml`, `"explicit"` for one passed via `--contracts`.
-- `incrementality_hint` — set on a `full_refresh` model that has a monotonic-looking column.
 - `cost_hint` — set when the upstream statistics support an estimate.
 
 The `tags` object holds the model's `[tags]` merged over any config-group baseline, with the sidecar winning. Rocky omits an empty `tags`, an empty `depends_on`, and any absent optional field.
@@ -193,7 +186,7 @@ Compile with seeded source schemas so leaf `.sql` models pick up real types:
 rocky compile --with-seed
 ```
 
-`--with-seed` looks for `data/seed.sql` relative to the project root (one level up from `--models`). It opens an in-memory DuckDB, runs the seed, and feeds the resulting `information_schema.columns` back into the compiler so downstream incrementality and type-inference get concrete types instead of `RockyType::Unknown`. Bails if `data/seed.sql` is missing or fails to execute.
+`--with-seed` looks for `data/seed.sql` relative to the project root (one level up from `--models`). It opens an in-memory DuckDB, runs the seed, and feeds the resulting `information_schema.columns` back into the compiler so type inference gets concrete types instead of `RockyType::Unknown`. Bails if `data/seed.sql` is missing or fails to execute.
 
 ### Related Commands
 
@@ -521,16 +514,17 @@ Three outcomes, and the middle one is the point of the no-credentials promise:
 
 One exception sits under row two: a placeholder written as a bare value, such as `port = ${PORT}`, is not valid TOML whether or not the variable is set. That is row three, and the error names `PORT`.
 
-Full-refresh models emit a complete `CREATE OR REPLACE TABLE … AS …` that runs as-is against a fresh warehouse and matches what a run executes in the resolved dialect. Incremental and merge models emit their steady-state statement instead: a bare `INSERT` or `MERGE` that operates on an existing target. `rocky run` bootstraps the target table on first build and threads the incremental watermark from state, neither of which a static emit can reproduce, so those files carry a leading note to that effect:
+Full-refresh models emit a complete `CREATE OR REPLACE TABLE … AS …` that runs as-is against a fresh warehouse and matches what a run executes in the resolved dialect. Merge and `delete_insert` models emit their steady-state statement instead, which operates on an existing target. `rocky run` bootstraps the target table on first build, which a static emit cannot reproduce, so those files carry a leading note:
 
 ```sql
--- NOTE: incremental/merge statement — operates on an existing target.
--- `rocky run` bootstraps the table on first build and threads the
--- incremental watermark from state; this static SQL does neither.
+-- NOTE: merge/delete_insert statement — operates on an existing target.
+-- `rocky run` creates the table on first build; this static SQL does not.
 MERGE INTO ...
 ```
 
-Models that produce no standalone SQL are reported on stderr rather than silently dropped, so you never mistake the emitted set for the complete project. Two cases are skipped this way: ephemeral models (inlined as CTEs upstream, so they have no statement of their own) and strategies that cannot render offline, such as a Snowflake dynamic table that needs a live compute-warehouse name.
+`emit-sql` refuses a project with any compile error, before it filters by model. `type = "incremental"` on a transformation model fails with `E037`, and `type = "ephemeral"` fails with `E038`. Either stops the whole export, even when `--model` names a different model.
+
+A model whose SQL cannot be rendered offline is reported on stderr rather than silently dropped. So you never mistake the emitted set for the complete project. A Snowflake dynamic table is one: it needs a live compute-warehouse name.
 
 ### Examples
 
@@ -571,7 +565,7 @@ When some models cannot be emitted as standalone SQL, the skip report goes to st
 
 ```text
 emit-sql: 1 model(s) not emitted:
-  - dim_session (ephemeral — inlined as a CTE)
+  - dim_session (cannot render offline: <the dialect's reason>)
 ```
 
 ### Related Commands

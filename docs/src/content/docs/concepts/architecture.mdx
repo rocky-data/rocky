@@ -27,7 +27,7 @@ Config struct
 Source metadata  ◀── Fivetran REST API / DuckDB info_schema / manual config
     │  compile .sql + .toml models
     ▼
-rocky-compiler  →  diagnostics (E001–E036 / W001–W031)
+rocky-compiler  →  diagnostics (E001–E037 / W001–W031)
     │  produces typed ProjectIr on success
     ▼
 ProjectIr  (one ModelIr per model, fully typed and validated)
@@ -348,7 +348,6 @@ Decides how a model's rows land in the target table. One strategy per model.
 - **MaterializedView**: `CREATE OR REPLACE MATERIALIZED VIEW ... AS SELECT ...`. Databricks-specific.
 - **DynamicTable**: `CREATE OR REPLACE DYNAMIC TABLE ... TARGET_LAG = '...' AS SELECT ...`. Snowflake-specific.
 - **TimeInterval**: partition-keyed materialization. The model SQL uses `@start_date` and `@end_date` placeholders; the runtime substitutes per-partition timestamps. Supports `--partition`, `--from/--to`, `--latest`, `--missing` CLI flags.
-- **Ephemeral**: not materialized; inlined as a CTE in downstream consumers.
 - **DeleteInsert**: delete rows matching the partition key, then insert fresh data. Cheaper alternative to `Merge` when the partition key identifies the rows being rewritten.
 - **Microbatch**: alias for `TimeInterval` with `hour`-granularity defaults; dbt-compatible naming.
 - **ContentAddressed**: content-addressed Parquet + Delta log commit via the `rocky-iceberg` writer. Designed for cross-engine reads (DuckDB `iceberg_scan`, Trino, Spark). SQL generation does not run for this strategy; the runtime drives `rocky-iceberg::uniform_writer` directly. See [Content-Addressed Materialization](/concepts/content-addressed/).

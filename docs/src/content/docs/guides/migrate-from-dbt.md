@@ -313,7 +313,7 @@ The importer does not translate the items below, by design. Rocky has no Jinja r
 - **dbt tests with no native Rocky equivalent.** Beyond the canonical four, the importer converts several `dbt_utils` and `dbt_expectations` tests to native Rocky assertions: `unique_combination_of_columns`, `accepted_range` / `expect_column_values_to_be_between` (→ `in_range`), `expect_column_values_to_match_regex` (→ `regex_match`), `expect_column_values_to_be_in_set` (→ `accepted_values`), and `dbt_utils.expression_is_true` (→ `expression`). See [Generic test mapping](#generic-test-mapping). Anything outside that set — other `dbt_utils.*` and `dbt_expectations.*` tests, project-defined generics, other model-level tests — becomes a structured `UnsupportedTest` warning per occurrence. The emitted TOML carries no stub for it. Rewrite those as a Rocky `expression` test or a quality-pipeline check.
 - **Singular tests** in `tests/` (custom SQL): copy and rewrite them yourself.
 - **dbt macros and `dbt_packages/`.** Rocky has no Jinja runtime, so no macro body expands.
-- **Raw Jinja that calls `is_incremental()`**, on the no-manifest or raw-manifest path: **refused**. Stripping the branch can delete bounded logic. Keeping it can reference a target that does not exist during bootstrap. The refusal covers compound `if` and `elif` conditions and indirect `{% set %}` forms. It applies even when a `unique_key` would map the model to `merge`: a full-source merge is idempotent by key, but it is not the same query as dbt's bounded one. You have two ways out. Compile dbt in an incremental context and import that manifest. Do this once you confirm the compiled SQL keeps its intended predicate and suits Rocky's initial target state. Or rewrite the model with a strategy Rocky supports.
+- **Raw Jinja that calls `is_incremental()`**, on the no-manifest or raw-manifest path: **refused**. Stripping the branch can delete bounded logic. Keeping it can reference a target that does not exist during bootstrap. The refusal covers compound `if` and `elif` conditions and indirect `{% set %}` forms. It applies even when a `unique_key` would map the model to `merge`. A full-source merge is idempotent by key, but it is not the same query as dbt's bounded one. The refusal message also suggests compiling dbt in an incremental context and importing that manifest. That does not help today. A manifest import refuses an unkeyed model too, and imports a keyed one as `merge` with the filter still in its SQL ([#2059](https://github.com/rocky-data/rocky/issues/2059)). Rewrite the model by hand: remove the `is_incremental()` filter, then use `merge` with a `unique_key` or a `time_interval` model.
 - **`{% for %}` and `{% set %}`** on the no-manifest path: **refused**. The importer lists the model as a failure rather than half-rendering it into broken SQL, because the loop or assignment body would survive exactly once. Re-run after `dbt compile`, which the manifest path resolves, or rewrite the model. A `{% if %}` is different: the importer emits it verbatim with a TODO marker, and its body then applies *unconditionally*, so review it. `{{ var() }}` is not in this list. It converts to an `@var()` run-variable marker, as described above.
 - **Unmapped `materialized` values** (`dynamic_table`, `seed`): flattened to `full_refresh` and listed in `MIGRATION-NOTES.md`. `materialized_view` is not in this group; it maps to Rocky's own `materialized_view` strategy.
 - **Adapters Rocky does not support natively** (Postgres, Redshift, and others): the generated repo stubs DuckDB so the project still loads. Replace the `[adapter]` block once Rocky has an adapter for that warehouse, or pass `--target-adapter <kind>` to skip detection.
@@ -905,8 +905,8 @@ intent = "Stage raw Shopify orders with order_id, customer, date, and amount col
 depends_on = []
 
 [strategy]
-type = "incremental"
-timestamp_column = "_fivetran_synced"
+type = "merge"
+unique_key = ["order_id"]
 
 [target]
 catalog = "warehouse"
@@ -967,9 +967,25 @@ So you can leave a vendor-maintained staging package in dbt and write your own a
 
 The importer names each model after its SQL file's stem, so `stg_orders.sql` becomes `stg_orders`. If your dbt project renames models with `{{ config(alias='...') }}`, a `depends_on` reference may not match. Read each TOML file's `name` field and update the `depends_on` references to match.
 
-### Incremental models do not pick up the right watermark
+### An incremental model imported as `full_refresh`
 
-A Rocky transformation incremental expects the model SQL to carry its own row filter. `timestamp_column` adds no filter. That is why the raw and no-manifest importer refuses unresolved Jinja that calls `is_incremental()`, rather than deleting bounded logic silently. If you import from a manifest, read the compiled SQL and confirm it contains the bound you intended, on `_fivetran_synced` or `updated_at` for example.
+Rocky has no append strategy for transformation models. It refuses `type = "incremental"` there with `E037`, because it would re-insert every row on each run. So the importer maps an append-style dbt model to `full_refresh`, which rebuilds from the model SQL and cannot duplicate rows:
+
+- an `incremental` model with no `unique_key`
+- `incremental_strategy = 'append'`, even with a `unique_key`
+- `incremental_strategy = 'merge'` with no `unique_key`
+- an `incremental_strategy` the importer does not recognise
+- a `microbatch` model with no `unique_key`
+
+Each one appears as a warning. To keep incremental behaviour, give the model a `unique_key` and set `incremental_strategy` to `'merge'` or leave it unset. It then maps to `merge`. Otherwise, rewrite it as a [`time_interval`](/concepts/time-interval/) model with `@start_date` and `@end_date`.
+
+Any of these is refused rather than imported when its dbt SQL uses `is_incremental()`. dbt compiles that branch as true against an existing table. The compiled SQL can then keep a filter such as `WHERE updated_at > '2026-09-01'`. As `full_refresh`, every run would replace the table with only those recent rows. So the importer lists that model as a failed import instead. Rewrite it by hand: remove the `is_incremental()` filter, then use `merge` with a `unique_key` or a `time_interval` model.
+
+:::caution[Remove the filter before you rely on merge]
+A keyed model is imported as `merge` from the same compiled SQL, and the importer does not refuse it. `merge` creates its table from that SQL on the first run, and so does `delete_insert`. If the SQL kept an `is_incremental()` filter, that first run goes wrong ([#2059](https://github.com/rocky-data/rocky/issues/2059)). The common filter, `MAX(...)` over the model's own table, fails because that table does not exist yet. A literal cutoff loads only the recent rows. Check every imported model whose dbt SQL used `is_incremental()`, and remove the filter first.
+:::
+
+The raw and no-manifest importer still refuses unresolved Jinja that calls `is_incremental()`, rather than deleting bounded logic silently.
 
 ### Environment-specific logic
 

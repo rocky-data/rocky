@@ -88,27 +88,27 @@ GROUP BY DATE_TRUNC('month', o.order_date), p.category
 
 ### Pick a materialization + target
 
-Pair `--materialization` with `--watermark` for an incremental model. `--watermark` names the timestamp column Rocky compares against the last run's high-water mark (see the [glossary](/reference/glossary/)). Add `--target` to land the output in a real catalog and schema instead of the `generated.ai.*` default:
+`--materialization` takes `full_refresh` (the default) or `merge`. `incremental` and `ephemeral` fail before any LLM call, with `E037` and `E038`. Pair `merge` with `--unique-key`, the columns that identify a row. Add `--target` to land the output in a real catalog and schema instead of the `generated.ai.*` default:
 
 ```bash
 rocky ai "daily order facts from stg_orders" \
-  --materialization incremental --watermark order_date \
+  --materialization merge --unique-key order_date \
   --target analytics.marts.fct_orders_daily
 ```
 
-The sidecar (`models/fct_orders_daily.toml`) then carries the materialization, the watermark, and the target:
+The sidecar (`models/fct_orders_daily.toml`) then carries the materialization, the key, and the target:
 
 ```toml
 name = "fct_orders_daily"
 
 [strategy]
-type = "incremental"
-timestamp_column = "order_date"
+type = "merge"
+unique_key = ["order_date"]
 
 [target]
 catalog = "analytics"
-schema  = "marts"
-table   = "fct_orders_daily"
+schema = "marts"
+table = "fct_orders_daily"
 ```
 
 Pass `--overwrite` to replace a body or sidecar that already exists at the destination. Without that flag the command fails instead of overwriting a model you wrote yourself. See [`rocky ai`](/reference/commands/ai/#rocky-ai) for the full flag table, including the v1 `--materialization merge` limitation.
@@ -201,8 +201,7 @@ Grain: one row per date per category.
 depends_on = ["stg_orders", "dim_products"]
 
 [strategy]
-type = "incremental"
-timestamp_column = "order_date"
+type = "full_refresh"
 
 [target]
 catalog = "analytics"

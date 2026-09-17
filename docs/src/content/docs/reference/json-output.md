@@ -306,6 +306,9 @@ A check name is one of:
 - `null_rate:<column>` — one per configured column.
 - `cross_source_overlap:<source_type>.<table>` — one per sibling group.
 - `quarantine:compile` — a quarantine plan Rocky refused to compile.
+- `quarantine:execute` — a quarantine statement that failed at the warehouse. `not_evaluated` names the statement's role and the warehouse error.
+
+A failing `quarantine:compile` or `quarantine:execute` also counts the table in `tables_failed` and lists it in `errors`. That is what fails the run. With `fail_on_error` off, the check result itself is still let through, but the failed table fails the run anyway. A refused plan has `failure_kind` `compile-error`. A failed write keeps the warehouse error's `failure_kind` and `cooldown_seconds`.
 - `schema_expansion` — a `[[tables]]` entry naming a whole schema that could not be listed.
 - the `name` you gave a `[[checks.custom]]` block.
 - an assertion's `name`, or `{kind}:{column}` when you did not set one (`{kind}:-` when the kind has no column).

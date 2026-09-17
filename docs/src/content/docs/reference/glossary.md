@@ -57,7 +57,7 @@ Identified by the hash of its contents rather than a name or timestamp. Rocky re
 
 ### CTE (common table expression)
 
-A named subquery declared with `WITH <name> AS (…)` that the rest of the statement can read. An [ephemeral](#ephemeral) model becomes a CTE inside every model that reads it, instead of becoming its own table.
+A named subquery declared with `WITH <name> AS (…)` that the rest of the statement can read. Rocky writes one when it lowers a `.rocky` model's steps into a single statement.
 
 ### DDL (data definition language)
 
@@ -93,7 +93,7 @@ A [config group](#config-group) with `enforce = true`. The group's fields become
 
 ### Ephemeral
 
-A model that is never written to the warehouse. Rocky inlines its SQL as a [CTE](#cte-common-table-expression) in every model that reads it, and runs no DDL for it. Set it with `strategy = "ephemeral"`. See [Ephemeral](/reference/model-format/#ephemeral).
+A dbt strategy Rocky refuses. `type = "ephemeral"` is error `E038`: Rocky never inlined such a model into its consumers, so a consumer read whatever table already carried the name. Use `view` for an intermediate several models read. See [Ephemeral](/reference/model-format/#ephemeral).
 
 ### Exit code
 
@@ -125,7 +125,7 @@ A rule that hides a sensitive column's value. Tag the column with a `[classifica
 
 ### Materialization strategy
 
-How a model's output lands in the warehouse: `view`, `table`, `incremental`, `merge`, and others. Set per model. See [Model format](/reference/model-format/).
+How a model's output lands in the warehouse: `view`, `table`, `merge`, `time_interval`, and others. A replication pipeline also takes `incremental`, which a transformation model cannot use (`E037`). Set per model. See [Model format](/reference/model-format/).
 
 ### MCP (Model Context Protocol)
 
@@ -161,7 +161,7 @@ A deterministic, reviewable record of what a run will do: compiled SQL, drift ac
 
 ### Plan store
 
-Where Rocky keeps built plans between `rocky plan` and `rocky apply`, so a plan can be reviewed, approved, and applied later. `rocky plan` writes each one to `.rocky/plans/<plan-id>.json`, and `rocky apply` reads it back. See [Plan store v1 to v2](/concepts/plan-store-v1-to-v2/).
+Where Rocky keeps built plans between `rocky plan` and `rocky apply`, so a plan can be reviewed, approved, and applied later. `rocky plan` writes each one to `.rocky/plans/<plan-id>.json`, and `rocky apply` reads it back. The directory is a trusted input: anyone who can write it can author a plan that `rocky apply` runs. See [Branches](/concepts/architecture-of-trust/#branches) for why, and [Plan store v1 to v2](/concepts/plan-store-v1-to-v2/).
 
 ### Provenance
 
@@ -169,7 +169,7 @@ The record of where a result came from: which SQL produced it, which inputs it r
 
 ### Quarantine
 
-Separating a model's failing rows from its passing ones, so bad data does not block the run or reach downstream readers. Turn it on under `[pipeline.<name>.checks.quarantine]` of a `quality` pipeline and pick a mode: split the rows into separate tables, tag them in place, or drop them. See [`[pipeline.NAME.checks]`](/reference/configuration/#pipelinenamechecks).
+Separating a model's failing rows from its passing ones, so a downstream reader can read only the passing rows. It does not keep the run green: the error-severity checks that select those rows still fail it under the default `fail_on_error = true`. Nor does every mode move the rows: `tag` marks them and leaves them in the table. Turn it on under `[pipeline.<name>.checks.quarantine]` of a `quality` pipeline. Pick a mode: split the rows into separate tables, tag them in place, or drop them. See [`[pipeline.NAME.checks]`](/reference/configuration/#pipelinenamechecks).
 
 ### Reconcile
 

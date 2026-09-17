@@ -20,7 +20,6 @@ Rocky models are plain SQL files. Dependencies and materialization live in a sid
   ┌─────────────────────────────────────────────────────┐
   │ the strategy decides the statement                  │
   │   full_refresh → CREATE OR REPLACE TABLE …          │
-  │   incremental  → INSERT INTO … WHERE ts > watermark │
   │   merge        → MERGE INTO … USING (…)             │
   │   … and the other strategies listed below           │
   └──────────────────────────┬──────────────────────────┘
@@ -76,14 +75,6 @@ Model TOML fields (full reference: [Model Format](/reference/model-format/)):
 ### `[strategy]`
 
 A sidecar declares at most one `[strategy]`. If it declares none, Rocky takes one from the config group, then from the directory defaults, and otherwise uses `full_refresh`. Pick the block that matches what you need.
-
-**Incremental.**
-
-```toml
-[strategy]
-type = "incremental"
-timestamp_column = "updated_at"
-```
 
 **Merge.** `update_columns` is optional and defaults to all non-key columns.
 
@@ -179,7 +170,6 @@ WHEN NOT MATCHED THEN INSERT *
 | Strategy | When to use | Adapters |
 |---|---|---|
 | [`full_refresh`](#full_refresh-default) | Small tables, complex transforms, guaranteed consistency | All |
-| [`incremental`](#incremental) | Large append-mostly tables, timestamped events | All |
 | [`merge`](#merge) | SCDs, upserts by key | All |
 | [`time_interval`](/concepts/time-interval/) | Partition-keyed reprocessing with `@start_date` / `@end_date` | All |
 | `materialized_view` | Warehouse-managed view refresh | Databricks, Snowflake, BigQuery |
@@ -195,13 +185,9 @@ CREATE OR REPLACE TABLE target AS SELECT ...
 
 ### incremental
 
-Rocky appends the rows that arrived after the stored watermark:
+A silver model cannot use `incremental`. Rocky has no watermark to apply to a model's SQL, so the strategy could only append the whole result again on every run. `rocky compile` refuses it with `E037`, and the error names four strategies that work: `merge`, `delete_insert`, `time_interval` and `full_refresh`. See [Incremental](/reference/model-format/#incremental) in the model format reference.
 
-```sql
-INSERT INTO target SELECT ... WHERE updated_at > :watermark
-```
-
-A watermark is the timestamp of the newest row Rocky has already loaded. Watermarks live in Rocky's embedded [state store](/concepts/state-management/) and advance after each successful run.
+`incremental` still works in the [bronze layer](/concepts/bronze-layer/), where Rocky copies source tables and filters each copy on a stored watermark.
 
 ### merge
 

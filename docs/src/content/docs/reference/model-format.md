@@ -67,8 +67,8 @@ The `.toml` file names the model, lists what it depends on, picks a materializat
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"incremental"`, `"merge"`, `"time_interval"`, `"ephemeral"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`. |
-| `timestamp_column` | string | | Column used as the incremental watermark. Required when `type = "incremental"` or `type = "microbatch"`. |
+| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"merge"`, `"time_interval"`, `"view"`, `"materialized_view"`, `"dynamic_table"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`. Two are refused: `"incremental"` on a transformation model (`E037`, see [Incremental](#incremental)), and `"ephemeral"` outright (`E038`, see [Ephemeral](#ephemeral)). |
+| `timestamp_column` | string | | Column used as the incremental watermark. Required when `type = "microbatch"`. |
 | `unique_key` | list of strings | | Key columns for merge matching. Required when `type = "merge"`. |
 | `update_columns` | list of strings | | Columns to update on merge match. Defaults to all non-key columns if omitted. |
 | `partition_by` | list of strings | | Column(s) identifying the partition to delete. Required when `type = "delete_insert"`. |
@@ -83,7 +83,7 @@ The `.toml` file names the model, lists what it depends on, picks a materializat
 :::note[Lakehouse formats]
 Warehouse-managed table shapes (**Delta tables**, **Iceberg tables**, **materialized views**, **streaming tables**, **plain views**) are modeled as a separate `format` axis (a top-level `format = "delta_table"` / `"iceberg_table"` key plus an optional `[format_options]` block for partitioning, clustering, table properties, and a comment). `[strategy]` controls how Rocky writes data into the table; `format` controls the physical table shape. The two are orthogonal. The engine-side DDL generator (`rocky-core::lakehouse::generate_lakehouse_ddl`) handles each format; end-to-end TOML wiring varies by adapter, so consult the per-adapter guides before committing to one.
 
-The chosen `format` and `format_options` are now applied on the **first** materialization of incremental-family models (`incremental`, `delete_insert`, `microbatch`, `time_interval`), not just on full-create strategies — so the table that bootstraps an incremental model is created as the requested Delta or Iceberg shape from the start, rather than as a plain table that only later gains the format.
+The chosen `format` and `format_options` apply on the **first** materialization of incremental-family models (`delete_insert`, `microbatch`, `time_interval`), not only on full-create strategies. The table that bootstraps such a model is created in the requested Delta or Iceberg shape from the start. It is not a plain table that gains the format later.
 :::
 
 **`[target]`** -- Output table:
@@ -383,7 +383,7 @@ min = 1
 
 `expression` is bounded. Rocky parses it under the target dialect and refuses anything that is not one boolean expression over the model's own columns: a subquery, a qualified function name (`schema.fn(...)`), or a function outside its allowlist of pure scalar functions is refused when the test SQL is generated, before anything runs. Comparisons, `CASE`, `CAST`, and functions such as `coalesce`, `length`, `lower` and `date_trunc` pass; anything that can read a file, a secret, session state or a remote endpoint does not. The refusal names the function.
 
-`filter` is bounded by the same gate. A subquery, a qualified function name or an off-allowlist function is refused when the test SQL is generated, and the refusal names the field and the table. See [Per-assertion `filter`](/concepts/data-quality-checks/#per-assertion-filter) for the full rule, including the two extra rules that apply to a key expression and to quarantine's split mode.
+`filter` is bounded by the same gate. A subquery, a qualified function name or an off-allowlist function is refused when the test SQL is generated. The refusal names the field and the table. See [Per-assertion `filter`](/concepts/data-quality-checks/#per-assertion-filter) for the full rule, including the extra rule for a key expression.
 
 ### `[[use_test]]`
 
@@ -503,8 +503,8 @@ name = "fct_orders"
 retention = "90d"
 
 [strategy]
-type = "incremental"
-timestamp_column = "_fivetran_synced"
+type = "merge"
+unique_key = ["order_id"]
 
 [target]
 catalog = "analytics"
@@ -612,56 +612,26 @@ WHERE _fivetran_deleted = false
 
 ### Incremental
 
-Appends only the rows that arrived since last time. Rocky stores a [watermark](/reference/glossary/#watermark) — the timestamp of the newest row it has already loaded — and reads past it on the next run. Use this for a large fact table where a full refresh is too slow.
+A transformation model cannot use `type = "incremental"`. Rocky has no watermark to apply to a model's SQL, so the only statement this strategy could emit is `INSERT INTO <target> <model SQL>`. That appends the whole result again on every run.
 
-**SQL** (`models/fct_orders.sql`):
+`rocky compile` reports the model as error `E037`, with this message:
 
-```sql
-SELECT
-    order_id,
-    customer_id,
-    order_date,
-    total_amount,
-    _fivetran_synced
-FROM raw_catalog.src__acme__us_west__shopify.orders
-```
+> model 'fct_orders' uses `type = "incremental"`, which is not supported on transformation models: it emits an unfiltered INSERT and appends every row again on each run
 
-**Config** (`models/fct_orders.toml`):
+`rocky test`, `rocky ci` and `rocky emit-sql` fail on the same error. The SQL generator refuses the model too, so `rocky plan --model` and `rocky estimate` cannot produce SQL for it.
 
-```toml
-name = "fct_orders"
-depends_on = ["dim_products"]
+`rocky run` records the model as a failed table and leaves its existing table alone. If an earlier run built that table, it keeps the rows those runs appended again. By default, a model downstream still builds from it. With no earlier table, that downstream model fails instead. Set `contain_failures = true` under `[resilience]` to hold back everything downstream of the failed model instead. That also holds back any model whose reads Rocky cannot prove are unrelated. Rebuild the table before you trust it, for example with one `full_refresh` run.
 
-[strategy]
-type = "incremental"
-timestamp_column = "_fivetran_synced"
+Pick the strategy that matches what you need. These are the four the error names:
 
-[target]
-catalog = "analytics"
-schema = "warehouse"
-table = "fct_orders"
+| You need | Use |
+|---|---|
+| Update existing rows by key, insert new ones | [`merge`](#merge) with `unique_key` |
+| Replace whole partitions | [`delete_insert`](#delete--insert) with `partition_by` |
+| Process one time window per run, with late data | [`time_interval`](#time-interval), with `@start_date` and `@end_date` in the SQL |
+| Rebuild the table from the model's SQL | [`full_refresh`](#full-refresh) |
 
-[[sources]]
-catalog = "raw_catalog"
-schema = "src__acme__us_west__shopify"
-table = "orders"
-```
-
-Generated SQL (on incremental runs):
-
-```sql
-INSERT INTO analytics.warehouse.fct_orders
-SELECT
-    order_id,
-    customer_id,
-    order_date,
-    total_amount,
-    _fivetran_synced
-FROM raw_catalog.src__acme__us_west__shopify.orders
-WHERE _fivetran_synced > TIMESTAMP '2026-04-17 09:30:00'
-```
-
-The watermark literal is the previous run's `MAX(_fivetran_synced)`, read from Rocky's state store — not a subquery against the target. On the first run (when the target table does not exist), Rocky performs a full refresh automatically.
+`incremental` still works on a replication pipeline. There Rocky copies source tables and filters each copy on a stored watermark. See [Incremental processing](/concepts/incremental/).
 
 ---
 
@@ -736,24 +706,18 @@ When `update_columns` is omitted, Rocky updates all non-key columns.
 
 ### Ephemeral
 
-An [ephemeral](/reference/glossary/#ephemeral) model never becomes a table. Rocky inlines it as a [CTE](/reference/glossary/#cte-common-table-expression) — a named subquery in a `WITH` clause — inside every model that reads it. Use it for a small intermediate step you do not want to keep.
+`type = "ephemeral"` is refused. `rocky compile` reports the model as error `E038`, with this message:
 
-**Config** (`models/stg_recent_orders.toml`):
+> model 'stg_recent_orders' uses `type = "ephemeral"`, which is not supported: an ephemeral model is not materialized and is not inlined into its consumers, so a consumer reads whatever table already carries the name
 
-```toml
-name = "stg_recent_orders"
-depends_on = []
+Rocky never inlined such a model. Nothing rewrote a consumer's `FROM <model>` into a `WITH` clause. So the consumer read whatever physical table already carried that name: an error when none existed, an unrelated table when one did.
 
-[strategy]
-type = "ephemeral"
+Two strategies cover what it was for:
 
-[target]
-catalog = "analytics"
-schema = "staging"
-table = "stg_recent_orders"
-```
-
-No DDL runs for ephemeral models. The SQL body is injected as a `WITH stg_recent_orders AS (…)` CTE wherever the model is referenced.
+| You want | Use |
+|---|---|
+| An intermediate that several models read | `type = "view"`. No copied data, always-fresh reads, one view object per model, on every dialect. |
+| An intermediate only one model reads | An earlier step of that model, in a [`.rocky` file](/concepts/rocky-dsl/). The step folds into the later ones when Rocky lowers the model. |
 
 ---
 

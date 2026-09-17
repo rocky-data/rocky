@@ -109,12 +109,11 @@ Scope on the ELT spectrum:
 ## Materialization strategies
 
 - `full_refresh` — `CREATE OR REPLACE TABLE`
-- `incremental` — `INSERT INTO ... WHERE ts > watermark`
+- `incremental` — replication only: `INSERT INTO ... WHERE ts > watermark`. A transformation model is refused with `E037`
 - `merge` — `MERGE INTO ... USING ON key`
 - `delete_insert` — delete the affected partitions, then insert
 - `time_interval` / `microbatch` — Partition-keyed processing
-- `view` — a warehouse view
-- `ephemeral` — writes no table; inlining it into consumers is not implemented yet (#1996)
+- `view` — a warehouse view: an intermediate other models read, with no copied data. `ephemeral` is refused (`E038`)
 - `materialized_view` — warehouse-managed materialized views (Databricks, Snowflake, BigQuery)
 - `dynamic_table` — Snowflake dynamic tables with target lag
 - `content_addressed` — hash-addressed Parquet written to a Delta UniForm table

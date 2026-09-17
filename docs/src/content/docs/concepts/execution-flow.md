@@ -222,7 +222,7 @@ Rocky serializes the `RunOutput` struct to JSON on stdout. The shape below is il
       "rows_copied": 1200,
       "duration_ms": 45,
       "metadata": {
-        "strategy": "incremental",
+        "strategy": "full_refresh",
         "target_table_full_name": "analytics.main.orders_summary",
         "sql_hash": "..."
       }

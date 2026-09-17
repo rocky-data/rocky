@@ -63,7 +63,7 @@ of finding them later.
 
 Rocky infers column-level types across the whole DAG. It reports problems as
 diagnostic codes you can grep in a CI log. The error codes run from `E001` to
-`E036`, with `W` warnings and `P` lints alongside.
+`E037`, with `W` warnings and `P` lints alongside.
 
 Compilation fails on any error-level diagnostic. That is the whole point: the
 failure becomes a non-zero exit code at PR time, not a wrong number in
@@ -129,6 +129,21 @@ recompute the digest together. What it catches is a modification that was not
 re-hashed. It authenticates nobody: the approver's email is a self-asserted git
 identity hashed with the rest of the artifact, and a writer can set it to
 anything.
+
+The plans directory, `.rocky/plans/`, is a trusted input for the same reason. A
+plan's id is the blake3 digest of its kind and payload. Rocky recomputes that
+digest on every read and refuses a plan that no longer matches its own id. The id
+is unkeyed, so it catches a file changed without re-hashing, not a plan written
+whole. A promote plan runs the SQL statement it records. The checks at apply read
+the table names recorded beside it, not names parsed from the SQL. The
+`AiAuthored` review marker is unsigned too. Anyone who can write `.rocky/plans/`
+can therefore author a plan that `rocky apply` runs with the applier's warehouse
+credentials. For a promote plan, the policy gate still runs at apply, against
+the principal applying it. It judges the plan by the table names it records, not
+by the table the SQL writes. Rocky tries to keep `.rocky/` out of git by writing a
+`.gitignore` there. It skips that when one already exists, and ignores a failed
+write, so check what your repository excludes. Protect write access to the
+directory as you would the project itself.
 
 What you get today is schema-prefix isolation, not a warehouse-native zero-copy
 clone. Delta `SHALLOW CLONE` and Snowflake zero-copy `CLONE` would make branch
