@@ -165,7 +165,6 @@ pub async fn run_ai(
     output_json: bool,
     cache_ttl_override: Option<u64>,
     materialization: &str,
-    watermark: Option<&str>,
     unique_key: Option<Vec<String>>,
     target: Option<&str>,
     overwrite: bool,
@@ -174,11 +173,10 @@ pub async fn run_ai(
     let fmt = format.unwrap_or("rocky");
 
     // Validate sidecar inputs up-front — failing here costs no LLM tokens.
-    // Materialization parsing also enforces the `--watermark` requirement
-    // for `incremental` before we make the API call.
-    let parsed_materialization =
-        SidecarMaterialization::parse(materialization, watermark, unique_key)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Materialization parsing also refuses `incremental` (#1990) before we
+    // make the API call.
+    let parsed_materialization = SidecarMaterialization::parse(materialization, unique_key)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let parsed_target_override = match target {
         Some(value) => Some(SidecarTarget::parse(value).map_err(|e| anyhow::anyhow!("{e}"))?),
         None => None,

@@ -21458,7 +21458,7 @@ timestamp_column = "ts"
     ///
     /// Sibling of the replication regression above, for the second of the three
     /// executor bootstrap paths. A strategy that mutates an existing target
-    /// (here `incremental`) probes the target with `describe_table` and, if it
+    /// (here `microbatch`) probes the target with `describe_table` and, if it
     /// reads as absent, bootstraps via the non-replacing
     /// `generate_transformation_initial_ddl` CTAS. When that probe *misfires*
     /// against a live target, the bootstrap must fail closed ("already exists")
@@ -21493,8 +21493,9 @@ timestamp_column = "ts"
 name = "fct_events"
 
 [strategy]
-type = "incremental"
+type = "microbatch"
 timestamp_column = "id"
+granularity = "hour"
 
 [target]
 catalog = ""
@@ -21828,8 +21829,9 @@ table = "fct_daily"
 name = "fct_events"
 
 [strategy]
-type = "incremental"
+type = "microbatch"
 timestamp_column = "id"
+granularity = "hour"
 
 [target]
 catalog = ""
@@ -21949,8 +21951,9 @@ table = "fct_events"
 name = "fct_events"
 
 [strategy]
-type = "incremental"
+type = "microbatch"
 timestamp_column = "id"
+granularity = "hour"
 
 [target]
 catalog = ""
@@ -22047,8 +22050,9 @@ table = "fct_events"
 name = "fct_events"
 
 [strategy]
-type = "incremental"
+type = "microbatch"
 timestamp_column = "id"
+granularity = "hour"
 
 [target]
 catalog = ""
@@ -29862,11 +29866,13 @@ auto_create_schemas = true
                 .await
                 .unwrap();
         }
-        // Incremental strategy so the gate tracks `ts` for the MAX(ts) probe.
+        // A timestamp-tracking strategy so the gate tracks `ts` for the
+        // MAX(ts) probe. `microbatch`, because `incremental` is refused on
+        // transformation models (#1990).
         std::fs::write(models_dir.join("agg.sql"), "SELECT id, ts FROM main.ev\n").unwrap();
         std::fs::write(
             models_dir.join("agg.toml"),
-            "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"agg\"\n",
+            "[strategy]\ntype = \"microbatch\"\ntimestamp_column = \"ts\"\ngranularity = \"hour\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"agg\"\n",
         )
         .unwrap();
 
@@ -33136,7 +33142,7 @@ auto_create_schemas = true
         }
     }
 
-    /// Runtime regression: a first run of an incremental transformation
+    /// Runtime regression: a first run of an append-strategy transformation
     /// model against a missing target must bootstrap the table (via
     /// `generate_transformation_initial_ddl`) and load the source **exactly
     /// once** — the populated CTAS is the load, so the subsequent `INSERT INTO`
@@ -33146,13 +33152,15 @@ auto_create_schemas = true
     /// runtime path on in-memory DuckDB (format = None, so dialect-independent
     /// of the lakehouse DDL — what's proven here is the skip, not the format).
     ///
-    /// The model SQL carries no watermark filter (transformation incrementals
-    /// own their own filtering), so a second run re-selects the full source and
-    /// appends it — proving the table is reused, not recreated, and that the
-    /// skip only fires on the bootstrap run.
+    /// The second-run assertion PINS A DEFECT, not a contract. The model SQL
+    /// carries no watermark filter and nothing adds one, so a second run
+    /// re-selects the full source and appends it again. `incremental` used to
+    /// take this path and is now refused (#1990, E037); `microbatch` still
+    /// takes it and is pending its own ruling (#2054). When #2054 is decided,
+    /// this assertion changes with it.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
-    async fn incremental_transformation_first_run_loads_source_once_then_appends() {
+    async fn append_transformation_first_run_loads_source_once_then_appends() {
         use std::time::Instant;
 
         use rocky_core::models::load_model_pair;
@@ -33181,8 +33189,9 @@ auto_create_schemas = true
 name = "fct_events"
 
 [strategy]
-type = "incremental"
+type = "microbatch"
 timestamp_column = "id"
+granularity = "hour"
 
 [target]
 catalog = ""

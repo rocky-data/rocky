@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+
+- **The `strategy-incremental` snippet, and `incremental` from the model sidecar schema.** The engine now refuses `type = "incremental"` on a transformation model (E037), because it appended every row again on each run. The editor no longer offers or validates it. (#1990)
+
 ## [1.41.0] — 2026-09-12
 
 Pairs with engine 1.74.0.

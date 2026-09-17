@@ -1238,19 +1238,27 @@ fn map_incremental_strategy(
                 warnings.push(ImportWarning {
                     model: model_name.to_string(),
                     category: WarningCategory::UnsupportedMaterialization,
-                    message: "incremental_strategy='merge' requires unique_key — falling back to incremental(updated_at)".to_string(),
+                    message: format!(
+                        "incremental_strategy='merge' requires unique_key — falling back to full_refresh. {NO_APPEND_EQUIVALENT}"
+                    ),
                     suggestion: Some(
-                        "add unique_key to the model config or pick a non-merge incremental_strategy".to_string(),
+                        "add unique_key to the model config so it maps to merge".to_string(),
                     ),
                 });
-                StrategyConfig::Incremental {
-                    timestamp_column: "updated_at".to_string(),
-                }
+                StrategyConfig::FullRefresh
             }
         },
-        "append" => StrategyConfig::Incremental {
-            timestamp_column: "updated_at".to_string(),
-        },
+        "append" => {
+            warnings.push(ImportWarning {
+                model: model_name.to_string(),
+                category: WarningCategory::UnsupportedMaterialization,
+                message: format!(
+                    "incremental_strategy='append' mapped to full_refresh. {NO_APPEND_EQUIVALENT}"
+                ),
+                suggestion: Some(APPEND_SUGGESTION.to_string()),
+            });
+            StrategyConfig::FullRefresh
+        }
         "delete+insert" | "delete_insert" => {
             let partition_by = config.partition_by.clone().or_else(|| unique_keys.clone());
             match partition_by {
@@ -1316,18 +1324,29 @@ fn map_incremental_strategy(
                 model: model_name.to_string(),
                 category: WarningCategory::UnsupportedMaterialization,
                 message: format!(
-                    "incremental_strategy='{other}' not recognized — falling back to incremental(updated_at)"
+                    "incremental_strategy='{other}' not recognized — falling back to full_refresh"
                 ),
                 suggestion: Some(
                     "use one of: append, merge, delete+insert, insert_overwrite, microbatch".to_string(),
                 ),
             });
-            StrategyConfig::Incremental {
-                timestamp_column: "updated_at".to_string(),
-            }
+            StrategyConfig::FullRefresh
         }
     }
 }
+
+/// Why an append-style dbt model cannot keep its semantics in Rocky (#1990).
+///
+/// Rocky refuses `type = "incremental"` on transformation models (E037): with
+/// no watermark to apply, it would re-insert every row on each run. The
+/// importer therefore never emits it, and maps append semantics to
+/// `full_refresh`, which rebuilds from the model SQL and cannot duplicate.
+const NO_APPEND_EQUIVALENT: &str = "Rocky has no append strategy for transformation models: \
+     an unfiltered append re-inserts every row on each run, so `incremental` is refused (E037) \
+     and the model rebuilds in full instead";
+
+const APPEND_SUGGESTION: &str = "add a unique_key so the model maps to merge, or hand-author a \
+     time_interval model with @start_date/@end_date";
 
 /// Map `materialized='microbatch'` (or `incremental_strategy='microbatch'`)
 /// to a Rocky strategy. Emits a
@@ -1439,22 +1458,22 @@ fn map_microbatch_strategy(
             warnings.push(ImportWarning {
                 model: model_name.to_string(),
                 category: WarningCategory::UnsupportedMaterialization,
-                message: "dbt microbatch without a unique_key maps to an append-only incremental strategy — it re-inserts the lookback window on every run".to_string(),
+                message: format!(
+                    "dbt microbatch without a unique_key mapped to full_refresh. {NO_APPEND_EQUIVALENT}"
+                ),
                 suggestion: Some(
                     "add a unique_key (dbt microbatch normally has one) so it maps to an idempotent merge, or convert to a time-interval strategy with @start_date/@end_date".to_string(),
                 ),
             });
             structured.push(ImportDbtStructuredWarning::MicrobatchMapped {
                 model: model_name.to_string(),
-                mapped_to: "incremental_append".to_string(),
+                mapped_to: "full_refresh".to_string(),
             });
-            // Emit `incremental`, not `microbatch`: both lower to an
-            // append-only INSERT (sql_gen), but `microbatch` misleadingly
-            // implies dbt's idempotent partition-replace. `incremental` is
-            // honest about the append semantics.
-            StrategyConfig::Incremental {
-                timestamp_column: event_time,
-            }
+            // Neither `incremental` (refused, #1990) nor `microbatch` (the
+            // same unfiltered append, #2054): both would re-insert every row
+            // on each run. A full rebuild is the one mapping that cannot
+            // duplicate.
+            StrategyConfig::FullRefresh
         }
     }
 }
@@ -2028,9 +2047,15 @@ fn import_single_model(
         {
             match resolved.materialized.as_str() {
                 "incremental" => {
-                    strategy = StrategyConfig::Incremental {
-                        timestamp_column: "updated_at".to_string(),
-                    };
+                    // Stays `full_refresh` (#1990): see `NO_APPEND_EQUIVALENT`.
+                    warnings.push(ImportWarning {
+                        model: name.to_string(),
+                        category: WarningCategory::UnsupportedMaterialization,
+                        message: format!(
+                            "project config materialized='incremental' mapped to full_refresh. {NO_APPEND_EQUIVALENT}"
+                        ),
+                        suggestion: Some(APPEND_SUGGESTION.to_string()),
+                    });
                 }
                 "view" => {
                     strategy = StrategyConfig::View;

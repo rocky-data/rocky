@@ -372,7 +372,18 @@ pub fn generate_transformation_sql_with_warehouse(
             Ok(stmts)
         }
         MaterializationStrategy::Incremental { .. } => {
-            Ok(vec![dialect.insert_into(&target, &model_ir.sql)])
+            // Refused (#1990). On a transformation model this strategy has
+            // no watermark to apply, so the only SQL it could emit is an
+            // unfiltered `INSERT INTO <target> <model SQL>` that appends the
+            // whole result again on every run. `rocky compile` reports E037;
+            // this arm keeps callers that skip the compile gate (`rocky plan`,
+            // `rocky estimate`) from printing or running that INSERT.
+            // Replication `incremental` goes through `generate_insert_sql`.
+            Err(SqlGenError::InvalidRequest(format!(
+                "model '{}': `type = \"incremental\"` is not supported on transformation models \
+                 (E037); use merge, delete_insert, time_interval or full_refresh",
+                model_ir.name
+            )))
         }
         MaterializationStrategy::Merge {
             unique_key,
@@ -466,9 +477,10 @@ pub fn generate_transformation_sql_with_warehouse(
         MaterializationStrategy::Microbatch {
             timestamp_column, ..
         } => {
-            // Microbatch is functionally an incremental append keyed by
-            // the timestamp column. The runtime handles batch windowing;
-            // SQL gen emits a simple INSERT with watermark filter.
+            // No windowing and no watermark filter exist for a transformation
+            // model: this is an unfiltered `INSERT INTO <target> <model SQL>`,
+            // so every run after the first appends the whole result again.
+            // Tracked in #2054; left legal pending that ruling.
             validation::validate_identifier(timestamp_column)?;
             Ok(vec![dialect.insert_into(&target, &model_ir.sql)])
         }
@@ -1644,8 +1656,13 @@ mod tests {
         assert!(sql.contains("WHERE active = true"));
     }
 
+    /// #1990: a transformation `incremental` model has no watermark to apply,
+    /// so the only SQL it could produce is an unfiltered INSERT that appends
+    /// the whole result on every run. The generator refuses it, so callers
+    /// that skip the compile gate (`rocky plan`, `rocky estimate`) cannot
+    /// print or run that statement either.
     #[test]
-    fn test_transformation_incremental() {
+    fn test_transformation_incremental_is_refused() {
         let ir = ModelIr::transformation(
             TargetRef {
                 catalog: "cat".into(),
@@ -1665,9 +1682,11 @@ mod tests {
             None,
             None,
         );
-        let stmts = generate_transformation_sql(&ir, &dialect()).unwrap();
-        assert_eq!(stmts.len(), 1);
-        assert!(stmts[0].starts_with("INSERT INTO cat.silver.fct_orders"));
+        let err = generate_transformation_sql(&ir, &dialect())
+            .expect_err("an incremental transformation model must not produce SQL");
+        let msg = err.to_string();
+        assert!(matches!(err, SqlGenError::InvalidRequest(_)), "{msg}");
+        assert!(msg.contains("E037"), "the error names the compile diagnostic: {msg}");
     }
 
     #[test]
@@ -2205,22 +2224,25 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     }
 
     #[test]
-    fn test_lakehouse_incremental_ignores_format_on_insert() {
-        // Incremental INSERT should not emit lakehouse DDL — that's for
+    fn test_lakehouse_append_ignores_format_on_insert() {
+        // An append INSERT should not emit lakehouse DDL — that's for
         // initial table creation. The format field is silently ignored for
-        // the INSERT path, since the table already exists.
+        // the INSERT path, since the table already exists. Uses `microbatch`,
+        // the append strategy still legal on transformation models (#2054);
+        // `incremental` is refused before this path (#1990).
         let plan = lakehouse_ir(
             LakehouseFormat::DeltaTable,
             LakehouseOptions::default(),
-            MaterializationStrategy::Incremental {
+            MaterializationStrategy::Microbatch {
                 timestamp_column: "updated_at".into(),
+                granularity: rocky_ir::TimeGrain::Hour,
             },
         );
         let stmts = generate_transformation_sql(&plan, &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         assert!(
             stmts[0].starts_with("INSERT INTO"),
-            "incremental should be INSERT INTO: {}",
+            "an append strategy should be INSERT INTO: {}",
             stmts[0]
         );
     }
