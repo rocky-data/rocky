@@ -1366,8 +1366,12 @@ const NO_APPEND_EQUIVALENT: &str = "Rocky has no append strategy for transformat
      an unfiltered append re-inserts every row on each run, so `incremental` is refused (E037) \
      and the model rebuilds in full instead";
 
-const APPEND_SUGGESTION: &str = "add a unique_key so the model maps to merge, or hand-author a \
-     time_interval model with @start_date/@end_date";
+/// An explicit `incremental_strategy` wins over `unique_key` in
+/// `map_incremental_strategy`, so adding a key alone does not change an
+/// explicit `'append'`: the strategy must be `'merge'` or unset as well.
+const APPEND_SUGGESTION: &str = "add a unique_key and set incremental_strategy to 'merge' (or \
+     leave it unset) so the model maps to merge, or hand-author a time_interval model with \
+     @start_date/@end_date";
 
 /// Map `materialized='microbatch'` (or `incremental_strategy='microbatch'`)
 /// to a Rocky strategy. Emits a
