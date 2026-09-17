@@ -3216,10 +3216,18 @@ table = "stg_users"
         );
         assert_eq!(out.skipped.len(), 1, "got {:?}", out.skipped);
         assert_eq!(out.skipped[0].model, "stg_users");
-        assert!(
-            out.skipped[0].reason.contains("E038") && out.skipped[0].reason.contains("view"),
-            "the reason names the refusal and the strategy that works: {}",
-            out.skipped[0].reason
+        // The WHOLE string, prefix included. `reason` is
+        // `SqlGenError::InvalidRequest`'s Display, so it carries the
+        // `invalid SQL generation request: ` prefix its `#[error]` adds, and
+        // `plan.rs` stores it verbatim. A `contains("E038")` assertion would
+        // not notice that prefix changing, and the reference docs quote this
+        // string in full — pinning it is what keeps the page and the engine
+        // from drifting apart silently.
+        assert_eq!(
+            out.skipped[0].reason,
+            "invalid SQL generation request: model 'stg_users': `type = \"ephemeral\"` is not \
+             supported (E038) — an ephemeral model is not materialized and is not inlined into \
+             its consumers; use `type = \"view\"`"
         );
     }
 
