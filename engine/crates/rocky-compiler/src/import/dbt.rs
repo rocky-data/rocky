@@ -1031,6 +1031,28 @@ fn import_manifest_node(
         warnings: strategy_warnings,
         structured,
     } = map_manifest_strategy(&node.config, &node.name, microbatch_mode);
+
+    // #1990: an incremental dbt model with no Rocky append equivalent falls
+    // back to `full_refresh`. That is safe only when the SQL has no dbt
+    // incremental branch. dbt compiles `is_incremental()` as true against an
+    // existing target, so `compiled_code` can keep a delta filter such as
+    // `WHERE updated_at > '<last load>'`; run as `full_refresh`, that would
+    // replace the table with only the recent rows on every run. Refuse it
+    // instead, before any warning claims a mapping.
+    if matches!(strategy, StrategyConfig::FullRefresh)
+        && matches!(
+            node.config.materialized.as_str(),
+            "incremental" | "microbatch"
+        )
+        && contains_unresolved_is_incremental(&node.raw_code)
+    {
+        result.failed.push(ImportFailure {
+            name: node.name.clone(),
+            reason: INCREMENTAL_FALLBACK_REFUSED.to_string(),
+        });
+        return;
+    }
+
     result.warnings.extend(strategy_warnings);
     result.structured_warnings.extend(structured);
 
@@ -1364,7 +1386,17 @@ fn push_append_fallback(
 /// `full_refresh`, which rebuilds from the model SQL and cannot duplicate.
 const NO_APPEND_EQUIVALENT: &str = "Rocky has no append strategy for transformation models: \
      an unfiltered append re-inserts every row on each run, so `incremental` is refused (E037) \
-     and the model rebuilds in full instead";
+     and the model is imported as `full_refresh`, which replaces the table with the model SQL's \
+     result on every run";
+
+/// Why an incremental dbt model whose SQL uses `is_incremental()` is not
+/// imported at all when it would fall back to `full_refresh` (#1990).
+const INCREMENTAL_FALLBACK_REFUSED: &str = "is an incremental dbt model with no Rocky append \
+     equivalent, and its SQL uses `is_incremental()`. dbt compiles that branch as true against an \
+     existing table, so the compiled SQL can keep an incremental filter; imported as \
+     `full_refresh`, it would replace the table with only the recent rows on every run. Add a \
+     unique_key and set incremental_strategy to 'merge' (or leave it unset) so it maps to merge, \
+     or rewrite it as a time_interval model with @start_date/@end_date";
 
 /// An explicit `incremental_strategy` wins over `unique_key` in
 /// `map_incremental_strategy`, so adding a key alone does not change an
@@ -3968,6 +4000,89 @@ FROM {{ ref('stg_events') }}
                     if model == "events_append" && action == "fell back to full_refresh")),
             "the append fallback must be a structured UnsupportedMaterialization: {:?}",
             result.structured_warnings
+        );
+    }
+
+    /// #1990: dbt compiles `is_incremental()` as true against an existing
+    /// table, so the compiled SQL keeps the delta filter. Imported as the
+    /// `full_refresh` fallback, every run would replace the table with only
+    /// the recent rows. The model is refused, not imported, and says why.
+    #[test]
+    fn test_append_model_using_is_incremental_is_refused_not_full_refreshed() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.events_append": {
+                    "unique_id": "model.p.events_append",
+                    "name": "events_append",
+                    "resource_type": "model",
+                    "raw_code": "SELECT * FROM {{ ref('raw_events') }}\n{% if is_incremental() %}\nWHERE updated_at > (SELECT MAX(updated_at) FROM {{ this }})\n{% endif %}",
+                    "compiled_code": "SELECT * FROM raw_events\nWHERE updated_at > '2026-09-01 00:00:00'",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": { "materialized": "incremental" },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert!(
+            result.imported.iter().all(|m| m.name != "events_append"),
+            "a delta-filtered model must not be imported as full_refresh: {:?}",
+            result
+                .imported
+                .iter()
+                .map(|m| (&m.name, &m.config.strategy))
+                .collect::<Vec<_>>()
+        );
+        let failure = result
+            .failed
+            .iter()
+            .find(|f| f.name == "events_append")
+            .expect("the model is reported as a failed import");
+        assert!(
+            failure.reason.contains("is_incremental()") && failure.reason.contains("merge"),
+            "the refusal names the cause and the way out: {}",
+            failure.reason
+        );
+        assert!(
+            !result.warnings.iter().any(|w| w.model == "events_append"
+                && w.message.contains("mapped to full_refresh")),
+            "no warning may claim a full_refresh mapping for a refused model: {:?}",
+            result.warnings
+        );
+    }
+
+    /// The boundary: the same append model WITH a unique_key maps to merge,
+    /// where a delta filter in the compiled SQL is correct, so it is imported.
+    #[test]
+    fn test_append_model_using_is_incremental_with_unique_key_still_maps_to_merge() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.events_keyed": {
+                    "unique_id": "model.p.events_keyed",
+                    "name": "events_keyed",
+                    "resource_type": "model",
+                    "raw_code": "SELECT * FROM {{ ref('raw_events') }}\n{% if is_incremental() %}\nWHERE updated_at > (SELECT MAX(updated_at) FROM {{ this }})\n{% endif %}",
+                    "compiled_code": "SELECT * FROM raw_events\nWHERE updated_at > '2026-09-01 00:00:00'",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": { "materialized": "incremental", "unique_key": "id" },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        let model = result
+            .imported
+            .iter()
+            .find(|m| m.name == "events_keyed")
+            .expect("a keyed incremental model is imported");
+        assert!(
+            matches!(model.config.strategy, StrategyConfig::Merge { .. }),
+            "expected Merge, got {:?}",
+            model.config.strategy
         );
     }
 
