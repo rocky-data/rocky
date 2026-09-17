@@ -511,8 +511,8 @@ Keep the bad rows out of the clean table instead of only counting them. Rocky ta
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Turn quarantine on. Without `enabled = true`, the block does nothing. |
 | `mode` | `"split"` \| `"tag"` \| `"drop"` | `"split"` | What Rocky does with the failing rows. See the table below. |
-| `suffix_valid` | string | `"__valid"` | Suffix for the table of passing rows. Keep it non-empty: an empty suffix names the source table, so the valid write replaces it. Rocky does not check. |
-| `suffix_quarantine` | string | `"__quarantine"` | Suffix for the table of failing rows. Keep it different from `suffix_valid`: equal suffixes name one table, so the valid write replaces the quarantine rows. Rocky does not check. |
+| `suffix_valid` | string | `"__valid"` | Suffix for the table of passing rows. `split` and `drop` refuse a suffix that makes this name match the source table, ignoring case, so an empty suffix is refused. |
+| `suffix_quarantine` | string | `"__quarantine"` | Suffix for the table of failing rows. `split` refuses a suffix that makes this name match the source table or the valid table, ignoring case. `drop` writes no quarantine table, so it does not check this one. |
 
 ```toml
 [pipeline.dq.checks.quarantine]
@@ -522,7 +522,7 @@ mode = "split"
 
 | Mode | Behavior |
 |---|---|
-| `split` | Writes `<table>__valid` with the passing rows and `<table>__quarantine` with the failing rows. When the run completes and the suffixes differ, each row lands in exactly one of them. Each failing row carries an `_error_<name>` column per assertion. The original `<table>` stays as it is. Point downstream models at `<table>__valid`. Refused on a dialect with no `SELECT * EXCEPT` form, such as Trino. |
+| `split` | Writes `<table>__valid` with the passing rows and `<table>__quarantine` with the failing rows. When the run completes, each row lands in exactly one of them. Each failing row carries an `_error_<name>` column per assertion. The original `<table>` stays as it is. Point downstream models at `<table>__valid`. Refused on a dialect with no `SELECT * EXCEPT` form, such as Trino. |
 | `tag` | Rewrites `<table>` in place and adds an `_error_<name>` column per assertion, set on the failing rows. Every row stays. This rewrites the source, so take care on a raw replication target. |
 | `drop` | Writes only `<table>__valid`. Rocky discards the failing rows. |
 
