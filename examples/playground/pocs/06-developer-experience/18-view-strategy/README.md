@@ -7,7 +7,7 @@ in its sidecar compiles, types, and the SQL generator emits
 ## Why distinctive
 
 The materialization-strategy catalog Rocky ships covers FullRefresh, Incremental,
-Merge, TimeInterval / Microbatch, Ephemeral, DeleteInsert, ContentAddressed,
+Merge, TimeInterval / Microbatch, DeleteInsert, ContentAddressed,
 and the warehouse-managed `view`, `materialized_view`, and `dynamic_table`
 variants. This POC pins the cheapest of those: a plain SQL view that every
 target warehouse supports.

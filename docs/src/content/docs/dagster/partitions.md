@@ -80,7 +80,7 @@ The higher-level builder. It takes a `ModelDetail` from
 `time_interval`, it calls the pure builder above.
 
 It returns `None` for every other strategy: `full_refresh`,
-`merge`, `ephemeral`, `delete_insert`, and `view`. It also
+`merge`, `delete_insert`, and `view`. It also
 returns `None` for `microbatch` today, even though that strategy is
 time-based.
 

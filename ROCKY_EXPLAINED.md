@@ -35,7 +35,7 @@ Rocky's terms are collected in the [glossary](https://rocky-data.dev/reference/g
 |---|---|
 | **Typed compiler** | Catches type mismatches and missing columns before any SQL runs |
 | **DAG-aware** | Knows which models depend on which; runs them in the right order |
-| **Multiple materialization strategies** | `full_refresh`, `merge`, `time_interval`, `microbatch`, `delete_insert`, `ephemeral`, `view`, `materialized_view`, `dynamic_table`, `content_addressed` |
+| **Multiple materialization strategies** | `full_refresh`, `merge`, `time_interval`, `microbatch`, `delete_insert`, `view`, `materialized_view`, `dynamic_table`, `content_addressed` |
 | **Incremental loads** | A replication pipeline copies only the rows newer than a stored watermark. A transformation model cannot use `incremental` (`E037`); use `merge` or `time_interval` |
 | **Schema drift detection** | Notices when a source column changed type and handles it automatically |
 | **Data contracts** | Declare what columns must exist and what types they must be; enforced at compile time |
@@ -48,7 +48,7 @@ Rocky's terms are collected in the [glossary](https://rocky-data.dev/reference/g
 | **Role graph & permissions** | Declare a role hierarchy; on Databricks, Rocky flattens it and grants it. It adds only: it sends no REVOKE |
 | **Hooks & webhooks** | Fire shell commands or HTTP calls on 18 lifecycle events. `rocky run` fires them on a replication pipeline only |
 | **Column lineage** | Trace an output column back through casts and function calls to the source column it came from |
-| **Cost model** | Reads run history and recommends `ephemeral`, `table`, or `view` per model |
+| **Cost model** | Reads run history and recommends `table` or `view` per model |
 | **Dagster integration** | Orchestration via RockyResource and Dagster Pipes |
 | **VS Code extension** | LSP client: hover types, go-to-definition, inline diagnostics, completion |
 | **AI intent layer** | Generate models from a plain-English description (`rocky ai "..."`) |
@@ -1096,7 +1096,7 @@ It recommends one of three strategies, and never any other:
 ```
 history_runs < 5?                  →  keep the current strategy, reason
                                       "insufficient history: N runs (need 5)"
-under 2s and at most 1 consumer?   →  ephemeral
+under 2s and at most 1 consumer?   →  view
 2 or more consumers?               →  table, unless recomputing for each
                                       consumer is cheaper than storing once,
                                       which gives view
@@ -1110,17 +1110,17 @@ Real output from a DuckDB playground. Four models had run five times; `order_fac
 $ rocky optimize
 MODEL                          CURRENT      RECOMMENDED    SAVINGS/MO   REASONING
 ------------------------------------------------------------------------------------------
-customer_orders                table        ephemeral      $0.0023      fast execution (0.0s) with 1 downstre...
+customer_orders                table        view           $0.0023      fast execution (0.0s) with 1 downstre...
 order_facts                    table        table          $0.0000      insufficient history: 1 runs (need 5)
-raw_orders                     table        ephemeral      $0.0023      fast execution (0.0s) with 1 downstre...
-revenue_summary                table        ephemeral      $0.0023      fast execution (0.0s) with 0 downstre...
-top_customers                  table        ephemeral      $0.0023      fast execution (0.0s) with 0 downstre...
+raw_orders                     table        view           $0.0023      fast execution (0.0s) with 1 downstre...
+revenue_summary                table        view           $0.0023      fast execution (0.0s) with 0 downstre...
+top_customers                  table        view           $0.0023      fast execution (0.0s) with 0 downstre...
 
 Total estimated monthly savings: $0.01
 Models analyzed: 5
 ```
 
-Read `CURRENT` with care. The command does not read each model's declared strategy; it reports `table` for every model. What the `ephemeral` strategy does at execution time is under review: see [issue #1996](https://github.com/rocky-data/rocky/issues/1996).
+Read `CURRENT` with care. The command does not read each model's declared strategy; it reports `table` for every model ([#2056](https://github.com/rocky-data/rocky/issues/2056)). It used to recommend `ephemeral` here. That strategy is refused now (`E038`), because Rocky never inlined such a model into its consumers.
 
 ---
 

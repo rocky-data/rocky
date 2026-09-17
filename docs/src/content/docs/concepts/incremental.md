@@ -18,7 +18,7 @@ Every model, replication or transformation, declares a materialization strategy.
 | `merge` | `MERGE INTO ... USING ... ON key WHEN MATCHED THEN UPDATE WHEN NOT MATCHED THEN INSERT` | Mutable data with a unique key |
 | `time_interval` | Per-partition `INSERT OVERWRITE` with `@start_date`/`@end_date` placeholders | Time-series data with partition-level reprocessing |
 | `microbatch` | `time_interval` alias with hourly defaults | dbt-compatible partition processing |
-| `ephemeral` | No table; inlined as CTE in downstream models | Lightweight intermediate transformations |
+| `view` | `CREATE OR REPLACE VIEW ... AS SELECT ...` | An intermediate other models read, with no copied data |
 | `delete_insert` | `DELETE WHERE partition_key IN (...); INSERT ...` | Partition-replace when MERGE overhead isn't needed |
 
 See [Model Format](/reference/model-format/) for the full configuration of each strategy.

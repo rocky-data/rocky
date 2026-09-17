@@ -57,7 +57,7 @@ Identified by the hash of its contents rather than a name or timestamp. Rocky re
 
 ### CTE (common table expression)
 
-A named subquery declared with `WITH <name> AS (…)` that the rest of the statement can read. An [ephemeral](#ephemeral) model becomes a CTE inside every model that reads it, instead of becoming its own table.
+A named subquery declared with `WITH <name> AS (…)` that the rest of the statement can read. Rocky writes one when it lowers a `.rocky` model's steps into a single statement.
 
 ### DDL (data definition language)
 
@@ -93,7 +93,7 @@ A [config group](#config-group) with `enforce = true`. The group's fields become
 
 ### Ephemeral
 
-A model that is never written to the warehouse. Rocky inlines its SQL as a [CTE](#cte-common-table-expression) in every model that reads it, and runs no DDL for it. Set it with `strategy = "ephemeral"`. See [Ephemeral](/reference/model-format/#ephemeral).
+A dbt strategy Rocky refuses. `type = "ephemeral"` is error `E038`: Rocky never inlined such a model into its consumers, so a consumer read whatever table already carried the name. Use `view` for an intermediate several models read. See [Ephemeral](/reference/model-format/#ephemeral).
 
 ### Exit code
 

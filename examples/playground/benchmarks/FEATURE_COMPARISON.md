@@ -54,7 +54,6 @@ This document provides a factual feature-by-feature comparison of the major SQL 
 | **Materialized View** | Yes (Databricks MV) | Yes (adapter-specific) | Yes | No | No | Yes (BigQuery) |
 | **Dynamic Table** | Yes (Snowflake, lag-based) | No | No | No | No | No |
 | **Time Interval** | Yes (partition-keyed, lookback) | No | No | No | No | No |
-| **Ephemeral (CTE)** | Yes (inlined as CTE) | Yes | Yes | No | No | No |
 | **Microbatch** | Yes (alias for time_interval) | Yes (v1.9+) | Yes | No | No | No |
 | **Delete+Insert** | Yes (partition_by key) | Yes | Yes | No | No | No |
 | **Custom materializations** | Via adapter SDK | Yes (macros) | Yes | Via hooks | Via node types | No |

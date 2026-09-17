@@ -402,6 +402,19 @@ rocky plan --filter client=acme
 }
 ```
 
+A model the preview could not render is listed in `skipped`, rather than left out silently:
+
+```json
+  "skipped": [
+    {
+      "model": "stg_events",
+      "reason": "invalid SQL generation request: model 'stg_events': `type = \"ephemeral\"` is not supported (E038) — an ephemeral model is not materialized and is not inlined into its consumers; use `type = \"view\"`"
+    }
+  ]
+```
+
+The `reason` is the generator's own error. A refused strategy puts a model there, and so does one that needs a live warehouse, such as a Snowflake dynamic table. The MCP `plan_preview` tool returns the same list. The key is absent when nothing was skipped.
+
 Plan with table output and a custom config:
 
 ```bash
@@ -663,7 +676,7 @@ rocky compare --filter client=acme
 Shadow mode is only useful if it truly isolates the run from production. Rocky refuses the run rather than write a target it cannot isolate. A shadow or branch run fails closed in any of these cases.
 
 - The selected transformation set contains a `content_addressed` or `time_interval` model. Both need extra storage or partition-state isolation that shadow mode does not give them.
-- The selected set contains an `ephemeral` model. Rocky neither materializes nor inlines it, so its consumer would read production.
+- The selected set contains an `ephemeral` model. Compile already reports it as `E038`, and the shadow path refuses it again by name. A consumer would read the production table, because Rocky neither materializes nor inlines it.
 - The chosen suffix or schema would collide with a production target, or with another selected shadow target.
 - All three of the following hold at once:
   - the dialect treats identifier case as part of object identity (Snowflake and BigQuery);
