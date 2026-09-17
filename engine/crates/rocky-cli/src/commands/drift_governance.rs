@@ -61,9 +61,10 @@ pub(crate) enum GovernDecision {
 /// on that table's scope so [`Self::govern`] can combine it with the actual
 /// detected drift.
 ///
-/// Present on a [`TableTask`](super::run) only when both the config opt-in and
-/// a `[policy]` block are configured; absent it, the drift path is untouched
-/// and byte-identical to today.
+/// Present on a [`TableTask`](super::run) whenever the config opt-in is on,
+/// with or without a `[policy]` block (without one, it governs fail-closed as
+/// `require_review`; see [`Self::build`]). With the opt-in off it is absent, and
+/// the drift path is untouched and byte-identical to today.
 #[derive(Debug, Clone)]
 pub(crate) struct DriftGovernor {
     run_id: String,
@@ -103,7 +104,11 @@ pub(crate) struct DriftGovernor {
 
 impl DriftGovernor {
     /// Build the governor for one table, or `None` when auto-apply is not
-    /// enabled for this run (the flag is off or no `[policy]` block exists).
+    /// enabled for this run (`[resilience] auto_apply_additive_drift` is off).
+    ///
+    /// With the flag on and no `[policy]` block this still returns `Some`,
+    /// governing as `require_review`, so every drift is refused. Returning
+    /// `None` there would let the drift path apply changes ungoverned.
     ///
     /// A replication (bronze) target is not a compiled model, so it is
     /// evaluated against a bare-named [`ModelAttributes`] — the policy scope
@@ -130,7 +135,10 @@ impl DriftGovernor {
         // mutate UNGOVERNED (fail-open: a breaking retype would silently apply).
         // Govern with a no-grant, fail-closed posture instead: the effect is
         // `require_review`, so `is_auto_apply_eligible` refuses every drift until
-        // a `[policy]` rule explicitly grants `schema_change.additive`.
+        // a `[policy]` block grants `schema_change.additive` — through a matching
+        // rule, or through `default_agent_effect = "allow"`, since the gate
+        // evaluates as `PolicyPrincipal::Agent` below and an unmatched agent gets
+        // that default.
         let attrs = ModelAttributes {
             name: model_name.to_string(),
             ..Default::default()
