@@ -141,9 +141,7 @@ A `unique_key` maps a model to `merge` only when `incremental_strategy` is unset
 
 Where the fallback is reported depends on the import path. From a manifest, each model is listed in `MIGRATION-NOTES.md` under "Items to translate manually", and under "Warnings". With `--no-manifest`, the importer keeps only the warning text, so the model appears under "Warnings" alone. That includes a model with no `config()` block that inherits `materialized = 'incremental'` from `dbt_project.yml`.
 
-:::caution[A fallback model can drop history]
-A manifest import keeps dbt's compiled SQL. If dbt compiled the model against an existing table, the SQL can still carry its incremental filter. As `full_refresh`, each run then replaces the table with only the filtered rows. Remove the filter before the first run.
-:::
+Some fallbacks are refused instead. A manifest import keeps dbt's compiled SQL, and dbt compiles `is_incremental()` as true against an existing table. So the compiled SQL can keep an incremental filter, and as `full_refresh` each run would replace the table with only the recent rows. When an `incremental` or `microbatch` model would fall back to `full_refresh` and its raw SQL uses `is_incremental()`, the importer does not import it. The model is listed under `failed_details`, with the two ways out: a `unique_key` that maps it to `merge`, or a `time_interval` rewrite.
 
 Rocky refuses a model whose raw Jinja calls `is_incremental()` on either raw-SQL path: `--no-manifest`, or a manifest node with no `compiled_code`. Without compiled SQL, Rocky cannot preserve dbt's first-run versus later-run distinction. Each refused model is listed under `failed_details`.
 

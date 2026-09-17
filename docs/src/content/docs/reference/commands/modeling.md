@@ -524,9 +524,8 @@ One exception sits under row two: a placeholder written as a bare value, such as
 Full-refresh models emit a complete `CREATE OR REPLACE TABLE … AS …` that runs as-is against a fresh warehouse and matches what a run executes in the resolved dialect. Merge and `delete_insert` models emit their steady-state statement instead, which operates on an existing target. `rocky run` bootstraps the target table on first build, which a static emit cannot reproduce, so those files carry a leading note:
 
 ```sql
--- NOTE: incremental/merge statement — operates on an existing target.
--- `rocky run` bootstraps the table on first build and threads the
--- incremental watermark from state; this static SQL does neither.
+-- NOTE: merge/delete_insert statement — operates on an existing target.
+-- `rocky run` creates the table on first build; this static SQL does not.
 MERGE INTO ...
 ```
 
