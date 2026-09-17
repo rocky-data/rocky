@@ -18,7 +18,8 @@ use sqlparser::parser::Parser;
 
 use crate::compile::default_type_mapper;
 use crate::diagnostic::{
-    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, I001, I002, SourceSpan, W001,
+    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E037, I001, I002, SourceSpan,
+    W001,
     W002, W003, W004, W005, W006,
 };
 use crate::semantic::{ModelSchema, SemanticGraph};
@@ -600,6 +601,7 @@ fn compute_model_typecheck(
     // parenthesised or computed item lineage cannot name) and an emptiness
     // check misses the partial case.
     if let Some(model) = model_by_name.get(model_name) {
+        diagnostics.extend(check_incremental_strategy(model));
         diagnostics.extend(check_time_interval_strategy(model, &typed_cols));
         diagnostics.extend(check_merge_strategy(
             model,
@@ -912,6 +914,42 @@ fn check_merge_strategy(
             ))
         })
         .collect()
+}
+
+/// E037 — refuse `type = "incremental"` on a transformation model (#1990).
+///
+/// The transformation path lowers `incremental` to `INSERT INTO <target>
+/// <model SQL>` with no watermark filter, so every run after the first appends
+/// the whole result again and exits 0. Every [`rocky_core::models::Model`] is a
+/// transformation model (replication tables have no sidecar and never reach
+/// this pass), so no variant check is needed here.
+///
+/// `microbatch` takes the same unfiltered path and is deliberately NOT refused
+/// here: it is tracked separately in #2054, and the suggestion below does not
+/// offer it.
+fn check_incremental_strategy(model: &rocky_core::models::Model) -> Vec<Diagnostic> {
+    use rocky_core::models::StrategyConfig;
+
+    let StrategyConfig::Incremental { .. } = &model.config.strategy else {
+        return Vec::new();
+    };
+    let model_name = model.config.name.as_str();
+    vec![
+        Diagnostic::error(
+            E037,
+            model_name,
+            format!(
+                "model '{model_name}' uses `type = \"incremental\"`, which is not supported on \
+                 transformation models: it emits an unfiltered INSERT and appends every row \
+                 again on each run"
+            ),
+        )
+        .with_suggestion(
+            "Use `type = \"merge\"` with a `unique_key`, `type = \"delete_insert\"` with \
+             `partition_by`, `type = \"time_interval\"` with `@start_date`/`@end_date` in the \
+             SQL, or `type = \"full_refresh\"`",
+        ),
+    ]
 }
 
 /// E024 / W003 — both `@start_date` and `@end_date` placeholders should appear
