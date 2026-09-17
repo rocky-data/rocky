@@ -1153,7 +1153,7 @@ fn map_manifest_strategy(
                 message: "materialized='ephemeral' has no Rocky equivalent — using full_refresh"
                     .to_string(),
                 suggestion: Some(
-                    "ephemeral models inline into downstream queries; consider folding the SQL into the consumer or keeping it as a `full_refresh` table".to_string(),
+                    "dbt inlines an ephemeral model into its consumers; Rocky does not, and refuses `type = \"ephemeral\"` (E038). Use `type = \"view\"`, fold the SQL into the consumer, or keep the `full_refresh` table".to_string(),
                 ),
             });
             structured.push(ImportDbtStructuredWarning::UnsupportedMaterialization {
@@ -2092,7 +2092,7 @@ fn import_single_model(
         category: WarningCategory::UnsupportedMaterialization,
         message: msg,
         suggestion: Some(
-            "set `type = \"full_refresh\"` (or `\"ephemeral\"` for staging models) in the emitted sidecar".to_string(),
+            "set `type = \"full_refresh\"` (or `\"view\"` for staging models) in the emitted sidecar".to_string(),
         ),
     }));
 
@@ -2126,7 +2126,7 @@ fn import_single_model(
                         category: WarningCategory::UnsupportedMaterialization,
                         message: "project config materialized='ephemeral' has no Rocky equivalent — using full_refresh".to_string(),
                         suggestion: Some(
-                            "override per-model with `type = \"full_refresh\"` or fold the SQL into downstream models".to_string(),
+                            "override per-model with `type = \"full_refresh\"` or `type = \"view\"`; Rocky refuses `type = \"ephemeral\"` (E038)".to_string(),
                         ),
                     });
                 }

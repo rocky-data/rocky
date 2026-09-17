@@ -1096,9 +1096,8 @@ pub fn plan_preview_output(
         match sql_gen::generate_transformation_sql_with_warehouse(model_ir, dialect.as_ref(), None)
         {
             Ok(stmts) => {
-                // Ephemeral models return `Ok(vec![])` (inlined as CTEs) — no
-                // statement to preview. Multi-statement strategies
-                // (DeleteInsert, lakehouse DDL) emit one row each.
+                // Multi-statement strategies (DeleteInsert, lakehouse DDL)
+                // emit one row each.
                 for sql in stmts {
                     output.statements.push(PlannedStatement {
                         purpose: purpose.to_string(),

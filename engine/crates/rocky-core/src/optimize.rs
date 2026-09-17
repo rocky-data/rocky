@@ -1,7 +1,7 @@
 //! Cost model and materialization strategy recommendations.
 //!
 //! Analyzes model execution history to recommend optimal materialization
-//! strategies (view, table, ephemeral) based on compute cost, storage cost,
+//! strategies (view, table) based on compute cost, storage cost,
 //! and downstream consumer patterns.
 
 use serde::{Deserialize, Serialize};
