@@ -1,0 +1,5 @@
+# A view: no copied data, and every read sees the source as it is now.
+# `type = "ephemeral"` is refused (E038) — nothing inlines it into a
+# consumer, so the consumer would read whatever table carried the name.
+[strategy]
+type = "view"

@@ -413,7 +413,8 @@ pub enum StrategyConfig {
         #[serde(default)]
         first_partition: Option<String>,
     },
-    /// Ephemeral model — inlined as CTE in downstream queries, no table created.
+    /// Ephemeral model — refused at compile time (E038). No table is created
+    /// and no consumer inlines it, so it is kept only to name the refusal.
     #[serde(rename = "ephemeral")]
     Ephemeral,
     /// Delete+Insert: delete matching rows by partition key, then insert.

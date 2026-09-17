@@ -18,8 +18,8 @@ use sqlparser::parser::Parser;
 
 use crate::compile::default_type_mapper;
 use crate::diagnostic::{
-    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E037, I001, I002, SourceSpan,
-    W001, W002, W003, W004, W005, W006,
+    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E037, E038, I001, I002,
+    SourceSpan, W001, W002, W003, W004, W005, W006,
 };
 use crate::semantic::{ModelSchema, SemanticGraph};
 use crate::types::{RockyType, TypedColumn};
@@ -601,6 +601,7 @@ fn compute_model_typecheck(
     // check misses the partial case.
     if let Some(model) = model_by_name.get(model_name) {
         diagnostics.extend(check_incremental_strategy(model));
+        diagnostics.extend(check_ephemeral_strategy(model));
         diagnostics.extend(check_time_interval_strategy(model, &typed_cols));
         diagnostics.extend(check_merge_strategy(
             model,
@@ -947,6 +948,43 @@ fn check_incremental_strategy(model: &rocky_core::models::Model) -> Vec<Diagnost
             "Use `type = \"merge\"` with a `unique_key`, `type = \"delete_insert\"` with \
              `partition_by`, `type = \"time_interval\"` with `@start_date`/`@end_date` in the \
              SQL, or `type = \"full_refresh\"`",
+        ),
+    ]
+}
+
+/// E038 — refuse `type = "ephemeral"` (#1996).
+///
+/// An ephemeral model emits no statement, and no pass rewrites a consumer's
+/// reference to it into a CTE. The consumer's SQL keeps a bare
+/// `FROM <model>`, so it reads whatever physical table carries that name:
+/// a catalog error when none exists, and a stale or unrelated table when one
+/// does. Both ways the model's own rows are never read.
+///
+/// `view` gives what `ephemeral` promised — no copied data, always-fresh
+/// reads — for one view object per model, on every dialect. A private
+/// intermediate has a second answer: an earlier step of a `.rocky` model,
+/// which does fold into the later steps at lowering.
+fn check_ephemeral_strategy(model: &rocky_core::models::Model) -> Vec<Diagnostic> {
+    use rocky_core::models::StrategyConfig;
+
+    let StrategyConfig::Ephemeral = &model.config.strategy else {
+        return Vec::new();
+    };
+    let model_name = model.config.name.as_str();
+    vec![
+        Diagnostic::error(
+            E038,
+            model_name,
+            format!(
+                "model '{model_name}' uses `type = \"ephemeral\"`, which is not supported: an \
+                 ephemeral model is not materialized and is not inlined into its consumers, so \
+                 a consumer reads whatever table already carries the name"
+            ),
+        )
+        .with_suggestion(
+            "Use `type = \"view\"` for an intermediate other models read: no copied data, \
+             always-fresh reads, one view object. For an intermediate only one model reads, \
+             make it an earlier step of that model in a `.rocky` file",
         ),
     ]
 }

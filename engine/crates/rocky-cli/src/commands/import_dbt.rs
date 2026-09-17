@@ -23,7 +23,6 @@
 //! pass. Known limitations are listed in `MIGRATION-NOTES.md`. The goal is
 //! a `rocky compile`-clean repo, not a line-for-line dbt clone.
 
-use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::Result;
@@ -95,11 +94,6 @@ pub fn run_import_dbt(
         });
     }
 
-    // Capture which models had their `view` materialization flattened to
-    // FullRefresh by the importer — we re-rewrite those to Ephemeral at
-    // emit time per the importer's `view → ephemeral` mapping.
-    let view_models = collect_view_flattened_models(&import_result);
-
     let policy = if overwrite {
         OverwritePolicy::ReplaceContents
     } else {
@@ -114,7 +108,6 @@ pub fn run_import_dbt(
         default_catalog: &default_target.catalog,
         default_schema: &default_target.schema,
         import: &import_result,
-        view_models_to_make_ephemeral: view_models,
         adapter_override_label,
     })
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -317,14 +310,6 @@ fn run_importer(
     } else {
         dbt::import_dbt_project(dbt_project, default_target).map_err(|e| anyhow::anyhow!("{e}"))
     }
-}
-
-fn collect_view_flattened_models(_result: &ImportResult) -> BTreeSet<String> {
-    // Wave 2: `view` maps to `StrategyConfig::View` directly, so there's
-    // no longer a flattening step to compensate for at emit time. The
-    // BTreeSet is retained on `EmitInputs` for back-compat and always
-    // empty here.
-    BTreeSet::new()
 }
 
 /// Translate a `rocky-compiler`-side structured warning into the

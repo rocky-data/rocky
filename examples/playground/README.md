@@ -108,7 +108,7 @@ How Rocky avoids rebuilding what has not changed. These POCs cover the increment
 | [04-column-propagation](pocs/02-performance/04-column-propagation) | Column-level lineage pruning — `rocky plan` skips downstream models whose consumed columns didn't change |
 | [05-optimize-recommendations](pocs/02-performance/05-optimize-recommendations) | `rocky optimize` + `profile-storage` + `compact --dry-run` after building run history |
 | [06-schema-drift-recover](pocs/02-performance/06-schema-drift-recover) | Drift detection auto-widening `STRING→INT`, unsafe changes via `DROP+RECREATE` |
-| [07-ephemeral-cte](pocs/02-performance/07-ephemeral-cte) | `strategy = "ephemeral"` — model inlined as CTE, never persisted as a table |
+| [07-view-intermediate](pocs/02-performance/07-view-intermediate) | `strategy = "view"` — a shared intermediate that copies no data |
 | [08-delete-insert-partitioned](pocs/02-performance/08-delete-insert-partitioned) | `strategy = "delete_insert"` with `partition_by` — atomic partition replacement without MERGE |
 | [09-adaptive-concurrency](pocs/02-performance/09-adaptive-concurrency) | AIMD throttling — dynamic parallelism with `concurrency`, `error_rate_abort_pct`, `table_retries` |
 | [10-cost-budgets](pocs/02-performance/10-cost-budgets) | **Trust arc 2** — per-run `cost_summary` + `[budget]` block + `budget_breach` record |

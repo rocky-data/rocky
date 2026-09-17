@@ -134,6 +134,8 @@ A passing contract is what lets you refactor a model's internals without breakin
 
 Rocky applies each action during the run that reports it. The entry records what already happened. It is not a plan for the next run.
 
+The list covers only the attempt that finished. Rocky records the entry after the table's copy succeeds. If the rebuild after a `drop_and_recreate` fails, that entry is lost, although the drop already ran. A retry, one by default through `table_retries`, can then rebuild the table and report it as materialized, with no sign of the drop. So a missing entry does not prove the target was left alone.
+
 Each entry's `reason` names the columns behind the action, one phrase per column. The JSON carries no other column-level detail.
 
 Rocky does not detect a column that disappeared from the source. No action covers a removed column, and no grace period runs today.
@@ -143,7 +145,7 @@ Rocky does not detect a column that disappeared from the source. No action cover
 - **`add_columns`**: Rocky already added the columns. They are nullable, so historical rows hold NULL. Check any downstream model that reads them.
 - **`alter_column_types`**: Rocky already widened the columns. Check that downstream tables, views, and dashboards still parse the wider type.
 - **`drop_and_recreate`**: Rocky already dropped the target and rebuilt it. Consumers saw the table disappear and come back mid-run. Check whether the source type change was intended.
-- **Governing the auto-apply**: these mutations apply on Rocky's own authority by default. Set `auto_apply_additive_drift = true` under `[resilience]` in `rocky.toml` to route each one through the policy plane instead. Rocky then applies only a provably additive change that a `[policy]` rule allows, and refuses the rest with a require-review failure.
+- **Governing the auto-apply**: these mutations apply on Rocky's own authority by default. Set `auto_apply_additive_drift = true` under `[resilience]` in `rocky.toml` to route each one through the policy plane instead. Rocky then applies only a provably additive change that policy resolves to `allow`, through a matching rule or `default_agent_effect`. It refuses the rest with a require-review failure.
 
 Rocky corrects drift inside the run rather than waiting for you. Your job is to read what it did, then check the consumers downstream.
 

@@ -136,7 +136,7 @@ Nine variants, defined in [`src/ir.rs`](src/ir.rs). The variant-by-variant seman
 | `MaterializedView` | Databricks Materialized View — warehouse manages refresh. | `CREATE OR REPLACE MATERIALIZED VIEW`. |
 | `DynamicTable { target_lag }` | Snowflake Dynamic Table — warehouse manages lag-based refresh. | `CREATE OR REPLACE DYNAMIC TABLE … TARGET_LAG = '…'`. |
 | `TimeInterval { time_column, granularity, window }` | Partition-keyed materialization. | `INSERT OVERWRITE PARTITION (…)` per partition; one IR instance per partition. |
-| `Ephemeral` | Inlined as a CTE in downstream consumers. | No SQL emitted; consumers reference the model name. |
+| `Ephemeral` | Refused at compile time (E038). | No SQL emitted; nothing inlines it, so a consumer would read whatever table already carries the name. Use `View`. |
 | `DeleteInsert { partition_by }` | Delete matching rows by partition key, then insert fresh data. dbt-compatible. | `DELETE FROM target WHERE …; INSERT INTO target SELECT …`. |
 | `Microbatch { timestamp_column, granularity }` | Alias for `TimeInterval` with sensible defaults. dbt-compatible naming. | Same as `TimeInterval` after defaulting. |
 

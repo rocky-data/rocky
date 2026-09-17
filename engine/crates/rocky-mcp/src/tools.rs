@@ -317,8 +317,9 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
     // one. The rewrite carried "exactly what would execute" straight from
     // the CLI sentence onto the tool, which is the surface the claim is
     // least true of: `commands::plan_preview_output` renders offline and
-    // DROPS any model `sql_gen` cannot render, and `PlanPreviewResult` has
-    // no field that names one.
+    // DROPS any model `sql_gen` cannot render. `PlanPreviewResult` names
+    // such a model in `skipped` since #1996; the description still has to
+    // say the statement list is not the whole plan.
     //
     // The needle is now the whole step, because the default sentence it
     // replaces carries three CLI routes (`rocky emit-sql`, `rocky plan` and
@@ -396,8 +397,9 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
          matches your intent.",
         "Call the `plan_preview` tool and read the SQL it returns. It renders offline. It \
          is not the whole plan: a model whose SQL cannot be rendered offline is SKIPPED, \
-         and the result does not name it. So a model missing from the statements means \
-         'not renderable offline', never 'nothing to do'. Three are skipped by \
+         and named in `skipped` with the reason. So a model missing from \
+         the statements means 'not renderable offline', never 'nothing to do' — read \
+         `skipped` to see which. Three are skipped by \
          construction: a Snowflake dynamic table needs a live compute warehouse, a \
          time-interval model needs a runtime window, and a content-addressed model never \
          goes through SQL generation. Confirm the SQL it does return matches your intent.",
@@ -2524,9 +2526,10 @@ impl RockyMcpServer {
     // execute", and the preview is offline: it passes no warehouse to
     // `sql_gen::generate_transformation_sql_with_warehouse`, and
     // `commands::plan_preview_output` logs and SKIPS any model whose SQL
-    // that call cannot render. `PlanPreviewResult` carries `statements` and
-    // nothing else, so a skipped model leaves no trace in the result at
-    // all. Three strategies are skipped by construction — a Snowflake
+    // that call cannot render. `PlanPreviewResult` now carries `skipped`
+    // beside `statements`, so such a model is named with its reason instead
+    // of leaving no trace (#1996). Three strategies are skipped by
+    // construction — a Snowflake
     // `DynamicTable` needs a compute warehouse, a `TimeInterval` model
     // needs a runtime window that static planning leaves `None`, and
     // `ContentAddressed` never reaches SQL generation — and any other
@@ -2534,12 +2537,14 @@ impl RockyMcpServer {
     #[tool(
         description = "Render the SQL Rocky generates for the project's transformation models, \
          offline and with no warehouse connection. It is not the whole plan: a model whose SQL \
-         cannot be rendered offline is SKIPPED, and the result does not name it, so a short or \
-         empty statement list is not proof the project has nothing else to do. Skipped by \
-         construction: a Snowflake dynamic table (it needs a live compute warehouse), a \
-         time-interval model (it needs a runtime window), and a content-addressed model (it \
-         never goes through SQL generation). Read the statements it does return to confirm the \
-         generated SQL matches intent before proposing a materialization."
+         cannot be rendered offline is SKIPPED, and named in `skipped` with the reason, so a \
+         short or empty statement list is not proof the project has nothing else to do — read \
+         `skipped` too. Skipped by construction: a Snowflake dynamic table (it needs a live \
+         compute warehouse), a time-interval model (it needs a runtime window), and a \
+         content-addressed model (it never goes through SQL generation). A model whose \
+         strategy Rocky refuses, such as `ephemeral`, is skipped with its diagnostic code as \
+         the reason. Read the statements it does return to confirm the generated SQL matches \
+         intent before proposing a materialization."
     )]
     async fn plan_preview(
         &self,
@@ -2565,7 +2570,21 @@ impl RockyMcpServer {
                 sql: s.sql,
             })
             .collect();
-        Ok(Json(PlanPreviewResult { statements }))
+        // A model that rendered nothing is named here with its reason. It
+        // used to leave no trace, so an agent holding a successful draft and
+        // an empty preview had nothing to connect the two (#1996).
+        let skipped = output
+            .skipped
+            .into_iter()
+            .map(|s| SkippedModelLite {
+                model: s.model,
+                reason: s.reason,
+            })
+            .collect();
+        Ok(Json(PlanPreviewResult {
+            statements,
+            skipped,
+        }))
     }
 
     #[tool(
@@ -6825,17 +6844,19 @@ fn render_cell(v: serde_json::Value) -> String {
 /// reach either. The harm is concrete and this is the surface that delivers
 /// it: a dynamic-table draft SUCCEEDS, receives this guidance, and is then
 /// absent from the preview it was just told to read, because
-/// `commands::plan_preview_output` skips what it cannot render offline and
-/// `PlanPreviewResult` carries no field naming a skipped model. The agent
-/// is holding a successful draft and an empty preview with nothing to tell
-/// it the two are about the same model.
+/// `commands::plan_preview_output` skips what it cannot render offline.
+/// The agent was holding a successful draft and an empty preview with
+/// nothing to tell it the two are about the same model; `PlanPreviewResult`
+/// names such a model in `skipped` since #1996, and this text sends the
+/// agent to look there.
 const DRAFT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or touched the \
      warehouse. Continue the authoring loop: fix any error diagnostics above and re-draft (or \
      `compile`) until it is clean, `plan_preview` to read the SQL that renders offline, then \
      `propose` to record an AI-authored plan for a human to `rocky review <plan_id> --approve` \
      and `rocky apply`. The preview is not the whole plan: a model it cannot render offline is \
-     skipped and is not named, so a draft that succeeded here and is missing from the preview \
-     is unrenderable offline, not absent from the project. Never apply a draft directly.";
+     skipped and named in `skipped`, so a draft that succeeded here and is missing from the \
+     statements is unrenderable offline, not absent from the project. Never apply a draft \
+     directly.";
 
 /// The worker-profile variant of [`DRAFT_NEXT_STEPS`] (FF-WP1 fix round 2,
 /// item 5c): the default reminder instructs `propose`, a tool this profile
@@ -6856,8 +6877,8 @@ const DRAFT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or 
 const WORKER_DRAFT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or touched \
      the warehouse. Continue the drafting loop: fix any error diagnostics above and re-draft \
      (or `compile`) until it is clean, `plan_preview` to read the SQL that renders offline \
-     (the preview is not the whole plan — a model it cannot render offline is skipped and is \
-     not named, so a draft that succeeded here and is missing from the preview is \
+     (the preview is not the whole plan — a model it cannot render offline is skipped and \
+     named in `skipped`, so a draft that succeeded here and is missing from the statements is \
      unrenderable offline, not absent from the project), and the \
      `test` tool to run the project's LOCAL tests. Those local tests are the only suite you \
      can run here. The checks the product spec declares — its grain, its not-null columns, its \
@@ -9498,10 +9519,10 @@ database = ":memory:"
              it renders offline and silently drops what it cannot render: {body}"
         );
         assert!(
-            body.contains("SKIPPED, and the result does not name it"),
-            "the projected body must say a model the preview cannot render offline is \
-             dropped WITHOUT being named, or an empty preview reads as an empty project: \
-             {body}"
+            body.contains("SKIPPED, and named in `skipped` with the reason"),
+            "the projected body must say a model the preview cannot render offline is left \
+             out of the statements and named in `skipped`, or an empty statement list reads \
+             as an empty project: {body}"
         );
         // FINDING 1C — the retry steer. It presumed materializing a pipeline
         // through a route this profile does not serve; no worker tool runs
@@ -9836,8 +9857,9 @@ database = ":memory:"
             // test's original family. `plan_preview` called its output "the
             // exact SQL Rocky would execute" while
             // `commands::plan_preview_output` passes no warehouse and skips
-            // every model `sql_gen` cannot render offline, and
-            // `PlanPreviewResult` has no field that names a skipped model.
+            // every model `sql_gen` cannot render offline. Since #1996 the
+            // result names such a model in `skipped`; the description still
+            // must not promise the statements are the whole plan.
             //
             // Pinned in BOTH directions and on BOTH profiles: the removed
             // exactness claim must stay gone, and the disclosure that
@@ -9852,10 +9874,10 @@ database = ":memory:"
                  {plan_preview}"
             );
             assert!(
-                plan_preview.contains("SKIPPED, and the result does not name it"),
+                plan_preview.contains("SKIPPED, and named in `skipped` with the reason"),
                 "{profile:?}: `plan_preview`'s description must say that a model it cannot \
-                 render offline is dropped WITHOUT being named, or an empty preview reads as \
-                 an empty project: {plan_preview}"
+                 render offline is left out of the statements and named in `skipped`, or an \
+                 empty statement list reads as an empty project: {plan_preview}"
             );
         }
     }
@@ -10449,9 +10471,9 @@ database = ":memory:"
              it is clean, `plan_preview` to read the SQL that renders offline, then `propose` \
              to record an AI-authored plan for a human to `rocky review <plan_id> --approve` \
              and `rocky apply`. The preview is not the whole plan: a model it cannot render \
-             offline is skipped and is not named, so a draft that succeeded here and is \
-             missing from the preview is unrenderable offline, not absent from the project. \
-             Never apply a draft directly.",
+             offline is skipped and named in `skipped`, so a draft that succeeded here and is \
+             missing from the statements is unrenderable offline, not absent from the \
+             project. Never apply a draft directly.",
             "default draft_model next_steps are pinned byte-for-byte"
         );
         assert_eq!(
@@ -10493,10 +10515,10 @@ database = ":memory:"
         // property is being held rather than leaving it to a diff.
         //
         // The harm is specific to this surface. A dynamic-table draft
-        // SUCCEEDS, carries this text, and is then absent from the preview
-        // it names — `commands::plan_preview_output` passes no warehouse and
-        // skips what `sql_gen` cannot render, and `PlanPreviewResult` has no
-        // field that names a skipped model.
+        // SUCCEEDS, carries this text, and is then absent from the preview's
+        // statements — `commands::plan_preview_output` passes no warehouse
+        // and skips what `sql_gen` cannot render. Since #1996 `skipped`
+        // names it, and this text has to send the agent there.
         for (profile, next_steps) in [
             (McpProfile::Default, default_server.draft_model_next_steps()),
             (McpProfile::Worker, worker_server.draft_model_next_steps()),
@@ -10508,11 +10530,11 @@ database = ":memory:"
                  {next_steps}"
             );
             assert!(
-                next_steps.contains("skipped and is not named"),
+                next_steps.contains("skipped and named in `skipped`"),
                 "{profile:?}: `draft_model`'s next_steps must say a model the preview cannot \
-                 render offline is dropped WITHOUT being named — a draft can succeed here \
-                 and then be missing from the preview this text sends the agent to read: \
-                 {next_steps}"
+                 render offline is left out of the statements and named in `skipped` — a \
+                 draft can succeed here and then be missing from the preview this text sends \
+                 the agent to read: {next_steps}"
             );
         }
     }

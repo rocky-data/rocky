@@ -1542,6 +1542,15 @@ pub struct DriftActionOutput {
 /// consumers that do not include a compile step remain byte-stable. When
 /// `rocky plan` runs against a project with a `models/` directory, these
 /// fields are populated and the plan is persisted to `.rocky/plans/`.
+/// One model `rocky plan` left out of the preview, and why.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SkippedModel {
+    /// The model's name, as declared in its sidecar.
+    pub model: String,
+    /// Why no statement was previewed for it.
+    pub reason: String,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PlanOutput {
     pub version: String,
@@ -1574,6 +1583,14 @@ pub struct PlanOutput {
     /// warehouses without a first-class retention knob.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retention_actions: Vec<RetentionAction>,
+    /// Models the preview could not render, one entry each, with the
+    /// reason. A model whose SQL cannot be rendered offline lands here
+    /// (a Snowflake dynamic table needs a live compute-warehouse name),
+    /// and so does one whose strategy is refused, such as `ephemeral`
+    /// (E038). Before, such a model left no trace: an ephemeral-only
+    /// project previewed as an empty plan and exit 0.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedModel>,
 
     // ---- D-3 stage 2: pre-execution budget diagnostics ------------------
     //
@@ -5455,6 +5472,7 @@ impl PlanOutput {
             classification_actions: vec![],
             mask_actions: vec![],
             retention_actions: vec![],
+            skipped: vec![],
             budget_diagnostics: vec![],
             has_budget_errors: false,
             plan_id: None,

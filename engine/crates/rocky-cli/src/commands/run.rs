@@ -30494,6 +30494,345 @@ auto_create_schemas = true
         }
     }
 
+    /// #1996 end to end through `execute_models`: an `ephemeral` model fails
+    /// compile with E038 and is excluded from the run, which records it as a
+    /// failed table. It writes nothing, so nothing reads its rows by accident.
+    ///
+    /// Its dependent follows the same compile-error policy (#1291) that E037
+    /// follows above: only the failing model is excluded, downstream
+    /// containment is opt-in. The ephemeral case differs in one way worth
+    /// naming — a table carrying the model's name was never written by the
+    /// model, because an ephemeral model never wrote one. So the dependent
+    /// that builds is reading an unrelated table. The run still fails
+    /// (`tables_failed >= 1`, never `Success`), which is what changed: before
+    /// E038 the same read happened with no diagnostic at all. This pins the
+    /// policy for E038 on purpose: changing it should be a deliberate edit
+    /// here, and it is tracked as its own decision.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn an_e038_model_is_excluded_from_run_and_its_dependent_follows_policy() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        for upstream_exists in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).unwrap();
+            let db = tmp.path().join("e038.duckdb");
+            let state = StateStore::open(&tmp.path().join("state")).unwrap();
+            {
+                let s = DuckDbWarehouseAdapter::open(&db).unwrap();
+                s.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
+                    .await
+                    .unwrap();
+                s.execute_statement(
+                    "CREATE TABLE main.ev AS SELECT * FROM (VALUES \
+                     (1, TIMESTAMP '2024-01-01 00:00:00'), \
+                     (2, TIMESTAMP '2024-01-02 00:00:00')) AS t(id, ts)",
+                )
+                .await
+                .unwrap();
+                if upstream_exists {
+                    // NOT written by `up`: an ephemeral model never writes a
+                    // table. Something else in the schema carries the name.
+                    s.execute_statement(
+                        "CREATE TABLE main.up AS SELECT 99 AS id, \
+                         TIMESTAMP '2023-01-01 00:00:00' AS ts",
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            std::fs::write(models_dir.join("up.sql"), "SELECT id, ts FROM main.ev\n").unwrap();
+            std::fs::write(
+                models_dir.join("up.toml"),
+                "[strategy]\ntype = \"ephemeral\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"up\"\n",
+            )
+            .unwrap();
+            std::fs::write(models_dir.join("down.sql"), "SELECT id FROM main.up\n").unwrap();
+            std::fs::write(
+                models_dir.join("down.toml"),
+                "depends_on = [\"up\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"down\"\n",
+            )
+            .unwrap();
+
+            let adapter = DuckDbWarehouseAdapter::open(&db).expect("open duckdb");
+            let mut output = RunOutput::new(String::new(), 0, 1);
+            let gate_off = SkipGateConfig {
+                feature_enabled: false,
+                force_rebuild: false,
+                rowcount_fallback: false,
+                lag_tolerance_seconds: 0,
+                shadow_or_branch: false,
+            };
+            // Both outcomes are asserted below: the exclusion lands in `output`
+            // either way, and the Result says whether the dependent could run.
+            let res = super::execute_models(
+                &models_dir,
+                None,
+                &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+                Some(&state),
+                &PartitionRunOptions::default(),
+                "run-e038",
+                None,
+                None,
+                &mut output,
+                None,
+                None,
+                &rocky_core::config::SchemaCacheConfig::default(),
+                false,
+                None,
+                &DeferOptions::default(),
+                gate_off,
+                false,
+                false,
+                &rocky_core::run_vars::RunVars::new(),
+                rocky_core::config::ResilienceConfig::default(),
+                false,
+                true,
+                None,
+                None,
+                false,
+            )
+            .await;
+            drop(adapter);
+
+            let case = if upstream_exists {
+                "old upstream table"
+            } else {
+                "no upstream table"
+            };
+            assert!(
+                output
+                    .errors
+                    .iter()
+                    .any(|e| e.asset_key == vec!["up".to_string()] && e.error.contains("[E038]")),
+                "{case}: the run must report E038 on `up`: {:?}",
+                output.errors
+            );
+            assert!(
+                output.tables_failed >= 1,
+                "{case}: the E038 model counts as failed"
+            );
+            assert_ne!(
+                output.derive_run_status(),
+                rocky_core::state::RunStatus::Success,
+                "{case}: a run with an E038 model must not report success"
+            );
+            assert!(
+                !output
+                    .materializations
+                    .iter()
+                    .any(|m| m.asset_key.last().map(String::as_str) == Some("up")),
+                "{case}: `up` must not materialize"
+            );
+
+            if upstream_exists {
+                assert!(
+                    res.is_ok(),
+                    "with an old upstream table the run completes: {:?}",
+                    res.as_ref().err()
+                );
+                assert_eq!(
+                    count_rows(&db, "up").await,
+                    1,
+                    "the table that carries the name is untouched"
+                );
+                assert_eq!(
+                    count_rows(&db, "down").await,
+                    1,
+                    "policy (#1291): the dependent builds from whatever table \
+                     carries the name, and the run fails"
+                );
+            } else {
+                // The dependent fails for the right reason: the excluded model
+                // never created its table. Not silently skipped, not aborted early.
+                let err = format!(
+                    "{:#}",
+                    res.expect_err("with no upstream table the dependent must fail the run")
+                );
+                assert!(
+                    err.contains("model 'down' failed") && err.contains("does not exist"),
+                    "the failure names `down` and the missing upstream table: {err}"
+                );
+                assert!(
+                    !output
+                        .materializations
+                        .iter()
+                        .any(|m| m.asset_key.last().map(String::as_str) == Some("down")),
+                    "with no upstream table the dependent cannot build"
+                );
+            }
+        }
+    }
+
+    /// The containment knob already covers a refused strategy: with
+    /// `[resilience] contain_failures = true`, the E038 model's descendants
+    /// are withheld instead of building from whatever table carries the name.
+    ///
+    /// `run.rs` seeds the containment ledger's poison set from
+    /// `compile_failed_models`, so a compile-error exclusion poisons its
+    /// closure exactly as a runtime failure does. The knob defaults to
+    /// `false`, which is the case the test above pins.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn containment_withholds_the_dependent_of_an_e038_model() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("e038c.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+        {
+            let s = DuckDbWarehouseAdapter::open(&db).unwrap();
+            s.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
+                .await
+                .unwrap();
+            s.execute_statement(
+                "CREATE TABLE main.ev AS SELECT * FROM (VALUES \
+                 (1, TIMESTAMP '2024-01-01 00:00:00')) AS t(id, ts)",
+            )
+            .await
+            .unwrap();
+            // The unrelated table the dependent would otherwise read.
+            s.execute_statement(
+                "CREATE TABLE main.up AS SELECT 99 AS id, \
+                 TIMESTAMP '2023-01-01 00:00:00' AS ts",
+            )
+            .await
+            .unwrap();
+        }
+        std::fs::write(models_dir.join("up.sql"), "SELECT id, ts FROM main.ev\n").unwrap();
+        std::fs::write(
+            models_dir.join("up.toml"),
+            "[strategy]\ntype = \"ephemeral\"\n\n\
+             [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"up\"\n",
+        )
+        .unwrap();
+        std::fs::write(models_dir.join("down.sql"), "SELECT id FROM main.up\n").unwrap();
+        std::fs::write(
+            models_dir.join("down.toml"),
+            "depends_on = [\"up\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"down\"\n",
+        )
+        .unwrap();
+        // A model in no way related to `up`. Containment withholds a blast
+        // radius; a global abort would take this one down too, and without
+        // it the test could not tell the two apart.
+        std::fs::write(models_dir.join("side.sql"), "SELECT id FROM main.ev\n").unwrap();
+        std::fs::write(
+            models_dir.join("side.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"side\"\n",
+        )
+        .unwrap();
+
+        let adapter = DuckDbWarehouseAdapter::open(&db).expect("open duckdb");
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        let gate_off = SkipGateConfig {
+            feature_enabled: false,
+            force_rebuild: false,
+            rowcount_fallback: false,
+            lag_tolerance_seconds: 0,
+            shadow_or_branch: false,
+        };
+        let resilience = rocky_core::config::ResilienceConfig {
+            contain_failures: true,
+            ..rocky_core::config::ResilienceConfig::default()
+        };
+        let res = super::execute_models(
+            &models_dir,
+            None,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            Some(&state),
+            &PartitionRunOptions::default(),
+            "run-e038-contain",
+            None,
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            false,
+            None,
+            &DeferOptions::default(),
+            gate_off,
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            resilience,
+            false,
+            true,
+            None,
+            None,
+            false,
+        )
+        .await;
+        drop(adapter);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|e| e.asset_key == vec!["up".to_string()] && e.error.contains("[E038]")),
+            "the run still reports E038 on `up`: {:?}",
+            output.errors
+        );
+        assert!(
+            res.is_ok(),
+            "containment continues the run rather than aborting it: {:?}",
+            res.as_ref().err()
+        );
+        let contained: Vec<&str> = output.contained.iter().map(|c| c.model.as_str()).collect();
+        assert_eq!(
+            contained,
+            vec!["down"],
+            "`down` must be the sole contained model: {contained:?}"
+        );
+        assert_eq!(
+            output.contained[0].blocked_by,
+            vec!["up".to_string()],
+            "the refused model is named as the blocker"
+        );
+        assert!(
+            !output
+                .materializations
+                .iter()
+                .any(|m| m.asset_key.last().map(String::as_str) == Some("down")),
+            "with containment on, the dependent is withheld, not built"
+        );
+        assert!(
+            output
+                .materializations
+                .iter()
+                .any(|m| m.asset_key.last().map(String::as_str) == Some("side")),
+            "an unrelated model still builds — this is containment, not an abort: {:?}",
+            output.materializations
+        );
+        let down_exists = {
+            let a = DuckDbWarehouseAdapter::open(&db).expect("open duckdb");
+            let r = a
+                .execute_query(
+                    "SELECT COUNT(*) FROM information_schema.tables \
+                     WHERE table_schema = 'main' AND table_name = 'down'",
+                )
+                .await
+                .unwrap();
+            r.rows[0][0]
+                .as_i64()
+                .or_else(|| r.rows[0][0].as_str().and_then(|s| s.parse().ok()))
+                .unwrap()
+        };
+        assert_eq!(
+            down_exists, 0,
+            "no `down` table is written from the unrelated `main.up`"
+        );
+    }
+
     /// `lag_tolerance_seconds`: a sub-tolerance MAX(ts) movement is treated as
     /// unchanged (SKIP) only when a tolerance is configured; an above-tolerance
     /// movement always builds; the default tolerance 0 builds on any movement.

@@ -991,6 +991,61 @@ fn an_incremental_transformation_model_is_refused_with_e037() {
     assert!(result.has_errors, "an E037 must make the compile fail");
 }
 
+/// #1996: an ephemeral model is never materialized and never inlined, so a
+/// consumer reads whatever physical table carries the name. The refusal must
+/// be an ERROR on the model that declares the strategy, for the same reason
+/// E037 must: `rocky run` excludes a model from execution only on an
+/// error-severity diagnostic keyed on its name.
+#[test]
+fn an_ephemeral_model_is_refused_with_e038() {
+    let result = compile_strategy_project("type = \"ephemeral\"");
+
+    let e038: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| &*d.code == "E038")
+        .collect();
+    assert_eq!(
+        e038.len(),
+        1,
+        "exactly one E038, got: {:?}",
+        result.diagnostics
+    );
+    let d = e038[0];
+    assert!(
+        d.is_error(),
+        "E038 must be an error so the model is excluded from execution"
+    );
+    assert_eq!(
+        d.model, "leaf",
+        "the diagnostic names the model that declares the strategy"
+    );
+    let suggestion = d.suggestion.as_deref().unwrap_or_default();
+    assert!(
+        suggestion.contains("view"),
+        "the suggestion names the strategy that works: {suggestion}"
+    );
+    assert!(result.has_errors, "an E038 must make the compile fail");
+}
+
+/// Boundary: the refusal is scoped to `ephemeral`. Every other strategy a
+/// model can declare compiles clean of E038.
+#[test]
+fn e038_does_not_fire_for_other_strategies() {
+    for strategy in [
+        "type = \"full_refresh\"",
+        "type = \"view\"",
+        "type = \"merge\"\nunique_key = [\"id\"]",
+    ] {
+        let result = compile_strategy_project(strategy);
+        assert!(
+            !result.diagnostics.iter().any(|d| &*d.code == "E038"),
+            "{strategy}: unexpected E038 in {:?}",
+            result.diagnostics
+        );
+    }
+}
+
 /// Boundary: the refusal is scoped to `incremental`. A `full_refresh` leaf
 /// compiles clean of E037, and `microbatch` is not refused by this check:
 /// its ruling is pending in #2054, so a change here must be deliberate.
