@@ -3570,6 +3570,7 @@ pub fn validate_freeze_marker_writes(config: &RockyConfig) -> Vec<ConfigError> {
 const RESERVED_CHECK_NAMES: &[&str] = &[
     // engine
     "quarantine:compile",
+    "quarantine:execute",
     // dagster checks declared on every asset, unconditionally
     // (`component.py::DEFAULT_CHECK_NAMES`, minus the conditional freshness)
     "row_count",
@@ -8806,9 +8807,9 @@ autonomy_budget = { failures = 0, window = "7d" }
         );
     }
 
-    /// The engine emits a `quarantine:compile` check of its own. A user
-    /// assertion may not take that name, in ANY spelling that sanitizes to
-    /// the same thing.
+    /// The engine emits `quarantine:compile` and `quarantine:execute` checks
+    /// of its own. A user assertion may not take either name, in ANY spelling
+    /// that sanitizes to the same thing.
     ///
     /// Dagster maps every non-alphanumeric character to `_` and then keys by
     /// `(asset_key, sanitized_name)` with no dedup, so `quarantine:compile`
@@ -8820,6 +8821,9 @@ autonomy_budget = { failures = 0, window = "7d" }
             "quarantine:compile",
             "quarantine_compile",
             "quarantine.compile",
+            "quarantine:execute",
+            "quarantine_execute",
+            "quarantine.execute",
         ] {
             let cfg = parse(&format!(
                 r#"

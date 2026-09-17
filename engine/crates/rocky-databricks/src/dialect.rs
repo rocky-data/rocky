@@ -232,6 +232,11 @@ impl SqlDialect for DatabricksSqlDialect {
         format!("`{name}`")
     }
 
+    /// `* EXCEPT (a, b)`.
+    fn star_excluding(&self, columns: &[&str]) -> Option<String> {
+        Some(format!("* EXCEPT ({})", columns.join(", ")))
+    }
+
     fn string_type_name(&self) -> &'static str {
         // Spark SQL (Databricks) rejects a bare `VARCHAR` in `CAST(... AS
         // VARCHAR)` with `[DATATYPE_MISSING_SIZE] DataType "VARCHAR" requires

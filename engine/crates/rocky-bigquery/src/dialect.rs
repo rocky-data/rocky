@@ -339,6 +339,11 @@ impl SqlDialect for BigQueryDialect {
         format!("`{name}`")
     }
 
+    /// `* EXCEPT (a, b)`.
+    fn star_excluding(&self, columns: &[&str]) -> Option<String> {
+        Some(format!("* EXCEPT ({})", columns.join(", ")))
+    }
+
     fn identifier_takes_backslash_escapes(&self) -> bool {
         // GoogleSQL quoted identifiers take the string-literal escape
         // sequences, unlike every other dialect Rocky ships (#1939).

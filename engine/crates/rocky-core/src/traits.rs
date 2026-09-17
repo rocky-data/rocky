@@ -1235,6 +1235,24 @@ pub trait SqlDialect: Send + Sync {
         format!("\"{name}\"")
     }
 
+    /// A select-list `*` that leaves out the named columns, or `None` when
+    /// the warehouse has no form for it.
+    ///
+    /// DuckDB and Snowflake spell it `* EXCLUDE (a, b)`. Databricks and
+    /// BigQuery spell it `* EXCEPT (a, b)`. Trino has neither, so the default
+    /// is `None`, and a caller that needs one refuses instead of guessing.
+    ///
+    /// The names are emitted as given, without quotes. Callers pass validated
+    /// identifiers that they also created without quotes, so both references
+    /// fold the same way. Snowflake, for example, upper-cases both.
+    ///
+    /// Quarantine `split` mode uses it to keep its label columns out of the
+    /// valid table (#1937).
+    fn star_excluding(&self, columns: &[&str]) -> Option<String> {
+        let _ = columns;
+        None
+    }
+
     /// Does this warehouse read backslash escape sequences inside a QUOTED
     /// identifier?
     ///

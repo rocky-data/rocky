@@ -22,6 +22,11 @@ impl SqlDialect for DuckDbSqlDialect {
         "duckdb"
     }
 
+    /// `* EXCLUDE (a, b)`.
+    fn star_excluding(&self, columns: &[&str]) -> Option<String> {
+        Some(format!("* EXCLUDE ({})", columns.join(", ")))
+    }
+
     /// DuckDB's `'…'` literal has no backslash escape; a quote is doubled.
     ///
     /// DuckDB's `E'…'` prefix *does* process backslashes, but Rocky never
