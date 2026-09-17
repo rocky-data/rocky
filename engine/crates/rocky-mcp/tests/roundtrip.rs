@@ -5181,6 +5181,52 @@ async fn an_initialize_that_names_2026_07_28_is_answered_with_the_newest_handsha
 /// swallowed it would return `is_error: None` and a `CREATE OR REPLACE TABLE`
 /// in the wrong dialect, and every other assertion in this file would stay
 /// green.
+/// #1996 — a model `plan_preview` cannot render is NAMED in the result.
+///
+/// It used to leave no trace: `commands::plan_preview_output` logged the
+/// reason at debug level and `PlanPreviewResult` carried `statements` and
+/// nothing else. An agent that drafted an ephemeral model got a successful
+/// draft and an empty preview, with nothing connecting the two. The end of
+/// that chain is this call result, so it is pinned here rather than at the
+/// helper.
+#[tokio::test]
+async fn plan_preview_names_a_model_it_could_not_render() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let config_path = dir.path().join("rocky.toml");
+    std::fs::write(
+        dir.path().join("models").join("stg_orders.sql"),
+        "SELECT 1 AS id\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("models").join("stg_orders.toml"),
+        "name = \"stg_orders\"\n\n[strategy]\ntype = \"ephemeral\"\n\n\
+         [target]\ncatalog = \"warehouse\"\nschema = \"out\"\ntable = \"stg_orders\"\n",
+    )
+    .unwrap();
+
+    let server = RockyMcpServer::new(config_path);
+    let client = connect(server).await;
+    let result = client
+        .call_tool(CallToolRequestParams::new("plan_preview"))
+        .await
+        .expect("plan_preview returns a result");
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "the preview still succeeds — the refusal is reported, not raised: {result:?}"
+    );
+
+    let json = serde_json::to_string(&result).expect("result serializes");
+    assert!(
+        json.contains("stg_orders") && json.contains("E038"),
+        "the skipped model and its reason must reach the caller: {json}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_malformed_config_refuses_on_plan_preview_the_way_it_does_on_compile() {
     let dir = TempDir::new().unwrap();

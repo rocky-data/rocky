@@ -30720,6 +30720,16 @@ auto_create_schemas = true
              [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"down\"\n",
         )
         .unwrap();
+        // A model in no way related to `up`. Containment withholds a blast
+        // radius; a global abort would take this one down too, and without
+        // it the test could not tell the two apart.
+        std::fs::write(models_dir.join("side.sql"), "SELECT id FROM main.ev\n").unwrap();
+        std::fs::write(
+            models_dir.join("side.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"side\"\n",
+        )
+        .unwrap();
 
         let adapter = DuckDbWarehouseAdapter::open(&db).expect("open duckdb");
         let mut output = RunOutput::new(String::new(), 0, 1);
@@ -30734,7 +30744,7 @@ auto_create_schemas = true
             contain_failures: true,
             ..rocky_core::config::ResilienceConfig::default()
         };
-        let _ = super::execute_models(
+        let res = super::execute_models(
             &models_dir,
             None,
             &adapter as &dyn rocky_core::traits::WarehouseAdapter,
@@ -30773,11 +30783,35 @@ auto_create_schemas = true
             output.errors
         );
         assert!(
+            res.is_ok(),
+            "containment continues the run rather than aborting it: {:?}",
+            res.as_ref().err()
+        );
+        let contained: Vec<&str> = output.contained.iter().map(|c| c.model.as_str()).collect();
+        assert_eq!(
+            contained,
+            vec!["down"],
+            "`down` must be the sole contained model: {contained:?}"
+        );
+        assert_eq!(
+            output.contained[0].blocked_by,
+            vec!["up".to_string()],
+            "the refused model is named as the blocker"
+        );
+        assert!(
             !output
                 .materializations
                 .iter()
                 .any(|m| m.asset_key.last().map(String::as_str) == Some("down")),
             "with containment on, the dependent is withheld, not built"
+        );
+        assert!(
+            output
+                .materializations
+                .iter()
+                .any(|m| m.asset_key.last().map(String::as_str) == Some("side")),
+            "an unrelated model still builds — this is containment, not an abort: {:?}",
+            output.materializations
         );
         let down_exists = {
             let a = DuckDbWarehouseAdapter::open(&db).expect("open duckdb");

@@ -437,9 +437,14 @@ pub async fn plan(
             "models directory '{}' not found (required for --model)",
             blueprint_models_dir.display()
         );
-        output.statements =
-            plan_preview_output(Some(config_path), &blueprint_models_dir, Some(model), env)?
-                .statements;
+        // Both halves of the preview, not just the statements: a model the
+        // preview could not render is named in `skipped`, and dropping it
+        // here left `rocky plan --model <refused>` reporting an empty plan
+        // with nothing to say why (#1996).
+        let preview =
+            plan_preview_output(Some(config_path), &blueprint_models_dir, Some(model), env)?;
+        output.statements = preview.statements;
+        output.skipped = preview.skipped;
     }
     let mut run_plan_persisted = false;
     if blueprint_models_dir.exists() {
