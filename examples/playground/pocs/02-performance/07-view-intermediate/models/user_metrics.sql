@@ -5,5 +5,5 @@ SELECT
     COALESCE(SUM(amount), 0)                     AS total_spent,
     MIN(event_date)                              AS first_active,
     MAX(event_date)                              AS last_active
-FROM stg_events
+FROM analytics.stg_events
 GROUP BY user_id

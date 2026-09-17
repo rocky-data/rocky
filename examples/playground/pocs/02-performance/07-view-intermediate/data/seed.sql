@@ -1,4 +1,6 @@
 CREATE SCHEMA IF NOT EXISTS seeds;
+-- The models' target schema (models/_defaults.toml).
+CREATE SCHEMA IF NOT EXISTS analytics;
 
 CREATE OR REPLACE TABLE seeds.raw_events AS
 SELECT

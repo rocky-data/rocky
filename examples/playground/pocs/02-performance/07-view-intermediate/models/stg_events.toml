@@ -1,4 +1,5 @@
-# Ephemeral: this model is inlined as a CTE in downstream consumers.
-# No table is created — saves storage and avoids unnecessary I/O.
+# A view: no copied data, and every read sees the source as it is now.
+# `type = "ephemeral"` is refused (E038) — nothing inlines it into a
+# consumer, so the consumer would read whatever table carried the name.
 [strategy]
-type = "ephemeral"
+type = "view"
