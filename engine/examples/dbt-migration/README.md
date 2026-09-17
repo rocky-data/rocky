@@ -98,14 +98,22 @@ import path refuses it. For a model named `stg_events` the line reads:
   stg_events: contains an unresolved reference to dbt's `is_incremental()` macro; the raw SQL importer cannot preserve dbt's false-on-bootstrap, true-on-existing-target semantics without either referencing a missing target during bootstrap or deleting bounded incremental logic. Compile dbt in an incremental context, verify the compiled SQL retains its intended predicate and is valid for Rocky's initial target state, and import that manifest; otherwise, rewrite the model with a Rocky-supported strategy
 ```
 
-The message names both ways out. Compile dbt in an incremental context and
-import that manifest. Or rewrite the model with a Rocky strategy: set
-`type = "incremental"` and a `timestamp_column` in the sidecar.
+The message names two ways out, but only the second one works today. A
+manifest import is refused too when the model has no `unique_key`. With a key,
+it imports as `merge` and keeps the `is_incremental()` filter in its SQL, so
+the first run fails or loads only recent rows
+([#2059](https://github.com/rocky-data/rocky/issues/2059)).
+
+So rewrite the model by hand. A transformation model cannot use
+`incremental`: Rocky refuses it with `E037`, because it would append every row
+again on each run. Remove the `is_incremental()` filter, then use `merge` with
+a `unique_key`, or `time_interval` with `@start_date` and `@end_date` in the
+SQL:
 
 ```toml
 [strategy]
-type = "incremental"
-timestamp_column = "updated_at"
+type = "merge"
+unique_key = ["event_id"]
 ```
 
 Case two is `{% for %}` and `{% set %}`. The regex importer strips the
@@ -176,7 +184,7 @@ or point that line at a table you have.
 | Source reference | `{{ source('raw', 'customers') }}` | qualified name: `source.raw.customers` |
 | Project + connection | `dbt_project.yml` plus `profiles.yml` | one `rocky.toml` |
 | Templating | Jinja | none; the body is SQL or Rocky DSL |
-| Incremental logic | `{% if is_incremental() %}` in the SQL body | `type = "incremental"` plus `timestamp_column` in the sidecar |
+| Incremental logic | `{% if is_incremental() %}` in the SQL body | `type = "merge"` with a `unique_key`, or `type = "time_interval"`, in the sidecar. `incremental` is refused (`E037`) |
 
 The last row is the one that can block an import. `rocky import-dbt` refuses a
 model whose SQL still holds an unresolved `is_incremental()`, as described

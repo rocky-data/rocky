@@ -63,7 +63,7 @@ of finding them later.
 
 Rocky infers column-level types across the whole DAG. It reports problems as
 diagnostic codes you can grep in a CI log. The error codes run from `E001` to
-`E036`, with `W` warnings and `P` lints alongside.
+`E037`, with `W` warnings and `P` lints alongside.
 
 Compilation fails on any error-level diagnostic. That is the whole point: the
 failure becomes a non-zero exit code at PR time, not a wrong number in

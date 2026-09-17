@@ -521,14 +521,15 @@ Three outcomes, and the middle one is the point of the no-credentials promise:
 
 One exception sits under row two: a placeholder written as a bare value, such as `port = ${PORT}`, is not valid TOML whether or not the variable is set. That is row three, and the error names `PORT`.
 
-Full-refresh models emit a complete `CREATE OR REPLACE TABLE … AS …` that runs as-is against a fresh warehouse and matches what a run executes in the resolved dialect. Incremental and merge models emit their steady-state statement instead: a bare `INSERT` or `MERGE` that operates on an existing target. `rocky run` bootstraps the target table on first build and threads the incremental watermark from state, neither of which a static emit can reproduce, so those files carry a leading note to that effect:
+Full-refresh models emit a complete `CREATE OR REPLACE TABLE … AS …` that runs as-is against a fresh warehouse and matches what a run executes in the resolved dialect. Merge and `delete_insert` models emit their steady-state statement instead, which operates on an existing target. `rocky run` bootstraps the target table on first build, which a static emit cannot reproduce, so those files carry a leading note:
 
 ```sql
--- NOTE: incremental/merge statement — operates on an existing target.
--- `rocky run` bootstraps the table on first build and threads the
--- incremental watermark from state; this static SQL does neither.
+-- NOTE: merge/delete_insert statement — operates on an existing target.
+-- `rocky run` creates the table on first build; this static SQL does not.
 MERGE INTO ...
 ```
+
+`emit-sql` refuses a project with any compile error, before it filters by model. One transformation model with `type = "incremental"` fails with `E037`, so it stops the whole export, even when `--model` names a different model.
 
 Models that produce no standalone SQL are reported on stderr rather than silently dropped, so you never mistake the emitted set for the complete project. Two cases are skipped this way: ephemeral models (inlined as CTEs upstream, so they have no statement of their own) and strategies that cannot render offline, such as a Snowflake dynamic table that needs a live compute-warehouse name.
 

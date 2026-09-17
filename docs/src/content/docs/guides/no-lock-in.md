@@ -26,7 +26,9 @@ Rocky generates that output through the same code path `rocky run` uses, includi
 
 A full-refresh model emits a complete `CREATE OR REPLACE TABLE … AS …`. That statement runs as-is, and it matches what a run executes.
 
-An incremental or merge model emits its steady-state statement instead: a bare `INSERT` or `MERGE` against an existing target. `rocky run` creates that target on the first build, and it threads the incremental [watermark](/reference/glossary/#watermark) (the timestamp of the newest row already loaded) from its state store. A static SQL file can carry neither, so those files include a short note. Treat them as the recurring operation, not as a from-scratch build.
+A merge or `delete_insert` model emits its steady-state statement instead, against an existing target. `rocky run` creates that target on the first build. A static SQL file cannot, so those files include a short note. Treat them as the recurring operation, not as a from-scratch build.
+
+The export needs a project that compiles cleanly. A transformation model with `type = "incremental"` fails with `E037` and stops the whole export.
 
 Rocky emits models in dependency order: a model never appears before one it reads. The stdout form is therefore a single ordered script you can pipe straight to your warehouse:
 

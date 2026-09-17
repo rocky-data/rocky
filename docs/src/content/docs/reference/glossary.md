@@ -125,7 +125,7 @@ A rule that hides a sensitive column's value. Tag the column with a `[classifica
 
 ### Materialization strategy
 
-How a model's output lands in the warehouse: `view`, `table`, `incremental`, `merge`, and others. Set per model. See [Model format](/reference/model-format/).
+How a model's output lands in the warehouse: `view`, `table`, `merge`, `time_interval`, and others. A replication pipeline also takes `incremental`, which a transformation model cannot use (`E037`). Set per model. See [Model format](/reference/model-format/).
 
 ### MCP (Model Context Protocol)
 

@@ -126,9 +126,26 @@ The importer never inlines a connection secret. Passwords, API tokens, and servi
 | `view` | `view` |
 | `table` | `full_refresh` |
 | `incremental` with a `unique_key` | `merge` |
-| `incremental` without a `unique_key` | `incremental` |
-| `microbatch` | `merge`, or `time_interval` when you pass `--microbatch-as time_interval` |
+| `incremental` without a `unique_key` | `full_refresh`, with a warning |
+| `microbatch` | `merge`, or `time_interval` when you pass `--microbatch-as time_interval`. Without a `unique_key`, `full_refresh` with a warning |
 | anything else | `full_refresh`, plus a TODO line in `MIGRATION-NOTES.md` |
+
+Rocky has no append strategy for transformation models: `incremental` is refused there with `E037`, because it would re-insert every row on each run. The importer never emits it. An append-style dbt model falls back to `full_refresh`, which cannot duplicate rows. The fallback covers four cases:
+
+- `incremental` with no `unique_key`
+- `incremental_strategy = 'append'`, even with a `unique_key`
+- `incremental_strategy = 'merge'` with no `unique_key`
+- an `incremental_strategy` the importer does not recognise, even with a `unique_key`
+
+A `unique_key` maps a model to `merge` only when `incremental_strategy` is unset or `'merge'`. An explicit `'append'` keeps the fallback.
+
+Where the fallback is reported depends on the import path. From a manifest, each model is listed in `MIGRATION-NOTES.md` under "Items to translate manually", and under "Warnings". With `--no-manifest`, the importer keeps only the warning text, so the model appears under "Warnings" alone. That includes a model with no `config()` block that inherits `materialized = 'incremental'` from `dbt_project.yml`.
+
+Some fallbacks are refused instead. A manifest import keeps dbt's compiled SQL, and dbt compiles `is_incremental()` as true against an existing table. So the compiled SQL can keep an incremental filter, and as `full_refresh` each run would replace the table with only the recent rows. When an `incremental` or `microbatch` model would fall back to `full_refresh` and its raw SQL uses `is_incremental()`, the importer does not import it. The model is listed under `failed_details`. Rewrite it by hand: remove the `is_incremental()` filter, then use `merge` with a `unique_key`, or a `time_interval` model.
+
+:::caution[A keyed model has the same filter problem]
+An `incremental` model with a `unique_key` is imported as `merge` from the same compiled SQL. `merge` creates its table from that SQL on the first run, and so does `delete_insert`. If the SQL kept an `is_incremental()` filter, that first run goes wrong ([#2059](https://github.com/rocky-data/rocky/issues/2059)). The common filter, `MAX(...)` over the model's own table, fails because that table does not exist yet. A literal cutoff loads only the recent rows. The importer does not refuse this case. Remove the filter from the model's SQL before the first run.
+:::
 
 Rocky refuses a model whose raw Jinja calls `is_incremental()` on either raw-SQL path: `--no-manifest`, or a manifest node with no `compiled_code`. Without compiled SQL, Rocky cannot preserve dbt's first-run versus later-run distinction. Each refused model is listed under `failed_details`.
 
