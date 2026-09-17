@@ -636,7 +636,8 @@ pub fn generate_transformation_initial_ddl(
     Ok(vec![dialect.create_table_as_new(&target, &model_ir.sql)])
 }
 
-/// The refusal both transformation generators return for `incremental` (#1990).
+/// The refusal every transformation generator returns for `incremental` (#1990):
+/// the exec SQL, the first-run CTAS and the time-interval bootstrap.
 ///
 /// A transformation model has no watermark to apply, so every statement this
 /// strategy could produce, the bootstrap CTAS and the INSERT alike, loads the

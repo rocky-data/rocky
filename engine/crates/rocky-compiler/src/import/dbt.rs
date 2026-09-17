@@ -1394,9 +1394,9 @@ const NO_APPEND_EQUIVALENT: &str = "Rocky has no append strategy for transformat
 const INCREMENTAL_FALLBACK_REFUSED: &str = "is an incremental dbt model with no Rocky append \
      equivalent, and its SQL uses `is_incremental()`. dbt compiles that branch as true against an \
      existing table, so the compiled SQL can keep an incremental filter; imported as \
-     `full_refresh`, it would replace the table with only the recent rows on every run. Add a \
-     unique_key and set incremental_strategy to 'merge' (or leave it unset) so it maps to merge, \
-     or rewrite it as a time_interval model with @start_date/@end_date";
+     `full_refresh`, it would replace the table with only the recent rows on every run. Rewrite \
+     it by hand: remove the `is_incremental()` filter, then use merge with a unique_key or a \
+     time_interval model with @start_date/@end_date";
 
 /// An explicit `incremental_strategy` wins over `unique_key` in
 /// `map_incremental_strategy`, so adding a key alone does not change an
@@ -4045,6 +4045,16 @@ FROM {{ ref('stg_events') }}
             "the refusal names the cause and the way out: {}",
             failure.reason
         );
+        // Adding a key alone would import it as merge from the same compiled
+        // delta SQL, whose first run loads only recent rows (#2059).
+        assert!(
+            failure
+                .reason
+                .contains("remove the `is_incremental()` filter")
+                && !failure.reason.to_lowercase().contains("add a unique_key"),
+            "the refusal must not steer into the keyed cold-start defect: {}",
+            failure.reason
+        );
         assert!(
             !result.warnings.iter().any(|w| w.model == "events_append"
                 && w.message.contains("mapped to full_refresh")),
@@ -4053,8 +4063,10 @@ FROM {{ ref('stg_events') }}
         );
     }
 
-    /// The boundary: the same append model WITH a unique_key maps to merge,
-    /// where a delta filter in the compiled SQL is correct, so it is imported.
+    /// The boundary of #2058's refusal: the same model WITH a unique_key is
+    /// still imported as merge. This PINS CURRENT BEHAVIOUR, NOT A CONTRACT:
+    /// merge's first run builds the table from the compiled delta SQL, so it
+    /// loads only recent rows (#2059). When #2059 is ruled, this test changes.
     #[test]
     fn test_append_model_using_is_incremental_with_unique_key_still_maps_to_merge() {
         let manifest = serde_json::json!({
