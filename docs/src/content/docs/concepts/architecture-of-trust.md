@@ -208,11 +208,16 @@ warehouse-neutral. The depth is not yet portable.
 
 ### Schema drift handling
 
-When a source schema changes under a materialized model, Rocky does not quietly
-keep going. It picks one of three responses: ignore the change, apply a safe
-column-type widening, or drop and recreate the table. A grace period runs before
-any destructive action. Drift becomes an explicit, graded decision instead of a
-silent divergence.
+Rocky checks for drift as it copies each table, whenever the target already
+exists. It grades the response. A new source column becomes `ALTER TABLE ADD
+COLUMN`. A safe type widening becomes `ALTER COLUMN TYPE`, which keeps the data.
+Any other type change drops the target and rebuilds it with a full refresh. Each
+action is reported in the run's `drift` output.
+
+Two limits matter. The drop happens in the same run that finds the change: no
+grace period runs first. And Rocky does not detect a column that disappeared from
+the source. No action covers it. See
+[Failure modes](/advanced/failure-modes/) for each action and its recovery.
 
 **Shipped.**
 
@@ -295,7 +300,7 @@ surprised.
 | Compile-time column-level types and diagnostics (`E###` errors) | Shipped | Compilation fails on any error-level diagnostic. |
 | Compile-time column-level lineage + `lineage-diff` blast radius | Shipped | Intra-project; computed at compile time. |
 | Compile-time contracts (`E010`–`E013`) | Shipped | Intra-project contract validation against inferred schema. |
-| Schema drift handling (ignore / safe widen / drop-and-recreate) | Shipped | Explicit graded response with a grace period. |
+| Schema drift handling (add column / safe widen / drop-and-recreate) | Shipped | Graded response, applied in the run that detects it. No grace period before a drop. A column removed from the source is not detected. |
 | Dialect-divergence lint (`P001`) | Shipped | Opt-in via `--target-dialect`; error severity. |
 | VS Code trust overlays | Shipped | Exactly four: Drift, Breaking, Replay, Governance. |
 | Branches | Partial | Schema-prefix isolation with promotion. The approval gate is opt-in (`[branch.approval] required = true`) and checks an unkeyed digest: an integrity checksum, not a tamper boundary, and it authenticates nobody. No warehouse-native zero-copy clones yet. |
