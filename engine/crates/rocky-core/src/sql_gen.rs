@@ -379,11 +379,7 @@ pub fn generate_transformation_sql_with_warehouse(
             // this arm keeps callers that skip the compile gate (`rocky plan`,
             // `rocky estimate`) from printing or running that INSERT.
             // Replication `incremental` goes through `generate_insert_sql`.
-            Err(SqlGenError::InvalidRequest(format!(
-                "model '{}': `type = \"incremental\"` is not supported on transformation models \
-                 (E037); use merge, delete_insert, time_interval or full_refresh",
-                model_ir.name
-            )))
+            Err(incremental_transformation_refused(model_ir))
         }
         MaterializationStrategy::Merge {
             unique_key,
@@ -599,6 +595,15 @@ pub fn generate_transformation_initial_ddl(
     if model_ir.variant() != ModelIrVariant::Transformation {
         return Err(variant_mismatch(model_ir, "Transformation"));
     }
+    // The bootstrap CTAS is the first load of an `incremental` model, so it
+    // is refused here too (#1990). Otherwise a caller that skips the compile
+    // gate could still create and load the table before the exec arm refuses.
+    if matches!(
+        model_ir.materialization,
+        MaterializationStrategy::Incremental { .. }
+    ) {
+        return Err(incremental_transformation_refused(model_ir));
+    }
     let target = dialect.format_table_ref(
         &model_ir.target.catalog,
         &model_ir.target.schema,
@@ -621,6 +626,19 @@ pub fn generate_transformation_initial_ddl(
     }
 
     Ok(vec![dialect.create_table_as_new(&target, &model_ir.sql)])
+}
+
+/// The refusal both transformation generators return for `incremental` (#1990).
+///
+/// A transformation model has no watermark to apply, so every statement this
+/// strategy could produce, the bootstrap CTAS and the INSERT alike, loads the
+/// whole result again. `rocky compile` reports the same thing as E037.
+fn incremental_transformation_refused(model_ir: &ModelIr) -> SqlGenError {
+    SqlGenError::InvalidRequest(format!(
+        "model '{}': `type = \"incremental\"` is not supported on transformation models \
+         (E037); use merge, delete_insert, time_interval or full_refresh",
+        model_ir.name
+    ))
 }
 
 /// Substitute `@start_date` / `@end_date` placeholders in the model SQL with
@@ -1690,6 +1708,11 @@ mod tests {
             msg.contains("E037"),
             "the error names the compile diagnostic: {msg}"
         );
+
+        // The bootstrap CTAS is the first load, so it is refused too.
+        let err = generate_transformation_initial_ddl(&ir, &dialect())
+            .expect_err("an incremental transformation model must not bootstrap either");
+        assert!(err.to_string().contains("E037"), "{err}");
     }
 
     #[test]
@@ -2259,8 +2282,11 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
                 table_properties: vec![("delta.enableChangeDataFeed".into(), "true".into())],
                 ..LakehouseOptions::default()
             },
-            MaterializationStrategy::Incremental {
+            // An append strategy still legal on transformation models (#2054);
+            // `incremental` is refused before any DDL (#1990).
+            MaterializationStrategy::Microbatch {
                 timestamp_column: "updated_at".into(),
+                granularity: rocky_ir::TimeGrain::Hour,
             },
         );
         let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();
@@ -2479,8 +2505,11 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
                 comment: Some("Incremental orders mart".into()),
                 ..LakehouseOptions::default()
             },
-            MaterializationStrategy::Incremental {
+            // `microbatch`, the append strategy still legal on transformation
+            // models (#2054); `incremental` is refused before any DDL (#1990).
+            MaterializationStrategy::Microbatch {
                 timestamp_column: "updated_at".into(),
+                granularity: rocky_ir::TimeGrain::Hour,
             },
         );
         let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();
