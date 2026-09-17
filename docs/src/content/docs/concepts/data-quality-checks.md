@@ -337,7 +337,7 @@ mode = "split"   # or "tag" or "drop"
 
 | Mode | Behavior |
 |---|---|
-| `split` | Rocky materializes two new tables: `<target>__valid` with the passing rows and `<target>__quarantine` with the failing rows (plus per-assertion `_error_<name>` label columns marking which assertion each row failed). When the run completes, each row lands in exactly one of them. The original `<target>` is left untouched; point downstream models at `<target>__valid`. Not available on Trino. |
+| `split` | Rocky materializes two new tables: `<target>__valid` with the passing rows and `<target>__quarantine` with the failing rows (plus per-assertion `_error_<name>` label columns marking which assertion each row failed). When the run completes, and the two suffixes name two different tables in your warehouse, each row lands in exactly one of them. The original `<target>` is left untouched; point downstream models at `<target>__valid`. Not available on Trino. |
 | `tag` | Rocky rewrites `<target>` in place, adding a per-assertion `_error_<name>` column populated on failing rows (NULL on passing rows). Every row stays in the table. Useful for observation without a second table — rewrites the source, so use with care on a raw replication target. |
 | `drop` | Only `<target>__valid` (the passing rows) is written; failing rows are discarded. Quarantine count is still reported in `check_results[]`. |
 
@@ -352,7 +352,7 @@ Rocky builds the quarantine predicate from every quarantinable assertion, combin
 A quarantine that fails or is refused fails the run, whatever `fail_on_error` says. The table counts in `tables_failed` and is listed in `errors`. What the failure leaves behind depends on when it happened:
 
 - **Refused** (`quarantine:compile`): nothing runs, so no table is written. Downstream reads the previous run's rows.
-- **Failed at the warehouse** (`quarantine:execute`): the check names the statement's role and the warehouse error. `split` runs its statements in order: the label table, then `__quarantine`, then `__valid`, then the drop. A failure keeps what earlier statements wrote. If only the drop fails, both outputs are new and the label table stays. A statement that times out may still have committed.
+- **Failed at the warehouse** (`quarantine:execute`): the check names the statement's role and the warehouse error. `split` runs its statements in order: the label table, then `__quarantine`, then `__valid`, then the drop. Statements that already finished keep what they wrote, so `__quarantine` can be new while `__valid` is the previous run's. Rocky still tries to drop the label table after a failure, so it is normally gone. A failed drop leaves it behind. A statement that times out may still have committed.
 
 ### Output
 
