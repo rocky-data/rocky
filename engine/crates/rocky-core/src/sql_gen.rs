@@ -525,6 +525,14 @@ pub fn generate_time_interval_bootstrap_sql(
     if model_ir.variant() != ModelIrVariant::Transformation {
         return Err(variant_mismatch(model_ir, "Transformation"));
     }
+    // An `incremental` body has no `@start_date`/`@end_date` for the sentinel
+    // window to empty, so this CTAS would load the whole result (#1990).
+    if matches!(
+        model_ir.materialization,
+        MaterializationStrategy::Incremental { .. }
+    ) {
+        return Err(incremental_transformation_refused(model_ir));
+    }
     let target = dialect.format_table_ref(
         &model_ir.target.catalog,
         &model_ir.target.schema,
@@ -1712,6 +1720,12 @@ mod tests {
         // The bootstrap CTAS is the first load, so it is refused too.
         let err = generate_transformation_initial_ddl(&ir, &dialect())
             .expect_err("an incremental transformation model must not bootstrap either");
+        assert!(err.to_string().contains("E037"), "{err}");
+
+        // Nor through the time-interval bootstrap: with no placeholders for its
+        // sentinel window to empty, that CTAS would load the whole result.
+        let err = generate_time_interval_bootstrap_sql(&ir, &dialect())
+            .expect_err("the time-interval bootstrap must refuse it too");
         assert!(err.to_string().contains("E037"), "{err}");
     }
 

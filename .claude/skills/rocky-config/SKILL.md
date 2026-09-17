@@ -480,7 +480,7 @@ name       = "dim_customers"
 depends_on = ["stg_customers"]
 
 [strategy]
-type       = "merge"                 # full_refresh | merge | delete_insert | time_interval (not incremental: E037)
+type       = "merge"                 # e.g. full_refresh, merge, delete_insert, time_interval, view; not incremental (E037)
 unique_key = ["customer_id"]
 # update_columns = ["name", "email"] # omit for UPDATE SET *
 

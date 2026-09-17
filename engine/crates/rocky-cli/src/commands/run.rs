@@ -30394,9 +30394,9 @@ auto_create_schemas = true
                 lag_tolerance_seconds: 0,
                 shadow_or_branch: false,
             };
-            // The Result is not the assertion: whatever it is, `output` must
-            // record the exclusion.
-            let _ = super::execute_models(
+            // Both outcomes are asserted below: the exclusion lands in `output`
+            // either way, and the Result says whether the dependent could run.
+            let res = super::execute_models(
                 &models_dir,
                 None,
                 &adapter as &dyn rocky_core::traits::WarehouseAdapter,
@@ -30457,6 +30457,11 @@ auto_create_schemas = true
             );
 
             if upstream_exists {
+                assert!(
+                    res.is_ok(),
+                    "with an old upstream table the run completes: {:?}",
+                    res.as_ref().err()
+                );
                 assert_eq!(
                     count_rows(&db, "up").await,
                     1,
@@ -30468,6 +30473,16 @@ auto_create_schemas = true
                     "policy (#1291): the dependent builds from the old upstream table"
                 );
             } else {
+                // The dependent fails for the right reason: the excluded model
+                // never created its table. Not silently skipped, not aborted early.
+                let err = format!(
+                    "{:#}",
+                    res.expect_err("with no upstream table the dependent must fail the run")
+                );
+                assert!(
+                    err.contains("model 'down' failed") && err.contains("does not exist"),
+                    "the failure names `down` and the missing upstream table: {err}"
+                );
                 assert!(
                     !output
                         .materializations
