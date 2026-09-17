@@ -337,8 +337,7 @@ rocky optimize
       "downstream_references": 0
     }
   ],
-  "total_models_analyzed": 3,
-  "incrementality_note": "Run `rocky compile --output json` for inferred incrementality hints on full_refresh models"
+  "total_models_analyzed": 3
 }
 ```
 
@@ -355,7 +354,7 @@ Analyze a single model:
 rocky optimize --model dim_customers
 ```
 
-Same `recommendations` shape, single entry. When compile-time incrementality analysis offers additional opportunities, Rocky populates an `incrementality_note` pointing to `rocky compile --output json`.
+Same `recommendations` shape, single entry.
 
 ### Related Commands
 
