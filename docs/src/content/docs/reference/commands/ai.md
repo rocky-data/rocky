@@ -29,7 +29,7 @@ rocky ai <intent> [flags]
 |------|------|---------|-------------|
 | `--format <FORMAT>` | `string` | `rocky` | Output format: `rocky` (`.rocky` body + `.toml` sidecar) or `sql` (`.sql` body + `.toml` sidecar). |
 | `--models <PATH>` | `string` | `models` | Models directory. Used both to ground the prompt in real schemas and as the destination directory for the emitted body + sidecar. |
-| `--materialization <STRATEGY>` | `string` | `full_refresh` | Materialization strategy written into the sidecar `[strategy]` block. One of `full_refresh`, `merge`, `ephemeral`. `incremental` fails before any LLM call: on a transformation model it re-inserts every row on each run (`E037`). |
+| `--materialization <STRATEGY>` | `string` | `full_refresh` | Materialization strategy written into the sidecar `[strategy]` block. One of `full_refresh` or `merge`. Two values fail before any LLM call: `incremental`, because on a transformation model it re-inserts every row on each run (`E037`), and `ephemeral`, because it is never inlined into its consumers (`E038`). |
 | `--unique-key <COLUMNS>` | `string` | | Upsert key for `--materialization=merge`. Maps to `[strategy].unique_key` (an array) in the sidecar. Accepts a comma-separated list (`--unique-key id,created_at`) or repeated flags. Required when materialization is `merge`; the emitted sidecar is incomplete without it. |
 | `--target <FQN>` | `string` | `generated.ai.<name>` | Target table coordinates as `catalog.schema.table`. Written into the sidecar `[target]` block. |
 | `--overwrite` | `bool` | `false` | Overwrite an existing body or sidecar file at the destination. Without this flag, the command fails loudly rather than silently clobber user-authored models. |
@@ -86,6 +86,10 @@ table = "fct_orders_daily"
 `--materialization incremental` fails before any LLM call, with:
 
 > --materialization incremental is not supported: on a transformation model it re-inserts every row on each run (E037). Use `merge` with --unique-key, or `full_refresh`
+
+`--materialization ephemeral` fails the same way, with:
+
+> --materialization ephemeral is not supported: an ephemeral model is not materialized and is not inlined into its consumers, so a consumer reads whatever table already carries the name (E038). Use `view`, or `full_refresh`
 
 `--watermark` no longer exists. Passing it is an argument error.
 
