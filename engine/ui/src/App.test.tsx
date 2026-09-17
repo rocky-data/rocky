@@ -107,11 +107,16 @@ describe("App", () => {
       // Decorative: the name beside it is the text a screen reader reads.
       expect(mark).toHaveAttribute("alt", "");
       // The build inlines a mark this small as a data URI and emits larger
-      // ones under `assets/`. Either is same-origin; nothing may be remote,
-      // which the page's CSP would refuse anyway.
+      // ones under `assets/`. Either is the page itself; nothing may be
+      // remote, which the page's CSP would refuse anyway. Resolved against
+      // the page, so `//other.example/x.svg` counts as remote too.
       const src = mark.getAttribute("src") ?? "";
-      expect(src).toMatch(/^data:image\/svg\+xml|rocky-logo.*\.svg$/);
-      expect(src).not.toMatch(/^https?:/);
+      if (src.startsWith("data:")) {
+        expect(src).toMatch(/^data:image\/svg\+xml/);
+      } else {
+        expect(new URL(src, window.location.href).origin).toBe(window.location.origin);
+        expect(src).toMatch(/rocky-logo.*\.svg$/);
+      }
       expect(mark.closest("span")?.textContent).toBe("Rocky");
     }
   });

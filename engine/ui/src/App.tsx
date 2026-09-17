@@ -211,7 +211,10 @@ const SIDEBAR_ID = "shell-sidebar";
 function Wordmark({ className }: { className: string }) {
   return (
     <span className={`items-center gap-2 text-base font-semibold tracking-tight ${className}`}>
-      <img src={markUrl} alt="" width={20} height={20} className="rounded-[5px]" />
+      {/* No CSS rounding: the mark draws its own rounded tile (`rx="36"` on a
+          200-wide square), so a radius here would clip it at a different
+          curve than the docs favicon shows. */}
+      <img src={markUrl} alt="" width={20} height={20} />
       Rocky
     </span>
   );

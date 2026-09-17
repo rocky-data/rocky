@@ -13,17 +13,27 @@ import { describe, expect, it } from "vitest";
  * are checked, so a runner started elsewhere fails here instead of passing on
  * a file it never read.
  */
-function read(relative: string): string {
+function bytes(relative: string): Buffer {
   const path = resolve(process.cwd(), relative);
   if (!existsSync(path)) {
     throw new Error(`${path} does not exist; vitest ran from ${process.cwd()}, expected engine/ui`);
   }
-  return readFileSync(path, "utf8");
+  return readFileSync(path);
+}
+
+function read(relative: string): string {
+  return bytes(relative).toString("utf8");
 }
 
 describe("the Rocky mark", () => {
   it("is the same file the docs site serves as its favicon", () => {
-    expect(read("src/assets/rocky-logo.svg")).toBe(read("../../docs/public/favicon.svg"));
+    // Bytes, not decoded text: two different malformed byte sequences decode
+    // to the same replacement character, so a string compare could pass on a
+    // copy that is not identical.
+    const mine = bytes("src/assets/rocky-logo.svg");
+    const docs = bytes("../../docs/public/favicon.svg");
+    expect(mine.equals(docs)).toBe(true);
+    expect(mine.length).toBe(docs.length);
   });
 
   it("carries its own size and needs no external font or image", () => {
