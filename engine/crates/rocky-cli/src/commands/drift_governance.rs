@@ -61,9 +61,10 @@ pub(crate) enum GovernDecision {
 /// on that table's scope so [`Self::govern`] can combine it with the actual
 /// detected drift.
 ///
-/// Present on a [`TableTask`](super::run) only when both the config opt-in and
-/// a `[policy]` block are configured; absent it, the drift path is untouched
-/// and byte-identical to today.
+/// Present on a [`TableTask`](super::run) whenever the config opt-in is on,
+/// with or without a `[policy]` block (without one, it governs fail-closed as
+/// `require_review`; see [`Self::build`]). With the opt-in off it is absent, and
+/// the drift path is untouched and byte-identical to today.
 #[derive(Debug, Clone)]
 pub(crate) struct DriftGovernor {
     run_id: String,
