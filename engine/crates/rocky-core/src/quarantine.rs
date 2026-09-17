@@ -72,13 +72,14 @@ pub enum QuarantineError {
     /// Two tables a mode writes, or one it writes and the source it reads,
     /// resolve to the same name.
     #[error(
-        "quarantine would write the {first} table and the {second} table under one name, \
-         '{name}': give suffix_valid and suffix_quarantine distinct, non-empty values"
+        "quarantine would write the {first} table under the {second} table's name, '{name}': {fix}"
     )]
     TableNameCollision {
         name: String,
         first: &'static str,
         second: &'static str,
+        /// What to change, for this pair.
+        fix: &'static str,
     },
 }
 
@@ -753,9 +754,13 @@ fn build_valid_ctas(
 /// An empty `suffix_valid` names the valid table after the source, so the
 /// valid CTAS replaces the source with its passing rows. Equal suffixes name
 /// the valid and quarantine tables alike, so the valid CTAS replaces the
-/// quarantined rows and they land in neither output. Both are checked
-/// case-insensitively: Snowflake folds unquoted names to upper case, and
-/// DuckDB and Databricks compare them without case.
+/// quarantined rows and they land in neither output.
+///
+/// Compared exactly, not without case. Snowflake quotes the names Rocky
+/// formats, so `"orders__OUT"` and `"orders__out"` are two tables there, and a
+/// case-insensitive comparison would refuse a working config. On DuckDB and
+/// Databricks those two names are one table, and this comparison does not
+/// catch it: suffixes that differ only in case are not refused.
 ///
 /// Only the tables a mode writes are compared. `drop` writes no quarantine
 /// table, so its suffix is free; `tag` rewrites the source by design.
@@ -765,21 +770,25 @@ fn refuse_colliding_names(
     valid: &str,
     quarantine: &str,
 ) -> Result<(), QuarantineError> {
-    let pairs: Vec<(&str, &'static str, &str, &'static str)> = match mode {
+    const VALID_EMPTY: &str = "set suffix_valid to a non-empty value";
+    const QUARANTINE_EMPTY: &str = "set suffix_quarantine to a non-empty value";
+    const EQUAL: &str = "give suffix_valid and suffix_quarantine different values";
+    let pairs: Vec<(&str, &'static str, &str, &'static str, &'static str)> = match mode {
         QuarantineMode::Split => vec![
-            (valid, "valid", source, "source"),
-            (quarantine, "quarantine", source, "source"),
-            (valid, "valid", quarantine, "quarantine"),
+            (valid, "valid", source, "source", VALID_EMPTY),
+            (quarantine, "quarantine", source, "source", QUARANTINE_EMPTY),
+            (valid, "valid", quarantine, "quarantine", EQUAL),
         ],
-        QuarantineMode::Drop => vec![(valid, "valid", source, "source")],
+        QuarantineMode::Drop => vec![(valid, "valid", source, "source", VALID_EMPTY)],
         QuarantineMode::Tag => vec![],
     };
-    for (a, first, b, second) in pairs {
-        if a.eq_ignore_ascii_case(b) {
+    for (a, first, b, second, fix) in pairs {
+        if a == b {
             return Err(QuarantineError::TableNameCollision {
                 name: a.to_string(),
                 first,
                 second,
+                fix,
             });
         }
     }
@@ -1290,7 +1299,6 @@ mod unit_tests {
             (Split, "", "__quarantine", "valid replaces the source"),
             (Split, "__valid", "", "quarantine replaces the source"),
             (Split, "__out", "__out", "valid replaces quarantine"),
-            (Split, "__OUT", "__out", "the same name without case"),
             (Drop, "", "__quarantine", "valid replaces the source"),
         ] {
             assert!(
@@ -1299,9 +1307,21 @@ mod unit_tests {
             );
         }
 
-        // Controls: tables a mode does not write do not collide.
+        // The fix names the suffix to change for that pair, so `drop` is
+        // never told to change the quarantine suffix it does not use.
+        let message = |mode, valid: &str, quarantine: &str| {
+            compile(mode, valid, quarantine).unwrap_err().to_string()
+        };
+        assert!(message(Drop, "", "").ends_with("set suffix_valid to a non-empty value"));
+        assert!(message(Split, "__v", "").ends_with("set suffix_quarantine to a non-empty value"));
+        assert!(message(Split, "__x", "__x").ends_with("different values"));
+
+        // Controls: tables a mode does not write do not collide, and names
+        // that differ only in case are two tables on Snowflake, which quotes
+        // them.
         for (mode, valid, quarantine) in [
             (Split, "__valid", "__quarantine"),
+            (Split, "__OUT", "__out"),
             (Drop, "__out", "__out"),
             (Drop, "__valid", ""),
             (Tag, "", ""),
