@@ -905,8 +905,8 @@ intent = "Stage raw Shopify orders with order_id, customer, date, and amount col
 depends_on = []
 
 [strategy]
-type = "incremental"
-timestamp_column = "_fivetran_synced"
+type = "merge"
+unique_key = ["order_id"]
 
 [target]
 catalog = "warehouse"
@@ -967,9 +967,18 @@ So you can leave a vendor-maintained staging package in dbt and write your own a
 
 The importer names each model after its SQL file's stem, so `stg_orders.sql` becomes `stg_orders`. If your dbt project renames models with `{{ config(alias='...') }}`, a `depends_on` reference may not match. Read each TOML file's `name` field and update the `depends_on` references to match.
 
-### Incremental models do not pick up the right watermark
+### An incremental model imported as `full_refresh`
 
-A Rocky transformation incremental expects the model SQL to carry its own row filter. `timestamp_column` adds no filter. That is why the raw and no-manifest importer refuses unresolved Jinja that calls `is_incremental()`, rather than deleting bounded logic silently. If you import from a manifest, read the compiled SQL and confirm it contains the bound you intended, on `_fivetran_synced` or `updated_at` for example.
+Rocky has no append strategy for transformation models. It refuses `type = "incremental"` there with `E037`, because it would re-insert every row on each run. So the importer maps an append-style dbt model to `full_refresh`, which rebuilds from the model SQL and cannot duplicate rows:
+
+- an `incremental` model with no `unique_key`
+- `incremental_strategy = 'merge'` with no `unique_key`
+- an `incremental_strategy` the importer does not recognise
+- a `microbatch` model with no `unique_key`
+
+Each one appears as a warning. To keep incremental behaviour, add a `unique_key` so the model maps to `merge`, or rewrite it as a [`time_interval`](/concepts/time-interval/) model with `@start_date` and `@end_date`.
+
+The raw and no-manifest importer still refuses unresolved Jinja that calls `is_incremental()`, rather than deleting bounded logic silently.
 
 ### Environment-specific logic
 

@@ -35,8 +35,8 @@ Rocky's terms are collected in the [glossary](https://rocky-data.dev/reference/g
 |---|---|
 | **Typed compiler** | Catches type mismatches and missing columns before any SQL runs |
 | **DAG-aware** | Knows which models depend on which; runs them in the right order |
-| **Multiple materialization strategies** | `full_refresh`, `incremental`, `merge`, `time_interval`, `microbatch`, `delete_insert`, `ephemeral`, `view`, `materialized_view`, `dynamic_table`, `content_addressed` |
-| **Incremental loads** | Only processes new rows since the last run (watermark-based) |
+| **Multiple materialization strategies** | `full_refresh`, `merge`, `time_interval`, `microbatch`, `delete_insert`, `ephemeral`, `view`, `materialized_view`, `dynamic_table`, `content_addressed` |
+| **Incremental loads** | A replication pipeline copies only the rows newer than a stored watermark. A transformation model cannot use `incremental` (`E037`); use `merge` or `time_interval` |
 | **Schema drift detection** | Notices when a source column changed type and handles it automatically |
 | **Data contracts** | Declare what columns must exist and what types they must be; enforced at compile time |
 | **Deterministic surrogate keys** | Declare `[[surrogate_key]]` and Rocky injects a dialect-correct hash column into the SELECT; the value matches `dbt_utils.generate_surrogate_key` over the same columns, so keys stay stable when migrating a dbt Core project to Rocky |
@@ -261,13 +261,14 @@ The second error is the E012 for the same column, left out here: the contract al
 
 Every diagnostic has: `code`, `severity` (Error/Warning/Info), `message`, `span` (file + line + col, and `null` when the emitter has no span), `model`, and `suggestion`.
 
-The full set spans E001–E036, W001–W031, D011–D012, P001–P002, and I001–I003. Those ranges have gaps, so not every number in them is in use. Not all of them come from the compiler either: the budget ceiling (E027), the import family (E030–E034, W012, W030, W031) and the portability lint (P001) are added by the `rocky compile` command itself, so `rocky test`, `rocky ci`, the LSP and `rocky serve` never report them. The codes you meet most often:
+The full set spans E001–E037, W001–W031, D011–D012, P001–P002, and I001–I003. Those ranges have gaps, so not every number in them is in use. Not all of them come from the compiler either: the budget ceiling (E027), the import family (E030–E034, W012, W030, W031) and the portability lint (P001) are added by the `rocky compile` command itself, so `rocky test`, `rocky ci`, the LSP and `rocky serve` never report them. The codes you meet most often:
 - `E001` — join key with no common type between two upstream models
 - `E010`–`E014` — contract violations (missing / retyped / nullability / protected-column removed / a new nullable column under `no_new_nullable`)
 - `E020`–`E028` — time-interval placeholders, the budget ceiling, and an unsupplied `@var(name)`
 - `E030`–`E034` — cross-team import-contract violations
 - `E035` — Managed-Iceberg `format_options` the warehouse would reject
 - `E036` — two models that write the same target table
+- `E037` — a transformation model declares `type = "incremental"`, which would append every row again on each run
 - `W001` — implicit type coercion on a join key
 - `W002` — `SELECT *` over an upstream whose schema is unknown
 - `W004` / `W005` — classification and freshness gaps

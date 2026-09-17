@@ -67,8 +67,8 @@ The `.toml` file names the model, lists what it depends on, picks a materializat
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"incremental"`, `"merge"`, `"time_interval"`, `"ephemeral"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`. |
-| `timestamp_column` | string | | Column used as the incremental watermark. Required when `type = "incremental"` or `type = "microbatch"`. |
+| `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"merge"`, `"time_interval"`, `"ephemeral"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`. `"incremental"` is refused on a transformation model (`E037`): see [Incremental](#incremental). |
+| `timestamp_column` | string | | Column used as the incremental watermark. Required when `type = "microbatch"`. |
 | `unique_key` | list of strings | | Key columns for merge matching. Required when `type = "merge"`. |
 | `update_columns` | list of strings | | Columns to update on merge match. Defaults to all non-key columns if omitted. |
 | `partition_by` | list of strings | | Column(s) identifying the partition to delete. Required when `type = "delete_insert"`. |
@@ -83,7 +83,7 @@ The `.toml` file names the model, lists what it depends on, picks a materializat
 :::note[Lakehouse formats]
 Warehouse-managed table shapes (**Delta tables**, **Iceberg tables**, **materialized views**, **streaming tables**, **plain views**) are modeled as a separate `format` axis (a top-level `format = "delta_table"` / `"iceberg_table"` key plus an optional `[format_options]` block for partitioning, clustering, table properties, and a comment). `[strategy]` controls how Rocky writes data into the table; `format` controls the physical table shape. The two are orthogonal. The engine-side DDL generator (`rocky-core::lakehouse::generate_lakehouse_ddl`) handles each format; end-to-end TOML wiring varies by adapter, so consult the per-adapter guides before committing to one.
 
-The chosen `format` and `format_options` are now applied on the **first** materialization of incremental-family models (`incremental`, `delete_insert`, `microbatch`, `time_interval`), not just on full-create strategies — so the table that bootstraps an incremental model is created as the requested Delta or Iceberg shape from the start, rather than as a plain table that only later gains the format.
+The chosen `format` and `format_options` are now applied on the **first** materialization of incremental-family models (`delete_insert`, `microbatch`, `time_interval`), not just on full-create strategies — so the table that bootstraps an incremental model is created as the requested Delta or Iceberg shape from the start, rather than as a plain table that only later gains the format.
 :::
 
 **`[target]`** -- Output table:
@@ -503,8 +503,8 @@ name = "fct_orders"
 retention = "90d"
 
 [strategy]
-type = "incremental"
-timestamp_column = "_fivetran_synced"
+type = "merge"
+unique_key = ["order_id"]
 
 [target]
 catalog = "analytics"
@@ -612,56 +612,24 @@ WHERE _fivetran_deleted = false
 
 ### Incremental
 
-Appends only the rows that arrived since last time. Rocky stores a [watermark](/reference/glossary/#watermark) — the timestamp of the newest row it has already loaded — and reads past it on the next run. Use this for a large fact table where a full refresh is too slow.
+A transformation model cannot use `type = "incremental"`. Rocky has no watermark to apply to a model's SQL, so the only statement this strategy could emit is `INSERT INTO <target> <model SQL>`. That appends the whole result again on every run.
 
-**SQL** (`models/fct_orders.sql`):
+`rocky compile` reports the model as error `E037`, with this message:
 
-```sql
-SELECT
-    order_id,
-    customer_id,
-    order_date,
-    total_amount,
-    _fivetran_synced
-FROM raw_catalog.src__acme__us_west__shopify.orders
-```
+> model 'fct_orders' uses `type = "incremental"`, which is not supported on transformation models: it emits an unfiltered INSERT and appends every row again on each run
 
-**Config** (`models/fct_orders.toml`):
+`rocky test`, `rocky ci` and `rocky emit-sql` fail on the same error. The SQL generator refuses the model too, so `rocky plan --model` and `rocky estimate` cannot print or run its `INSERT` either.
 
-```toml
-name = "fct_orders"
-depends_on = ["dim_products"]
+Pick the strategy that matches what you need. These are the four the error names:
 
-[strategy]
-type = "incremental"
-timestamp_column = "_fivetran_synced"
+| You need | Use |
+|---|---|
+| Update existing rows by key, insert new ones | [`merge`](#merge) with `unique_key` |
+| Replace whole partitions | [`delete_insert`](#delete--insert) with `partition_by` |
+| Process one time window per run, with late data | [`time_interval`](#time-interval), with `@start_date` and `@end_date` in the SQL |
+| Rebuild the table from the model's SQL | [`full_refresh`](#full-refresh) |
 
-[target]
-catalog = "analytics"
-schema = "warehouse"
-table = "fct_orders"
-
-[[sources]]
-catalog = "raw_catalog"
-schema = "src__acme__us_west__shopify"
-table = "orders"
-```
-
-Generated SQL (on incremental runs):
-
-```sql
-INSERT INTO analytics.warehouse.fct_orders
-SELECT
-    order_id,
-    customer_id,
-    order_date,
-    total_amount,
-    _fivetran_synced
-FROM raw_catalog.src__acme__us_west__shopify.orders
-WHERE _fivetran_synced > TIMESTAMP '2026-04-17 09:30:00'
-```
-
-The watermark literal is the previous run's `MAX(_fivetran_synced)`, read from Rocky's state store — not a subquery against the target. On the first run (when the target table does not exist), Rocky performs a full refresh automatically.
+`incremental` still works on a replication pipeline. There Rocky copies source tables and filters each copy on a stored watermark. See [Incremental processing](/concepts/incremental/).
 
 ---
 

@@ -303,34 +303,46 @@ rocky optimize
 
 ```json
 {
-  "version": "1.6.0",
+  "version": "1.74.0",
   "command": "optimize",
-  "total_models_analyzed": 3,
   "recommendations": [
     {
-      "model_name": "fct_revenue",
-      "current_strategy": "incremental",
-      "recommended_strategy": "incremental",
-      "estimated_monthly_savings": 0.0,
-      "reasoning": "Incremental is optimal. Average 2.3s per run, 1.2% of rows processed each run."
+      "model_name": "stg_events",
+      "current_strategy": "table",
+      "recommended_strategy": "ephemeral",
+      "estimated_monthly_savings": 0.0023,
+      "reasoning": "fast execution (1.4s) with 1 downstream consumer(s); inline into consumer query to eliminate materialization overhead",
+      "compute_cost_per_run": 0.0014,
+      "storage_cost_per_month": 0.0023,
+      "downstream_references": 1
     },
     {
       "model_name": "dim_customers",
-      "current_strategy": "full_refresh",
-      "recommended_strategy": "incremental",
-      "estimated_monthly_savings": 8.50,
-      "reasoning": "Full refresh takes 18.5s and processes 250K rows. Only 0.3% change rate between runs — switching to incremental saves ~17s per run."
+      "current_strategy": "table",
+      "recommended_strategy": "table",
+      "estimated_monthly_savings": 0.0,
+      "reasoning": "3 downstream consumers; materializing once ($0.5665/mo) is cheaper than recomputing for each ($1.6650/mo)",
+      "compute_cost_per_run": 0.0185,
+      "storage_cost_per_month": 0.0115,
+      "downstream_references": 3
     },
     {
-      "model_name": "stg_events",
-      "current_strategy": "incremental",
-      "recommended_strategy": "full_refresh",
-      "estimated_monthly_savings": 0.25,
-      "reasoning": "Drift detected in 4 of last 5 runs, triggering full refresh anyway. Switching to full_refresh avoids drift detection overhead."
+      "model_name": "fct_revenue",
+      "current_strategy": "table",
+      "recommended_strategy": "view",
+      "estimated_monthly_savings": 0.046,
+      "reasoning": "compute cost ($0.0690/mo) is less than storage ($0.1150/mo); recompute on read instead of materializing",
+      "compute_cost_per_run": 0.0023,
+      "storage_cost_per_month": 0.115,
+      "downstream_references": 0
     }
-  ]
+  ],
+  "total_models_analyzed": 3,
+  "incrementality_note": "Run `rocky compile --output json` for inferred incrementality hints on full_refresh models"
 }
 ```
+
+`rocky optimize` recommends `ephemeral`, `table` or `view`. `current_strategy` is always `"table"` ([#2056](https://github.com/rocky-data/rocky/issues/2056)), and a model with too little run history keeps that recommendation. Rocky assumes it rather than reading the strategy the model declares, so `estimated_monthly_savings` is `0.0` whenever the recommendation is `table`.
 
 Analyze a single model:
 

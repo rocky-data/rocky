@@ -109,7 +109,7 @@ Scope on the ELT spectrum:
 ## Materialization strategies
 
 - `full_refresh` — `CREATE OR REPLACE TABLE`
-- `incremental` — `INSERT INTO ... WHERE ts > watermark`
+- `incremental` — replication only: `INSERT INTO ... WHERE ts > watermark`. A transformation model is refused with `E037`
 - `merge` — `MERGE INTO ... USING ON key`
 - `delete_insert` — delete the affected partitions, then insert
 - `time_interval` / `microbatch` — Partition-keyed processing

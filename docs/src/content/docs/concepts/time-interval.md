@@ -16,8 +16,9 @@ Reach for this strategy when:
 - Your model aggregates by date and you need per-day rebuilds
 - You want cost and row counts reported per partition
 
-For a pure append-only pattern, where a row never arrives late, `incremental`
-stays the simpler choice.
+A transformation model cannot use `incremental`. Rocky refuses it with `E037`,
+because it would append every row again on each run. If each row has a key you
+can match on, `merge` is the simpler choice.
 
 ## TOML reference
 
@@ -279,14 +280,9 @@ discriminator into a Dagster `DailyPartitionsDefinition`, or `Hourly`,
 
 ## Comparison with `incremental`
 
-| Aspect | `[strategy] type = "incremental"` | `[strategy] type = "time_interval"` |
-|---|---|---|
-| State | Single watermark per table | Per-partition `PARTITIONS` records |
-| Filter | `WHERE ts > MAX(ts_in_target)` | `WHERE ts >= @start_date AND ts < @end_date` |
-| Late data | Missed (watermark already past) | Picked up on partition re-run |
-| Idempotent re-run | No (depends on watermark state) | Yes (DELETE+INSERT) |
-| Backfill | `full_refresh` only | `--from / --to` walks the range |
-| Per-partition observability | No | Yes (`PartitionInfo` in JSON) |
+There is no choice to make on a transformation model. `rocky compile` refuses `type = "incremental"` there with `E037`, because Rocky has no watermark to apply to the model's SQL and the strategy would append every row again on each run. `time_interval` is the strategy for time-windowed reprocessing of a model.
+
+`incremental` remains a [replication](/concepts/incremental/) strategy, where Rocky filters each copy of a source table on a stored watermark.
 
 ## Limitations (v1)
 
