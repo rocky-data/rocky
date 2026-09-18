@@ -39,13 +39,15 @@
     "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020"
   ],
   "SETUP_UV_SOURCE": [
-    "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d"
+    "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d",
+    "astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4"
   ],
   "SETUP_ZIG_SOURCE": [
     "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29"
   ],
   "TAIKI_INSTALL_SOURCE": [
-    "taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8"
+    "taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8",
+    "taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375"
   ],
   "UPLOAD_ARTIFACT_SOURCE": [
     "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
