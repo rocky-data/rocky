@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { externalLoads, layoutProblems } from "./check-no-external.mjs";
+import { externalLoads, layoutProblems, shellLoadProblems } from "./check-no-external.mjs";
 
 describe("layoutProblems", () => {
   const build = (files) => {
@@ -24,6 +24,42 @@ describe("layoutProblems", () => {
     // a root-level bundle would be served as HTML when its hash goes stale.
     expect(layoutProblems(build(["index.html", "index-abc.js"]))).toHaveLength(1);
     expect(layoutProblems(build(["index.html", "static/a.js"]))).toHaveLength(1);
+  });
+});
+
+describe("shellLoadProblems", () => {
+  const shell = (html, assets = ["index-abc.js", "index-abc.css"]) => {
+    const dir = mkdtempSync(join(tmpdir(), "rocky-shell-"));
+    mkdirSync(join(dir, "assets"), { recursive: true });
+    for (const name of assets) writeFileSync(join(dir, "assets", name), "");
+    writeFileSync(join(dir, "index.html"), html);
+    return dir;
+  };
+
+  it("accepts the hrefs Vite emits, and a data URI", () => {
+    const dir = shell(
+      `<link rel="icon" href="/ui/assets/rocky-logo-abc.svg">
+       <link rel="stylesheet" href="/ui/assets/index-abc.css">
+       <script type="module" src="/ui/assets/index-abc.js"></script>
+       <link rel="apple-touch-icon" href="data:image/svg+xml,%3csvg%3e">`,
+      ["index-abc.js", "index-abc.css", "rocky-logo-abc.svg"],
+    );
+    expect(shellLoadProblems(dir)).toHaveLength(0);
+  });
+
+  it("refuses a source path the build failed to rewrite", () => {
+    // The tab icon is written as `./src/assets/rocky-logo.svg`. If Vite ever
+    // stops rewriting it, the server answers `/ui/src/...` with the shell, so
+    // the icon would be an HTML document and would not draw — silently.
+    const dir = shell('<link rel="icon" href="./src/assets/rocky-logo.svg">');
+    expect(shellLoadProblems(dir)).toHaveLength(1);
+  });
+
+  it("refuses an asset href with no file behind it", () => {
+    const dir = shell('<link rel="icon" href="/ui/assets/rocky-logo-stale.svg">');
+    expect(shellLoadProblems(dir)).toEqual([
+      'index.html: href="/ui/assets/rocky-logo-stale.svg" has no file in assets/',
+    ]);
   });
 });
 

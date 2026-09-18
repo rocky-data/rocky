@@ -73,6 +73,29 @@ export function layoutProblems(dir) {
   return problems;
 }
 
+// Every URL the built shell asks the browser to load must be one the server
+// answers as a file: `/ui/assets/<name>`. Vite rewrites the relative hrefs in
+// `index.html` to that form; a build that stops doing it would leave, say,
+// `./src/assets/rocky-logo.svg` in the shell, and the server would answer
+// that path with the shell itself (`ui.rs`, the SPA fallback). The tab icon
+// would then be an HTML document and simply not draw, with nothing failing.
+// A data URI is a load from the page itself, so it passes.
+export function shellLoadProblems(dir) {
+  const problems = [];
+  const html = readFileSync(join(dir, "index.html"), "utf8");
+  const names = new Set(readdirSync(join(dir, "assets")));
+  for (const [, attribute, url] of html.matchAll(/\b(src|href)\s*=\s*["']([^"']+)["']/gi)) {
+    if (url.startsWith("data:")) continue;
+    const asset = /^\/ui\/assets\/(.+)$/.exec(url);
+    if (!asset) {
+      problems.push(`index.html: ${attribute}="${url}" is not /ui/assets/<name> or a data: URI`);
+      continue;
+    }
+    if (!names.has(asset[1])) problems.push(`index.html: ${attribute}="${url}" has no file in assets/`);
+  }
+  return problems;
+}
+
 const invokedDirectly = process.argv[1] && process.argv[1].endsWith("check-no-external.mjs");
 if (invokedDirectly) {
   const dir = process.argv[2] ?? "dist";
@@ -90,5 +113,13 @@ if (invokedDirectly) {
     for (const p of layout) console.error(`  ${p}`);
     process.exit(1);
   }
-  console.log(`no external loads under ${dir}; layout is index.html + assets/`);
+  const shell = shellLoadProblems(dir);
+  if (shell.length > 0) {
+    console.error("the built shell asks for a path the server does not answer as a file:");
+    for (const p of shell) console.error(`  ${p}`);
+    process.exit(1);
+  }
+  console.log(
+    `no external loads under ${dir}; layout is index.html + assets/; the shell's loads are all assets`,
+  );
 }
