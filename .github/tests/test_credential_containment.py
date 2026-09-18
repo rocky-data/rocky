@@ -8,7 +8,9 @@ import shutil
 import sys
 import tempfile
 import unittest
+import urllib.error
 import zipfile
+from unittest import mock
 from pathlib import Path
 from unittest.mock import patch
 
@@ -28,9 +30,14 @@ from fetch_ai_review_context import (  # noqa: E402
     select_artifact,
     validate_context,
 )
+import fetch_policy_candidate as fetch_module  # noqa: E402
 from fetch_policy_candidate import (  # noqa: E402
+    MAX_API_RESPONSE_BYTES,
     MAX_BLOB_BYTES,
+    REQUEST_ATTEMPTS,
+    RETRY_BACKOFF_SECONDS,
     PolicyCandidateError,
+    _request_json,
     fetch_policy_candidate,
 )
 from normalize_json import (  # noqa: E402
@@ -40,12 +47,35 @@ from normalize_json import (  # noqa: E402
     normalize_preview_json,
 )
 from check_credential_containment import (  # noqa: E402
-    CHECKOUT_SOURCE,
+    ACTION_PINS_RELATIVE_PATH,
+    CHECKOUT_SOURCES,
     FROZEN_TRUST_ROOTS,
+    MAX_COMMITS_PER_ACTION,
     RELEASE_ACTION_SOURCES,
-    WASM_PACK_SOURCE,
+    REQUIRED_PIN_NAMES,
+    WASM_PACK_SOURCES,
     check_repository,
+    load_action_pins,
 )
+
+# A pinned action accepts more than one commit only while a rotation is in
+# flight, so the fixtures below pick any accepted one to stand for "the pin".
+CHECKOUT_SOURCE = sorted(CHECKOUT_SOURCES)[0]
+
+
+def write_action_pins(root: Path, pins: object | None = None) -> None:
+    """Give a fixture tree a pin file, the real one unless another is given."""
+
+    destination = root / ACTION_PINS_RELATIVE_PATH
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if pins is None:
+        destination.write_bytes(
+            (REPOSITORY_ROOT / ACTION_PINS_RELATIVE_PATH).read_bytes()
+        )
+    elif isinstance(pins, str):
+        destination.write_text(pins)
+    else:
+        destination.write_text(json.dumps(pins))
 from preview_comment import (  # noqa: E402
     COMMENT_MARKER,
     MAX_COMMENT_BYTES,
@@ -305,6 +335,137 @@ class PolicyCandidateFetchTests(unittest.TestCase):
                 self.fetch(payloads, output)
             self.assertFalse(output.exists())
             self.assertEqual(list(root.glob(".candidate-policy-*")), [])
+
+
+class PolicyCandidateRetryTests(unittest.TestCase):
+    """A transient API error must not fail a required check on its own.
+
+    The gate went red three times in one day before it read any diff, each time
+    cleared by a human re-run. Retrying does not weaken it: the candidate is
+    still fetched once, every validation still runs, and a failure that persists
+    still fails the job.
+    """
+
+    ENDPOINT = "repos/o/r/git/commits/" + "a" * 40
+
+    class Response:
+        def __init__(self, payload: bytes) -> None:
+            self._payload = payload
+
+        def read(self, size: int) -> bytes:
+            return self._payload[:size]
+
+        def __enter__(self) -> "PolicyCandidateRetryTests.Response":
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    def run_request(self, outcomes: list[object]) -> tuple[object, list[str], list[float]]:
+        """Drive one _request_json call through a scripted list of outcomes."""
+
+        remaining = list(outcomes)
+        seen: list[str] = []
+        slept: list[float] = []
+
+        class Opener:
+            def open(self, request: object, timeout: float) -> object:
+                seen.append(getattr(request, "full_url", ""))
+                outcome = remaining.pop(0)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
+
+        with (
+            mock.patch.object(
+                fetch_module.urllib.request, "build_opener", lambda *_: Opener()
+            ),
+            mock.patch.object(fetch_module.time, "sleep", slept.append),
+        ):
+            try:
+                result = _request_json(
+                    "https://api.github.com", self.ENDPOINT, "read-token"
+                )
+            except PolicyCandidateError as error:
+                result = error
+        return result, seen, slept
+
+    def http_error(self, code: int, headers: dict | None = None) -> urllib.error.HTTPError:
+        return urllib.error.HTTPError(
+            "https://api.github.com/" + self.ENDPOINT, code, "boom", headers or {}, None
+        )
+
+    def ok(self) -> "PolicyCandidateRetryTests.Response":
+        return self.Response(b'{"sha": "ok"}')
+
+    def test_a_transient_server_error_is_retried_and_then_succeeds(self) -> None:
+        result, seen, slept = self.run_request([self.http_error(502), self.ok()])
+        self.assertEqual(result, {"sha": "ok"})
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(slept, [RETRY_BACKOFF_SECONDS[0]])
+
+    def test_every_retryable_status_is_retried(self) -> None:
+        for code in (429, 500, 502, 503, 504):
+            with self.subTest(code=code):
+                _, seen, _ = self.run_request([self.http_error(code), self.ok()])
+                self.assertEqual(len(seen), 2)
+
+    def test_a_persistent_failure_still_fails_the_job(self) -> None:
+        result, seen, _ = self.run_request([self.http_error(503)] * REQUEST_ATTEMPTS)
+        self.assertIsInstance(result, PolicyCandidateError)
+        self.assertEqual(len(seen), REQUEST_ATTEMPTS)
+
+    def test_the_final_message_names_the_endpoint_and_every_attempt(self) -> None:
+        """Three failures used to print one identical line with no cause."""
+
+        result, _, _ = self.run_request(
+            [self.http_error(502), self.http_error(503), self.http_error(504)]
+        )
+        message = str(result)
+        self.assertIn(self.ENDPOINT, message)
+        for detail in ("HTTP 502", "HTTP 503", "HTTP 504"):
+            self.assertIn(detail, message)
+        self.assertIsInstance(result.__cause__, urllib.error.HTTPError)
+
+    def test_an_error_the_request_caused_is_not_retried(self) -> None:
+        """Repeating a 404 or a 401 cannot fix it, and costs the backoff."""
+
+        for code in (401, 404, 422):
+            with self.subTest(code=code):
+                result, seen, slept = self.run_request(
+                    [self.http_error(code)] + [self.ok()] * REQUEST_ATTEMPTS
+                )
+                self.assertIsInstance(result, PolicyCandidateError)
+                self.assertEqual(len(seen), 1)
+                self.assertEqual(slept, [])
+                self.assertIn(f"HTTP {code}", str(result))
+
+    def test_a_rate_limited_403_is_retried_but_a_forbidden_403_is_not(self) -> None:
+        limited, seen, _ = self.run_request(
+            [self.http_error(403, {"x-ratelimit-remaining": "0"}), self.ok()]
+        )
+        self.assertEqual(limited, {"sha": "ok"})
+        self.assertEqual(len(seen), 2)
+
+        forbidden, seen, _ = self.run_request([self.http_error(403), self.ok()])
+        self.assertIsInstance(forbidden, PolicyCandidateError)
+        self.assertEqual(len(seen), 1)
+
+    def test_a_connection_error_is_retried_and_named(self) -> None:
+        """A DNS failure and a 502 used to read the same in the log."""
+
+        result, seen, _ = self.run_request(
+            [urllib.error.URLError("Name or service not known")] * REQUEST_ATTEMPTS
+        )
+        self.assertIsInstance(result, PolicyCandidateError)
+        self.assertEqual(len(seen), REQUEST_ATTEMPTS)
+        self.assertIn("Name or service not known", str(result))
+
+    def test_the_byte_limit_still_applies_after_a_retry(self) -> None:
+        oversized = self.Response(b"x" * (MAX_API_RESPONSE_BYTES + 1))
+        result, _, _ = self.run_request([self.http_error(502), oversized])
+        self.assertIsInstance(result, PolicyCandidateError)
+        self.assertIn("exceeds the byte limit", str(result))
 
 
 class ApprovalPolicyTests(unittest.TestCase):
@@ -687,6 +848,7 @@ class CredentialContainmentPolicyTests(unittest.TestCase):
             workflows = root / ".github" / "workflows"
             workflows.mkdir(parents=True)
             (workflows / name).write_text(text)
+            write_action_pins(root)
             return check_repository(root)
 
     def read(self, relative_path: str) -> str:
@@ -1876,7 +2038,222 @@ jobs:
 
         workflows = REPOSITORY_ROOT / ".github" / "workflows"
         wasm = (workflows / "engine-wasm-release.yml").read_text()
-        self.assertIn(WASM_PACK_SOURCE, wasm)
+        self.assertTrue(
+            any(source in wasm for source in WASM_PACK_SOURCES),
+            "engine-wasm-release.yml runs a wasm-pack commit that is not pinned",
+        )
+
+class ActionPinFileTests(unittest.TestCase):
+    """The pin file is data a pull request may change, so it is validated hard.
+
+    Its whole purpose is that a commit rotation stops needing an administrator
+    merge. That only stays safe while a malformed or hostile file is refused,
+    and while the sources a candidate is judged against keep coming from the
+    trusted checkout rather than from the candidate itself.
+    """
+
+    LABEL = "pins"
+
+    def load(self, pins: object) -> tuple[dict, list[str]]:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_action_pins(root, pins)
+            return load_action_pins(root, self.LABEL)
+
+    def valid_pins(self) -> dict[str, list[str]]:
+        return json.loads((REPOSITORY_ROOT / ACTION_PINS_RELATIVE_PATH).read_text())
+
+    def test_the_repository_pin_file_loads_every_required_name(self) -> None:
+        pins, violations = load_action_pins(REPOSITORY_ROOT, self.LABEL)
+        self.assertEqual(violations, [])
+        self.assertEqual(set(pins), set(REQUIRED_PIN_NAMES))
+
+    def test_the_pin_file_is_not_a_frozen_trust_root(self) -> None:
+        """The point of the split: rotating a commit must not need the hammer."""
+
+        self.assertNotIn(ACTION_PINS_RELATIVE_PATH, FROZEN_TRUST_ROOTS)
+
+    def test_a_missing_pin_file_yields_no_pins(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pins, violations = load_action_pins(Path(directory), self.LABEL)
+        self.assertEqual(pins, {})
+        self.assertTrue(any("missing or unsafe" in item for item in violations))
+
+    def test_a_malformed_pin_file_is_a_violation_not_an_exception(self) -> None:
+        """An import-time crash would kill the job before it named a reason."""
+
+        pins, violations = self.load("{ not json")
+        self.assertEqual(pins, {})
+        self.assertTrue(any("not valid JSON" in item for item in violations))
+
+    def test_a_pin_file_that_is_not_an_object_fails_closed(self) -> None:
+        pins, violations = self.load([])
+        self.assertEqual(pins, {})
+        self.assertTrue(any("must be a JSON object" in item for item in violations))
+
+    def test_an_unknown_pin_name_is_refused(self) -> None:
+        """A new name is a new trusted action, which stays behind the freeze."""
+
+        pins = self.valid_pins()
+        pins["BACKDOOR_SOURCE"] = ["attacker/action@" + "a" * 40]
+        loaded, violations = self.load(pins)
+        self.assertEqual(loaded, {})
+        self.assertTrue(
+            any("BACKDOOR_SOURCE is not a known action pin" in i for i in violations)
+        )
+
+    def test_a_missing_pin_name_is_refused(self) -> None:
+        pins = self.valid_pins()
+        del pins["CHECKOUT_SOURCE"]
+        loaded, violations = self.load(pins)
+        self.assertEqual(loaded, {})
+        self.assertTrue(any("CHECKOUT_SOURCE is missing" in i for i in violations))
+
+    def test_an_empty_commit_list_is_refused(self) -> None:
+        """"No commits" and "every commit is fine" must not look the same."""
+
+        for value in ([], "actions/checkout@" + "a" * 40, None):
+            with self.subTest(value=value):
+                pins = self.valid_pins()
+                pins["CHECKOUT_SOURCE"] = value
+                loaded, violations = self.load(pins)
+                self.assertEqual(loaded, {})
+                self.assertTrue(
+                    any("must list at least one commit" in i for i in violations)
+                )
+
+    def test_a_commit_that_is_not_a_full_sha_is_refused(self) -> None:
+        for value in (
+            "actions/checkout@v4",
+            "actions/checkout@" + "a" * 39,
+            "actions/checkout@" + "A" * 40,
+            "actions/checkout",
+            "actions/checkout@" + "a" * 40 + " # trailing",
+            42,
+        ):
+            with self.subTest(value=value):
+                pins = self.valid_pins()
+                pins["CHECKOUT_SOURCE"] = [value]
+                loaded, violations = self.load(pins)
+                self.assertEqual(loaded, {})
+                self.assertTrue(
+                    any("owner/repo@<40-hex commit>" in i for i in violations)
+                )
+
+    def test_commits_under_one_name_must_belong_to_the_same_action(self) -> None:
+        """The bypass this guard closes.
+
+        Without it, PR 1 of a rotation adds an unrelated action beside the real
+        one and PR 2 points the workflow at it. Both are ordinary pull requests,
+        and the result is an unreviewed action holding a write token.
+        """
+
+        pins = self.valid_pins()
+        pins["CHECKOUT_SOURCE"] = [
+            *pins["CHECKOUT_SOURCE"],
+            "attacker/checkout@" + "b" * 40,
+        ]
+        loaded, violations = self.load(pins)
+        self.assertEqual(loaded, {})
+        self.assertTrue(
+            any("mixes commits from different actions" in i for i in violations)
+        )
+
+    def test_more_commits_than_one_rotation_needs_are_refused(self) -> None:
+        pins = self.valid_pins()
+        pins["CHECKOUT_SOURCE"] = [
+            "actions/checkout@" + letter * 40
+            for letter in "abcdef"[: MAX_COMMITS_PER_ACTION + 1]
+        ]
+        loaded, violations = self.load(pins)
+        self.assertEqual(loaded, {})
+        self.assertTrue(any("accepts more than" in i for i in violations))
+
+    def test_a_repeated_commit_is_refused(self) -> None:
+        pins = self.valid_pins()
+        pins["CHECKOUT_SOURCE"] = pins["CHECKOUT_SOURCE"] * 2
+        loaded, violations = self.load(pins)
+        self.assertEqual(loaded, {})
+        self.assertTrue(any("repeats a commit" in i for i in violations))
+
+    def test_one_commit_cannot_stand_for_two_actions(self) -> None:
+        """Catches a rotation that pasted the wrong action's commit."""
+
+        pins = self.valid_pins()
+        sha = pins["CHECKOUT_SOURCE"][0].partition("@")[2]
+        pins["SETUP_UV_SOURCE"] = ["astral-sh/setup-uv@" + sha]
+        loaded, violations = self.load(pins)
+        self.assertEqual(loaded, {})
+        self.assertTrue(any("repeats the commit pinned by" in i for i in violations))
+
+    def test_one_bad_entry_withholds_every_pin(self) -> None:
+        """A partly valid file must not leave some rules comparing and others not."""
+
+        pins = self.valid_pins()
+        pins["CHECKOUT_SOURCE"] = ["actions/checkout@v4"]
+        loaded, _ = self.load(pins)
+        self.assertEqual(loaded, {})
+
+    def test_a_rotation_accepts_the_old_and_the_new_commit(self) -> None:
+        """The two-pull-request rotation this split exists to allow."""
+
+        pins = self.valid_pins()
+        replacement = "actions/checkout@" + "c" * 40
+        pins["CHECKOUT_SOURCE"] = [*pins["CHECKOUT_SOURCE"], replacement]
+        loaded, violations = self.load(pins)
+        self.assertEqual(violations, [])
+        self.assertIn(replacement, loaded["CHECKOUT_SOURCE"])
+        self.assertEqual(len(loaded["CHECKOUT_SOURCE"]), 2)
+
+    def test_a_malformed_candidate_pin_file_is_reported(self) -> None:
+        """PR 1 of every rotation edits this file, so the candidate's copy is checked.
+
+        The rules compare against the trusted pins, so nothing else would notice
+        a broken candidate file until it had merged and broken main.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shutil.copytree(REPOSITORY_ROOT / ".github", root / ".github")
+            write_action_pins(root, "{ not json")
+            violations = check_repository(root)
+        self.assertTrue(
+            any(
+                item.startswith(f"{ACTION_PINS_RELATIVE_PATH}: ")
+                and "not valid JSON" in item
+                for item in violations
+            )
+        )
+
+    def test_the_candidate_cannot_supply_the_sources_it_is_judged_against(self) -> None:
+        """The invariant the whole gate rests on.
+
+        `ci-security-policy.yml` runs the checker out of `trusted/` against a
+        `candidate/` tree. If the pins came from the candidate, a pull request
+        would supply both the source and the permission for it.
+        """
+
+        forged = "attacker/checkout@" + "d" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shutil.copytree(REPOSITORY_ROOT / ".github", root / ".github")
+            write_action_pins(root, {**self.valid_pins(), "CHECKOUT_SOURCE": [forged]})
+            workflow = root / ".github" / "workflows" / "ci-security-policy.yml"
+            workflow.write_text(workflow.read_text().replace(CHECKOUT_SOURCE, forged))
+            violations = check_repository(root)
+        # The forged file is well-formed, so the candidate-side validation passes
+        # it. What refuses it is the workflow rule, still comparing against the
+        # trusted commit — which is the property being asserted.
+        self.assertTrue(
+            any(
+                "ci-security-policy.yml" in item
+                and "action sources are not exact" in item
+                for item in violations
+            ),
+            f"a forged pin file approved its own source: {violations}",
+        )
+        self.assertNotIn(forged, RELEASE_ACTION_SOURCES)
+
 
 class WorkflowPolicyTests(unittest.TestCase):
     def read(self, relative_path: str) -> str:
