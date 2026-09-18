@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 // Errors — type checking
-/// Unresolved model reference.
+/// Join key type mismatch between two upstream models, with no common
+/// supertype. The same comparison emits [`W001`] instead when one exists.
 pub const E001: &str = "E001";
 
 // Errors — contract validation
