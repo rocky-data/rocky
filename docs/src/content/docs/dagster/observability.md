@@ -118,7 +118,12 @@ the check has four outcomes:
 | The detector skipped it | fails (WARN) | `not_evaluated`, plus `rocky/reason` |
 | The run says nothing about it | fails (WARN) | `not produced by rocky` |
 
-The last two are new. Before, silence was a pass:
+A table that `prune_unchanged` skipped is the exception to the last row. It
+keeps the verdict from its last completed evaluation, so a check that passed
+before stays green while the source does not change. A pruned table with no
+earlier verdict fails (WARN). Both carry `rocky/pruned_unchanged`.
+
+The last two rows are new. Before, silence was a pass:
 
 ```
 before        anomalies: []  ──►  row_count_anomaly: PASS   (green, detector never ran)
@@ -187,6 +192,11 @@ def my_rocky_asset(context, rocky):
         if check.asset_key not in emitted:
             yield check
 ```
+
+Declare a `check_spec` for every asset your resolver can return. Both
+helpers yield a result for any table the resolver maps, and `RockyComponent`
+drops the ones whose `(asset, check)` pair it did not declare. Your own
+asset has no such guard.
 
 Rocky names a table with a plain string. That string is either
 `catalog.schema.table` or a bare `table`. The `key_resolver` callable maps
