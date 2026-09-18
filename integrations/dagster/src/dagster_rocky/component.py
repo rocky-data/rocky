@@ -3653,7 +3653,10 @@ def _emit_results(
 
     # Anomalies → AssetCheckResult with severity WARN. The check name is
     # pre-declared in DEFAULT_CHECK_NAMES so the spec is visible in the UI
-    # before any run; placeholders below cover the no-anomaly case.
+    # before any run. A table with no anomaly gets its verdict from
+    # `anomaly_evaluation_results` below, not from a placeholder — this check
+    # left PASS_BY_ABSENCE_CHECK_NAMES, so its placeholder now reports
+    # `passed=False` (#1790).
     for run_result in results:
         for anomaly_result in anomaly_check_results(run_result, key_resolver=selected_resolver):
             spec_key = (anomaly_result.asset_key, ANOMALY_CHECK_NAME)
