@@ -218,7 +218,13 @@ There is a consequence for orchestrators. By the time a `failure_kind: "transien
 
 ## Failure containment across the model graph
 
-By default a transformation run **fails fast**. The first model that fails stops the run, and Rocky skips every model it has not yet built. Turn on containment to let unrelated work continue:
+By default a transformation run **fails fast**. The first model that fails while it runs stops the run, and Rocky skips every model it has not yet built.
+
+A compile error is the exception. Rocky excludes the model that does not compile, then builds the others. The run reports `Failure`, or `PartialFailure` when another model succeeded. Nothing holds back a model downstream of the excluded one. It builds from the table an earlier run left. With no such table, it fails.
+
+This is the model graph only. Replicated tables have their own switch, [`[execution] fail_fast`](/reference/configuration/#pipelinenameexecution), which is `false` by default: one table that fails does not stop the others.
+
+Turn on containment to let unrelated work continue:
 
 ```toml
 [resilience]
