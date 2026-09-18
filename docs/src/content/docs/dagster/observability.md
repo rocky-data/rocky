@@ -181,16 +181,18 @@ def my_rocky_asset(context, rocky):
     yield dg.MaterializeResult(...)
     yield from drift_observations(result, key_resolver=resolver)
 
-    # Anomalies first, then the verdict for every other table. A table with
-    # an anomaly is in both lists, so skip the assets you already emitted —
-    # the anomaly's failure must win over the pass.
+    # Anomalies first, then the verdict for every other table. Emit each
+    # asset once: a table with an anomaly is in both lists, and two tables
+    # can resolve to the same asset. The anomaly's failure must win.
     emitted = set()
-    for check in anomaly_check_results(result, key_resolver=resolver):
+    for check in (
+        *anomaly_check_results(result, key_resolver=resolver),
+        *anomaly_evaluation_results(result, key_resolver=resolver),
+    ):
+        if check.asset_key in emitted:
+            continue
         emitted.add(check.asset_key)
         yield check
-    for check in anomaly_evaluation_results(result, key_resolver=resolver):
-        if check.asset_key not in emitted:
-            yield check
 ```
 
 Declare a `check_spec` for every asset your resolver can return. Both
