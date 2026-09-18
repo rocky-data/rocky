@@ -392,6 +392,36 @@ describe("App", () => {
       vi.unstubAllGlobals();
     });
 
+    it("gives each drawn engine line its own description id", async () => {
+      // Both copies carry the capability list as a hidden description. One id
+      // for both would point every `aria-describedby` at the first element.
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          async () =>
+            new Response(JSON.stringify(META), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            }),
+        ),
+      );
+      window.history.pushState(null, "", "/ui/estate");
+      render(<App token="t" estate={<span>estate slot</span>} />);
+      await waitFor(() => expect(screen.getAllByText("2 capabilities").length).toBe(1));
+      const button = openButton();
+      fireEvent.click(button);
+      await screen.findByRole("dialog");
+
+      const described = [...document.querySelectorAll("[aria-describedby]")].map((node) =>
+        node.getAttribute("aria-describedby"),
+      );
+      expect(described).toHaveLength(2);
+      expect(new Set(described).size).toBe(2);
+      // Each one points at an element that exists, and at its own.
+      for (const id of described) expect(document.getElementById(id ?? "")).not.toBeNull();
+      vi.unstubAllGlobals();
+    });
+
     it("reads the engine once, however often the drawer opens", async () => {
       // The sidebar is drawn twice; two reads of `/api/v1/meta` would be the
       // shape of #2075 again, one level up.
