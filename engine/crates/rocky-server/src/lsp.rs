@@ -329,7 +329,10 @@ const SEMANTIC_TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::FUNCTION,  // 2: SQL functions
     SemanticTokenType::KEYWORD,   // 3: SQL keywords
     SemanticTokenType::TYPE,      // 4: type annotations
-    SemanticTokenType::MACRO,     // 5: ref() / source() calls
+    // 5: never emitted. It described `ref()`/`source()`, which are dbt's and
+    // which Rocky does not have — dependencies come from `depends_on` and from
+    // the bare table names in the SQL. Kept so the indexes above stay stable.
+    SemanticTokenType::MACRO,
 ];
 
 // ── LSP backend ─────────────────────────────────────────────────────────────
