@@ -218,7 +218,29 @@ There is a consequence for orchestrators. By the time a `failure_kind: "transien
 
 ## Failure containment across the model graph
 
-By default a transformation run **fails fast**. The first model that fails stops the run, and Rocky skips every model it has not yet built. Turn on containment to let unrelated work continue:
+By default a transformation run **fails fast**. A model that fails while it runs stops the run: no later layer starts. Models already running beside it still finish, because `--parallel` is 4 by default. Only DuckDB runs one model at a time.
+
+A type error is the exception. If a model parses but fails type-checking, Rocky excludes that model and builds the others. `rocky compile` reports these as an `E` code, such as `E037`. The run reports `Failure`, or `PartialFailure` when another model succeeded.
+
+A project that cannot compile at all is not an exception. Nothing builds, and the run reports one error keyed `<compile>`. These are the causes:
+
+- SQL that does not parse.
+- A `.rocky` file Rocky cannot lower.
+- Broken or missing frontmatter.
+- A duplicate model name.
+- A `depends_on` entry that names a model that does not exist.
+
+```
+model parses, type error   ->  that model is excluded, the others build
+project does not compile   ->  nothing builds
+model fails while running  ->  no later layer starts
+```
+
+Nothing holds back a model downstream of an excluded one. It builds from the table an earlier run left. With no such table, it fails. `rocky run --dag` differs: each model is its own sub-run, so the failed node's descendants are skipped.
+
+This is the model graph only. Replicated tables have their own switch, [`[execution] fail_fast`](/reference/configuration/#pipelinenameexecution), which is `false` by default: one table that fails does not stop the others. A second switch still can. `error_rate_abort_pct` defaults to 50, so once 4 or more tables finish, a failure rate at or above half aborts the rest.
+
+Turn on containment to let unrelated work continue:
 
 ```toml
 [resilience]
@@ -227,7 +249,7 @@ contain_failures = true   # default: false
 
 With containment on, Rocky withholds the failed model and its whole downstream closure. Unrelated subtrees still materialize. The run reports `PartialFailure`. It lists the withheld models on `RunOutput.contained[*]`, each naming what blocked it plus an unblock hint, and the causes on `RunOutput.errors[*]`. For a partitioned (`time_interval`) model, a failed partition withholds the downstream while the healthy partitions still land.
 
-**Guarantee scope.** Containment is *guaranteed* for two kinds of dependency. The first is a dependency declared with `ref()`. The second is a physical read Rocky can resolve statically: `schema.table` or `catalog.schema.table`, quoted or unquoted.
+**Guarantee scope.** Containment is *guaranteed* for two kinds of dependency. The first is a dependency listed in the model's `depends_on`. The second is a physical read Rocky can resolve statically: `schema.table` or `catalog.schema.table`, quoted or unquoted.
 
 Rocky folds both kinds into the withholding closure and into the execution order. So a downstream model is never built on the stale or missing output of a failure. Under `--parallel`, a reader is scheduled strictly after every producer it reads.
 
@@ -235,7 +257,7 @@ Some reads Rocky **cannot enumerate**: a model built on a CTE, a sub-query, or a
 
 Such a model is still withheld when a *known* upstream of it failed. But its reads do not resolve into an ordering edge. So under `--parallel`, a same-layer reader of a failing producer can materialize on stale data, exactly as it would in a fail-fast run.
 
-This is a documented boundary, not a regression. Containment never materializes anything a fail-fast run would not. **Declare the dependency with `ref()` when you need a hard containment guarantee.**
+This is a documented boundary, not a regression. Containment never materializes anything a fail-fast run would not. **List the dependency in the model's `depends_on` when you need a hard containment guarantee.**
 
 Containment is off by default. The fail-fast behaviour described elsewhere on this page is unchanged unless you set `contain_failures = true`.
 
