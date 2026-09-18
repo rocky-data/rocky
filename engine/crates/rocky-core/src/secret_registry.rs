@@ -39,8 +39,24 @@
 //! serves that record. Forgetting a rotated value would re-expose exactly the
 //! history a rotation was meant to retire.
 //!
-//! The set is bounded by the number of distinct environment values a process
-//! ever expands, which is small and does not grow with traffic.
+//! ### The bound, and why it holds
+//!
+//! Monotonic is not unbounded. Both production call sites — the two branches
+//! of the `${VAR}` expander in `config.rs` — take their value from
+//! `std::env::var`, and a process's environment does not change while it runs.
+//! So the set is bounded by the distinct `${VAR}` values the loaded config
+//! references, however long the process lives.
+//!
+//! Reloading does not grow it. `rocky serve` re-reads config on every watched
+//! change, but re-registering a value it already holds is a no-op, so a server
+//! that reloads a thousand times with an unchanged environment holds exactly as
+//! many entries as one that never reloaded.
+//!
+//! The bound is worth stating because the cost is paid per response, not once.
+//! The filter scans the whole body for each entry, so `n` entries cost `O(n*b)`
+//! on a body of length `b` — memory is two `String`s per entry and is not the
+//! concern. Bounded by the config's distinct values, that work is bounded too
+//! (#1946).
 //!
 //! ## Why the replacement is `${NAME}` and not an opaque token
 //!
