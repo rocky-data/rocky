@@ -6,7 +6,7 @@ import {
   type ErrorInfo,
   type ReactNode,
 } from "react";
-import { Dialog, DialogBackdrop, DialogPanel } from "@headlessui/react";
+import { Dialog, DialogBackdrop, DialogPanel, useClose } from "@headlessui/react";
 import { Bars3Icon, XMarkIcon } from "@heroicons/react/24/outline";
 import type { MetaOutput } from "@rocky-types/meta";
 import { ApiError, apiGet } from "./api";
@@ -252,8 +252,7 @@ export const WIDE_ENOUGH_FOR_THE_SIDEBAR = "(min-width: 64rem)";
  *
  * `alt=""`, because the mark says nothing the name beside it does not: a
  * screen reader that announced both would say "Rocky" twice. The caller
- * passes the display class, so the sidebar can hide it under `md` while the
- * narrow header shows it.
+ * passes the display class, so each copy of the sidebar sets its own.
  */
 function Wordmark({ className }: { className: string }) {
   return (
@@ -275,6 +274,9 @@ function Wordmark({ className }: { className: string }) {
 function AreaLink({ area, current }: { area: Area & { kind: "link" }; current: AreaId }) {
   const here = area.id === current;
   const Icon = area.icon;
+  // Folds the drawer this link is drawn in. Outside a dialog — the fixed rail
+  // — the default context is a no-op, so the same link works in both copies.
+  const close = useClose();
   return (
     <a
       href={area.href}
@@ -283,8 +285,12 @@ function AreaLink({ area, current }: { area: Area & { kind: "link" }; current: A
       aria-current={here ? (areaHasTabs(area.id) ? "true" : "page") : undefined}
       onClick={(event) => {
         event.preventDefault();
-        // The menu folds on the route change this causes (see `App`).
         navigateTo(area.href);
+        // Not left to the route change: tapping the area you are already on
+        // pushes the same path, so `usePathname` sets an identical string,
+        // React bails out, and the effect keyed on it never runs. The drawer
+        // would stay open over the page it just failed to navigate away from.
+        close();
       }}
       className={`group flex gap-x-3 rounded-md p-2 text-sm/6 font-semibold ${
         here
@@ -388,11 +394,13 @@ function SidebarContents({ current, engine }: { current: AreaId; engine: ReactNo
  * is also the only shape that stays true when a lane is added — a per-lane
  * gate would let that lane fire requests nobody notices.
  *
- * Below `lg` the sidebar folds behind a Menu button and opens as a slide-over.
- * The drawer is mounted only while it is open, so the areas are never in the
- * page twice — two copies would mark two links current and offer two tab
- * stops. It closes on every navigation, and when the viewport grows past the
- * breakpoint: an open drawer left behind there would keep its focus trap over
+ * Below `lg` the sidebar folds behind an Areas button and opens as a
+ * slide-over. While the drawer is open the areas are in the page twice, but
+ * only once for anyone reading it: the dialog marks the rest of the page
+ * `inert` and `aria-hidden`, so the rail's copy offers no tab stop and no
+ * second current link. It closes on every navigation, on a click that does
+ * not navigate — the area you are already on — and when the viewport grows
+ * past the breakpoint, where an open drawer would keep its focus trap over
  * the fixed sidebar. Escape and focus return are the dialog's own.
  *
  * The engine read is the shell's, not the sidebar's, so the drawer and the
@@ -439,7 +447,12 @@ export function App({
     <ErrorBoundary>
       <div className="min-h-screen bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
         {/* The drawer, below `lg`. Mounted only while open. */}
-        <Dialog open={menuOpen} onClose={setMenuOpen} className="relative z-50 lg:hidden">
+        <Dialog
+          open={menuOpen}
+          onClose={setMenuOpen}
+          aria-label="Areas"
+          className="relative z-50 lg:hidden"
+        >
           <DialogBackdrop
             transition
             className="fixed inset-0 bg-zinc-900/80 transition-opacity duration-300 ease-linear data-closed:opacity-0"

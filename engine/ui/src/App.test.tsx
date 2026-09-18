@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MetaOutput } from "@rocky-types/meta";
 import { ApiError } from "./api";
 import { App, EnginePanel, WIDE_ENOUGH_FOR_THE_SIDEBAR } from "./App";
+import { NOT_YET_HEADING } from "./areas";
 import { GovernorScreen } from "./governor/GovernorScreen";
 import { TOKEN_STORAGE_KEY } from "./token";
 
@@ -196,7 +197,9 @@ describe("App", () => {
     render(<App token="t" {...slots} />);
     const nav = liveAreasNav();
     // Five that open a screen, then the six that do not, under their heading.
-    expect(nav.textContent).toContain("No page yet");
+    // Queried as its own element, not as page text: three of the six reasons
+    // also begin "No page yet", so a `toContain` passes with the heading gone.
+    expect(within(nav).getByText(NOT_YET_HEADING, { selector: "div" })).toBeInTheDocument();
     expect(within(nav).getAllByRole("link").map((link) => link.textContent)).toEqual([
       "Needs you",
       "Estate",
@@ -368,6 +371,7 @@ describe("App", () => {
       // Left open there, the dialog would keep its focus trap and its hold on
       // the page over a sidebar the viewer can now see anyway.
       const listeners: ((event: MediaQueryListEvent) => void)[] = [];
+      const removed: ((event: MediaQueryListEvent) => void)[] = [];
       vi.stubGlobal(
         "matchMedia",
         vi.fn((query: string) => ({
@@ -375,7 +379,8 @@ describe("App", () => {
           media: query,
           addEventListener: (_: string, fn: (event: MediaQueryListEvent) => void) =>
             listeners.push(fn),
-          removeEventListener: vi.fn(),
+          removeEventListener: (_: string, fn: (event: MediaQueryListEvent) => void) =>
+            removed.push(fn),
         })),
       );
       window.history.pushState(null, "", "/ui/estate");
@@ -390,6 +395,49 @@ describe("App", () => {
       });
       await waitFor(() => expect(button).toHaveAttribute("aria-expanded", "false"));
       vi.unstubAllGlobals();
+    });
+
+    it("takes its breakpoint listener back off on unmount", () => {
+      // Without this the subscription outlives the component: a later match
+      // calls `setMenuOpen` on a tree that is gone.
+      const added: ((event: MediaQueryListEvent) => void)[] = [];
+      const removed: ((event: MediaQueryListEvent) => void)[] = [];
+      vi.stubGlobal(
+        "matchMedia",
+        vi.fn((query: string) => ({
+          matches: false,
+          media: query,
+          addEventListener: (_: string, fn: (event: MediaQueryListEvent) => void) =>
+            added.push(fn),
+          removeEventListener: (_: string, fn: (event: MediaQueryListEvent) => void) =>
+            removed.push(fn),
+        })),
+      );
+      window.history.pushState(null, "", "/ui/estate");
+      const view = render(<App token="t" {...slots} />);
+      expect(added.length).toBeGreaterThan(0);
+
+      view.unmount();
+      // The same functions come back off, not merely the same count.
+      expect(removed).toEqual(added);
+      vi.unstubAllGlobals();
+    });
+
+    it("folds when you tap the area you are already on", async () => {
+      // That click navigates nowhere: `navigateTo` pushes the same path, so
+      // the pathname never changes and the effect keyed on it never runs.
+      // Left to that effect, the drawer stayed open with its focus trap and
+      // scroll lock over an inert page.
+      window.history.pushState(null, "", "/ui/estate");
+      render(<App token="t" {...slots} />);
+      const button = openButton();
+      fireEvent.click(button);
+      const dialog = await screen.findByRole("dialog");
+
+      fireEvent.click(within(dialog).getByRole("link", { name: "Estate" }));
+
+      await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+      expect(window.location.pathname).toBe("/ui/estate");
     });
 
     it("gives each drawn engine line its own description id", async () => {
