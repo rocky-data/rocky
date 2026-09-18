@@ -228,7 +228,18 @@ Returns a complete summary of the pipeline execution.
     "query_duration_max_ms": 7100
   },
   "errors": [],
-  "anomalies": []
+  "anomalies": [],
+  "anomaly_evaluated": [
+    {
+      "table": "acme_warehouse.staging__us_west__shopify.orders",
+      "evaluated": true
+    },
+    {
+      "table": "acme_warehouse.staging__us_west__shopify.line_items",
+      "evaluated": false,
+      "not_evaluated_reason": "no row count was measured for this table, so there is nothing to compare against its history"
+    }
+  ]
 }
 ```
 
@@ -248,6 +259,7 @@ Returns a complete summary of the pipeline execution.
 | `execution` | object | Concurrency and throughput summary. |
 | `metrics` | object or null | Counters and percentile histograms for the run. |
 | `anomalies` | array | Row count anomalies detected by historical baseline comparison. |
+| `anomaly_evaluated` | array | One entry per table the run considered for anomaly detection: `table`, `evaluated` (boolean), and `not_evaluated_reason` (set exactly when `evaluated` is `false`). Omitted when empty. Read it with `anomalies`: an empty `anomalies` list alone means both "the detector found nothing" and "the detector never ran". See [Anomaly detection](/concepts/data-quality-checks/#anomaly-detection). |
 | `partition_summaries` | array | Per-model partition execution summaries (present for `time_interval` models). |
 | `cost_summary` | object or absent | Per-run cost rollup: `total_cost_usd` (float or null), `adapter_type` (string), `total_bytes_scanned` (integer or null), `total_duration_ms` (integer), and `per_model` (array of `{asset_key, duration_ms, cost_usd}`). Absent only for unbilled source adapters (`fivetran`/`airbyte`); present otherwise — including DuckDB, which reports `total_cost_usd` `0`, and billed adapters that computed no cost, where `total_cost_usd` is null. See [`[budget]`](/reference/configuration/#budget) for how cost limits are enforced. |
 | `budget_breaches` | array | Populated when `[budget]` limits tripped. Each entry has `limit_type` (`"max_usd"` / `"max_duration_ms"` / `"max_bytes_scanned"`), `limit`, and `actual` (both floats). Empty array when within budget or no limits configured. |

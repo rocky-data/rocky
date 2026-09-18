@@ -69,6 +69,42 @@ No other warehouse batches these two checks today. Snowflake and BigQuery batch 
 }
 ```
 
+### Anomaly detection
+
+Compares this run's target row count against the table's recent history in the state store. A deviation above `anomaly_threshold_pct` is reported in the run's `anomalies` list. The default threshold is 50%.
+
+The detector does not run for every table. It runs for a table only when all of these are true:
+
+- Row-count checks are on for the pipeline.
+- At least one table in the batch was checked for row counts.
+- `anomaly_threshold_pct` is above 0. A value of 0 or less switches detection off.
+- The run has a state store, which holds the history.
+- This table's row count was measured, and its history could be read.
+
+`rocky run` therefore reports, per table, whether the detector evaluated it:
+
+```json
+"anomaly_evaluated": [
+  { "table": "analytics.marts.orders", "evaluated": true },
+  {
+    "table": "analytics.marts.line_items",
+    "evaluated": false,
+    "not_evaluated_reason": "this run has no state store, so there is no row-count history to compare against"
+  }
+]
+```
+
+Read the two lists together. An empty `anomalies` list on its own means both "the detector found nothing" and "the detector never looked":
+
+```
+anomalies: []  +  evaluated: true   ──►  the count is normal
+anomalies: []  +  evaluated: false  ──►  nothing was measured; the reason says why
+```
+
+`not_evaluated_reason` names one missing condition, not all of them, because the remedies differ. Two are a line in `rocky.toml`, one is how the run was invoked, and two are about the table.
+
+Detection is a heuristic. A row-count swing is often real business behavior, so an anomaly is a warning, not a failed run.
+
 ### Column Match
 
 Compares the source and target column sets, ignoring case, and reports any missing or extra column. Rocky reads both column lists again after the copy, one schema read per side, so the check costs two extra metadata queries per table. It reads them after the copy so it sees the schema the copy produced, including a column the run itself added. A read that fails is retried once, but only when the adapter classifies the failure as retryable and it is not a rate limit. A rate limit, a permanent error, or a second failure reports the check as not evaluated instead of comparing against a list nobody read.

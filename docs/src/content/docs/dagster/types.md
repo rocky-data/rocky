@@ -127,6 +127,7 @@ Top-level result from `rocky run`.
 | `permissions` | `PermissionInfo` | Permission reconciliation summary |
 | `drift` | `DriftInfo` | Schema drift detection summary |
 | `anomalies` | `list[AnomalyResult]` | Anomaly detection results |
+| `anomaly_evaluated` | `list[AnomalyEvaluation]` | Whether the detector evaluated each table |
 | `partition_summaries` | `list[PartitionSummary]` | Per-model `time_interval` partition stats |
 
 ### `MaterializationInfo`
@@ -298,6 +299,21 @@ Result of anomaly detection for a table.
 | `baseline_avg` | `float` | Baseline average row count |
 | `deviation_pct` | `float` | Percentage deviation from baseline |
 | `reason` | `str` | Explanation of the anomaly determination |
+
+### `AnomalyEvaluation`
+
+Whether the row-count anomaly detector evaluated one table. One entry per
+table the run considered.
+
+| Field | Type | Description |
+|---|---|---|
+| `table` | `str` | Fully qualified table name, the same key `AnomalyResult.table` uses |
+| `evaluated` | `bool` | True when the detector compared this table's count against its history |
+| `not_evaluated_reason` | `str \| None` | Why it did not. Set exactly when `evaluated` is `False` |
+
+`RunResult.anomalies` alone cannot tell "the detector ran and found
+nothing" from "the detector never ran": both are an empty list. An engine
+too old to send the field parses as an empty list.
 
 ### `ContractResult`
 

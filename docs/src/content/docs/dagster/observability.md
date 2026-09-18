@@ -99,11 +99,58 @@ baseline. For every anomaly it finds, the component yields one
 
 The check spec is declared at load time, before anything runs. The Dagster
 UI therefore shows the `row_count_anomaly` slot on every asset from the
-start. A run that finds no anomalies emits a placeholder check result.
+start.
 
 Severity is `WARN`, not `ERROR`. Rocky's anomaly detection is a heuristic,
 and a row-count swing is often real business behavior. To treat an anomaly
 as a hard failure, post-process the check evaluation events yourself.
+
+### A green check means the detector ran
+
+The detector does not run for every table. `rocky run` therefore reports,
+per table, whether it evaluated one. The component reads that report, so
+the check has four outcomes:
+
+| What the run says about the table | Check | Status metadata |
+|---|---|---|
+| It has an anomaly | fails (WARN) | the anomaly metadata above |
+| The detector evaluated it, no anomaly | passes | `evaluated against the row-count history; no anomaly` |
+| The detector skipped it | fails (WARN) | `not_evaluated`, plus `rocky/reason` |
+| The run says nothing about it | fails (WARN) | `not produced by rocky` |
+
+A table that `prune_unchanged` skipped is the exception to the last row. It
+keeps the verdict from its last completed evaluation, so a check that passed
+before stays green while the source does not change. A pruned table with no
+earlier verdict fails (WARN). Both carry `rocky/pruned_unchanged`.
+
+The last two rows are new. Before, silence was a pass:
+
+```
+before        anomalies: []  ──►  row_count_anomaly: PASS   (green, detector never ran)
+
+now           anomalies: []           ─┐
+              anomaly_evaluated: []   ─┴►  row_count_anomaly: WARN  (no evidence)
+```
+
+**On upgrade, a check that was green can turn amber.** That happens on a
+pipeline where the detector was not running, and against an engine too old
+to send the per-table report.
+
+The detector runs for a table only when all of these are true:
+
+- Row-count checks are on for the pipeline (`row_count` under `[pipeline.<name>.checks]`).
+- At least one table in the batch was checked for row counts.
+- Anomaly detection is not switched off (`anomaly_threshold_pct = 0` switches it off).
+- The run has a state store, which holds the row-count history.
+- This table's row count was measured, and its history could be read.
+
+When one of these is missing, `rocky/reason` names which one. The remedies
+differ: two are a line in `rocky.toml`, one is how the run was invoked, and
+two are about the table.
+
+`compliance_exception` keeps the old rule. Its producer is unconditional: a
+scan that crashes yields an explicit not-evaluated result rather than
+silence.
 
 ## Standalone builders
 
@@ -114,6 +161,7 @@ functions:
 from dagster_rocky import (
     drift_observations,
     anomaly_check_results,
+    anomaly_evaluation_results,
     ANOMALY_CHECK_NAME,
 )
 
@@ -132,8 +180,23 @@ def my_rocky_asset(context, rocky):
 
     yield dg.MaterializeResult(...)
     yield from drift_observations(result, key_resolver=resolver)
-    yield from anomaly_check_results(result, key_resolver=resolver)
+
+    # Anomalies first, then the verdict for every other table. A table with
+    # an anomaly is in both lists, so skip the assets you already emitted —
+    # the anomaly's failure must win over the pass.
+    emitted = set()
+    for check in anomaly_check_results(result, key_resolver=resolver):
+        emitted.add(check.asset_key)
+        yield check
+    for check in anomaly_evaluation_results(result, key_resolver=resolver):
+        if check.asset_key not in emitted:
+            yield check
 ```
+
+Declare a `check_spec` for every asset your resolver can return. Both
+helpers yield a result for any table the resolver maps, and `RockyComponent`
+drops the ones whose `(asset, check)` pair it did not declare. Your own
+asset has no such guard.
 
 Rocky names a table with a plain string. That string is either
 `catalog.schema.table` or a bare `table`. The `key_resolver` callable maps
