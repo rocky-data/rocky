@@ -218,11 +218,21 @@ There is a consequence for orchestrators. By the time a `failure_kind: "transien
 
 ## Failure containment across the model graph
 
-By default a transformation run **fails fast**. The first model that fails while it runs stops the run, and Rocky skips every model it has not yet built.
+By default a transformation run **fails fast**. A model that fails while it runs stops the run: no later layer starts. Models already running beside it still finish, because `--parallel` is 4 by default. Only DuckDB runs one model at a time.
 
-A compile error is the exception. Rocky excludes the model that does not compile, then builds the others. The run reports `Failure`, or `PartialFailure` when another model succeeded. Nothing holds back a model downstream of the excluded one. It builds from the table an earlier run left. With no such table, it fails.
+A type error is the exception. If a model parses but fails type-checking, Rocky excludes that model and builds the others. `rocky compile` reports these as an `E` code, such as `E037`. The run reports `Failure`, or `PartialFailure` when another model succeeded.
 
-This is the model graph only. Replicated tables have their own switch, [`[execution] fail_fast`](/reference/configuration/#pipelinenameexecution), which is `false` by default: one table that fails does not stop the others.
+A project that cannot compile at all is not an exception. Nothing builds. This covers SQL that does not parse, a `.rocky` file Rocky cannot lower, broken or missing frontmatter, a duplicate model name, and an unresolved `ref()`. The run reports one error keyed `<compile>`.
+
+```
+model parses, type error   ->  that model is excluded, the others build
+project does not parse     ->  nothing builds
+model fails while running  ->  no later layer starts
+```
+
+Nothing holds back a model downstream of an excluded one. It builds from the table an earlier run left. With no such table, it fails. `rocky run --dag` differs: each model is its own sub-run, so the failed node's descendants are skipped.
+
+This is the model graph only. Replicated tables have their own switch, [`[execution] fail_fast`](/reference/configuration/#pipelinenameexecution), which is `false` by default: one table that fails does not stop the others. A second switch still can. `error_rate_abort_pct` defaults to 50, so once 4 or more tables finish, a failure rate at or above half aborts the rest.
 
 Turn on containment to let unrelated work continue:
 
