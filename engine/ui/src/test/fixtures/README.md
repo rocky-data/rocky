@@ -45,3 +45,51 @@ curl -s http://127.0.0.1:8137/api/v1/dag | python3 -m json.tool > dag-mixed-kind
 
 The same project shape is built by `engine/rocky/tests/serve_ui.rs`, which
 asserts against the live API what this fixture asserts in vitest.
+
+## `dag-two-pipelines.json` and `model-list-two-pipelines.json`
+
+`GET /api/v1/dag` and `GET /api/v1/models` from one server, on a project
+whose graph draws a model the server did not compile.
+
+```
+pipeline     directory    in the DAG         in the model list
+playground   models/      raw_orders         yes
+                          customer_orders    yes
+                          revenue_summary    yes
+reporting    reporting/   weekly_revenue     no   → /models/weekly_revenue is 404
+```
+
+The DAG reads every transformation pipeline's own models directory. The
+server compiles one. The estate screen reads the model list to know which
+nodes open.
+
+### To record them again
+
+```bash
+rocky playground /tmp/twofix
+```
+
+Then, in `/tmp/twofix/rocky.toml`, add a second transformation pipeline:
+
+```toml
+[pipeline.reporting]
+type = "transformation"
+models = "reporting/**"
+
+[pipeline.reporting.target.governance]
+auto_create_schemas = true
+```
+
+Add `reporting/weekly_revenue.sql` (`SELECT 1 AS week, 2 AS revenue`) and a
+`reporting/weekly_revenue.toml` sidecar with `name = "weekly_revenue"`, a
+`full_refresh` strategy and a `playground.main.weekly_revenue` target. Then:
+
+```bash
+cd /tmp/twofix && rocky serve --port 8137 &
+curl -s http://127.0.0.1:8137/api/v1/dag    | python3 -m json.tool > dag-two-pipelines.json
+curl -s http://127.0.0.1:8137/api/v1/models | python3 -m json.tool > model-list-two-pipelines.json
+```
+
+Wait for `/api/v1/models` to answer `200` before recording: until the first
+compile lands it answers `503 engine_not_ready`. `serve_ui.rs` builds the same
+project and fails if either capture stops describing the live server.

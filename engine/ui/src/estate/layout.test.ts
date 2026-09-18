@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { DagOutput } from "@rocky-types/dag";
+import type { ModelListOutput } from "@rocky-types/model_list";
 import dagFixture from "@rocky-fixtures/dag.json";
 import mixedDag from "../test/fixtures/dag-mixed-kinds.json";
+import twoPipelinesDag from "../test/fixtures/dag-two-pipelines.json";
+import twoPipelinesModels from "../test/fixtures/model-list-two-pipelines.json";
 import { NODE_HEIGHT, NODE_WIDTH, layeredFlow } from "./layout";
+import { compiledModels } from "./nodeRoute";
 
 function dag(overrides: Partial<DagOutput>): DagOutput {
   return {
@@ -29,6 +33,7 @@ describe("layeredFlow", () => {
         ],
         execution_layers: [["a"], ["b", "c"]],
       }),
+      "unknown",
     );
     const byId = new Map(flow.nodes.map((n) => [n.id, n]));
     expect(byId.get("a")?.position.x).toBe(0);
@@ -50,6 +55,7 @@ describe("layeredFlow", () => {
         edges: [{ from: "a", to: "ghost", edge_type: "depends_on" }],
         execution_layers: [["a"]],
       }),
+      "unknown",
     );
     expect(flow.edges).toEqual([]);
     expect(flow.dropped).toBe(1);
@@ -62,6 +68,7 @@ describe("layeredFlow", () => {
         edges: [],
         execution_layers: [["a"]],
       }),
+      "unknown",
     );
     const stray = flow.nodes.find((n) => n.id === "stray");
     expect(stray?.data.layer).toBe(1);
@@ -82,6 +89,7 @@ describe("layeredFlow", () => {
         ],
         execution_layers: [["orders", "bare"]],
       }),
+      "unknown",
     );
     const orders = flow.nodes.find((n) => n.id === "orders")?.data;
     expect(orders?.strategy).toBe("merge");
@@ -101,6 +109,7 @@ describe("layeredFlow", () => {
         ] as DagOutput["nodes"],
         execution_layers: [["transformation:orders", "source:ecommerce"]],
       }),
+      "unknown",
     );
     const model = flow.nodes.find((n) => n.id === "transformation:orders");
     expect(model?.focusable).toBe(true);
@@ -116,7 +125,7 @@ describe("layeredFlow", () => {
   });
 
   it("takes every kind but transformation out of the captured DAG's tab order", () => {
-    const flow = layeredFlow(mixedDag as unknown as DagOutput);
+    const flow = layeredFlow(mixedDag as unknown as DagOutput, "unknown");
     const focusable = flow.nodes.filter((n) => n.focusable);
     expect(focusable.map((n) => n.id)).toEqual([
       "transformation:raw_orders",
@@ -134,12 +143,46 @@ describe("layeredFlow", () => {
     // controlled with no `onNodesChange`, so a measurement has nowhere to be
     // written back to. Measured before this: the minimap drew 0 of 3 nodes
     // while its viewBox spanned the correct bounds.
-    const flow = layeredFlow(mixedDag as unknown as DagOutput);
+    const flow = layeredFlow(mixedDag as unknown as DagOutput, "unknown");
     expect(flow.nodes.length).toBeGreaterThan(0);
     for (const node of flow.nodes) {
       expect(node.width).toBe(NODE_WIDTH);
       expect(node.height).toBe(NODE_HEIGHT);
     }
+  });
+
+  it("takes a model the server did not compile out of the tab order", () => {
+    const flow = layeredFlow(
+      twoPipelinesDag as unknown as DagOutput,
+      compiledModels(twoPipelinesModels as unknown as ModelListOutput),
+    );
+    const byId = new Map(flow.nodes.map((n) => [n.id, n]));
+
+    const outside = byId.get("transformation:weekly_revenue");
+    expect(outside?.focusable).toBe(false);
+    expect(outside?.selectable).toBe(false);
+    expect(outside?.ariaRole).toBeUndefined();
+    expect(outside?.domAttributes).toEqual({ "aria-disabled": true });
+    expect(outside?.data.route).toEqual({ state: "not-compiled", model: "weekly_revenue" });
+
+    const inside = byId.get("transformation:raw_orders");
+    expect(inside?.focusable).toBe(true);
+    expect(inside?.ariaRole).toBe("button");
+    expect(inside?.data.route).toEqual({ state: "servable", model: "raw_orders" });
+  });
+
+  it("keeps every model in the tab order while the compiled set is unknown", () => {
+    const flow = layeredFlow(twoPipelinesDag as unknown as DagOutput, "unknown");
+    expect(flow.nodes.every((n) => n.focusable)).toBe(true);
+  });
+
+  it("does not move a node when the compiled set changes", () => {
+    // The panel refits on layout identity. A set that arrives after the DAG
+    // changes which nodes open, and must not reshape the graph under a hand.
+    const dagValue = twoPipelinesDag as unknown as DagOutput;
+    const before = layeredFlow(dagValue, "unknown").nodes.map((n) => [n.id, n.position]);
+    const after = layeredFlow(dagValue, new Set<string>()).nodes.map((n) => [n.id, n.position]);
+    expect(after).toEqual(before);
   });
 
   it("refuses a tab stop to a kind it cannot classify", () => {
@@ -148,13 +191,14 @@ describe("layeredFlow", () => {
         nodes: [{ id: "x:a", label: "a", kind: "materialized_view" }] as DagOutput["nodes"],
         execution_layers: [["x:a"]],
       }),
+      "unknown",
     );
     expect(flow.nodes[0]?.focusable).toBe(false);
   });
 
   it("lays out the playground's captured DAG: one node per model, one edge per dependency", () => {
     const captured = dagFixture as unknown as DagOutput;
-    const flow = layeredFlow(captured);
+    const flow = layeredFlow(captured, "unknown");
     expect(flow.nodes.map((n) => n.id).sort()).toEqual(captured.nodes.map((n) => n.id).sort());
     expect(flow.edges).toHaveLength(captured.edges.length);
     expect(flow.dropped).toBe(0);

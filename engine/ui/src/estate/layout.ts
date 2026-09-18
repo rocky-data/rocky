@@ -8,7 +8,7 @@
 
 import type { Edge, Node } from "@xyflow/react";
 import type { DagNodeOutput, DagOutput } from "@rocky-types/dag";
-import { nodeRoute } from "./nodeRoute";
+import { type CompiledModels, type NodeRoute, nodeRoute } from "./nodeRoute";
 
 export interface ModelNodeData extends Record<string, unknown> {
   label: string;
@@ -17,6 +17,12 @@ export interface ModelNodeData extends Record<string, unknown> {
   target: string | null;
   pipeline: string | null;
   layer: number;
+  /**
+   * What the detail route can do with this node, decided once here. The
+   * card and the panel read it rather than asking again, so the three can
+   * never disagree about whether a node opens.
+   */
+  route: NodeRoute;
 }
 
 export type ModelFlowNode = Node<ModelNodeData, "model">;
@@ -51,7 +57,7 @@ function position(column: number, row: number, rowsInColumn: number) {
   };
 }
 
-export function layeredFlow(dag: DagOutput): Flow {
+export function layeredFlow(dag: DagOutput, compiled: CompiledModels): Flow {
   const byId = new Map(dag.nodes.map((n) => [n.id, n]));
   const placed = new Set<string>();
   const nodes: ModelFlowNode[] = [];
@@ -61,7 +67,8 @@ export function layeredFlow(dag: DagOutput): Flow {
     // Flow honours these per node: `tabIndex`, `onKeyDown` and `role` are all
     // gated on `focusable`, and the global flags apply only where a node
     // leaves them undefined. So the rest leave the tab order entirely.
-    const openable = nodeRoute(node).state === "servable";
+    const route = nodeRoute(node, compiled);
+    const openable = route.state === "servable";
     return {
       id: node.id,
       type: "model",
@@ -88,6 +95,7 @@ export function layeredFlow(dag: DagOutput): Flow {
         target: targetOf(node),
         pipeline: node.pipeline ?? null,
         layer: column,
+        route,
       },
     };
   };

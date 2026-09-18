@@ -18,8 +18,8 @@ import {
 import type { DagOutput } from "@rocky-types/dag";
 import { EmptyState } from "../components";
 import { layeredFlow, type ModelFlowNode, type ModelNodeData } from "./layout";
-import { ModelNode } from "./ModelNode";
-import { nodeRoute } from "./nodeRoute";
+import { ModelNode, NOT_COMPILED } from "./ModelNode";
+import type { CompiledModels } from "./nodeRoute";
 
 const nodeTypes = { model: ModelNode };
 
@@ -179,15 +179,25 @@ function FittingControls({ onFitted }: { onFitted: (zoom: number) => void }) {
 /**
  * The project's DAG, laid out by the engine's execution layers. Clicking a
  * node that the detail route can serve opens its pane, under the bare model
- * name the route wants. The visually hidden list names every model for
- * assistive technology, and is what the tests read: React Flow only paints
- * once the canvas has a size.
+ * name the route wants. A model the server did not compile does not open;
+ * `compiled` is the set from `GET /api/v1/models`, or `"unknown"`. The
+ * visually hidden list names every model for assistive technology, and is
+ * what the tests read: React Flow only paints once the canvas has a size.
  */
-export function DagPanel({ dag, onSelect }: { dag: DagOutput; onSelect: (name: string) => void }) {
+export function DagPanel({
+  dag,
+  compiled,
+  onSelect,
+}: {
+  dag: DagOutput;
+  compiled: CompiledModels;
+  onSelect: (name: string) => void;
+}) {
   const canvasRef = useRef<HTMLDivElement | null>(null);
   const [minZoom, setMinZoom] = useState(MIN_ZOOM);
   const onFitted = useCallback((zoom: number) => setMinZoom(floorFor(zoom)), []);
-  const flow = useMemo(() => layeredFlow(dag), [dag]);
+  const flow = useMemo(() => layeredFlow(dag, compiled), [dag, compiled]);
+  const notCompiled = flow.nodes.filter((node) => node.data.route.state === "not-compiled").length;
   // The identity of the LAYOUT, so a Refresh that reshapes it refits.
   const graph = useMemo(() => layoutIdentity(flow.nodes), [flow]);
   const dataById = useMemo(
@@ -197,7 +207,7 @@ export function DagPanel({ dag, onSelect }: { dag: DagOutput; onSelect: (name: s
 
   /** Open the pane if this node has one. Says whether it did. */
   const open = (data: ModelNodeData): boolean => {
-    const route = nodeRoute(data);
+    const route = data.route;
     if (route.state !== "servable") return false;
     onSelect(route.model);
     return true;
@@ -232,7 +242,8 @@ export function DagPanel({ dag, onSelect }: { dag: DagOutput; onSelect: (name: s
       <ul className="sr-only" aria-label="Models in the DAG">
         {flow.nodes.map((node) => (
           <li key={node.id}>
-            {node.data.label} (layer {node.data.layer + 1}, {node.data.kind})
+            {node.data.label} (layer {node.data.layer + 1}, {node.data.kind}
+            {node.data.route.state === "not-compiled" ? `, ${NOT_COMPILED}` : ""})
           </li>
         ))}
       </ul>
@@ -270,6 +281,16 @@ export function DagPanel({ dag, onSelect }: { dag: DagOutput; onSelect: (name: s
         {dag.execution_layers.length} execution layers
         {flow.dropped > 0 ? `; ${flow.dropped} edge(s) named a node that is not in the graph` : ""}
       </p>
+      {notCompiled > 0 && (
+        // Said as a count on the page, not only on each card, so a reader
+        // who never hovers a node still learns why some do not open.
+        <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">
+          {notCompiled} model(s), drawn dashed, are not in the server's compile, so they have no
+          detail to open. A model is outside the compile when it lives in another pipeline's
+          models directory, or when the server has not yet compiled a change on disk. The
+          compiled list is read again every few seconds while this line shows.
+        </p>
+      )}
     </div>
   );
 }

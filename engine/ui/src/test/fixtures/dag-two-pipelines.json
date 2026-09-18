@@ -1,0 +1,101 @@
+{
+    "version": "1.74.0",
+    "schema_version": "1",
+    "command": "dag",
+    "nodes": [
+        {
+            "id": "transformation:customer_orders",
+            "kind": "transformation",
+            "label": "customer_orders",
+            "pipeline": "playground",
+            "target": {
+                "catalog": "playground",
+                "schema": "main",
+                "table": "customer_orders"
+            },
+            "strategy": {
+                "type": "full_refresh"
+            },
+            "depends_on": [
+                "transformation:raw_orders"
+            ]
+        },
+        {
+            "id": "transformation:raw_orders",
+            "kind": "transformation",
+            "label": "raw_orders",
+            "pipeline": "playground",
+            "target": {
+                "catalog": "playground",
+                "schema": "main",
+                "table": "raw_orders"
+            },
+            "strategy": {
+                "type": "full_refresh"
+            }
+        },
+        {
+            "id": "transformation:revenue_summary",
+            "kind": "transformation",
+            "label": "revenue_summary",
+            "pipeline": "playground",
+            "target": {
+                "catalog": "playground",
+                "schema": "main",
+                "table": "revenue_summary"
+            },
+            "strategy": {
+                "type": "full_refresh"
+            },
+            "depends_on": [
+                "transformation:customer_orders"
+            ]
+        },
+        {
+            "id": "transformation:weekly_revenue",
+            "kind": "transformation",
+            "label": "weekly_revenue",
+            "pipeline": "reporting",
+            "target": {
+                "catalog": "playground",
+                "schema": "main",
+                "table": "weekly_revenue"
+            },
+            "strategy": {
+                "type": "full_refresh"
+            }
+        }
+    ],
+    "edges": [
+        {
+            "from": "transformation:raw_orders",
+            "to": "transformation:customer_orders",
+            "edge_type": "data"
+        },
+        {
+            "from": "transformation:customer_orders",
+            "to": "transformation:revenue_summary",
+            "edge_type": "data"
+        }
+    ],
+    "execution_layers": [
+        [
+            "transformation:raw_orders",
+            "transformation:weekly_revenue"
+        ],
+        [
+            "transformation:customer_orders"
+        ],
+        [
+            "transformation:revenue_summary"
+        ]
+    ],
+    "summary": {
+        "total_nodes": 4,
+        "total_edges": 2,
+        "execution_layers": 3,
+        "counts_by_kind": {
+            "transformation": 4
+        }
+    }
+}
