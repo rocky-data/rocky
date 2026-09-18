@@ -26,6 +26,13 @@
     }
   ],
   "check_results": [],
+  "anomaly_evaluated": [
+    {
+      "table": "playground.staging__orders.orders",
+      "evaluated": false,
+      "not_evaluated_reason": "row-count checks are off for this pipeline (`row_count = false` under `[pipeline.<name>.checks]`), so the anomaly detector did not run"
+    }
+  ],
   "execution": {
     "concurrency": 4,
     "tables_processed": 1,

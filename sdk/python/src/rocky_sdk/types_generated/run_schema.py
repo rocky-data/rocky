@@ -8,6 +8,29 @@ from enum import StrEnum
 from pydantic import AwareDatetime, BaseModel, conint
 
 
+class AnomalyEvaluationOutput(BaseModel):
+    """
+    Whether the row-count anomaly detector evaluated one table.
+
+    One entry per table in the run's batches, whatever happened. A consumer reading [`RunOutput::anomalies`] alone cannot tell "the detector ran and found nothing" from "the detector never ran": both are an empty list (#1790). Dagster read the empty list as a pass, so a run with `row_count = false` showed a green anomaly check for a detector that had not run.
+
+    The detector runs only when row-count checks are on, the run has a state store, the table's row count was measured, and its history could be read. `not_evaluated_reason` names which of those was missing, because the remedy differs: one is a config line, another is how the run was invoked.
+    """
+
+    evaluated: bool
+    """
+    `true` when the detector compared this table's count against its history. An anomaly, if any, is in [`RunOutput::anomalies`].
+    """
+    not_evaluated_reason: str | None = None
+    """
+    Why the detector did not evaluate this table. Set exactly when `evaluated` is `false`.
+    """
+    table: str
+    """
+    Fully-qualified table the entry is about, the same key [`AnomalyOutput::table`] uses.
+    """
+
+
 class AnomalyOutput(BaseModel):
     """
     Row count anomaly detected by historical baseline comparison.
@@ -775,6 +798,10 @@ class RunOutput(BaseModel):
     """
 
     anomalies: list[AnomalyOutput] | None = None
+    anomaly_evaluated: list[AnomalyEvaluationOutput] | None = None
+    """
+    One entry per table the run considered for row-count anomaly detection, saying whether the detector evaluated it. Empty for a run with no batched checks. See [`AnomalyEvaluationOutput`] — without it, an empty `anomalies` list means both "nothing anomalous" and "nothing was looked at" (#1790).
+    """
     budget_breaches: list[BudgetBreachOutput] | None = None
     """
     Budget breaches detected at end of run. Empty when no `[budget]` block is configured or all configured limits were respected. Each breach is also emitted as a `budget_breach` [`rocky_observe::events::PipelineEvent`] and fires the `on_budget_breach` hook so subscribers see them live.

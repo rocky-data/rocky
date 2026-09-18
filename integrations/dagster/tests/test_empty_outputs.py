@@ -766,10 +766,16 @@ def test_pruned_placeholder_carries_prior_failure_end_to_end(tmp_path):
     assert tuesday_checks["column_match"].passed is True
     assert tuesday_checks["column_match"].metadata["rocky/pruned_unchanged"].value is True
 
-    # And the other half of #1645, visible in the same story: `row_count_anomaly`
-    # is declared on every asset and the engine reported none, on either day.
-    # It is an EVENT check, so silence is the clean verdict and it stays green.
-    assert tuesday_checks[ANOMALY_CHECK_NAME].passed is True
+    # `row_count_anomaly` was green here, on the #1645 reasoning that it is an
+    # EVENT check: the engine reports one only when it HAS an anomaly, so
+    # silence is the clean verdict. That reasoning was narrowed deliberately
+    # (#1790). It holds only if the detector ran, and it runs only when
+    # row-count checks are on, the run has a state store, the count was
+    # measured and the history could be read. This payload carries no
+    # `anomaly_evaluated` list, so nothing says the detector looked at this
+    # table — and an unevidenced check is not a passing one, the same rule
+    # `row_count` and `column_match` follow two lines up.
+    assert tuesday_checks[ANOMALY_CHECK_NAME].passed is False
 
 
 def test_an_unproduced_measurement_check_does_not_report_passed():
@@ -784,9 +790,17 @@ def test_an_unproduced_measurement_check_does_not_report_passed():
     metadata said "not produced by rocky"; the verdict said pass, and the
     badge shows the verdict.
 
-    The two EVENT checks are the deliberate exception: the engine emits
-    `row_count_anomaly` / `compliance_exception` only when it has one to
-    report, so silence there really is the clean verdict.
+    `compliance_exception` is the one deliberate exception left: the engine
+    emits it only when it has one to report, and a crashed scan yields an
+    explicit not-evaluated result rather than nothing, so silence there really
+    is the clean verdict.
+
+    `row_count_anomaly` used to be an exception too, and was narrowed (#1790).
+    Its producer is conditional — the detector runs only when row-count checks
+    are on, the run has a state store, the count was measured and the history
+    could be read — so silence meant both "nothing anomalous" and "nothing
+    looked at". The engine now reports per table whether it evaluated one, and
+    this placeholder path is what a table with no such report gets.
 
     Same rule as #1741 one layer down in the engine: a check that did not run
     is not a check that passed.
@@ -817,8 +831,11 @@ def test_an_unproduced_measurement_check_does_not_report_passed():
         assert results[name].severity == dg.AssetCheckSeverity.WARN, name
         assert "not produced by rocky" in results[name].metadata["status"].value
 
-    # No anomaly reported means no anomaly. This one stays green.
-    assert results[ANOMALY_CHECK_NAME].passed is True
+    # Nothing says the detector looked at this table, so it is not a pass
+    # either — same rule, now that the name is not an exception (#1790).
+    assert results[ANOMALY_CHECK_NAME].passed is False
+    assert results[ANOMALY_CHECK_NAME].severity == dg.AssetCheckSeverity.WARN
+    assert "not produced by rocky" in results[ANOMALY_CHECK_NAME].metadata["status"].value
 
 
 def test_an_unproduced_check_on_an_unmaterialized_table_is_unchanged():

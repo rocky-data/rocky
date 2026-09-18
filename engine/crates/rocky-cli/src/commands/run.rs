@@ -5748,6 +5748,7 @@ pub async fn run(
         &assertion_targets,
         &mut pending_checks,
         &mut output.anomalies,
+        &mut output.anomaly_evaluated,
     )
     .await?;
 
@@ -6694,7 +6695,9 @@ async fn partition_overlap_key_carriers(
 /// decision is per leg (#1719). Assertions, custom checks, null-rate checks and the
 /// cross-source overlap check run per table through the plain
 /// `WarehouseAdapter`. Row-count anomalies detected on the way are pushed to
-/// `anomalies`.
+/// `anomalies`, and every table the detector considered is recorded in
+/// `anomaly_evaluated`, evaluated or not — an empty `anomalies` list alone
+/// cannot say which happened (#1790).
 ///
 /// Lifted out of `run()` so a test can drive it with a warehouse that fails
 /// a specific query; `run()` itself builds its adapters from the config and
@@ -6715,6 +6718,7 @@ async fn run_batched_checks(
     assertion_targets: &[(TableRef, Vec<String>)],
     pending_checks: &mut HashMap<String, PendingCheck>,
     anomalies: &mut Vec<AnomalyOutput>,
+    anomaly_evaluated: &mut Vec<AnomalyEvaluationOutput>,
 ) -> Result<()> {
     let row_count_enabled = pipeline.checks.row_count.enabled() && !source_batch_refs.is_empty();
     let freshness_enabled = pipeline.checks.freshness.is_some() && !freshness_batch_refs.is_empty();
@@ -7094,19 +7098,95 @@ async fn run_batched_checks(
         }
     }
 
-    // Anomaly detection
-    if row_count_enabled && let Some(store) = state_store {
+    // Anomaly detection.
+    //
+    // Every table in the batch gets an `anomaly_evaluated` entry, whether or
+    // not the detector ran for it. A consumer reading `anomalies` alone sees
+    // an empty list for two different reasons — nothing anomalous, and
+    // nothing looked at — and Dagster read that as a pass (#1790).
+    //
+    // The reason is per conjunct on purpose. "row_count = false" is a line in
+    // `rocky.toml`; "no state store" is how the run was invoked; the other
+    // two are about this table. One shared string would send the operator to
+    // the wrong file (#1856).
+    let detector_off_reason = if !pipeline.checks.row_count.enabled() {
+        Some(
+            "row-count checks are off for this pipeline (`row_count = false` under \
+             `[pipeline.<name>.checks]`), so the anomaly detector did not run"
+                .to_string(),
+        )
+    } else if source_batch_refs.is_empty() {
+        Some(
+            "no table in this batch was checked for row counts, so the anomaly detector \
+             did not run"
+                .to_string(),
+        )
+    } else if state_store.is_none() {
+        Some(
+            "this run has no state store, so there is no row-count history to compare \
+             against"
+                .to_string(),
+        )
+    } else if pipeline.checks.anomaly_threshold_pct <= 0.0 {
+        // `anomaly_threshold_pct = 0` is the documented off switch
+        // (`detect_anomaly` returns "detection is disabled"). Calling the
+        // detector anyway and recording the table as evaluated would report
+        // a green check for a detector that is switched off — the same
+        // false green this field exists to stop.
+        Some(format!(
+            "anomaly detection is disabled for this pipeline \
+             (`anomaly_threshold_pct = {}` under `[pipeline.<name>.checks]`)",
+            pipeline.checks.anomaly_threshold_pct
+        ))
+    } else {
+        None
+    };
+    if let Some(reason) = detector_off_reason {
+        for (target_key, _) in batch_asset_keys {
+            anomaly_evaluated.push(AnomalyEvaluationOutput {
+                table: target_key.clone(),
+                evaluated: false,
+                not_evaluated_reason: Some(reason.clone()),
+            });
+        }
+    } else if let Some(store) = state_store {
         for (target_key, _) in batch_asset_keys {
             // Only a measured count enters the anomaly history. The 0 a
             // failed query used to record read as "the table emptied" and
             // skewed every later baseline.
             let Some(&tgt_count) = target_map.get(target_key) else {
+                anomaly_evaluated.push(AnomalyEvaluationOutput {
+                    table: target_key.clone(),
+                    evaluated: false,
+                    not_evaluated_reason: Some(
+                        "no row count was measured for this table, so there is nothing to \
+                         compare against its history"
+                            .to_string(),
+                    ),
+                });
                 continue;
             };
 
             let _ = store.record_row_count(target_key, tgt_count, 10);
 
-            if let Ok(history) = store.get_check_history(target_key) {
+            let Ok(history) = store.get_check_history(target_key) else {
+                anomaly_evaluated.push(AnomalyEvaluationOutput {
+                    table: target_key.clone(),
+                    evaluated: false,
+                    not_evaluated_reason: Some(
+                        "this table's row-count history could not be read from the state \
+                         store"
+                            .to_string(),
+                    ),
+                });
+                continue;
+            };
+            {
+                anomaly_evaluated.push(AnomalyEvaluationOutput {
+                    table: target_key.clone(),
+                    evaluated: true,
+                    not_evaluated_reason: None,
+                });
                 let anomaly = rocky_core::state::detect_anomaly(
                     target_key,
                     tgt_count,
@@ -19610,6 +19690,7 @@ auto_create_schemas = true
             check_results: vec![],
             quarantine: vec![],
             anomalies: vec![],
+            anomaly_evaluated: vec![],
             errors: vec![],
             execution: ExecutionSummary {
                 concurrency: 1,
@@ -34174,9 +34255,14 @@ table = "fct_events"
             warehouse: &dyn WarehouseAdapter,
             batch_check: Option<&dyn BatchCheckAdapter>,
             state_store: Option<&StateStore>,
-        ) -> Result<(HashMap<String, PendingCheck>, Vec<AnomalyOutput>)> {
+        ) -> Result<(
+            HashMap<String, PendingCheck>,
+            Vec<AnomalyOutput>,
+            Vec<AnomalyEvaluationOutput>,
+        )> {
             let mut pending = HashMap::new();
             let mut anomalies = Vec::new();
+            let mut anomaly_evaluated = Vec::new();
             run_batched_checks(
                 warehouse,
                 batch_check,
@@ -34192,9 +34278,10 @@ table = "fct_events"
                 &self.assertion_targets,
                 &mut pending,
                 &mut anomalies,
+                &mut anomaly_evaluated,
             )
             .await?;
-            Ok((pending, anomalies))
+            Ok((pending, anomalies, anomaly_evaluated))
         }
 
         async fn run(
@@ -34202,7 +34289,11 @@ table = "fct_events"
             warehouse: &dyn WarehouseAdapter,
             batch_check: Option<&dyn BatchCheckAdapter>,
             state_store: Option<&StateStore>,
-        ) -> (HashMap<String, PendingCheck>, Vec<AnomalyOutput>) {
+        ) -> (
+            HashMap<String, PendingCheck>,
+            Vec<AnomalyOutput>,
+            Vec<AnomalyEvaluationOutput>,
+        ) {
             self.try_run(warehouse, batch_check, state_store)
                 .await
                 .expect("the batched checks run")
@@ -34246,7 +34337,7 @@ table = "fct_events"
         let fx = BatchedCheckFixture::new("row_count = true");
 
         // Control: with a working warehouse the check is a real measurement.
-        let (pending, _) = fx.run(&inner, None, None).await;
+        let (pending, _, _) = fx.run(&inner, None, None).await;
         let measured = the_result(&pending, &fx.target_key(), "row_count");
         assert!(measured.passed, "one row on each side passes: {measured:?}");
         assert!(measured.not_evaluated.is_none());
@@ -34257,7 +34348,7 @@ table = "fct_events"
             prefix: "SELECT COUNT(*)",
             reply: Intercept::Fail("injected COUNT failure"),
         };
-        let (pending, _) = fx.run(&failing, None, None).await;
+        let (pending, _, _) = fx.run(&failing, None, None).await;
         let result = the_result(&pending, &fx.target_key(), "row_count");
         assert!(
             !result.passed,
@@ -34301,7 +34392,7 @@ table = "fct_events"
             prefix: "SELECT COUNT(*) FROM src.orders",
             reply: Intercept::Fail("injected source COUNT failure"),
         };
-        let (pending, _) = fx.run(&failing, None, None).await;
+        let (pending, _, _) = fx.run(&failing, None, None).await;
         let result = the_result(&pending, &fx.target_key(), "row_count");
         assert!(
             !result.passed,
@@ -34327,7 +34418,7 @@ table = "fct_events"
             prefix: "SELECT COUNT(*) FROM tgt.orders",
             reply: Intercept::Rows(vec![vec![serde_json::json!("not-a-number")]]),
         };
-        let (pending, _) = fx.run(&unreadable, None, None).await;
+        let (pending, _, _) = fx.run(&unreadable, None, None).await;
         let result = the_result(&pending, &fx.target_key(), "row_count");
         assert!(!result.passed, "{result:?}");
         assert_eq!(
@@ -34489,7 +34580,7 @@ table = "fct_events"
         let inner = seeded_duckdb().await;
         let fx = BatchedCheckFixture::new("row_count = true");
 
-        let (pending, _) = fx.run(&inner, Some(&EmptyBatchCheck), None).await;
+        let (pending, _, _) = fx.run(&inner, Some(&EmptyBatchCheck), None).await;
         let result = the_result(&pending, &fx.target_key(), "row_count");
         assert!(!result.passed, "{result:?}");
         assert_eq!(
@@ -34500,6 +34591,108 @@ table = "fct_events"
             ),
             "{result:?}"
         );
+    }
+
+    /// #1790: every table in the batch gets an `anomaly_evaluated` entry, and
+    /// the reason names which conjunct was missing.
+    ///
+    /// Reading `anomalies` alone cannot tell "the detector ran and found
+    /// nothing" from "the detector never ran" — both are an empty list. The
+    /// reason is per conjunct because the remedies differ: `row_count = false`
+    /// is a line in `rocky.toml`, a missing state store is how the run was
+    /// invoked, and the other two are about the table.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn every_table_reports_whether_the_anomaly_detector_evaluated_it() {
+        let inner = seeded_duckdb().await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+
+        // (a) Evaluated: checks on, a state store, a measured count.
+        let fx = BatchedCheckFixture::new("row_count = true");
+        let (_, _, evaluated) = fx.run(&inner, None, Some(&store)).await;
+        assert_eq!(
+            evaluated.len(),
+            1,
+            "one entry per batch table: {evaluated:?}"
+        );
+        assert_eq!(evaluated[0].table, fx.target_key());
+        assert!(evaluated[0].evaluated, "{evaluated:?}");
+        assert!(evaluated[0].not_evaluated_reason.is_none(), "{evaluated:?}");
+
+        // (b) `row_count = false`: the detector never runs, and the reason
+        // names the config key rather than the run.
+        let off = BatchedCheckFixture::new("row_count = false");
+        let (_, anomalies, evaluated) = off.run(&inner, None, Some(&store)).await;
+        assert!(anomalies.is_empty(), "{anomalies:?}");
+        assert_eq!(evaluated.len(), 1, "{evaluated:?}");
+        assert!(!evaluated[0].evaluated, "{evaluated:?}");
+        let reason = evaluated[0]
+            .not_evaluated_reason
+            .as_deref()
+            .expect("a reason");
+        assert!(reason.contains("row_count = false"), "{reason}");
+
+        // (c) No state store: same silence, a different remedy.
+        let (_, _, evaluated) = fx.run(&inner, None, None).await;
+        assert_eq!(evaluated.len(), 1, "{evaluated:?}");
+        assert!(!evaluated[0].evaluated, "{evaluated:?}");
+        let reason = evaluated[0]
+            .not_evaluated_reason
+            .as_deref()
+            .expect("a reason");
+        assert!(reason.contains("state store"), "{reason}");
+        assert!(
+            !reason.contains("row_count = false"),
+            "the no-store reason must not send the operator to rocky.toml: {reason}"
+        );
+
+        // (d) The count could not be measured, so there is nothing to compare.
+        let failing = InterceptingDuckDb {
+            inner: &inner,
+            prefix: "SELECT COUNT(*) FROM tgt.orders",
+            reply: Intercept::Fail("injected target COUNT failure"),
+        };
+        let (_, _, evaluated) = fx.run(&failing, None, Some(&store)).await;
+        assert_eq!(evaluated.len(), 1, "{evaluated:?}");
+        assert!(!evaluated[0].evaluated, "{evaluated:?}");
+        let reason = evaluated[0]
+            .not_evaluated_reason
+            .as_deref()
+            .expect("a reason");
+        assert!(reason.contains("no row count was measured"), "{reason}");
+
+        // (e) `anomaly_threshold_pct = 0` is the documented off switch, and
+        // `detect_anomaly` honours it by returning "detection is disabled".
+        // Calling it anyway and recording the table as evaluated would put an
+        // honest-looking green on a detector that is switched off.
+        let disabled = BatchedCheckFixture::new("row_count = true\nanomaly_threshold_pct = 0.0");
+        let (_, anomalies, evaluated) = disabled.run(&inner, None, Some(&store)).await;
+        assert!(anomalies.is_empty(), "{anomalies:?}");
+        assert_eq!(evaluated.len(), 1, "{evaluated:?}");
+        assert!(!evaluated[0].evaluated, "{evaluated:?}");
+        let reason = evaluated[0]
+            .not_evaluated_reason
+            .as_deref()
+            .expect("a reason");
+        assert!(reason.contains("anomaly detection is disabled"), "{reason}");
+
+        // (f) An empty row-count batch: nothing was counted, so nothing can
+        // be compared.
+        let mut empty_batch = BatchedCheckFixture::new("row_count = true");
+        empty_batch.source_refs = Vec::new();
+        let (_, _, evaluated) = empty_batch.run(&inner, None, Some(&store)).await;
+        assert_eq!(evaluated.len(), 1, "{evaluated:?}");
+        assert!(!evaluated[0].evaluated, "{evaluated:?}");
+        let reason = evaluated[0]
+            .not_evaluated_reason
+            .as_deref()
+            .expect("a reason");
+        assert!(reason.contains("no table in this batch"), "{reason}");
+
+        // The one branch with no seam here is an unreadable history:
+        // `StateStore` is concrete and `get_check_history` cannot be made to
+        // fail through this fixture. It is covered by reading, not by a test.
     }
 
     /// The anomaly baseline is built from the target counts. A failed target
@@ -34550,7 +34743,7 @@ table = "fct_events"
             prefix: "SELECT COUNT(*), MAX(",
             reply: Intercept::Fail("injected MAX failure"),
         };
-        let (pending, _) = fx.run(&failing, None, None).await;
+        let (pending, _, _) = fx.run(&failing, None, None).await;
         let result = the_result(&pending, &fx.target_key(), "freshness");
         assert!(!result.passed, "{result:?}");
         assert_eq!(
@@ -34591,7 +34784,7 @@ table = "fct_events"
                 serde_json::json!("yesterday"),
             ]]),
         };
-        let (pending, _) = fx.run(&unreadable, None, None).await;
+        let (pending, _, _) = fx.run(&unreadable, None, None).await;
         let result = the_result(&pending, &fx.target_key(), "freshness");
         assert!(!result.passed, "{result:?}");
         assert_eq!(
@@ -34620,7 +34813,7 @@ table = "fct_events"
                 serde_json::Value::Null,
             ]]),
         };
-        let (pending, _) = fx.run(&unreadable, None, None).await;
+        let (pending, _, _) = fx.run(&unreadable, None, None).await;
         let result = the_result(&pending, &fx.target_key(), "freshness");
         assert!(!result.passed, "{result:?}");
         assert_eq!(
@@ -34653,7 +34846,7 @@ table = "fct_events"
             .execute_statement("UPDATE tgt.orders SET ts = NULL")
             .await
             .unwrap();
-        let (pending, _) = fx.run(&inner, None, None).await;
+        let (pending, _, _) = fx.run(&inner, None, None).await;
         let result = the_result(&pending, &fx.target_key(), "freshness");
         assert!(!result.passed, "{result:?}");
         assert_eq!(
@@ -34680,7 +34873,7 @@ table = "fct_events"
             "[pipeline.bronze.checks.freshness]\nthreshold_seconds = 3600",
         );
 
-        let (pending, _) = fx.run(&inner, None, None).await;
+        let (pending, _, _) = fx.run(&inner, None, None).await;
         let measured = the_result(&pending, &fx.target_key(), "freshness");
         assert!(measured.not_evaluated.is_none(), "{measured:?}");
 
@@ -34688,7 +34881,7 @@ table = "fct_events"
             .execute_statement("DELETE FROM tgt.orders")
             .await
             .unwrap();
-        let (pending, _) = fx.run(&inner, None, None).await;
+        let (pending, _, _) = fx.run(&inner, None, None).await;
         assert!(
             results_named(&pending, &fx.target_key(), "freshness").is_empty(),
             "an empty table has no freshness to measure: {pending:?}",
@@ -34712,7 +34905,7 @@ table = "fct_events"
         );
 
         // Control: both columns are measured.
-        let (pending, _) = fx.run(&inner, None, None).await;
+        let (pending, _, _) = fx.run(&inner, None, None).await;
         for name in ["null_rate:id", "null_rate:ts"] {
             let measured = the_result(&pending, &fx.target_key(), name);
             assert!(
@@ -34726,7 +34919,7 @@ table = "fct_events"
             prefix: "SELECT 'id' AS col",
             reply: Intercept::Fail("injected null-rate failure"),
         };
-        let (pending, _) = fx.run(&failing, None, None).await;
+        let (pending, _, _) = fx.run(&failing, None, None).await;
         for name in ["null_rate:id", "null_rate:ts"] {
             let result = the_result(&pending, &fx.target_key(), name);
             assert!(!result.passed, "{result:?}");
@@ -34766,7 +34959,7 @@ table = "fct_events"
             prefix: "SELECT 'id' AS col",
             reply: Intercept::Fail("injected null-rate failure"),
         };
-        let (pending, _) = fx.run(&failing, None, None).await;
+        let (pending, _, _) = fx.run(&failing, None, None).await;
 
         let result = the_result(&pending, &fx.target_key(), "null_rate:id");
         assert_eq!(
@@ -34812,7 +35005,7 @@ table = "fct_events"
             prefix: "SELECT COUNT(*) FROM tgt.orders",
             reply: Intercept::Fail("injected row-count failure"),
         };
-        let (pending, _) = fx.run(&failing, None, None).await;
+        let (pending, _, _) = fx.run(&failing, None, None).await;
 
         let result = the_result(&pending, &fx.target_key(), "row_count");
         assert!(
@@ -34862,7 +35055,7 @@ table = "fct_events"
                 serde_json::json!(1),
             ]]),
         };
-        let (pending, _) = fx.run(&all_null, None, None).await;
+        let (pending, _, _) = fx.run(&all_null, None, None).await;
 
         let result = the_result(&pending, &fx.target_key(), "null_rate:ts");
         assert!(
@@ -34899,7 +35092,7 @@ table = "fct_events"
             "[pipeline.bronze.checks.freshness]\nthreshold_seconds = 3600",
         );
 
-        let (pending, _) = fx.run(&inner, Some(&EmptyBatchCheck), None).await;
+        let (pending, _, _) = fx.run(&inner, Some(&EmptyBatchCheck), None).await;
         let result = the_result(&pending, &fx.target_key(), "freshness");
         assert!(!result.passed, "{result:?}");
         assert_eq!(
@@ -34938,7 +35131,7 @@ table = "fct_events"
 
         // Control: every leg answers, both tables are measured on both kinds.
         let healthy = LegFailingBatchCheck::healthy();
-        let (pending, anomalies) = fx.run(&inner, Some(&healthy), Some(&store)).await;
+        let (pending, anomalies, _) = fx.run(&inner, Some(&healthy), Some(&store)).await;
         for table in ["orders", "customers"] {
             let key = fx.key_of(table);
             let rc = the_result(&pending, &key, "row_count");
@@ -34954,7 +35147,7 @@ table = "fct_events"
         let outcome = fx.try_run(&inner, Some(&failing), Some(&store)).await;
         // ⚠ THE assertion that fails on `main`: `try_join!` returned the leg's
         // error and `?` ended the run before one check was reported.
-        let (pending, anomalies) = outcome.expect(
+        let (pending, anomalies, _) = outcome.expect(
             "a failed batched leg must not abort the run — the data has already landed (#1655)",
         );
 
@@ -34999,7 +35192,7 @@ table = "fct_events"
         .plus_table("customers");
 
         let failing = LegFailingBatchCheck::failing(FailingLeg::Freshness);
-        let (pending, _) = fx
+        let (pending, _, _) = fx
             .try_run(&inner, Some(&failing), None)
             .await
             .expect("a failed freshness leg must not abort the run (#1655)");
@@ -35030,7 +35223,7 @@ table = "fct_events"
         let fx = BatchedCheckFixture::new("row_count = true");
 
         let failing = LegFailingBatchCheck::failing(FailingLeg::BothRowCounts);
-        let (pending, _) = fx
+        let (pending, _, _) = fx
             .try_run(&inner, Some(&failing), None)
             .await
             .expect("two failed legs must not abort the run (#1655)");
@@ -35076,7 +35269,7 @@ table = "fct_events"
             freshness_row_count: Some(0),
             ..LegFailingBatchCheck::healthy()
         };
-        let (pending, _) = fx
+        let (pending, _, _) = fx
             .try_run(&inner, Some(&empty), None)
             .await
             .expect("an empty answer is not a failure");
@@ -35104,7 +35297,7 @@ table = "fct_events"
             freshness_row_count: Some(3),
             ..LegFailingBatchCheck::healthy()
         };
-        let (pending, _) = fx
+        let (pending, _, _) = fx
             .try_run(&inner, Some(&rows_without_a_value), None)
             .await
             .expect("an answered leg is not a failure");
@@ -35139,7 +35332,7 @@ table = "fct_events"
             freshness_row_count: None,
             ..LegFailingBatchCheck::healthy()
         };
-        let (pending, _) = fx
+        let (pending, _, _) = fx
             .try_run(&inner, Some(&uncounted), None)
             .await
             .expect("an answered leg is not a failure");
@@ -35303,7 +35496,7 @@ table = "fct_events"
         let fx = both_checks_fixture();
 
         let cannot = CapabilityBatchCheck::new(false, false);
-        let (pending, _) = fx.run(&inner, Some(&cannot), None).await;
+        let (pending, _, _) = fx.run(&inner, Some(&cannot), None).await;
 
         let rc = the_result(&pending, &fx.target_key(), "row_count");
         assert!(
@@ -35352,7 +35545,7 @@ table = "fct_events"
         let fx = both_checks_fixture();
 
         let partial = CapabilityBatchCheck::new(true, false);
-        let (pending, _) = fx.run(&inner, Some(&partial), None).await;
+        let (pending, _, _) = fx.run(&inner, Some(&partial), None).await;
 
         let rc = the_result(&pending, &fx.target_key(), "row_count");
         assert!(
@@ -35395,7 +35588,7 @@ table = "fct_events"
 
         // Declares it can batch both, and the row-count query fails.
         let failing = LegFailingBatchCheck::failing(FailingLeg::BothRowCounts);
-        let (pending, _) = fx.run(&inner, Some(&failing), None).await;
+        let (pending, _, _) = fx.run(&inner, Some(&failing), None).await;
 
         let rc = the_result(&pending, &fx.target_key(), "row_count");
         assert!(!rc.passed, "{rc:?}");
@@ -35438,7 +35631,7 @@ table = "fct_events"
         );
 
         let failing = LegFailingBatchCheck::failing(FailingLeg::Freshness);
-        let (pending, _) = fx.run(&inner, Some(&failing), None).await;
+        let (pending, _, _) = fx.run(&inner, Some(&failing), None).await;
 
         let fresh = the_result(&pending, &fx.target_key(), "freshness");
         assert_eq!(
@@ -35482,7 +35675,7 @@ table = "fct_events"
             max_timestamp: Some(Utc::now() - chrono::Duration::days(30)),
             ..LegFailingBatchCheck::healthy()
         };
-        let (pending, _) = fx.run(&inner, Some(&stale), None).await;
+        let (pending, _, _) = fx.run(&inner, Some(&stale), None).await;
 
         let fresh = the_result(&pending, &fx.target_key(), "freshness");
         assert!(!fresh.passed, "30 days is past the threshold: {fresh:?}");
@@ -35512,7 +35705,7 @@ table = "fct_events"
         let fx = both_checks_fixture();
 
         let batches = CapabilityBatchCheck::new(true, true);
-        let (pending, _) = fx.run(&inner, Some(&batches), None).await;
+        let (pending, _, _) = fx.run(&inner, Some(&batches), None).await;
 
         let rc = the_result(&pending, &fx.target_key(), "row_count");
         assert!(rc.passed && rc.not_evaluated.is_none(), "{rc:?}");
@@ -35550,7 +35743,7 @@ table = "fct_events"
         make_seeded_rows_fresh(&inner).await;
         let fx = both_checks_fixture();
 
-        let (pending, _) = fx.run(&inner, None, None).await;
+        let (pending, _, _) = fx.run(&inner, None, None).await;
 
         let rc = the_result(&pending, &fx.target_key(), "row_count");
         assert!(rc.passed && rc.not_evaluated.is_none(), "{rc:?}");
@@ -35602,7 +35795,7 @@ table = "fct_events"
                 ],
             ]),
         };
-        let (pending, _) = fx.run(&partial, None, None).await;
+        let (pending, _, _) = fx.run(&partial, None, None).await;
         let id = the_result(&pending, &fx.target_key(), "null_rate:id");
         assert!(id.passed && id.not_evaluated.is_none(), "{id:?}");
         let ts = the_result(&pending, &fx.target_key(), "null_rate:ts");
@@ -35637,7 +35830,7 @@ table = "fct_events"
                 serde_json::json!("0"),
             ]]),
         };
-        let (pending, _) = fx.run(&empty_sample, None, None).await;
+        let (pending, _, _) = fx.run(&empty_sample, None, None).await;
         let id = the_result(&pending, &fx.target_key(), "null_rate:id");
         assert!(
             id.passed && id.not_evaluated.is_none(),
@@ -35672,7 +35865,7 @@ table = "fct_events"
         let key = bad.full_name();
         fx.assertion_targets = vec![(bad, vec!["test".into(), "bad-name".into()])];
 
-        let (pending, _) = fx.run(&inner, None, None).await;
+        let (pending, _, _) = fx.run(&inner, None, None).await;
         let assertion = the_result(&pending, &key, "not_null:id");
         assert!(!assertion.passed, "{assertion:?}");
         assert!(
@@ -36067,7 +36260,7 @@ value = "'{source}'"
         )
         .plus_overlap_sibling("tgt2", "orders");
 
-        let (pending, _) = fx.run(&inner, None, None).await;
+        let (pending, _, _) = fx.run(&inner, None, None).await;
         let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
 
         assert!(
@@ -36129,7 +36322,7 @@ value = "'{source}'"
             prefix: "SELECT customer_id, COUNT(DISTINCT _src)",
             reply: Intercept::Fail("injected overlap query failure"),
         };
-        let (pending, _) = fx.run(&failing, None, None).await;
+        let (pending, _, _) = fx.run(&failing, None, None).await;
         let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
 
         assert!(
@@ -36175,7 +36368,7 @@ value = "'{source}'"
         )
         .plus_overlap_sibling("tgt2", "orders");
 
-        let (pending, _) = fx.run(&inner, None, None).await;
+        let (pending, _, _) = fx.run(&inner, None, None).await;
         let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
 
         assert!(result.passed, "5 and 99 do not overlap: {result:?}");
@@ -36209,7 +36402,7 @@ value = "'{source}'"
         )
         .plus_overlap_sibling("tgt2", "orders");
 
-        let (pending, _) = fx.run(&inner, None, None).await;
+        let (pending, _, _) = fx.run(&inner, None, None).await;
         let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
 
         assert!(result.passed, "no non-NULL key is shared: {result:?}");
@@ -36239,7 +36432,7 @@ value = "'{source}'"
         )
         .plus_overlap_sibling("tgt2", "orders");
 
-        let (pending, _) = fx.run(&inner, None, None).await;
+        let (pending, _, _) = fx.run(&inner, None, None).await;
         let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
 
         assert!(
@@ -36276,7 +36469,7 @@ value = "'{source}'"
         )
         .plus_overlap_sibling("tgt2", "orders");
 
-        let (pending, _) = fx.run(&inner, None, None).await;
+        let (pending, _, _) = fx.run(&inner, None, None).await;
         let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
 
         assert!(
@@ -36305,7 +36498,7 @@ value = "'{source}'"
         )
         .plus_overlap_sibling("tgt2", "orders");
 
-        let (pending, _) = fx.run(&inner, None, None).await;
+        let (pending, _, _) = fx.run(&inner, None, None).await;
         let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
 
         assert!(
@@ -36334,7 +36527,7 @@ value = "'{source}'"
 
         let blind = DescribeFailingDuckDb { inner: &inner };
         let recording = QueryRecordingAdapter::new(&blind);
-        let (pending, _) = fx.run(&recording, None, None).await;
+        let (pending, _, _) = fx.run(&recording, None, None).await;
         let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
 
         assert!(
@@ -36514,7 +36707,7 @@ value = "'{source}'"
         .plus_overlap_sibling("tgt3", "orders");
 
         let recorder = QueryRecordingAdapter::new(&inner);
-        let (pending, _) = fx.run(&recorder, None, None).await;
+        let (pending, _, _) = fx.run(&recorder, None, None).await;
         let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
 
         assert!(
@@ -36576,7 +36769,7 @@ value = "'{source}'"
         .plus_overlap_sibling("tgt2", "orders")
         .plus_overlap_sibling("tgt3", "orders");
 
-        let (pending, _) = fx.run(&inner, None, None).await;
+        let (pending, _, _) = fx.run(&inner, None, None).await;
         let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
 
         assert!(result.passed, "5 and 99 do not overlap: {result:?}");
@@ -36615,7 +36808,7 @@ value = "'{source}'"
         .plus_overlap_sibling("tgt2", "orders");
 
         let recorder = QueryRecordingAdapter::new(&inner);
-        let (pending, _) = fx.run(&recorder, None, None).await;
+        let (pending, _, _) = fx.run(&recorder, None, None).await;
         let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
 
         assert!(
@@ -36673,7 +36866,7 @@ value = "'{source}'"
         .plus_overlap_sibling("tgt3", "orders");
 
         let recorder = QueryRecordingAdapter::new(&inner);
-        let (pending, _) = fx.run(&recorder, None, None).await;
+        let (pending, _, _) = fx.run(&recorder, None, None).await;
         let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
 
         assert!(result.passed, "5, 99 and 7 do not overlap: {result:?}");
@@ -36727,7 +36920,7 @@ value = "'{source}'"
         .plus_overlap_sibling("tgt2", "orders")
         .plus_overlap_sibling("tgt3", "orders");
 
-        let (pending, _) = fx.run(&inner, None, None).await;
+        let (pending, _, _) = fx.run(&inner, None, None).await;
         // `fx.target_key()` IS `tgt.orders`, the excluded sibling.
         let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
 
@@ -36769,7 +36962,7 @@ value = "'{source}'"
         .plus_overlap_sibling("tgt3", "orders");
 
         let recorder = QueryRecordingAdapter::new(&inner);
-        let (pending, _) = fx.run(&recorder, None, None).await;
+        let (pending, _, _) = fx.run(&recorder, None, None).await;
         let result = the_result(&pending, &fx.target_key(), OVERLAP_CHECK);
 
         assert!(
