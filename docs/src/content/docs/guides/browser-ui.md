@@ -27,7 +27,7 @@ The UI ships inside the release binaries and the container image. A sidebar list
   Settings           -
 ```
 
-The other six are not links. Each shows, under its name, what is true instead. They are listed in [Areas without a screen](#areas-without-a-screen). On a screen narrower than 768 pixels the sidebar folds behind a **Menu** button.
+The other six are not links. Each shows, under its name, what is true instead. They are listed in [Areas without a screen](#areas-without-a-screen). On a screen narrower than 1024 pixels the sidebar folds behind an **Areas** button.
 
 ## Open the UI
 
