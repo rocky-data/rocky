@@ -1586,7 +1586,7 @@ class RockyClient:
         each model's ``downstream_references`` accurately. Without it the engine
         defaults to ``models/`` and, for a custom ``models_dir``, silently reports
         ``downstream_references: 0`` for every model — skewing the recommended
-        materialization strategy (table vs view vs ephemeral).
+        materialization strategy (table vs view).
         """
         args: list[str] = ["optimize", "--models", self.models_dir]
         if model is not None:

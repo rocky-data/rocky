@@ -21,6 +21,7 @@ import dagster as dg
 from dagster_rocky.component import _build_table_resolver, _emit_results
 from dagster_rocky.observability import ANOMALY_CHECK_NAME
 from dagster_rocky.types import (
+    AnomalyEvaluation,
     AnomalyResult,
     CheckResult,
     DriftInfo,
@@ -35,6 +36,7 @@ def _run_result(
     *,
     check_results: list[TableCheckResult] | None = None,
     anomalies: list[AnomalyResult] | None = None,
+    anomaly_evaluated: list[AnomalyEvaluation] | None = None,
 ) -> RunResult:
     return RunResult(
         version="0.3.0",
@@ -51,6 +53,7 @@ def _run_result(
         ),
         drift=DriftInfo(tables_checked=0, tables_drifted=0, actions_taken=[]),
         anomalies=anomalies or [],
+        anomaly_evaluated=anomaly_evaluated or [],
     )
 
 
@@ -173,6 +176,85 @@ def test_emit_results_dedupes_same_key_anomaly():
     ]
     assert len(anomaly_results) == 1
     assert anomaly_results[0].asset_key == orders
+
+
+def test_an_anomaly_beats_the_evaluated_pass_for_the_same_table():
+    """#1790: a table that HAS an anomaly is also an evaluated table.
+
+    It appears in both lists, so the emit order decides the verdict the badge
+    shows. Anomalies are yielded first and the dedup drops the later pass —
+    reversing that order would turn a detected anomaly into a green check.
+    """
+    orders = dg.AssetKey(["fivetran", "acme", "us_west", "shopify", "orders"])
+    mapping = {("fivetran", "acme", "us_west", "shopify", "orders"): orders}
+    check_specs = [dg.AssetCheckSpec(name=ANOMALY_CHECK_NAME, asset=orders)]
+    run_result = _run_result(
+        anomalies=[
+            AnomalyResult(
+                table="orders",
+                current_count=900,
+                baseline_avg=1500.0,
+                deviation_pct=40.0,
+                reason="row count below baseline by 40%",
+            )
+        ],
+        anomaly_evaluated=[AnomalyEvaluation(table="orders", evaluated=True)],
+    )
+
+    events = list(
+        _emit_results(
+            results=[run_result],
+            check_specs=check_specs,
+            selected_keys={orders},
+            rocky_key_to_dagster_key=mapping,
+        )
+    )
+
+    anomaly_results = [
+        e
+        for e in events
+        if isinstance(e, dg.AssetCheckResult) and e.check_name == ANOMALY_CHECK_NAME
+    ]
+    assert len(anomaly_results) == 1, anomaly_results
+    assert anomaly_results[0].passed is False
+    assert "below baseline" in anomaly_results[0].metadata["rocky/reason"].value
+
+
+def test_a_skipped_table_reports_not_evaluated_end_to_end():
+    """#1790 through `_emit_results`: the engine says it did not evaluate the
+    table, and the check reports that instead of a green placeholder."""
+    orders = dg.AssetKey(["fivetran", "acme", "us_west", "shopify", "orders"])
+    mapping = {("fivetran", "acme", "us_west", "shopify", "orders"): orders}
+    check_specs = [dg.AssetCheckSpec(name=ANOMALY_CHECK_NAME, asset=orders)]
+    run_result = _run_result(
+        anomaly_evaluated=[
+            AnomalyEvaluation(
+                table="orders",
+                evaluated=False,
+                not_evaluated_reason="this run has no state store",
+            )
+        ],
+    )
+
+    events = list(
+        _emit_results(
+            results=[run_result],
+            check_specs=check_specs,
+            selected_keys={orders},
+            rocky_key_to_dagster_key=mapping,
+        )
+    )
+
+    anomaly_results = [
+        e
+        for e in events
+        if isinstance(e, dg.AssetCheckResult) and e.check_name == ANOMALY_CHECK_NAME
+    ]
+    assert len(anomaly_results) == 1, anomaly_results
+    assert anomaly_results[0].passed is False
+    assert anomaly_results[0].severity == dg.AssetCheckSeverity.WARN
+    assert anomaly_results[0].metadata["status"].value == "not_evaluated"
+    assert "state store" in anomaly_results[0].metadata["rocky/reason"].value
 
 
 def test_emit_results_anomaly_yields_when_unique():
