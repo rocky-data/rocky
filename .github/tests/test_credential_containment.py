@@ -6,6 +6,7 @@ import json
 import os
 import http.client
 import shutil
+import ssl
 import sys
 import tempfile
 import unittest
@@ -475,6 +476,26 @@ class PolicyCandidateRetryTests(unittest.TestCase):
         )
         self.assertEqual(result, {"sha": "ok"})
         self.assertEqual(len(seen), 2)
+
+    def test_a_certificate_that_does_not_verify_is_not_retried(self) -> None:
+        """A failed TLS identity check is not a transient error.
+
+        Retrying would log it as one, and would give an intermittent
+        interceptor three chances at the connection instead of one.
+        """
+
+        for error in (
+            ssl.SSLCertVerificationError("certificate verify failed"),
+            urllib.error.URLError(
+                ssl.SSLCertVerificationError("certificate verify failed")
+            ),
+        ):
+            with self.subTest(error=type(error).__name__):
+                result, seen, slept = self.run_request([error] + [self.ok()] * 3)
+                self.assertIsInstance(result, PolicyCandidateError)
+                self.assertEqual(len(seen), 1)
+                self.assertEqual(slept, [])
+                self.assertIn("certificate verification failed", str(result))
 
     def test_the_byte_limit_still_applies_after_a_retry(self) -> None:
         oversized = self.Response(b"x" * (MAX_API_RESPONSE_BYTES + 1))

@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import sys
 import tempfile
 import time
@@ -130,6 +131,13 @@ def _describe_failure(error: BaseException) -> tuple[bool, str]:
             return True, "HTTP 403 (rate limit exhausted)"
         return error.code in RETRYABLE_STATUSES, f"HTTP {error.code}"
     reason = getattr(error, "reason", None)
+    # A certificate that does not verify is not a blip. Retrying would say
+    # "transient" in the log for a failed TLS identity check, and would give an
+    # intermittent interceptor three chances instead of one.
+    if isinstance(error, ssl.SSLCertVerificationError) or isinstance(
+        reason, ssl.SSLCertVerificationError
+    ):
+        return False, f"TLS certificate verification failed: {reason or error}"
     detail = f"{type(error).__name__}: {reason}" if reason else type(error).__name__
     # A connection that never produced a response: DNS, TLS, reset, timeout.
     return True, detail
