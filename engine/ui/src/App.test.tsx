@@ -3,7 +3,7 @@ import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MetaOutput } from "@rocky-types/meta";
 import { ApiError } from "./api";
-import { App, EnginePanel } from "./App";
+import { App, EnginePanel, WIDE_ENOUGH_FOR_THE_SIDEBAR } from "./App";
 import { GovernorScreen } from "./governor/GovernorScreen";
 import { TOKEN_STORAGE_KEY } from "./token";
 
@@ -152,14 +152,25 @@ describe("App", () => {
     governor: <span>governor slot</span>,
   };
 
-  /** The sidebar's nav, so a Governor tab link of the same name never matches. */
-  const areas = () => within(screen.getByRole("navigation", { name: "Areas" }));
+  /**
+   * The areas nav a screen reader would read, so a Governor tab of the same
+   * name never matches — and neither does the fixed sidebar while the drawer
+   * is open, since the dialog puts `aria-hidden` on the rest of the page.
+   */
+  function liveAreasNav(): HTMLElement {
+    const navs = [...document.querySelectorAll('nav[aria-label="Areas"]')].filter(
+      (nav) => nav.closest('[aria-hidden="true"]') === null,
+    );
+    expect(navs).toHaveLength(1);
+    return navs[0] as HTMLElement;
+  }
+  const areas = () => within(liveAreasNav());
 
   it("shows the Rocky mark beside the name, and says nothing twice", () => {
     window.history.pushState(null, "", "/ui/estate");
     const { container } = render(<App token="t" {...slots} />);
-    // Two wordmarks in the page: the narrow header's and the sidebar's. CSS
-    // shows one at a time; both carry the mark.
+    // Two wordmarks with the drawer closed: the sidebar's and the narrow
+    // bar's. CSS shows one at a time; both carry the mark.
     const marks = container.querySelectorAll("img");
     expect(marks).toHaveLength(2);
     for (const mark of marks) {
@@ -183,8 +194,9 @@ describe("App", () => {
   it("renders the eleven areas: five links, six disabled with their reasons", () => {
     window.history.pushState(null, "", "/ui/estate");
     render(<App token="t" {...slots} />);
-    const nav = screen.getByRole("navigation", { name: "Areas" });
-    expect(within(nav).getAllByRole("listitem")).toHaveLength(11);
+    const nav = liveAreasNav();
+    // Five that open a screen, then the six that do not, under their heading.
+    expect(nav.textContent).toContain("No page yet");
     expect(within(nav).getAllByRole("link").map((link) => link.textContent)).toEqual([
       "Needs you",
       "Estate",
@@ -273,39 +285,66 @@ describe("App", () => {
     expect(areas().getByRole("link", { name: "Estate" })).toHaveAttribute("aria-current", "page");
   });
 
-  describe("the menu on a narrow screen", () => {
-    it("opens and folds the one sidebar, and says which it controls", () => {
-      window.history.pushState(null, "", "/ui/estate");
+  describe("the drawer below the breakpoint", () => {
+    /**
+     * The button that opens the drawer, captured as a node: once the dialog
+     * is open it sits behind `aria-hidden`, so a role query cannot find it.
+     */
+    const openButton = () => screen.getByRole("button", { name: "Areas" });
+
+    it("names the current area in the bar, and opens the areas in a dialog", async () => {
+      window.history.pushState(null, "", "/ui/review");
       render(<App token="t" {...slots} />);
-      const button = screen.getByRole("button", { name: "Menu" });
-      const sidebar = document.getElementById(button.getAttribute("aria-controls") ?? "");
-      expect(sidebar).not.toBeNull();
+      // The bar names where you are, since the sidebar is folded away.
+      expect(screen.getByText("Review", { selector: "div" })).toBeInTheDocument();
+      const button = openButton();
       expect(button).toHaveAttribute("aria-expanded", "false");
-      expect(sidebar).toHaveClass("hidden");
+      expect(document.querySelectorAll('[role="dialog"]')).toHaveLength(0);
 
       fireEvent.click(button);
+      const dialog = await screen.findByRole("dialog");
       expect(button).toHaveAttribute("aria-expanded", "true");
-      expect(sidebar).not.toHaveClass("hidden");
-      // One sidebar at every width, so the engine line is rendered once.
-      expect(screen.getAllByText("engine slot")).toHaveLength(1);
+      expect(within(dialog).getByRole("link", { name: "Estate" })).toBeInTheDocument();
     });
 
-    it("folds on a navigation", async () => {
+    it("leaves one set of areas in the reading order while it is open", async () => {
       window.history.pushState(null, "", "/ui/estate");
       render(<App token="t" {...slots} />);
-      const button = screen.getByRole("button", { name: "Menu" });
+      const button = openButton();
       fireEvent.click(button);
-      areas().getByRole("link", { name: "Review" }).click();
-      await waitFor(() => expect(button).toHaveAttribute("aria-expanded", "false"));
+      await screen.findByRole("dialog");
+
+      // Two navs exist in the page — the fixed one and the drawer's — but the
+      // dialog hides the rest of the page, so only one is read, and only one
+      // link says it is the current page.
+      expect(document.querySelectorAll('nav[aria-label="Areas"]')).toHaveLength(2);
+      expect(liveAreasNav().closest('[role="dialog"]')).not.toBeNull();
+      const announced = [...document.querySelectorAll('[aria-current="page"]')].filter(
+        (node) => node.closest('[aria-hidden="true"]') === null,
+      );
+      expect(announced.map((node) => node.textContent)).toEqual(["Estate"]);
+      // And the engine line is drawn twice but read once, from one request.
+      expect(screen.getAllByText("engine slot")).toHaveLength(2);
     });
 
-    it("folds on Back, not only on a click in the menu", async () => {
+    it("closes on a navigation from inside it", async () => {
+      window.history.pushState(null, "", "/ui/estate");
+      render(<App token="t" {...slots} />);
+      const button = openButton();
+      fireEvent.click(button);
+      const dialog = await screen.findByRole("dialog");
+      within(dialog).getByRole("link", { name: "Review" }).click();
+      await waitFor(() => expect(button).toHaveAttribute("aria-expanded", "false"));
+      expect(window.location.pathname).toBe("/ui/review");
+    });
+
+    it("closes on Back", async () => {
       window.history.pushState(null, "", "/ui/estate");
       window.history.pushState(null, "", "/ui/review");
       render(<App token="t" {...slots} />);
-      const button = screen.getByRole("button", { name: "Menu" });
+      const button = openButton();
       fireEvent.click(button);
-      expect(button).toHaveAttribute("aria-expanded", "true");
+      await screen.findByRole("dialog");
       act(() => {
         window.history.back();
       });
@@ -313,15 +352,72 @@ describe("App", () => {
       expect(button).toHaveAttribute("aria-expanded", "false");
     });
 
-    it("folds on Escape and gives focus back to the button", () => {
+    it("closes on Escape and gives focus back to the button", async () => {
       window.history.pushState(null, "", "/ui/estate");
       render(<App token="t" {...slots} />);
-      const button = screen.getByRole("button", { name: "Menu" });
+      const button = openButton();
       fireEvent.click(button);
-      areas().getByRole("link", { name: "Review" }).focus();
+      await screen.findByRole("dialog");
       fireEvent.keyDown(document, { key: "Escape" });
-      expect(button).toHaveAttribute("aria-expanded", "false");
-      expect(document.activeElement).toBe(button);
+      await waitFor(() => expect(button).toHaveAttribute("aria-expanded", "false"));
+      // The dialog restores focus itself, after it has closed.
+      await waitFor(() => expect(document.activeElement).toBe(button));
+    });
+
+    it("closes when the window grows past the breakpoint", async () => {
+      // Left open there, the dialog would keep its focus trap and its hold on
+      // the page over a sidebar the viewer can now see anyway.
+      const listeners: ((event: MediaQueryListEvent) => void)[] = [];
+      vi.stubGlobal(
+        "matchMedia",
+        vi.fn((query: string) => ({
+          matches: false,
+          media: query,
+          addEventListener: (_: string, fn: (event: MediaQueryListEvent) => void) =>
+            listeners.push(fn),
+          removeEventListener: vi.fn(),
+        })),
+      );
+      window.history.pushState(null, "", "/ui/estate");
+      render(<App token="t" {...slots} />);
+      expect(window.matchMedia).toHaveBeenCalledWith(WIDE_ENOUGH_FOR_THE_SIDEBAR);
+      const button = openButton();
+      fireEvent.click(button);
+      await screen.findByRole("dialog");
+
+      act(() => {
+        for (const fn of listeners) fn({ matches: true } as MediaQueryListEvent);
+      });
+      await waitFor(() => expect(button).toHaveAttribute("aria-expanded", "false"));
+      vi.unstubAllGlobals();
+    });
+
+    it("reads the engine once, however often the drawer opens", async () => {
+      // The sidebar is drawn twice; two reads of `/api/v1/meta` would be the
+      // shape of #2075 again, one level up.
+      const calls: string[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL) => {
+          calls.push(String(input));
+          return new Response(JSON.stringify(META), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }),
+      );
+      window.history.pushState(null, "", "/ui/estate");
+      render(<App token="t" estate={<span>estate slot</span>} />);
+      await waitFor(() => expect(calls.some((url) => url.includes("/api/v1/meta"))).toBe(true));
+
+      const button = openButton();
+      fireEvent.click(button);
+      await screen.findByRole("dialog");
+      fireEvent.keyDown(document, { key: "Escape" });
+      await waitFor(() => expect(button).toHaveAttribute("aria-expanded", "false"));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(calls.filter((url) => url.includes("/api/v1/meta"))).toHaveLength(1);
+      vi.unstubAllGlobals();
     });
   });
 });
