@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import os
+import http.client
 import shutil
 import sys
 import tempfile
@@ -460,6 +461,20 @@ class PolicyCandidateRetryTests(unittest.TestCase):
         self.assertIsInstance(result, PolicyCandidateError)
         self.assertEqual(len(seen), REQUEST_ATTEMPTS)
         self.assertIn("Name or service not known", str(result))
+
+    def test_a_response_that_dies_mid_body_is_retried(self) -> None:
+        """`http.client.IncompleteRead` is not an OSError.
+
+        Caught by the wrong except clause it escapes as a traceback: no retry,
+        and no line saying which call failed — the exact failure this change
+        exists to remove, reappearing one layer down.
+        """
+
+        result, seen, _ = self.run_request(
+            [http.client.IncompleteRead(b"partial"), self.ok()]
+        )
+        self.assertEqual(result, {"sha": "ok"})
+        self.assertEqual(len(seen), 2)
 
     def test_the_byte_limit_still_applies_after_a_retry(self) -> None:
         oversized = self.Response(b"x" * (MAX_API_RESPONSE_BYTES + 1))

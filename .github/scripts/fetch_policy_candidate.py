@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import http.client
 import json
 import os
 import re
@@ -152,7 +153,11 @@ def _request_json(api_url: str, endpoint: str, token: str) -> dict[str, Any]:
             with opener.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
                 payload = response.read(MAX_API_RESPONSE_BYTES + 1)
             break
-        except (OSError, urllib.error.URLError) as error:
+        # http.client.HTTPException is NOT an OSError, so a response that dies
+        # mid-body (IncompleteRead) would otherwise escape as a traceback: no
+        # retry, and no line saying which call failed. That is the failure this
+        # change exists to remove, so it must be caught here too.
+        except (OSError, urllib.error.URLError, http.client.HTTPException) as error:
             retryable, detail = _describe_failure(error)
             attempts.append(f"attempt {attempt}: {detail}")
             if not retryable or attempt == REQUEST_ATTEMPTS:
