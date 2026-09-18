@@ -53,12 +53,23 @@ type EngineState =
   | { kind: "unreachable"; message: string };
 
 /**
+ * The production reader, at module scope so its identity never changes.
+ *
+ * As a default parameter (`fetchMeta = () => apiGet(...)`) it was a NEW
+ * function on every render, and the effect below depends on it: the effect
+ * fetched, the answer set state, the state rendered, the render made another
+ * function, and the effect ran again. An idle tab asked the engine for
+ * `/api/v1/meta` about 15 times a second, for as long as it was open (#2075).
+ */
+const fetchMetaFromEngine = (): Promise<MetaOutput> => apiGet<MetaOutput>("meta");
+
+/**
  * The engine panel: `GET /api/v1/meta` with the tab's token. It proves the
  * whole path on every load: embedded assets, token bootstrap, bearer
  * header, typed payload, envelope on refusal.
  */
 export function EnginePanel({
-  fetchMeta = () => apiGet<MetaOutput>("meta"),
+  fetchMeta = fetchMetaFromEngine,
   token = currentToken(sessionStorage),
 }: {
   fetchMeta?: () => Promise<MetaOutput>;

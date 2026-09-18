@@ -317,6 +317,22 @@ class AnomalyResult(BaseModel):
     reason: str
 
 
+class AnomalyEvaluation(BaseModel):
+    """Whether the row-count anomaly detector evaluated one table.
+
+    One entry per table the run considered. Reading :attr:`RunResult.anomalies`
+    alone cannot tell "the detector ran and found nothing" from "the detector
+    never ran" — both are an empty list, and Dagster read that as a pass
+    (#1790). ``not_evaluated_reason`` is set exactly when ``evaluated`` is
+    ``False``, and names which condition was missing: row-count checks off, no
+    state store, no measured count, or an unreadable history.
+    """
+
+    table: str
+    evaluated: bool
+    not_evaluated_reason: str | None = None
+
+
 class TableError(BaseModel):
     asset_key: list[str]
     error: str
@@ -536,6 +552,10 @@ class RunResult(BaseModel):
     permissions: PermissionInfo
     drift: DriftInfo
     anomalies: list[AnomalyResult] = []
+    #: One entry per table the run considered for anomaly detection, saying
+    #: whether the detector evaluated it. Empty for a run with no batched
+    #: checks, and for any engine older than the field (#1790).
+    anomaly_evaluated: list[AnomalyEvaluation] = []
     #: Per-model partition execution summaries, populated only when the
     #: run touched one or more ``time_interval`` models. Empty for runs
     #: that didn't execute any partitioned models.

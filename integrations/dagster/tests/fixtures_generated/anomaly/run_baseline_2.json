@@ -43,6 +43,12 @@
       ]
     }
   ],
+  "anomaly_evaluated": [
+    {
+      "table": "poc.staging__events.events",
+      "evaluated": true
+    }
+  ],
   "execution": {
     "concurrency": 32,
     "tables_processed": 1,

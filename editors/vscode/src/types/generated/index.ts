@@ -182,6 +182,7 @@ export type {
   PermissionSummary,
   ExecutionSummary,
   AnomalyOutput,
+  AnomalyEvaluationOutput,
   TableErrorOutput,
   MetricsSnapshot,
 } from "./run";

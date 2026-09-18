@@ -1,6 +1,31 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "AnomalyEvaluationOutput": {
+      "description": "Whether the row-count anomaly detector evaluated one table.\n\nOne entry per table in the run's batches, whatever happened. A consumer reading [`RunOutput::anomalies`] alone cannot tell \"the detector ran and found nothing\" from \"the detector never ran\": both are an empty list (#1790). Dagster read the empty list as a pass, so a run with `row_count = false` showed a green anomaly check for a detector that had not run.\n\nThe detector runs only when row-count checks are on, the run has a state store, the table's row count was measured, and its history could be read. `not_evaluated_reason` names which of those was missing, because the remedy differs: one is a config line, another is how the run was invoked.",
+      "properties": {
+        "evaluated": {
+          "description": "`true` when the detector compared this table's count against its history. An anomaly, if any, is in [`RunOutput::anomalies`].",
+          "type": "boolean"
+        },
+        "not_evaluated_reason": {
+          "description": "Why the detector did not evaluate this table. Set exactly when `evaluated` is `false`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "table": {
+          "description": "Fully-qualified table the entry is about, the same key [`AnomalyOutput::table`] uses.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "evaluated",
+        "table"
+      ],
+      "type": "object"
+    },
     "AnomalyOutput": {
       "description": "Row count anomaly detected by historical baseline comparison.",
       "properties": {
@@ -1187,6 +1212,13 @@
     "anomalies": {
       "items": {
         "$ref": "#/definitions/AnomalyOutput"
+      },
+      "type": "array"
+    },
+    "anomaly_evaluated": {
+      "description": "One entry per table the run considered for row-count anomaly detection, saying whether the detector evaluated it. Empty for a run with no batched checks. See [`AnomalyEvaluationOutput`] — without it, an empty `anomalies` list means both \"nothing anomalous\" and \"nothing was looked at\" (#1790).",
+      "items": {
+        "$ref": "#/definitions/AnomalyEvaluationOutput"
       },
       "type": "array"
     },

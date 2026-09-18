@@ -87,6 +87,7 @@ from .observability import (
     ANOMALY_CHECK_NAME,
     COMPLIANCE_CHECK_NAME,
     anomaly_check_results,
+    anomaly_evaluation_results,
     compliance_check_results,
     drift_observations,
     optimize_metadata_for_keys,
@@ -214,16 +215,29 @@ DEFAULT_CHECK_NAMES: tuple[str, ...] = (
 )
 
 #: The checks for which "the engine reported nothing" genuinely means "nothing
-#: is wrong". Both are EVENT checks: the engine emits a result only when it has
-#: an anomaly or an exception to report, so silence is the clean verdict and a
-#: passing placeholder states the truth.
+#: is wrong". An EVENT check: the engine emits a result only when it has an
+#: exception to report, so silence is the clean verdict and a passing
+#: placeholder states the truth.
 #:
 #: Every other check is a MEASUREMENT. Silence there means the measurement was
 #: not taken, which is not the same as taking it and finding nothing — so its
 #: placeholder reports ``passed=False`` (#1645). This is the same rule the
 #: engine settled in #1741 one layer down: a check that did not run is not a
 #: check that passed.
-PASS_BY_ABSENCE_CHECK_NAMES: frozenset[str] = frozenset({ANOMALY_CHECK_NAME, COMPLIANCE_CHECK_NAME})
+#:
+#: ``row_count_anomaly`` was here too, and that was wrong (#1790). The
+#: reasoning holds only if the PRODUCER is unconditional, and the anomaly
+#: detector is not: it runs only when row-count checks are on, the run has a
+#: state store, the count was measured and the history could be read. With
+#: ``row_count = false`` the detector never ran and this list reported it
+#: green. The engine now says per table whether it evaluated one
+#: (``RunResult.anomaly_evaluated``), so the name does not need to be here.
+#:
+#: ``compliance_exception`` stays, and its producer IS checked: a crashed
+#: ``rocky compliance`` yields an explicit not-evaluated result rather than
+#: nothing (see ``_emit_governance_events``), so silence here means a scan
+#: that ran and found no exception.
+PASS_BY_ABSENCE_CHECK_NAMES: frozenset[str] = frozenset({COMPLIANCE_CHECK_NAME})
 
 
 @dataclass(frozen=True)
@@ -3654,6 +3668,20 @@ def _emit_results(
                 continue
             yielded_checks.add(spec_key)
             yield anomaly_result
+
+    # The verdict for every OTHER table the detector considered: evaluated and
+    # clean, or not evaluated and why. Yielded after the anomalies so a table
+    # that has one keeps its `passed=False` — the dedup below drops the pass
+    # this would otherwise add for the same (asset, check) pair (#1790).
+    for run_result in results:
+        for evaluation_result in anomaly_evaluation_results(
+            run_result, key_resolver=selected_resolver
+        ):
+            spec_key = (evaluation_result.asset_key, ANOMALY_CHECK_NAME)
+            if spec_key not in declared_checks or spec_key in yielded_checks:
+                continue
+            yielded_checks.add(spec_key)
+            yield evaluation_result
 
     # Model-failure containment → AssetObservation. A model in ``contained``
     # was withheld this run because an upstream failed (or was itself withheld)
