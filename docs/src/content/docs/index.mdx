@@ -1,6 +1,6 @@
 ---
 title: "Rocky: the typed graph between your code and your warehouse"
-description: "A typed compiler over Databricks, Snowflake, BigQuery, and DuckDB: branches, replay, column-level lineage, compile-time contracts, and per-model cost attribution."
+description: "A typed SQL compiler for Databricks, Snowflake, BigQuery, and DuckDB, with contracts, change plans, and local tooling."
 template: splash
 hero:
   tagline: "The typed graph between your code and whatever warehouse you have chosen. Branches, replay, column-level lineage, contracts, and per-model cost. Storage and compute stay where they are."
@@ -20,22 +20,23 @@ hero:
 
 import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
-## The failures Rocky turns into compile errors
+## Checks Rocky reports at compile time
 
 The expensive failures on a data platform are trust failures, not slow queries.
 A column type changes upstream and a revenue dashboard quietly diverges for
 three days. Warehouse spend doubles and nobody can say which model caused it.
 
-**Rocky moves correctness into the compiler.** Each of those becomes something
-you catch before a row is written. See
+**Rocky reports supported static problems before execution.** The available SQL,
+schemas, and configuration determine which checks can run. A clean compile does
+not prove general SQL validity or correct result values. See
 [the full list, and how Rocky catches each one](/getting-started/introduction/).
 
 <CardGrid>
   <Card title="Typed compiler, not a templating engine" icon="approve-check">
-    Rocky infers column types across the whole dependency graph. 35+ diagnostic codes name the problem and suggest a fix, so `E013` blocks the PR before a row is written.
+    Rocky infers types where source and expression information is available. Its diagnostics name problems and suggest fixes. An `E013` error fails that compile.
   </Card>
   <Card title="Column-level lineage at compile time" icon="seti:graphql">
-    Rocky traces every column through every transformation, before anything runs. `rocky lineage-diff main` lists the per-column downstream blast radius for PR review.
+    Rocky traces represented columns through supported transformations. `rocky lineage-diff main` lists the recorded downstream impact for PR review.
   </Card>
   <Card title="Branches + content-addressed run records" icon="random">
     A named branch is an isolated schema. `rocky replay <run_id>` inspects a run and shows its recorded per-model SQL hashes, row counts, and bytes.
@@ -43,8 +44,8 @@ you catch before a row is written. See
   <Card title="Per-model cost attribution" icon="rocket">
     Cost is a column on every run, not a dashboard you check afterwards. `[budget]` blocks fail the run on overspend, and `rocky preview cost` projects spend at PR time.
   </Card>
-  <Card title="AI gated through the compiler" icon="star">
-    Every AI suggestion has to type-check before it lands. `rocky ai` generates a model, compiles it, auto-fixes what it can, and ships.
+  <Card title="AI-assisted drafting" icon="star">
+    `rocky ai` generates a draft and validates it against available project context. Review the generated files, run relevant tests, then plan and approve execution.
   </Card>
   <Card title="Dialect-divergence lint" icon="puzzle">
     `P001` catches a Snowflake-only construct in a Databricks project, and the reverse. Cross-warehouse teams stop finding portability bugs in prod.
@@ -53,7 +54,7 @@ you catch before a row is written. See
     Tests are declarative TOML. Rocky generates the assertion SQL for your target dialect, and `rocky test` runs fixture-driven tests locally on DuckDB.
   </Card>
   <Card title="Data products declared in a spec file" icon="document">
-    `products/<name>.toml` states a product's grain, columns, checks, and freshness. `rocky product compile` renders the model's contract and merges spec-owned sidecar metadata, turning the grain and checks into declarative `[[tests]]`. `rocky fulfill` then drives an agent through drafting and verification, and stops at each gate for you (experimental).
+    `products/<name>.toml` states a product's grain, columns, checks, and freshness. `rocky product compile` renders the model's contract and merges spec-owned sidecar metadata, turning the grain and checks into declarative `[[tests]]`. `rocky fulfill` drives an agent through drafting and verification (experimental). Its output checks follow `apply`, so a failure can be live.
   </Card>
   <Card title="A tested exit door, not a one-way door" icon="cloud-download">
     `rocky emit-sql` renders the compiled SQL for your transformation models with no warehouse connection. The output is plain runnable SQL, so adopting Rocky never locks you in.
