@@ -75,6 +75,11 @@ rocky compile && rocky test && rocky run
 
 No credentials needed — the playground runs on local DuckDB.
 
+The installer downloads a published engine release. Changes on `main` can arrive before the next release.
+Check `rocky --version` and the [release notes](https://github.com/rocky-data/rocky/releases) when following examples.
+
+[Share your first-run experience](https://github.com/rocky-data/rocky/issues/new?template=first_run_feedback.yml), including a successful attempt or where you stopped.
+
 For production deploys, use `rocky plan` (saves what will change) then `rocky apply <plan-id>` (runs it). For local work and automation, `rocky run` does it all in one step.
 
 ## Who Rocky is for
