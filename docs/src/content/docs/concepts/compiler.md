@@ -174,7 +174,10 @@ absent from that model's output. Other shapes can remain `Unknown`. `E039`
 does not validate them.
 
 External source schemas do not prove completeness or freshness. Incomplete
-scopes, struct field reads, and warehouse metadata columns remain conservative.
+scopes, duplicate output names, struct field reads, and warehouse metadata
+columns remain conservative. The upstream output must use plain column
+projections or aliased columns and literals. Functions and other expressions
+remain conservative.
 
 ### Numeric promotion
 

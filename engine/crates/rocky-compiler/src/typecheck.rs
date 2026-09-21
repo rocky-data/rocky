@@ -745,7 +745,7 @@ fn check_known_missing_projection_refs(
     let Some(upstream_model) = model_by_name.get(relation_name) else {
         return Vec::new();
     };
-    if !is_plain_select(&upstream_model.sql) {
+    if !has_provably_fixed_output_names(&upstream_model.sql) {
         return Vec::new();
     }
     let Some(upstream_schema) = graph
@@ -754,6 +754,18 @@ fn check_known_missing_projection_refs(
     else {
         return Vec::new();
     };
+    let mut output_names = HashSet::with_capacity(upstream_schema.columns.len());
+    if upstream_schema
+        .columns
+        .iter()
+        .any(|column| !output_names.insert(CiKey::owned(column.name.clone())))
+    {
+        // Warehouses can rename duplicate projected names while materializing
+        // the model (DuckDB turns the second `id` into `id_1`). The semantic
+        // graph preserves both source spellings, so it cannot prove absence
+        // from the physical relation in this shape.
+        return Vec::new();
+    }
 
     let qualifier = alias
         .as_ref()
@@ -844,7 +856,7 @@ fn is_warehouse_pseudo_column(name: &str) -> bool {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("metadata$"))
 }
 
-fn is_plain_select(sql: &str) -> bool {
+fn has_provably_fixed_output_names(sql: &str) -> bool {
     let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, sql) else {
         return false;
     };
@@ -858,6 +870,16 @@ fn is_plain_select(sql: &str) -> bool {
         && select.exclude.is_none()
         && select.value_table_mode.is_none()
         && select.flavor == ast::SelectFlavor::Standard
+        && select.projection.iter().all(|item| {
+            matches!(
+                item,
+                SelectItem::UnnamedExpr(Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+                    | SelectItem::ExprWithAlias {
+                        expr: Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_),
+                        ..
+                    }
+            )
+        })
 }
 
 /// Validate a model's `time_interval` strategy against its typed output schema.
@@ -4024,11 +4046,12 @@ mod tests {
             "SELECT _metadata FROM stg_orders",
             "SELECT _PARTITIONTIME FROM stg_orders",
             "SELECT _partitiondate FROM stg_orders",
+            "SELECT id_1 FROM stg_orders",
         ] {
-            let upstream_sql = if sql == "SELECT s.foo FROM stg_orders AS s" {
-                "SELECT struct_pack(foo := 42) AS s FROM raw.orders"
-            } else {
-                "SELECT order_id, amount AS order_amount FROM raw.orders"
+            let upstream_sql = match sql {
+                "SELECT s.foo FROM stg_orders AS s" => "SELECT payload AS s FROM raw.orders",
+                "SELECT id_1 FROM stg_orders" => "SELECT 1 AS id, 2 AS id",
+                _ => "SELECT order_id, amount AS order_amount FROM raw.orders",
             };
             let result = compile_typechecks(vec![
                 make_model("stg_orders", upstream_sql),
@@ -4101,9 +4124,22 @@ mod tests {
             );
         }
 
-        assert!(!is_plain_select(
+        assert!(!has_provably_fixed_output_names(
             "SELECT id FROM raw.left UNION BY NAME SELECT id FROM raw.right"
         ));
+    }
+
+    #[test]
+    fn known_missing_check_skips_output_expanding_upstream_functions() {
+        let result = compile_typechecks(vec![
+            make_model("upstream", "SELECT unnest(array(1, 2)) AS x"),
+            make_model("consumer", "SELECT a FROM upstream"),
+        ]);
+        assert!(
+            e039_diagnostics(&result).is_empty(),
+            "an aliased function can expand to different physical output names: {:?}",
+            result.diagnostics
+        );
     }
 
     #[test]
