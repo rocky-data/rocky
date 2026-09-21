@@ -173,7 +173,7 @@ protected = ["customer_id"]
 ```
 
 The contract declares two rules:
-- **required**: these columns must exist with the declared types. The compiler fails if one is missing or has the wrong type.
+- **required**: these columns must exist. The compiler checks a declared type only when it can infer the output type.
 - **protected**: these columns cannot be removed by a later change. The compiler fails with error `E013` if a protected column disappears from the model's output.
 
 The columns are marked `nullable = true`, and the TOML comment above explains why. A strict-contract walkthrough that pins types and nullability lives in the dedicated POCs.
@@ -186,20 +186,18 @@ Run the compiler to type-check all models, resolve dependencies, and validate co
 rocky compile --contracts contracts
 ```
 
-Expected output:
-
-```
-  ✓ raw_orders (6 columns)
-  ✓ customer_orders (4 columns)
-  ✓ revenue_summary (5 columns)
-
-  Compiled: 3 models, 0 errors, 0 warnings
-```
+The command exits `0`, but this template reports `I003` information notices.
+The compiler cannot infer every type from `raw__orders.orders` during this
+compile. It still checks the required output-column names.
 
 The compiler performs three checks:
 - **Dependency resolution**: it builds a DAG from the model configs. `customer_orders` depends on `raw_orders`, and `revenue_summary` depends on `customer_orders`.
-- **Type inference**: it resolves column types through the chain. `amount` in `raw_orders` flows through `sum(amount)` in `customer_orders` into `total_revenue / order_count` in `revenue_summary`.
-- **Contract validation**: it checks that `revenue_summary` outputs `customer_id` (Int64), `total_revenue` (Decimal), and `order_count` (Int64), as the contract requires.
+- **Type inference**: it carries known types through the model graph. This template leaves some types unknown, so it reports `I003` notices.
+- **Contract validation**: it checks required and protected output columns. It checks a declared type only when it can infer that type. An `I003` notice says when it could not.
+
+The template's local transformation pipeline does not support `rocky plan`.
+Use `rocky emit-sql` to inspect the statements before you run them. It does not
+create a saved plan or an approval.
 
 ### Try introducing an error
 
@@ -227,7 +225,20 @@ Run `rocky compile --contracts contracts` again:
   Compiled: 3 models, 1 errors, 0 warnings
 ```
 
-Revert the change before continuing.
+Restore the line before continuing. Use the compile command as a gate before
+you run models:
+
+```bash
+rocky compile --contracts contracts && rocky run
+```
+
+The `&&` runs `rocky run` only when the contract compile exits `0`.
+`rocky run` has no `--contracts` option. A bare run can execute the model graph
+without this contract check.
+
+A failed compile leaves tables from a previous run in `playground.duckdb`.
+`rocky preview rows` shows those stored rows. It does not prove the current
+source passed the contract check.
 
 ## 4. Run the Tests
 
@@ -258,6 +269,24 @@ The test runner does four things:
 ```bash
 rocky test --model revenue_summary
 ```
+
+### Run the Models and Inspect the Rows
+
+Materialize the model graph into `playground.duckdb` after the contract check
+passes:
+
+```bash
+rocky compile --contracts contracts && rocky run
+```
+
+Inspect the materialized result:
+
+```bash
+rocky preview rows --model revenue_summary
+```
+
+The command shows the output columns and up to 100 rows from the local DuckDB
+file. Run it again after a change to verify the materialized result.
 
 ## 5. View Column Lineage
 
