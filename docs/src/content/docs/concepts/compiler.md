@@ -168,6 +168,14 @@ what it had. A missing reference and unsupported inference can both lead to
 so checks that need the type can remain unresolved. A declared type does not
 validate an unresolved reference.
 
+Rocky reports `E039` for one bounded missing-reference shape. The consumer must
+directly project a name from one complete in-project model. The name must be
+absent from that model's output. Other shapes can remain `Unknown`. `E039`
+does not validate them.
+
+External source schemas do not prove completeness or freshness. Incomplete
+scopes, struct field reads, and warehouse metadata columns remain conservative.
+
 ### Numeric promotion
 
 When two numeric types meet in one expression (arithmetic, `COALESCE`, `CASE`,
@@ -261,6 +269,7 @@ span, and sometimes a suggested fix.
 | `E035` | Managed-Iceberg `format_options` declares a combination the warehouse rejects (e.g. `partition_by` + `cluster_by`) |
 | `E036` | Two or more models write the same target table |
 | `E037` | A transformation model declares `type = "incremental"`, which would append every row again on each run. Use `merge`, `delete_insert`, `time_interval` or `full_refresh` |
+| `E039` | A direct projection names a column absent from a complete in-project upstream model |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | Duplicate column in model output |
 | `W003` | `time_column` is TIMESTAMP where DATE is preferred for the granularity |
