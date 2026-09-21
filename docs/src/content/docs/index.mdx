@@ -42,10 +42,10 @@ not prove general SQL validity or correct result values. See
     A named branch is an isolated schema. `rocky replay <run_id>` inspects a run and shows its recorded per-model SQL hashes, row counts, and bytes.
   </Card>
   <Card title="Per-model cost attribution" icon="rocket">
-    Cost is a column on every run, not a dashboard you check afterwards. `[budget]` blocks fail the run on overspend, and `rocky preview cost` projects spend at PR time.
+    Rocky records available run duration and byte metrics. `rocky cost` derives a per-model allocation from metrics plus configured rates or an adapter formula. An estimate or allocation is not a warehouse bill.
   </Card>
   <Card title="AI-assisted drafting" icon="star">
-    `rocky ai` generates a draft and validates it against available project context. Review the generated files, run relevant tests, then plan and approve execution.
+    `rocky ai` generates a draft and validates it against available project context. Review the generated files and run relevant checks. Replication pipelines can use the saved plan and approval path before execution.
   </Card>
   <Card title="Dialect-divergence lint" icon="puzzle">
     `P001` catches a Snowflake-only construct in a Databricks project, and the reverse. Cross-warehouse teams stop finding portability bugs in prod.
@@ -97,7 +97,7 @@ project that one record from different angles.
         ▼               ▼               ▼
    rocky trace     rocky cost      rocky replay
    causality and   per-model       recorded hashes
-   concurrency     warehouse spend and row counts
+   concurrency     cost allocation and row counts
 ```
 
 Walk through it end to end in
