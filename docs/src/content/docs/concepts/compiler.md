@@ -179,6 +179,18 @@ columns remain conservative. The upstream output must use plain column
 projections or aliased columns and literals. Functions and other expressions
 remain conservative.
 
+During `rocky run`, a selected model with an `Error` diagnostic records a
+`compile-error`. Rocky withholds that model's declared DAG descendants. Healthy
+branches can still run. Retained target tables are old output, not validated
+output. `RunOutput.contained` lists the withheld descendants.
+
+With `rocky run --model <name> --defer`, a successful external rewrite
+suppresses local `E039` only for the rewritten reference. A qualified local
+reference or an unrewritten input remains local and keeps its normal blocking
+rules. The exemption requires a complete plain `SELECT` `FROM` or `JOIN` read
+set. CTEs, subqueries, and set operations keep local failure dependencies.
+An invalid external schema still fails when the warehouse runs the SQL.
+
 ### Numeric promotion
 
 When two numeric types meet in one expression (arithmetic, `COALESCE`, `CASE`,
