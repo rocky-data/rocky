@@ -161,6 +161,13 @@ pub const E037: &str = "E037";
 /// data, on every dialect.
 pub const E038: &str = "E038";
 
+/// A direct projection reads a column absent from a complete in-project model.
+///
+/// Emitted only when Rocky can prove the upstream model's output names are
+/// complete. External source schemas do not carry completeness or freshness
+/// provenance, so their unresolved references remain conservative `Unknown`s.
+pub const E039: &str = "E039";
+
 // Warnings
 /// Unused model (no downstream consumers).
 pub const W001: &str = "W001";

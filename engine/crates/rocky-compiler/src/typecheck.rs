@@ -18,7 +18,7 @@ use sqlparser::parser::Parser;
 
 use crate::compile::default_type_mapper;
 use crate::diagnostic::{
-    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E037, E038, I001, I002,
+    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E037, E038, E039, I001, I002,
     SourceSpan, W001, W002, W003, W004, W005, W006,
 };
 use crate::semantic::{ModelSchema, SemanticGraph};
@@ -552,6 +552,18 @@ fn compute_model_typecheck(
     );
     diagnostics.extend(enhanced_diags);
 
+    // A missing type is normally conservative Unknown: unsupported functions,
+    // incomplete source schemas, and expressions outside our inference subset
+    // are all valid reasons not to know. Refuse only the narrow case where the
+    // SQL directly projects a name from one complete in-project upstream model
+    // and that name is absent from the model's proven output schema.
+    diagnostics.extend(check_known_missing_projection_refs(
+        model_name,
+        model_schema,
+        graph,
+        model_by_name,
+    ));
+
     // Step 3: SELECT * warning
     let schema_incomplete = model_schema.has_star
         && model_schema
@@ -637,6 +649,215 @@ fn compute_model_typecheck(
         ref_map,
         typecheck_ms,
     }
+}
+
+/// Refuse a direct projection only when absence is proven from a complete
+/// in-project relation.
+///
+/// This deliberately skips expression traversal, external source schemas,
+/// CTEs, derived relations, joins, stars, set operations, and relation aliases
+/// with column lists. Those forms need more scope or provenance than the
+/// compiler currently carries, so they retain the existing `Unknown` fallback.
+fn check_known_missing_projection_refs(
+    model_name: &str,
+    model_schema: &ModelSchema,
+    graph: &SemanticGraph,
+    model_by_name: &HashMap<&str, &rocky_core::models::Model>,
+) -> Vec<Diagnostic> {
+    let Some(model) = model_by_name.get(model_name) else {
+        return Vec::new();
+    };
+    let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, &model.sql)
+    else {
+        return Vec::new();
+    };
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Vec::new();
+    };
+    if query.with.is_some() {
+        return Vec::new();
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Vec::new();
+    };
+    if !select.lateral_views.is_empty()
+        || select.exclude.is_some()
+        || select.value_table_mode.is_some()
+        || select.flavor != ast::SelectFlavor::Standard
+    {
+        return Vec::new();
+    }
+    let [from] = select.from.as_slice() else {
+        return Vec::new();
+    };
+    if !from.joins.is_empty() {
+        return Vec::new();
+    }
+    let TableFactor::Table {
+        name,
+        alias,
+        args,
+        with_hints,
+        version,
+        with_ordinality,
+        partitions,
+        json_path,
+        sample,
+        index_hints,
+    } = &from.relation
+    else {
+        return Vec::new();
+    };
+    if args.is_some()
+        || !with_hints.is_empty()
+        || version.is_some()
+        || *with_ordinality
+        || !partitions.is_empty()
+        || json_path.is_some()
+        || sample.is_some()
+        || !index_hints.is_empty()
+    {
+        return Vec::new();
+    }
+    if alias
+        .as_ref()
+        .is_some_and(|alias| !alias.columns.is_empty())
+    {
+        return Vec::new();
+    }
+    let [part] = name.0.as_slice() else {
+        return Vec::new();
+    };
+    let Some(relation_name) = part.as_ident().map(|ident| ident.value.as_str()) else {
+        return Vec::new();
+    };
+
+    // Bind only through the dependency graph's exact logical model name. A
+    // physical `catalog.schema.name` must never be shortened into a project
+    // model merely because the last component happens to match.
+    if !model_schema
+        .upstream
+        .iter()
+        .any(|upstream| upstream == relation_name)
+    {
+        return Vec::new();
+    }
+    let Some(upstream_model) = model_by_name.get(relation_name) else {
+        return Vec::new();
+    };
+    if !is_plain_select(&upstream_model.sql) {
+        return Vec::new();
+    }
+    let Some(upstream_schema) = graph
+        .model_schema(relation_name)
+        .filter(|schema| schema.schema_is_complete())
+    else {
+        return Vec::new();
+    };
+
+    let qualifier = alias
+        .as_ref()
+        .map_or(relation_name, |alias| alias.name.value.as_str());
+    let column_exists = |name: &str| {
+        upstream_schema
+            .columns
+            .iter()
+            .any(|column| column.name.eq_ignore_ascii_case(name))
+    };
+
+    let mut diagnostics = Vec::new();
+    let mut prior_projection_aliases: Vec<&str> = Vec::new();
+    for item in &select.projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => Some(expr),
+            _ => None,
+        };
+        let missing = expr.and_then(|expr| match expr {
+            Expr::Identifier(identifier) => {
+                let name = identifier.value.as_str();
+                // DuckDB/Postgres accept a relation binding as a whole-row
+                // value. A prior SELECT alias may also be visible in dialects
+                // Rocky supports. Neither is a source-column absence proof.
+                if name.eq_ignore_ascii_case(qualifier)
+                    || name.eq_ignore_ascii_case(relation_name)
+                    || is_warehouse_pseudo_column(name)
+                    || prior_projection_aliases
+                        .iter()
+                        .any(|alias| alias.eq_ignore_ascii_case(name))
+                    || column_exists(name)
+                {
+                    None
+                } else {
+                    Some(name)
+                }
+            }
+            Expr::CompoundIdentifier(parts) => {
+                let [qualifier_part, column_part] = parts.as_slice() else {
+                    return None;
+                };
+                // `s.foo` is not necessarily relation-alias qualification:
+                // when the upstream outputs a STRUCT column named `s`,
+                // DuckDB resolves this as field dereference. Prefer the valid
+                // expression over an absence diagnostic when both readings
+                // are possible.
+                if !qualifier_part.value.eq_ignore_ascii_case(qualifier)
+                    || column_exists(&qualifier_part.value)
+                    || is_warehouse_pseudo_column(&qualifier_part.value)
+                    || is_warehouse_pseudo_column(&column_part.value)
+                    || column_exists(&column_part.value)
+                {
+                    None
+                } else {
+                    Some(column_part.value.as_str())
+                }
+            }
+            _ => None,
+        });
+        if let Some(column) = missing {
+            diagnostics.push(
+                Diagnostic::error(
+                    E039,
+                    model_name,
+                    format!(
+                        "column '{column}' does not exist in complete upstream model '{relation_name}'"
+                    ),
+                )
+                .with_suggestion(format!(
+                    "use a column produced by '{relation_name}', or add the intended derivation upstream"
+                )),
+            );
+        }
+        if let SelectItem::ExprWithAlias { alias, .. } = item {
+            prior_projection_aliases.push(alias.value.as_str());
+        }
+    }
+    diagnostics
+}
+
+fn is_warehouse_pseudo_column(name: &str) -> bool {
+    name.eq_ignore_ascii_case("rowid")
+        || name.eq_ignore_ascii_case("_metadata")
+        || name.eq_ignore_ascii_case("_partitiontime")
+        || name.eq_ignore_ascii_case("_partitiondate")
+        || name
+            .get(.."metadata$".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("metadata$"))
+}
+
+fn is_plain_select(sql: &str) -> bool {
+    let Ok(statements) = Parser::parse_sql(&rocky_sql::dialect::DatabricksDialect, sql) else {
+        return false;
+    };
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return false;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    query.with.is_none()
+        && select.exclude.is_none()
+        && select.value_table_mode.is_none()
+        && select.flavor == ast::SelectFlavor::Standard
 }
 
 /// Validate a model's `time_interval` strategy against its typed output schema.
@@ -3721,6 +3942,183 @@ mod tests {
 
         let errors: Vec<_> = result.diagnostics.iter().filter(|d| d.is_error()).collect();
         assert!(errors.is_empty());
+    }
+
+    fn compile_typechecks(models: Vec<Model>) -> TypeCheckResult {
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None)
+    }
+
+    fn e039_diagnostics(result: &TypeCheckResult) -> Vec<&Diagnostic> {
+        result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code.as_ref() == E039)
+            .collect()
+    }
+
+    #[test]
+    fn known_missing_direct_projection_refuses() {
+        let result = compile_typechecks(vec![
+            make_model(
+                "stg_orders",
+                "SELECT order_id, customer_id, amount AS order_amount FROM raw.orders",
+            ),
+            make_model("fct_revenue", "SELECT order_id, amount FROM stg_orders"),
+        ]);
+
+        let diagnostics = e039_diagnostics(&result);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "diagnostics: {:?}",
+            result.diagnostics
+        );
+        let diagnostic = diagnostics[0];
+        assert_eq!(diagnostic.model, "fct_revenue");
+        assert!(diagnostic.message.contains("'amount'"));
+        assert!(diagnostic.message.contains("'stg_orders'"));
+        assert_eq!(diagnostic.span.as_ref().map(|span| span.line), Some(1));
+        assert_eq!(diagnostic.span.as_ref().map(|span| span.col), Some(1));
+    }
+
+    #[test]
+    fn known_missing_qualified_projection_refuses_but_valid_alias_passes() {
+        for (projection, expected_errors) in [
+            ("s.amount", 1),
+            ("s.order_amount", 0),
+            ("stg_orders.amount", 0),
+        ] {
+            let sql = format!("SELECT {projection} FROM stg_orders AS s");
+            let result = compile_typechecks(vec![
+                make_model(
+                    "stg_orders",
+                    "SELECT amount AS order_amount FROM raw.orders",
+                ),
+                make_model("consumer", &sql),
+            ]);
+            assert_eq!(
+                e039_diagnostics(&result).len(),
+                expected_errors,
+                "projection {projection}: {:?}",
+                result.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn known_missing_check_preserves_alias_and_nested_scopes() {
+        for sql in [
+            "SELECT order_id AS id2, id2 FROM stg_orders",
+            "SELECT u FROM stg_orders AS u",
+            "SELECT missing FROM stg_orders AS u(order_id, order_amount)",
+            "WITH stg_orders AS (SELECT 1 AS missing) SELECT missing FROM stg_orders",
+            "SELECT scoped.missing FROM (SELECT 1 AS missing) AS scoped",
+            "SELECT sha256(order_amount) AS digest FROM stg_orders",
+            "SELECT item FROM stg_orders LATERAL VIEW explode(array(1)) t AS item",
+            "SELECT missing FROM stg_orders()",
+            "SELECT s.foo FROM stg_orders AS s",
+            "SELECT rowid FROM stg_orders",
+            "SELECT s.ROWID FROM stg_orders AS s",
+            "SELECT _metadata FROM stg_orders",
+            "SELECT _PARTITIONTIME FROM stg_orders",
+            "SELECT _partitiondate FROM stg_orders",
+        ] {
+            let upstream_sql = if sql == "SELECT s.foo FROM stg_orders AS s" {
+                "SELECT struct_pack(foo := 42) AS s FROM raw.orders"
+            } else {
+                "SELECT order_id, amount AS order_amount FROM raw.orders"
+            };
+            let result = compile_typechecks(vec![
+                make_model("stg_orders", upstream_sql),
+                make_model("consumer", sql),
+            ]);
+            assert!(
+                e039_diagnostics(&result).is_empty(),
+                "valid or deferred scope must remain accepted for {sql}: {:?}",
+                result.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn known_warehouse_pseudo_column_names_remain_conservative() {
+        for name in [
+            "rowid",
+            "ROWID",
+            "_metadata",
+            "_PARTITIONTIME",
+            "_partitiondate",
+            "METADATA$FILENAME",
+            "metadata$file_row_number",
+        ] {
+            assert!(is_warehouse_pseudo_column(name), "{name}");
+        }
+        assert!(!is_warehouse_pseudo_column("ordinary_column"));
+    }
+
+    #[test]
+    fn known_missing_check_requires_exact_single_model_binding() {
+        let mut qualified_physical =
+            make_model("physical_reader", "SELECT missing FROM raw.upstream");
+        qualified_physical.config.depends_on = vec!["upstream".to_string()];
+
+        for consumer in [
+            qualified_physical,
+            make_model(
+                "mixed_reader",
+                "SELECT missing FROM upstream JOIN raw.extra ON upstream.id = raw.extra.id",
+            ),
+            make_model("source_reader", "SELECT missing FROM raw.orders"),
+        ] {
+            let result = compile_typechecks(vec![
+                make_model("upstream", "SELECT id FROM raw.orders"),
+                consumer,
+            ]);
+            assert!(
+                e039_diagnostics(&result).is_empty(),
+                "non-exact or mixed binding must stay conservative: {:?}",
+                result.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn known_missing_check_requires_complete_plain_upstream_projection() {
+        for upstream_sql in [
+            "SELECT * FROM raw.orders",
+            "SELECT (order_id), amount FROM raw.orders",
+        ] {
+            let result = compile_typechecks(vec![
+                make_model("upstream", upstream_sql),
+                make_model("consumer", "SELECT missing FROM upstream"),
+            ]);
+            assert!(
+                e039_diagnostics(&result).is_empty(),
+                "incomplete upstream must suppress absence for {upstream_sql}: {:?}",
+                result.diagnostics
+            );
+        }
+
+        assert!(!is_plain_select(
+            "SELECT id FROM raw.left UNION BY NAME SELECT id FROM raw.right"
+        ));
+    }
+
+    #[test]
+    fn parser_062_star_modifier_compatibility_gate_is_explicit() {
+        let dialect = rocky_sql::dialect::DatabricksDialect;
+        for sql in [
+            "SELECT * EXCLUDE (secret) FROM raw.orders",
+            "SELECT * REPLACE (1 AS amount) FROM raw.orders",
+            "SELECT * RENAME (amount AS order_amount) FROM raw.orders",
+        ] {
+            assert!(
+                Parser::parse_sql(&dialect, sql).is_err(),
+                "sqlparser 0.62 baseline unexpectedly accepts {sql}; add it to the incomplete-upstream controls before upgrading"
+            );
+        }
     }
 
     #[test]
