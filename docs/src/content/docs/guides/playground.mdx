@@ -356,7 +356,10 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 rocky ai "monthly revenue per customer from raw_orders, only completed orders"
 ```
 
-Rocky sends your intent to Claude, receives generated code, and compiles it to verify correctness. If compilation fails, it retries with the error context (up to 3 attempts).
+Rocky sends your intent to Claude, receives generated code, and compiles it
+against the available project context. Compilation can find supported static
+problems. It does not prove warehouse behavior or business correctness.
+Review the SQL and run relevant checks before you use the generated model.
 
 ### Add intent to existing models
 
@@ -378,10 +381,11 @@ See the [AI Features guide](/guides/ai-features/) for a complete walkthrough.
 
 ## 7. Run CI Locally
 
-The `ci` command runs compilation and testing in one pass, and returns an exit code your CI job can branch on:
+The `ci` command runs compilation and local tests in one pass. Pass the
+contracts directory when contract checks are part of the job:
 
 ```bash
-rocky ci
+rocky ci --contracts contracts
 ```
 
 ```
@@ -393,7 +397,9 @@ Rocky CI Pipeline
   Exit code: 0
 ```
 
-Exit code 0 means every check passed. A non-zero exit code fails the CI job.
+Exit code `0` means the configured supported checks passed. It does not prove
+warehouse execution or business correctness. A non-zero exit code fails the CI
+job.
 
 ## 8. Explore the POC Catalog
 
