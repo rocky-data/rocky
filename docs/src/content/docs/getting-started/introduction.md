@@ -6,8 +6,8 @@ sidebar:
 ---
 
 **Rocky is the typed graph between your code and your warehouse.** You write SQL
-and TOML. Rocky compiles them, checks every column type across the whole
-dependency graph, and only then sends SQL to the warehouse.
+and TOML. Rocky compiles them and reports supported static problems across the
+project graph. A later run sends generated SQL to the warehouse.
 
 Rocky owns the graph. Your warehouse keeps storage and compute: Databricks,
 Snowflake, BigQuery, or DuckDB. Everything between the two is Rocky's job:
@@ -18,7 +18,7 @@ dialect-portability lint, and per-model cost.
    your SQL + rocky.toml
             │
             ▼
-   ┌──────────────────┐   type errors, E### ──► fails the PR
+   ┌──────────────────┐   compile errors, E### ──► fix the project
    │      Rocky       │───────────────────────────────────┐
    │  compile · plan  │                                   │
    └────────┬─────────┘                                   ▼
@@ -47,8 +47,8 @@ number somebody already acted on.
 - An auditor asks who changed `fct_revenue.amount`, when, and why. The honest
   answer is `git blame` and screenshots.
 
-**Rocky turns each of these into a compile error or a CI gate.** A column-type
-change is `E011` at compile time. A rename's blast radius is a
+**Rocky can report or gate selected failures.** A known column-type mismatch can
+raise `E011` at compile time against a declared contract. A rename's represented blast radius is a
 `rocky lineage-diff` comment on the pull request. An unbudgeted cost spike is a
 `[budget]` block that fails the run. Classified data with no mask strategy fails
 `rocky compliance`.
@@ -105,12 +105,12 @@ declare data tests such as not-null and uniqueness, which
 Each item below names the CLI surface or diagnostic code it ships as, so you can
 check it rather than take it on faith.
 
-1. **SQL as a typed, compiled language.** Rocky infers column types across the
-   whole dependency graph. It reports problems as 35+ diagnostic codes: `E###`
+1. **SQL as a typed, compiled language.** Rocky infers column types where it
+   has enough source and expression information. It reports problems as `E###`
    errors, `W###` warnings, and `P###` portability lints, each with a suggested
    fix. This is a compiler with a language server, not a text-macro engine.
-2. **Column-level lineage at compile time.** Rocky traces every column through
-   every transformation before anything runs. `rocky lineage-diff main` lists
+2. **Column-level lineage at compile time.** Rocky traces represented columns
+   through supported transformations. `rocky lineage-diff main` lists
    the per-column downstream blast radius for a pull request. That CI gate needs
    a compiler; there is no way to do it from templated strings.
 3. **Branches and a content-addressed run record.** A named branch is an
@@ -125,9 +125,9 @@ check it rather than take it on faith.
    dashboard you check afterwards. `[budget]` blocks fail the run on overspend,
    `budget_breach` fires the hook, and `rocky preview cost` projects spend at
    pull-request time.
-5. **AI gated through the compiler.** Every AI suggestion has to type-check
-   before it lands. `rocky ai` generates a model, compiles it, auto-fixes what it
-   can, and ships. The `Attempts: 2` retry line is the signature. The wider AI
+5. **AI-assisted drafting.** `rocky ai` generates a model and validates it
+   against available project context. Treat the result as a draft. Review the
+   files, run relevant checks, then plan and approve execution. The wider AI
    surface, such as a mass refactor after a column-type change, is on the
    [Roadmap](/getting-started/roadmap/).
 6. **Dialect-divergence lint.** `P001` catches a Snowflake-only construct in a
@@ -152,8 +152,8 @@ See the [Roadmap](/getting-started/roadmap/) for the full breakdown.
 - **Fast.** A single binary that starts in under 100 ms. It compiles 10k models
   in about 1 s with about 150 MB of peak memory. See
   [benchmarks](/getting-started/benchmarks/).
-- **Type-safe.** Column-level type inference catches schema errors at compile
-  time, before a row is written.
+- **Typed checks.** Column-level inference can report resolvable schema errors
+  at compile time. Unknown types and runtime behavior need separate checks.
 - **SQL-first.** No Jinja. Business logic stays in SQL. An optional Rocky DSL
   exists for the cases plain SQL handles badly; it never replaces SQL.
 - **Config-first bronze.** Source replication is driven by `rocky.toml`, with

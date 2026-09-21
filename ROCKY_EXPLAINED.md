@@ -6,9 +6,12 @@ Everything Rocky does, from the outside in, with ASCII diagrams.
 
 ## 1. What Is Rocky?
 
-Rocky is a **typed, compiled data platform**. You write SQL. Rocky compiles it, checks it for mistakes, then runs it against your warehouse. A SQL-like DSL is available for people who want it, but raw SQL is the primary input.
+Rocky is a **typed, compiled data platform**. You write SQL. Rocky compiles it
+and reports supported static problems. A later command runs generated SQL
+against your warehouse. A SQL-like DSL is available for people who want it, but
+raw SQL is the primary input.
 
-Rocky has a real compiler. There is no Jinja templating and no string-substitution trick. Rocky parses your SQL into a typed tree. It then checks types across the whole DAG at once — the DAG being the graph of which model reads which. Only after every check passes does Rocky generate warehouse SQL.
+Rocky has a real compiler. There is no Jinja templating and no string-substitution trick. Rocky parses your SQL into a typed tree. It checks supported types, references, and contracts across the project graph when it can resolve the needed information. A successful compile generates warehouse SQL. It does not prove that every warehouse query is valid or that the result values are correct.
 
 ```
 You write this:            Rocky does this:              Warehouse gets this:
@@ -23,7 +26,7 @@ GROUP BY order_id          5. Generate dialect SQL         SUM(amount) AS total
                                                          GROUP BY order_id
 ```
 
-Key idea: **Rocky is a program that compiles other programs** (your SQL models). Compilation produces verified, typed SQL. Rocky sends that SQL to the warehouse. A type mismatch, a missing column, or a broken dependency stops the build before anything runs.
+Key idea: **Rocky is a program that compiles other programs** (your SQL models). Compilation produces typed SQL and diagnostics. A type mismatch, missing column, or broken dependency that Rocky can resolve stops that compile. A separate run can still encounter warehouse errors or produce an incorrect result.
 
 Rocky's terms are collected in the [glossary](https://rocky-data.dev/reference/glossary/).
 
@@ -33,7 +36,7 @@ Rocky's terms are collected in the [glossary](https://rocky-data.dev/reference/g
 
 | Feature | What it means |
 |---|---|
-| **Typed compiler** | Catches type mismatches and missing columns before any SQL runs |
+| **Typed compiler** | Reports resolvable type mismatches and missing columns before the compile succeeds |
 | **DAG-aware** | Knows which models depend on which; runs them in the right order |
 | **Multiple materialization strategies** | `full_refresh`, `merge`, `time_interval`, `microbatch`, `delete_insert`, `view`, `materialized_view`, `dynamic_table`, `content_addressed` |
 | **Incremental loads** | A replication pipeline copies only the rows newer than a stored watermark. A transformation model cannot use `incremental` (`E037`); use `merge` or `time_interval` |
@@ -707,7 +710,7 @@ Use these exact key names. Rocky ignores a key it does not recognise, and both s
 
 The `[rules]` block also accepts `no_new_nullable = true`. It is off by default. When it is on, every nullable output column the contract does not declare under `[[columns]]` is an E014 error. A contract that sets it with no `[[columns]]` at all is also E014: there is no baseline, so "new" would mean nothing.
 
-At compile time, Rocky checks every model against its contract:
+At compile time, Rocky checks contract facts it can resolve for each model:
 
 ```
 Compile time check:
@@ -1249,12 +1252,13 @@ Everything Rocky does, in one ASCII map:
  models/*.toml ──────────▶        │
                            ┌──────▼──────┐
  *.contract.toml ────────▶ │  Compiler   │ ── diagnostics (E/W/D/P/I codes)
-                           │  10 stages  │    ↓ errors → stop here
-                           └──────┬──────┘    ↓ clean → continue
+                           │  10 stages  │    ↓ errors → compile exits nonzero
+                           └──────┬──────┘    ↓ clean → a later run can execute
                                   │
                            ┌──────▼──────┐
                            │  ProjectIr  │  ModelIr × N
-                           │  (all typed)│
+                           │  (types may  │
+                           │   be Unknown)│
                            └──────┬──────┘
                                   │
                            ┌──────▼──────────────────────┐
@@ -1517,7 +1521,7 @@ A product spec at `products/<name>.toml` declares what a data product must be: i
 
 The other subcommands are `verify` (the frozen `propose_only` trust posture), `status`, `list`, `journal` (every persisted transition, in order), and `approve` (a human authority transition on the current spec revision).
 
-`rocky fulfill <product>` drives the loop: elicit → approve-spec → lower → draft → verify → governed propose → human review → digest-gated apply → observe. One invocation advances it as far as it can without a human, then stops and prints the state, why it stopped, and the exact next command. Its exit codes are their own vocabulary: `0` clean stop, `2` blocked, `3` parked for a human, `4` applied but failing a check the product declares about itself.
+`rocky fulfill <product>` drives the loop: elicit → approve-spec → lower → draft → verify → governed propose → human review → digest-gated apply → observe. One invocation advances it as far as it can without a human, then stops and prints the state, why it stopped, and the exact next command. Observation follows `apply`, so a failing output can already be live. Its exit codes are their own vocabulary: `0` clean stop, `2` blocked, `3` parked for a human, `4` applied but failing a check the product declares about itself.
 
 Reference: [product commands](https://rocky-data.dev/reference/commands/products/) and [`rocky fulfill`](https://rocky-data.dev/reference/commands/fulfill/).
 

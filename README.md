@@ -11,24 +11,28 @@
 [![VS Code CI](https://github.com/rocky-data/rocky/actions/workflows/vscode-ci.yml/badge.svg)](https://github.com/rocky-data/rocky/actions/workflows/vscode-ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-**Rocky checks your whole SQL pipeline before it runs, and tells you what a change will break.**
+**Rocky compiles SQL models, reports supported static problems, and helps you review changes before execution.**
 
 Rocky works with Databricks, Snowflake, BigQuery, and DuckDB. You keep your warehouse and your existing SQL. Apache 2.0.
 
-The failures that cost the most are the quiet ones. A source column changes type. Someone renames a column and three models stop working. A query works in dev and fails in production. Rocky finds all of these at check time.
+The failures that cost the most are the quiet ones. A source column can change
+type. Someone can rename a column and break downstream models. Rocky reports
+type and contract problems when the available SQL, schemas, and configuration
+make them visible. A clean compile does not prove every query will run in a
+warehouse or produce correct values.
 
 ```
    you edit SQL          rocky compile              rocky run
         │                      │                        │
         ▼                      ▼                        ▼
    ┌─────────┐        ┌──────────────────┐        ┌───────────┐
-   │  model  │───────►│  check the whole │───────►│ warehouse │
-   │  files  │        │  pipeline: types,│        │  writes   │
-   └─────────┘        │  refs, contracts │        └───────────┘
+   │  model  │───────►│  check selected  │───────►│ warehouse │
+   │  files  │        │  types, refs,    │        │  execution│
+   └─────────┘        │  and contracts   │        └───────────┘
                       └──────────────────┘
                                │
-                               │ a problem is found here,
-                               ▼ so nothing runs
+                               │ an error makes this compile
+                               ▼ exit nonzero
                         E010: required column
                         `order_id` is missing
 ```
@@ -116,14 +120,14 @@ tells you `fct_revenue.total_revenue` reads it, before you merge.
 ### More demos
 
 - [Schema drift recovery](examples/playground/pocs/02-performance/06-schema-drift-recover/): a source column changes type. Rocky spots it and rebuilds safely.
-- [Data contracts](examples/playground/pocs/01-quality/01-data-contracts-strict/): a missing or dropped column stops the build. You get `E010`, `E011` or `E013` before a row is written.
+- [Data contracts](examples/playground/pocs/01-quality/01-data-contracts-strict/): a known missing or dropped output column can refuse the affected model with `E010`, `E011`, or `E013`. An unresolved reference needs source schemas or a runtime check.
 - [BigQuery cost to the byte](examples/playground/pocs/07-adapters/05-bigquery-native-queries/): the run receipt matches your bill exactly. Needs credentials.
 - [Named branches and replay](examples/playground/pocs/00-foundations/06-branches-replay-lineage/): run against an isolated copy, look at it, then drop or promote it.
 - [Agent policy](examples/playground/pocs/03-ai/07-policy/): decide what an agent may do alone. CI catches a rule you loosen by accident.
 - [Column lineage](examples/playground/pocs/06-developer-experience/01-lineage-column-level/): trace one column back to its source.
 - [Incremental loads](examples/playground/pocs/02-performance/01-incremental-watermark/): set `strategy = "incremental"`. Rocky then reads only new rows.
 - [Data masking](examples/playground/pocs/04-governance/05-classification-masking-compliance/): tag the personal columns. The check fails if one goes out unmasked.
-- [AI model generation](examples/playground/pocs/03-ai/01-model-generation/): say what you want. Rocky writes the SQL, checks it, and retries if it is wrong.
+- [AI model generation](examples/playground/pocs/03-ai/01-model-generation/): say what you want. Rocky generates a draft and checks it against available project context. Review it and run relevant tests before execution.
 
 ## In your editor
 
@@ -174,15 +178,17 @@ The page cannot run or approve anything. Its token is read-only, and you approve
 
 Agents now write real pipeline changes. An agent that is trusted too much, with production access, can destroy real data in seconds. Rocky treats an agent as an operator with a controlled path to production.
 
-Rocky type-checks every change an agent writes. The agent produces a plan. A plan never applies itself. It must first pass the rules you wrote, and every decision goes into a ledger you can query.
+Rocky can check an agent's proposal against the project context it has. An agent
+can then produce a plan. A plan never applies itself. Before `rocky apply`
+executes it, configured policy and the AI-plan marker gate can refuse it.
 
 ```
    an agent drafts a change
               │
               ▼
    ┌─────────────────────┐
-   │ compiler            │   types and contracts are checked
-   │                     │   as the agent writes
+   │ compiler            │   available types and contracts
+   │                     │   can produce diagnostics
    └──────────┬──────────┘
               ▼
    ┌─────────────────────┐
@@ -217,14 +223,17 @@ Rocky type-checks every change an agent writes. The agent produces a plan. A pla
                └────────────┬─────────────┘
                             ▼
               ┌──────────────────────────────┐
-              │ every decision lands here:   │
+              │ recorded policy decisions:   │
               │ rocky audit · rocky brief    │
               └──────────────────────────────┘
 ```
 
 The diagram shows the gate at `rocky apply`. The MCP `draft` and `propose` tools read the same rules earlier, before Rocky keeps a file or a plan. Rocky leaves no new file for a denied draft, and writes no plan for a denied proposal.
 
-A rule can also name checks that must pass in that run. If one fails, or never ran, Rocky stops and records the failure. It cannot undo the write: the change stays until a human reverts it.
+A rule can name checks that must pass in that run. A failed or missing required
+check stops the governed action and records the failure. A check that runs after
+a warehouse write cannot undo that write. A person must review, repair, or
+revert it.
 
 - **You write the rules.** A `[policy]` rule in `rocky.toml` says what each principal may do, and where. The answer is allow, require review, or deny. Set `max_downstreams` to cap how far one change may reach.
 - **An AI-written plan needs an approval marker.** `rocky apply` refuses an AI-authored plan unless a marker file is present that parses and names that exact plan. That check runs whatever your rules say, so an `allow` rule cannot waive it — since engine v1.71.0; on earlier versions a rule could waive it. The marker is not signed, so it records that an approval was made on this machine, not who made it.
@@ -287,7 +296,7 @@ The loop does compare the checks it is about to run with the set the plan was ve
 
 The runner then re-reads what the agent wrote from disk, re-verifies it, and hands it to the same governed `propose` as any other agent change.
 
-The plan records the digest of the approved spec. A bare `rocky apply` refuses a product-bound plan. You run `rocky apply <plan-id> --expect-spec-digest <digest>`, and it refuses when the digest you pass does not match the one on the plan. `rocky fulfill` is experimental.
+The plan records the digest of the approved spec. A bare `rocky apply` refuses a product-bound plan. You run `rocky apply <plan-id> --expect-spec-digest <digest>`, and it refuses when the digest you pass does not match the one on the plan. `rocky fulfill` is experimental. It observes declared output checks after `apply`, so failing output can already be live. A person reviews the repair or reverts the change.
 
 Full detail: [Product commands](https://rocky-data.dev/reference/commands/products/) and [Fulfill commands](https://rocky-data.dev/reference/commands/fulfill/).
 
