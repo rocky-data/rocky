@@ -350,3 +350,5 @@ Dagster integration, and the adapter SDK.
 ## License
 
 [Apache 2.0](../LICENSE)
+
+<!-- throwaway edit for changelog-gate live-fire test v2, issue #1938, will be closed without merge -->
