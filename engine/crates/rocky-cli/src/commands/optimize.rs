@@ -26,18 +26,34 @@ pub fn optimize_output(
 ) -> Result<OptimizeOutput> {
     let store = StateStore::open_read_only(state_path)?;
 
-    // `[cost]` pricing: read it from the loaded project config when one
-    // exists, and fall back to `CostConfig::default()` only when the
-    // project has no `rocky.toml` to read (#2056). Credential-tolerant and
-    // offline, the same loader `rocky cost`'s `adapter_pricing` uses — this
-    // command opens no warehouse connection either. A `rocky.toml` that is
-    // there but does not load is a hard error: a wrong price is worse than
-    // no price.
+    // `[cost]` pricing: read it from the loaded project config when the
+    // project actually declares one, and fall back to `CostConfig::default()`
+    // otherwise (#2056) — whether because there is no `rocky.toml` to read,
+    // or because the loaded one declares no `[cost]` block. The second case
+    // needs an explicit check: `RockyConfig.cost` is `#[serde(default)]`, so
+    // an absent `[cost]` block still parses to a live `CostSection`, and that
+    // section's OWN conversion doesn't numerically match `CostConfig::default()`
+    // (found in Codex review of #2056: `CostSection::default().into()` is
+    // ~$0.0027/s of compute, not $0.002/s) — comparing against
+    // `CostSection::default()` is what actually answers "did the project set
+    // one", not merely "does the project have a rocky.toml". Credential-
+    // tolerant and offline, the same loader `rocky cost`'s `adapter_pricing`
+    // uses — this command opens no warehouse connection either. A
+    // `rocky.toml` that is there but does not load is a hard error: a wrong
+    // price is worse than no price.
     let config = match rocky_core::config::load_optional_project_config(Some(config_path))
         .with_context(|| format!("failed to load config from {}", config_path.display()))?
     {
-        Some(cfg) => CostConfig::from(cfg.cost),
-        None => CostConfig::default(),
+        // Exact comparison is deliberate: this asks "is the parsed section
+        // byte-identical to the default" (i.e. did the project declare
+        // nothing), not "is it numerically close to the default" — a
+        // project that explicitly sets every field to the default value is
+        // indistinguishable from setting none, and that's fine since the
+        // resulting price is identical either way.
+        Some(cfg) if cfg.cost != rocky_core::config::CostSection::default() => {
+            CostConfig::from(cfg.cost)
+        }
+        _ => CostConfig::default(),
     };
 
     // Get all runs to extract model names and compute stats
@@ -446,13 +462,14 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let models_dir = tmp.path().join("models");
         write_model(&models_dir, "priced_model", "type = \"view\"\n");
-        // compute_cost_per_dbu = 3600 => compute_cost_per_second = 1.0 (the
-        // conversion in `CostConfig::from(CostSection)` divides by 3600), so
-        // a 4s average run costs exactly $4.00/run, not the default $0.008.
+        // warehouse_size stays at its default ("Medium" = 24 DBU/hour, see
+        // `warehouse_size_to_dbu_per_hour`). compute_cost_per_dbu = 150 =>
+        // compute_cost_per_second = 150 * 24 / 3600 = 1.0, so a 4s average
+        // run costs exactly $4.00/run, not the default $0.008.
         // storage_cost_per_gb_month = 100 => 1 GiB costs $100/mo, not $0.023.
         write(
             &tmp.path().join("rocky.toml"),
-            "[cost]\ncompute_cost_per_dbu = 3600.0\nstorage_cost_per_gb_month = 100.0\n",
+            "[cost]\ncompute_cost_per_dbu = 150.0\nstorage_cost_per_gb_month = 100.0\n",
         );
         let config_path = tmp.path().join("rocky.toml");
         // duration >= 2s keeps this out of the "fast, view" branch so the
@@ -486,6 +503,54 @@ mod tests {
             (rec.estimated_monthly_savings - 500.0).abs() < 1e-6,
             "expected $500.00/mo savings from the custom prices, got {}",
             rec.estimated_monthly_savings
+        );
+    }
+
+    /// A `rocky.toml` that declares no `[cost]` block must price identically
+    /// to having no `rocky.toml` at all — both mean "the project set none"
+    /// (#2056). `RockyConfig.cost` is `#[serde(default)]`, so an absent
+    /// `[cost]` block still parses to a live `CostSection`, and that
+    /// section's OWN conversion does not numerically match
+    /// `CostConfig::default()` (Medium's 24 DBU/hour throughput moves the
+    /// compute price); pinned here so a future change to either default
+    /// can't silently re-diverge them.
+    #[test]
+    fn a_rocky_toml_with_no_cost_block_matches_no_rocky_toml_at_all() {
+        let with_toml = tempfile::tempdir().expect("tempdir");
+        write(
+            &with_toml.path().join("rocky.toml"),
+            "[state]\nbackend = \"local\"\n",
+        );
+        let with_toml_config = with_toml.path().join("rocky.toml");
+        let with_toml_state = record_history(with_toml.path(), "m", 5, 4_000, Some(1_073_741_824));
+
+        let no_toml = tempfile::tempdir().expect("tempdir");
+        let no_toml_config = no_toml.path().join("rocky.toml"); // never written
+        let no_toml_state = record_history(no_toml.path(), "m", 5, 4_000, Some(1_073_741_824));
+
+        let with = optimize_output(&with_toml_state, &with_toml_config, None, None)
+            .expect("optimize_output (rocky.toml, no [cost])");
+        let without = optimize_output(&no_toml_state, &no_toml_config, None, None)
+            .expect("optimize_output (no rocky.toml)");
+
+        assert_eq!(with.recommendations.len(), 1);
+        assert_eq!(without.recommendations.len(), 1);
+        let a = &with.recommendations[0];
+        let b = &without.recommendations[0];
+        assert_eq!(
+            a.compute_cost_per_run, b.compute_cost_per_run,
+            "a rocky.toml with no [cost] block must price compute like no rocky.toml at all"
+        );
+        assert_eq!(
+            a.storage_cost_per_month, b.storage_cost_per_month,
+            "a rocky.toml with no [cost] block must price storage like no rocky.toml at all"
+        );
+        // Pin the actual default, not just "the two paths agree": the
+        // built-in rate is $0.002/compute-second.
+        assert!(
+            (a.compute_cost_per_run - 4.0 * 0.002).abs() < 1e-9,
+            "expected the default $0.002/s compute rate, got {}",
+            a.compute_cost_per_run
         );
     }
 

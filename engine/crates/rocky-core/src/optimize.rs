@@ -58,9 +58,22 @@ impl Default for CostConfig {
 
 impl From<crate::config::CostSection> for CostConfig {
     fn from(section: crate::config::CostSection) -> Self {
+        // `compute_cost_per_dbu` is dollars per DBU-*hour* (Databricks'/
+        // Snowflake's own billing unit — see `CostSection`'s doc comment
+        // and the $0.40 default, which is a per-hour DBU rate). Converting
+        // it to a per-second compute price therefore needs the warehouse's
+        // DBU/hour throughput, not just a division by 3600: dividing the
+        // per-DBU-hour rate straight by 3600 silently assumes 1 DBU/hour,
+        // underpricing every other size (24x for the "Medium" default,
+        // `rocky cost`'s `adapter_pricing` already folds in this same
+        // factor via `warehouse_size_to_dbu_per_hour` — this conversion
+        // must match it (found in Codex review of #2056: this impl was
+        // unused in production before this PR wired it into
+        // `rocky optimize`, so the mismatch was never observed).
+        let dbu_per_hour = crate::cost::warehouse_size_to_dbu_per_hour(&section.warehouse_size);
         CostConfig {
             storage_cost_per_gb_month: section.storage_cost_per_gb_month,
-            compute_cost_per_second: section.compute_cost_per_dbu / 3600.0, // DBU per hour -> per second
+            compute_cost_per_second: section.compute_cost_per_dbu * dbu_per_hour / 3600.0,
             min_history_runs: section.min_history_runs,
         }
     }
@@ -387,6 +400,11 @@ mod tests {
         assert_eq!(result.recommended_strategy, "view");
     }
 
+    /// The "Medium" default carries a real DBU/hour throughput (24, per
+    /// `warehouse_size_to_dbu_per_hour`), so the per-second price is
+    /// `$/DBU-hour * DBU/hour / 3600`, not `$/DBU-hour / 3600` — the latter
+    /// silently assumes 1 DBU/hour and underprices every warehouse size by
+    /// that size's DBU/hour factor (found by Codex review of #2056).
     #[test]
     fn test_cost_section_defaults() {
         let section = crate::config::CostSection::default();
@@ -394,10 +412,24 @@ mod tests {
         let config: CostConfig = section.into();
         assert!((config.storage_cost_per_gb_month - 0.023).abs() < f64::EPSILON);
         assert!(config.compute_cost_per_second > 0.0);
-        // 0.40 DBU/hour = 0.40/3600 per second
-        let expected = 0.40 / 3600.0;
+        // 0.40 $/DBU-hour * 24 DBU/hour (Medium) / 3600 s/hour
+        let expected = 0.40 * 24.0 / 3600.0;
         assert!((config.compute_cost_per_second - expected).abs() < 1e-10);
         assert_eq!(config.min_history_runs, 5);
+    }
+
+    /// A non-default warehouse size changes the per-second price
+    /// proportionally to its DBU/hour throughput — the field is not
+    /// decorative.
+    #[test]
+    fn test_cost_section_scales_with_warehouse_size() {
+        let section = crate::config::CostSection {
+            warehouse_size: "Large".to_string(), // 40 DBU/hour
+            ..crate::config::CostSection::default()
+        };
+        let config: CostConfig = section.into();
+        let expected = 0.40 * 40.0 / 3600.0;
+        assert!((config.compute_cost_per_second - expected).abs() < 1e-10);
     }
 
     #[test]
