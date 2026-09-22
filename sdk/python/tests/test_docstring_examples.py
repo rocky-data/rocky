@@ -24,7 +24,18 @@ import pytest
 
 from rocky_sdk import RockyClient
 
-DOCUMENTED_METHODS = ("apply", "discover", "plan", "run")
+DOCUMENTED_METHODS = (
+    "apply",
+    "discover",
+    "plan",
+    "run",
+    "product_verify",
+    "product_compile",
+    "product_approve",
+    "product_status",
+    "product_list",
+    "product_journal",
+)
 
 # Minimal but SCHEMA-VALID engine payloads. Every required field is present —
 # a fixture that fails validation would make these tests fail for a reason
@@ -79,12 +90,108 @@ RUN_PAYLOAD: dict[str, Any] = {
     "errors": [{"asset_key": ["raw", "orders"], "error": "boom", "failure_kind": "query"}],
 }
 
+PRODUCT_VERIFY_PAYLOAD: dict[str, Any] = {
+    "version": "1",
+    "command": "product verify",
+    "product_id": "product:orders_mart",
+    "spec_digest": "sha256:aa",
+    # `needs_input` exercises the example's `paste_block` branch.
+    "status": "needs_input",
+    "paste_block": '[policy]\nagent_apply = "deny"',
+    "reason": "classification tag unresolved",
+    "output_model": "orders_mart",
+}
+
+PRODUCT_COMPILE_PAYLOAD: dict[str, Any] = {
+    "version": "1",
+    "command": "product compile",
+    "product_id": "product:orders_mart",
+    "spec_digest": "sha256:aa",
+    "spec_path": "products/orders_mart.toml",
+    "output_model": "orders_mart",
+    "phase": "lowered_contract",
+    "manifest_path": "products/.rocky/orders_mart.manifest.json",
+    "artifacts": [{"path": "products/orders_mart.sql", "sha256": "sha256:bb"}],
+    # `False` exercises the example's supersession-warning branch.
+    "spec_matches_approval": False,
+}
+
+PRODUCT_APPROVE_PAYLOAD: dict[str, Any] = {
+    "version": "1",
+    "command": "product approve",
+    "product_id": "product:orders_mart",
+    "spec_digest": "sha256:aa",
+    "output_model": "orders_mart",
+    # `False` exercises the example's fresh-approval branch.
+    "already_approved": False,
+    "approved_at": "2026-09-22T00:00:00Z",
+    "approver": "hugo",
+    "snapshot_path": "products/.rocky/orders_mart.snapshot.json",
+    "state": "spec_approved",
+}
+
+PRODUCT_STATUS_PAYLOAD: dict[str, Any] = {
+    "version": "1",
+    "command": "product status",
+    "product": "orders_mart",
+    "spec_present": True,
+    "staging_journal_present": False,
+    "journal_rows": 3,
+    "artifact_problems": [],
+    "committed_phase": "lowered_contract",
+}
+
+PRODUCT_LIST_PAYLOAD: dict[str, Any] = {
+    "version": "1",
+    "command": "product list",
+    "count": 1,
+    "products": [
+        {
+            "name": "orders_mart",
+            "spec_present": True,
+            "staging_journal_present": False,
+            "journal_rows": 3,
+            "artifact_problems": 0,
+            "committed_phase": "lowered_contract",
+            "fulfill_state": "spec_approved",
+        }
+    ],
+}
+
+PRODUCT_JOURNAL_PAYLOAD: dict[str, Any] = {
+    "version": "1",
+    "command": "product journal",
+    "product": "orders_mart",
+    "product_id": "product:orders_mart",
+    "count": 1,
+    # A non-empty journal exercises the `for row in result.rows` branch —
+    # the `except RockyCommandError` branch in the example references no
+    # model attributes, so there is nothing there for a fixture to guard.
+    "rows": [
+        {
+            "seq": 0,
+            "event": "spec approved",
+            "to_state": "spec_approved",
+            "at": "2026-09-22T00:00:00Z",
+        }
+    ],
+}
+
 # `rocky apply` of a run-shaped plan prints a RunOutput, so it reuses the payload.
+# `product <verb>` payloads are keyed by method name (`_payload_key` maps the
+# `["product", "<verb>", ...]` argv to it) since `args[0]` alone is `"product"`
+# for all six.
 PAYLOADS = {
     "discover": DISCOVER_PAYLOAD,
     "plan": PLAN_PAYLOAD,
     "run": RUN_PAYLOAD,
     "apply": RUN_PAYLOAD,
+    "product_verify": PRODUCT_VERIFY_PAYLOAD,
+    "product_compile": PRODUCT_COMPILE_PAYLOAD,
+    "product_approve": PRODUCT_APPROVE_PAYLOAD,
+    "product_status": PRODUCT_STATUS_PAYLOAD,
+    "product_list": PRODUCT_LIST_PAYLOAD,
+    "product_journal": PRODUCT_JOURNAL_PAYLOAD,
 }
 
 # Snippets that continue an earlier one (no `RockyClient(...)` of their own)
@@ -143,13 +250,27 @@ def _snippets(doc: str) -> list[str]:
     return [s for s in out if s.strip()]
 
 
+def _payload_key(args: list[str]) -> str:
+    """Map CLI argv to its ``PAYLOADS`` key.
+
+    ``args[0]`` alone (``"discover"``, ``"plan"``, ``"run"``, ``"apply"``) is
+    enough for the four core commands. ``rocky product <verb>`` needs the
+    subverb too — ``args[0]`` is just ``"product"`` for all six — so the key
+    becomes the method name, e.g. ``["product", "verify", "orders_mart"]`` ->
+    ``"product_verify"``.
+    """
+    if args[0] == "product":
+        return f"product_{args[1]}"
+    return args[0]
+
+
 def _fake_run_cli(self: RockyClient, args: list[str], **_kwargs: Any) -> str:
-    return json.dumps(PAYLOADS[args[0]])
+    return json.dumps(PAYLOADS[_payload_key(args)])
 
 
 @pytest.mark.parametrize("method", DOCUMENTED_METHODS)
 def test_core_method_has_a_runnable_example(method: str) -> None:
-    """#898: each of the four core methods documents a worked example.
+    """#898/#1802: each documented method carries a worked example.
 
     Asserted separately from execution so deleting an example fails loudly
     instead of silently reducing what the executing test covers to nothing.
