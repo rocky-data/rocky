@@ -56,6 +56,18 @@ fn init_duckdb(dir: &Path) -> Result<()> {
     // with "Catalog with name main does not exist" (#2005 review).
     // `init_duckdb_scaffold_catalog_matches_the_duckdb_derivation` below
     // pins all three call sites to `catalog_name_for_path`'s answer.
+    //
+    // `[pipeline.target.governance] auto_create_schemas = true` is required
+    // too: `auto_create_schemas` defaults to `false`, and a fresh
+    // `playground.duckdb` has no `staging__orders` schema yet — without
+    // this, `rocky run` gets past the catalog fix above and then fails with
+    // "Schema with name staging__orders does not exist" instead (also
+    // caught by the #2005 review). `dagster_rocky.scaffold`'s
+    // `ROCKY_TOML_TEMPLATE` (integrations/dagster, #1998) carries the same
+    // `[pipeline.main.target.governance] auto_create_schemas = true` for
+    // exactly this reason; this scaffold now matches its shape.
+    // `init_duckdb_scaffold_runs_end_to_end` below seeds this project and
+    // runs it for real, not just `rocky validate`.
     std::fs::write(
         dir.join("rocky.toml"),
         r#"# Rocky project — DuckDB local quickstart
@@ -67,8 +79,15 @@ type = "duckdb"
 path = "playground.duckdb"
 
 [pipeline]
+strategy = "full_refresh"
 source.schema_pattern = { prefix = "raw__", separator = "__", components = ["source"] }
-target = { catalog_template = "playground", schema_template = "staging__{source}" }
+
+[pipeline.target]
+catalog_template = "playground"
+schema_template = "staging__{source}"
+
+[pipeline.target.governance]
+auto_create_schemas = true
 "#,
     )?;
 
@@ -656,6 +675,108 @@ mod tests {
         assert!(
             model_sql.contains(&format!("FROM {expected}.")),
             "the sample model must read from the same catalog: {model_sql}"
+        );
+    }
+
+    /// #2152 follow-up: the `duckdb` scaffold must actually RUN, not just
+    /// `rocky validate` clean. Writes the scaffold, seeds `playground.duckdb`
+    /// with a `raw__demo.orders`-shaped source table matching the scaffold's
+    /// own `schema_pattern` (prefix `raw__`, separator `__`, components
+    /// `["source"]` — schema `raw__demo` parses to `source = "demo"`), runs
+    /// the replication pipeline for real, and asserts the row landed at
+    /// `playground.staging__demo.orders` — the catalog/schema the scaffold's
+    /// own `catalog_template`/`schema_template` name.
+    ///
+    /// `run()` returns `RunTermination`, which deliberately does not carry
+    /// the JSON `RunOutput`/`tables_copied` counter back to a caller ("CLI
+    /// callers discard this value" — see its doc comment), so this checks
+    /// the equivalent, stronger signal directly: the seeded row is actually
+    /// present at the destination, which cannot happen unless the copy ran.
+    ///
+    /// Before the `auto_create_schemas = true` fix, this failed with
+    /// "Schema with name staging__demo does not exist" — `playground.duckdb`
+    /// is created fresh by the seed step below and has no such schema yet.
+    ///
+    /// The scaffold's own `path = "playground.duckdb"` is relative — correct
+    /// for real use (a user runs `rocky` from inside the project directory,
+    /// exactly as the scaffold's own `rocky --config rocky.toml run` comment
+    /// assumes), but a `#[tokio::test]` shares the harness process's ONE
+    /// current directory with every other test running in parallel, so
+    /// rewriting it to `dir`'s `path` here (rather than calling
+    /// `std::env::set_current_dir`) tests the same pipeline logic without
+    /// that cross-test hazard.
+    #[tokio::test]
+    #[cfg(feature = "duckdb")]
+    async fn init_duckdb_scaffold_runs_end_to_end() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("proj");
+        init(dir.to_str().unwrap(), Some("duckdb")).unwrap();
+
+        let db_path = dir.join("playground.duckdb");
+        let config_path = dir.join("rocky.toml");
+        let rewritten = std::fs::read_to_string(&config_path).unwrap().replace(
+            "path = \"playground.duckdb\"",
+            &format!("path = {:?}", db_path.display().to_string()),
+        );
+        std::fs::write(&config_path, rewritten).unwrap();
+        {
+            let db = DuckDbWarehouseAdapter::open(&db_path).expect("seed duckdb");
+            for sql in [
+                "CREATE SCHEMA raw__demo",
+                "CREATE TABLE raw__demo.orders (order_id INTEGER, amount DECIMAL(10,2))",
+                "INSERT INTO raw__demo.orders VALUES (1, 9.99), (2, 19.99)",
+            ] {
+                db.execute_statement(sql).await.unwrap();
+            }
+        }
+
+        let state_path = dir.join("state.redb");
+        crate::commands::run::run(
+            &config_path,
+            std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+            ),
+            None, // filter
+            None, // pipeline_name_arg — single pipeline resolves
+            &state_path,
+            None,  // governance_override
+            true,  // output_json (suppresses pretty stdout in tests)
+            None,  // models_dir — replication-only run, no transformation models
+            false, // run_all
+            None,  // resume_run_id
+            false, // resume_latest
+            None,  // shadow_config
+            &crate::commands::run::PartitionRunOptions::default(),
+            None, // model_name_filter
+            None, // cache_ttl_override
+            None, // idempotency_key
+            None, // env
+            &crate::commands::run::DeferOptions::default(),
+            &crate::commands::run::SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            None,  // no run_id override — mint the usual timestamp id
+            None,  // no governance ctx (test)
+            false, // assume_fresh_state (test)
+            None,  // #1460
+        )
+        .await
+        .expect("the scaffolded duckdb project must run end to end");
+
+        let db = DuckDbWarehouseAdapter::open(&db_path).expect("verify duckdb");
+        let result = db
+            .execute_query("SELECT COUNT(*) FROM playground.staging__demo.orders")
+            .await
+            .expect("the replicated table must exist and be queryable");
+        let n: i64 = result.rows[0][0]
+            .as_i64()
+            .or_else(|| result.rows[0][0].as_str().and_then(|s| s.parse().ok()))
+            .expect("row count must parse");
+        assert!(
+            n >= 1,
+            "expected at least one row copied into playground.staging__demo.orders, got {n}"
         );
     }
 }
