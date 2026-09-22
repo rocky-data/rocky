@@ -163,8 +163,13 @@ pub fn run_optimize(
         println!(
             "{:<30} {:<12} {:<14} ${:<11.4} {}",
             truncate(&rec.model_name, 29),
-            rec.current_strategy,
-            rec.recommended_strategy,
+            // Before #2056, `current_strategy`/`recommended_strategy` were
+            // always "table" or "view" — both fit `{:<12}`/`{:<14}` with
+            // room to spare. Now they can be "materialized_view" or
+            // "content_addressed" (17 chars), so truncate like the other
+            // variable-width columns rather than let the table go ragged.
+            truncate(&rec.current_strategy, 11),
+            truncate(&rec.recommended_strategy, 13),
             rec.estimated_monthly_savings,
             truncate(&rec.reasoning, 40),
         );
