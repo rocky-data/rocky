@@ -6,12 +6,20 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Sentinel [`ModelStats::current_strategy`] for a model whose configured
+/// strategy could not be determined — e.g. it appears only in run history
+/// and is absent from the compiled project. [`recommend_strategy`] treats
+/// this as a hard "make no recommendation" signal rather than comparing it
+/// against an assumed baseline (#2056).
+pub const UNKNOWN_STRATEGY: &str = "unknown";
+
 /// Cost estimate and strategy recommendation for a single model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaterializationCost {
     /// Name of the model being analyzed.
     pub model_name: String,
-    /// Current materialization strategy (e.g., "table", "view", "incremental").
+    /// Current materialization strategy (e.g., "table", "view", "incremental";
+    /// [`UNKNOWN_STRATEGY`] when the caller could not determine it).
     pub current_strategy: String,
     /// Estimated compute cost per run in dollars.
     pub compute_cost_per_run: f64,
@@ -63,7 +71,9 @@ impl From<crate::config::CostSection> for CostConfig {
 pub struct ModelStats {
     /// Name of the model.
     pub model_name: String,
-    /// Current materialization strategy.
+    /// Current materialization strategy, or [`UNKNOWN_STRATEGY`] when the
+    /// caller could not resolve it (e.g. a history-only model absent from
+    /// the compiled project).
     pub current_strategy: String,
     /// Average execution duration in seconds across recent runs.
     pub avg_duration_seconds: f64,
@@ -86,10 +96,33 @@ pub struct ModelStats {
 ///   Higher storage cost justified by reduced total compute across consumers.
 ///   A view is also what a very fast (< 2s) single-consumer model gets: it
 ///   stores nothing, and recomputing it on read costs little.
+/// - **[`UNKNOWN_STRATEGY`]**: neither. `stats.current_strategy ==
+///   UNKNOWN_STRATEGY` short-circuits before either branch, echoing the
+///   sentinel back as both current and recommended strategy with zero
+///   savings, rather than comparing it against a guess.
 pub fn recommend_strategy(stats: &ModelStats, config: &CostConfig) -> MaterializationCost {
     let compute_cost_per_run = stats.avg_duration_seconds * config.compute_cost_per_second;
     let storage_cost_per_month = stats.estimated_size_gb * config.storage_cost_per_gb_month;
     let monthly_compute = compute_cost_per_run * stats.runs_per_month;
+
+    // The model's real strategy is unknown to the caller (#2056) — comparing
+    // it against a recommended "table"/"view" would silently pass off a
+    // guess as a considered recommendation. Report the cost inputs, make no
+    // recommendation.
+    if stats.current_strategy == UNKNOWN_STRATEGY {
+        return MaterializationCost {
+            model_name: stats.model_name.clone(),
+            current_strategy: stats.current_strategy.clone(),
+            compute_cost_per_run,
+            storage_cost_per_month,
+            downstream_references: stats.downstream_references,
+            recommended_strategy: stats.current_strategy.clone(),
+            estimated_monthly_savings: 0.0,
+            reasoning: "current strategy is unknown (model not found in the compiled project); \
+                        no recommendation"
+                .to_string(),
+        };
+    }
 
     // Not enough history to make a recommendation
     if stats.history_runs < config.min_history_runs {
@@ -258,6 +291,28 @@ mod tests {
         // monthly compute = 5 * 0.002 * 4 = 0.04
         // storage = 50 * 0.023 = 1.15
         assert!(result.estimated_monthly_savings > 1.0);
+    }
+
+    /// An unknown current strategy (#2056: a model absent from the compiled
+    /// project) must never be told to "switch" — the recommender has no real
+    /// baseline to compare against, so it reports the sentinel back and
+    /// zero savings rather than comparing it against a guessed "table".
+    #[test]
+    fn test_unknown_strategy_gets_no_recommendation() {
+        let stats = ModelStats {
+            model_name: "history_only_model".into(),
+            current_strategy: UNKNOWN_STRATEGY.into(),
+            avg_duration_seconds: 30.0,
+            estimated_size_gb: 2.0,
+            downstream_references: 5,
+            history_runs: 20,
+            runs_per_month: 30.0,
+        };
+        let result = recommend_strategy(&stats, &default_config());
+        assert_eq!(result.current_strategy, UNKNOWN_STRATEGY);
+        assert_eq!(result.recommended_strategy, UNKNOWN_STRATEGY);
+        assert_eq!(result.estimated_monthly_savings, 0.0);
+        assert!(result.reasoning.contains("unknown"));
     }
 
     #[test]
