@@ -164,9 +164,10 @@ PRODUCT_JOURNAL_PAYLOAD: dict[str, Any] = {
     "product": "orders_mart",
     "product_id": "product:orders_mart",
     "count": 1,
-    # A non-empty journal exercises the `for row in result.rows` branch —
-    # the `except RockyCommandError` branch in the example references no
-    # model attributes, so there is nothing there for a fixture to guard.
+    # A non-empty journal exercises the `for row in result.rows` branch.
+    # The example's `except RockyCommandError as exc` branch reads
+    # `exc.stderr_tail`, checked separately since this fixture returns a
+    # successful payload instead of raising.
     "rows": [
         {
             "seq": 0,
@@ -255,7 +256,7 @@ def _payload_key(args: list[str]) -> str:
 
     ``args[0]`` alone (``"discover"``, ``"plan"``, ``"run"``, ``"apply"``) is
     enough for the four core commands. ``rocky product <verb>`` needs the
-    subverb too — ``args[0]`` is just ``"product"`` for all six — so the key
+    subverb too, since ``args[0]`` is just ``"product"`` for all six. The key
     becomes the method name, e.g. ``["product", "verify", "orders_mart"]`` ->
     ``"product_verify"``.
     """

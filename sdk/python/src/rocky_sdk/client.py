@@ -1097,7 +1097,7 @@ class RockyClient:
 
         Example:
 
-            Branch on ``status`` — not on a caught exception, since the
+            Branch on ``status``, not on a caught exception, since the
             non-pass statuses are not errors here::
 
                 from rocky_sdk import RockyClient
@@ -1142,7 +1142,7 @@ class RockyClient:
                     print(" ", artifact.path, artifact.sha256)
 
                 if result.spec_matches_approval is False:
-                    print("spec has moved past the approval — re-approve before fulfilling")
+                    print("spec has moved past the approval: re-approve before fulfilling")
         """
         return _parse_rocky_json(
             self.run_cli(["product", "compile", product]),
@@ -1197,7 +1197,10 @@ class RockyClient:
                 result = client.product_status("orders_mart")
 
                 if not result.spec_present:
-                    print("no products/orders_mart.toml yet")
+                    # False covers both "no products/orders_mart.toml" and
+                    # "the file exists but does not parse". spec_error says
+                    # which, when the CLI knows.
+                    print("no usable spec:", result.spec_error)
                 elif result.artifact_problems:
                     print("byte-verification failed:", result.artifact_problems)
                 else:
@@ -1249,9 +1252,11 @@ class RockyClient:
 
         Example:
 
-            An empty journal and an unknown product are different things —
-            catch :class:`~rocky_sdk.exceptions.RockyCommandError` for the
-            latter rather than reading an empty ``rows`` as "unknown"::
+            An unknown product surfaces as
+            :class:`~rocky_sdk.exceptions.RockyCommandError`, with the
+            engine's reason in ``stderr_tail``. An empty journal is a normal
+            result with no rows, not an error, so do not read one as the
+            other::
 
                 from rocky_sdk import RockyClient, RockyCommandError
 
@@ -1259,8 +1264,8 @@ class RockyClient:
 
                 try:
                     result = client.product_journal("orders_mart")
-                except RockyCommandError:
-                    print("orders_mart is not a product this project knows")
+                except RockyCommandError as exc:
+                    print("product journal failed:", exc.stderr_tail)
                 else:
                     if not result.rows:
                         print("orders_mart has no fulfillment history yet")
