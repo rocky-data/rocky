@@ -416,7 +416,7 @@ See [Data quality checks](/concepts/data-quality-checks/) for what each one mean
 | `fail_on_error` | bool | `true` | When `false`, downgrades every `error`-severity assertion to a non-fatal result. |
 | `row_count` | bool | `false` | Compare row counts between source and target. |
 | `column_match` | bool | `false` | Verify source and target have the same column sets. |
-| `freshness` | table | | `{ threshold_seconds = N }`. The `overrides` map parses and validates, but nothing reads it: every table is checked against the single `threshold_seconds` ([#1620](https://github.com/rocky-data/rocky/issues/1620)). |
+| `freshness` | table | | `{ threshold_seconds = N }`. Every table is checked against the single `threshold_seconds`. There is no per-schema override. |
 | `null_rate` | table | | `{ columns = [...], threshold = 0.0–1.0, sample_percent = 10 }`. |
 | `custom` | list | `[]` | Custom SQL checks. Each entry has `name`, `sql`, and optional `threshold`. |
 | `anomaly_threshold_pct` | float | `50.0` | Row count deviation percentage that triggers an anomaly. Set to 0 (or a negative value) to disable detection. Must be a finite number: `nan` and `inf` are refused when the config loads. |
