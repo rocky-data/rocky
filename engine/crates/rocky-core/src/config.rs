@@ -2042,12 +2042,15 @@ impl<'de> Deserialize<'de> for RemovedSchemaEvolution {
 ///
 /// Controls pricing assumptions used by [`crate::optimize::recommend_strategy`]
 /// when analyzing materialization costs and generating recommendations.
-///
-/// `PartialEq` lets a caller (`rocky optimize`) tell "the project declared no
-/// `[cost]` block" (this equals [`CostSection::default`]) apart from "the
-/// project declared `[cost]` with values that happen to be the defaults" —
-/// both parse to the same struct under serde's field-level `#[serde(default)]`,
-/// so there is no other signal after parsing.
+//
+// `PartialEq` (a plain code comment, not `///`, so it doesn't change this
+// struct's exported JSON Schema `description` and trigger the codegen
+// cascade for an unrelated derive) lets a caller (`rocky optimize`) tell
+// "the project declared no `[cost]` block" (this equals
+// `CostSection::default()`) apart from "the project declared `[cost]` with
+// values that happen to be the defaults" — both parse to the same struct
+// under serde's field-level `#[serde(default)]`, so there is no other
+// signal after parsing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CostSection {
