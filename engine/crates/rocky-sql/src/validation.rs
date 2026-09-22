@@ -78,9 +78,9 @@ pub enum ValidationError {
 
     // ---- `expression` check content (#1524) -------------------------------
     // An expression check is interpolated into `WHERE NOT (<expression>)` and
-    // executed with the project's warehouse credentials. These seven refuse
-    // anything that is not one expression over the model's own columns. See
-    // `crate::check_expression`.
+    // executed with the project's warehouse credentials. The first five below
+    // refuse anything that is not one expression over the model's own
+    // columns. See `crate::check_expression`.
     //
     // The same validator judges a metadata column value, a filter and a
     // grouping key, so the advice beside each refusal comes from `use_`
@@ -90,11 +90,13 @@ pub enum ValidationError {
     // author of a `filter` it wrote "an expression check" names the wrong
     // field (#1971).
     //
-    // `ExpressionVolatileInKey` and `ExpressionCollateInKey` are their own
-    // variants rather than more `ExpressionFunctionNotAllowed` cases: both
-    // refuse something already allowed (or not a function at all) for its
-    // POSITION, not its name, so "add it to CHECK_EXPRESSION_FUNCTIONS" was
-    // false advice for either (#1971).
+    // `ExpressionVolatileInKey` and `ExpressionCollateInKey` refuse a
+    // different thing: content that IS a valid, on-list expression, refused
+    // only because of where it sits (a grouping key). They are their own
+    // variants rather than more `ExpressionFunctionNotAllowed` cases because
+    // "add it to CHECK_EXPRESSION_FUNCTIONS" is false advice for either — the
+    // volatile name is already on the list, and COLLATE is not a function at
+    // all (#1971).
     #[error(
         "{context}: expression does not parse as a single SQL expression ({detail}). {} is {}",
         .use_.noun(),

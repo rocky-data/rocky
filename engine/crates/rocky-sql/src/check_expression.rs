@@ -507,7 +507,12 @@ impl ExpressionUse {
     ///
     /// False only for a grouping key, where the value must come from the row.
     /// Exhaustive on purpose (no wildcard): a new variant must pick a side
-    /// rather than silently inherit one.
+    /// rather than silently inherit one. The refusal built from `false` here
+    /// (`ValidationError::ExpressionVolatileInKey`, in the walker below)
+    /// hardcodes the word "key" into its sentence, so a future variant that
+    /// picks `false` for a reason other than "this position is a grouping
+    /// key" needs that message split back out by noun, the same way
+    /// `ExpressionFunctionNotAllowed` was (#1971).
     fn tolerates_volatility(self) -> bool {
         match self {
             ExpressionUse::SinglePredicate

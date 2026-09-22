@@ -1216,6 +1216,23 @@ mod tests {
         );
     }
 
+    /// The CHANGELOG for #1971 names `cross_source_overlap`'s `key_expr`
+    /// alongside `unique_expr`'s — both go through the same `GroupingKey`
+    /// mode, so both need the fixed advice pinned at their own entry point,
+    /// not only at `unique_expr`'s in `rocky-core/src/tests.rs`.
+    #[test]
+    fn test_cross_source_overlap_key_expr_refuses_a_volatile_function_with_its_own_advice() {
+        let siblings = vec![sibling("s1", "t"), sibling("s2", "t")];
+        let err = generate_cross_source_overlap_sql(&siblings, &["now()".into()], &dialect())
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("A value that can change between evaluations cannot be a key"),
+            "{msg}"
+        );
+        assert!(!msg.contains("CHECK_EXPRESSION_FUNCTIONS"), "{msg}");
+    }
+
     #[test]
     fn test_cross_source_overlap_key_expr_accepts_quoted_literals() {
         // The shipped POC key: quoted `'|'` separator, balanced, no terminator.
