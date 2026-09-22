@@ -87,7 +87,7 @@ miette = { version = "7", features = ["fancy"] }
 glob = "0.3"
 
 # SQL parsing
-sqlparser = { version = "0.62", features = ["visitor"] }
+sqlparser = { version = "0.63", features = ["visitor"] }
 
 # State store
 redb = "2"
@@ -116,7 +116,7 @@ tokio = { version = "1", features = ["full"] }
 # and `result_type_reaches_a_2026_07_28_client_and_no_other` green — NOT by
 # narrowing `supported_protocol_versions`, which is the extreme that test was
 # written to distinguish from a real fix.
-rmcp = { version = "=3.3.0", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "=3.4.0", features = ["server", "macros", "transport-io"] }
 
 # HTTP
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "http2"] }
