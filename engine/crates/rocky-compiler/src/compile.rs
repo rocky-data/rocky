@@ -943,6 +943,86 @@ mod tests {
         assert_eq!(incremental.type_check.typed_models["m11"].len(), 1);
     }
 
+    #[test]
+    fn known_missing_diagnostic_tracks_upstream_edits_incrementally() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("create models dir");
+
+        // Twelve models keep this on the real incremental path. Changing m00
+        // affects m00 + m01, which remains below the half-project fallback.
+        write_flat_models(&models_dir, 12);
+        std::fs::write(models_dir.join("m00.sql"), "SELECT 1 AS amount\n").expect("write upstream");
+        std::fs::write(models_dir.join("m01.sql"), "SELECT amount FROM m00\n")
+            .expect("write consumer");
+        std::fs::write(models_dir.join("m02.sql"), "SELECT missing FROM m03\n")
+            .expect("write independent broken consumer");
+
+        let config = CompilerConfig {
+            models_dir: models_dir.clone(),
+            ..Default::default()
+        };
+        let first = compile(&config).expect("first compile");
+        assert_eq!(
+            first
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code.as_ref() == "E039")
+                .map(|diagnostic| diagnostic.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m02"]
+        );
+
+        let upstream = models_dir.join("m00.sql");
+        std::fs::write(&upstream, "SELECT 1 AS order_amount\n").expect("rename upstream output");
+        let broken = compile_incremental(&config, std::slice::from_ref(&upstream), &first)
+            .expect("incremental after upstream rename");
+        let mut broken_models = broken
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code.as_ref() == "E039")
+            .map(|diagnostic| diagnostic.model.as_str())
+            .collect::<Vec<_>>();
+        broken_models.sort_unstable();
+        assert_eq!(
+            broken_models,
+            vec!["m01", "m02"],
+            "new dependent diagnostic and unaffected retained diagnostic"
+        );
+
+        let consumer = models_dir.join("m01.sql");
+        std::fs::write(&consumer, "SELECT order_amount FROM m00\n")
+            .expect("repair downstream output");
+        let repaired = compile_incremental(&config, std::slice::from_ref(&consumer), &broken)
+            .expect("incremental after downstream repair");
+        assert_eq!(
+            repaired
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code.as_ref() == "E039")
+                .map(|diagnostic| diagnostic.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m02"],
+            "repair removes the affected error while preserving unrelated diagnostics"
+        );
+
+        let full = compile(&config).expect("full compile of final state");
+        assert_eq!(
+            repaired
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code.as_ref() == "E039")
+                .map(|diagnostic| (&diagnostic.model, diagnostic.message.as_ref()))
+                .collect::<Vec<_>>(),
+            full.diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code.as_ref() == "E039")
+                .map(|diagnostic| (&diagnostic.model, diagnostic.message.as_ref()))
+                .collect::<Vec<_>>(),
+            "incremental and full compile must agree on the final diagnostic set"
+        );
+    }
+
     /// 🔴 #1730. A model under a directory whose name is not valid UTF-8 must
     /// still be marked affected when the watcher reports it changed.
     ///

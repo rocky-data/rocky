@@ -441,12 +441,11 @@ class MetricsSnapshot(BaseModel):
 class ContainedModel(BaseModel):
     """A model Rocky withheld this run because an upstream failed.
 
-    Emitted only under ``[resilience] contain_failures``: when a model (or one
-    of its upstreams) fails, the engine continues the disjoint subgraphs and
-    records every withheld model here — the blast radius of the failures named
-    in :attr:`RunResult.errors`. A withheld model was **not built**; its target
-    was left untouched. Empty (and omitted from the wire) for a default
-    fail-fast run and for any successful run.
+    Emitted after an upstream compile failure, or when ``[resilience]
+    contain_failures`` continues disjoint subgraphs after a runtime failure.
+    Rocky records every withheld model here — the blast radius of failures in
+    :attr:`RunResult.errors`. A withheld model was **not built**; its target was
+    left untouched. Empty and omitted from the wire when no model was withheld.
 
     Hand-written to match the wire field names emitted by the engine's
     ``ContainedModelOutput``. It is not re-exported from the generated barrel,
@@ -532,11 +531,11 @@ class RunResult(BaseModel):
     #: Run id this run resumed from, when invoked with ``--resume``. ``None``
     #: for a fresh run.
     resumed_from: str | None = None
-    #: Models withheld this run because an upstream failed (or was itself
-    #: withheld) and ``[resilience] contain_failures`` continued the disjoint
-    #: subgraphs — the blast radius of the failures in :attr:`errors`. Empty
-    #: (and omitted on the wire) for a default fail-fast run and for any
-    #: successful run. Without this field declared, Pydantic's default
+    #: Models withheld after an upstream compile failure, or while
+    #: ``[resilience] contain_failures`` continues disjoint subgraphs after a
+    #: runtime failure. This is the blast radius of failures in :attr:`errors`.
+    #: Empty and omitted on the wire when no model was withheld. Without this
+    #: field declared, Pydantic's default
     #: ``extra="ignore"`` would silently drop the wire value (the runtime
     #: ``RunResult`` is the hand-written dispatch target, not the generated
     #: ``RunOutput``), so a consumer mapping it — e.g. dagster-rocky surfacing

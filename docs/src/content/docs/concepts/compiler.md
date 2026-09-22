@@ -168,6 +168,29 @@ what it had. A missing reference and unsupported inference can both lead to
 so checks that need the type can remain unresolved. A declared type does not
 validate an unresolved reference.
 
+Rocky reports `E039` for one bounded missing-reference shape. The consumer must
+directly project a name from one complete in-project model. The name must be
+absent from that model's output. Other shapes can remain `Unknown`. `E039`
+does not validate them.
+
+External source schemas do not prove completeness or freshness. Incomplete
+scopes, duplicate output names, struct field reads, and warehouse metadata
+columns remain conservative. The upstream output must use plain column
+projections or aliased columns and literals. Functions and other expressions
+remain conservative.
+
+During `rocky run`, a selected model with an `Error` diagnostic records a
+`compile-error`. Rocky withholds that model's declared DAG descendants. Healthy
+branches can still run. Retained target tables are old output, not validated
+output. `RunOutput.contained` lists the withheld descendants.
+
+With `rocky run --model <name> --defer`, a successful external rewrite
+suppresses local `E039` only for the rewritten reference. A qualified local
+reference or an unrewritten input remains local and keeps its normal blocking
+rules. The exemption requires a complete plain `SELECT` `FROM` or `JOIN` read
+set. CTEs, subqueries, and set operations keep local failure dependencies.
+An invalid external schema still fails when the warehouse runs the SQL.
+
 ### Numeric promotion
 
 When two numeric types meet in one expression (arithmetic, `COALESCE`, `CASE`,
@@ -261,6 +284,7 @@ span, and sometimes a suggested fix.
 | `E035` | Managed-Iceberg `format_options` declares a combination the warehouse rejects (e.g. `partition_by` + `cluster_by`) |
 | `E036` | Two or more models write the same target table |
 | `E037` | A transformation model declares `type = "incremental"`, which would append every row again on each run. Use `merge`, `delete_insert`, `time_interval` or `full_refresh` |
+| `E039` | A direct projection names a column absent from a complete in-project upstream model |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | Duplicate column in model output |
 | `W003` | `time_column` is TIMESTAMP where DATE is preferred for the granularity |

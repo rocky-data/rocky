@@ -902,7 +902,17 @@ parallelism: 2 lanes
 
 ## `rocky cost`
 
-Historical cost rollup for a completed run. Reads the same `RunRecord` as [`rocky replay`](#rocky-replay) and [`rocky trace`](#rocky-trace), then recomputes per-model cost via the adapter-appropriate formula (Databricks / Snowflake duration × DBU rate; BigQuery bytes × $/TB; DuckDB zero). The three are siblings: replay shows what ran, trace shows when, `cost` shows what it cost.
+Historical cost allocation for a completed run. `rocky cost` reads the same
+`RunRecord` as [`rocky replay`](#rocky-replay) and
+[`rocky trace`](#rocky-trace). It recomputes per-model dollar values from the
+recorded metrics and the current configuration's selected adapter and formula.
+
+The command does not contact the warehouse or read an invoice. Its dollar
+values can change when you change the configured rates or selected adapter. In
+the output, `cost_usd` is an allocation. It is not a billed amount.
+
+When a model lacks the metrics for its formula, its dollar value is `null`.
+The total includes only models with a dollar value. It is not a complete bill.
 
 ```bash
 rocky cost <target> [flags]
@@ -930,6 +940,9 @@ Roll up cost for the most recent run:
 ```bash
 rocky cost latest
 ```
+
+The dollar values in this example are illustrative allocations. They are not
+invoice amounts.
 
 ```json
 {
@@ -986,12 +999,16 @@ status: success   adapter: databricks   total: $0.101
 
 ### Adapter coverage
 
-- **Databricks / Snowflake**: cost computed from recorded duration × DBU rate × `$/DBU`. Configure via `[cost]` in `rocky.toml` (see [configuration reference](/reference/configuration/#cost)).
-- **BigQuery**: computed from recorded `bytes_scanned` × `$6.25/TB`. `rocky cost` surfaces real dollars here even when the live `rocky apply` still reports `None` for BQ bytes on its own `RunOutput.cost_summary`, because the state-store record is written before that plumbing completes.
-- **DuckDB / local**: `$0.00` by definition (no billed compute).
+- **Databricks / Snowflake**: derived from recorded duration, the configured warehouse size, and `[cost].compute_cost_per_dbu`. The adapter does not report a billed amount. An omitted `[cost]` block uses Rocky's defaults.
+- **BigQuery**: the compiled bytes formula runs only when the saved run has `bytes_scanned`. Otherwise `cost_usd` is `null`.
+- **DuckDB / local**: the cost model reports `$0.00`. This excludes machine and infrastructure costs. DuckDB `EXPLAIN` supplies no numeric byte, row, or compute estimate.
 - **Discovery adapters (Fivetran, Airbyte, etc.)**: skipped; cost is `None`.
 
-Missing `adapter_type` or unconfigured `[cost]` degrades cleanly: the command still emits duration + bytes totals but leaves `cost_usd` as `null`.
+If the configuration file is missing, the command keeps recorded duration and
+bytes but leaves `cost_usd` as `null`. A discovery-only adapter also has no
+dollar allocation. A configured DuckDB adapter reports the local `$0.00`
+model. An unreadable configuration is an error. Missing BigQuery bytes is
+`null`, not zero.
 
 ### Related Commands
 
