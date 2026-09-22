@@ -408,7 +408,7 @@ fn shape_refusal(name: &str, function: &Function) -> Option<&'static str> {
         {
             Some(
                 "with a date part other than `week` (or one of its synonyms `w`, `wk`, \
-                 `weekofyear`, `woy`, `wy`) — e.g. `date_trunc('day', x)`. A `week` \
+                 `weekofyear`, `woy`, `wy`), for example `date_trunc('day', x)`. A `week` \
                  truncation depends on Snowflake's WEEK_START session parameter",
             )
         }
@@ -426,7 +426,7 @@ fn shape_refusal(name: &str, function: &Function) -> Option<&'static str> {
         {
             Some(
                 "with a date part other than `week` (or one of its synonyms `w`, `wk`, \
-                 `weekofyear`, `woy`, `wy`) — e.g. `datediff('day', a, b)`. A `week` \
+                 `weekofyear`, `woy`, `wy`), for example `datediff('day', a, b)`. A `week` \
                  difference depends on Snowflake's WEEK_START session parameter",
             )
         }
