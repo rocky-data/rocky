@@ -373,6 +373,8 @@ pub enum ConfigError {
          first spec wins and the second is silently dropped. Rename one of them."
     )]
     DuplicateCheckName {
+        /// The pipeline the collision was found in.
+        pipeline: String,
         /// `"<kind> \"<name>\""`, e.g. `custom "null rate id"` — kind and
         /// name folded into one field (rather than two) to keep this
         /// variant's size down; `ConfigError` is returned by value on
@@ -380,10 +382,11 @@ pub enum ConfigError {
         /// `result_large_err` flags a variant this wide.
         source_a: String,
         source_b: String,
-        /// Where the collision applies: `"on table \"orders\""` for a
-        /// single-table pair (an assertion is involved), or a
-        /// pipeline-wide phrase for two table-independent producers
-        /// (custom checks and `null_rate` columns run on EVERY
+        /// Where the collision applies, already naming `pipeline` in
+        /// prose: `"on table \"orders\" in pipeline \"p\""` for a
+        /// single-table pair (an assertion is involved), or `"on every
+        /// table pipeline \"p\" copies"` for two table-independent
+        /// producers (custom checks and `null_rate` columns run on EVERY
         /// materialized table).
         scope: String,
         sanitized: String,
@@ -3961,9 +3964,10 @@ pub fn validate_checks(config: &RockyConfig) -> Vec<ConfigError> {
         let table_independent = table_independent_check_names(checks, executed_kinds);
         for (a, b, sanitized) in resolved_check_name_collisions(&table_independent) {
             errors.push(ConfigError::DuplicateCheckName {
+                pipeline: name.clone(),
                 source_a: describe_resolved_check_name(&a),
                 source_b: describe_resolved_check_name(&b),
-                scope: "on every table this pipeline copies".to_string(),
+                scope: format!("on every table pipeline {name:?} copies"),
                 sanitized,
             });
         }
@@ -3988,9 +3992,10 @@ pub fn validate_checks(config: &RockyConfig) -> Vec<ConfigError> {
                     continue;
                 }
                 errors.push(ConfigError::DuplicateCheckName {
+                    pipeline: name.clone(),
                     source_a: describe_resolved_check_name(&a),
                     source_b: describe_resolved_check_name(&b),
-                    scope: format!("on table {table:?}"),
+                    scope: format!("on table {table:?} in pipeline {name:?}"),
                     sanitized,
                 });
             }
@@ -9792,9 +9797,13 @@ threshold = 0
             "a table-independent collision must be refused: {errors:?}"
         );
         if let Some(ConfigError::DuplicateCheckName {
-            source_a, source_b, ..
+            pipeline,
+            source_a,
+            source_b,
+            ..
         }) = found
         {
+            assert_eq!(pipeline, "repl", "must name the offending pipeline");
             let sources = [source_a.as_str(), source_b.as_str()];
             assert!(
                 sources.iter().any(|s| s.contains("null rate amount")),

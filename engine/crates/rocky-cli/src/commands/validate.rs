@@ -547,6 +547,9 @@ fn config_error_diagnostic(
             "V046",
             Some(format!("pipeline.{pipeline}.checks.anomaly_threshold_pct")),
         ),
+        ConfigError::DuplicateCheckName { pipeline, .. } => {
+            ("V046", Some(format!("pipeline.{pipeline}.checks")))
+        }
         _ => ("V046", None),
     };
 
