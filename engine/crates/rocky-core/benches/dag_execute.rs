@@ -74,6 +74,10 @@ fn bench_dag(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("dag_execute_wide_50");
     group.measurement_time(Duration::from_secs(10));
+    // CI runs this on every `perf`-labeled PR (#1947): keep it cheap. 10
+    // samples of the ~500ms sequential arm is ~5s, well under the 10s
+    // measurement window above.
+    group.sample_size(10);
 
     for (label, concurrency) in [("sequential", Some(1)), ("parallel", None)] {
         group.bench_with_input(

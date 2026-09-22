@@ -64,6 +64,7 @@ jobs:
         run: |
           cargo bench --bench compile -p rocky-cli -- --output-format bencher | tee bench-output.txt
           cargo bench --bench state_store -p rocky-core -- --output-format bencher | tee -a bench-output.txt
+          cargo bench --bench dag_execute -p rocky-core -- --output-format bencher | tee -a bench-output.txt
 
       # This workflow runs only on perf-labeled PRs (no push trigger), so there
       # is no main-branch baseline to compare against — github-action-benchmark
