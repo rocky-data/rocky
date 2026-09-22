@@ -1094,6 +1094,24 @@ class RockyClient:
         JSON report — ``allow_partial=True`` returns that JSON (the doctor
         pattern), so callers triage ``status`` from the result, not from the
         exit code.
+
+        Example:
+
+            Branch on ``status``, not on a caught exception, since the
+            non-pass statuses are not errors here::
+
+                from rocky_sdk import RockyClient
+
+                client = RockyClient(config_path="rocky.toml")
+                result = client.product_verify("orders_mart")
+
+                if result.status == "pass":
+                    print("verified:", result.spec_digest)
+                elif result.status == "needs_input":
+                    print("edit [policy] to:")
+                    print(result.paste_block)
+                else:
+                    print("verify failed:", result.reason)
         """
         return _parse_rocky_json(
             self.run_cli(["product", "verify", product], allow_partial=True),
@@ -1108,6 +1126,23 @@ class RockyClient:
         sidecar exists) merges the spec-owned metadata. Every generation
         commits through the staged journaled protocol with the manifest
         rename as the marker.
+
+        Example:
+
+            Compile, then check whether the working spec has moved past
+            the approval it was last checked against::
+
+                from rocky_sdk import RockyClient
+
+                client = RockyClient(config_path="rocky.toml")
+                result = client.product_compile("orders_mart")
+
+                print(result.phase, "->", result.manifest_path)
+                for artifact in result.artifacts:
+                    print(" ", artifact.path, artifact.sha256)
+
+                if result.spec_matches_approval is False:
+                    print("spec has moved past the approval: re-approve before fulfilling")
         """
         return _parse_rocky_json(
             self.run_cli(["product", "compile", product]),
@@ -1122,6 +1157,21 @@ class RockyClient:
         state-store transaction (approval record + fulfillment state +
         journal row). Re-approving the already-approved digest is a no-op
         with ``already_approved = True``.
+
+        Example:
+
+            Distinguish a fresh approval from a repeat of one already on
+            record::
+
+                from rocky_sdk import RockyClient
+
+                client = RockyClient(config_path="rocky.toml")
+                result = client.product_approve("orders_mart")
+
+                if result.already_approved:
+                    print("already approved at", result.approved_at)
+                else:
+                    print("approved", result.spec_digest, "by", result.approver)
         """
         return _parse_rocky_json(
             self.run_cli(["product", "approve", product]),
@@ -1135,6 +1185,26 @@ class RockyClient:
         Spec identity, committed lowering phase, artifact byte-verification,
         pending staging journal, approval + snapshot integrity, and the
         persisted fulfillment state. Never mutates.
+
+        Example:
+
+            Check byte-verification before trusting a committed artifact
+            downstream::
+
+                from rocky_sdk import RockyClient
+
+                client = RockyClient(config_path="rocky.toml")
+                result = client.product_status("orders_mart")
+
+                if not result.spec_present:
+                    # False covers both "no products/orders_mart.toml" and
+                    # "the file exists but does not parse". spec_error says
+                    # which, when the CLI knows.
+                    print("no usable spec:", result.spec_error)
+                elif result.artifact_problems:
+                    print("byte-verification failed:", result.artifact_problems)
+                else:
+                    print(result.committed_phase, "committed;", result.journal_rows, "journal rows")
         """
         return _parse_rocky_json(
             self.run_cli(["product", "status", product]),
@@ -1149,6 +1219,21 @@ class RockyClient:
         holds a fulfillment or approval record for, sorted by name. A
         project with no products returns an empty list, not an error.
         Never mutates.
+
+        Example:
+
+            List every product with its committed phase, flagging any
+            whose committed artifacts no longer match their manifest::
+
+                from rocky_sdk import RockyClient
+
+                client = RockyClient(config_path="rocky.toml")
+                result = client.product_list()
+
+                for product in result.products:
+                    print(product.name, product.committed_phase, product.fulfill_state)
+                    if product.artifact_problems:
+                        print("  byte-verification problems:", product.artifact_problems)
         """
         return _parse_rocky_json(
             self.run_cli(["product", "list"]),
@@ -1164,6 +1249,28 @@ class RockyClient:
         through. A known product with no rows returns an empty journal; a
         product the project does not know fails with ``RockyCommandError``
         (exit 1). Never mutates.
+
+        Example:
+
+            An unknown product surfaces as
+            :class:`~rocky_sdk.exceptions.RockyCommandError`, with the
+            engine's reason in ``stderr_tail``. An empty journal is a normal
+            result with no rows, not an error, so do not read one as the
+            other::
+
+                from rocky_sdk import RockyClient, RockyCommandError
+
+                client = RockyClient(config_path="rocky.toml")
+
+                try:
+                    result = client.product_journal("orders_mart")
+                except RockyCommandError as exc:
+                    print("product journal failed:", exc.stderr_tail)
+                else:
+                    if not result.rows:
+                        print("orders_mart has no fulfillment history yet")
+                    for row in result.rows:
+                        print(row.seq, row.at, row.event, "->", row.to_state)
         """
         return _parse_rocky_json(
             self.run_cli(["product", "journal", product]),
