@@ -1169,6 +1169,15 @@ fn validate_replication_pipeline(
         });
     }
 
+    // V055: for a DuckDB target WITH a `path`, a literal (no placeholder)
+    // catalog_template that disagrees with the catalog name DuckDB actually
+    // assigns the file is a warning — `rocky run` fails with "Catalog Error:
+    // Catalog with name '<template>' does not exist!" (#2005). A warning,
+    // not an error: DuckDB itself doesn't reject the config, only the run.
+    if let Some(msg) = duckdb_catalog_template_mismatch(name, pipeline, cfg) {
+        msgs.push(msg);
+    }
+
     msgs.push(ValidateMessage {
         severity: "ok".into(),
         code: "V020".into(),
@@ -1181,6 +1190,63 @@ fn validate_replication_pipeline(
     });
 
     (ok, msgs)
+}
+
+/// Warns when a DuckDB target adapter has a persistent `path` AND
+/// `target.catalog_template` is a literal (no `{placeholder}`) that
+/// disagrees with the catalog name DuckDB will actually assign that file.
+///
+/// Only checked for a literal template — one containing a `{placeholder}`
+/// resolves to something this function can't predict without the runtime
+/// schema-pattern values, and V049 above already validates the placeholder
+/// itself.
+///
+/// Gated on the `duckdb` Cargo feature (default-on) because the derivation
+/// this compares against lives in `rocky-duckdb`, itself an optional
+/// dependency of this crate — see `#[cfg(feature = "duckdb")]` elsewhere in
+/// this file (e.g. `archive.rs`, `compile.rs`) for the same convention.
+#[cfg(feature = "duckdb")]
+fn duckdb_catalog_template_mismatch(
+    name: &str,
+    pipeline: &rocky_core::config::ReplicationPipelineConfig,
+    cfg: &rocky_core::config::RockyConfig,
+) -> Option<ValidateMessage> {
+    let target_adapter = cfg.adapters.get(&pipeline.target.adapter)?;
+    if target_adapter.adapter_type != "duckdb" {
+        return None;
+    }
+    let path = target_adapter.path.as_ref()?;
+    if !rocky_core::schema::template_placeholder_names(&pipeline.target.catalog_template)
+        .is_empty()
+    {
+        return None;
+    }
+    let expected = rocky_duckdb::dialect::catalog_name_for_path(path);
+    if pipeline.target.catalog_template == expected {
+        return None;
+    }
+    Some(ValidateMessage {
+        severity: "warn".into(),
+        code: "V055".into(),
+        message: format!(
+            "pipeline.{name}: target.catalog_template = '{}' but DuckDB names the catalog \
+             '{expected}' for adapter.{}'s path '{path}' (the file's base name, or \
+             '<name>_db' when that name collides with a reserved catalog) — `rocky run` will \
+             fail with a catalog-not-found error unless target.catalog_template matches.",
+            pipeline.target.catalog_template, pipeline.target.adapter
+        ),
+        file: None,
+        field: Some(format!("pipeline.{name}.target.catalog_template")),
+    })
+}
+
+#[cfg(not(feature = "duckdb"))]
+fn duckdb_catalog_template_mismatch(
+    _name: &str,
+    _pipeline: &rocky_core::config::ReplicationPipelineConfig,
+    _cfg: &rocky_core::config::RockyConfig,
+) -> Option<ValidateMessage> {
+    None
 }
 
 fn validate_transformation_pipeline(
@@ -3019,6 +3085,163 @@ schema_template = "staging__{source}"
         assert!(
             !out.messages.iter().any(|m| m.code == "V049"),
             "known placeholders must not trigger V049: {:?}",
+            out.messages
+        );
+    }
+
+    /// #2005 case 4: a literal `catalog_template` that disagrees with the
+    /// catalog name DuckDB actually assigns the target file is a warning —
+    /// `rocky run` fails with "Catalog with name '<template>' does not
+    /// exist!" once it tries to write there.
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn test_duckdb_catalog_template_mismatch_is_v055_warning() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = "warehouse.duckdb"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "other"
+schema_template = "demo"
+"#,
+        );
+        assert!(out.valid, "a catalog_template mismatch is a warning, not an error");
+        let v055: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V055" && m.severity == "warn")
+            .collect();
+        assert_eq!(v055.len(), 1, "expected one V055: {:?}", out.messages);
+        assert!(v055[0].message.contains("'other'"));
+        assert!(v055[0].message.contains("'warehouse'"));
+        assert_eq!(
+            v055[0].field.as_deref(),
+            Some("pipeline.poc.target.catalog_template")
+        );
+    }
+
+    /// Pins the DuckDB-specific "main" -> "main_db" reserved-catalog
+    /// derivation (the exact example in #2005) — not just "some" mismatch.
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn test_duckdb_catalog_template_main_reserved_name_is_v055() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = "main.duckdb"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "main"
+schema_template = "demo"
+"#,
+        );
+        let v055: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V055" && m.severity == "warn")
+            .collect();
+        assert_eq!(v055.len(), 1, "expected one V055: {:?}", out.messages);
+        assert!(
+            v055[0].message.contains("'main_db'"),
+            "must name the actual DuckDB catalog name, main_db: {}",
+            v055[0].message
+        );
+    }
+
+    /// Counter-check: a `catalog_template` that already matches the
+    /// DuckDB-derived name must not warn.
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn test_duckdb_catalog_template_match_is_not_v055() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = "warehouse.duckdb"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "warehouse"
+schema_template = "demo"
+"#,
+        );
+        assert!(
+            !out.messages.iter().any(|m| m.code == "V055"),
+            "a matching catalog_template must not warn: {:?}",
+            out.messages
+        );
+    }
+
+    /// Counter-check: a `catalog_template` with a placeholder is never
+    /// literal, so it must never trigger V055 regardless of what it would
+    /// resolve to — V049 above validates the placeholder itself.
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn test_duckdb_catalog_template_with_placeholder_is_not_v055() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = "warehouse.duckdb"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "{source}"
+schema_template = "demo"
+"#,
+        );
+        assert!(
+            !out.messages.iter().any(|m| m.code == "V055"),
+            "a templated catalog_template must not warn: {:?}",
             out.messages
         );
     }

@@ -284,6 +284,93 @@ impl SqlDialect for DuckDbSqlDialect {
     }
 }
 
+/// The catalog name DuckDB assigns when it attaches the database file at
+/// `path` as the primary database — mirrors
+/// `AttachedDatabase::ExtractDatabaseName` in DuckDB's own
+/// `src/main/attached_database.cpp` (checked against the bundled 1.10503
+/// source and confirmed live against the `duckdb` 1.5.5 CLI, #2005): the
+/// file's base name (any `?query` suffix stripped), split on every `.`, with
+/// empty pieces dropped — the FIRST remaining piece is the name. If that
+/// name collides with a catalog DuckDB reserves (`main`, `temp`, `system`),
+/// DuckDB appends `_db`.
+///
+/// No such derivation existed anywhere in this crate before this function —
+/// `rocky-duckdb` just opens the file and lets the bundled DuckDB engine
+/// name the catalog internally. This is the first Rust-side copy, added so
+/// `rocky validate` can warn when a config's `catalog_template` disagrees
+/// with the name DuckDB will actually use.
+///
+/// Examples (confirmed against the live CLI):
+/// - `"warehouse.duckdb"` -> `"warehouse"`
+/// - `"main.duckdb"` -> `"main_db"` (collides with the reserved `main` catalog)
+/// - `"my.warehouse.duckdb"` -> `"my"` (DuckDB splits on the FIRST `.`, not the last —
+///   this differs from [`std::path::Path::file_stem`], which would return `"my.warehouse"`)
+pub fn catalog_name_for_path(path: &str) -> String {
+    let base = std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path);
+    // DuckDB strips a `?query` suffix before splitting on `.`
+    // (`RemoveQueryParams` in `attached_database.cpp`).
+    let base = base.split('?').next().unwrap_or(base);
+    let first_segment = base.split('.').find(|s| !s.is_empty()).unwrap_or(base);
+    match first_segment {
+        "main" | "temp" | "system" => format!("{first_segment}_db"),
+        other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod catalog_name_for_path_tests {
+    use super::catalog_name_for_path;
+
+    #[test]
+    fn plain_stem_is_the_catalog_name() {
+        assert_eq!(catalog_name_for_path("warehouse.duckdb"), "warehouse");
+        assert_eq!(catalog_name_for_path("wh.duckdb"), "wh");
+        assert_eq!(catalog_name_for_path("/tmp/dir/wh.duckdb"), "wh");
+    }
+
+    #[test]
+    fn reserved_names_get_the_db_suffix() {
+        assert_eq!(catalog_name_for_path("main.duckdb"), "main_db");
+        assert_eq!(catalog_name_for_path("system.duckdb"), "system_db");
+        assert_eq!(catalog_name_for_path("temp.duckdb"), "temp_db");
+    }
+
+    #[test]
+    fn reserved_check_is_case_sensitive() {
+        // Matches DuckDB's own `name == DEFAULT_SCHEMA` exact-string check —
+        // "MAIN.duckdb" does NOT get the "_db" suffix (it instead fails to
+        // attach at all, a live-adapter concern, not this pure function's).
+        assert_eq!(catalog_name_for_path("MAIN.duckdb"), "MAIN");
+    }
+
+    #[test]
+    fn first_dot_wins_not_the_last() {
+        // DuckDB splits the base name on EVERY '.' and keeps the first
+        // piece — NOT `Path::file_stem()`, which would keep everything
+        // before only the last extension ("my.warehouse").
+        assert_eq!(catalog_name_for_path("my.warehouse.duckdb"), "my");
+        assert_eq!(catalog_name_for_path("foo.bar.baz.duckdb"), "foo");
+    }
+
+    #[test]
+    fn leading_dot_is_a_hidden_file_marker_not_the_name() {
+        assert_eq!(catalog_name_for_path(".hidden.duckdb"), "hidden");
+    }
+
+    #[test]
+    fn no_extension_uses_the_whole_base_name() {
+        assert_eq!(catalog_name_for_path("warehouse"), "warehouse");
+    }
+
+    #[test]
+    fn query_suffix_is_stripped_before_splitting() {
+        assert_eq!(catalog_name_for_path("warehouse.duckdb?access_mode=ro"), "warehouse");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
