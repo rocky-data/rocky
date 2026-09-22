@@ -3704,6 +3704,20 @@ pub struct ResolvedCheckName {
     /// siblings (`cross_source_overlap`) and so may not be emitted on every
     /// run. Mirrors `ResolvedCheckNameOutput.candidate`.
     pub candidate: bool,
+    /// Disambiguates two entries whose `name` is byte-identical — chiefly
+    /// two UNNAMED assertions on the same table, same test kind, same (or
+    /// absent) column: `resolved_name()` synthesizes the same
+    /// `"{kind}:{column}"` for both (e.g. two unnamed `expression`
+    /// assertions both produce `"expression:-"`), so without this a
+    /// collision message naming both sides would print the identical
+    /// string twice, telling the author nothing about WHICH two assertions
+    /// collide. Populated only for [`CheckNameKind::Assertion`] — its
+    /// 1-based position among the table's own `[[checks.assertions]]`
+    /// entries, e.g. `"assertion #2 for table"`. Internal only; not part
+    /// of any JSON output — `rocky-cli`'s `ResolvedCheckNameOutput`
+    /// projection reads only `name`/`kind`/`candidate` and ignores this
+    /// field, so adding it here does not touch the wire schema.
+    pub detail: Option<String>,
 }
 
 /// Custom-check and `null_rate` names, independent of any specific table.
@@ -3729,6 +3743,7 @@ fn table_independent_check_names(
                 name: custom.name.clone(),
                 kind: CheckNameKind::Custom,
                 candidate: false,
+                detail: None,
             });
         }
     }
@@ -3741,6 +3756,7 @@ fn table_independent_check_names(
                 name: crate::checks::null_rate_check_name(col),
                 kind: CheckNameKind::NullRate,
                 candidate: false,
+                detail: None,
             });
         }
     }
@@ -3783,11 +3799,20 @@ pub fn resolved_check_names_for_table(
     let mut names = table_independent_check_names(cfg, executed_kinds);
 
     if runs(CheckKind::Assertions) {
-        for assertion in cfg.assertions.iter().filter(|a| a.table == table) {
+        for (idx, assertion) in cfg
+            .assertions
+            .iter()
+            .filter(|a| a.table == table)
+            .enumerate()
+        {
             names.push(ResolvedCheckName {
                 name: assertion.resolved_name(),
                 kind: CheckNameKind::Assertion,
                 candidate: false,
+                // 1-based, and scoped to THIS table's own assertions (not
+                // a global index into `cfg.assertions`) — see the doc
+                // comment on `ResolvedCheckName::detail`.
+                detail: Some(format!("assertion #{} for table {table:?}", idx + 1)),
             });
         }
     }
@@ -3803,6 +3828,7 @@ pub fn resolved_check_names_for_table(
                     name: crate::checks::cross_source_overlap_name(source_type, table),
                     kind: CheckNameKind::CrossSourceOverlap,
                     candidate: true,
+                    detail: None,
                 });
             }
         }
@@ -3835,9 +3861,17 @@ pub fn resolved_check_name_collisions(
 }
 
 /// `"<kind> \"<name>\""` — one side of a [`ConfigError::DuplicateCheckName`],
-/// naming both the resolved name and the producer that resolved it.
+/// naming both the resolved name and the producer that resolved it. When
+/// `detail` is set (currently only for [`CheckNameKind::Assertion`]) it is
+/// appended in parentheses, so two unnamed assertions that synthesize the
+/// SAME name (e.g. two unnamed `expression` assertions both producing
+/// `"expression:-"`) still read as two distinguishable sides rather than
+/// the identical string twice.
 fn describe_resolved_check_name(n: &ResolvedCheckName) -> String {
-    format!("{} {:?}", n.kind.as_str(), n.name)
+    match &n.detail {
+        Some(detail) => format!("{} {:?} ({detail})", n.kind.as_str(), n.name),
+        None => format!("{} {:?}", n.kind.as_str(), n.name),
+    }
 }
 
 /// Refuse a `metadata_columns[].value` that is not one parseable SQL
@@ -3967,7 +4001,11 @@ pub fn validate_checks(config: &RockyConfig) -> Vec<ConfigError> {
                 pipeline: name.clone(),
                 source_a: describe_resolved_check_name(&a),
                 source_b: describe_resolved_check_name(&b),
-                scope: format!("on every table pipeline {name:?} copies"),
+                // "checks", not "copies": a quality pipeline runs custom
+                // and null_rate checks against tables it never copies —
+                // "copies" was replication-specific wording on a sentence
+                // that applies to every pipeline type.
+                scope: format!("on every table pipeline {name:?} checks"),
                 sanitized,
             });
         }
@@ -9812,6 +9850,78 @@ threshold = 0
             assert!(
                 sources.iter().any(|s| s.contains("null_rate:amount")),
                 "must name the null_rate source: {sources:?}"
+            );
+        }
+    }
+
+    /// Two UNNAMED `expression` assertions on the same table both
+    /// synthesize the SAME name (`resolved_name()` -> `"expression:-"` for
+    /// both, since neither has a `column`), so the collision message must
+    /// not print the identical string twice — the reader would have no way
+    /// to tell WHICH two assertions collide. `describe_resolved_check_name`
+    /// appends each side's 1-based per-table assertion index to disambiguate
+    /// (#1941 review finding).
+    ///
+    /// Mutation that must turn this red: drop the `detail` field, or stop
+    /// populating it in `resolved_check_names_for_table`'s assertion loop,
+    /// or stop appending it in `describe_resolved_check_name`.
+    #[test]
+    fn validate_checks_disambiguates_two_unnamed_assertions_colliding() {
+        let cfg = parse(
+            r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.repl]
+strategy = "full_refresh"
+
+[pipeline.repl.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.repl.target]
+catalog_template = "wh"
+schema_template = "raw__{source}"
+
+[[pipeline.repl.checks.assertions]]
+table = "orders"
+type = "expression"
+expression = "amount > 0"
+
+[[pipeline.repl.checks.assertions]]
+table = "orders"
+type = "expression"
+expression = "quantity > 0"
+"#,
+        );
+        let errors = validate_checks(&cfg);
+        let found = errors.iter().find(|e| {
+            matches!(
+                e,
+                ConfigError::DuplicateCheckName { sanitized, .. } if sanitized == "expression__"
+            )
+        });
+        assert!(
+            found.is_some(),
+            "two unnamed assertions colliding must be refused: {errors:?}"
+        );
+        if let Some(ConfigError::DuplicateCheckName {
+            source_a, source_b, ..
+        }) = found
+        {
+            assert_ne!(
+                source_a, source_b,
+                "the two sides must be distinguishable, not the identical string twice"
+            );
+            assert!(
+                source_a.contains('1') || source_b.contains('1'),
+                "one side must be identified as assertion #1: {source_a} / {source_b}"
+            );
+            assert!(
+                source_a.contains('2') || source_b.contains('2'),
+                "one side must be identified as assertion #2: {source_a} / {source_b}"
             );
         }
     }
