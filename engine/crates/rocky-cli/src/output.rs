@@ -759,14 +759,18 @@ fn cooldown_from_snowflake(err: &rocky_snowflake::connector::ConnectorError) -> 
 /// `ConnectorError` and classify it via [`FailureKind`]. Returns
 /// [`FailureKind::Unknown`] when neither connector enum is reachable.
 ///
-/// Production-path note: adapter calls go through
-/// [`rocky_adapter_sdk::AdapterError`], a `Box<dyn Error>` wrapper
-/// whose `Error::source()` impl returns the *inner*'s source — so a
-/// bare `chain()` walk skips past the wrapper straight to whatever the
+/// Production-path note: adapter calls go through one of two `Box<dyn
+/// Error>` wrapper types — [`rocky_adapter_sdk::AdapterError`] (the
+/// adapter-SDK trait boundary; used for e.g. Databricks volume / Snowflake
+/// stage file staging) or [`rocky_core::traits::AdapterError`] (what every
+/// `WarehouseAdapter` method, including the databricks/snowflake/trino/
+/// bigquery `execute_statement*` path, actually returns) — and both
+/// wrappers' `Error::source()` impl returns the *inner*'s source, so a bare
+/// `chain()` walk skips past either wrapper straight to whatever the
 /// `ConnectorError` carries (e.g. `reqwest::Error`) and never sees the
-/// connector variant itself. To handle that, each cause is also
-/// downcast to `AdapterError`; when matched, its
-/// [`AdapterError::inner`] is probed for the typed `ConnectorError`.
+/// connector variant itself (#2064). To handle that, each cause is also
+/// downcast to both wrapper types via [`classify_wrapped_adapter_cause`];
+/// when matched, its inner error is probed for the typed `ConnectorError`.
 ///
 /// Many existing call sites in `run.rs` still build their `anyhow`
 /// errors via `anyhow::anyhow!("…{e}")`, which stringifies the
@@ -801,14 +805,42 @@ fn classify_cause_with_cooldown(
     None
 }
 
+/// Downcast a single chain link to whichever `AdapterError` wrapper type
+/// Rocky's adapters use — [`rocky_adapter_sdk::AdapterError`] or
+/// [`rocky_core::traits::AdapterError`] (#2064: warehouse adapters return
+/// the latter, not the former the classifiers previously assumed) — and
+/// walk from its `inner()` through `source()` the same way
+/// [`classify_adapter_error_with_cooldown`] does, so a typed connector
+/// error nested at any depth inside either wrapper is found. Returns
+/// `None` when `cause` is neither wrapper type, or neither wrapper's inner
+/// chain holds a typed connector error.
+fn classify_wrapped_adapter_cause(
+    cause: &(dyn std::error::Error + 'static),
+) -> Option<(FailureKind, Option<u64>)> {
+    let inner: &(dyn std::error::Error + 'static) =
+        if let Some(e) = cause.downcast_ref::<rocky_adapter_sdk::AdapterError>() {
+            e.inner()
+        } else if let Some(e) = cause.downcast_ref::<rocky_core::traits::AdapterError>() {
+            e.inner()
+        } else {
+            return None;
+        };
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(inner);
+    while let Some(c) = cause {
+        if let Some(pair) = classify_cause_with_cooldown(c) {
+            return Some(pair);
+        }
+        cause = c.source();
+    }
+    None
+}
+
 pub fn classify_anyhow_error(err: &anyhow::Error) -> FailureKind {
     for cause in err.chain() {
         if let Some(kind) = classify_cause(cause) {
             return kind;
         }
-        if let Some(adapter_err) = cause.downcast_ref::<rocky_adapter_sdk::AdapterError>()
-            && let Some(kind) = classify_cause(adapter_err.inner())
-        {
+        if let Some((kind, _)) = classify_wrapped_adapter_cause(cause) {
             return kind;
         }
     }
@@ -829,9 +861,7 @@ pub fn classify_anyhow_error_with_cooldown(err: &anyhow::Error) -> (FailureKind,
         if let Some(pair) = classify_cause_with_cooldown(cause) {
             return pair;
         }
-        if let Some(adapter_err) = cause.downcast_ref::<rocky_adapter_sdk::AdapterError>()
-            && let Some(pair) = classify_cause_with_cooldown(adapter_err.inner())
-        {
+        if let Some(pair) = classify_wrapped_adapter_cause(cause) {
             return pair;
         }
     }
@@ -841,11 +871,12 @@ pub fn classify_anyhow_error_with_cooldown(err: &anyhow::Error) -> (FailureKind,
 /// [`classify_anyhow_error_with_cooldown`] for a bare
 /// [`rocky_core::traits::AdapterError`], as `WarehouseAdapter` methods return.
 ///
-/// The anyhow walks above cannot see a typed connector error inside one. They
-/// unwrap `rocky_adapter_sdk::AdapterError`, a different type, and
 /// `rocky_core`'s `AdapterError::source()` returns its inner error's source,
-/// skipping the inner error itself. This starts at [`inner`] and walks
-/// `source()` from there.
+/// skipping the inner error itself, so this starts at [`inner`] and walks
+/// `source()` from there — the same walk [`classify_wrapped_adapter_cause`]
+/// now runs on a *wrapped* `AdapterError` found inside an `anyhow::Error`
+/// chain; this is the entry point for a caller holding the bare type
+/// directly, with no `anyhow::Error` to walk.
 ///
 /// [`inner`]: rocky_core::traits::AdapterError::inner
 pub fn classify_adapter_error_with_cooldown(
@@ -11750,7 +11781,10 @@ mod failure_kind_tests {
     // ---- classify_anyhow_error_with_cooldown chain walk ------------------
 
     /// A typed breaker error inside a `rocky_core` `AdapterError`, as a
-    /// warehouse adapter returns it, keeps its kind and cooldown.
+    /// warehouse adapter returns it, keeps its kind and cooldown — both
+    /// through the bare-`AdapterError` entry point and (#2064) through the
+    /// `anyhow::Error` chain walk a warehouse failure actually crosses on
+    /// its way to `TableErrorOutput`.
     #[test]
     fn classify_adapter_error_with_cooldown_sees_the_connector_error_inside() {
         let err = rocky_core::traits::AdapterError::new(DbE::CircuitBreakerOpen {
@@ -11761,7 +11795,9 @@ mod failure_kind_tests {
             classify_adapter_error_with_cooldown(&err),
             (FailureKind::QuotaExceeded, Some(180)),
         );
-        // Control: the anyhow walk does not see it, which is why this exists.
+        // The anyhow walk sees the SAME wrapper the bare check above does —
+        // `classify_wrapped_adapter_cause` downcasts to `rocky_core`'s
+        // `AdapterError` too, not only the SDK's.
         assert_eq!(
             classify_anyhow_error_with_cooldown(&anyhow::Error::new(
                 rocky_core::traits::AdapterError::new(DbE::CircuitBreakerOpen {
@@ -11769,7 +11805,7 @@ mod failure_kind_tests {
                     cooldown_seconds: Some(180),
                 })
             )),
-            (FailureKind::Unknown, None),
+            (FailureKind::QuotaExceeded, Some(180)),
         );
         assert_eq!(
             classify_adapter_error_with_cooldown(&rocky_core::traits::AdapterError::msg("boom")),
@@ -11834,15 +11870,16 @@ mod failure_kind_tests {
 
     #[test]
     fn classify_anyhow_with_cooldown_unwraps_adapter_error_wrapping_breaker() {
-        // Mirrors the production path: ConnectorError is wrapped in
-        // AdapterError (boxed) before crossing into anyhow — the
-        // cooldown walker must descend through the wrapper just like
-        // its FailureKind-only counterpart.
+        // Mirrors the production path (#2064): a `WarehouseAdapter` method
+        // wraps its `ConnectorError` in `rocky_core::traits::AdapterError`
+        // (not the SDK's) before it crosses into anyhow — the cooldown
+        // walker must descend through THIS wrapper just like its
+        // FailureKind-only counterpart.
         let conn_err = DbE::CircuitBreakerOpen {
             consecutive_failures: 5,
             cooldown_seconds: Some(300),
         };
-        let adapter_err = rocky_adapter_sdk::AdapterError::new(conn_err);
+        let adapter_err = rocky_core::traits::AdapterError::new(conn_err);
         let err = anyhow::Error::new(adapter_err);
         assert_eq!(
             classify_anyhow_error_with_cooldown(&err),
@@ -11852,17 +11889,23 @@ mod failure_kind_tests {
 
     #[test]
     fn classify_anyhow_unwraps_adapter_error_wrapping_databricks_connector() {
-        // Mirrors the production path: ConnectorError is wrapped in
-        // AdapterError (boxed) before crossing into anyhow.
+        // Mirrors the production path (#2064): `execute_statement` et al.
+        // wrap their `ConnectorError` in `rocky_core::traits::AdapterError`,
+        // the type `WarehouseAdapter` methods actually return.
         let conn_err = DbE::ApiError {
             status: 429,
             body: String::new(),
         };
-        let adapter_err = rocky_adapter_sdk::AdapterError::new(conn_err);
+        let adapter_err = rocky_core::traits::AdapterError::new(conn_err);
         let err = anyhow::Error::new(adapter_err).context("execute_statement failed");
         assert_eq!(classify_anyhow_error(&err), FailureKind::QuotaExceeded);
     }
 
+    /// The OTHER wrapper: `rocky_adapter_sdk::AdapterError` is not the
+    /// `WarehouseAdapter` return type, but it is still a real production
+    /// path (Databricks volume / Snowflake stage file staging — see
+    /// `rocky-databricks/src/volume.rs`, `rocky-snowflake/src/stage.rs`), so
+    /// the classifier must keep unwrapping it too.
     #[test]
     fn classify_anyhow_unwraps_adapter_error_wrapping_snowflake_connector() {
         let conn_err = SnE::Timeout {
