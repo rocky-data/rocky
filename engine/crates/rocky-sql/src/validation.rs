@@ -91,12 +91,14 @@ pub enum ValidationError {
     // field (#1971).
     //
     // `ExpressionVolatileInKey` and `ExpressionCollateInKey` refuse a
-    // different thing: content that IS a valid, on-list expression, refused
-    // only because of where it sits (a grouping key). They are their own
-    // variants rather than more `ExpressionFunctionNotAllowed` cases because
-    // "add it to CHECK_EXPRESSION_FUNCTIONS" is false advice for either — the
-    // volatile name is already on the list, and COLLATE is not a function at
-    // all (#1971).
+    // different thing: content refused only because of where it sits (a
+    // grouping key), not because the name is off some list. They are their
+    // own variants rather than more `ExpressionFunctionNotAllowed` cases
+    // because "add it to CHECK_EXPRESSION_FUNCTIONS" is false advice for
+    // either — a volatile name may already be on the list (`now()` is), and
+    // even one that isn't would still be refused here, because the walker
+    // checks volatility before it consults the allowlist; COLLATE is not a
+    // function at all (#1971).
     #[error(
         "{context}: expression does not parse as a single SQL expression ({detail}). {} is {}",
         .use_.noun(),

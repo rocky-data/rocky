@@ -735,10 +735,13 @@ impl Visitor for Walker<'_> {
                         .iter()
                         .any(|v| v.eq_ignore_ascii_case(&name))
                 {
-                    // The name IS on the allowlist — it is refused for the
-                    // POSITION, not the name, so "add it to
-                    // CHECK_EXPRESSION_FUNCTIONS" would be false advice
-                    // (#1971).
+                    // The name may already be on the allowlist (`now` is);
+                    // it is refused for the POSITION, not the name, so "add
+                    // it to CHECK_EXPRESSION_FUNCTIONS" would be false advice
+                    // either way — for an allowlisted name it is already
+                    // there, and for one that is not, this check runs before
+                    // the allowlist is even consulted, so adding it would not
+                    // change the outcome (#1971).
                     return ControlFlow::Break(ValidationError::ExpressionVolatileInKey {
                         context: self.context.to_string(),
                         function: ident.value.clone(),
@@ -857,13 +860,41 @@ mod tests {
     /// `rocky-core/src/tests.rs` for that half (#1971).
     #[test]
     fn filter_permits_exactly_what_single_predicate_permits() {
-        let filter =
-            |e: &str| validate_check_expression(CTX, e, &GenericDialect, ExpressionUse::Filter);
-        filter("created_at > now()").expect("a filter may use a clock, same as a predicate");
-        filter("email COLLATE NOCASE = 'a'")
-            .expect("a filter may use COLLATE, same as a predicate");
-        filter("amount >= 0").expect("an ordinary filter predicate");
-        filter("my_udf(a)").expect_err("the allowlist boundary still applies to a filter");
+        // Each case is run through BOTH modes and must agree, so the
+        // equality is pinned rather than asserted one mode at a time — that
+        // would stay green even if a future change split the two rule sets
+        // without anyone noticing the drift. `expect_ok` also pins the
+        // DIRECTION: two modes silently agreeing on the wrong answer would
+        // pass an agreement-only check.
+        let cases = [
+            ("created_at > now()", true),         // a clock is fine in both
+            ("email COLLATE NOCASE = 'a'", true), // COLLATE is fine in both
+            ("amount >= 0", true),                // an ordinary predicate
+            ("my_udf(a)", false),                 // off the allowlist in both
+            ("amount > (SELECT 1)", false),       // a subquery in both
+            ("amount > 0, 1", false),             // trailing tokens in both
+        ];
+        for (expr, expect_ok) in cases {
+            let filter_ok =
+                validate_check_expression(CTX, expr, &GenericDialect, ExpressionUse::Filter)
+                    .is_ok();
+            let predicate_ok = validate_check_expression(
+                CTX,
+                expr,
+                &GenericDialect,
+                ExpressionUse::SinglePredicate,
+            )
+            .is_ok();
+            assert_eq!(
+                filter_ok, predicate_ok,
+                "`{expr}`: Filter and SinglePredicate disagree (filter={filter_ok}, \
+                 predicate={predicate_ok})"
+            );
+            assert_eq!(
+                filter_ok, expect_ok,
+                "`{expr}`: expected ok={expect_ok}, got {filter_ok}"
+            );
+        }
     }
 
     /// The advice beside a refusal describes the position that was
