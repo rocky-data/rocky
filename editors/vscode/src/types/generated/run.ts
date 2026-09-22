@@ -243,6 +243,10 @@ export interface RunOutput {
  * Row count anomaly detected by historical baseline comparison.
  */
 export interface AnomalyOutput {
+  /**
+   * Dagster-style asset key path, same convention as [`AnomalyEvaluationOutput::asset_key`] (#2073).
+   */
+  asset_key: string[];
   baseline_avg: number;
   current_count: number;
   deviation_pct: number;
@@ -258,6 +262,10 @@ export interface AnomalyOutput {
  * The detector runs only when row-count checks are on, the run has a state store, the table's row count was measured, and its history could be read. `not_evaluated_reason` names which of those was missing, because the remedy differs: one is a config line, another is how the run was invoked.
  */
 export interface AnomalyEvaluationOutput {
+  /**
+   * Dagster-style asset key path (`[source_type, ...components, table]`), the same value [`MaterializationOutput::asset_key`] carries for this table. Added (#2073) so the Dagster Pipes emitter can report this verdict as a `report_asset_check` without re-deriving the mapping `batch_asset_keys` already has — the same reason [`TableCheckOutput::asset_key`] exists.
+   */
+  asset_key: string[];
   /**
    * `true` when the detector compared this table's count against its history. An anomaly, if any, is in [`RunOutput::anomalies`].
    */
@@ -362,6 +370,10 @@ export interface DriftSummary {
 }
 export interface DriftActionOutput {
   action: string;
+  /**
+   * Dagster-style asset key path (`[source_type, ...components, table]`) for this table, the same value [`MaterializationOutput::asset_key`] carries. Added (#2073) so the Dagster Pipes emitter can report drift as a `report_asset_check` keyed on the asset, instead of passing `table` (a bare `catalog.schema.table` string, not a Dagster asset key) as the asset key.
+   */
+  asset_key: string[];
   reason: string;
   table: string;
   [k: string]: unknown;

@@ -587,6 +587,13 @@ pub struct AnomalyEvaluationOutput {
     /// Fully-qualified table the entry is about, the same key
     /// [`AnomalyOutput::table`] uses.
     pub table: String,
+    /// Dagster-style asset key path (`[source_type, ...components, table]`),
+    /// the same value [`MaterializationOutput::asset_key`] carries for this
+    /// table. Added (#2073) so the Dagster Pipes emitter can report this
+    /// verdict as a `report_asset_check` without re-deriving the mapping
+    /// `batch_asset_keys` already has — the same reason
+    /// [`TableCheckOutput::asset_key`] exists.
+    pub asset_key: Vec<String>,
     /// `true` when the detector compared this table's count against its
     /// history. An anomaly, if any, is in [`RunOutput::anomalies`].
     pub evaluated: bool,
@@ -600,6 +607,9 @@ pub struct AnomalyEvaluationOutput {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct AnomalyOutput {
     pub table: String,
+    /// Dagster-style asset key path, same convention as
+    /// [`AnomalyEvaluationOutput::asset_key`] (#2073).
+    pub asset_key: Vec<String>,
     pub current_count: u64,
     pub baseline_avg: f64,
     pub deviation_pct: f64,
@@ -1582,6 +1592,13 @@ pub struct DriftSummary {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct DriftActionOutput {
     pub table: String,
+    /// Dagster-style asset key path (`[source_type, ...components, table]`)
+    /// for this table, the same value [`MaterializationOutput::asset_key`]
+    /// carries. Added (#2073) so the Dagster Pipes emitter can report drift
+    /// as a `report_asset_check` keyed on the asset, instead of passing
+    /// `table` (a bare `catalog.schema.table` string, not a Dagster asset
+    /// key) as the asset key.
+    pub asset_key: Vec<String>,
     pub action: String,
     pub reason: String,
 }

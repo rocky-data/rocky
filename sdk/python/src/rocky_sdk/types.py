@@ -289,6 +289,10 @@ class PermissionInfo(BaseModel):
 
 class DriftAction(BaseModel):
     table: str
+    #: Dagster-style asset key path, the same convention
+    #: :attr:`MaterializationInfo.asset_key` uses. Defaults to an empty list
+    #: so an engine older than #2073 still parses. (#2073)
+    asset_key: list[str] = []
     action: str
     reason: str
 
@@ -312,6 +316,10 @@ class ContractResult(BaseModel):
 
 class AnomalyResult(BaseModel):
     table: str
+    #: Dagster-style asset key path, the same convention
+    #: :attr:`MaterializationInfo.asset_key` uses. Defaults to an empty list
+    #: so an engine older than #2073 still parses. (#2073)
+    asset_key: list[str] = []
     current_count: int
     baseline_avg: float
     deviation_pct: float
@@ -330,6 +338,10 @@ class AnomalyEvaluation(BaseModel):
     """
 
     table: str
+    #: Dagster-style asset key path, the same convention
+    #: :attr:`MaterializationInfo.asset_key` uses. Defaults to an empty list
+    #: so an engine older than #2073 still parses. (#2073)
+    asset_key: list[str] = []
     evaluated: bool
     not_evaluated_reason: str | None = None
 

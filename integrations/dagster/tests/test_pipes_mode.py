@@ -395,9 +395,12 @@ def test_run_filters_pipes_builds_asset_key_fn_from_group_mapping():
     assert fn(["unknown", "path"]) is None
 
 
-def test_run_filters_pipes_falls_back_to_last_segment_for_drift_events():
-    """Drift events carry a bare table name as asset_key — the component's
-    fn falls back to matching the trailing segment in rocky_key_to_dagster_key."""
+def test_run_filters_pipes_falls_back_to_last_segment_for_a_bare_table_name():
+    """A single-segment asset_key (e.g. an engine older than #2073, whose
+    drift events carried a bare table name) falls back to matching the
+    trailing segment in rocky_key_to_dagster_key. Drift now sends the full
+    path like everything else (#2073); this fallback covers older binaries
+    and any other single-segment producer."""
     from dagster_rocky.component import _GroupBuild, _run_filters_pipes
 
     rocky_path = ("fivetran", "acme", "orders")
@@ -427,7 +430,7 @@ def test_run_filters_pipes_falls_back_to_last_segment_for_drift_events():
     )
 
     fn = rocky.run_pipes.call_args.kwargs["asset_key_fn"]
-    # Drift event shape: single-element list containing the table name.
+    # Single-element list containing just the table name.
     assert fn(["orders"]) == dagster_key
 
 
@@ -508,3 +511,151 @@ def test_run_filters_pipes_yields_non_check_results_unchanged():
         )
     )
     assert out == sentinel_events
+
+
+# ---------------------------------------------------------------------------
+# Anomaly checks over Pipes (#2073) — the engine emits `row_count_anomaly`
+# results the same way `check_results` are emitted; these fixtures are the
+# raw wire messages the fixed emitter produces (see
+# `test_emit_pipes_anomaly_events_cover_all_three_verdicts` in
+# `engine/crates/rocky-cli/src/commands/run.rs`, which pins the Rust side).
+# This test covers the Dagster RECEIVING side: the same handler-proxy layer
+# every other Pipes check goes through must resolve the asset key and carry
+# the anomaly / not-evaluated verdicts through unchanged.
+# ---------------------------------------------------------------------------
+
+
+def test_handler_proxy_translates_anomaly_check_results():
+    """A detected anomaly and a not-evaluated table both reach Dagster with
+    their asset key resolved and their verdict/metadata intact — the same
+    translation every other `report_asset_check` message gets. Before #2073
+    the engine sent neither message at all over Pipes."""
+    inner = MagicMock()
+    orders_key = dg.AssetKey(["warehouse", "acme", "orders"])
+    customers_key = dg.AssetKey(["warehouse", "acme", "customers"])
+
+    def asset_key_fn(path: list[str]) -> dg.AssetKey | None:
+        return {
+            ("fivetran", "acme", "orders"): orders_key,
+            ("fivetran", "acme", "customers"): customers_key,
+        }.get(tuple(path))
+
+    proxy = _PipesHandlerProxy(inner, asset_key_fn=asset_key_fn, include_keys=None)
+
+    # One detected anomaly — fails, with the metric detail. Metadata keys
+    # match `anomaly_check_results` in observability.py: fully rocky/-prefixed.
+    anomaly_msg = {
+        "__dagster_pipes_version": "0.1",
+        "method": "report_asset_check",
+        "params": {
+            "asset_key": "fivetran/acme/orders",
+            "check_name": "row_count_anomaly",
+            "passed": False,
+            "severity": "WARN",
+            "metadata": {
+                "rocky/current_count": 5,
+                "rocky/baseline_avg": 376.25,
+                "rocky/deviation_pct": 98.67,
+                "rocky/reason": "row count 5 deviates 98.67% from baseline 376.25",
+            },
+        },
+    }
+    # One not-evaluated table — fails, with the engine's reason, not silence.
+    # `status` stays bare and `reason` is rocky/-prefixed, matching
+    # `anomaly_evaluation_results` in observability.py.
+    not_evaluated_msg = {
+        "__dagster_pipes_version": "0.1",
+        "method": "report_asset_check",
+        "params": {
+            "asset_key": "fivetran/acme/customers",
+            "check_name": "row_count_anomaly",
+            "passed": False,
+            "severity": "WARN",
+            "metadata": {
+                "status": "not_evaluated",
+                "rocky/reason": "no row count was measured for this table",
+            },
+        },
+    }
+
+    proxy.handle_message(anomaly_msg)
+    proxy.handle_message(not_evaluated_msg)
+
+    assert inner.handle_message.call_count == 2
+    forwarded_anomaly = inner.handle_message.call_args_list[0].args[0]
+    forwarded_not_evaluated = inner.handle_message.call_args_list[1].args[0]
+
+    assert forwarded_anomaly["params"]["asset_key"] == orders_key.to_user_string()
+    assert forwarded_anomaly["params"]["check_name"] == "row_count_anomaly"
+    assert forwarded_anomaly["params"]["passed"] is False
+    assert forwarded_anomaly["params"]["metadata"]["rocky/current_count"] == 5
+
+    assert forwarded_not_evaluated["params"]["asset_key"] == customers_key.to_user_string()
+    assert forwarded_not_evaluated["params"]["passed"] is False
+    assert forwarded_not_evaluated["params"]["metadata"]["status"] == "not_evaluated"
+
+
+# ---------------------------------------------------------------------------
+# Drift checks over Pipes (#2073) — drift is never a declared check spec, so
+# `_run_filters_pipes` must convert it to an AssetObservation instead of
+# routing it through the generic undeclared-check path (whose "declared
+# specs are stale" warning is the wrong diagnosis for a check that was never
+# meant to be declared).
+# ---------------------------------------------------------------------------
+
+
+def test_run_filters_pipes_converts_drift_check_to_observation():
+    """A Pipes `drift` check result becomes an AssetObservation with
+    rocky/drift_* metadata — matching `drift_observations` on the streaming
+    side — instead of the generic undeclared-check warning."""
+    from dagster_rocky.component import _GroupBuild, _run_filters_pipes
+
+    group = _GroupBuild(
+        name="acme",
+        source_ids={"acme"},
+        filter="client=acme",
+        rocky_key_to_dagster_key={},
+    )
+    context = MagicMock(spec=dg.AssetExecutionContext)
+    context.log = MagicMock()
+    rocky = MagicMock(spec=RockyResource)
+
+    asset_key = dg.AssetKey(["warehouse", "acme", "orders"])
+    drift_result = dg.AssetCheckResult(
+        asset_key=asset_key,
+        check_name="drift",
+        passed=True,
+        severity=dg.AssetCheckSeverity.WARN,
+        metadata={
+            "table": dg.MetadataValue.text("acme.raw_orders"),
+            "action": dg.MetadataValue.text("add_column"),
+            "reason": dg.MetadataValue.text("column 'email' found in source but not target"),
+        },
+    )
+    fake_invocation = MagicMock()
+    fake_invocation.get_results = MagicMock(return_value=iter([drift_result]))
+    rocky.run_pipes = MagicMock(return_value=fake_invocation)
+
+    out = list(
+        _run_filters_pipes(
+            context=context,
+            rocky=rocky,
+            filters=["client=acme"],
+            group=group,
+            selected_keys={asset_key},
+            # Deliberately empty: "drift" must never need to be declared.
+            declared_check_pairs=set(),
+        )
+    )
+
+    assert len(out) == 1
+    observation = out[0]
+    assert isinstance(observation, dg.AssetObservation)
+    assert observation.asset_key == asset_key
+    assert observation.metadata["rocky/drift_action"].value == "add_column"
+    assert observation.metadata["rocky/drift_reason"].value == (
+        "column 'email' found in source but not target"
+    )
+    assert observation.metadata["rocky/drift_table"].value == "acme.raw_orders"
+    # The generic undeclared-check path (which would log this) must not fire.
+    context.log.warning.assert_not_called()
