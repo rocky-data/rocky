@@ -131,6 +131,25 @@ pub enum ValidationError {
         use_: ExpressionUse,
     },
 
+    // `to_date`, `to_timestamp`, `to_char`, `date_trunc` and `datediff` /
+    // `date_diff` are on the allowlist, but only one argument shape each is
+    // a function of its arguments alone — the other reads a Snowflake
+    // session parameter (#1942). `function` names which call was refused;
+    // `accepted_shape` is `shape_refusal`'s per-function advice, so the
+    // message can point at the fix rather than at `CHECK_EXPRESSION_FUNCTIONS`,
+    // which is the wrong fix here — the name is already allowed.
+    #[error(
+        "{context}: expression calls `{function}` in a shape whose result can depend on more \
+         than its arguments. {} may call `{function}` only {accepted_shape}",
+        .use_.noun()
+    )]
+    ExpressionFunctionShapeNotAllowed {
+        context: String,
+        function: String,
+        use_: ExpressionUse,
+        accepted_shape: &'static str,
+    },
+
     #[error(
         "{context}: expression calls the qualified function `{function}`. Qualified names \
          reach user-defined, remote or plugin functions, which are never allowed in {}",

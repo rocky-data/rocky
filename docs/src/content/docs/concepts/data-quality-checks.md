@@ -355,6 +355,15 @@ Rocky measured this per target dialect instead of assuming it:
 | BigQuery | Not probed. | No sandbox available |
 | Trino | Not probed. | No environment available |
 
+Five names on the allowlist are refused in one particular shape, because that shape reads a Snowflake session parameter instead of only its arguments:
+
+| Function | Refused | Accepted |
+|---|---|---|
+| `to_date`, `to_timestamp`, `to_char` | called with one argument, e.g. `to_date(order_date)`, reads a session default format | called with an explicit format, e.g. `to_date(order_date, 'YYYY-MM-DD')` |
+| `date_trunc`, `datediff` (and its `date_diff` spelling) | a `week` date part, or a synonym (`w`, `wk`, `weekofyear`, `woy`, `wy`), reads `WEEK_START` | any other date part, e.g. `day`, `month`, `year`, or the fixed, Monday-start `week_iso` |
+
+`to_char` was off the allowlist entirely until this rule shipped; it is back on now that its risky shape is refused rather than its name.
+
 One position adds a rule, because the expression is used differently there:
 
 | Position | Extra rule |
