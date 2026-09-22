@@ -1205,7 +1205,7 @@ dropped one and `grace_period_days` never took effect. Delete the
 
 **What to do:** delete the section. Nothing about your pipeline changes. Rocky never dropped a column on the strength of that key, so there is no behaviour to replace.
 
-Grace-period column drops are tracked as their own feature. The detector, the `ALTER TABLE ... DROP COLUMN` generator, and the state-store record all exist; only the call site is missing. It will come back behind an explicit opt-in, because dropping a column is destructive and must not be a default.
+Rocky does not drop a column the source lost. The target keeps it. A detector and an `ALTER TABLE ... DROP COLUMN` generator exist in the engine. So does a state table for tracking a grace period, but nothing writes a record to it or calls either function. There is no opt-in for a source-driven drop today.
 
 See [Schema drift](/concepts/schema-drift/) for the changes Rocky does detect and act on.
 

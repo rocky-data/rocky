@@ -93,7 +93,7 @@ Examples: `STRING` to `INT`, `BIGINT` to `INT` (narrowing), `DATE` to `TIMESTAMP
 ## What Is NOT Drift
 
 - **New columns in the source.** Rocky adds them rather than treating them as drift. Before the copy it issues one `ALTER TABLE ADD COLUMN` per new column, each nullable, so historical rows keep `NULL`. The run reports an `add_columns` action.
-- **Columns removed from the source.** Rocky ignores extra columns in the target table.
+- **Columns removed from the source.** Rocky ignores a target column the source does not have. It does not drop a column the source lost, and there is no opt-in for that today.
 
 ## Output
 
