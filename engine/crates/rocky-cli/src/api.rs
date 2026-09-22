@@ -6397,12 +6397,13 @@ mod tests {
     /// ABANDONED, not stopped, once its deadline fires: it keeps running on its
     /// own OS thread. Dropping a `tokio::Runtime` waits, with no timeout, for
     /// every such thread to finish. A one-shot writer (write once, then exit)
-    /// only answers that first, abandoned read -- production sampling caught a
-    /// SECOND read of this FIFO starting after this test's writer had already
-    /// exited, from a caller this test does not otherwise pin down. That read
-    /// found no writer, blocked forever, and the runtime's drop hung the whole
-    /// test BINARY with it (#2153; #2133 is the duplicate that first observed
-    /// it, under load, as a ~53-minute stall rather than a full hang).
+    /// only answers that first, abandoned read -- sampling the hung test
+    /// binaries directly caught a SECOND read of this FIFO starting after this
+    /// test's writer had already exited, from a caller this test does not
+    /// otherwise pin down. That read found no writer, blocked forever, and the
+    /// runtime's drop hung the whole test BINARY with it (#2153; #2133 is the
+    /// duplicate that first hit it under load and killed the binary after it
+    /// sat hung for about 53 minutes).
     ///
     /// So the fix has two independent parts:
     ///
@@ -6445,9 +6446,12 @@ mod tests {
         std::thread::spawn(move || {
             let bound = std::time::Duration::from_secs(60);
             if done_rx.recv_timeout(bound).is_err() {
-                // libtest's output capture is per-thread and does not reach a
-                // thread it never spawned, so a captured `eprintln!` here can
-                // vanish along with the process; write the raw fd instead.
+                // libtest's output capture is inherited by a spawned thread,
+                // so a captured `eprintln!` here would sit in a buffer that
+                // only gets printed once the test function returns -- which,
+                // on the abort below, never happens, so the message would be
+                // lost with it. Writing the raw fd instead bypasses that
+                // capture and lands in the log immediately.
                 let _ = std::io::stderr().write_all(
                     format!(
                         "\nWATCHDOG: a_stuck_config_read_is_bounded_refused_and_recovers \
@@ -6630,13 +6634,21 @@ mod tests {
         // Only now release the writer: set the flag, then open the FIFO
         // read+write -- the one open mode a FIFO never blocks on, for either
         // side -- to unstick a writer parked in `open(O_WRONLY)` waiting for a
-        // reader that will never come now.
+        // reader that will never come now. HOLD this handle across the join,
+        // not just the open call: if the writer hasn't reached its own
+        // `open(O_WRONLY)` yet, closing ours immediately would let it go back
+        // to sleep and try again with no reader left, hanging `join()` below
+        // (the watchdog would still catch that, but it would take down this
+        // whole ~2000-test binary over a bug in the cleanup, not the fix).
+        // Held open, it also gives the writer's last `write()` a reader, so
+        // that call cannot return `EPIPE`.
         stop_writer.store(true, Ordering::Release);
-        let _ = std::fs::OpenOptions::new()
+        let unstick = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&fifo);
         writer_handle.join().unwrap();
+        drop(unstick);
 
         // Reached only when every assertion above passed; a failing run leaves
         // the directory behind on purpose (see `keep()` above) -- and, now
