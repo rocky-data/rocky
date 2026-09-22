@@ -108,12 +108,18 @@ write "$NON_BRACKET_HEAD" \
     '# Changelog' '' '## [Unreleased]' '' '## 1.74.0 - 2026-09-01' '' \
     '- Added a note to an old release retroactively. (#1938)' '- An old, already-released entry.'
 
-readonly DIFF_WITH_ENTRY="$(gen_diff "$WITH_ENTRY_BASE" "$WITH_ENTRY_HEAD")"
-readonly DIFF_HEADER_ONLY="$(gen_diff "$NO_UNRELEASED_BASE" "$HEADER_ONLY_HEAD")"
-readonly DIFF_OLD_RELEASE_ONLY="$(gen_diff "$EMPTY_UNRELEASED" "$OLD_RELEASE_ONLY_HEAD")"
-readonly DIFF_BULLET_ONLY="$(gen_diff "$BULLET_ONLY_BASE" "$BULLET_ONLY_HEAD")"
-readonly DIFF_DUPLICATE_HEADING="$(gen_diff "$DUPLICATE_HEADING_BASE" "$DUPLICATE_HEADING_HEAD")"
-readonly DIFF_NON_BRACKET="$(gen_diff "$NON_BRACKET_BASE" "$NON_BRACKET_HEAD")"
+DIFF_WITH_ENTRY="$(gen_diff "$WITH_ENTRY_BASE" "$WITH_ENTRY_HEAD")"
+readonly DIFF_WITH_ENTRY
+DIFF_HEADER_ONLY="$(gen_diff "$NO_UNRELEASED_BASE" "$HEADER_ONLY_HEAD")"
+readonly DIFF_HEADER_ONLY
+DIFF_OLD_RELEASE_ONLY="$(gen_diff "$EMPTY_UNRELEASED" "$OLD_RELEASE_ONLY_HEAD")"
+readonly DIFF_OLD_RELEASE_ONLY
+DIFF_BULLET_ONLY="$(gen_diff "$BULLET_ONLY_BASE" "$BULLET_ONLY_HEAD")"
+readonly DIFF_BULLET_ONLY
+DIFF_DUPLICATE_HEADING="$(gen_diff "$DUPLICATE_HEADING_BASE" "$DUPLICATE_HEADING_HEAD")"
+readonly DIFF_DUPLICATE_HEADING
+DIFF_NON_BRACKET="$(gen_diff "$NON_BRACKET_BASE" "$NON_BRACKET_HEAD")"
+readonly DIFF_NON_BRACKET
 readonly DIFF_EMPTY=''
 
 readonly BODY_NO_MARKER='## Summary
