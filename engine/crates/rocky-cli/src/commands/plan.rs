@@ -323,8 +323,11 @@ pub async fn plan(
     // adapter — the action rows parallel `statements` but represent
     // control-plane operations rather than warehouse SQL. Models are loaded
     // from the conventional `models/` directory next to the config; a
-    // missing directory is not an error (projects without models produce
-    // empty action arrays and the three fields omit themselves from JSON).
+    // missing directory is not an error, and neither is an existing but
+    // empty one (a replication-only project that keeps `models/.gitkeep`
+    // in git — the dagster scaffold does this on purpose, #1991). Both
+    // produce empty action arrays and the three fields omit themselves
+    // from JSON (#1997).
     let models_dir = config_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -334,7 +337,7 @@ pub async fn plan(
         models_dir_exists = models_dir.exists(),
         "plan: models_dir check"
     );
-    if models_dir.exists() {
+    if models_dir.exists() && models_dir_has_model_source(&models_dir) {
         let adapter_type = rocky_cfg
             .adapters
             .get(&pipeline.target.adapter)
@@ -1684,6 +1687,43 @@ fn build_and_persist_replication_plan(
 
     let persisted_at = Utc::now();
     Ok((replication_plan, plan_id, persisted_at))
+}
+
+/// True when `models_dir` (or a subdirectory) holds at least one `.sql` or
+/// `.rocky` model source file, checked recursively through the one shared
+/// models-tree walk (`rocky_core::model_walk::walk_model_dirs`, #1262) — the
+/// same directory set the compiler itself loads from.
+///
+/// This is the #1997 gate: it lets the governance preview tell "no models
+/// yet" (an existing but empty `models/`, e.g. the dagster scaffold's
+/// `models/.gitkeep`, #1991) apart from "a broken project" without
+/// softening [`rocky_compiler::project::ProjectError::NoModels`] itself —
+/// other callers of the compiler still treat an empty directory as an
+/// error, on purpose.
+///
+/// A tree the walk cannot fully read (permission error, dangling symlink,
+/// depth ceiling) is conservatively treated as "has a model": this
+/// function only decides whether to SKIP compiling, never whether to
+/// report a walk error as success. A broken tree still reaches
+/// `populate_governance_actions` → `compile(..)`, which surfaces the real
+/// [`rocky_core::model_walk::ModelWalkError`].
+fn models_dir_has_model_source(models_dir: &Path) -> bool {
+    let (dirs, walk_errors) = rocky_core::model_walk::walk_model_dirs(models_dir);
+    if !walk_errors.is_empty() {
+        return true;
+    }
+    dirs.iter().any(|dir| {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                matches!(
+                    entry.path().extension().and_then(|e| e.to_str()),
+                    Some("sql" | "rocky")
+                )
+            })
+    })
 }
 
 /// Compile the project and populate `classification_actions`,
@@ -3115,6 +3155,211 @@ ssn = "confidential"
         assert!(out.mask_actions.is_empty());
         // Retention absent too — no sidecar declares it here.
         assert!(out.retention_actions.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // #1997 — an existing, empty `models/` directory is "no governance
+    // actions", not a compile failure.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn models_dir_has_model_source_false_for_empty_dir_with_gitkeep() {
+        let tmp = TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        // The realistic shape: `dagster-rocky`'s `init_rocky_project()`
+        // writes `models/.gitkeep` on purpose (#1991) so the directory
+        // exists in git with nothing else in it.
+        fs::write(models_dir.join(".gitkeep"), "").unwrap();
+
+        assert!(!models_dir_has_model_source(&models_dir));
+    }
+
+    #[test]
+    fn models_dir_has_model_source_false_for_missing_dir() {
+        let tmp = TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        assert!(!models_dir_has_model_source(&models_dir));
+    }
+
+    #[test]
+    fn models_dir_has_model_source_true_for_sql_file() {
+        let tmp = TempDir::new().unwrap();
+        let (_cfg_path, models_dir) = write_project(&tmp, "", &[("t", "name = \"t\"\n")]);
+        assert!(models_dir_has_model_source(&models_dir));
+    }
+
+    /// The walk is recursive: a `.sql` file two levels below `models/` must
+    /// still count.
+    #[test]
+    fn models_dir_has_model_source_true_for_nested_sql_file() {
+        let tmp = TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        let nested = models_dir.join("staging").join("shop");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("orders.sql"), "SELECT 1 AS id").unwrap();
+
+        assert!(models_dir_has_model_source(&models_dir));
+    }
+
+    /// The gate must not silently swallow a broken tree: an unreadable
+    /// subtree keeps reaching `populate_governance_actions` → `compile`,
+    /// which is where `ModelWalkError` gets surfaced today.
+    #[cfg(unix)]
+    #[test]
+    fn models_dir_has_model_source_true_when_walk_cannot_read_a_subdirectory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        let unreadable = models_dir.join("locked");
+        fs::create_dir_all(&unreadable).unwrap();
+        let mut perms = fs::metadata(&unreadable).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&unreadable, perms.clone()).unwrap();
+
+        let has_source = models_dir_has_model_source(&models_dir);
+
+        // Restore permissions so TempDir can clean up the directory.
+        perms.set_mode(0o755);
+        fs::set_permissions(&unreadable, perms).unwrap();
+
+        assert!(
+            has_source,
+            "an unreadable subtree must not be reported as ok-to-skip"
+        );
+    }
+
+    /// The #1997 gate composed with the real downstream call: a non-empty
+    /// `models/` directory must still reach `populate_governance_actions`
+    /// and populate its action arrays — proves the fix does not become a
+    /// blanket skip.
+    #[test]
+    fn non_empty_models_dir_still_runs_the_governance_preview() {
+        let tmp = TempDir::new().unwrap();
+        let (cfg_path, models_dir) = write_project(
+            &tmp,
+            r#"
+[adapter.default]
+type = "duckdb"
+database = ":memory:"
+"#,
+            &[(
+                "t",
+                r#"name = "t"
+[target]
+catalog = "c"
+schema = "s"
+table = "t"
+
+[classification]
+ssn = "confidential"
+"#,
+            )],
+        );
+
+        assert!(
+            models_dir_has_model_source(&models_dir),
+            "a directory holding a .sql/.toml pair must report a model source"
+        );
+
+        let cfg = rocky_core::config::load_rocky_config(&cfg_path).unwrap();
+        let mut out = PlanOutput::new(String::new());
+        populate_governance_actions(&cfg, &models_dir, None, "duckdb", &mut out).unwrap();
+        assert_eq!(
+            out.classification_actions.len(),
+            1,
+            "the preview must still run for a non-empty models/ dir"
+        );
+    }
+
+    /// End-to-end reproduction of #1997: `rocky plan` on a replication-only
+    /// project whose `models/` directory exists but holds no model source
+    /// must exit 0, exactly like `rocky validate` and `rocky run` on the
+    /// same project (`rocky run` never compiles `models/` for a
+    /// replication-only pipeline, which is why only `plan` failed).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_succeeds_with_existing_empty_models_dir_on_replication_only_project() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("warehouse.duckdb");
+        let config_path = dir.path().join("rocky.toml");
+        let state_path = dir.path().join("state.redb");
+
+        {
+            let warehouse = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+            warehouse
+                .execute_statement("CREATE SCHEMA src__shop")
+                .await
+                .unwrap();
+            warehouse
+                .execute_statement(
+                    "CREATE TABLE src__shop.orders AS SELECT 1 AS id, now() AS _loaded_at",
+                )
+                .await
+                .unwrap();
+        }
+
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.main]
+strategy = "incremental"
+timestamp_column = "_loaded_at"
+
+[pipeline.main.source.discovery]
+adapter = "default"
+
+[pipeline.main.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.main.target]
+catalog_template = "warehouse"
+schema_template = "raw__{{source}}"
+
+[pipeline.main.target.governance]
+auto_create_schemas = true
+"#,
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        // The realistic shape (#1991): the directory exists, tracked in git
+        // via `.gitkeep`, and holds no `.sql` / `.rocky` model.
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join(".gitkeep"), "").unwrap();
+
+        let run_options = PlanRunOptions::default();
+        let result = plan(
+            &config_path,
+            None,
+            None,
+            None,
+            &run_options,
+            false,
+            "HEAD",
+            &state_path,
+            false,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "plan must succeed on an existing, empty models/ dir: {:?}",
+            result.err()
+        );
     }
 
     #[test]
