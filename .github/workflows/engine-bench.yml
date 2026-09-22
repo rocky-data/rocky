@@ -19,6 +19,11 @@ permissions:
 defaults:
   run:
     working-directory: engine
+    # Explicit `bash` (not the bare non-Windows default, which runs
+    # `bash -e {0}` with no `pipefail`) so a failing `cargo bench` in the
+    # `| tee -a bench-output.txt` pipeline below actually fails the job
+    # instead of being masked by `tee`'s own exit code.
+    shell: bash
 
 jobs:
   bench:
@@ -64,6 +69,7 @@ jobs:
         run: |
           cargo bench --bench compile -p rocky-cli -- --output-format bencher | tee bench-output.txt
           cargo bench --bench state_store -p rocky-core -- --output-format bencher | tee -a bench-output.txt
+          cargo bench --bench dag_execute -p rocky-core -- --output-format bencher | tee -a bench-output.txt
 
       # This workflow runs only on perf-labeled PRs (no push trigger), so there
       # is no main-branch baseline to compare against — github-action-benchmark
