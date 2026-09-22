@@ -88,13 +88,17 @@ jobs:
           persist-credentials: false
           fetch-depth: 2
 
+      # github.event.pull_request.user.login (the PR's author), not
+      # github.actor (whoever triggered THIS run): a maintainer editing the
+      # body of a Dependabot PR, or reopening it, makes github.actor the
+      # maintainer -- the bypass must not depend on who last touched it.
       - name: Dependabot PRs pass automatically
-        if: ${{ github.actor == 'dependabot[bot]' }}
+        if: ${{ github.event.pull_request.user.login == 'dependabot[bot]' }}
         run: |
-          echo "Actor is dependabot[bot]: changelog-gate passes automatically, no check run."
+          echo "PR author is dependabot[bot]: changelog-gate passes automatically, no check run."
 
       - name: Check for a changelog entry or marker
-        if: ${{ github.actor != 'dependabot[bot]' }}
+        if: ${{ github.event.pull_request.user.login != 'dependabot[bot]' }}
         env:
           # Read via an env var, never string-interpolated into the script:
           # the PR body is attacker-controlled text, and embedding it

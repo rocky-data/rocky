@@ -13,17 +13,25 @@
 # touches engine/, and it does not special-case dependabot — both of those
 # are the caller's job (see the workflow).
 #
-# Inputs, both required, read from the environment rather than argv or a
-# heredoc, so the caller never has to interpolate an attacker-controlled PR
-# body into a shell command line:
+# Inputs, read from the environment rather than argv or a heredoc, so the
+# caller never has to interpolate an attacker-controlled PR body into a
+# shell command line:
 #
-#   PR_BODY         the raw pull request body (github.event.pull_request.body)
-#   CHANGELOG_DIFF  the output of `git diff --no-renames <base> <head> --
-#                   engine/CHANGELOG.md` (see the workflow for why HEAD^1 HEAD
-#                   on the checked-out merge ref stands in for `base...head`)
+#   PR_BODY         required. The raw pull request body
+#                   (github.event.pull_request.body).
+#   CHANGELOG_DIFF  required. The output of `git diff --no-renames <base>
+#                   <head> -- engine/CHANGELOG.md` (see the workflow for why
+#                   HEAD^1 HEAD on the checked-out merge ref stands in for
+#                   `base...head`).
+#   CHANGELOG_PATH  optional, defaults to engine/CHANGELOG.md. The path to
+#                   the file's HEAD (post-PR) content on disk -- used to
+#                   find the extent of the `## [Unreleased]` section, so an
+#                   added line is only accepted when it actually lands
+#                   there (see has_changelog_entry below for why this is
+#                   not optional to check).
 #
-# Exit 0: engine/CHANGELOG.md gained a line, or the body carries a valid
-#         `Changelog: none` marker with a real reason.
+# Exit 0: engine/CHANGELOG.md gained a line under [Unreleased], or the body
+#         carries a valid `Changelog: none` marker with a real reason.
 # Exit 1: neither. The message names both remedies, and says specifically
 #         when a marker was attempted but is missing its reason.
 
@@ -31,19 +39,42 @@ set -euo pipefail
 
 : "${PR_BODY:=}"
 : "${CHANGELOG_DIFF:=}"
+: "${CHANGELOG_PATH:=engine/CHANGELOG.md}"
 
 readonly MARKER_SHAPE='a line starting "Changelog: none" (case-insensitive), followed by " - " or " because ", followed by a reason of at least 10 characters -- e.g. Changelog: none - test-only refactor, no behaviour change'
 
-# True when the diff added at least one non-blank line to engine/CHANGELOG.md
-# that is not the `## [Unreleased]` header re-appearing. This does not check
-# that the added line sits UNDER the Unreleased section specifically, or that
-# it is a good entry -- see the "optimistic count" discussion on #1938. A
-# commit that touches the file for an unrelated reason, or adds a line
-# elsewhere in it, still counts; that is the same limitation the issue's own
-# count method has, accepted for the same reason: it never produces a false
-# "no entry" for a PR that genuinely added one.
+# The trimmed, non-blank lines currently inside the `## [Unreleased]`
+# section of the HEAD (post-PR) file: after the `## [Unreleased]` heading,
+# up to the next `## [` heading or end of file. Reads $CHANGELOG_PATH
+# directly rather than the diff, because the diff alone cannot tell which
+# section an added line landed in without also tracking hunk line numbers.
+unreleased_section_lines() {
+    [[ -f "$CHANGELOG_PATH" ]] || return 0
+    awk '
+        /^## \[Unreleased\]/ { inside = 1; next }
+        /^## \[/ { if (inside) exit }
+        inside { print }
+    ' "$CHANGELOG_PATH"
+}
+
+# True when the diff added at least one line to engine/CHANGELOG.md whose
+# trimmed content is found inside the Unreleased section of the HEAD file.
+# Both conditions matter: added-by-this-diff (a `+` line) rules out a PR
+# that adds nothing and merely benefits from entries already in Unreleased
+# from other in-flight work; inside-Unreleased rules out a PR that edits
+# only an already-released section's notes, which an earlier version of
+# this check accepted (any non-blank `+` line, anywhere in the file, passed
+# -- caught in review on #1938: a released-section-only edit reproduced a
+# false "gained a line under [Unreleased]" pass).
+#
+# This does not check that the entry is a GOOD one -- see the "optimistic
+# count" discussion on #1938. A line whose exact trimmed text happens to
+# match a pre-existing Unreleased line elsewhere in the section could, in
+# principle, false-positive; accepted as a narrow residual versus the
+# complexity of tracking exact hunk line numbers.
 has_changelog_entry() {
-    local line trimmed
+    local unreleased_lines line trimmed
+    unreleased_lines="$(unreleased_section_lines | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -v '^$' || true)"
     while IFS= read -r line; do
         line="${line%$'\r'}"
         case "$line" in
@@ -52,7 +83,8 @@ has_changelog_entry() {
                 ;;
             '+'*)
                 trimmed="$(printf '%s' "${line#+}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-                if [[ -n "$trimmed" && "$trimmed" != "## [Unreleased]" ]]; then
+                if [[ -n "$trimmed" && "$trimmed" != "## [Unreleased]" ]] \
+                    && grep -qxF "$trimmed" <<<"$unreleased_lines"; then
                     return 0
                 fi
                 ;;
