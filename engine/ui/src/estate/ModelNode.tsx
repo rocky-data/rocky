@@ -1,41 +1,55 @@
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import type { ModelFlowNode } from "./layout";
 import { NODE_HEIGHT, NODE_WIDTH } from "./layout";
-import { nodeRoute } from "./nodeRoute";
+import { NODE_KINDS, type NodeKind, nodeRoute } from "./nodeRoute";
+
+interface Presentation {
+  readonly glyph: string;
+  readonly accent: string;
+}
+
+/**
+ * One glyph and one accent per kind the engine can actually send — `NODE_KINDS`
+ * from `nodeRoute.ts`, the one place that list is written down. A
+ * `Record<NodeKind, Presentation>` fails to typecheck if a kind here is
+ * missing or misspelled, so this table cannot drift from the route table the
+ * way the old one (keyed on `model`, `view`, `materializedview` — none of
+ * them a kind the engine emits) silently did (#1859).
+ */
+const PRESENTATION: Record<NodeKind, Presentation> = {
+  source: { glyph: "SRC", accent: "border-l-emerald-500" },
+  replication: { glyph: "REP", accent: "border-l-teal-500" },
+  transformation: { glyph: "XFM", accent: "border-l-sky-500" },
+  quality: { glyph: "DQ", accent: "border-l-fuchsia-500" },
+  snapshot: { glyph: "SNP", accent: "border-l-violet-500" },
+  load: { glyph: "LD", accent: "border-l-cyan-500" },
+  seed: { glyph: "SD", accent: "border-l-lime-500" },
+  test: { glyph: "TST", accent: "border-l-amber-500" },
+};
+
+const DEFAULT_PRESENTATION: Presentation = { glyph: "•", accent: "border-l-zinc-400" };
+
+const KNOWN_KINDS: ReadonlySet<string> = new Set(NODE_KINDS);
+
+/**
+ * A kind's presentation, or the default dot and grey accent for anything
+ * `NODE_KINDS` does not name. `data.kind` reaches this component as a bare
+ * string — the engine's `NodeKind` enum crosses the wire as JSON — so an
+ * unknown value (a stale stored DAG, a kind a newer engine adds) has to fall
+ * to the default rather than fail to render.
+ */
+function presentationFor(kind: string): Presentation {
+  return KNOWN_KINDS.has(kind) ? PRESENTATION[kind as NodeKind] : DEFAULT_PRESENTATION;
+}
 
 /** Accent by resource kind, the VS Code Inspector's idiom in the SPA's palette. */
-function kindClass(kind: string): string {
-  switch (kind.toLowerCase()) {
-    case "source":
-      return "border-l-emerald-500";
-    case "model":
-    case "load":
-      return "border-l-sky-500";
-    case "view":
-      return "border-l-violet-500";
-    case "materializedview":
-      return "border-l-amber-500";
-    default:
-      return "border-l-zinc-400";
-  }
+export function kindClass(kind: string): string {
+  return presentationFor(kind).accent;
 }
 
 /** Short glyph shown on a node, by resource kind. */
 export function kindGlyph(kind: string): string {
-  switch (kind.toLowerCase()) {
-    case "source":
-      return "SRC";
-    case "model":
-      return "MDL";
-    case "load":
-      return "LD";
-    case "view":
-      return "VW";
-    case "materializedview":
-      return "MV";
-    default:
-      return "•";
-  }
+  return presentationFor(kind).glyph;
 }
 
 /** A rounded card: a kind glyph and the model name. Every value is text. */
