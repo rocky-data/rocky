@@ -1702,28 +1702,56 @@ fn build_and_persist_replication_plan(
 /// error, on purpose.
 ///
 /// A tree the walk cannot fully read (permission error, dangling symlink,
-/// depth ceiling) is conservatively treated as "has a model": this
-/// function only decides whether to SKIP compiling, never whether to
-/// report a walk error as success. A broken tree still reaches
+/// depth ceiling), or one this function's own per-directory listing cannot
+/// read — including a `models_dir` that exists but is a regular file, which
+/// `walk_model_dirs` treats as "nothing to descend into" rather than an
+/// error — is conservatively treated as "has a model": this function only
+/// decides whether to SKIP compiling, never whether to report an
+/// unreadable tree as success. A broken tree still reaches
 /// `populate_governance_actions` → `compile(..)`, which surfaces the real
-/// [`rocky_core::model_walk::ModelWalkError`].
+/// [`rocky_core::model_walk::ModelWalkError`] or
+/// [`rocky_compiler::project::ProjectError::NoModels`].
 fn models_dir_has_model_source(models_dir: &Path) -> bool {
     let (dirs, walk_errors) = rocky_core::model_walk::walk_model_dirs(models_dir);
     if !walk_errors.is_empty() {
         return true;
     }
-    dirs.iter().any(|dir| {
-        std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .any(|entry| {
-                matches!(
-                    entry.path().extension().and_then(|e| e.to_str()),
-                    Some("sql" | "rocky")
-                )
-            })
-    })
+    for dir in &dirs {
+        // This second `read_dir` is independent of the walk above and can
+        // fail where the walk did not: `walk_model_dirs` silently skips
+        // (with no error) a root that exists but is not a directory — the
+        // "nothing to descend into" branch that also covers a proven-absent
+        // path — so a `models/` that collides with a regular file reaches
+        // here with an empty `walk_errors`. A `read_dir` failure, or a
+        // failed directory entry, must not read as "no model here" UNLESS
+        // it is a proven absence: that would turn an unreadable or
+        // misconfigured `models/` into a silent "nothing to preview"
+        // instead of the real compiler error. `NotFound` alone conflates a
+        // never-created path with a dangling symlink (#1668, #1707), so it
+        // goes through the same disambiguation `walk_model_dirs` uses.
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                match rocky_core::path_presence::classify_not_found(dir) {
+                    rocky_core::path_presence::PathPresence::Absent => continue,
+                    rocky_core::path_presence::PathPresence::Present { .. } => return true,
+                }
+            }
+            Err(_) => return true,
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return true;
+            };
+            if matches!(
+                entry.path().extension().and_then(|e| e.to_str()),
+                Some("sql" | "rocky")
+            ) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Compile the project and populate `classification_actions`,
@@ -3227,6 +3255,25 @@ ssn = "confidential"
         assert!(
             has_source,
             "an unreadable subtree must not be reported as ok-to-skip"
+        );
+    }
+
+    /// Codex adversarial review (#2118): `walk_model_dirs` treats a root
+    /// that exists but is not a directory as "nothing to descend into" —
+    /// not an error — so a `models/` that collides with a regular file
+    /// (or a symlink to one) sailed past the `walk_errors` check with an
+    /// empty error list. The gate's own second scan must independently
+    /// refuse to read that as "no model here": a `read_dir` failure must
+    /// still force the real compiler error rather than a silent skip.
+    #[test]
+    fn models_dir_has_model_source_true_when_models_dir_is_a_regular_file() {
+        let tmp = TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        fs::write(&models_dir, "not a directory").unwrap();
+
+        assert!(
+            models_dir_has_model_source(&models_dir),
+            "a models/ path that is a regular file must not be read as ok-to-skip"
         );
     }
 
