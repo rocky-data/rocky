@@ -6632,6 +6632,37 @@ pub fn parse_rocky_config(path: &Path) -> Result<RockyConfig, ConfigError> {
     parse_rocky_config_str(&raw)
 }
 
+/// Parses `path` into the same normalized raw TOML document
+/// [`parse_rocky_config`] deserializes from — after env-var substitution,
+/// deprecation remapping, and bare-`[adapter]`/`[pipeline]` shorthand
+/// normalization — but stops short of building a [`RockyConfig`].
+///
+/// `rocky validate`'s L004/L006 lints need this: whether a key like
+/// `[state] backend` or `pipeline.*.target.governance.auto_create_catalogs`
+/// was actually written in the file, not what the defaulted struct resolved
+/// it to. A deserialized `RockyConfig` cannot answer that — `#[serde(default)]`
+/// makes an absent key and an explicitly-written default value
+/// indistinguishable. Because this document ran through the same
+/// normalization `parse_rocky_config` does, a bare `[pipeline]` (single,
+/// unnamed) is already keyed as `pipeline.default` here too, so a caller can
+/// index it by the exact same names `RockyConfig::pipelines` reports.
+///
+/// Presence of a key does not depend on what an env-var placeholder resolves
+/// to — only on the document's structure — so this does not need the
+/// credential-tolerance policy `parse_rocky_config` applies; an unresolved
+/// `${VAR}` left verbatim inside a quoted string parses as an ordinary raw
+/// string either way. It is still an error, not a silent skip, so the caller
+/// gets one clear signal (`Err`) rather than a document that just doesn't
+/// have keys it should.
+pub fn parse_rocky_config_raw(path: &Path) -> Result<toml::Value, ConfigError> {
+    let raw = read_config_file(path)?;
+    let expanded = substitute_env_vars_inner(&raw);
+    let mut value: toml::Value = toml::from_str(&expanded.text)?;
+    apply_deprecations(&mut value);
+    normalize_toml_shorthands(&mut value);
+    Ok(value)
+}
+
 /// Read the raw config file bytes.
 ///
 /// A path with nothing at it maps to [`ConfigError::FileNotFound`] — the one
