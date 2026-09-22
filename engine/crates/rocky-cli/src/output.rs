@@ -168,9 +168,9 @@ pub struct ResolvedCheckNameOutput {
 
 /// Freshness check configuration projected into the discover output.
 ///
-/// Per-schema `overrides` from `rocky_core::config::FreshnessConfig` are
-/// intentionally not exposed yet — the override-key semantics need to be
-/// nailed down before integrations can rely on them.
+/// Just the scalar threshold: `[checks.freshness]` has no per-schema
+/// `overrides` key. One existed and parsed but nothing on the check path
+/// ever read it, so it was removed rather than exposed here (#1620).
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct FreshnessConfigOutput {
     pub threshold_seconds: u64,
