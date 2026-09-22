@@ -7097,9 +7097,12 @@ async fn run_batched_checks(
     // a future second entrypoint) still gets the refusal.
     refuse_check_name_collisions(
         pipeline,
-        assertion_targets
-            .iter()
-            .map(|(tref, asset_key)| (tref.table.as_str(), asset_key.first().map(String::as_str).unwrap_or(""))),
+        assertion_targets.iter().map(|(tref, asset_key)| {
+            (
+                tref.table.as_str(),
+                asset_key.first().map(String::as_str).unwrap_or(""),
+            )
+        }),
     )?;
 
     let row_count_enabled = pipeline.checks.row_count.enabled() && !source_batch_refs.is_empty();
@@ -20813,11 +20816,9 @@ auto_create_schemas = true
                 a.execute_statement(&format!("CREATE SCHEMA {schema}"))
                     .await
                     .unwrap();
-                a.execute_statement(&format!(
-                    "CREATE TABLE {schema}.orders AS SELECT 1 AS id"
-                ))
-                .await
-                .unwrap();
+                a.execute_statement(&format!("CREATE TABLE {schema}.orders AS SELECT 1 AS id"))
+                    .await
+                    .unwrap();
             }
         }
         let config_path = dir.join("rocky.toml");
