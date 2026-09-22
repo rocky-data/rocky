@@ -145,7 +145,7 @@ pub fn run_policy_check(
     if json {
         print_json(&output)?;
     } else {
-        render_text(&output);
+        render_text(&mut io::stdout().lock(), &output)?;
     }
     Ok(())
 }
@@ -270,7 +270,7 @@ pub fn run_policy_test(config_path: &Path, json: bool) -> Result<()> {
     if json {
         print_json(&output)?;
     } else {
-        render_test_text(&output);
+        render_test_text(&mut io::stdout().lock(), &output)?;
     }
 
     if output.failed > 0 {
@@ -718,11 +718,15 @@ remote authority was not downloaded, so a freeze recorded by another pod may be 
 }
 
 /// Render the scenario results as a compact pass/fail report.
-fn render_test_text(out: &PolicyTestOutput) {
-    println!("policy test: {} scenario(s)", out.total);
+///
+/// Writes to a sink rather than calling `println!` so a test can assert the
+/// whole block — the same reason [`render_show_text`] takes one (#1908,
+/// following #1879).
+fn render_test_text<W: Write>(w: &mut W, out: &PolicyTestOutput) -> io::Result<()> {
+    writeln!(w, "policy test: {} scenario(s)", out.total)?;
     for result in &out.results {
         let verdict = if result.passed { "PASS" } else { "FAIL" };
-        println!("  [{verdict}] {}", result.name);
+        writeln!(w, "  [{verdict}] {}", result.name)?;
         if !result.passed {
             let principal = serde_plain(&result.principal);
             let capability = serde_plain(&result.capability);
@@ -733,38 +737,47 @@ fn render_test_text(out: &PolicyTestOutput) {
             } else {
                 result.model.as_str()
             };
-            println!("         {principal} / {capability} / {model}");
-            println!("         expected {expected}, got {actual}");
+            writeln!(w, "         {principal} / {capability} / {model}")?;
+            writeln!(w, "         expected {expected}, got {actual}")?;
             match result.matched_rule {
-                Some(idx) => println!("         matched: rule {idx}"),
-                None => println!("         matched: (none)"),
+                Some(idx) => writeln!(w, "         matched: rule {idx}")?,
+                None => writeln!(w, "         matched: (none)")?,
             }
-            println!("         reason: {}", result.reason);
+            writeln!(w, "         reason: {}", result.reason)?;
         }
     }
-    println!("  {} passed, {} failed", out.passed, out.failed);
+    writeln!(w, "  {} passed, {} failed", out.passed, out.failed)?;
     // Same static-vs-dynamic divergence note `rocky policy check` prints:
     // scenarios evaluate the STATIC `[policy]` config, but a live enforcement
     // seam additionally projects the ledger (active freezes, autonomy-budget
     // burn), which can only tighten a scenario's resolved effect.
-    println!(
+    writeln!(
+        w,
         "  note: scenarios evaluate the static [policy] config; live seams (apply/promote) also \
          project active freezes and autonomy-budget burn, which can only tighten these effects"
-    );
+    )?;
+    Ok(())
 }
 
 /// Render the decision as a compact human-readable block.
-fn render_text(out: &PolicyCheckOutput) {
+///
+/// Writes to a sink rather than calling `println!` so a test can assert the
+/// whole block (#1908, following #1879).
+fn render_text<W: Write>(w: &mut W, out: &PolicyCheckOutput) -> io::Result<()> {
     let principal = serde_plain(&out.principal);
     let capability = serde_plain(&out.capability);
     let effect = serde_plain(&out.effect);
-    println!("policy check: {principal} / {capability} / {}", out.model);
-    println!("  effect: {effect}");
+    writeln!(
+        w,
+        "policy check: {principal} / {capability} / {}",
+        out.model
+    )?;
+    writeln!(w, "  effect: {effect}")?;
     match out.matched_rule {
-        Some(idx) => println!("  matched: rule {idx}"),
-        None => println!("  matched: (none)"),
+        Some(idx) => writeln!(w, "  matched: rule {idx}")?,
+        None => writeln!(w, "  matched: (none)")?,
     }
-    println!("  reason: {}", out.reason);
+    writeln!(w, "  reason: {}", out.reason)?;
     let attrs = &out.model_attributes;
     let classifications = if attrs.classifications.is_empty() {
         "(none)".to_string()
@@ -775,22 +788,25 @@ fn render_text(out: &PolicyCheckOutput) {
         .reachable_downstreams
         .map(|n| n.to_string())
         .unwrap_or_else(|| "(uncomputable)".to_string());
-    println!(
+    writeln!(
+        w,
         "  model: contracted={} layer={} classifications=[{}] downstreams={} blast_radius={}",
         attrs.contracted,
         attrs.layer.as_deref().unwrap_or("(none)"),
         classifications,
         attrs.downstreams,
         reachable,
-    );
+    )?;
     // This is the static base effect. The dynamic breakers — autonomy-budget
     // burn and active policy freezes — are ledger-derived and applied at the
     // mutating enforcement seam (apply / promote); they can only tighten this
     // effect. See `rocky brief` for the current budget/freeze state.
-    println!(
+    writeln!(
+        w,
         "  note: base effect only; autonomy-budget burn and active freezes apply at enforcement \
          (apply/promote) and can only tighten it"
-    );
+    )?;
+    Ok(())
 }
 
 /// Serialize a small serde enum to its wire spelling for text output.
@@ -1237,7 +1253,7 @@ pub fn run_policy_freeze(
     if json {
         print_json(&output)?;
     } else {
-        render_freeze_text(&output);
+        render_freeze_text(&mut io::stdout().lock(), &output)?;
     }
     Ok(())
 }
@@ -1267,32 +1283,43 @@ fn freeze_enforcement_notes(config_path: &Path, lift: bool) -> Vec<String> {
     )]
 }
 
-fn render_freeze_text(out: &PolicyFreezeOutput) {
+/// Writes to a sink rather than calling `println!` so a test can assert the
+/// whole block (#1908, following #1879). The `! {note}` lines this prints are
+/// the highest-value branch: they are the only place that warns a freeze is
+/// recorded but inert (no `[policy]` block, so nothing enforces it).
+fn render_freeze_text<W: Write>(w: &mut W, out: &PolicyFreezeOutput) -> io::Result<()> {
     let verb = if out.lifted { "unfreeze" } else { "freeze" };
-    println!(
+    writeln!(
+        w,
         "policy {verb}: scope '{}' ({} rule set(s))",
         out.scope,
         out.entries.len()
-    );
+    )?;
     for e in &out.entries {
-        println!(
+        writeln!(
+            w,
             "  {} -> {} [{}]",
             serde_plain(&e.principal),
             serde_plain(&e.effect),
             e.decision_ref,
-        );
+        )?;
     }
     if out.lifted {
-        println!("  the matching freeze is lifted; agents resume their authored policy effect");
+        writeln!(
+            w,
+            "  the matching freeze is lifted; agents resume their authored policy effect"
+        )?;
     } else {
-        println!(
+        writeln!(
+            w,
             "  frozen — matched actions now DENY at enforcement; lift with `rocky policy unfreeze` \
              (same --principal/--scope) or a policy-change PR"
-        );
+        )?;
     }
     for note in &out.notes {
-        println!("  ! {note}");
+        writeln!(w, "  ! {note}")?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2816,6 +2843,272 @@ expect = \"allow\"
              rules: 0\n\
              freezes in force (none: no [policy] block, so nothing is enforced): 0\n\
              freeze sources: ledger not_consulted, markers not_consulted\n",
+        );
+    }
+
+    // #1908. The three sibling renderers `render_show_text` did not cover:
+    // `render_test_text` (`policy test`), `render_text` (`policy check`) and
+    // `render_freeze_text` (`policy freeze`/`unfreeze`). Same shape as
+    // #1879's `show_text`/`populated_plane` pair above: render into a
+    // `Vec<u8>` and assert the whole block, not a substring — a substring
+    // assertion would have missed both `render_show_text` regressions #1879
+    // exists to close.
+
+    /// `rocky policy test`, rendered.
+    fn test_report_text(out: &PolicyTestOutput) -> String {
+        let mut buf = Vec::new();
+        render_test_text(&mut buf, out).expect("a Vec sink never fails");
+        String::from_utf8(buf).expect("the renderer writes UTF-8")
+    }
+
+    /// One passing scenario and two failing ones. The failures cover both
+    /// `matched_rule` arms (`Some`/`None`) and the unnamed-model fallback, so
+    /// deleting any one line only this renderer prints has somewhere to fail.
+    fn populated_test_report() -> PolicyTestOutput {
+        PolicyTestOutput {
+            version: "1".to_string(),
+            command: "policy_test".to_string(),
+            total: 3,
+            passed: 1,
+            failed: 2,
+            results: vec![
+                PolicyTestResult {
+                    name: "agent may read".to_string(),
+                    passed: true,
+                    principal: PolicyPrincipal::Agent,
+                    capability: PolicyCapability::Read,
+                    model: "orders".to_string(),
+                    expected: PolicyEffect::Allow,
+                    actual: PolicyEffect::Allow,
+                    matched_rule: Some(1),
+                    reason: "rule 1 matched".to_string(),
+                },
+                PolicyTestResult {
+                    name: "agent apply on contracted must deny".to_string(),
+                    passed: false,
+                    principal: PolicyPrincipal::Agent,
+                    capability: PolicyCapability::Apply,
+                    model: "orders".to_string(),
+                    expected: PolicyEffect::Deny,
+                    actual: PolicyEffect::Allow,
+                    matched_rule: Some(0),
+                    reason: "rule 0 matched: contracted=true".to_string(),
+                },
+                PolicyTestResult {
+                    name: "an unnamed model falls to the default posture".to_string(),
+                    passed: false,
+                    principal: PolicyPrincipal::Human,
+                    capability: PolicyCapability::Promote,
+                    model: String::new(),
+                    expected: PolicyEffect::RequireReview,
+                    actual: PolicyEffect::Allow,
+                    matched_rule: None,
+                    reason: "no rule matched; default posture applied".to_string(),
+                },
+            ],
+        }
+    }
+
+    /// #1908. The whole `policy test` block, asserted as bytes.
+    #[test]
+    fn the_test_report_carries_every_authored_field() {
+        let rendered = test_report_text(&populated_test_report());
+        let expected = concat!(
+            "policy test: 3 scenario(s)\n",
+            "  [PASS] agent may read\n",
+            "  [FAIL] agent apply on contracted must deny\n",
+            "         agent / apply / orders\n",
+            "         expected deny, got allow\n",
+            "         matched: rule 0\n",
+            "         reason: rule 0 matched: contracted=true\n",
+            "  [FAIL] an unnamed model falls to the default posture\n",
+            "         human / promote / (unnamed)\n",
+            "         expected require_review, got allow\n",
+            "         matched: (none)\n",
+            "         reason: no rule matched; default posture applied\n",
+            "  1 passed, 2 failed\n",
+            "  note: scenarios evaluate the static [policy] config; live seams (apply/promote) \
+             also project active freezes and autonomy-budget burn, which can only tighten these \
+             effects\n",
+        );
+        assert_eq!(rendered, expected);
+    }
+
+    /// `rocky policy check`, rendered.
+    fn check_text(out: &PolicyCheckOutput) -> String {
+        let mut buf = Vec::new();
+        render_text(&mut buf, out).expect("a Vec sink never fails");
+        String::from_utf8(buf).expect("the renderer writes UTF-8")
+    }
+
+    /// Every optional field set: a matched rule, classifications, a layer,
+    /// and a computed blast radius.
+    fn populated_check() -> PolicyCheckOutput {
+        PolicyCheckOutput {
+            version: "1".to_string(),
+            command: "policy_check".to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::Apply,
+            model: "orders".to_string(),
+            effect: PolicyEffect::Deny,
+            matched_rule: Some(2),
+            reason: "rule 2 matched: contracted=true".to_string(),
+            model_attributes: PolicyModelAttributes {
+                tags: [("tier".to_string(), "gold".to_string())]
+                    .into_iter()
+                    .collect(),
+                classifications: vec!["pii".to_string(), "financial".to_string()],
+                layer: Some("gold".to_string()),
+                contracted: true,
+                downstreams: 3,
+                reachable_downstreams: Some(7),
+            },
+        }
+    }
+
+    /// #1908. The whole `policy check` block, asserted as bytes.
+    #[test]
+    fn the_check_block_carries_every_authored_field() {
+        let rendered = check_text(&populated_check());
+        let expected = concat!(
+            "policy check: agent / apply / orders\n",
+            "  effect: deny\n",
+            "  matched: rule 2\n",
+            "  reason: rule 2 matched: contracted=true\n",
+            "  model: contracted=true layer=gold classifications=[pii, financial] \
+             downstreams=3 blast_radius=7\n",
+            "  note: base effect only; autonomy-budget burn and active freezes apply at \
+             enforcement (apply/promote) and can only tighten it\n",
+        );
+        assert_eq!(rendered, expected);
+    }
+
+    /// The `Option`-typed columns' other arm: no matched rule, no
+    /// classifications, no layer, no computable blast radius. Each renders a
+    /// distinct placeholder rather than an empty field.
+    #[test]
+    fn an_unmatched_check_renders_every_placeholder() {
+        let unmatched = PolicyCheckOutput {
+            version: "1".to_string(),
+            command: "policy_check".to_string(),
+            principal: PolicyPrincipal::Human,
+            capability: PolicyCapability::Read,
+            model: "stg_customers".to_string(),
+            effect: PolicyEffect::Allow,
+            matched_rule: None,
+            reason: "read is always allowed".to_string(),
+            model_attributes: PolicyModelAttributes {
+                tags: Default::default(),
+                classifications: Vec::new(),
+                layer: None,
+                contracted: false,
+                downstreams: 0,
+                reachable_downstreams: None,
+            },
+        };
+
+        let rendered = check_text(&unmatched);
+        let expected = concat!(
+            "policy check: human / read / stg_customers\n",
+            "  effect: allow\n",
+            "  matched: (none)\n",
+            "  reason: read is always allowed\n",
+            "  model: contracted=false layer=(none) classifications=[(none)] downstreams=0 \
+             blast_radius=(uncomputable)\n",
+            "  note: base effect only; autonomy-budget burn and active freezes apply at \
+             enforcement (apply/promote) and can only tighten it\n",
+        );
+        assert_eq!(rendered, expected);
+    }
+
+    /// `rocky policy freeze` / `unfreeze`, rendered.
+    fn freeze_text(out: &PolicyFreezeOutput) -> String {
+        let mut buf = Vec::new();
+        render_freeze_text(&mut buf, out).expect("a Vec sink never fails");
+        String::from_utf8(buf).expect("the renderer writes UTF-8")
+    }
+
+    /// A freeze on two principals, recorded with no `[policy]` block — the
+    /// case the issue calls the highest-value: the `! {note}` line is the
+    /// ONLY place the text warns the freeze is recorded but not enforced.
+    /// Deleting the notes loop would pass every other test in this file.
+    #[test]
+    fn the_freeze_block_carries_every_authored_field_and_its_inert_warning() {
+        let out = PolicyFreezeOutput {
+            version: "1".to_string(),
+            command: "policy_freeze".to_string(),
+            lifted: false,
+            scope: "any".to_string(),
+            recorded_at: "2026-09-01T12:00:00+00:00".to_string(),
+            entries: vec![
+                PolicyFreezeEntry {
+                    principal: PolicyPrincipal::Agent,
+                    effect: PolicyEffect::Deny,
+                    decision_ref: "2026-09-01T12:00:00+00:00|plan-1|any".to_string(),
+                    plan_id: "plan-1".to_string(),
+                    reason: "incident 42".to_string(),
+                },
+                PolicyFreezeEntry {
+                    principal: PolicyPrincipal::Human,
+                    effect: PolicyEffect::Deny,
+                    decision_ref: "2026-09-01T12:00:00+00:00|plan-1|any".to_string(),
+                    plan_id: "plan-1".to_string(),
+                    reason: "incident 42".to_string(),
+                },
+            ],
+            notes: vec![
+                "freeze recorded but NOT enforced: no [policy] block configured in \
+                 rocky.toml. Every enforcement seam short-circuits before reading the ledger \
+                 until a [policy] block exists; the freeze takes effect the moment one is \
+                 added."
+                    .to_string(),
+            ],
+        };
+
+        let rendered = freeze_text(&out);
+        let expected = concat!(
+            "policy freeze: scope 'any' (2 rule set(s))\n",
+            "  agent -> deny [2026-09-01T12:00:00+00:00|plan-1|any]\n",
+            "  human -> deny [2026-09-01T12:00:00+00:00|plan-1|any]\n",
+            "  frozen — matched actions now DENY at enforcement; lift with \
+             `rocky policy unfreeze` (same --principal/--scope) or a policy-change PR\n",
+            "  ! freeze recorded but NOT enforced: no [policy] block configured in \
+             rocky.toml. Every enforcement seam short-circuits before reading the ledger \
+             until a [policy] block exists; the freeze takes effect the moment one is added.\n",
+        );
+        assert_eq!(rendered, expected);
+    }
+
+    /// The lifted (`unfreeze`) branch, with an empty `notes` — the negative
+    /// control that the `! {note}` line only appears when there is one.
+    #[test]
+    fn a_lifted_freeze_says_so_and_carries_no_notes() {
+        let out = PolicyFreezeOutput {
+            version: "1".to_string(),
+            command: "policy_unfreeze".to_string(),
+            lifted: true,
+            scope: "layer=gold".to_string(),
+            recorded_at: "2026-09-02T08:00:00+00:00".to_string(),
+            entries: vec![PolicyFreezeEntry {
+                principal: PolicyPrincipal::Agent,
+                effect: PolicyEffect::Allow,
+                decision_ref: "2026-09-02T08:00:00+00:00|plan-2|layer=gold".to_string(),
+                plan_id: "plan-2".to_string(),
+                reason: "resolved".to_string(),
+            }],
+            notes: Vec::new(),
+        };
+
+        let rendered = freeze_text(&out);
+        let expected = concat!(
+            "policy unfreeze: scope 'layer=gold' (1 rule set(s))\n",
+            "  agent -> allow [2026-09-02T08:00:00+00:00|plan-2|layer=gold]\n",
+            "  the matching freeze is lifted; agents resume their authored policy effect\n",
+        );
+        assert_eq!(rendered, expected);
+        assert!(
+            !rendered.contains('!'),
+            "no notes means no `! {{note}}` line: {rendered}"
         );
     }
 }

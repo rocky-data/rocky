@@ -9,8 +9,10 @@ use rocky_ir::{ColumnInfo, DriftAction, DriftResult, DriftedColumn, GracePeriodC
 
 /// Compares source and target column types to detect schema drift.
 ///
-/// Two categories surface from a single pass over the source columns
-/// (column drops are detected separately by [`detect_column_drops`]):
+/// Column drops have a separate detector, [`detect_column_drops`], with no
+/// production caller: left unwired by decision (rocky-data/rocky#1616).
+///
+/// Two categories surface from a single pass over the source columns:
 ///
 /// - **Type mismatches** on an existing column populate `drifted_columns`
 ///   and drive the [`DriftAction`] (`AlterColumnTypes` when every change
@@ -70,6 +72,11 @@ pub fn detect_drift(
         drifted_columns,
         action,
         added_columns,
+        // Left unwired by decision (2026-09-17, rocky-data/rocky#1616):
+        // detect_column_drops and generate_drop_column_sql below are built
+        // and tested but have no production caller. The GRACE_PERIODS state
+        // table stays, because it is persisted state. Do not wire this path
+        // without revisiting that decision.
         grace_period_columns: Vec::new(),
         columns_to_drop: Vec::new(),
     }
@@ -237,6 +244,10 @@ pub fn generate_add_column_sql(
 
 /// Detects columns that exist in the target but have been dropped from the
 /// source, and evaluates them against the grace-period policy.
+///
+/// No production code calls this function: left unwired by decision
+/// (rocky-data/rocky#1616, 2026-09-17). Do not wire it without revisiting
+/// that decision.
 ///
 /// This function is pure — it takes existing grace-period records as input
 /// and returns three categories of columns:

@@ -323,7 +323,9 @@ pub struct QualityGateFailure {
 /// violation is on a table this resume never re-copied, so it produced no
 /// check result to count. Reporting "0 error-severity check(s) failed" would
 /// be a lie about a run that is deliberately not green, so the message says
-/// which run raised the gate instead.
+/// which run raised the gate instead — and, per #1851, which checks that
+/// run's own record carries as failed (see
+/// [`recorded_failed_checks_clause`] for the "recorded, not blocking" caveat).
 #[derive(Debug)]
 pub struct CheckGateFailure {
     pub count: usize,
@@ -331,6 +333,11 @@ pub struct CheckGateFailure {
     /// The run whose standing check gate this one inherited, or `None` when
     /// the gate is this run's own.
     pub inherited_from: Option<String>,
+    /// `inherited_from`'s own [`rocky_core::state::CheckOutcome`] names where
+    /// `passed` is `false` (#1851). Always empty when `inherited_from` is
+    /// `None`; see [`InheritedCheckGate::failed_checks`] for what this can
+    /// and cannot claim.
+    pub inherited_failed_checks: Vec<String>,
 }
 
 impl std::fmt::Display for CheckGateFailure {
@@ -344,12 +351,13 @@ impl std::fmt::Display for CheckGateFailure {
                 self.count, self.run_id
             );
         };
+        let clause = recorded_failed_checks_clause(prior, &self.inherited_failed_checks);
         write!(
             f,
             "the check gate raised by run {prior} still stands (run_id: {}); this resume \
              re-ran none of those checks — it builds its check inputs only from the tables it \
-             copied — and added {} error-severity failure(s) of its own. Fix the data and \
-             re-run the pipeline; resuming again cannot clear the gate",
+             copied — and added {} error-severity failure(s) of its own. {clause} Fix the data \
+             and re-run the pipeline; resuming again cannot clear the gate",
             self.run_id, self.count
         )
     }
@@ -2383,12 +2391,31 @@ fn ensure_the_resume_would_do_work(
     )
 }
 
-/// The prior run whose still-standing check gate an admitted resume inherits.
+/// The prior run whose still-standing check gate an admitted resume inherits,
+/// plus the check names that run's own record carries (#1851).
 ///
-/// `Some(run_id)` when the run being resumed recorded
+/// `run_id` is the run being resumed, when it recorded
 /// [`rocky_core::state::RunRecord::check_gate_failed`]: an error-severity check
 /// failed (or could not be evaluated) while that pipeline's `fail_on_error`
 /// gate was on.
+///
+/// `failed_checks` is every [`rocky_core::state::CheckOutcome::name`] on that
+/// record where `passed` is `false` — including a `not_evaluated` outcome,
+/// which always carries `passed: false` except the one deliberate exception
+/// documented on [`rocky_core::state::CheckOutcome::not_evaluated`] (a
+/// keyless overlap sibling, which is not a failure and correctly excluded
+/// here too). These are named as *recorded*, never as *blocking*:
+/// `CheckOutcome` carries no severity, so a warning-severity check that
+/// failed under a `fail_on_error` pipeline sits in this list beside the
+/// error-severity one that actually raised the gate, and there is no way to
+/// tell them apart from the record alone (see
+/// [`ensure_the_resume_would_do_work`]'s doc for why the gate's own refusal
+/// decision does not consult this field either). `CheckOutcome` also carries
+/// no table/asset key, so two tables failing the same check name are
+/// indistinguishable in this list — `rocky history` is still how an operator
+/// finds which table. Empty for a pre-v27 record (`check_outcomes` did not
+/// exist yet) or the unobserved case of a gate standing over an all-`passed`
+/// record.
 ///
 /// # Why an admitted resume has to inherit it
 ///
@@ -2419,13 +2446,67 @@ fn ensure_the_resume_would_do_work(
 /// case [`ensure_run_is_resumable`] deliberately admits), or when the record
 /// predates state schema v25 — an unrecorded verdict reads `false`, so a
 /// pre-v25 run resumes exactly as it does today.
+struct InheritedCheckGate {
+    run_id: String,
+    failed_checks: Vec<String>,
+}
+
 fn inherited_check_gate(
     state_store: &StateStore,
     progress: Option<&RunProgress>,
-) -> Option<String> {
+) -> Option<InheritedCheckGate> {
     let progress = progress?;
     let record = state_store.get_run(&progress.run_id).ok().flatten()?;
-    record.check_gate_failed.then(|| progress.run_id.clone())
+    if !record.check_gate_failed {
+        return None;
+    }
+    let failed_checks = record
+        .check_outcomes
+        .iter()
+        .filter(|c| !c.passed)
+        .map(|c| c.name.clone())
+        .collect();
+    Some(InheritedCheckGate {
+        run_id: progress.run_id.clone(),
+        failed_checks,
+    })
+}
+
+/// The clause naming what a prior run's [`InheritedCheckGate::failed_checks`]
+/// recorded, for a message that must not claim the list is exactly what
+/// tripped the gate (#1851) — see that field's doc.
+fn recorded_failed_checks_clause(run_id: &str, failed_checks: &[String]) -> String {
+    if failed_checks.is_empty() {
+        // Not necessarily a pre-v27 record: `failed_checks` is also empty for
+        // a resume-of-a-resume whose own `check_outcomes` is empty (it
+        // inherited the gate and re-ran no check of its own), so this must
+        // not guess a reason.
+        return format!("Run {run_id}'s record does not carry check names for that gate.");
+    }
+    // `CheckOutcome` has no table/asset key (see this clause's caller's doc),
+    // so two tables failing the same check name arrive here as duplicate
+    // strings — collapsed here, in first-seen order, so a run with many
+    // identically-named per-table failures renders as one entry with a
+    // count instead of the same name repeated dozens of times.
+    let mut counted: Vec<(&str, usize)> = Vec::new();
+    for name in failed_checks {
+        match counted.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, count)) => *count += 1,
+            None => counted.push((name, 1)),
+        }
+    }
+    let rendered = counted
+        .into_iter()
+        .map(|(name, count)| {
+            if count > 1 {
+                format!("{name} (×{count})")
+            } else {
+                name.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Run {run_id} recorded these checks as failed: {rendered}.")
 }
 
 /// The prior run whose still-standing `verify_after` failure an admitted
@@ -4051,7 +4132,8 @@ pub async fn run(
     // The `false` is this run's OWN verdict, which is necessarily false here:
     // no check has run yet. Written through the same helper as the stamp
     // below so the two sites cannot drift apart.
-    output.check_gate_failed = resolved_check_gate(false, inherited_gate.as_ref());
+    output.check_gate_failed =
+        resolved_check_gate(false, inherited_gate.as_ref().map(|g| &g.run_id));
     // Same early stamp, same reason, for the inherited verification verdict:
     // an interrupted resume must persist it too, or a resume of THAT run
     // inherits nothing and can go green (#1732).
@@ -5985,7 +6067,8 @@ pub async fn run(
     // Without this `||` the resumed run derives `Success`, and
     // `latest_successful_run` starts matching it — the laundering path. `None`
     // on every run that is not a resume of a gated run, so nothing else moves.
-    output.check_gate_failed = resolved_check_gate(this_run_gated, inherited_gate.as_ref());
+    output.check_gate_failed =
+        resolved_check_gate(this_run_gated, inherited_gate.as_ref().map(|g| &g.run_id));
     // The inherited verification verdict rides alongside. This run's OWN
     // `verify_after` has not run yet — it runs after the record is persisted,
     // because it reads that record — so the failure branch there ORs itself in
@@ -6006,13 +6089,15 @@ pub async fn run(
     }
     if let Some(prior) = &inherited_gate {
         warn!(
-            resumed_from = prior.as_str(),
+            resumed_from = prior.run_id.as_str(),
             "resumed run inherits a standing check gate"
         );
+        let clause = recorded_failed_checks_clause(&prior.run_id, &prior.failed_checks);
         crate::status_line!(
-            "Check gate: run {prior} was gated by its checks and this resume re-ran none of \
-             them, so the gate still stands — this run cannot report success. Fix the data and \
-             re-run the pipeline."
+            "Check gate: run {run_id} was gated by its checks and this resume re-ran none of \
+             them, so the gate still stands — this run cannot report success. {clause} Fix the \
+             data and re-run the pipeline.",
+            run_id = prior.run_id,
         );
     }
 
@@ -6635,14 +6720,21 @@ pub async fn run(
             return Err(CheckGateFailure {
                 count,
                 run_id: run_id.clone(),
-                inherited_from: inherited_gate.clone(),
+                inherited_from: inherited_gate.as_ref().map(|g| g.run_id.clone()),
+                inherited_failed_checks: inherited_gate
+                    .as_ref()
+                    .map(|g| g.failed_checks.clone())
+                    .unwrap_or_default(),
             }
             .into());
         }
         if let Some(prior) = &inherited_gate {
+            let clause = recorded_failed_checks_clause(&prior.run_id, &prior.failed_checks);
             anyhow::bail!(
-                "the check gate raised by run {prior} still stands (run_id: {run_id}); this \
-                 resume re-ran none of those checks — fix the data and re-run the pipeline"
+                "the check gate raised by run {} still stands (run_id: {run_id}); this \
+                 resume re-ran none of those checks. {clause} Fix the data and re-run the \
+                 pipeline",
+                prior.run_id
             );
         }
         anyhow::bail!(
@@ -7053,7 +7145,7 @@ async fn run_batched_checks(
                             });
                         }
                         (Some(rows), Some(cell)) => {
-                            match cell.as_str().and_then(parse_freshness_timestamp) {
+                            match cell.as_str().and_then(parse_timestamp_cell) {
                                 Some(ts) => fresh_results.push(BatchFreshnessResult {
                                     table: br.clone(),
                                     max_timestamp: Some(ts),
@@ -7846,10 +7938,19 @@ async fn run_batched_checks(
     Ok(())
 }
 
-/// Reads a `MAX(timestamp_column)` cell the way the per-table freshness
-/// fallback always has: RFC 3339 first, then the `YYYY-MM-DD HH:MM:SS[.fff]`
-/// shape most warehouses render a timestamp in.
-fn parse_freshness_timestamp(s: &str) -> Option<DateTime<Utc>> {
+/// Reads a `MAX(timestamp_column)` cell: RFC 3339 first, then the
+/// `YYYY-MM-DD HH:MM:SS[.fff]` shape most warehouses render a timestamp in.
+/// Both directives accept a fractional-second suffix of any width, so a
+/// sub-second timestamp round-trips unchanged rather than being clamped to
+/// whole seconds. `pub(super)`: also called from
+/// `commands::skip_gate::query_max_ts` and
+/// `commands::fulfill_api::observe_max_time_column`, which read the same
+/// shape of cell for the same reason. Used in this file by the per-table
+/// freshness fallback and [`query_target_max_timestamp`] (the
+/// incremental-replication watermark read) — see #2004: the two read the
+/// same column, and a watermark that loses the fraction re-copies the
+/// newest source rows on the next run.
+pub(super) fn parse_timestamp_cell(s: &str) -> Option<DateTime<Utc>> {
     s.parse::<DateTime<Utc>>().ok().or_else(|| {
         chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
             .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
@@ -12488,6 +12589,74 @@ fn typed_model_ir(
     Ok(ir)
 }
 
+/// The warehouse-visible [`rocky_core::traits::ObjectKind`] a
+/// materialization strategy's `CREATE OR REPLACE` statement targets — for
+/// the two strategies the #2037 reconciliation check covers. `None` for
+/// every other strategy: see the call site in [`execute_one_plain_model`]
+/// for why the other eight strategies are out of scope for this binary
+/// table/view check.
+fn strategy_implies_object_kind(
+    strategy: &rocky_ir::MaterializationStrategy,
+) -> Option<rocky_core::traits::ObjectKind> {
+    use rocky_core::traits::ObjectKind;
+    use rocky_ir::MaterializationStrategy as S;
+    match strategy {
+        S::FullRefresh => Some(ObjectKind::Table),
+        S::View => Some(ObjectKind::View),
+        S::Incremental { .. }
+        | S::Merge { .. }
+        | S::MaterializedView
+        | S::DynamicTable { .. }
+        | S::TimeInterval { .. }
+        | S::Ephemeral
+        | S::DeleteInsert { .. }
+        | S::Microbatch { .. }
+        | S::ContentAddressed { .. } => None,
+    }
+}
+
+/// The target already exists, but as the other warehouse-visible kind
+/// (table vs view) than the model's materialization strategy implies
+/// (#2037). Raised by [`execute_one_plain_model`] BEFORE the strategy's
+/// `CREATE OR REPLACE <kind>` is generated or sent — `CREATE OR REPLACE`
+/// only ever replaces an object of that same kind, so sending it here
+/// would surface the warehouse's own "Existing object X is of type Y,
+/// trying to replace with type Z" catalog error, naming neither the cause
+/// nor the fix.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "target {target} exists as a {existing_kind}, but the strategy now asks for a \
+     {expected_kind}. Rocky does not drop an existing object implicitly. Run \
+     `DROP {existing_kind_sql} {target}` first, then re-run."
+)]
+struct StrategyKindMismatch {
+    target: String,
+    existing_kind: &'static str,
+    expected_kind: &'static str,
+    existing_kind_sql: &'static str,
+}
+
+/// Builds the `.context("model '<name>' failed")`-wrapped
+/// [`StrategyKindMismatch`], matching the wrapping every other runtime
+/// failure in [`execute_one_plain_model`] uses — so the printed chain
+/// reads `model '<name>' failed: target ... exists as a <kind> ...`
+/// exactly like the raw-warehouse-error case it replaces (#2037).
+fn strategy_kind_mismatch_error(
+    model_name: &str,
+    target: &str,
+    existing_kind: &'static str,
+    expected_kind: &'static str,
+    existing_kind_sql: &'static str,
+) -> anyhow::Error {
+    anyhow::Error::from(StrategyKindMismatch {
+        target: target.to_string(),
+        existing_kind,
+        expected_kind,
+        existing_kind_sql,
+    })
+    .context(format!("model '{model_name}' failed"))
+}
+
 /// Execute exactly one "plain" single-statement transformation model:
 /// bootstrap a MERGE target if missing, generate SQL, run the statements
 /// in order, and build the resulting [`MaterializationOutput`].
@@ -12537,6 +12706,70 @@ async fn execute_one_plain_model(
             &model_ir.target.table,
         )
         .map_err(anyhow::Error::from)?;
+
+    // Strategy/target-kind reconciliation (#2037, part 1: "say what
+    // happened"). `FullRefresh` and `View` each issue `CREATE OR REPLACE
+    // <kind>` further down — `TABLE` for `FullRefresh`, `VIEW` for `View`
+    // (`sql_gen::generate_transformation_sql_with_warehouse`) — and that
+    // statement only ever replaces an object of the SAME kind. Switching a
+    // model between `view` and a table-shaped strategy leaves the target as
+    // the OLD kind, and the warehouse refuses with its own catalog error
+    // ("Existing object X is of type Y, trying to replace with type Z")
+    // naming neither the cause nor the fix (#2037's repro). Check the
+    // target's actual kind here, before that statement is generated or
+    // sent, and fail with a Rocky diagnostic instead.
+    //
+    // Scoped to `FullRefresh`/`View` only: they are the two strategies
+    // whose SQL is *always* a `CREATE OR REPLACE <kind>` of the two kinds
+    // `ObjectKind` models (table, view). `Merge`/`Incremental`/
+    // `DeleteInsert`/`Microbatch` never replace an existing object (they
+    // bootstrap once via a non-replacing `CREATE TABLE` below and otherwise
+    // `INSERT`/`MERGE` into it); `MaterializedView`/`DynamicTable` are a
+    // third and fourth object kind this binary check does not model.
+    if let Some(expected_kind) = strategy_implies_object_kind(&model_ir.materialization) {
+        let target_table_struct = rocky_ir::TableRef {
+            catalog: model_ir.target.catalog.clone(),
+            schema: model_ir.target.schema.clone(),
+            table: model_ir.target.table.clone(),
+        };
+        // Advisory only: an adapter that doesn't implement the probe
+        // (`Ok(Unknown)`, the default — every adapter but DuckDB today) and
+        // a transport/permission failure asking for it (`Err`) are treated
+        // identically — skip the check. Neither is a safety regression: on
+        // "can't tell", the strategy's own `CREATE OR REPLACE` runs exactly
+        // as it did before this check existed, so a genuine mismatch still
+        // surfaces — just as the warehouse's own error, not yet this one.
+        let existing_kind = warehouse
+            .object_kind(&target_table_struct)
+            .await
+            .unwrap_or(rocky_core::traits::ObjectKind::Unknown);
+        // Exhaustive over `existing_kind` (no `_ =>`) so a future
+        // `ObjectKind` variant fails to compile here instead of silently
+        // falling into "skip" or "mismatch".
+        match existing_kind {
+            rocky_core::traits::ObjectKind::Unknown => {}
+            rocky_core::traits::ObjectKind::Table | rocky_core::traits::ObjectKind::View
+                if existing_kind == expected_kind => {}
+            rocky_core::traits::ObjectKind::Table => {
+                return Err(strategy_kind_mismatch_error(
+                    model_name,
+                    &target_ref,
+                    "table",
+                    "view",
+                    "TABLE",
+                ));
+            }
+            rocky_core::traits::ObjectKind::View => {
+                return Err(strategy_kind_mismatch_error(
+                    model_name,
+                    &target_ref,
+                    "view",
+                    "table",
+                    "VIEW",
+                ));
+            }
+        }
+    }
 
     let model_started_at = Utc::now();
     let mut bytes_scanned_acc: Option<u64> = None;
@@ -13446,21 +13679,12 @@ async fn query_target_max_timestamp(
             target.full_name()
         )
     })?;
-    let parsed = raw
-        .parse::<chrono::DateTime<Utc>>()
-        .ok()
-        .or_else(|| {
-            chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
-                .or_else(|_| chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S"))
-                .ok()
-                .map(|naive| naive.and_utc())
-        })
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "could not parse target-side watermark for {}: {raw}",
-                target.full_name()
-            )
-        })?;
+    let parsed = parse_timestamp_cell(raw).ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not parse target-side watermark for {}: {raw}",
+            target.full_name()
+        )
+    })?;
     Ok(Some(parsed))
 }
 
@@ -16693,6 +16917,35 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         store.record_run(&record).unwrap();
     }
 
+    /// A gated run's record, carrying the [`rocky_core::state::CheckOutcome`]
+    /// entries `to_run_record` would have flattened onto it (#1851). Each
+    /// tuple is `(name, passed)`; `not_evaluated` is left unset — the tests
+    /// that use this only care about `passed`.
+    fn seed_gated_run_record_with_checks(
+        store: &StateStore,
+        run_id: &str,
+        status: &str,
+        checks: &[(&str, bool)],
+    ) {
+        let check_outcomes: Vec<_> = checks
+            .iter()
+            .map(|(name, passed)| serde_json::json!({"name": name, "passed": passed}))
+            .collect();
+        let record: rocky_core::state::RunRecord = serde_json::from_value(serde_json::json!({
+            "run_id": run_id,
+            "started_at": "2026-08-30T00:00:00Z",
+            "finished_at": "2026-08-30T00:01:00Z",
+            "status": status,
+            "models_executed": [],
+            "trigger": "Manual",
+            "config_hash": "test",
+            "check_gate_failed": true,
+            "check_outcomes": check_outcomes,
+        }))
+        .expect("minimal RunRecord deserializes");
+        store.record_run(&record).unwrap();
+    }
+
     /// #1720. Every table this run planned copied, the checks gated it, AND a
     /// failed `models_executed` entry is present — the `<verify_after>` shape,
     /// which needs no `--all` and no model at all.
@@ -16919,11 +17172,54 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                 .expect("the checkpoint resolves");
             assert_eq!(progress.run_id, "run-1");
             assert_eq!(
-                super::inherited_check_gate(&store, Some(&progress)).as_deref(),
+                super::inherited_check_gate(&store, Some(&progress))
+                    .as_ref()
+                    .map(|g| g.run_id.as_str()),
                 Some("run-1"),
                 "the admitted resume must carry the standing gate forward"
             );
         }
+    }
+
+    /// #1851. The prior run's own record carries which checks it recorded as
+    /// failed, at zero extra query cost — `inherited_check_gate` must surface
+    /// every one of them (not just the run id) so the resume's refusal
+    /// message can name them instead of sending the operator to
+    /// `rocky history` for the prior run. A passing check must not appear.
+    ///
+    /// Fails without the fix: pre-#1851, `inherited_check_gate` returns only
+    /// the run id and this test does not compile against that shape.
+    #[test]
+    fn inherited_check_gate_names_every_check_the_prior_run_recorded_as_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        store
+            .init_run_progress("run-1", &planned_keys(3), Some(&scope))
+            .unwrap();
+        complete_tables(&store, "run-1", 2);
+        seed_gated_run_record_with_checks(
+            &store,
+            "run-1",
+            "PartialFailure",
+            &[
+                ("row_count", false),
+                ("not_null:email", false),
+                ("freshness", true),
+            ],
+        );
+
+        let progress = resolve_resume_progress(&store, Some("run-1"), false, &scope)
+            .expect("a gated run with a table left to copy still resumes")
+            .expect("the checkpoint resolves");
+        let inherited = super::inherited_check_gate(&store, Some(&progress))
+            .expect("the standing gate must be inherited");
+        assert_eq!(
+            inherited.failed_checks,
+            vec!["row_count".to_string(), "not_null:email".to_string()],
+            "both failed checks must be named and the passing one excluded: {:?}",
+            inherited.failed_checks
+        );
     }
 
     /// Control (#1720): an ungated failed run is untouched. `main`'s
@@ -21888,6 +22184,226 @@ table = "fct_events"
         assert_eq!(rows.rows, vec![vec![serde_json::json!("99")]]);
     }
 
+    /// #2037, part 1 ("say what happened"): a model run as `strategy =
+    /// "view"`, then switched to `strategy = "full_refresh"`, fails on the
+    /// next run — but with a Rocky diagnostic naming the target, the kind
+    /// mismatch, and the exact `DROP VIEW` that fixes it, never the raw
+    /// DuckDB catalog error ("Existing object X is of type Y, trying to
+    /// replace with type Z"). The pre-created `tgt.orders_view` VIEW stands
+    /// in for what `run 1` left behind; `execute_one_plain_model` is the
+    /// shared entry point both the serial and intra-layer-concurrent
+    /// full-pipeline paths call for `run 2`, so this exercises the
+    /// production dispatch target directly.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn strategy_switch_view_to_full_refresh_fails_with_rocky_diagnostic() {
+        use rocky_core::models::load_model_pair;
+        use rocky_core::traits::{ObjectKind, WarehouseAdapter};
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+        use rocky_ir::TableRef;
+
+        let warehouse = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for ddl in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.orders (id INTEGER)",
+            "INSERT INTO src.orders VALUES (1), (2)",
+            // What `run 1` (strategy = "view") left behind.
+            "CREATE VIEW tgt.orders_view AS SELECT * FROM src.orders",
+        ] {
+            warehouse.execute_statement(ddl).await.unwrap();
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("orders_view.toml"),
+            r#"
+name = "orders_view"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = ""
+schema = "tgt"
+table = "orders_view"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("orders_view.sql"),
+            "SELECT id FROM src.orders",
+        )
+        .unwrap();
+        let model = load_model_pair(
+            &dir.path().join("orders_view.sql"),
+            &dir.path().join("orders_view.toml"),
+            None,
+        )
+        .expect("load full_refresh model");
+
+        let dialect = DuckDbSqlDialect;
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+        };
+
+        let error = match super::execute_one_plain_model(
+            &model,
+            &warehouse as &dyn WarehouseAdapter,
+            &dialect as &dyn rocky_core::traits::SqlDialect,
+            "orders_view",
+            std::time::Instant::now(),
+            exec_ctx,
+        )
+        .await
+        {
+            Ok(_) => panic!(
+                "a view -> full_refresh strategy switch over a live view must fail, \
+                 not silently replace it"
+            ),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(
+                "target tgt.orders_view exists as a view, but the strategy now asks for a table"
+            ),
+            "message should name the cause: {message}"
+        );
+        assert!(
+            message.contains("DROP VIEW tgt.orders_view"),
+            "message should name the fix: {message}"
+        );
+        assert!(
+            !message.contains("trying to replace with type"),
+            "the raw warehouse catalog error must not reach the operator: {message}"
+        );
+
+        // Refused before anything was sent — the view survives untouched.
+        let kind = warehouse
+            .object_kind(&TableRef {
+                catalog: String::new(),
+                schema: "tgt".into(),
+                table: "orders_view".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(kind, ObjectKind::View);
+    }
+
+    /// #2037, part 1, the reverse direction: a model run as `strategy =
+    /// "full_refresh"`, then switched to `strategy = "view"`, fails with the
+    /// same Rocky diagnostic — this time naming `DROP TABLE` — never the raw
+    /// warehouse text. Mirrors the test above; see its doc comment.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn strategy_switch_full_refresh_to_view_fails_with_rocky_diagnostic() {
+        use rocky_core::models::load_model_pair;
+        use rocky_core::traits::{ObjectKind, WarehouseAdapter};
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+        use rocky_ir::TableRef;
+
+        let warehouse = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for ddl in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.orders (id INTEGER)",
+            "INSERT INTO src.orders VALUES (1), (2)",
+            // What `run 1` (strategy = "full_refresh") left behind.
+            "CREATE TABLE tgt.orders_view AS SELECT * FROM src.orders",
+        ] {
+            warehouse.execute_statement(ddl).await.unwrap();
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("orders_view.toml"),
+            r#"
+name = "orders_view"
+
+[strategy]
+type = "view"
+
+[target]
+catalog = ""
+schema = "tgt"
+table = "orders_view"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("orders_view.sql"),
+            "SELECT id FROM src.orders",
+        )
+        .unwrap();
+        let model = load_model_pair(
+            &dir.path().join("orders_view.sql"),
+            &dir.path().join("orders_view.toml"),
+            None,
+        )
+        .expect("load view model");
+
+        let dialect = DuckDbSqlDialect;
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+        };
+
+        let error = match super::execute_one_plain_model(
+            &model,
+            &warehouse as &dyn WarehouseAdapter,
+            &dialect as &dyn rocky_core::traits::SqlDialect,
+            "orders_view",
+            std::time::Instant::now(),
+            exec_ctx,
+        )
+        .await
+        {
+            Ok(_) => panic!(
+                "a full_refresh -> view strategy switch over a live table must fail, \
+                 not silently replace it"
+            ),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(
+                "target tgt.orders_view exists as a table, but the strategy now asks for a view"
+            ),
+            "message should name the cause: {message}"
+        );
+        assert!(
+            message.contains("DROP TABLE tgt.orders_view"),
+            "message should name the fix: {message}"
+        );
+        assert!(
+            !message.contains("trying to replace with type"),
+            "the raw warehouse catalog error must not reach the operator: {message}"
+        );
+
+        // Refused before anything was sent — the table survives untouched.
+        let kind = warehouse
+            .object_kind(&TableRef {
+                catalog: String::new(),
+                schema: "tgt".into(),
+                table: "orders_view".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(kind, ObjectKind::Table);
+    }
+
     /// Fail-closed bootstrap — time_interval path (`execute_time_interval_model`).
     ///
     /// Third of the three executor bootstrap paths. The per-partition
@@ -23716,6 +24232,284 @@ timestamp_column = "ts"
         );
     }
 
+    /// #2004: the shared cell parser (`parse_timestamp_cell`, used by both
+    /// the incremental-watermark read and the freshness-check fallback)
+    /// must keep a fractional second it receives, and must still accept a
+    /// whole-second value — state files written before this fix used
+    /// `WatermarkState.last_value` at whole-second precision, and those
+    /// still need to load.
+    #[test]
+    fn parse_timestamp_cell_round_trips_fractional_seconds() {
+        use chrono::Timelike;
+
+        let with_fraction = super::parse_timestamp_cell("2026-09-15T10:00:00.250Z")
+            .expect("RFC 3339 with a fractional second must parse");
+        assert_eq!(
+            with_fraction.nanosecond(),
+            250_000_000,
+            "the fractional second must round-trip unchanged, got {with_fraction:?}"
+        );
+
+        let whole_second = super::parse_timestamp_cell("2026-09-15T10:00:00Z")
+            .expect("RFC 3339 with no fractional second must still parse");
+        assert_eq!(whole_second.nanosecond(), 0);
+    }
+
+    /// #2004 repro: a source row stamped with a fractional second
+    /// (`10:00:00.250`, the shape every warehouse's `now()` produces) must
+    /// not be re-copied on the next incremental run. DuckDB's own
+    /// `Value::Timestamp` handling (`rocky-duckdb/src/lib.rs`) used to
+    /// integer-divide the raw tick count down to whole seconds and hand
+    /// `MAX(_loaded_at)` back to `resolve_new_watermark` /
+    /// `query_target_max_timestamp` already clamped to `:00` — one row
+    /// short of what it needs to exclude itself on the next run. This
+    /// drives the real SQL adapter + dialect + `resolve_new_watermark`
+    /// function across two consecutive incremental runs and checks
+    /// `checks::check_row_count` on counts read straight from the
+    /// warehouse — a lower-level unit test than the full pipeline, not a
+    /// claim that it drives `super::run`, SQL generation, the
+    /// deferred-watermark phase, or the redb store. See
+    /// [`incremental_fractional_second_watermark_row_count_passes_end_to_end`]
+    /// just below for the same scenario driven through `super::run` and
+    /// its own `row_count` check gate.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn incremental_fractional_second_watermark_excludes_itself_on_next_run() {
+        use chrono::Timelike;
+        use rocky_core::traits::{SqlDialect, WarehouseAdapter};
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+        use rocky_ir::{MaterializationStrategy, TableRef};
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for ddl in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.t (id INTEGER, _loaded_at TIMESTAMP)",
+            "CREATE TABLE tgt.t (id INTEGER, _loaded_at TIMESTAMP)",
+            // The one row from the issue's repro: a fractional-second stamp.
+            "INSERT INTO src.t VALUES (1, TIMESTAMP '2026-09-15 10:00:00.250')",
+        ] {
+            adapter.execute_statement(ddl).await.unwrap();
+        }
+
+        let dialect = DuckDbSqlDialect;
+        let strategy = MaterializationStrategy::Incremental {
+            timestamp_column: "_loaded_at".to_string(),
+        };
+        let target = TableRef {
+            catalog: String::new(),
+            schema: "tgt".into(),
+            table: "t".into(),
+        };
+        let now = chrono::Utc::now();
+
+        // ── Run 1 ────────────────────────────────────────────────────────
+        let where1 = dialect.watermark_where("_loaded_at", None).unwrap();
+        adapter
+            .execute_statement(&format!("INSERT INTO tgt.t SELECT * FROM src.t {where1}"))
+            .await
+            .unwrap();
+        let wm1 = super::resolve_new_watermark(
+            &strategy,
+            &adapter as &dyn WarehouseAdapter,
+            &dialect as &dyn SqlDialect,
+            &target,
+            "_loaded_at",
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+        // The fix under test: the recorded watermark must keep the row's
+        // fractional second, not clamp it to `:00`.
+        assert_eq!(
+            wm1.nanosecond(),
+            250_000_000,
+            "watermark must carry the source row's fractional second, got {wm1:?}"
+        );
+
+        // ── Run 2 ────────────────────────────────────────────────────────
+        // Nothing changed in the source. `_loaded_at > wm1` must exclude the
+        // very row wm1 was read from — a strict `>` against an unrounded
+        // watermark does that; a watermark rounded down to `:00` does not.
+        let where2 = dialect.watermark_where("_loaded_at", Some(&wm1)).unwrap();
+        adapter
+            .execute_statement(&format!("INSERT INTO tgt.t SELECT * FROM src.t {where2}"))
+            .await
+            .unwrap();
+
+        let read_count = |cell: &serde_json::Value| -> u64 {
+            cell.as_u64()
+                .or_else(|| cell.as_str().and_then(|s| s.parse::<u64>().ok()))
+                .unwrap()
+        };
+        let source_count = read_count(
+            &adapter
+                .execute_query("SELECT COUNT(*) FROM src.t")
+                .await
+                .unwrap()
+                .rows[0][0],
+        );
+        let target_count = read_count(
+            &adapter
+                .execute_query("SELECT COUNT(*) FROM tgt.t")
+                .await
+                .unwrap()
+                .rows[0][0],
+        );
+        assert_eq!(
+            target_count, 1,
+            "run 2 re-copied the fractional-second row instead of excluding it"
+        );
+        let row_count_check = rocky_core::checks::check_row_count(source_count, target_count);
+        assert!(
+            row_count_check.passed,
+            "row_count must pass on an untouched source: {row_count_check:?}"
+        );
+    }
+
+    /// #2004 acceptance test: the issue's own repro, driven through the real
+    /// `rocky run` entry point end to end — a real `rocky.toml`, a DuckDB
+    /// file on disk, and the redb state store — using the same
+    /// `run_pipeline` harness shape as
+    /// [`fail_fast_partial_failure_commits_successful_watermark`] just
+    /// below. Unlike the lower-level test above, this exercises
+    /// `super::run`, SQL generation, the deferred-watermark commit phase,
+    /// and the pipeline's own `row_count` check gate: `row_count = true`
+    /// in `[pipeline.repro.checks]` means a failing check surfaces as
+    /// `Err(CheckGateFailure)` (exit 2 in the CLI, matching the issue's own
+    /// `PartialFailure` repro), so `run_pipeline(..).await` returning `Ok`
+    /// on run 2 IS the row_count-passed assertion.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn incremental_fractional_second_watermark_row_count_passes_end_to_end() {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        async fn run_pipeline(
+            config_path: &std::path::Path,
+            state_path: &std::path::Path,
+            run_id: &str,
+        ) -> anyhow::Result<RunTermination> {
+            super::run(
+                config_path,
+                Arc::new(rocky_core::config::load_rocky_config_fingerprinted(config_path).unwrap()),
+                None,
+                Some("repro"),
+                state_path,
+                None,
+                true,
+                None,
+                false,
+                None,
+                false,
+                None,
+                &PartitionRunOptions::default(),
+                None,
+                None,
+                None,
+                None,
+                &DeferOptions::default(),
+                &SkipRunOptions::default(),
+                &rocky_core::run_vars::RunVars::new(),
+                Some(run_id),
+                None,
+                false,
+                None, // #1460
+            )
+            .await
+        }
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("repro.duckdb");
+        let config_path = tmp.path().join("rocky.toml");
+        let state_path = tmp.path().join("state.redb");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.repro]
+strategy = "incremental"
+timestamp_column = "_loaded_at"
+
+[pipeline.repro.source.discovery]
+adapter = "default"
+
+[pipeline.repro.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.repro.target]
+catalog_template = "repro"
+schema_template = "staging__{{source}}"
+
+[pipeline.repro.target.governance]
+auto_create_schemas = true
+
+[pipeline.repro.checks]
+row_count = true
+
+[pipeline.repro.execution]
+concurrency = 1
+
+[state]
+backend = "local"
+"#,
+                db_path.display()
+            ),
+        )
+        .expect("write rocky.toml");
+
+        {
+            let db = DuckDbWarehouseAdapter::open(&db_path).expect("seed duckdb");
+            for sql in [
+                "CREATE SCHEMA raw__demo",
+                "CREATE TABLE raw__demo.t (id INTEGER, _loaded_at TIMESTAMP)",
+                // The issue's exact repro value.
+                "INSERT INTO raw__demo.t VALUES (1, TIMESTAMP '2026-09-15 10:00:00.250')",
+            ] {
+                db.execute_statement(sql).await.unwrap();
+            }
+        }
+
+        run_pipeline(&config_path, &state_path, "run1")
+            .await
+            .expect("run 1 must succeed");
+
+        // Nothing changed in the source between runs — the issue's exact
+        // scenario. Before the fix this returned Err(CheckGateFailure): the
+        // watermark had been recorded as :00, so the .250 row re-passed the
+        // WHERE filter, target grew to 2 rows, and row_count (1 source != 2
+        // target) failed the check gate.
+        run_pipeline(&config_path, &state_path, "run2")
+            .await
+            .expect(
+                "run 2 must succeed: the fractional-second watermark must exclude \
+                 the row it was read from, so row_count passes",
+            );
+
+        let db = DuckDbWarehouseAdapter::open(&db_path).expect("verify duckdb");
+        let count = db
+            .execute_query("SELECT COUNT(*) FROM repro.staging__demo.t")
+            .await
+            .unwrap();
+        let n = count.rows[0][0].as_u64().or_else(|| {
+            count.rows[0][0]
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+        });
+        assert_eq!(
+            n,
+            Some(1),
+            "run 2 must not re-copy the fractional-second row into the target"
+        );
+    }
+
     /// Regression for #1410: a sibling failure under `fail_fast` must not
     /// withhold the watermark of an incremental table whose warehouse write
     /// already committed. Otherwise the recovery run appends that delta twice.
@@ -24406,14 +25200,20 @@ backend = "local"
         // --- the resume: it copies the one table that failed, and nothing
         // else. It runs the checks for that table only, and they pass.
         let inherited = super::inherited_check_gate(&store, Some(&progress));
-        assert_eq!(inherited.as_deref(), Some("run-1"));
+        assert_eq!(inherited.as_ref().map(|g| g.run_id.as_str()), Some("run-1"));
+        assert_eq!(
+            inherited.as_ref().map(|g| g.failed_checks.as_slice()),
+            Some(["row_count".to_string()].as_slice()),
+            "the prior run's own recorded failed check must carry through (#1851)"
+        );
 
         let mut resumed = RunOutput::new(String::new(), 0, 1);
         resumed.tables_copied = 1;
         resumed.resumed_from = Some("run-1".to_string());
         let own_gate = super::replication_check_gate_failed(&resumed, &checks);
         assert!(!own_gate, "the resume re-ran none of the gating checks");
-        resumed.check_gate_failed = super::resolved_check_gate(own_gate, inherited.as_ref());
+        resumed.check_gate_failed =
+            super::resolved_check_gate(own_gate, inherited.as_ref().map(|g| &g.run_id));
 
         assert!(
             !matches!(resumed.derive_run_status(), RunStatus::Success),
@@ -24446,7 +25246,9 @@ backend = "local"
             .unwrap();
         let progress2 = store.get_run_progress("run-2").unwrap().unwrap();
         assert_eq!(
-            super::inherited_check_gate(&store, Some(&progress2)).as_deref(),
+            super::inherited_check_gate(&store, Some(&progress2))
+                .as_ref()
+                .map(|g| g.run_id.as_str()),
             Some("run-2"),
             "a resume of the resume inherits the same standing gate"
         );
@@ -24676,15 +25478,28 @@ backend = "local"
     /// the ordering is asserted over this file's own source, the shape
     /// `rocky-mcp`'s `tools.rs` already uses for a claim about its own text.
     ///
+    /// The needle is the whole ASSIGNMENT, `output.check_gate_failed =
+    /// resolved_check_gate(...)`, not just the call (#2132 red-team finding):
+    /// a needle of the call alone still matches a mutation that deletes
+    /// `output.check_gate_failed =` and leaves the call as a discarded
+    /// expression statement — the stamp is gone but the text this test
+    /// looked for is still there. The source is whitespace-normalised before
+    /// matching (`split_whitespace().join(" ")`) because rustfmt wraps the
+    /// assignment across two lines, and the needle has no such wrapping.
+    ///
     /// Both `find`s take the FIRST occurrence, which is the production site;
     /// the copies inside this test are thousands of lines later.
     #[test]
     fn the_inherited_gate_is_stamped_before_the_interrupt_path_persists() {
         let source = include_str!("run.rs");
-        let stamp = source
-            .find("output.check_gate_failed = resolved_check_gate(false, inherited_gate.as_ref());")
+        let normalized = source.split_whitespace().collect::<Vec<_>>().join(" ");
+        let stamp = normalized
+            .find(
+                "output.check_gate_failed = resolved_check_gate(false, \
+                 inherited_gate.as_ref().map(|g| &g.run_id));",
+            )
             .expect("the early inherited-gate stamp is gone — see #1720");
-        let interrupt_persist = source
+        let interrupt_persist = normalized
             .find("// Persist interrupted RunRecord")
             .expect("the interrupt path's persist comment moved; re-anchor this test");
         assert!(
@@ -24888,6 +25703,7 @@ backend = "local"
             count: 2,
             run_id: "run-1".to_string(),
             inherited_from: None,
+            inherited_failed_checks: Vec::new(),
         }
         .to_string();
         assert!(
@@ -24900,6 +25716,7 @@ backend = "local"
             count: 0,
             run_id: "run-2".to_string(),
             inherited_from: Some("run-1".to_string()),
+            inherited_failed_checks: Vec::new(),
         }
         .to_string();
         assert!(
@@ -24911,6 +25728,94 @@ backend = "local"
                 && inherited.contains("re-ran none of those checks")
                 && inherited.contains("resuming again cannot clear the gate"),
             "an inherited gate must name the run that raised it: {inherited}"
+        );
+    }
+
+    /// #1851. The prior run's own record carries which checks it recorded as
+    /// failed — the operator's next question after "the gate raised by run
+    /// X still stands" is "which check?", and answering it used to mean a
+    /// trip to `rocky history` for run X. Both names must appear, and the
+    /// wording must say "recorded", never "blocking" — `CheckOutcome` carries
+    /// no severity, so this list can hold a warning-severity name beside the
+    /// error-severity one that actually raised the gate.
+    #[test]
+    fn the_inherited_gate_message_names_every_check_the_prior_run_recorded() {
+        let inherited = super::CheckGateFailure {
+            count: 0,
+            run_id: "run-2".to_string(),
+            inherited_from: Some("run-1".to_string()),
+            inherited_failed_checks: vec!["row_count".to_string(), "not_null:email".to_string()],
+        }
+        .to_string();
+        assert!(
+            inherited.contains("row_count") && inherited.contains("not_null:email"),
+            "both check names run-1 recorded as failed must appear: {inherited}"
+        );
+        assert!(
+            inherited.contains("recorded these checks as failed"),
+            "the checks must be labelled as recorded, not as blocking: {inherited}"
+        );
+        assert!(
+            !inherited.contains("blocking"),
+            "the message must not claim the list is exactly what blocked the run: {inherited}"
+        );
+        // The existing assertions above still hold with the names inserted.
+        assert!(
+            inherited.contains("raised by run run-1")
+                && inherited.contains("re-ran none of those checks")
+                && inherited.contains("resuming again cannot clear the gate"),
+            "the pre-#1851 wording must survive unchanged around the new clause: {inherited}"
+        );
+    }
+
+    /// #1851. A record whose `check_outcomes` is empty despite a standing
+    /// gate — a pre-v27 record, OR a resume-of-a-resume that inherited the
+    /// gate and re-ran no check of its own, so its OWN record's
+    /// `check_outcomes` is empty too — must not render an empty check list.
+    /// The clause has to say honestly that no names are available, not print
+    /// "recorded these checks as failed: " with nothing after the colon, and
+    /// it must not guess which of the two reasons applies.
+    #[test]
+    fn the_inherited_gate_message_has_a_fallback_when_no_check_names_are_recorded() {
+        let inherited = super::CheckGateFailure {
+            count: 0,
+            run_id: "run-2".to_string(),
+            inherited_from: Some("run-1".to_string()),
+            inherited_failed_checks: Vec::new(),
+        }
+        .to_string();
+        assert!(
+            !inherited.contains("failed: ."),
+            "an empty check list must not render as an empty, punctuated list: {inherited}"
+        );
+        assert!(
+            inherited.contains("does not carry check names"),
+            "an empty check list must say so honestly instead of going silent: {inherited}"
+        );
+    }
+
+    /// #1851. `CheckOutcome` has no table/asset key, so N tables failing the
+    /// same check name arrive as N identical strings — asserted directly at
+    /// `the_default_concurrency_runs_every_table_assertion`, where 40 tables
+    /// all fail `not_null:id`. Printing the name 40 times would read as a
+    /// bug, not a list, so the clause collapses repeats in first-seen order
+    /// and appends a count instead.
+    #[test]
+    fn the_recorded_failed_checks_clause_collapses_duplicate_names_with_a_count() {
+        let failed_checks = vec![
+            "not_null:id".to_string(),
+            "not_null:id".to_string(),
+            "row_count".to_string(),
+            "not_null:id".to_string(),
+        ];
+        let clause = super::recorded_failed_checks_clause("run-1", &failed_checks);
+        assert!(
+            clause.contains("not_null:id (×3)"),
+            "three identical names must collapse into one entry with a count: {clause}"
+        );
+        assert!(
+            clause.contains("row_count") && !clause.contains("row_count (×"),
+            "a name seen once must render without a count: {clause}"
         );
     }
 

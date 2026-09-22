@@ -380,6 +380,10 @@ pub async fn run_with_dag(
         .iter()
         .filter_map(|n| n.pipeline.as_ref().map(|p| (n.id.clone(), p.clone())))
         .collect();
+    let (seed_pipeline, seed_pipeline_refusal) = match sole_adapter_pipeline(cfg, &seeds) {
+        Ok(name) => (Some(name), None),
+        Err(reason) => (None, Some(reason)),
+    };
 
     let dispatcher = CliDispatcher {
         config_path: config_path.to_path_buf(),
@@ -387,6 +391,8 @@ pub async fn run_with_dag(
         state_path: state_path.to_path_buf(),
         seeds_dir,
         node_pipelines,
+        seed_pipeline,
+        seed_pipeline_refusal,
         partition_opts: partition_opts.clone(),
         skip_opts: *skip_opts,
         shadow_config: shadow_config.cloned(),
@@ -600,6 +606,127 @@ pub(super) struct TransformationModels {
     pub contributing_roots: Vec<PathBuf>,
 }
 
+/// Why [`sole_adapter_pipeline`] could not resolve a single pipeline for a
+/// seed, when it could not — distinguished so the `Seed` dispatch arm can
+/// name the actual disagreement instead of one generic sentence for two
+/// different problems.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeedPipelineRefusal {
+    /// The project's pipelines don't all target the same warehouse adapter.
+    AdapterMismatch,
+    /// Every pipeline shares one adapter, but at least one discovered seed
+    /// has no explicit sidecar `[target].catalog`, and the project's
+    /// replication pipelines don't all resolve the same default catalog for
+    /// it (see [`crate::commands::seed::default_seed_catalog`]).
+    CatalogMismatch,
+}
+
+/// The pipeline to load a `Seed` node against, for `run_seed`'s adapter (and,
+/// for a seed with no explicit `[target]`, default catalog) selection
+/// (#2018).
+///
+/// A seed has no pipeline of its own: `seeds_dir` is one project-global
+/// directory, not one per pipeline — `unified_dag::build_unified_dag` adds
+/// seed nodes as explicitly "pipeline-independent". Standalone `rocky seed`
+/// without `--pipeline` already refuses unless the project has exactly one
+/// pipeline, because it has no other way to pick a target adapter. `--dag`
+/// has no operator to ask.
+///
+/// Resolves to a pipeline only when BOTH hold:
+///
+/// 1. Every pipeline in the project shares ONE warehouse adapter name — in
+///    that case it does not matter which pipeline `run_seed` receives for
+///    adapter selection, because there is only one adapter it could choose.
+/// 2. Every DISCOVERED seed either declares its own sidecar
+///    `[target].catalog` explicitly, or the project's replication pipelines
+///    (if any) all resolve the SAME default catalog via
+///    [`crate::commands::seed::default_seed_catalog`] — `run_seed`'s
+///    `default_catalog` for a seed with no explicit catalog is NOT a
+///    function of the adapter alone; it reads the CHOSEN pipeline's
+///    replication `catalog_template` (or `"main"`), so two replication
+///    pipelines on one adapter with different fixed templates would let
+///    whichever one this function prefers silently pick the catalog for
+///    every such seed.
+///
+/// Prefers a replication pipeline when one exists (matching `run_seed`'s own
+/// `default_catalog`, which only resolves a template for a replication
+/// pipeline), else the first pipeline BY NAME — `cfg.pipelines` is an
+/// `IndexMap` populated by `toml`'s deserializer in sorted key order, not
+/// TOML declaration order.
+///
+/// Three more capable designs were tried and rejected, each by an
+/// independent red-team pass that found a route to a silently wrong
+/// warehouse or catalog:
+///
+/// 1. Picking the project's sole *replication* pipeline unconditionally: on
+///    a project with a replication pipeline on one adapter and the seed's
+///    real reader on a DIFFERENT one, the seed refreshes the unread adapter
+///    and leaves a stale same-named table on the reader's adapter
+///    untouched — the DAG reports success over silently wrong data.
+/// 2. Resolving from the seed's downstream consumers, verified against the
+///    consumer's own SQL: still routed off a bare/qualified table-name
+///    match derived from `unified_dag`'s inference machinery, which cannot
+///    prove the matched name is physically the SAME adapter connection —
+///    two different DuckDB files can share a catalog *name* (as this file's
+///    own test fixtures do), so a same-named table on the WRONG adapter
+///    could still pass.
+/// 3. Resolving purely on adapter agreement (condition 1 alone, no condition
+///    2): sound for the seed's WAREHOUSE, but not for its default CATALOG —
+///    see condition 2 above.
+///
+/// A project whose pipelines use different adapters, or whose replication
+/// pipelines disagree on a seed's default catalog, has no single correct
+/// answer without knowing exactly which physical warehouse (and catalog)
+/// the seed's real reader expects — a question this rule deliberately does
+/// not try to answer from the DAG — so it stays refused, exactly as
+/// `rocky seed` (no `--pipeline`) already refuses an ambiguous project.
+fn sole_adapter_pipeline(
+    cfg: &rocky_core::config::RockyConfig,
+    seeds: &[rocky_core::seeds::SeedFile],
+) -> Result<String, SeedPipelineRefusal> {
+    let mut adapters = cfg
+        .pipelines
+        .values()
+        .map(rocky_core::config::PipelineConfig::target_adapter);
+    let first_adapter = adapters
+        .next()
+        .ok_or(SeedPipelineRefusal::AdapterMismatch)?;
+    if !adapters.all(|adapter| adapter == first_adapter) {
+        return Err(SeedPipelineRefusal::AdapterMismatch);
+    }
+
+    let any_seed_missing_catalog = seeds.iter().any(|seed| {
+        seed.config
+            .target
+            .as_ref()
+            .and_then(|t| t.catalog.as_deref())
+            .is_none()
+    });
+    if any_seed_missing_catalog {
+        let mut replication_catalogs = cfg
+            .pipelines
+            .values()
+            .filter(|pipeline| {
+                matches!(pipeline, rocky_core::config::PipelineConfig::Replication(_))
+            })
+            .map(super::seed::default_seed_catalog);
+        if let Some(first_catalog) = replication_catalogs.next()
+            && !replication_catalogs.all(|catalog| catalog == first_catalog)
+        {
+            return Err(SeedPipelineRefusal::CatalogMismatch);
+        }
+    }
+
+    cfg.pipelines
+        .iter()
+        .find(|(_, pipeline)| {
+            matches!(pipeline, rocky_core::config::PipelineConfig::Replication(_))
+        })
+        .or_else(|| cfg.pipelines.iter().next())
+        .map(|(name, _)| name.clone())
+        .ok_or(SeedPipelineRefusal::AdapterMismatch)
+}
+
 fn status_str(s: &NodeStatus) -> &'static str {
     match s {
         NodeStatus::Pending => "pending",
@@ -635,6 +762,18 @@ struct CliDispatcher {
     /// Maps each pipeline-bound node to its owning pipeline name. Seed and
     /// source-marker nodes carry no entry (their `pipeline` is `None`).
     node_pipelines: HashMap<NodeId, String>,
+    /// The pipeline `Seed` nodes load against — [`sole_adapter_pipeline`]
+    /// resolved once for the whole DAG, since every seed uses the same rule
+    /// (#2018). `None` when unresolved (see [`SeedPipelineRefusal`], carried
+    /// in [`Self::seed_pipeline_refusal`]); `run_seed` refuses it exactly as
+    /// standalone `rocky seed` (no `--pipeline`) already does on an
+    /// ambiguous project.
+    seed_pipeline: Option<String>,
+    /// Why [`Self::seed_pipeline`] is `None`, when it is — `None` here too
+    /// when `seed_pipeline` resolved. Lets the `Seed` dispatch arm name the
+    /// actual disagreement (adapter vs. default catalog) instead of one
+    /// sentence for two different problems.
+    seed_pipeline_refusal: Option<SeedPipelineRefusal>,
     /// The outer DAG invocation's time-interval partition options, exactly as
     /// the caller passed them. [`Self::dispatch`] narrows them through
     /// [`sub_run_partition_opts`] on the way to each sub-run — the selection
@@ -799,11 +938,78 @@ impl NodeDispatcher for CliDispatcher {
                 // re-read (#1120), so a `rocky.toml` swap mid-DAG cannot make
                 // a warehouse-mutating seed node execute config B while the
                 // rest of the DAG runs A.
+                //
+                // `seed_pipeline` (#2018) is set only when every pipeline in
+                // the project shares one warehouse adapter AND (for a seed
+                // with no explicit sidecar `[target].catalog`) every
+                // replication pipeline resolves the same default catalog —
+                // in which case it doesn't matter which pipeline is named,
+                // so every seed uses the same value. Absent otherwise, in
+                // which case `run_seed` refuses exactly as standalone
+                // `rocky seed` (no `--pipeline`) already does on a
+                // multi-pipeline project — see `sole_adapter_pipeline`.
                 let seeds_dir = self.seeds_dir.clone();
+                let seed_pipeline = self.seed_pipeline.clone();
+                let seed_pipeline_refusal = self.seed_pipeline_refusal;
                 Some(Box::pin(async move {
-                    super::seed::run_seed(&loaded, &seeds_dir, None, Some(&label), false)
-                        .await
-                        .map_err(|e| format!("{e:#}"))
+                    // `resolve_pipeline` inside `run_seed` is about to hit the
+                    // same "which pipeline" ambiguity standalone `rocky seed`
+                    // refuses on — but under `--dag` there is no `--pipeline`
+                    // flag to suggest, so reframe it in terms the operator can
+                    // act on here.
+                    //
+                    // Gated on more than `seed_pipeline.is_none()` and
+                    // `pipelines.len() > 1` (not `!= 1`, which would also
+                    // fire — wrongly — for a zero-pipeline project, whose
+                    // real problem is "no pipelines defined", not an adapter
+                    // or catalog disagreement): `run_seed` builds its
+                    // `AdapterRegistry` BEFORE resolving the pipeline
+                    // (`seed.rs`), so an unrelated adapter-construction
+                    // failure on a multi-pipeline project would otherwise
+                    // also get mislabeled as a resolution problem. The
+                    // rendered error is checked for the literal context
+                    // `resolve_pipeline` attaches in `run_seed`
+                    // ("failed to resolve pipeline for seed") so only an
+                    // actual resolution failure is reframed.
+                    let maybe_ambiguous =
+                        seed_pipeline.is_none() && loaded.config.pipelines.len() > 1;
+                    let result = super::seed::run_seed(
+                        &loaded,
+                        &seeds_dir,
+                        seed_pipeline.as_deref(),
+                        Some(&label),
+                        false,
+                    )
+                    .await;
+                    let result = result.map_err(|e| {
+                        if maybe_ambiguous
+                            && format!("{e:#}").contains("failed to resolve pipeline for seed")
+                        {
+                            let sentence = match seed_pipeline_refusal {
+                                Some(SeedPipelineRefusal::CatalogMismatch) => {
+                                    "rocky run --dag cannot pick a default catalog for this \
+                                     seed: it has no explicit sidecar [target] catalog, and \
+                                     the project's replication pipelines do not all resolve \
+                                     the same default catalog, so there is no single pipeline \
+                                     to default to; give this seed an explicit [target] \
+                                     catalog, give every replication pipeline the same \
+                                     catalog_template, or load it outside --dag with \
+                                     `rocky seed --pipeline <name>`"
+                                }
+                                _ => {
+                                    "rocky run --dag cannot pick a warehouse adapter for this \
+                                     seed: the project's pipelines do not all use the same \
+                                     adapter, so there is no single pipeline to default to; \
+                                     give every pipeline the same adapter, or load this seed \
+                                     outside --dag with `rocky seed --pipeline <name>`"
+                                }
+                            };
+                            e.context(sentence)
+                        } else {
+                            e
+                        }
+                    });
+                    result.map_err(|e| format!("{e:#}"))
                 }))
             }
             _ => {
@@ -938,6 +1144,8 @@ mod run_opts_threading_tests {
             state_path: std::path::PathBuf::from(".rocky-state.redb"),
             seeds_dir: std::path::PathBuf::from("seeds"),
             node_pipelines,
+            seed_pipeline: None,
+            seed_pipeline_refusal: None,
             partition_opts,
             skip_opts,
             shadow_config,
@@ -1230,6 +1438,8 @@ mod state_turnstile_tests {
             state_path: std::path::PathBuf::from(state_path),
             seeds_dir: std::path::PathBuf::from("seeds"),
             node_pipelines,
+            seed_pipeline: None,
+            seed_pipeline_refusal: None,
             partition_opts: PartitionRunOptions::default(),
             skip_opts: SkipRunOptions::default(),
             shadow_config: None,
@@ -1526,6 +1736,8 @@ mod tests {
             state_path: root.join(".rocky-state.redb"),
             seeds_dir: root.join("seeds"),
             node_pipelines: HashMap::new(),
+            seed_pipeline: None,
+            seed_pipeline_refusal: None,
             partition_opts: PartitionRunOptions::default(),
             skip_opts: SkipRunOptions::default(),
             shadow_config: None,
@@ -1667,6 +1879,618 @@ mod tests {
             .execute_sql("SELECT COUNT(*) FROM proj.silver.dim_country")
             .unwrap();
         assert_eq!(cell_i64(&model_rows.rows[0][0]), 2, "model rows");
+    }
+
+    /// #2018: `rocky run --dag` must load a seed on a project with MORE THAN
+    /// ONE pipeline, not refuse with "multiple pipelines defined".
+    ///
+    /// Pre-fix, the `Seed` dispatch arm called `run_seed` with a hardcoded
+    /// `None` pipeline; `run_seed`'s `resolve_pipeline(None)` refuses unless
+    /// the project has exactly one pipeline — which this fixture, by design
+    /// (a replication pipeline `ingest` plus a transformation pipeline
+    /// `transform` depending on it), does not. The seed node then FAILED and
+    /// its dependent model was skipped as an upstream failure.
+    ///
+    /// Non-vacuous: `stg_orders` reads the table `ingest` replicates, so
+    /// asserting its row count also proves `ingest` itself completed — a
+    /// broken fix that leaves the seed unresolved would fail before this
+    /// model ever ran, not vacuously pass it.
+    #[tokio::test]
+    async fn seed_loads_on_a_dag_with_more_than_one_pipeline() {
+        use rocky_core::traits::WarehouseAdapter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+
+        let db_path = root.join("wh.duckdb");
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter.local]\n\
+                 type = \"duckdb\"\n\
+                 path = \"{}\"\n\n\
+                 [pipeline.ingest]\n\
+                 type = \"replication\"\n\
+                 strategy = \"full_refresh\"\n\n\
+                 [pipeline.ingest.source.discovery]\n\
+                 adapter = \"local\"\n\n\
+                 [pipeline.ingest.source.schema_pattern]\n\
+                 prefix = \"raw__\"\n\
+                 separator = \"__\"\n\
+                 components = [\"source\"]\n\n\
+                 [pipeline.ingest.target]\n\
+                 adapter = \"local\"\n\
+                 catalog_template = \"wh\"\n\
+                 schema_template = \"staging__{{source}}\"\n\n\
+                 [pipeline.ingest.target.governance]\n\
+                 auto_create_catalogs = true\n\
+                 auto_create_schemas = true\n\n\
+                 [pipeline.transform]\n\
+                 type = \"transformation\"\n\
+                 depends_on = [\"ingest\"]\n\n\
+                 [pipeline.transform.target]\n\
+                 adapter = \"local\"\n\n\
+                 [pipeline.transform.target.governance]\n\
+                 auto_create_catalogs = true\n\
+                 auto_create_schemas = true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        // Pre-existing "source" data `ingest` replicates — the schema_pattern
+        // above discovers it as source `shop`, table `orders_src`.
+        {
+            let seed_db = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+            seed_db
+                .execute_statement("CREATE SCHEMA raw__shop")
+                .await
+                .unwrap();
+            seed_db
+                .execute_statement(
+                    "CREATE TABLE raw__shop.orders_src AS SELECT 1 AS id, 100 AS amount",
+                )
+                .await
+                .unwrap();
+        }
+
+        std::fs::write(
+            root.join("seeds/orders.csv"),
+            "code,name\nUS,United States\nGB,United Kingdom\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("seeds/orders.toml"),
+            "name = \"orders\"\n\n\
+             [target]\n\
+             catalog = \"wh\"\n\
+             schema = \"seeds\"\n\
+             table = \"orders\"\n",
+        )
+        .unwrap();
+
+        // Reads BOTH the table `ingest` replicates and the seed's own
+        // table — no explicit `depends_on` (a seed is not a model the
+        // compiler's semantic graph knows about); `run_with_dag`'s SQL
+        // `FROM`-reference inference orders this model after both, mirroring
+        // the issue's repro where the seed's own failure skipped this node
+        // as an upstream failure.
+        std::fs::write(
+            root.join("models/stg_orders.sql"),
+            "SELECT o.id, o.amount, s.code \
+             FROM wh.staging__shop.orders_src o, wh.seeds.orders s\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("models/stg_orders.toml"),
+            "name = \"stg_orders\"\n\n\
+             [target]\n\
+             catalog = \"wh\"\n\
+             schema = \"silver\"\n\
+             table = \"stg_orders\"\n",
+        )
+        .unwrap();
+
+        let config_path = root.join("rocky.toml");
+        let state_path = root.join(".rocky-state.redb");
+        run_with_dag(
+            &config_path,
+            dag_snapshot(&config_path),
+            &state_path,
+            false,
+            &PartitionRunOptions::default(),
+            &crate::commands::run::SkipRunOptions::default(),
+            None,
+            None,
+        )
+        .await
+        .expect("run --dag must complete the seed node on a multi-pipeline project");
+
+        let adapter = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+
+        let seed_rows = guard
+            .execute_sql("SELECT COUNT(*) FROM wh.seeds.orders")
+            .unwrap();
+        assert_eq!(
+            cell_i64(&seed_rows.rows[0][0]),
+            2,
+            "seed node completed, not FAILED"
+        );
+
+        // The dependent model is not skipped: it materializes against the
+        // table `ingest` replicated.
+        let model_rows = guard
+            .execute_sql("SELECT COUNT(*) FROM wh.silver.stg_orders")
+            .unwrap();
+        assert_eq!(
+            cell_i64(&model_rows.rows[0][0]),
+            2,
+            "downstream model must not be skipped (1 replicated row x 2 seed rows)"
+        );
+    }
+
+    /// #2018: a seed on a multi-pipeline project, all sharing ONE warehouse
+    /// adapter, refreshes a STALE same-named table rather than leaving it
+    /// (or writing beside it).
+    ///
+    /// `ingest` (replication) and `transform` (transformation, reading the
+    /// seed) both point at the SAME DuckDB file — the only shape
+    /// `sole_adapter_pipeline` ever resolves without refusing. Non-vacuous:
+    /// the seed's own target table is seeded with a sentinel row
+    /// (`code = "STALE"`) before the run. Asserting the model output holds
+    /// the FRESH seed rows, not the sentinel, proves the seed node actually
+    /// ran (a node that dispatched but silently no-opped, or that raced the
+    /// model instead of ordering before it, would still leave the sentinel
+    /// visible).
+    #[tokio::test]
+    async fn seed_refreshes_a_stale_table_when_all_pipelines_share_one_adapter() {
+        use rocky_core::traits::WarehouseAdapter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+
+        let db_path = root.join("wh.duckdb");
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter.local]\n\
+                 type = \"duckdb\"\n\
+                 path = \"{}\"\n\n\
+                 [pipeline.ingest]\n\
+                 type = \"replication\"\n\
+                 strategy = \"full_refresh\"\n\n\
+                 [pipeline.ingest.source.discovery]\n\
+                 adapter = \"local\"\n\n\
+                 [pipeline.ingest.source.schema_pattern]\n\
+                 prefix = \"raw__\"\n\
+                 separator = \"__\"\n\
+                 components = [\"source\"]\n\n\
+                 [pipeline.ingest.target]\n\
+                 adapter = \"local\"\n\
+                 catalog_template = \"wh\"\n\
+                 schema_template = \"staging__{{source}}\"\n\n\
+                 [pipeline.ingest.target.governance]\n\
+                 auto_create_catalogs = true\n\
+                 auto_create_schemas = true\n\n\
+                 [pipeline.transform]\n\
+                 type = \"transformation\"\n\
+                 depends_on = [\"ingest\"]\n\n\
+                 [pipeline.transform.target]\n\
+                 adapter = \"local\"\n\n\
+                 [pipeline.transform.target.governance]\n\
+                 auto_create_catalogs = true\n\
+                 auto_create_schemas = true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        // Minimal source data so `ingest` has something to replicate;
+        // irrelevant to what this test pins beyond letting the DAG complete
+        // cleanly.
+        {
+            let source_db = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+            source_db
+                .execute_statement("CREATE SCHEMA raw__shop")
+                .await
+                .unwrap();
+            source_db
+                .execute_statement("CREATE TABLE raw__shop.orders_src AS SELECT 1 AS id")
+                .await
+                .unwrap();
+
+            // A STALE same-named seed table, as if left by an earlier run.
+            source_db
+                .execute_statement("CREATE SCHEMA wh.seeds")
+                .await
+                .unwrap();
+            source_db
+                .execute_statement(
+                    "CREATE TABLE wh.seeds.orders AS SELECT 'STALE' AS code, 'stale row' AS name",
+                )
+                .await
+                .unwrap();
+        }
+
+        std::fs::write(
+            root.join("seeds/orders.csv"),
+            "code,name\nUS,United States\nGB,United Kingdom\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("seeds/orders.toml"),
+            "name = \"orders\"\n\n\
+             [target]\n\
+             catalog = \"wh\"\n\
+             schema = \"seeds\"\n\
+             table = \"orders\"\n",
+        )
+        .unwrap();
+
+        // Reads the seed directly (no explicit `depends_on`; the SQL `FROM`
+        // reference is inferred) — the freshness of THIS read is what the
+        // test proves.
+        std::fs::write(
+            root.join("models/stg_orders.sql"),
+            "SELECT code, name FROM wh.seeds.orders\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("models/stg_orders.toml"),
+            "name = \"stg_orders\"\n\n\
+             [target]\n\
+             catalog = \"wh\"\n\
+             schema = \"silver\"\n\
+             table = \"stg_orders\"\n",
+        )
+        .unwrap();
+
+        let config_path = root.join("rocky.toml");
+        let state_path = root.join(".rocky-state.redb");
+        run_with_dag(
+            &config_path,
+            dag_snapshot(&config_path),
+            &state_path,
+            false,
+            &PartitionRunOptions::default(),
+            &crate::commands::run::SkipRunOptions::default(),
+            None,
+            None,
+        )
+        .await
+        .expect("run --dag should complete the seed and its downstream model");
+
+        let adapter = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        let model_rows = guard
+            .execute_sql("SELECT code FROM wh.silver.stg_orders ORDER BY code")
+            .unwrap();
+        let codes: Vec<String> = model_rows
+            .rows
+            .iter()
+            .map(|r| r[0].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            codes,
+            vec!["GB".to_string(), "US".to_string()],
+            "the model must read the FRESH seed rows, not the stale sentinel"
+        );
+    }
+
+    /// #2018: a project whose pipelines use DIFFERENT warehouse adapters has
+    /// no single correct answer for which one a seed belongs to, and
+    /// `--dag` must refuse rather than guess — naming the adapter
+    /// disagreement, not a generic failure.
+    ///
+    /// Two independent red-team passes each found a way an earlier, more
+    /// capable resolution rule (the project's sole replication pipeline;
+    /// then a downstream consumer's own SQL, checked against the seed's
+    /// resolved target) could still route a multi-adapter project's seed to
+    /// the wrong warehouse. `sole_adapter_pipeline` only ever resolves when
+    /// every pipeline shares one adapter — on two DIFFERENT adapters it has
+    /// no candidate to offer at all, so the failure class cannot occur
+    /// here.
+    ///
+    /// Dispatches the `Seed` node directly (the same pattern
+    /// `seed_dispatch_executes_the_captured_snapshot_not_a_reload` uses)
+    /// rather than through `run_with_dag`, whose only externally visible
+    /// error is the generic "DAG execution had N failed node(s)" — direct
+    /// dispatch is the one path that returns the actual per-node message
+    /// text `CliDispatcher::dispatch`'s `Seed` arm builds, which is what
+    /// this test pins.
+    ///
+    /// Non-vacuous: asserts the message names the adapter disagreement AND
+    /// that the seed's target table was created on NEITHER adapter.
+    /// `AdapterRegistry::from_config` (inside `run_seed`) DOES open both
+    /// DuckDB files as a side effect of registry construction — the refusal
+    /// happens after that, before any WRITE, which is why the assertion
+    /// checks for the seed's table specifically rather than for the files'
+    /// existence.
+    #[tokio::test]
+    async fn seed_refuses_when_the_projects_pipelines_use_different_adapters() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+
+        let db_a = root.join("a/wh.duckdb");
+        let db_b = root.join("b/wh.duckdb");
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter.a]\n\
+                 type = \"duckdb\"\n\
+                 path = \"{}\"\n\n\
+                 [adapter.b]\n\
+                 type = \"duckdb\"\n\
+                 path = \"{}\"\n\n\
+                 [pipeline.alpha]\n\
+                 type = \"transformation\"\n\n\
+                 [pipeline.alpha.target]\n\
+                 adapter = \"a\"\n\n\
+                 [pipeline.beta]\n\
+                 type = \"transformation\"\n\n\
+                 [pipeline.beta.target]\n\
+                 adapter = \"b\"\n",
+                db_a.display(),
+                db_b.display()
+            ),
+        )
+        .unwrap();
+
+        std::fs::write(
+            root.join("seeds/orders.csv"),
+            "code,name\nUS,United States\nGB,United Kingdom\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("seeds/orders.toml"),
+            "name = \"orders\"\n\n\
+             [target]\n\
+             catalog = \"wh\"\n\
+             schema = \"seeds\"\n\
+             table = \"orders\"\n",
+        )
+        .unwrap();
+
+        let config_path = root.join("rocky.toml");
+        let loaded = dag_snapshot(&config_path);
+        let refusal = sole_adapter_pipeline(&loaded.config, &[])
+            .expect_err("two different adapters must not resolve");
+        assert_eq!(refusal, SeedPipelineRefusal::AdapterMismatch);
+
+        let dispatcher = CliDispatcher {
+            config_path: config_path.clone(),
+            loaded,
+            state_path: root.join(".rocky-state.redb"),
+            seeds_dir: root.join("seeds"),
+            node_pipelines: HashMap::new(),
+            seed_pipeline: None,
+            seed_pipeline_refusal: Some(refusal),
+            partition_opts: PartitionRunOptions::default(),
+            skip_opts: SkipRunOptions::default(),
+            shadow_config: None,
+            sub_runner: default_sub_runner(),
+            state_turns: StateTurnstile::new(),
+        };
+        let id = NodeId::new("seed", "orders");
+        let fut = dispatcher
+            .dispatch(&id, NodeKind::Seed, "orders")
+            .expect("a seed node dispatches a future");
+        let err = fut.await.expect_err("must refuse, not guess");
+        assert!(
+            err.contains("cannot pick a warehouse adapter"),
+            "unexpected error: {err}"
+        );
+
+        for db in [&db_a, &db_b] {
+            let adapter = DuckDbWarehouseAdapter::open(db).unwrap();
+            let conn = adapter.shared_connector();
+            let guard = conn.lock().unwrap();
+            assert!(
+                guard.execute_sql("SELECT * FROM wh.seeds.orders").is_err(),
+                "the seed must not have been written to {db:?} — the refusal must \
+                 happen before any write"
+            );
+        }
+    }
+
+    /// #2018 round 3: two replication pipelines sharing ONE warehouse
+    /// adapter, but with DIFFERENT fixed `catalog_template`s, must not let
+    /// a seed with no explicit sidecar `[target].catalog` silently pick
+    /// whichever one happens to be preferred.
+    ///
+    /// `run_seed`'s `default_catalog` (`commands/seed.rs`,
+    /// `default_seed_catalog`) is not purely a function of the ADAPTER —
+    /// for a seed missing its own catalog, it reads the CHOSEN pipeline's
+    /// replication `catalog_template`. Resolving purely on adapter
+    /// agreement (condition 1 of `sole_adapter_pipeline` alone) would have
+    /// silently picked `ingest_x`'s or `ingest_y`'s catalog depending only
+    /// on which sorts first, with no way for an operator to tell which one
+    /// "won".
+    #[tokio::test]
+    async fn seed_refuses_when_replication_pipelines_disagree_on_default_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+
+        let db_path = root.join("wh.duckdb");
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter.local]\n\
+                 type = \"duckdb\"\n\
+                 path = \"{}\"\n\n\
+                 [pipeline.ingest_x]\n\
+                 type = \"replication\"\n\
+                 strategy = \"full_refresh\"\n\n\
+                 [pipeline.ingest_x.source.discovery]\n\
+                 adapter = \"local\"\n\n\
+                 [pipeline.ingest_x.source.schema_pattern]\n\
+                 prefix = \"raw_x__\"\n\
+                 separator = \"__\"\n\
+                 components = [\"source\"]\n\n\
+                 [pipeline.ingest_x.target]\n\
+                 adapter = \"local\"\n\
+                 catalog_template = \"catx\"\n\
+                 schema_template = \"staging__{{source}}\"\n\n\
+                 [pipeline.ingest_y]\n\
+                 type = \"replication\"\n\
+                 strategy = \"full_refresh\"\n\n\
+                 [pipeline.ingest_y.source.discovery]\n\
+                 adapter = \"local\"\n\n\
+                 [pipeline.ingest_y.source.schema_pattern]\n\
+                 prefix = \"raw_y__\"\n\
+                 separator = \"__\"\n\
+                 components = [\"source\"]\n\n\
+                 [pipeline.ingest_y.target]\n\
+                 adapter = \"local\"\n\
+                 catalog_template = \"caty\"\n\
+                 schema_template = \"staging__{{source}}\"\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        // No explicit `[target]` at all — the seed's default catalog is
+        // exactly what's ambiguous here.
+        std::fs::write(
+            root.join("seeds/orders.csv"),
+            "code,name\nUS,United States\nGB,United Kingdom\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("seeds/orders.toml"), "name = \"orders\"\n").unwrap();
+
+        let config_path = root.join("rocky.toml");
+        let loaded = dag_snapshot(&config_path);
+        let seeds = rocky_core::seeds::discover_seeds(&root.join("seeds")).unwrap();
+        let refusal = sole_adapter_pipeline(&loaded.config, &seeds)
+            .expect_err("disagreeing replication catalogs must not resolve");
+        assert_eq!(refusal, SeedPipelineRefusal::CatalogMismatch);
+
+        let dispatcher = CliDispatcher {
+            config_path: config_path.clone(),
+            loaded,
+            state_path: root.join(".rocky-state.redb"),
+            seeds_dir: root.join("seeds"),
+            node_pipelines: HashMap::new(),
+            seed_pipeline: None,
+            seed_pipeline_refusal: Some(refusal),
+            partition_opts: PartitionRunOptions::default(),
+            skip_opts: SkipRunOptions::default(),
+            shadow_config: None,
+            sub_runner: default_sub_runner(),
+            state_turns: StateTurnstile::new(),
+        };
+        let id = NodeId::new("seed", "orders");
+        let fut = dispatcher
+            .dispatch(&id, NodeKind::Seed, "orders")
+            .expect("a seed node dispatches a future");
+        let err = fut.await.expect_err("must refuse, not guess");
+        assert!(
+            err.contains("cannot pick a default catalog"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// #2018 round 3: the "prefer a replication pipeline" tie-break in
+    /// `sole_adapter_pipeline` is observable — it decides a catalog-less
+    /// seed's default catalog — and must not be an accident of iteration
+    /// order.
+    ///
+    /// `zzz_ingest` (replication) sorts AFTER `aaa_transform`
+    /// (transformation) by name, so an unpinned "first pipeline by name"
+    /// rule would pick `aaa_transform` and default the seed to catalog
+    /// `"main"`. Asserts the seed instead lands in `wh` — `zzz_ingest`'s
+    /// `catalog_template` — proving the replication preference, not
+    /// iteration order, decided it.
+    ///
+    /// Mutation-checked: dropping the `.find(is_replication)` preference
+    /// (falling straight to `.next()`) turns this red — the seed lands in
+    /// `main.seeds.orders` instead of `wh.seeds.orders`.
+    #[tokio::test]
+    async fn seed_without_a_catalog_prefers_the_replication_pipelines_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+
+        let db_path = root.join("wh.duckdb");
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter.local]\n\
+                 type = \"duckdb\"\n\
+                 path = \"{}\"\n\n\
+                 [pipeline.aaa_transform]\n\
+                 type = \"transformation\"\n\n\
+                 [pipeline.aaa_transform.target]\n\
+                 adapter = \"local\"\n\n\
+                 [pipeline.zzz_ingest]\n\
+                 type = \"replication\"\n\
+                 strategy = \"full_refresh\"\n\n\
+                 [pipeline.zzz_ingest.source.discovery]\n\
+                 adapter = \"local\"\n\n\
+                 [pipeline.zzz_ingest.source.schema_pattern]\n\
+                 prefix = \"raw__\"\n\
+                 separator = \"__\"\n\
+                 components = [\"source\"]\n\n\
+                 [pipeline.zzz_ingest.target]\n\
+                 adapter = \"local\"\n\
+                 catalog_template = \"wh\"\n\
+                 schema_template = \"staging__{{source}}\"\n\n\
+                 [pipeline.zzz_ingest.target.governance]\n\
+                 auto_create_catalogs = true\n\
+                 auto_create_schemas = true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        // No explicit `[target]` — the seed's landing catalog is exactly
+        // what this test pins.
+        std::fs::write(
+            root.join("seeds/orders.csv"),
+            "code,name\nUS,United States\nGB,United Kingdom\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("seeds/orders.toml"), "name = \"orders\"\n").unwrap();
+
+        let config_path = root.join("rocky.toml");
+        run_with_dag(
+            &config_path,
+            dag_snapshot(&config_path),
+            &root.join(".rocky-state.redb"),
+            false,
+            &PartitionRunOptions::default(),
+            &crate::commands::run::SkipRunOptions::default(),
+            None,
+            None,
+        )
+        .await
+        .expect("run --dag should resolve the replication pipeline's catalog");
+
+        let adapter = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        let rows = guard
+            .execute_sql("SELECT COUNT(*) FROM wh.seeds.orders")
+            .unwrap();
+        assert_eq!(
+            cell_i64(&rows.rows[0][0]),
+            2,
+            "the seed must land in the replication pipeline's catalog (wh), \
+             not \"main\" — proving the replication preference decided it, \
+             not alphabetical iteration order"
+        );
     }
 
     /// #1272 sentinel: `rocky run --dag --shadow` must not touch a production

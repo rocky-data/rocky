@@ -30,7 +30,12 @@
 //! 2. any nested query, wherever it appears;
 //! 3. any qualified function name — that is how UDFs, remote functions and
 //!    plugin functions are reached;
-//! 4. any unqualified function not in [`CHECK_EXPRESSION_FUNCTIONS`].
+//! 4. any unqualified function not in [`CHECK_EXPRESSION_FUNCTIONS`];
+//! 5. an allowlisted function called in the one shape whose result is not a
+//!    function of its arguments alone: the bare one-argument form of
+//!    `to_date`, `to_timestamp` and `to_char`, and a `week`-shaped part in
+//!    `date_trunc` / `datediff`. All five read a Snowflake session
+//!    parameter in exactly that shape and nowhere else (#1942).
 //!
 //! Refusal happens when the test SQL is generated, which is before execution
 //! on every path, so a refused check is visible in the deferred/executed
@@ -40,7 +45,10 @@
 
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{Expr, ObjectNamePart, Query, TableFactor, Value, Visit, Visitor};
+use sqlparser::ast::{
+    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectNamePart, Query,
+    TableFactor, Value, Visit, Visitor,
+};
 use sqlparser::dialect::{
     BigQueryDialect, DatabricksDialect, Dialect, DuckDbDialect, GenericDialect, SnowflakeDialect,
 };
@@ -62,6 +70,23 @@ use crate::validation::ValidationError;
 /// comparisons only, so this list is a starting point sized to plausible
 /// use, not a survey. A refusal names the function; extending the list is a
 /// one-line change here.
+///
+/// # What the allowlist does not guarantee
+///
+/// The allowlist matches a function's **name**, not the code it runs. A
+/// warehouse that lets a session rebind a built-in under an unqualified
+/// call routes the allowlisted call to the rebound body instead. On a
+/// persistent, file-backed DuckDB, creating that binding needs the same
+/// file-write access that already lets you edit the data; Rocky's
+/// in-memory DuckDB was not probed. Measured per target dialect (#1935):
+///
+/// | Dialect | Unqualified rebind wins? | Measured on |
+/// |---|---|---|
+/// | DuckDB | Yes — an unqualified `CREATE MACRO` shadows the built-in, even for a new session | v1.5.5, persistent file |
+/// | Databricks | No — unqualified stays built-in; a qualified override exists but is already refused | Unity Catalog |
+/// | Snowflake | Not probed (no sandbox) | — |
+/// | BigQuery | Not probed (no sandbox) | — |
+/// | Trino | Not probed | — |
 pub const CHECK_EXPRESSION_FUNCTIONS: &[&str] = &[
     // null handling / conditionals
     "coalesce",
@@ -164,14 +189,12 @@ pub const CHECK_EXPRESSION_FUNCTIONS: &[&str] = &[
     // date formatting. A grouping key very often buckets a timestamp by a
     // formatted string.
     //
-    // `to_char` is NOT here. Snowflake's one-argument form falls back to the
-    // session's output-format parameter, which makes it a read of session
-    // state rather than a function of its arguments — the exact thing this
-    // list excludes. The independent review flagged it as its own
-    // least-confidence item and I have no Snowflake to settle it on, so it
-    // stays off rather than shipping on "probably fine". Add it with a
-    // conformance test, or add `to_char(x, fmt)` as a two-argument form if
-    // someone can show the one-argument case is not reachable.
+    // `to_char` is back on the list (#1942; removed by #1922). Snowflake's
+    // one-argument form still falls back to the session's output-format
+    // parameter, so it is not unconditionally safe — but its two-argument
+    // form (`to_char(x, fmt)`) is a function of its arguments alone, and
+    // `shape_refusal` below refuses the one-argument form specifically.
+    "to_char",
     "date_format",
     "format_date",
     // string shaping (pure)
@@ -221,9 +244,199 @@ const SESSION_IDENTITY_KEYWORDS: &[&str] = &[
     "current_session",
 ];
 
+/// Date/time parts for `date_trunc` / `datediff` whose result does NOT
+/// depend on Snowflake's `WEEK_START` session parameter (#1942), lowercase.
+///
+/// An allowlist, on purpose, matching the reasoning at the top of this
+/// module: Snowflake documents that `WEEK_START` controls the output
+/// "[w]hen `date_or_time_part` is `week` (or any of its variations)"
+/// (`DATE_TRUNC`, `DATEDIFF`). Denying just `"week"` would miss its
+/// documented synonyms (`w`, `wk`, `weekofyear`, `woy`, `wy`), so this is the
+/// complete set of every OTHER documented part and its synonyms instead —
+/// covering every real key/predicate shape this repo uses
+/// (`docs/src/content/docs/**`, `examples/**` grep clean of `week` parts as
+/// of #1942) without having to enumerate week's aliases correctly.
+///
+/// The ISO week part (`week_iso` and its synonyms) is deliberately INCLUDED:
+/// an ISO week is fixed to start on Monday by the ISO 8601 standard, so
+/// Snowflake does not consult `WEEK_START` for it — only the plain `week`
+/// part is session-dependent.
+const SAFE_DATE_TIME_PARTS: &[&str] = &[
+    // Year
+    "year",
+    "y",
+    "yy",
+    "yyy",
+    "yyyy",
+    "yr",
+    "years",
+    "yrs",
+    // Quarter
+    "quarter",
+    "q",
+    "qtr",
+    "qtrs",
+    "quarters",
+    // Month
+    "month",
+    "mm",
+    "mon",
+    "mons",
+    "months",
+    // Week (ISO) — fixed to Monday-start, NOT WEEK_START-dependent.
+    "week_iso",
+    "weekiso",
+    "weekofyeariso",
+    "weekofyear_iso",
+    // Day
+    "day",
+    "d",
+    "dd",
+    "days",
+    "dayofmonth",
+    // Hour
+    "hour",
+    "h",
+    "hh",
+    "hr",
+    "hours",
+    "hrs",
+    // Minute
+    "minute",
+    "m",
+    "mi",
+    "min",
+    "minutes",
+    "mins",
+    // Second
+    "second",
+    "s",
+    "sec",
+    "seconds",
+    "secs",
+    // Millisecond
+    "millisecond",
+    "ms",
+    "msec",
+    "milliseconds",
+    // Microsecond
+    "microsecond",
+    "us",
+    "usec",
+    "microseconds",
+    // Nanosecond
+    "nanosecond",
+    "ns",
+    "nsec",
+    "nanosec",
+    "nsecond",
+    "nanoseconds",
+    "nanosecs",
+    "nseconds",
+];
+
+/// The number of positional arguments a parsed function call carries.
+///
+/// `FunctionArguments::None` (a niladic call with no parentheses, e.g. a bare
+/// `CURRENT_TIMESTAMP`) and `FunctionArguments::Subquery` (an unparenthesised
+/// subquery argument, irrelevant to every function this module shape-checks)
+/// both count as zero: neither is the two-argument shape any of these rules
+/// accept.
+fn positional_arg_count(function: &Function) -> usize {
+    match &function.args {
+        FunctionArguments::List(list) => list.args.len(),
+        FunctionArguments::None | FunctionArguments::Subquery(_) => 0,
+    }
+}
+
+/// The literal text of a function call's first argument, if it is a bare
+/// identifier (`WEEK`) or a quoted string literal (`'week'`) — the two
+/// shapes a `date_or_time_part` argument is written in. Anything else
+/// (a column, a nested call, a placeholder) returns `None`.
+fn first_arg_literal(function: &Function) -> Option<String> {
+    let FunctionArguments::List(list) = &function.args else {
+        return None;
+    };
+    let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = list.args.first()? else {
+        return None;
+    };
+    match expr {
+        Expr::Identifier(ident) => Some(ident.value.clone()),
+        Expr::Value(value) => value.value.clone().into_string(),
+        _ => None,
+    }
+}
+
+/// Per-function argument-shape rule for the five functions (six allowlist
+/// entries — `datediff` and its `date_diff` spelling share one rule) whose
+/// BARE call form reads a Snowflake session parameter instead of being a
+/// function of their arguments alone (#1942). Checked in addition to, not
+/// instead of, [`CHECK_EXPRESSION_FUNCTIONS`] membership — a name has to
+/// clear both.
+///
+/// Returns `Some(accepted_shape)` — the text
+/// [`ValidationError::ExpressionFunctionShapeNotAllowed`] reports — when
+/// `function`'s shape is refused, `None` when it is fine. A name absent from
+/// this `match` has no shape restriction.
+fn shape_refusal(name: &str, function: &Function) -> Option<&'static str> {
+    match name {
+        // Snowflake's one-argument form reads DATE_INPUT_FORMAT. An explicit
+        // second argument makes the result depend only on its own arguments.
+        "to_date" if positional_arg_count(function) < 2 => {
+            Some("with an explicit format, e.g. `to_date(x, 'YYYY-MM-DD')`")
+        }
+        // Same shape, TIMESTAMP_INPUT_FORMAT.
+        "to_timestamp" if positional_arg_count(function) < 2 => {
+            Some("with an explicit format, e.g. `to_timestamp(x, 'YYYY-MM-DD HH24:MI:SS')`")
+        }
+        // Same shape; this is the function #1922 removed entirely and #1942
+        // re-admits under it. Snowflake's one-argument form reads the
+        // session's output-format parameter; the second argument only has to
+        // be PRESENT to suppress that read, not a literal — so, like
+        // `to_date` and `to_timestamp` above, arity is the whole rule. A
+        // format built from an expression (`to_char(amount, fmt_col)`) is
+        // just as safe from a session read as a literal one.
+        "to_char" if positional_arg_count(function) < 2 => {
+            Some("with an explicit format, e.g. `to_char(x, 'YYYY-MM-DD')`")
+        }
+        // `date_trunc(part, x)` always takes two arguments, so arity cannot
+        // distinguish the safe shape here — the risk is in WHICH part.
+        "date_trunc"
+            if !first_arg_literal(function).is_some_and(|part| {
+                SAFE_DATE_TIME_PARTS.contains(&part.to_ascii_lowercase().as_str())
+            }) =>
+        {
+            Some(
+                "with a date part other than `week` (or one of its synonyms `w`, `wk`, \
+                 `weekofyear`, `woy`, `wy`), for example `date_trunc('day', x)`. A `week` \
+                 truncation depends on Snowflake's WEEK_START session parameter",
+            )
+        }
+        // Same risk, on the date-part argument of a three-argument call.
+        // `date_diff` (the BigQuery/DuckDB spelling) gets the identical rule:
+        // it is the same allowlist entry for the same date-part-taking
+        // function under a different dialect's name, so a Snowflake user
+        // could otherwise reach the exact bug this closes by spelling
+        // `datediff` with an underscore. Tightening, not the loosening this
+        // change is scoped to avoid.
+        "datediff" | "date_diff"
+            if !first_arg_literal(function).is_some_and(|part| {
+                SAFE_DATE_TIME_PARTS.contains(&part.to_ascii_lowercase().as_str())
+            }) =>
+        {
+            Some(
+                "with a date part other than `week` (or one of its synonyms `w`, `wk`, \
+                 `weekofyear`, `woy`, `wy`), for example `datediff('day', a, b)`. A `week` \
+                 difference depends on Snowflake's WEEK_START session parameter",
+            )
+        }
+        _ => None,
+    }
+}
+
 /// Where a validated expression is going to be used.
 ///
-/// The boundary is not the same in all three. A time function is fine in a
+/// The boundary is not the same in all four. A time function is fine in a
 /// predicate evaluated once and wrong in a grouping key, so the caller has to
 /// say which it is — there is deliberately NO `Default`, so a new call site
 /// must choose rather than inherit the permissive answer. That is how this
@@ -236,6 +449,22 @@ pub enum ExpressionUse {
     /// is a legitimate freshness-shaped check, and refusing it would break
     /// working configs to close a bug that does not exist in this position.
     SinglePredicate,
+
+    /// A per-check `filter` — scopes which rows an assertion applies to.
+    /// Evaluated ONCE, in the same statement as the predicate it filters
+    /// (`tests.rs`'s per-check `filter`; `quarantine.rs::wrap_filter`).
+    ///
+    /// Permits exactly what [`Self::SinglePredicate`] permits — same
+    /// volatility and `COLLATE` rules — because a filter is spliced into
+    /// that same statement and reaches exactly as far. It is a separate
+    /// variant only because the two differ in what field they name, which
+    /// [`Self::noun`] has to say correctly: `expression` is the check
+    /// itself, `filter` scopes which rows it applies to. A refused filter
+    /// used to be described as "an expression check" — the noun came from
+    /// the mode, not the field (#1971). Do NOT collapse this back into
+    /// `SinglePredicate`: the two must agree on rules by construction (one
+    /// arm below), not by two call sites staying in sync by hand.
+    Filter,
 
     /// A scalar value projected into the SELECT list, evaluated ONCE per
     /// statement (`metadata_columns[].value`).
@@ -277,11 +506,20 @@ impl ExpressionUse {
     /// Whether a value that can change between evaluations is acceptable.
     ///
     /// False only for a grouping key, where the value must come from the row.
+    /// Exhaustive on purpose (no wildcard): a new variant must pick a side
+    /// rather than silently inherit one. The refusal built from `false` here
+    /// (`ValidationError::ExpressionVolatileInKey`, in the walker below)
+    /// hardcodes the word "key" into its sentence, so a future variant that
+    /// picks `false` for a reason other than "this position is a grouping
+    /// key" needs that message split back out by noun, the same way
+    /// `ExpressionFunctionNotAllowed` was (#1971).
     fn tolerates_volatility(self) -> bool {
-        matches!(
-            self,
-            ExpressionUse::SinglePredicate | ExpressionUse::ScalarProjection
-        )
+        match self {
+            ExpressionUse::SinglePredicate
+            | ExpressionUse::Filter
+            | ExpressionUse::ScalarProjection => true,
+            ExpressionUse::GroupingKey => false,
+        }
     }
 
     /// Whether `COLLATE` is refused.
@@ -290,9 +528,14 @@ impl ExpressionUse {
     /// explicit collation is deterministic, so it is not a volatility
     /// question. What it changes is the meaning of equality, which matters
     /// only where the expression's value is compared against other rows'
-    /// values to form groups.
+    /// values to form groups. Exhaustive on purpose, same reason as above.
     fn refuses_collate(self) -> bool {
-        matches!(self, ExpressionUse::GroupingKey)
+        match self {
+            ExpressionUse::GroupingKey => true,
+            ExpressionUse::SinglePredicate
+            | ExpressionUse::Filter
+            | ExpressionUse::ScalarProjection => false,
+        }
     }
 
     /// What a refusal calls the expression in this position, at the start
@@ -305,15 +548,10 @@ impl ExpressionUse {
     /// values and the MCP `draft_check` tool — so the noun comes from the
     /// mode rather than from a sentence written for `[checks.assertions]`
     /// (#1959). `context` still names the exact field; this names its kind.
-    ///
-    /// The mode is an evaluation position, not a field kind, so it cannot
-    /// tell an assertion's `filter` from its `expression`: both are a
-    /// boolean over the row and share a predicate mode. A refused `filter`
-    /// is therefore still called an expression check. The shape advice is
-    /// right for it; only the noun is off. Tracked separately (#1971).
     pub(crate) fn noun(self) -> &'static str {
         match self {
             ExpressionUse::SinglePredicate => "An expression check",
+            ExpressionUse::Filter => "A filter",
             ExpressionUse::ScalarProjection => "A metadata column value",
             ExpressionUse::GroupingKey => "A key expression",
         }
@@ -323,6 +561,7 @@ impl ExpressionUse {
     pub(crate) fn noun_lowercase(self) -> &'static str {
         match self {
             ExpressionUse::SinglePredicate => "an expression check",
+            ExpressionUse::Filter => "a filter",
             ExpressionUse::ScalarProjection => "a metadata column value",
             ExpressionUse::GroupingKey => "a key expression",
         }
@@ -334,11 +573,18 @@ impl ExpressionUse {
     /// A predicate is a boolean. A metadata column value is not: `NULL`,
     /// `1` and `'rocky'` are all accepted there, so the boolean advice would
     /// send its author looking for a rule the validator never applies. A key
-    /// is any expression over the row that rows can be grouped by.
+    /// is any expression over the row that rows can be grouped by. A filter
+    /// is worded over "the row's columns" rather than "the model's columns"
+    /// — it is still the model's columns, but the sentence is read right
+    /// after `noun()` names the field, and "the row" matches how the rest of
+    /// the filter docs describe it.
     pub(crate) fn accepted_shape(self) -> &'static str {
         match self {
             ExpressionUse::SinglePredicate => {
                 "one boolean expression over the model's columns, e.g. `amount >= 0`"
+            }
+            ExpressionUse::Filter => {
+                "one boolean expression over the row's columns, e.g. `amount >= 0`"
             }
             ExpressionUse::ScalarProjection => {
                 "one scalar expression, e.g. `current_timestamp()`, `'rocky'` or `NULL`"
@@ -354,7 +600,7 @@ impl ExpressionUse {
     /// predicate wording of that refusal stays exactly what it was.
     pub(crate) fn single_kind(self) -> &'static str {
         match self {
-            ExpressionUse::SinglePredicate => "boolean expression",
+            ExpressionUse::SinglePredicate | ExpressionUse::Filter => "boolean expression",
             ExpressionUse::ScalarProjection => "scalar expression",
             ExpressionUse::GroupingKey => "key expression",
         }
@@ -459,11 +705,12 @@ impl Visitor for Walker<'_> {
             // one does not group by what it says it groups by. Deterministic,
             // so it is not a volatility question — it is refused in the
             // position where equality is the point, and nowhere else.
+            // `COLLATE` is not a function, so "add it to
+            // CHECK_EXPRESSION_FUNCTIONS" would be meaningless advice — its
+            // own variant carries the real reason instead (#1971).
             Expr::Collate { .. } if self.use_.refuses_collate() => {
-                ControlFlow::Break(ValidationError::ExpressionFunctionNotAllowed {
+                ControlFlow::Break(ValidationError::ExpressionCollateInKey {
                     context: self.context.to_string(),
-                    use_: self.use_,
-                    function: "COLLATE".to_string(),
                 })
             }
             Expr::Function(function) => {
@@ -488,21 +735,38 @@ impl Visitor for Walker<'_> {
                         .iter()
                         .any(|v| v.eq_ignore_ascii_case(&name))
                 {
+                    // The name may already be on the allowlist (`now` is);
+                    // it is refused for the POSITION, not the name, so "add
+                    // it to CHECK_EXPRESSION_FUNCTIONS" would be false advice
+                    // either way — for an allowlisted name it is already
+                    // there, and for one that is not, this check runs before
+                    // the allowlist is even consulted, so adding it would not
+                    // change the outcome (#1971).
+                    return ControlFlow::Break(ValidationError::ExpressionVolatileInKey {
+                        context: self.context.to_string(),
+                        function: ident.value.clone(),
+                    });
+                }
+                if !CHECK_EXPRESSION_FUNCTIONS.contains(&name.as_str()) {
                     return ControlFlow::Break(ValidationError::ExpressionFunctionNotAllowed {
                         context: self.context.to_string(),
                         use_: self.use_,
                         function: ident.value.clone(),
                     });
                 }
-                if CHECK_EXPRESSION_FUNCTIONS.contains(&name.as_str()) {
-                    ControlFlow::Continue(())
-                } else {
-                    ControlFlow::Break(ValidationError::ExpressionFunctionNotAllowed {
-                        context: self.context.to_string(),
-                        use_: self.use_,
-                        function: ident.value.clone(),
-                    })
+                // On the allowlist by name, but a handful of names admit
+                // only one argument shape (#1942) — see `shape_refusal`.
+                if let Some(accepted_shape) = shape_refusal(&name, function) {
+                    return ControlFlow::Break(
+                        ValidationError::ExpressionFunctionShapeNotAllowed {
+                            context: self.context.to_string(),
+                            use_: self.use_,
+                            function: ident.value.clone(),
+                            accepted_shape,
+                        },
+                    );
                 }
+                ControlFlow::Continue(())
             }
             // A lambda is a function body the warehouse executes; the
             // functions it can call are the same question one level down,
@@ -587,6 +851,50 @@ mod tests {
             ExpressionUse::ScalarProjection,
         )
         .expect("a projected value is not compared against other rows");
+    }
+
+    /// `Filter` shares `SinglePredicate`'s rules exactly — a clock and a
+    /// `COLLATE` are both fine, because a filter is evaluated once, in the
+    /// same statement as the predicate it scopes. Only the noun a refusal
+    /// uses differs; see `a_check_filter_is_described_as_a_filter` in
+    /// `rocky-core/src/tests.rs` for that half (#1971).
+    #[test]
+    fn filter_permits_exactly_what_single_predicate_permits() {
+        // Each case is run through BOTH modes and must agree, so the
+        // equality is pinned rather than asserted one mode at a time — that
+        // would stay green even if a future change split the two rule sets
+        // without anyone noticing the drift. `expect_ok` also pins the
+        // DIRECTION: two modes silently agreeing on the wrong answer would
+        // pass an agreement-only check.
+        let cases = [
+            ("created_at > now()", true),         // a clock is fine in both
+            ("email COLLATE NOCASE = 'a'", true), // COLLATE is fine in both
+            ("amount >= 0", true),                // an ordinary predicate
+            ("my_udf(a)", false),                 // off the allowlist in both
+            ("amount > (SELECT 1)", false),       // a subquery in both
+            ("amount > 0, 1", false),             // trailing tokens in both
+        ];
+        for (expr, expect_ok) in cases {
+            let filter_ok =
+                validate_check_expression(CTX, expr, &GenericDialect, ExpressionUse::Filter)
+                    .is_ok();
+            let predicate_ok = validate_check_expression(
+                CTX,
+                expr,
+                &GenericDialect,
+                ExpressionUse::SinglePredicate,
+            )
+            .is_ok();
+            assert_eq!(
+                filter_ok, predicate_ok,
+                "`{expr}`: Filter and SinglePredicate disagree (filter={filter_ok}, \
+                 predicate={predicate_ok})"
+            );
+            assert_eq!(
+                filter_ok, expect_ok,
+                "`{expr}`: expected ok={expect_ok}, got {filter_ok}"
+            );
+        }
     }
 
     /// The advice beside a refusal describes the position that was
@@ -721,9 +1029,10 @@ mod tests {
     /// a consistency check between two lists, not a completeness proof: an
     /// out-of-row function added to the allowlist and not to `CLOCK_SHAPED`
     /// leaves this test green. It also has no validator control — it would
-    /// pass against a validator that refused everything. #1942 tracks the
-    /// argument-shape cases (`to_date(x)`, `date_trunc('week', x)`) that name
-    /// matching cannot see at all.
+    /// pass against a validator that refused everything. Name matching alone
+    /// could not see the argument-shape cases either (`to_date(x)`,
+    /// `date_trunc('week', x)`) — `shape_refusal` and the tests below now
+    /// cover those (#1942).
     #[test]
     fn every_clock_name_on_the_allowlist_is_known_volatile() {
         // Names that read a clock, a session, or a sequence. Adding one to
@@ -1160,5 +1469,145 @@ mod tests {
             check_on("not-a-dialect", "read_text('x') IS NULL"),
             Err(ValidationError::ExpressionFunctionNotAllowed { .. })
         ));
+    }
+
+    // ---- Argument-shape rule (#1942) ---------------------------------
+    //
+    // Tested on the Snowflake dialect specifically, not the `check()`
+    // helper's `GenericDialect` default — this is the one dialect the
+    // session-parameter reads are documented against, and #1922 already
+    // found call sites that stayed green under a default-name dialect and
+    // would not have caught a dialect-specific regression.
+
+    /// `to_date`'s Snowflake one-argument form reads `DATE_INPUT_FORMAT`.
+    /// The two-argument form does not, and is admitted.
+    #[test]
+    fn to_date_admits_only_the_explicit_format_shape() {
+        match check_on("snowflake", "to_date(order_date) IS NOT NULL") {
+            Err(ValidationError::ExpressionFunctionShapeNotAllowed {
+                function,
+                accepted_shape,
+                ..
+            }) => {
+                assert_eq!(function, "to_date");
+                assert!(
+                    accepted_shape.contains("to_date(x, 'YYYY-MM-DD')"),
+                    "{accepted_shape}"
+                );
+            }
+            other => panic!("bare to_date must be refused by shape: {other:?}"),
+        }
+        check_on("snowflake", "to_date(order_date, 'YYYY-MM-DD') IS NOT NULL")
+            .expect("an explicit format makes to_date a function of its arguments alone");
+    }
+
+    /// Same rule, `TIMESTAMP_INPUT_FORMAT`.
+    #[test]
+    fn to_timestamp_admits_only_the_explicit_format_shape() {
+        match check_on("snowflake", "to_timestamp(loaded_at) IS NOT NULL") {
+            Err(ValidationError::ExpressionFunctionShapeNotAllowed { function, .. }) => {
+                assert_eq!(function, "to_timestamp");
+            }
+            other => panic!("bare to_timestamp must be refused by shape: {other:?}"),
+        }
+        check_on(
+            "snowflake",
+            "to_timestamp(loaded_at, 'YYYY-MM-DD HH24:MI:SS') IS NOT NULL",
+        )
+        .expect("an explicit format makes to_timestamp a function of its arguments alone");
+    }
+
+    /// `to_char` was removed from the allowlist entirely by #1922 because its
+    /// one-argument form reads the session output-format parameter. #1942
+    /// re-admits it under the same explicit-format rule as `to_date` and
+    /// `to_timestamp`.
+    #[test]
+    fn to_char_is_readmitted_only_with_an_explicit_format() {
+        match check_on("snowflake", "to_char(amount) = '0'") {
+            Err(ValidationError::ExpressionFunctionShapeNotAllowed { function, .. }) => {
+                assert_eq!(function, "to_char");
+            }
+            other => panic!("bare to_char must be refused by shape, not by name: {other:?}"),
+        }
+        check_on("snowflake", "to_char(amount, 'FM999999.00') = '0'")
+            .expect("an explicit format makes to_char a function of its arguments alone");
+    }
+
+    /// `date_trunc`'s `week` part (and every documented synonym, quoted or
+    /// bare) reads `WEEK_START`. Every other part, including the fixed
+    /// ISO week, does not and stays admitted.
+    #[test]
+    fn date_trunc_refuses_week_and_its_synonyms_and_admits_everything_else() {
+        for part in ["week", "WEEK", "w", "wk", "weekofyear", "woy", "wy"] {
+            let quoted = check_on(
+                "snowflake",
+                &format!("date_trunc('{part}', created_at) IS NOT NULL"),
+            );
+            assert!(
+                matches!(
+                    quoted,
+                    Err(ValidationError::ExpressionFunctionShapeNotAllowed { .. })
+                ),
+                "'{part}' must be refused: {quoted:?}"
+            );
+        }
+        for part in [
+            "day", "month", "year", "quarter", "hour", "minute", "second", "week_iso",
+        ] {
+            check_on(
+                "snowflake",
+                &format!("date_trunc('{part}', created_at) IS NOT NULL"),
+            )
+            .unwrap_or_else(|e| panic!("'{part}' must stay admitted: {e:?}"));
+        }
+        // The unchanged control from before #1942: a plain day truncation
+        // used as a grouping key is still fine.
+        check_key("date_trunc('day', created_at)")
+            .expect("an ordinary date_trunc key expression is unaffected");
+    }
+
+    /// `datediff` gets the identical `week` rule, and so does its `date_diff`
+    /// spelling — the same allowlist entry under a different dialect's name,
+    /// so leaving one ungated would reopen the bug through the other name.
+    #[test]
+    fn datediff_and_date_diff_share_the_week_rule() {
+        for name in ["datediff", "date_diff"] {
+            let refused = check_on("snowflake", &format!("{name}('week', a, b) > 0"));
+            assert!(
+                matches!(
+                    refused,
+                    Err(ValidationError::ExpressionFunctionShapeNotAllowed { .. })
+                ),
+                "{name}('week', ..): {refused:?}"
+            );
+            check_on("snowflake", &format!("{name}('day', a, b) > 0"))
+                .unwrap_or_else(|e| panic!("{name}('day', ..) must stay admitted: {e:?}"));
+        }
+    }
+
+    /// The shape rule applies at every nesting depth, not only when the
+    /// function is the top-level node — the walker descends into every
+    /// argument and branch, so a bad shape buried inside an allowed call or
+    /// a `CASE` must still be caught.
+    #[test]
+    fn a_shape_refusal_fires_at_any_nesting_depth() {
+        let nested_arity = check("coalesce(nullif(to_date(order_date), NULL), current_date)");
+        match nested_arity {
+            Err(ValidationError::ExpressionFunctionShapeNotAllowed { ref function, .. }) => {
+                assert_eq!(function, "to_date");
+            }
+            other => panic!("a bare to_date two calls deep must still be refused: {other:?}"),
+        }
+
+        let nested_literal =
+            check("CASE WHEN a > 0 THEN date_trunc('week', created_at) IS NOT NULL ELSE FALSE END");
+        match nested_literal {
+            Err(ValidationError::ExpressionFunctionShapeNotAllowed { ref function, .. }) => {
+                assert_eq!(function, "date_trunc");
+            }
+            other => {
+                panic!("a week date_trunc inside a CASE branch must still be refused: {other:?}")
+            }
+        }
     }
 }

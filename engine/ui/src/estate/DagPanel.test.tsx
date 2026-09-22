@@ -135,6 +135,31 @@ describe("DagPanel", () => {
     }
   });
 
+  // `border-zinc-200`/`dark:border-zinc-700` set the CSS `border-color`
+  // shorthand, which resets `border-left-color` along with it -- and the
+  // built stylesheet compiles `dark:border-zinc-700` after every
+  // `border-l-{kind}-500` rule, so an unselected card showed the same grey
+  // left border in dark mode whatever its kind (#1859, confirmed by
+  // inspecting `vite build`'s output CSS). jsdom does not resolve the CSS
+  // cascade, so this pins the class list itself: the neutral border must be
+  // three directional utilities that never touch the left side, leaving
+  // `kindClass`'s `border-l-*` the only thing that ever sets it.
+  it("never gives an unselected card a class that can reset its kind accent", () => {
+    render(<DagPanel dag={captured} onSelect={vi.fn()} />);
+    const card = nodeElement(MODEL).firstElementChild as HTMLElement;
+    expect(card).toHaveClass("border-l-sky-500");
+    expect(card).not.toHaveClass("border-zinc-200");
+    expect(card).not.toHaveClass("dark:border-zinc-700");
+    expect(card).toHaveClass(
+      "border-t-zinc-200",
+      "border-r-zinc-200",
+      "border-b-zinc-200",
+      "dark:border-t-zinc-700",
+      "dark:border-r-zinc-700",
+      "dark:border-b-zinc-700",
+    );
+  });
+
   it("does not open a node that has no tab stop, even if a key reaches it", () => {
     const onSelect = vi.fn();
     render(<DagPanel dag={captured} onSelect={onSelect} />);

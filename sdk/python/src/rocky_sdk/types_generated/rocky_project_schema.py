@@ -2161,16 +2161,14 @@ class DiscoveryConfig(BaseModel):
 
 class FreshnessConfig(BaseModel):
     """
-    Freshness check configuration with optional per-schema overrides.
+    Freshness check configuration.
+
+    A single scalar `threshold_seconds` applies to every checked table. There used to be an `overrides` key for per-schema thresholds; it parsed and validated but nothing on the check path ever read it, so it is now refused with a message naming the remedy (#1620).
     """
 
     model_config = ConfigDict(
         extra="forbid",
     )
-    overrides: dict[str, conint(ge=0)] | None = {}
-    """
-    Per-schema freshness overrides. Key is a schema pattern (e.g., "raw__us_west__shopify"), value overrides threshold_seconds for matching schemas.
-    """
     severity: TestSeverity5 | TestSeverity6 | None = "error"
     """
     Severity reported when freshness lag exceeds the threshold.
