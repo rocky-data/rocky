@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Worked `Example:` blocks on the six `product_*` client methods.** `product_verify`, `product_compile`, `product_approve`, `product_status`, `product_list` and `product_journal` now carry the same reST-style example the other typed methods use. `product_verify`'s example branches on `status` rather than a caught exception; `product_journal`'s distinguishes a known product with an empty journal from a product the project does not know, which raises `RockyCommandError`. (#1802)
+
 ### Changed
 
 - **`RunResult` gains `anomaly_evaluated`.** One `AnomalyEvaluation` entry per table the run considered for row-count anomaly detection, saying whether the detector evaluated it and, when it did not, why. `RunResult.anomalies` alone means both "nothing anomalous" and "nothing looked at" (#1790). Added to the hand-written runtime models and the generated ones; an engine that does not emit the field parses as before, with an empty list. (#1790)

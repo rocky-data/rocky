@@ -343,6 +343,18 @@ Before that, Rocky refuses a fragment that could end the query it is building, o
 
 Comparisons, `CASE`, `CAST`, `BETWEEN`, `IN (...)` with literals, and functions such as `coalesce`, `nullif`, `abs`, `round`, `length`, `lower`, `upper`, `trim`, `regexp_like`, `md5` and `date_trunc` pass. Functions that read a file, a secret, a session variable or a remote endpoint do not, whatever their name looks like — DuckDB's `read_text`, Snowflake's `GETVARIABLE` and Databricks' `secret` all sit in ordinary scalar position and are refused by name.
 
+That allowlist checks a function's name, not the code that name runs. A warehouse can let a session rebind a built-in under an unqualified call. Then an allowlisted call runs the rebound body instead of the built-in. On a persistent, file-backed DuckDB, creating that binding needs the same file-write access that already lets you edit the data. So the allowlist is not a boundary against that admin there. Rocky's in-memory DuckDB, Snowflake, BigQuery and Trino have not been probed, so the same privilege link is not established for them.
+
+Rocky measured this per target dialect instead of assuming it:
+
+| Dialect | Unqualified rebind wins over the built-in? | Measured on |
+|---|---|---|
+| DuckDB | Yes. Shadows the built-in, even for a new session. | v1.5.5, persistent file |
+| Databricks | No. A qualified override exists, but Rocky already refuses qualified names. | Unity Catalog |
+| Snowflake | Not probed. | No sandbox available |
+| BigQuery | Not probed. | No sandbox available |
+| Trino | Not probed. | No environment available |
+
 One position adds a rule, because the expression is used differently there:
 
 | Position | Extra rule |

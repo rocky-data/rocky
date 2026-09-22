@@ -62,6 +62,23 @@ use crate::validation::ValidationError;
 /// comparisons only, so this list is a starting point sized to plausible
 /// use, not a survey. A refusal names the function; extending the list is a
 /// one-line change here.
+///
+/// # What the allowlist does not guarantee
+///
+/// The allowlist matches a function's **name**, not the code it runs. A
+/// warehouse that lets a session rebind a built-in under an unqualified
+/// call routes the allowlisted call to the rebound body instead. On a
+/// persistent, file-backed DuckDB, creating that binding needs the same
+/// file-write access that already lets you edit the data; Rocky's
+/// in-memory DuckDB was not probed. Measured per target dialect (#1935):
+///
+/// | Dialect | Unqualified rebind wins? | Measured on |
+/// |---|---|---|
+/// | DuckDB | Yes — an unqualified `CREATE MACRO` shadows the built-in, even for a new session | v1.5.5, persistent file |
+/// | Databricks | No — unqualified stays built-in; a qualified override exists but is already refused | Unity Catalog |
+/// | Snowflake | Not probed (no sandbox) | — |
+/// | BigQuery | Not probed (no sandbox) | — |
+/// | Trino | Not probed | — |
 pub const CHECK_EXPRESSION_FUNCTIONS: &[&str] = &[
     // null handling / conditionals
     "coalesce",
