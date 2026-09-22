@@ -160,6 +160,11 @@ returns a `Vec<String>`, so the runtime can issue more than one statement.
 Atomicity holds per partition. If a statement fails mid-batch, the runtime
 issues `ROLLBACK` and marks the partition `Failed` in the state store.
 
+Before it runs any partition, Rocky checks that the target table exists. If
+not, it creates it empty by running the model SQL over an empty time window.
+The table gets the model's output columns and no rows. The partitions then
+run as below.
+
 ### Databricks (Delta Lake)
 
 Single statement using Delta's atomic `REPLACE WHERE`:
@@ -291,11 +296,6 @@ The following are deferred:
 - **Rocky DSL placeholder syntax** — `@start_date` / `@end_date` are
   recognized in `.sql` files only. The `.rocky` parser will gain `@var`
   syntax in v1.1.
-- **Bootstrap on first run** — the target table must exist before the
-  first partition runs. The runtime currently emits `DELETE` against the
-  target, which fails if the table is missing. Either pre-create the
-  table once (recommended for now) or `full_refresh` an empty version
-  via a one-time migration. Bootstrap-on-first-run is a planned follow-up.
 - **BigQuery and Postgres adapters** — these adapters don't exist yet.
   When they ship, BigQuery will use `MERGE ... WHEN NOT MATCHED BY SOURCE`
   and Postgres will route via parent table + child partition truncate.
