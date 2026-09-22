@@ -1201,6 +1201,8 @@ the `[schema_evolution]` section was removed because nothing ever read it: drift
 detection never reported a column that disappeared from the source, so Rocky never
 dropped one and `grace_period_days` never took effect. Delete the
 `[schema_evolution]` section from this config; removing it changes no behaviour.
+Rocky does not drop a column the source lost; there is no opt-in. See
+https://github.com/rocky-data/rocky/issues/1616.
 ```
 
 **What to do:** delete the section. Nothing about your pipeline changes. Rocky never dropped a column on the strength of that key, so there is no behaviour to replace.

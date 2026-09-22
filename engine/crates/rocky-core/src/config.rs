@@ -2014,8 +2014,8 @@ impl GovernanceOverride {
 pub const SCHEMA_EVOLUTION_REMOVED: &str = "the `[schema_evolution]` section was removed because nothing ever read it: \
      drift detection never reported a column that disappeared from the source, so Rocky never dropped one and \
      `grace_period_days` never took effect. Delete the `[schema_evolution]` section from this config; \
-     removing it changes no behaviour. Grace-period column drops are tracked in \
-     https://github.com/rocky-data/rocky/issues/1616 (see issue #1435)";
+     removing it changes no behaviour. Rocky does not drop a column the source lost; there is no opt-in. \
+     See https://github.com/rocky-data/rocky/issues/1616.";
 
 /// The removed `[schema_evolution]` section.
 ///
@@ -8604,7 +8604,7 @@ effect = "deny"
     }
 
     /// A config that still declares `[schema_evolution]` is refused, and
-    /// the message says what to delete and where the feature is tracked.
+    /// the message says what to delete and what Rocky actually does.
     ///
     /// The section parsed and validated before this change while nothing
     /// read it (#1435). Swapping one silence for another (an anonymous
