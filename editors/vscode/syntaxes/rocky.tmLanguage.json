@@ -15,11 +15,11 @@
     "pipeline-steps": {
       "patterns": [
         {
-          "match": "\\b(from|where|group|derive|select|join|sort|take|distinct|replicate)\\b",
+          "match": "\\b(let|from|where|group|derive|select|join|sort|take|distinct|replicate)\\b",
           "name": "keyword.control.rocky"
         },
         {
-          "match": "\\b(as|on|keep|asc|desc|inner|left|right|cross|full)\\b",
+          "match": "\\b(as|on|keep|asc|desc|inner|left_join|right_join|full_join|cross_join|left|right|cross|full|over|partition|rows|range|unbounded|current)\\b",
           "name": "keyword.other.rocky"
         }
       ]
