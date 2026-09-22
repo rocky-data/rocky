@@ -34,7 +34,7 @@
 //! 5. an allowlisted function called in the one shape whose result is not a
 //!    function of its arguments alone: the bare one-argument form of
 //!    `to_date`, `to_timestamp` and `to_char`, and a `week`-shaped part in
-//!    `date_trunc` / `datediff`. All four read a Snowflake session
+//!    `date_trunc` / `datediff`. All five read a Snowflake session
 //!    parameter in exactly that shape and nowhere else (#1942).
 //!
 //! Refusal happens when the test SQL is generated, which is before execution
@@ -391,7 +391,11 @@ fn shape_refusal(name: &str, function: &Function) -> Option<&'static str> {
         }
         // Same shape; this is the function #1922 removed entirely and #1942
         // re-admits under it. Snowflake's one-argument form reads the
-        // session's output-format parameter.
+        // session's output-format parameter; the second argument only has to
+        // be PRESENT to suppress that read, not a literal — so, like
+        // `to_date` and `to_timestamp` above, arity is the whole rule. A
+        // format built from an expression (`to_char(amount, fmt_col)`) is
+        // just as safe from a session read as a literal one.
         "to_char" if positional_arg_count(function) < 2 => {
             Some("with an explicit format, e.g. `to_char(x, 'YYYY-MM-DD')`")
         }
