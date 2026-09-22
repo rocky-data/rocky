@@ -38,21 +38,28 @@ pub struct MaterializationCost {
 /// Configuration for the cost model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostConfig {
-    /// Cost per GB of storage per month (default: $0.023 for S3/DBFS).
+    /// Cost per GB of storage per month (default: $0.023 for S3/DBFS —
+    /// [`crate::config::CostSection`]'s own default).
     pub storage_cost_per_gb_month: f64,
-    /// Cost per second of compute (default: $0.002 for DBU).
+    /// Cost per second of compute (default: ~$0.0027, i.e. $0.40/DBU-hour at
+    /// the "Medium" warehouse size's 24 DBU/hour — see
+    /// [`crate::cost::warehouse_size_to_dbu_per_hour`]).
     pub compute_cost_per_second: f64,
     /// Minimum number of historical runs required before making recommendations.
     pub min_history_runs: usize,
 }
 
 impl Default for CostConfig {
+    /// Deliberately delegates to [`crate::config::CostSection::default`]'s own
+    /// conversion rather than restating separate literals: the two used to
+    /// disagree (a project whose `rocky.toml` declared no `[cost]` block, or
+    /// one that explicitly restated the default values, got a different
+    /// price than a config-less project — #2056, found in Codex review).
+    /// Deriving this default FROM `CostSection`'s makes the two identical by
+    /// construction, for every caller, not just the ones a value-equality
+    /// guard happens to catch.
     fn default() -> Self {
-        CostConfig {
-            storage_cost_per_gb_month: 0.023,
-            compute_cost_per_second: 0.002,
-            min_history_runs: 5,
-        }
+        crate::config::CostSection::default().into()
     }
 }
 
@@ -301,7 +308,7 @@ mod tests {
         };
         let result = recommend_strategy(&stats, &default_config());
         assert_eq!(result.recommended_strategy, "view");
-        // monthly compute = 5 * 0.002 * 4 = 0.04
+        // monthly compute = 5 * ~0.0026667 * 4 ≈ 0.053
         // storage = 50 * 0.023 = 1.15
         assert!(result.estimated_monthly_savings > 1.0);
     }
@@ -375,7 +382,7 @@ mod tests {
         };
         let result = recommend_strategy(&stats, &default_config());
         assert_eq!(result.recommended_strategy, "table");
-        // compute = 120 * 0.002 * 30 = 7.2, storage = 0.1 * 0.023 = 0.0023
+        // compute = 120 * ~0.0026667 * 30 ≈ 9.6, storage = 0.1 * 0.023 = 0.0023
         assert!(result.estimated_monthly_savings > 7.0);
     }
 
