@@ -368,16 +368,18 @@ pub enum ConfigError {
     /// input, and only exists once both are sanitized the same way Dagster
     /// sanitizes them.
     #[error(
-        "[checks] {name_a:?} ({kind_a}) and {name_b:?} ({kind_b}) {scope} both sanitize to \
-         the Dagster check name {sanitized:?}. Dagster keys check results by \
-         (asset_key, sanitized_name); the first spec wins and the second is silently \
-         dropped. Rename one of them."
+        "[checks] {source_a} and {source_b} {scope} both sanitize to the Dagster check name \
+         {sanitized:?}. Dagster keys check results by (asset_key, sanitized_name); the \
+         first spec wins and the second is silently dropped. Rename one of them."
     )]
     DuplicateCheckName {
-        name_a: String,
-        kind_a: String,
-        name_b: String,
-        kind_b: String,
+        /// `"<kind> \"<name>\""`, e.g. `custom "null rate id"` — kind and
+        /// name folded into one field (rather than two) to keep this
+        /// variant's size down; `ConfigError` is returned by value on
+        /// every config-load path (`Result::Err`), and clippy's
+        /// `result_large_err` flags a variant this wide.
+        source_a: String,
+        source_b: String,
         /// Where the collision applies: `"on table \"orders\""` for a
         /// single-table pair (an assertion is involved), or a
         /// pipeline-wide phrase for two table-independent producers
@@ -3829,6 +3831,12 @@ pub fn resolved_check_name_collisions(
     collisions
 }
 
+/// `"<kind> \"<name>\""` — one side of a [`ConfigError::DuplicateCheckName`],
+/// naming both the resolved name and the producer that resolved it.
+fn describe_resolved_check_name(n: &ResolvedCheckName) -> String {
+    format!("{} {:?}", n.kind.as_str(), n.name)
+}
+
 /// Refuse a `metadata_columns[].value` that is not one parseable SQL
 /// expression calling only allowlisted scalar functions.
 ///
@@ -3953,10 +3961,8 @@ pub fn validate_checks(config: &RockyConfig) -> Vec<ConfigError> {
         let table_independent = table_independent_check_names(checks, executed_kinds);
         for (a, b, sanitized) in resolved_check_name_collisions(&table_independent) {
             errors.push(ConfigError::DuplicateCheckName {
-                name_a: a.name,
-                kind_a: a.kind.as_str().to_string(),
-                name_b: b.name,
-                kind_b: b.kind.as_str().to_string(),
+                source_a: describe_resolved_check_name(&a),
+                source_b: describe_resolved_check_name(&b),
                 scope: "on every table this pipeline copies".to_string(),
                 sanitized,
             });
@@ -3982,10 +3988,8 @@ pub fn validate_checks(config: &RockyConfig) -> Vec<ConfigError> {
                     continue;
                 }
                 errors.push(ConfigError::DuplicateCheckName {
-                    name_a: a.name,
-                    kind_a: a.kind.as_str().to_string(),
-                    name_b: b.name,
-                    kind_b: b.kind.as_str().to_string(),
+                    source_a: describe_resolved_check_name(&a),
+                    source_b: describe_resolved_check_name(&b),
                     scope: format!("on table {table:?}"),
                     sanitized,
                 });
@@ -9787,15 +9791,18 @@ threshold = 0
             found.is_some(),
             "a table-independent collision must be refused: {errors:?}"
         );
-        if let Some(ConfigError::DuplicateCheckName { name_a, name_b, .. }) = found {
-            let names = [name_a.as_str(), name_b.as_str()];
+        if let Some(ConfigError::DuplicateCheckName {
+            source_a, source_b, ..
+        }) = found
+        {
+            let sources = [source_a.as_str(), source_b.as_str()];
             assert!(
-                names.contains(&"null rate amount"),
-                "must name the custom-check source: {names:?}"
+                sources.iter().any(|s| s.contains("null rate amount")),
+                "must name the custom-check source: {sources:?}"
             );
             assert!(
-                names.contains(&"null_rate:amount"),
-                "must name the null_rate source: {names:?}"
+                sources.iter().any(|s| s.contains("null_rate:amount")),
+                "must name the null_rate source: {sources:?}"
             );
         }
     }
