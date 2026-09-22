@@ -1451,8 +1451,23 @@ pub async fn run_branch_promote(
         breaking_changes: None,
     });
 
-    let (targets_out, overall_success) =
-        run_promote_apply(&loaded, &promote_plan.targets, pipeline_name).await?;
+    // #2019 (Codex round 2 finding, gpt-5.6-terra, high confidence, 0.95):
+    // `promote_plan` was JUST built above by `build_promote_plan_inner`,
+    // which always resolves and records a concrete pipeline — so
+    // `promote_plan.pipeline` is never `None` here. Prefer it over the raw
+    // CLI `pipeline_name`: if `rocky.toml` were replaced between plan-build
+    // and this call (e.g. a one-pipeline `marts` config swapped for a
+    // one-pipeline `staging` config), re-resolving `pipeline_name` fresh
+    // would pick up `staging` and run the plan's `marts`-built SQL through
+    // staging's adapter. `.or(pipeline_name)` is defensive parity with the
+    // other two promote entrypoints, not a behavior this function can
+    // actually exercise (its `promote_plan` is always freshly built).
+    let (targets_out, overall_success) = run_promote_apply(
+        &loaded,
+        &promote_plan.targets,
+        promote_plan.pipeline.as_deref().or(pipeline_name),
+    )
+    .await?;
 
     audit.push(AuditEvent {
         kind: if overall_success {
