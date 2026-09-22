@@ -7942,11 +7942,15 @@ async fn run_batched_checks(
 /// `YYYY-MM-DD HH:MM:SS[.fff]` shape most warehouses render a timestamp in.
 /// Both directives accept a fractional-second suffix of any width, so a
 /// sub-second timestamp round-trips unchanged rather than being clamped to
-/// whole seconds. Shared by the per-table freshness fallback and
-/// [`query_target_max_timestamp`] (the incremental-replication watermark
-/// read) — see #2004: the two read the same column, and a watermark that
-/// loses the fraction re-copies the newest source rows on the next run.
-fn parse_timestamp_cell(s: &str) -> Option<DateTime<Utc>> {
+/// whole seconds. `pub(super)`: also called from
+/// `commands::skip_gate::query_max_ts` and
+/// `commands::fulfill_api::observe_max_time_column`, which read the same
+/// shape of cell for the same reason. Used in this file by the per-table
+/// freshness fallback and [`query_target_max_timestamp`] (the
+/// incremental-replication watermark read) — see #2004: the two read the
+/// same column, and a watermark that loses the fraction re-copies the
+/// newest source rows on the next run.
+pub(super) fn parse_timestamp_cell(s: &str) -> Option<DateTime<Utc>> {
     s.parse::<DateTime<Utc>>().ok().or_else(|| {
         chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
             .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
@@ -24260,8 +24264,14 @@ timestamp_column = "ts"
     /// `query_target_max_timestamp` already clamped to `:00` — one row
     /// short of what it needs to exclude itself on the next run. This
     /// drives the real SQL adapter + dialect + `resolve_new_watermark`
-    /// path across two consecutive incremental runs, the way the runner
-    /// does, and checks `row_count` the way the pipeline does.
+    /// function across two consecutive incremental runs and checks
+    /// `checks::check_row_count` on counts read straight from the
+    /// warehouse — a lower-level unit test than the full pipeline, not a
+    /// claim that it drives `super::run`, SQL generation, the
+    /// deferred-watermark phase, or the redb store. See
+    /// [`incremental_fractional_second_watermark_row_count_passes_end_to_end`]
+    /// just below for the same scenario driven through `super::run` and
+    /// its own `row_count` check gate.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn incremental_fractional_second_watermark_excludes_itself_on_next_run() {
@@ -24356,6 +24366,147 @@ timestamp_column = "ts"
         assert!(
             row_count_check.passed,
             "row_count must pass on an untouched source: {row_count_check:?}"
+        );
+    }
+
+    /// #2004 acceptance test: the issue's own repro, driven through the real
+    /// `rocky run` entry point end to end — a real `rocky.toml`, a DuckDB
+    /// file on disk, and the redb state store — using the same
+    /// `run_pipeline` harness shape as
+    /// [`fail_fast_partial_failure_commits_successful_watermark`] just
+    /// below. Unlike the lower-level test above, this exercises
+    /// `super::run`, SQL generation, the deferred-watermark commit phase,
+    /// and the pipeline's own `row_count` check gate: `row_count = true`
+    /// in `[pipeline.repro.checks]` means a failing check surfaces as
+    /// `Err(CheckGateFailure)` (exit 2 in the CLI, matching the issue's own
+    /// `PartialFailure` repro), so `run_pipeline(..).await` returning `Ok`
+    /// on run 2 IS the row_count-passed assertion.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn incremental_fractional_second_watermark_row_count_passes_end_to_end() {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        async fn run_pipeline(
+            config_path: &std::path::Path,
+            state_path: &std::path::Path,
+            run_id: &str,
+        ) -> anyhow::Result<RunTermination> {
+            super::run(
+                config_path,
+                Arc::new(rocky_core::config::load_rocky_config_fingerprinted(config_path).unwrap()),
+                None,
+                Some("repro"),
+                state_path,
+                None,
+                true,
+                None,
+                false,
+                None,
+                false,
+                None,
+                &PartitionRunOptions::default(),
+                None,
+                None,
+                None,
+                None,
+                &DeferOptions::default(),
+                &SkipRunOptions::default(),
+                &rocky_core::run_vars::RunVars::new(),
+                Some(run_id),
+                None,
+                false,
+                None, // #1460
+            )
+            .await
+        }
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("repro.duckdb");
+        let config_path = tmp.path().join("rocky.toml");
+        let state_path = tmp.path().join("state.redb");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.repro]
+strategy = "incremental"
+timestamp_column = "_loaded_at"
+
+[pipeline.repro.source.discovery]
+adapter = "default"
+
+[pipeline.repro.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.repro.target]
+catalog_template = "repro"
+schema_template = "staging__{{source}}"
+
+[pipeline.repro.target.governance]
+auto_create_schemas = true
+
+[pipeline.repro.checks]
+row_count = true
+
+[pipeline.repro.execution]
+concurrency = 1
+
+[state]
+backend = "local"
+"#,
+                db_path.display()
+            ),
+        )
+        .expect("write rocky.toml");
+
+        {
+            let db = DuckDbWarehouseAdapter::open(&db_path).expect("seed duckdb");
+            for sql in [
+                "CREATE SCHEMA raw__demo",
+                "CREATE TABLE raw__demo.t (id INTEGER, _loaded_at TIMESTAMP)",
+                // The issue's exact repro value.
+                "INSERT INTO raw__demo.t VALUES (1, TIMESTAMP '2026-09-15 10:00:00.250')",
+            ] {
+                db.execute_statement(sql).await.unwrap();
+            }
+        }
+
+        run_pipeline(&config_path, &state_path, "run1")
+            .await
+            .expect("run 1 must succeed");
+
+        // Nothing changed in the source between runs — the issue's exact
+        // scenario. Before the fix this returned Err(CheckGateFailure): the
+        // watermark had been recorded as :00, so the .250 row re-passed the
+        // WHERE filter, target grew to 2 rows, and row_count (1 source != 2
+        // target) failed the check gate.
+        run_pipeline(&config_path, &state_path, "run2")
+            .await
+            .expect(
+                "run 2 must succeed: the fractional-second watermark must exclude \
+                 the row it was read from, so row_count passes",
+            );
+
+        let db = DuckDbWarehouseAdapter::open(&db_path).expect("verify duckdb");
+        let count = db
+            .execute_query("SELECT COUNT(*) FROM repro.staging__demo.t")
+            .await
+            .unwrap();
+        let n = count.rows[0][0].as_u64().or_else(|| {
+            count.rows[0][0]
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+        });
+        assert_eq!(
+            n,
+            Some(1),
+            "run 2 must not re-copy the fractional-second row into the target"
         );
     }
 
