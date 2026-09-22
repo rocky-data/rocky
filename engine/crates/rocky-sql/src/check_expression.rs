@@ -67,10 +67,12 @@ use crate::validation::ValidationError;
 ///
 /// The allowlist matches a function's **name**, not the code it runs. A
 /// warehouse that lets a session rebind a built-in under an unqualified
-/// call routes the allowlisted call to the rebound body. Anyone who can
-/// create that binding already has arbitrary SQL access in the same
-/// place, so this guards against accidental non-determinism and volatile
-/// calls, not a hostile warehouse admin. Measured per dialect (#1935):
+/// call routes the allowlisted call to the rebound body instead. On
+/// DuckDB, creating that binding needs the same file-write access that
+/// already lets you edit the underlying data, so the allowlist is not a
+/// boundary against that admin there. Snowflake and BigQuery have not
+/// been probed, so the same privilege link is not established for them.
+/// Measured per dialect (#1935):
 ///
 /// | Dialect | Unqualified rebind wins? | Measured on |
 /// |---|---|---|
