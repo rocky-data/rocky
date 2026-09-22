@@ -820,10 +820,10 @@ fn classify_wrapped_adapter_cause(
     let inner: &(dyn std::error::Error + 'static) =
         if let Some(e) = cause.downcast_ref::<rocky_adapter_sdk::AdapterError>() {
             e.inner()
-        } else if let Some(e) = cause.downcast_ref::<rocky_core::traits::AdapterError>() {
-            e.inner()
         } else {
-            return None;
+            cause
+                .downcast_ref::<rocky_core::traits::AdapterError>()?
+                .inner()
         };
     let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(inner);
     while let Some(c) = cause {
