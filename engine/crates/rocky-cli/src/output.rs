@@ -7916,6 +7916,16 @@ pub struct PromoteTargetPlan {
 pub struct PromotePlan {
     /// Branch name being promoted.
     pub branch_name: String,
+    /// The resolved pipeline the promote targets were built against
+    /// (`resolve_pipeline`'s output at plan time — never ambiguous, even on a
+    /// single-pipeline config where `--pipeline` was omitted). `rocky apply
+    /// <plan-id>` reads this instead of re-resolving from the config, so
+    /// applying a promote plan is never ambiguous on a multi-pipeline
+    /// project. Absent on plans written before this field existed; apply
+    /// falls back to `resolve_pipeline(None)` for those, unchanged from
+    /// before this field was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
     /// Git ref that `base_ref` was resolved to at plan time (e.g. `"main"`).
     pub base_ref: String,
     /// Git HEAD SHA at plan time — informational for audit purposes.

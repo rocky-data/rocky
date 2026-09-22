@@ -561,6 +561,10 @@ class PromotePlan(BaseModel):
     """
     Git HEAD SHA at plan time — informational for audit purposes.
     """
+    pipeline: str | None = None
+    """
+    The resolved pipeline the promote targets were built against (`resolve_pipeline`'s output at plan time — never ambiguous, even on a single-pipeline config where `--pipeline` was omitted). `rocky apply <plan-id>` reads this instead of re-resolving from the config, so applying a promote plan is never ambiguous on a multi-pipeline project. Absent on plans written before this field existed; apply falls back to `resolve_pipeline(None)` for those, unchanged from before this field was added.
+    """
     plan_audit: list[AuditEvent]
     """
     Plan-time audit events (approvals gate + breaking-change gate outcomes). Apply-time events (`PromoteStarted`, `PromoteCompleted`, `PromoteFailed`) are appended in `BranchPromoteOutput.audit` at apply time.

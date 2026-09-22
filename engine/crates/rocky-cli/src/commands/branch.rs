@@ -192,11 +192,16 @@ pub fn run_branch_list(state_path: &Path, json: bool) -> Result<()> {
 ///
 /// Branches with no materialized tables yet surface as failed comparisons
 /// rather than crashing.
+///
+/// `pipeline_name` is `--pipeline`, required by `resolve_pipeline` (called
+/// inside `compare::compare`) when `rocky.toml` defines more than one
+/// pipeline — declared the same way as the sibling branch verbs (#2019).
 pub async fn run_branch_compare(
     state_path: &Path,
     config_path: &Path,
     branch_name: &str,
     filter: Option<&str>,
+    pipeline_name: Option<&str>,
     json: bool,
 ) -> Result<()> {
     let store = StateStore::open_read_only(state_path)
@@ -213,7 +218,15 @@ pub async fn run_branch_compare(
     };
     let thresholds = ComparisonThresholds::default();
 
-    super::compare::compare(config_path, filter, None, &shadow_config, &thresholds, json).await
+    super::compare::compare(
+        config_path,
+        filter,
+        pipeline_name,
+        &shadow_config,
+        &thresholds,
+        json,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -649,12 +662,17 @@ pub(crate) struct PlannedPromoteWithSql {
 /// pairs), this variant resolves the warehouse adapter, builds the SQL per
 /// target, and returns everything the plan needs to persist — so apply just
 /// calls `execute_statement` without re-running discovery.
+///
+/// Returns the RESOLVED pipeline name alongside the targets — never
+/// ambiguous, even when `pipeline_name` was `None` on a single-pipeline
+/// config — so the caller can persist it onto `PromotePlan.pipeline` and
+/// `rocky apply` never needs to re-resolve it from the config.
 pub(crate) async fn discover_branch_targets_for_plan(
     config_path: &Path,
     record: &BranchRecord,
     filter: Option<&str>,
     pipeline_name: Option<&str>,
-) -> Result<Vec<PlannedPromoteWithSql>> {
+) -> Result<(String, Vec<PlannedPromoteWithSql>)> {
     use crate::registry::AdapterRegistry;
 
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
@@ -662,8 +680,9 @@ pub(crate) async fn discover_branch_targets_for_plan(
         config_path.display()
     ))?;
     let registry = AdapterRegistry::from_config(&rocky_cfg)?;
-    let (_resolved_pipeline_name, pipeline) =
+    let (resolved_pipeline_name, pipeline) =
         crate::registry::resolve_pipeline(&rocky_cfg, pipeline_name)?;
+    let resolved_pipeline_name = resolved_pipeline_name.to_string();
     // `target_adapter()` is the pipeline-type-agnostic accessor; works for
     // both replication and transformation variants (and would error in
     // `discover_branch_targets` below for any other variant).
@@ -672,7 +691,7 @@ pub(crate) async fn discover_branch_targets_for_plan(
 
     let planned = discover_branch_targets(config_path, record, filter, pipeline_name).await?;
 
-    planned
+    let targets = planned
         .into_iter()
         .map(|p| {
             Ok(PlannedPromoteWithSql {
@@ -681,7 +700,9 @@ pub(crate) async fn discover_branch_targets_for_plan(
                 statement: build_promote_sql(dialect, &p.prod, &p.branch_source)?,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok((resolved_pipeline_name, targets))
 }
 
 /// Run the approval gate for a branch, updating `audit` and returning
@@ -864,11 +885,14 @@ pub(crate) async fn run_promote_apply(
     // promote at a warehouse the gate never verified).
     loaded: &rocky_core::config::LoadedConfig,
     targets: &[crate::output::PromoteTargetPlan],
-    // The `--pipeline` selector, threaded so the executor resolves the SAME
+    // The pipeline selector, threaded so the executor resolves the SAME
     // pipeline the promote targets were built against — not an arbitrary one.
     // A multi-pipeline `rocky.toml` requires it (`resolve_pipeline` errors on
-    // `None`); `rocky apply <promote-plan>` has no selector and passes `None`
-    // (unchanged: it still errors on a multi-pipeline config, as before).
+    // `None`). `rocky branch promote --plan` passes the `--pipeline` flag
+    // (if given); `rocky apply <promote-plan>` has no such flag but passes
+    // the RESOLVED pipeline recorded on the plan (`PromotePlan.pipeline`,
+    // #2019) — `None` only for a plan written before that field existed,
+    // which still errors on a multi-pipeline config, as before.
     pipeline_name: Option<&str>,
 ) -> Result<(Vec<crate::output::PromoteTarget>, bool)> {
     use crate::registry::AdapterRegistry;
@@ -1922,7 +1946,7 @@ mod tests {
         // branch fails before the config is loaded.
         let config_path = tmp.path().join("rocky.toml");
 
-        let err = run_branch_compare(&state_path, &config_path, "ghost", None, false)
+        let err = run_branch_compare(&state_path, &config_path, "ghost", None, None, false)
             .await
             .expect_err("missing branch must be an error");
 
@@ -1935,6 +1959,88 @@ mod tests {
             msg.contains("rocky branch list"),
             "error must steer user to 'rocky branch list': {msg}"
         );
+    }
+
+    /// #2019: `rocky branch compare <name> --pipeline <name>` must be
+    /// accepted — the flag exists on `Compare` (it previously did not) and
+    /// threads to the resolver — while the bare form still refuses on a
+    /// multi-pipeline config with the ambiguity error, proving `--pipeline`
+    /// disambiguates rather than a hardcoded default silently picking one.
+    #[tokio::test]
+    async fn branch_compare_pipeline_flag_disambiguates_multi_pipeline() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let duckdb_path = dir.join("warehouse.duckdb");
+        let config_path = dir.join("rocky.toml");
+        let state_path = dir.join("state.redb");
+        let models_dir = dir.join("models");
+        std::fs::create_dir_all(models_dir.join("marts")).unwrap();
+        std::fs::create_dir_all(models_dir.join("staging")).unwrap();
+
+        write_transformation_model(
+            &models_dir.join("marts"),
+            "fct_orders",
+            "warehouse",
+            "marts",
+            "fct_orders",
+            "SELECT 1 AS id",
+        );
+
+        // Two transformation pipelines — enough to make `resolve_pipeline(None)`
+        // ambiguous, mirroring the #2019 reproduction (`ingest` + `transform`).
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [pipeline.marts]\ntype = \"transformation\"\nmodels = \"models/marts/**\"\n\n\
+                 [pipeline.marts.target]\nadapter = \"default\"\n\n\
+                 [pipeline.staging]\ntype = \"transformation\"\nmodels = \"models/staging/**\"\n\n\
+                 [pipeline.staging.target]\nadapter = \"default\"\n",
+                duckdb_path.display()
+            ),
+        )
+        .unwrap();
+
+        // A hyphen-free branch name: `compare`'s row-count query dialect-
+        // quotes catalog/schema/table through `validate_identifier`
+        // (`^[a-zA-Z0-9_]+$`, unlike promote's looser `quote_identifier`),
+        // so a hyphenated `schema_prefix` would fail identifier validation
+        // for reasons unrelated to this fix.
+        run_branch_create(&state_path, "fix", None, false).unwrap();
+
+        // Seed matching prod + branch (shadow) tables so `--pipeline marts`
+        // reaches a clean PASS, not just "past the resolver".
+        {
+            let adapter = DuckDbWarehouseAdapter::open(&duckdb_path).expect("open duckdb");
+            for stmt in [
+                "CREATE SCHEMA IF NOT EXISTS marts",
+                "CREATE SCHEMA IF NOT EXISTS branch__fix",
+                "CREATE TABLE marts.fct_orders AS SELECT 1 AS id",
+                "CREATE TABLE branch__fix.fct_orders AS SELECT 1 AS id",
+            ] {
+                adapter.execute_statement(stmt).await.expect("seed");
+            }
+        }
+
+        // Bare form: `resolve_pipeline(None)` is ambiguous — must still error,
+        // unchanged from before this fix.
+        let ambiguous = run_branch_compare(&state_path, &config_path, "fix", None, None, false)
+            .await
+            .expect_err("omitting --pipeline on a multi-pipeline config must error");
+        assert!(
+            ambiguous.to_string().contains("multiple pipelines defined"),
+            "expected the multi-pipeline disambiguation error, got: {ambiguous}"
+        );
+
+        // `--pipeline marts` disambiguates AND the comparison passes clean —
+        // proving `--pipeline` is genuinely accepted end-to-end, not merely
+        // past the resolver into some other failure.
+        run_branch_compare(&state_path, &config_path, "fix", None, Some("marts"), false)
+            .await
+            .expect("`--pipeline marts` must resolve the pipeline and pass the comparison");
     }
 
     // --- Approval / promote helpers ---------------------------------------
@@ -3417,6 +3523,7 @@ adapter = "default"
 
         let promote_plan = crate::output::PromotePlan {
             branch_name: "fix-price".to_string(),
+            pipeline: None,
             base_ref: "main".to_string(),
             head_ref: "deadbeef".to_string(),
             branch_state_hash: "hash".to_string(),
@@ -4309,6 +4416,161 @@ adapter = "default"
         assert_eq!(
             count, 2,
             "`--pipeline marts` promote must copy both branch rows"
+        );
+    }
+
+    /// #2019: `rocky apply <plan-id>` must read the pipeline from the
+    /// PERSISTED promote plan instead of re-resolving it from the config.
+    /// `rocky plan promote <branch> --pipeline marts` disambiguates at PLAN
+    /// time and now stores the resolved pipeline on `PromotePlan.pipeline`;
+    /// `rocky apply <plan-id>` has no `--pipeline` flag at all, so pre-fix it
+    /// re-resolved against the (still ambiguous) config and refused with
+    /// "multiple pipelines defined" even though the plan it is about to
+    /// apply already names one, unambiguously.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn apply_reads_pipeline_from_persisted_promote_plan_on_multi_pipeline_config() {
+        use rocky_core::config::PolicyPrincipal;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let duckdb_path = dir.join("warehouse.duckdb");
+        let config_path = dir.join("rocky.toml");
+        let state_path = dir.join("state.redb");
+        let models_dir = dir.join("models");
+        std::fs::create_dir_all(models_dir.join("marts")).unwrap();
+        std::fs::create_dir_all(models_dir.join("staging")).unwrap();
+
+        for git_args in [
+            ["init", "-q", "."].as_slice(),
+            ["config", "user.email", "test@rocky.invalid"].as_slice(),
+            ["config", "user.name", "Rocky Test"].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(git_args)
+                .current_dir(dir)
+                .status()
+                .expect("git setup");
+            assert!(status.success(), "git {git_args:?} failed");
+        }
+
+        write_transformation_model(
+            &models_dir.join("marts"),
+            "fct_orders",
+            "warehouse",
+            "marts",
+            "fct_orders",
+            "SELECT 1 AS id",
+        );
+
+        // Two transformation pipelines (both on the default duckdb adapter) —
+        // enough to make `resolve_pipeline(None)` ambiguous, mirroring the
+        // #2019 reproduction (`ingest` + `transform`).
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.marts]
+type = "transformation"
+models = "models/marts/**"
+
+[pipeline.marts.target]
+adapter = "default"
+
+[pipeline.marts.target.governance]
+auto_create_schemas = true
+
+[pipeline.staging]
+type = "transformation"
+models = "models/staging/**"
+
+[pipeline.staging.target]
+adapter = "default"
+"#,
+                duckdb_path.display()
+            ),
+        )
+        .unwrap();
+
+        run_branch_create(&state_path, "ci-demo", None, false).unwrap();
+
+        {
+            let adapter = DuckDbWarehouseAdapter::open(&duckdb_path).expect("open duckdb");
+            for stmt in [
+                "CREATE SCHEMA IF NOT EXISTS warehouse",
+                "CREATE SCHEMA IF NOT EXISTS marts",
+                "CREATE SCHEMA IF NOT EXISTS \"branch__ci-demo\"",
+                "CREATE TABLE \"branch__ci-demo\".fct_orders AS SELECT 1 AS id UNION ALL SELECT 2",
+            ] {
+                adapter.execute_statement(stmt).await.expect("seed");
+            }
+        }
+
+        let _cwd_guard = cwd_lock();
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+
+        // `rocky plan promote ci-demo --pipeline marts` — disambiguates at
+        // plan-build time.
+        let plan_id = crate::commands::plan::build_promote_plan_inner(
+            dir,
+            &config_path,
+            &models_dir,
+            "main",
+            "ci-demo",
+            None,
+            Some("marts"),
+            false, // skip_approval_flag
+            true,  // allow_breaking (gate skips fail-open on a commit-less repo)
+            &state_path,
+            PolicyPrincipal::Human,
+        )
+        .await
+        .expect("plan build must succeed with --pipeline marts")
+        .plan_output
+        .plan_id
+        .expect("plan_id");
+
+        // `rocky apply <plan-id>` — `apply` has no `--pipeline` flag at all.
+        // Before the fix this re-resolved against the config and failed with
+        // "multiple pipelines defined" even though the plan already names its
+        // pipeline.
+        let apply_result = crate::commands::apply::run_apply_in(
+            dir,
+            &config_path,
+            &plan_id,
+            &state_path,
+            PolicyPrincipal::Human,
+            None,
+            false,
+        )
+        .await;
+
+        std::env::set_current_dir(saved_cwd).unwrap();
+
+        apply_result.expect(
+            "`rocky apply <plan-id>` must read the pipeline from the persisted plan and \
+             succeed on a multi-pipeline config",
+        );
+
+        let adapter = DuckDbWarehouseAdapter::open(&duckdb_path).expect("reopen duckdb");
+        let rows = adapter
+            .execute_query("SELECT CAST(COUNT(*) AS BIGINT) FROM warehouse.marts.fct_orders")
+            .await
+            .expect("prod table must exist after `rocky apply` on the promote plan");
+        let v = &rows.rows[0][0];
+        let count = v
+            .as_i64()
+            .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+            .unwrap_or_else(|| panic!("count value not parseable: {v:?}"));
+        assert_eq!(
+            count, 2,
+            "`rocky apply` on the promote plan must copy both branch rows"
         );
     }
 
