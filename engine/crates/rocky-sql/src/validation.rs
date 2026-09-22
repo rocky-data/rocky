@@ -78,15 +78,23 @@ pub enum ValidationError {
 
     // ---- `expression` check content (#1524) -------------------------------
     // An expression check is interpolated into `WHERE NOT (<expression>)` and
-    // executed with the project's warehouse credentials. These five refuse
+    // executed with the project's warehouse credentials. These seven refuse
     // anything that is not one expression over the model's own columns. See
     // `crate::check_expression`.
     //
-    // The same validator judges a metadata column value and a grouping key,
-    // so the advice beside each refusal comes from `use_` rather than being
-    // written for `[checks.assertions]` alone: telling the author of a
-    // metadata column value to write "one boolean expression" states a rule
-    // that position does not apply (#1959).
+    // The same validator judges a metadata column value, a filter and a
+    // grouping key, so the advice beside each refusal comes from `use_`
+    // rather than being written for `[checks.assertions]` alone: telling the
+    // author of a metadata column value to write "one boolean expression"
+    // states a rule that position does not apply (#1959), and telling the
+    // author of a `filter` it wrote "an expression check" names the wrong
+    // field (#1971).
+    //
+    // `ExpressionVolatileInKey` and `ExpressionCollateInKey` are their own
+    // variants rather than more `ExpressionFunctionNotAllowed` cases: both
+    // refuse something already allowed (or not a function at all) for its
+    // POSITION, not its name, so "add it to CHECK_EXPRESSION_FUNCTIONS" was
+    // false advice for either (#1971).
     #[error(
         "{context}: expression does not parse as a single SQL expression ({detail}). {} is {}",
         .use_.noun(),
@@ -149,6 +157,28 @@ pub enum ValidationError {
         use_: ExpressionUse,
         accepted_shape: &'static str,
     },
+
+    // A name refused here may already be on the allowlist — `now()` and
+    // `current_timestamp()` are — but the walker checks
+    // `determinism::VOLATILE_FUNCTIONS` before it ever consults the
+    // allowlist, so `random()` or `uuid()` land here too, and neither is on
+    // it. Either way "add it to CHECK_EXPRESSION_FUNCTIONS" is wrong: the
+    // refusal is for the POSITION (a grouping key), not the name, and the
+    // name's allowlist status does not change that (#1971).
+    #[error(
+        "{context}: expression calls `{function}`. A value that can change between \
+         evaluations cannot be a key"
+    )]
+    ExpressionVolatileInKey { context: String, function: String },
+
+    // `COLLATE` is not a function at all, so "add it to
+    // CHECK_EXPRESSION_FUNCTIONS" is meaningless advice for this refusal
+    // (#1971). See `ExpressionUse::refuses_collate`.
+    #[error(
+        "{context}: expression uses COLLATE. COLLATE changes what equality means, so a key \
+         may not carry one"
+    )]
+    ExpressionCollateInKey { context: String },
 
     #[error(
         "{context}: expression calls the qualified function `{function}`. Qualified names \

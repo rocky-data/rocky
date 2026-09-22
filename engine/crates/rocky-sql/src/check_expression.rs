@@ -436,7 +436,7 @@ fn shape_refusal(name: &str, function: &Function) -> Option<&'static str> {
 
 /// Where a validated expression is going to be used.
 ///
-/// The boundary is not the same in all three. A time function is fine in a
+/// The boundary is not the same in all four. A time function is fine in a
 /// predicate evaluated once and wrong in a grouping key, so the caller has to
 /// say which it is — there is deliberately NO `Default`, so a new call site
 /// must choose rather than inherit the permissive answer. That is how this
@@ -449,6 +449,22 @@ pub enum ExpressionUse {
     /// is a legitimate freshness-shaped check, and refusing it would break
     /// working configs to close a bug that does not exist in this position.
     SinglePredicate,
+
+    /// A per-check `filter` — scopes which rows an assertion applies to.
+    /// Evaluated ONCE, in the same statement as the predicate it filters
+    /// (`tests.rs`'s per-check `filter`; `quarantine.rs::wrap_filter`).
+    ///
+    /// Permits exactly what [`Self::SinglePredicate`] permits — same
+    /// volatility and `COLLATE` rules — because a filter is spliced into
+    /// that same statement and reaches exactly as far. It is a separate
+    /// variant only because the two differ in what field they name, which
+    /// [`Self::noun`] has to say correctly: `expression` is the check
+    /// itself, `filter` scopes which rows it applies to. A refused filter
+    /// used to be described as "an expression check" — the noun came from
+    /// the mode, not the field (#1971). Do NOT collapse this back into
+    /// `SinglePredicate`: the two must agree on rules by construction (one
+    /// arm below), not by two call sites staying in sync by hand.
+    Filter,
 
     /// A scalar value projected into the SELECT list, evaluated ONCE per
     /// statement (`metadata_columns[].value`).
@@ -490,11 +506,15 @@ impl ExpressionUse {
     /// Whether a value that can change between evaluations is acceptable.
     ///
     /// False only for a grouping key, where the value must come from the row.
+    /// Exhaustive on purpose (no wildcard): a new variant must pick a side
+    /// rather than silently inherit one.
     fn tolerates_volatility(self) -> bool {
-        matches!(
-            self,
-            ExpressionUse::SinglePredicate | ExpressionUse::ScalarProjection
-        )
+        match self {
+            ExpressionUse::SinglePredicate
+            | ExpressionUse::Filter
+            | ExpressionUse::ScalarProjection => true,
+            ExpressionUse::GroupingKey => false,
+        }
     }
 
     /// Whether `COLLATE` is refused.
@@ -503,9 +523,14 @@ impl ExpressionUse {
     /// explicit collation is deterministic, so it is not a volatility
     /// question. What it changes is the meaning of equality, which matters
     /// only where the expression's value is compared against other rows'
-    /// values to form groups.
+    /// values to form groups. Exhaustive on purpose, same reason as above.
     fn refuses_collate(self) -> bool {
-        matches!(self, ExpressionUse::GroupingKey)
+        match self {
+            ExpressionUse::GroupingKey => true,
+            ExpressionUse::SinglePredicate
+            | ExpressionUse::Filter
+            | ExpressionUse::ScalarProjection => false,
+        }
     }
 
     /// What a refusal calls the expression in this position, at the start
@@ -518,15 +543,10 @@ impl ExpressionUse {
     /// values and the MCP `draft_check` tool — so the noun comes from the
     /// mode rather than from a sentence written for `[checks.assertions]`
     /// (#1959). `context` still names the exact field; this names its kind.
-    ///
-    /// The mode is an evaluation position, not a field kind, so it cannot
-    /// tell an assertion's `filter` from its `expression`: both are a
-    /// boolean over the row and share a predicate mode. A refused `filter`
-    /// is therefore still called an expression check. The shape advice is
-    /// right for it; only the noun is off. Tracked separately (#1971).
     pub(crate) fn noun(self) -> &'static str {
         match self {
             ExpressionUse::SinglePredicate => "An expression check",
+            ExpressionUse::Filter => "A filter",
             ExpressionUse::ScalarProjection => "A metadata column value",
             ExpressionUse::GroupingKey => "A key expression",
         }
@@ -536,6 +556,7 @@ impl ExpressionUse {
     pub(crate) fn noun_lowercase(self) -> &'static str {
         match self {
             ExpressionUse::SinglePredicate => "an expression check",
+            ExpressionUse::Filter => "a filter",
             ExpressionUse::ScalarProjection => "a metadata column value",
             ExpressionUse::GroupingKey => "a key expression",
         }
@@ -547,11 +568,18 @@ impl ExpressionUse {
     /// A predicate is a boolean. A metadata column value is not: `NULL`,
     /// `1` and `'rocky'` are all accepted there, so the boolean advice would
     /// send its author looking for a rule the validator never applies. A key
-    /// is any expression over the row that rows can be grouped by.
+    /// is any expression over the row that rows can be grouped by. A filter
+    /// is worded over "the row's columns" rather than "the model's columns"
+    /// — it is still the model's columns, but the sentence is read right
+    /// after `noun()` names the field, and "the row" matches how the rest of
+    /// the filter docs describe it.
     pub(crate) fn accepted_shape(self) -> &'static str {
         match self {
             ExpressionUse::SinglePredicate => {
                 "one boolean expression over the model's columns, e.g. `amount >= 0`"
+            }
+            ExpressionUse::Filter => {
+                "one boolean expression over the row's columns, e.g. `amount >= 0`"
             }
             ExpressionUse::ScalarProjection => {
                 "one scalar expression, e.g. `current_timestamp()`, `'rocky'` or `NULL`"
@@ -567,7 +595,7 @@ impl ExpressionUse {
     /// predicate wording of that refusal stays exactly what it was.
     pub(crate) fn single_kind(self) -> &'static str {
         match self {
-            ExpressionUse::SinglePredicate => "boolean expression",
+            ExpressionUse::SinglePredicate | ExpressionUse::Filter => "boolean expression",
             ExpressionUse::ScalarProjection => "scalar expression",
             ExpressionUse::GroupingKey => "key expression",
         }
@@ -672,11 +700,12 @@ impl Visitor for Walker<'_> {
             // one does not group by what it says it groups by. Deterministic,
             // so it is not a volatility question — it is refused in the
             // position where equality is the point, and nowhere else.
+            // `COLLATE` is not a function, so "add it to
+            // CHECK_EXPRESSION_FUNCTIONS" would be meaningless advice — its
+            // own variant carries the real reason instead (#1971).
             Expr::Collate { .. } if self.use_.refuses_collate() => {
-                ControlFlow::Break(ValidationError::ExpressionFunctionNotAllowed {
+                ControlFlow::Break(ValidationError::ExpressionCollateInKey {
                     context: self.context.to_string(),
-                    use_: self.use_,
-                    function: "COLLATE".to_string(),
                 })
             }
             Expr::Function(function) => {
@@ -701,9 +730,12 @@ impl Visitor for Walker<'_> {
                         .iter()
                         .any(|v| v.eq_ignore_ascii_case(&name))
                 {
-                    return ControlFlow::Break(ValidationError::ExpressionFunctionNotAllowed {
+                    // The name IS on the allowlist — it is refused for the
+                    // POSITION, not the name, so "add it to
+                    // CHECK_EXPRESSION_FUNCTIONS" would be false advice
+                    // (#1971).
+                    return ControlFlow::Break(ValidationError::ExpressionVolatileInKey {
                         context: self.context.to_string(),
-                        use_: self.use_,
                         function: ident.value.clone(),
                     });
                 }
@@ -811,6 +843,22 @@ mod tests {
             ExpressionUse::ScalarProjection,
         )
         .expect("a projected value is not compared against other rows");
+    }
+
+    /// `Filter` shares `SinglePredicate`'s rules exactly — a clock and a
+    /// `COLLATE` are both fine, because a filter is evaluated once, in the
+    /// same statement as the predicate it scopes. Only the noun a refusal
+    /// uses differs; see `a_check_filter_is_described_as_a_filter` in
+    /// `rocky-core/src/tests.rs` for that half (#1971).
+    #[test]
+    fn filter_permits_exactly_what_single_predicate_permits() {
+        let filter =
+            |e: &str| validate_check_expression(CTX, e, &GenericDialect, ExpressionUse::Filter);
+        filter("created_at > now()").expect("a filter may use a clock, same as a predicate");
+        filter("email COLLATE NOCASE = 'a'")
+            .expect("a filter may use COLLATE, same as a predicate");
+        filter("amount >= 0").expect("an ordinary filter predicate");
+        filter("my_udf(a)").expect_err("the allowlist boundary still applies to a filter");
     }
 
     /// The advice beside a refusal describes the position that was
