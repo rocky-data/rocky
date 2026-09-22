@@ -1000,7 +1000,7 @@
     "@types/react-dom": "^19.3.0",
     "@types/vscode": "1.120.0",
     "@vscode/test-electron": "^3.1.0",
-    "@vscode/vsce": "^3.9.1",
+    "@vscode/vsce": "^4.0.0",
     "@xyflow/react": "^12.11.6",
     "esbuild": "^0.28.1",
     "eslint": "^10.10.0",
