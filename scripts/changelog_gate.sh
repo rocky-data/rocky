@@ -43,53 +43,78 @@ set -euo pipefail
 
 readonly MARKER_SHAPE='a line starting "Changelog: none" (case-insensitive), followed by " - " or " because ", followed by a reason of at least 10 characters -- e.g. Changelog: none - test-only refactor, no behaviour change'
 
-# The trimmed, non-blank lines currently inside the `## [Unreleased]`
-# section of the HEAD (post-PR) file: after the `## [Unreleased]` heading,
-# up to the next `## [` heading or end of file. Reads $CHANGELOG_PATH
-# directly rather than the diff, because the diff alone cannot tell which
-# section an added line landed in without also tracking hunk line numbers.
-unreleased_section_lines() {
+# Prints "start end" (1-indexed; end is the exclusive upper bound) marking
+# the line range strictly BETWEEN the `## [Unreleased]` heading and the
+# next level-2 heading (any `## ...`, not only this repo's current
+# `## [x.y.z] - date` shape -- a PR cannot dodge the boundary by using a
+# differently-formatted release heading) in $CHANGELOG_PATH's HEAD content.
+# Prints nothing if the file is missing or has no Unreleased heading.
+unreleased_line_range() {
     [[ -f "$CHANGELOG_PATH" ]] || return 0
     awk '
-        /^## \[Unreleased\]/ { inside = 1; next }
-        /^## \[/ { if (inside) exit }
-        inside { print }
+        BEGIN { start = 0; end = 0 }
+        /^## \[Unreleased\]/ && start == 0 { start = NR; next }
+        start != 0 && end == 0 && /^## / { end = NR; exit }
+        END {
+            if (start != 0) {
+                if (end == 0) { end = NR + 1 }
+                print start, end
+            }
+        }
     ' "$CHANGELOG_PATH"
 }
 
-# True when the diff added at least one line to engine/CHANGELOG.md whose
-# trimmed content is found inside the Unreleased section of the HEAD file.
-# Both conditions matter: added-by-this-diff (a `+` line) rules out a PR
-# that adds nothing and merely benefits from entries already in Unreleased
-# from other in-flight work; inside-Unreleased rules out a PR that edits
-# only an already-released section's notes, which an earlier version of
-# this check accepted (any non-blank `+` line, anywhere in the file, passed
-# -- caught in review on #1938: a released-section-only edit reproduced a
-# false "gained a line under [Unreleased]" pass).
-#
-# This does not check that the entry is a GOOD one -- see the "optimistic
-# count" discussion on #1938. A line whose exact trimmed text happens to
-# match a pre-existing Unreleased line elsewhere in the section could, in
-# principle, false-positive; accepted as a narrow residual versus the
-# complexity of tracking exact hunk line numbers.
+# Prints the HEAD (new-file) line number of every non-blank line the diff
+# added, one per line. Walks $CHANGELOG_DIFF's hunk headers
+# (`@@ -o,oc +n,nc @@`) to seed the new-file line counter, then advances it
+# by one for every context or added line (a removed `-` line does not exist
+# in the new file, so it does not advance the counter).
+added_line_numbers() {
+    awk '
+        BEGIN { started = 0; new_line = 0 }
+        /^\+\+\+/ { next }
+        /^@@/ {
+            match($0, /\+[0-9]+/)
+            new_line = substr($0, RSTART + 1, RLENGTH - 1) + 0
+            started = 1
+            next
+        }
+        !started { next }
+        /^\+/ {
+            content = substr($0, 2)
+            sub(/\r$/, "", content)
+            gsub(/^[ \t]+|[ \t]+$/, "", content)
+            if (content != "") { print new_line }
+            new_line++
+            next
+        }
+        /^-/ { next }
+        { new_line++ }
+    ' <<<"$CHANGELOG_DIFF"
+}
+
+# True when at least one line the diff added lands, by HEAD line position,
+# strictly inside the Unreleased section. Position, not text content: an
+# earlier version matched by trimmed text, which (a) let grep's `-F` pattern
+# choke on an ordinary bullet starting with "-" (a real bullet under an
+# existing "### Fixed" was silently treated as absent -- grep read the
+# leading "-" as an option) and (b) false-passed when the SAME heading text
+# (e.g. "### Fixed") already existed in Unreleased from other in-flight
+# work while the actual addition sat under an old release. Both were caught
+# in review on #1938, alongside the non-bracket heading gap `## \[` above
+# now closes. This does not check that the entry is a GOOD one -- see the
+# "optimistic count" discussion on #1938.
 has_changelog_entry() {
-    local unreleased_lines line trimmed
-    unreleased_lines="$(unreleased_section_lines | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -v '^$' || true)"
-    while IFS= read -r line; do
-        line="${line%$'\r'}"
-        case "$line" in
-            '+++'*)
-                continue
-                ;;
-            '+'*)
-                trimmed="$(printf '%s' "${line#+}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-                if [[ -n "$trimmed" && "$trimmed" != "## [Unreleased]" ]] \
-                    && grep -qxF "$trimmed" <<<"$unreleased_lines"; then
-                    return 0
-                fi
-                ;;
-        esac
-    done <<<"$CHANGELOG_DIFF"
+    local range start end lineno
+    range="$(unreleased_line_range)"
+    [[ -n "$range" ]] || return 1
+    read -r start end <<<"$range"
+    while IFS= read -r lineno; do
+        [[ -z "$lineno" ]] && continue
+        if (( lineno > start && lineno < end )); then
+            return 0
+        fi
+    done < <(added_line_numbers)
     return 1
 }
 
