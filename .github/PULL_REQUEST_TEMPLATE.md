@@ -35,6 +35,7 @@
 - [ ] `cargo test --all-targets` passes
 - [ ] `cargo clippy --all-targets -- -D warnings` is clean
 - [ ] `cargo fmt --check` passes
+- [ ] Behaviour change: added an `engine/CHANGELOG.md` entry under `[Unreleased]`, or, if none is needed, said why in this body with a line shaped like "Changelog: none - test-only refactor, no behaviour change" (10+ character reason, `because` also accepted)
 
 ### Dagster (`integrations/dagster/`)
 - [ ] `uv run pytest` passes
