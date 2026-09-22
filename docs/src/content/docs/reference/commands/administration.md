@@ -295,7 +295,7 @@ rocky optimize [flags]
 
 ### Examples
 
-Analyze all models. Each recommendation includes the current and suggested strategy, a free-text reasoning, and an estimated monthly compute savings:
+Analyze all models. Each recommendation includes the current and recommended strategy, a free-text reasoning, and an estimated monthly compute savings. `current_strategy` comes from the model's own configuration, not a guess:
 
 ```bash
 rocky optimize
@@ -307,46 +307,38 @@ rocky optimize
   "command": "optimize",
   "recommendations": [
     {
-      "model_name": "stg_events",
-      "current_strategy": "table",
-      "recommended_strategy": "view",
-      "estimated_monthly_savings": 0.0023,
-      "reasoning": "fast execution (1.4s) with 1 downstream consumer(s); recompute on read instead of storing a table",
-      "compute_cost_per_run": 0.0028,
-      "storage_cost_per_month": 0.0023,
-      "downstream_references": 1
-    },
-    {
-      "model_name": "dim_customers",
-      "current_strategy": "table",
-      "recommended_strategy": "table",
+      "model_name": "events",
+      "current_strategy": "unknown",
+      "recommended_strategy": "unknown",
       "estimated_monthly_savings": 0.0,
-      "reasoning": "3 downstream consumers; materializing once ($1.1215/mo) is cheaper than recomputing for each ($3.3300/mo)",
-      "compute_cost_per_run": 0.037,
-      "storage_cost_per_month": 0.0115,
-      "downstream_references": 3
-    },
-    {
-      "model_name": "fct_revenue",
-      "current_strategy": "table",
-      "recommended_strategy": "view",
-      "estimated_monthly_savings": 0.092,
-      "reasoning": "compute cost ($0.1380/mo) is less than storage ($0.2300/mo); recompute on read instead of materializing",
-      "compute_cost_per_run": 0.0046,
-      "storage_cost_per_month": 0.23,
+      "reasoning": "current strategy is unknown (model not found in the compiled project); no recommendation",
+      "compute_cost_per_run": 0.000010666666666666669,
+      "storage_cost_per_month": 0.0023,
       "downstream_references": 0
     }
   ],
-  "total_models_analyzed": 3
+  "total_models_analyzed": 1
 }
 ```
 
+`current_strategy` is `"unknown"` when Rocky cannot find the model in the compiled project, for example a model seen only in run history. Prices come from the project's `[cost]` block when it sets one, and fall back to Rocky's built-in rates otherwise.
+
 `rocky optimize` recommends `table` or `view`. A model needs at least 5 recorded runs; with fewer, it keeps its current strategy.
 
-Two inputs are fixed rather than read from your project ([#2056](https://github.com/rocky-data/rocky/issues/2056)):
+A compiled model reports its real strategy. Here `stg_events` is declared `type = "view"`:
 
-- `current_strategy` is always `"table"`. Rocky assumes it rather than reading the strategy the model declares, so `estimated_monthly_savings` is `0.0` whenever the recommendation is `table`.
-- The prices are $0.002 per second of compute and $0.023 per GB-month of storage. The `[cost]` block does not change them.
+```json
+{
+  "model_name": "stg_events",
+  "current_strategy": "view",
+  "recommended_strategy": "view",
+  "estimated_monthly_savings": 0.0,
+  "reasoning": "insufficient history: 1 runs (need 5)",
+  "compute_cost_per_run": 0.0000026666666666666673,
+  "storage_cost_per_month": 0.0023,
+  "downstream_references": 1
+}
+```
 
 Analyze a single model:
 
