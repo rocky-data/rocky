@@ -3033,6 +3033,61 @@ mod tests {
         );
     }
 
+    /// #1629 P1, through the `rocky run --dag` entry point: a producer whose
+    /// `[target]` omits catalog identity (`catalog = ""`, the DuckDB
+    /// single-catalog shape) is indexed under an empty catalog, so an exact
+    /// three-part `catalog.schema.table` read of it misses — the two-part
+    /// index fallback inside `derive_physical_edges` recovers the edge, and
+    /// `infer_physical_dependencies` (called from `run_dag_exec.rs` exactly
+    /// as here) phases the pair correctly.
+    #[test]
+    fn physical_reads_order_transformation_phases_across_an_omitted_catalog() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        let mut producer = model("orders_model", vec![], vec![]);
+        producer.config.target.catalog = "".into();
+        producer.config.target.table = "orders_v2".into();
+        producer.sql = "SELECT 1 AS id".into();
+        let mut consumer = model("mart", vec![], vec![]);
+        consumer.sql = "SELECT id FROM db.silver.orders_v2".into();
+
+        let models = vec![producer, consumer];
+        let by_pipeline = owned_by_sole_transformation(&config, models.clone());
+        let mut dag = build_unified_dag(&config, &by_pipeline, &[]).expect("build dag");
+
+        // Precondition: label inference alone leaves them co-phased (the
+        // renamed target hides it from the bare-name heuristic too).
+        let sql_by_name: std::collections::HashMap<String, String> = models
+            .iter()
+            .map(|m| (m.config.name.clone(), m.sql.clone()))
+            .collect();
+        infer_runtime_dependencies(&mut dag, &sql_by_name);
+        let phases = execution_phases(&dag).expect("phases");
+        let phase_of = |label: &str, phases: &Vec<Vec<&UnifiedNode>>| -> usize {
+            phases
+                .iter()
+                .position(|l| l.iter().any(|n| n.label == label))
+                .unwrap()
+        };
+        assert_eq!(
+            phase_of("orders_model", &phases),
+            phase_of("mart", &phases),
+            "precondition: the label heuristic is blind to the renamed target"
+        );
+
+        let inputs: Vec<crate::physical_edges::PhysicalEdgeModel<'_>> = models
+            .iter()
+            .map(crate::physical_edges::PhysicalEdgeModel::from_model)
+            .collect();
+        let derived = infer_physical_dependencies(&mut dag, &inputs);
+        assert_eq!(derived.edges.len(), 1, "{derived:?}");
+        let phases = execution_phases(&dag).expect("phases after augmentation");
+        assert!(
+            phase_of("orders_model", &phases) < phase_of("mart", &phases),
+            "producer must phase strictly before its physical reader, even when its own \
+             [target] omits catalog identity"
+        );
+    }
+
     /// #1275 cycle policy inside the unified DAG: mutual physical reads must
     /// not make `execution_phases` refuse — one direction is applied, the
     /// closer is skipped and reported.
