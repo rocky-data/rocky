@@ -338,6 +338,8 @@ Upstream output has `"direction": "upstream"` (the default shape, unchanged). Th
 
 Report the downstream blast radius of a change between two git refs, for PR review. It combines the structural diff from `rocky ci-diff` with the downstream consumers from `rocky lineage --downstream`. Together they show which downstream columns each changed column reaches.
 
+Git selects the changed paths from committed history between `base_ref` and HEAD. The column schemas and the downstream trace, though, come from the current working tree, not a git checkout of HEAD. For a report that must describe HEAD exactly, commit your changes first, so the working tree matches HEAD.
+
 ```bash
 rocky lineage-diff [base_ref] [flags]
 ```
@@ -440,9 +442,9 @@ rocky lineage-diff main -o json
 }
 ```
 
-A removed column always reports an empty `downstream_consumers` list. The column no longer exists on HEAD's compile, so Rocky cannot walk its downstream reach. The structural diff still reports the removal.
+A removed column has no downstream trace. The column no longer exists on HEAD's compile, so Rocky cannot walk its downstream reach. JSON omits `downstream_consumers` when it is empty, so a consumer should default a missing key to an empty list. The structural diff still reports the removal.
 
-`rocky lineage-diff` reports; it does not fail a build. Finding changed columns, however many, does not change the exit code. Only an error makes it exit non-zero: an invalid `base_ref`, or a `git diff` that fails.
+`rocky lineage-diff` reports; it does not fail a build. Finding changed columns, however many, does not change the exit code. Only an error makes it exit non-zero: an invalid `base_ref`, a `git diff` that fails, or invalid or unreadable project configuration.
 
 ### Related Commands
 
