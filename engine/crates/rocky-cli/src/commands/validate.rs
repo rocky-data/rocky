@@ -73,6 +73,28 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
         out.push(config_error_diagnostic(&err, config_path));
     }
 
+    // V002: a document with no `[adapter*]` and no `[pipeline.*]` at all has
+    // nothing for `rocky run`/`plan`/`discover` to act on — every one of
+    // them would exit having done nothing, silently. V010/V020 below already
+    // warn about each half separately (useful when only one is missing);
+    // this is the stronger, additional signal for the fully-empty case, and
+    // an error rather than a warning because there is no config here to run
+    // at all, not just a suboptimal one. Numbered right after V001 (the
+    // parse-success/failure code) since this is the next top-level check
+    // before any per-adapter or per-pipeline validation begins.
+    if cfg.adapters.is_empty() && cfg.pipelines.is_empty() {
+        out.push(ValidateMessage {
+            severity: "error".into(),
+            code: "V002".into(),
+            message: "rocky.toml defines no [adapter] and no [pipeline] — nothing to validate. \
+                      Add at least one [adapter.<name>] and [pipeline.<name>], or point --config \
+                      at a project that has them."
+                .into(),
+            file: Some(config_path.display().to_string()),
+            field: None,
+        });
+    }
+
     // Validate adapters
     if cfg.adapters.is_empty() {
         out.push(ValidateMessage {
@@ -2595,11 +2617,29 @@ schema_template = "demo"
         assert!(v035[0].message.contains("full_refresh"));
     }
 
+    /// An empty document is refused with V002 (#2005) — it used to report
+    /// `valid: true` with nothing but the two "no adapters"/"no pipelines"
+    /// warnings, which `rocky run`/`plan`/`discover` would all also accept
+    /// and then silently do nothing.
     #[test]
     fn test_empty_config() {
         let out = validate_toml("");
-        // Should warn about no adapters and no pipelines
-        assert!(out.valid); // warnings don't set valid=false
+        assert!(!out.valid, "an empty document must refuse: {:?}", out.messages);
+        let v002: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V002" && m.severity == "error")
+            .collect();
+        assert_eq!(
+            v002.len(),
+            1,
+            "expected exactly one V002 error: {:?}",
+            out.messages
+        );
+        assert!(v002[0].message.contains("[adapter]"));
+        assert!(v002[0].message.contains("[pipeline]"));
+        // V010/V020 still fire too — V002 is additive, not a replacement for
+        // the per-section warnings (useful when only one half is missing).
         let warns: Vec<_> = out
             .messages
             .iter()
@@ -2607,7 +2647,45 @@ schema_template = "demo"
             .collect();
         assert!(
             warns.len() >= 2,
-            "expected warnings for no adapters/pipelines"
+            "expected V010/V020 warnings alongside V002: {:?}",
+            out.messages
+        );
+    }
+
+    /// Counter-check: V002 must NOT fire once the document has both an
+    /// adapter and a pipeline — it is specifically the fully-empty case.
+    #[test]
+    fn test_v002_absent_on_populated_config() {
+        let out = validate_toml(MINIMAL_CONFIG);
+        assert!(
+            !out.messages.iter().any(|m| m.code == "V002"),
+            "V002 must not fire on a populated config: {:?}",
+            out.messages
+        );
+    }
+
+    /// Counter-check: a document with an adapter but no pipeline (or vice
+    /// versa) is the existing V010/V020-only case, not V002 — only the
+    /// fully-empty document is the new error.
+    #[test]
+    fn test_v002_absent_when_only_one_half_is_empty() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+"#,
+        );
+        assert!(
+            !out.messages.iter().any(|m| m.code == "V002"),
+            "V002 must not fire when adapters are present: {:?}",
+            out.messages
+        );
+        assert!(
+            out.messages
+                .iter()
+                .any(|m| m.code == "V020" && m.severity == "warn"),
+            "V020 must still fire for the missing pipelines: {:?}",
+            out.messages
         );
     }
 
