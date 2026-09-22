@@ -74,9 +74,13 @@ fn bench_dag(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("dag_execute_wide_50");
     group.measurement_time(Duration::from_secs(10));
-    // CI runs this on every `perf`-labeled PR (#1947): keep it cheap. 10
-    // samples of the ~500ms sequential arm is ~5s, well under the 10s
-    // measurement window above.
+    // CI runs this on every `perf`-labeled PR (#1947): keep it cheap. The
+    // ~600ms/iter sequential arm can't fit 100 samples in the 10s window
+    // above, so at the default sample_size(100) criterion just runs all 100
+    // iterations anyway (measured: ~65s for that arm alone, with a logged
+    // "Unable to complete 100 samples in 10.0s" warning). sample_size(10)
+    // caps it at 10 iterations instead (measured: ~12s for that arm, ~25s
+    // for the whole group including the faster parallel arm).
     group.sample_size(10);
 
     for (label, concurrency) in [("sequential", Some(1)), ("parallel", None)] {
