@@ -6,12 +6,20 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Sentinel [`ModelStats::current_strategy`] for a model whose configured
+/// strategy could not be determined — e.g. it appears only in run history
+/// and is absent from the compiled project. [`recommend_strategy`] treats
+/// this as a hard "make no recommendation" signal rather than comparing it
+/// against an assumed baseline (#2056).
+pub const UNKNOWN_STRATEGY: &str = "unknown";
+
 /// Cost estimate and strategy recommendation for a single model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaterializationCost {
     /// Name of the model being analyzed.
     pub model_name: String,
-    /// Current materialization strategy (e.g., "table", "view", "incremental").
+    /// Current materialization strategy (e.g., "table", "view", "incremental";
+    /// [`UNKNOWN_STRATEGY`] when the caller could not determine it).
     pub current_strategy: String,
     /// Estimated compute cost per run in dollars.
     pub compute_cost_per_run: f64,
@@ -30,29 +38,49 @@ pub struct MaterializationCost {
 /// Configuration for the cost model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostConfig {
-    /// Cost per GB of storage per month (default: $0.023 for S3/DBFS).
+    /// Cost per GB of storage per month (default: $0.023 for S3/DBFS —
+    /// [`crate::config::CostSection`]'s own default).
     pub storage_cost_per_gb_month: f64,
-    /// Cost per second of compute (default: $0.002 for DBU).
+    /// Cost per second of compute (default: ~$0.0027, i.e. $0.40/DBU-hour at
+    /// the "Medium" warehouse size's 24 DBU/hour — see
+    /// [`crate::cost::warehouse_size_to_dbu_per_hour`]).
     pub compute_cost_per_second: f64,
     /// Minimum number of historical runs required before making recommendations.
     pub min_history_runs: usize,
 }
 
 impl Default for CostConfig {
+    /// Deliberately delegates to [`crate::config::CostSection::default`]'s own
+    /// conversion rather than restating separate literals: the two used to
+    /// disagree (a project whose `rocky.toml` declared no `[cost]` block, or
+    /// one that explicitly restated the default values, got a different
+    /// price than a config-less project — #2056, found in Codex review).
+    /// Deriving this default FROM `CostSection`'s makes the two identical by
+    /// construction, for every caller, not just the ones a value-equality
+    /// guard happens to catch.
     fn default() -> Self {
-        CostConfig {
-            storage_cost_per_gb_month: 0.023,
-            compute_cost_per_second: 0.002,
-            min_history_runs: 5,
-        }
+        crate::config::CostSection::default().into()
     }
 }
 
 impl From<crate::config::CostSection> for CostConfig {
     fn from(section: crate::config::CostSection) -> Self {
+        // `compute_cost_per_dbu` is dollars per DBU-*hour* (Databricks'/
+        // Snowflake's own billing unit — see `CostSection`'s doc comment
+        // and the $0.40 default, which is a per-hour DBU rate). Converting
+        // it to a per-second compute price therefore needs the warehouse's
+        // DBU/hour throughput, not just a division by 3600: dividing the
+        // per-DBU-hour rate straight by 3600 silently assumes 1 DBU/hour,
+        // underpricing every other size (24x for the "Medium" default,
+        // `rocky cost`'s `adapter_pricing` already folds in this same
+        // factor via `warehouse_size_to_dbu_per_hour` — this conversion
+        // must match it (found in Codex review of #2056: this impl was
+        // unused in production before this PR wired it into
+        // `rocky optimize`, so the mismatch was never observed).
+        let dbu_per_hour = crate::cost::warehouse_size_to_dbu_per_hour(&section.warehouse_size);
         CostConfig {
             storage_cost_per_gb_month: section.storage_cost_per_gb_month,
-            compute_cost_per_second: section.compute_cost_per_dbu / 3600.0, // DBU per hour -> per second
+            compute_cost_per_second: section.compute_cost_per_dbu * dbu_per_hour / 3600.0,
             min_history_runs: section.min_history_runs,
         }
     }
@@ -63,7 +91,9 @@ impl From<crate::config::CostSection> for CostConfig {
 pub struct ModelStats {
     /// Name of the model.
     pub model_name: String,
-    /// Current materialization strategy.
+    /// Current materialization strategy, or [`UNKNOWN_STRATEGY`] when the
+    /// caller could not resolve it (e.g. a history-only model absent from
+    /// the compiled project).
     pub current_strategy: String,
     /// Average execution duration in seconds across recent runs.
     pub avg_duration_seconds: f64,
@@ -86,10 +116,33 @@ pub struct ModelStats {
 ///   Higher storage cost justified by reduced total compute across consumers.
 ///   A view is also what a very fast (< 2s) single-consumer model gets: it
 ///   stores nothing, and recomputing it on read costs little.
+/// - **[`UNKNOWN_STRATEGY`]**: neither. `stats.current_strategy ==
+///   UNKNOWN_STRATEGY` short-circuits before either branch, echoing the
+///   sentinel back as both current and recommended strategy with zero
+///   savings, rather than comparing it against a guess.
 pub fn recommend_strategy(stats: &ModelStats, config: &CostConfig) -> MaterializationCost {
     let compute_cost_per_run = stats.avg_duration_seconds * config.compute_cost_per_second;
     let storage_cost_per_month = stats.estimated_size_gb * config.storage_cost_per_gb_month;
     let monthly_compute = compute_cost_per_run * stats.runs_per_month;
+
+    // The model's real strategy is unknown to the caller (#2056) — comparing
+    // it against a recommended "table"/"view" would silently pass off a
+    // guess as a considered recommendation. Report the cost inputs, make no
+    // recommendation.
+    if stats.current_strategy == UNKNOWN_STRATEGY {
+        return MaterializationCost {
+            model_name: stats.model_name.clone(),
+            current_strategy: stats.current_strategy.clone(),
+            compute_cost_per_run,
+            storage_cost_per_month,
+            downstream_references: stats.downstream_references,
+            recommended_strategy: stats.current_strategy.clone(),
+            estimated_monthly_savings: 0.0,
+            reasoning: "current strategy is unknown (model not found in the compiled project); \
+                        no recommendation"
+                .to_string(),
+        };
+    }
 
     // Not enough history to make a recommendation
     if stats.history_runs < config.min_history_runs {
@@ -255,9 +308,31 @@ mod tests {
         };
         let result = recommend_strategy(&stats, &default_config());
         assert_eq!(result.recommended_strategy, "view");
-        // monthly compute = 5 * 0.002 * 4 = 0.04
+        // monthly compute = 5 * ~0.0026667 * 4 ≈ 0.053
         // storage = 50 * 0.023 = 1.15
         assert!(result.estimated_monthly_savings > 1.0);
+    }
+
+    /// An unknown current strategy (#2056: a model absent from the compiled
+    /// project) must never be told to "switch" — the recommender has no real
+    /// baseline to compare against, so it reports the sentinel back and
+    /// zero savings rather than comparing it against a guessed "table".
+    #[test]
+    fn test_unknown_strategy_gets_no_recommendation() {
+        let stats = ModelStats {
+            model_name: "history_only_model".into(),
+            current_strategy: UNKNOWN_STRATEGY.into(),
+            avg_duration_seconds: 30.0,
+            estimated_size_gb: 2.0,
+            downstream_references: 5,
+            history_runs: 20,
+            runs_per_month: 30.0,
+        };
+        let result = recommend_strategy(&stats, &default_config());
+        assert_eq!(result.current_strategy, UNKNOWN_STRATEGY);
+        assert_eq!(result.recommended_strategy, UNKNOWN_STRATEGY);
+        assert_eq!(result.estimated_monthly_savings, 0.0);
+        assert!(result.reasoning.contains("unknown"));
     }
 
     #[test]
@@ -307,7 +382,7 @@ mod tests {
         };
         let result = recommend_strategy(&stats, &default_config());
         assert_eq!(result.recommended_strategy, "table");
-        // compute = 120 * 0.002 * 30 = 7.2, storage = 0.1 * 0.023 = 0.0023
+        // compute = 120 * ~0.0026667 * 30 ≈ 9.6, storage = 0.1 * 0.023 = 0.0023
         assert!(result.estimated_monthly_savings > 7.0);
     }
 
@@ -332,6 +407,11 @@ mod tests {
         assert_eq!(result.recommended_strategy, "view");
     }
 
+    /// The "Medium" default carries a real DBU/hour throughput (24, per
+    /// `warehouse_size_to_dbu_per_hour`), so the per-second price is
+    /// `$/DBU-hour * DBU/hour / 3600`, not `$/DBU-hour / 3600` — the latter
+    /// silently assumes 1 DBU/hour and underprices every warehouse size by
+    /// that size's DBU/hour factor (found by Codex review of #2056).
     #[test]
     fn test_cost_section_defaults() {
         let section = crate::config::CostSection::default();
@@ -339,10 +419,24 @@ mod tests {
         let config: CostConfig = section.into();
         assert!((config.storage_cost_per_gb_month - 0.023).abs() < f64::EPSILON);
         assert!(config.compute_cost_per_second > 0.0);
-        // 0.40 DBU/hour = 0.40/3600 per second
-        let expected = 0.40 / 3600.0;
+        // 0.40 $/DBU-hour * 24 DBU/hour (Medium) / 3600 s/hour
+        let expected = 0.40 * 24.0 / 3600.0;
         assert!((config.compute_cost_per_second - expected).abs() < 1e-10);
         assert_eq!(config.min_history_runs, 5);
+    }
+
+    /// A non-default warehouse size changes the per-second price
+    /// proportionally to its DBU/hour throughput — the field is not
+    /// decorative.
+    #[test]
+    fn test_cost_section_scales_with_warehouse_size() {
+        let section = crate::config::CostSection {
+            warehouse_size: "Large".to_string(), // 40 DBU/hour
+            ..crate::config::CostSection::default()
+        };
+        let config: CostConfig = section.into();
+        let expected = 0.40 * 40.0 / 3600.0;
+        assert!((config.compute_cost_per_second - expected).abs() < 1e-10);
     }
 
     #[test]

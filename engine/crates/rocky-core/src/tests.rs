@@ -450,13 +450,15 @@ fn generate_test_sql_inner(
         // Same boundary as `expression`. A filter is spliced into the same
         // generated statement and executed with the same credentials, so a
         // disallowed function or a subquery reaches just as far from here.
+        // `Filter` shares `SinglePredicate`'s rules exactly; it is a
+        // separate mode only so a refusal names the right field (#1971).
         let sql_dialect =
             rocky_sql::check_expression::dialect_for(dialect.map_or("generic", |d| d.name()));
         rocky_sql::check_expression::validate_check_expression(
             &context,
             f,
             sql_dialect.as_ref(),
-            rocky_sql::check_expression::ExpressionUse::SinglePredicate,
+            rocky_sql::check_expression::ExpressionUse::Filter,
         )?;
     }
 
@@ -988,6 +990,71 @@ mod unit_tests {
             filter: Some("status <> 'void'".into()),
         };
         generate_test_sql(&decl, "wh.main.orders").expect("an ordinary filter must still compile");
+    }
+
+    /// A refused `filter` is described as a filter, not "an expression
+    /// check" — the noun used to come from the evaluation mode
+    /// (`SinglePredicate`), which an assertion's `expression` shares, rather
+    /// than the field kind (#1971).
+    #[test]
+    fn a_check_filter_is_described_as_a_filter() {
+        let decl = TestDecl {
+            test_type: TestType::NotNull,
+            column: Some("name".into()),
+            severity: TestSeverity::Error,
+            filter: Some("amount >".into()),
+        };
+        let err = generate_test_sql(&decl, "wh.main.orders").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("A filter is one boolean expression over the row's columns"),
+            "{msg}"
+        );
+        assert!(!msg.contains("An expression check"), "{msg}");
+    }
+
+    /// `now()` is on the allowlist — it is refused as a `key_expr` for the
+    /// POSITION, not the name, so the refusal must not send its author to
+    /// `CHECK_EXPRESSION_FUNCTIONS` (#1971).
+    #[test]
+    fn a_unique_expr_key_refuses_a_volatile_function_with_its_own_advice() {
+        let decl = TestDecl {
+            test_type: TestType::UniqueExpr {
+                key_expr: "now()".into(),
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let err = generate_test_sql(&decl, "wh.main.orders").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("A value that can change between evaluations cannot be a key"),
+            "{msg}"
+        );
+        assert!(!msg.contains("CHECK_EXPRESSION_FUNCTIONS"), "{msg}");
+    }
+
+    /// `COLLATE` is not a function, so telling its author to add it to
+    /// `CHECK_EXPRESSION_FUNCTIONS` is not just wrong advice, it names a list
+    /// COLLATE could never join (#1971).
+    #[test]
+    fn a_unique_expr_key_refuses_collate_with_its_own_advice() {
+        let decl = TestDecl {
+            test_type: TestType::UniqueExpr {
+                key_expr: "email COLLATE NOCASE".into(),
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let err = generate_test_sql(&decl, "wh.main.orders").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("COLLATE changes what equality means, so a key may not carry one"),
+            "{msg}"
+        );
+        assert!(!msg.contains("CHECK_EXPRESSION_FUNCTIONS"), "{msg}");
     }
 
     #[test]

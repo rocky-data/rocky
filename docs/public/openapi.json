@@ -7919,18 +7919,8 @@
       },
       "FreshnessConfig": {
         "additionalProperties": false,
-        "description": "Freshness check configuration with optional per-schema overrides.",
+        "description": "Freshness check configuration.\n\nA single scalar `threshold_seconds` applies to every checked table. There used to be an `overrides` key for per-schema thresholds; it parsed and validated but nothing on the check path ever read it, so it is now refused with a message naming the remedy (#1620).",
         "properties": {
-          "overrides": {
-            "additionalProperties": {
-              "format": "uint64",
-              "minimum": 0.0,
-              "type": "integer"
-            },
-            "default": {},
-            "description": "Per-schema freshness overrides. Key is a schema pattern (e.g., \"raw__us_west__shopify\"), value overrides threshold_seconds for matching schemas.",
-            "type": "object"
-          },
           "severity": {
             "allOf": [
               {
@@ -7952,7 +7942,7 @@
         "type": "object"
       },
       "FreshnessConfigOutput": {
-        "description": "Freshness check configuration projected into the discover output.\n\nPer-schema `overrides` from `rocky_core::config::FreshnessConfig` are intentionally not exposed yet — the override-key semantics need to be nailed down before integrations can rely on them.",
+        "description": "Freshness check configuration projected into the discover output.\n\nJust the scalar threshold: `[checks.freshness]` has no per-schema `overrides` key. One existed and parsed but nothing on the check path ever read it, so it was removed rather than exposed here (#1620).",
         "properties": {
           "threshold_seconds": {
             "format": "uint64",
@@ -15513,6 +15503,13 @@
           "head_ref": {
             "description": "Git HEAD SHA at plan time — informational for audit purposes.",
             "type": "string"
+          },
+          "pipeline": {
+            "description": "The resolved pipeline the promote targets were built against (`resolve_pipeline`'s output at plan time — never ambiguous, even on a single-pipeline config where `--pipeline` was omitted). `rocky apply <plan-id>` reads this instead of re-resolving from the config, so applying a promote plan is never ambiguous on a multi-pipeline project. Absent on plans written before this field existed; apply falls back to `resolve_pipeline(None)` for those, unchanged from before this field was added.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "plan_audit": {
             "description": "Plan-time audit events (approvals gate + breaking-change gate outcomes). Apply-time events (`PromoteStarted`, `PromoteCompleted`, `PromoteFailed`) are appended in `BranchPromoteOutput.audit` at apply time.",

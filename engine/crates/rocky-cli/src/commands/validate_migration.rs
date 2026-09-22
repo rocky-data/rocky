@@ -1,7 +1,10 @@
 //! `rocky validate-migration` — compare dbt and Rocky project outputs.
 //!
-//! Compile-only validation mode: imports the dbt project, compiles with Rocky,
-//! and reports schema/type mismatches without warehouse access.
+//! Imports the dbt project, compares model names against an optional
+//! Rocky project directory, and reports which dbt tests convert to
+//! Rocky contracts. It does not verify Rocky-side checks, does not
+//! compile Rocky SQL, and opens no warehouse adapter (`compile_ok` on
+//! each result reflects the dbt import, not a Rocky compile).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -33,10 +36,11 @@ struct ModelValidation {
 
 /// Execute `rocky validate-migration`.
 ///
-/// In compile-only mode (no warehouse), this:
+/// No warehouse access; this:
 /// 1. Imports the dbt project
 /// 2. Parses model YAML for test definitions
-/// 3. Reports per-model coverage and conversion stats
+/// 3. Compares model names against the optional Rocky project directory
+/// 4. Reports per-model coverage and conversion stats
 pub fn run_validate_migration(
     dbt_project: &Path,
     rocky_project: Option<&Path>,

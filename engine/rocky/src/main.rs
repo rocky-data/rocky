@@ -425,7 +425,8 @@ enum Command {
         /// Project directory name
         #[arg(default_value = ".")]
         path: String,
-        /// Project template: duckdb (default), databricks-fivetran, snowflake
+        /// Project template: duckdb (default), databricks-fivetran,
+        /// snowflake, bigquery, trino
         #[arg(long, default_value = "duckdb")]
         template: String,
     },
@@ -889,9 +890,11 @@ enum Command {
         /// is a content-hash of the payload, so plans differing only by
         /// idempotency-key get distinct plan_ids — the hash discriminates.
         ///
-        /// Supported on `local`, `valkey`, and `tiered` state backends.
-        /// `s3`-only and `gcs`-only backends error at flag-parse time — use
-        /// `tiered` for multi-pod deployments.
+        /// Supported on every state backend: `local` (a redb write
+        /// transaction), `valkey`/`tiered` (`SET NX EX`), and `s3`/`gcs`
+        /// (a conditional PUT). The initial claim is race-free on every
+        /// backend; recovery from a crashed prior claim is best-effort —
+        /// two callers can both adopt one stale claim.
         ///
         /// ⚠️ Keys are stored verbatim in the state store; do NOT put
         /// secrets in idempotency keys.
@@ -1063,9 +1066,11 @@ enum Command {
         /// work is done. If another caller currently holds the key's
         /// in-flight claim, exits with `skipped_in_flight`.
         ///
-        /// Supported on `local`, `valkey`, and `tiered` state backends.
-        /// `s3`-only and `gcs`-only backends error at flag-parse time — use
-        /// `tiered` for multi-pod deployments.
+        /// Supported on every state backend: `local` (a redb write
+        /// transaction), `valkey`/`tiered` (`SET NX EX`), and `s3`/`gcs`
+        /// (a conditional PUT). The initial claim is race-free on every
+        /// backend; recovery from a crashed prior claim is best-effort —
+        /// two callers can both adopt one stale claim.
         ///
         /// ⚠️ Keys are stored verbatim in the state store; do NOT put
         /// secrets in idempotency keys.
@@ -1619,7 +1624,11 @@ enum Command {
         /// Path to Rocky project directory (optional, for side-by-side comparison)
         #[arg(long)]
         rocky_project: Option<PathBuf>,
-        /// Number of rows to sample per table (for warehouse-based validation)
+        /// Number of rows to sample per table. Accepted but currently
+        /// ignored: `validate-migration` imports the dbt project,
+        /// compares model names against the optional Rocky project, and
+        /// reports which dbt tests convert to Rocky contracts — it does
+        /// not verify Rocky-side checks and opens no warehouse adapter.
         #[arg(long)]
         sample_size: Option<usize>,
     },
@@ -2809,6 +2818,9 @@ enum BranchAction {
         /// Filter sources by component value (e.g., --filter client=acme)
         #[arg(long)]
         filter: Option<String>,
+        /// Pipeline name (required if multiple pipelines are defined)
+        #[arg(long)]
+        pipeline: Option<String>,
     },
     /// Sign a content-addressed approval artifact for a branch.
     ///
@@ -4584,7 +4596,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             } else {
                 None
             };
-            rocky_cli::commands::run_optimize(&state_path, models_dir, model.as_deref(), json)
+            rocky_cli::commands::run_optimize(
+                &state_path,
+                &cli.config,
+                models_dir,
+                model.as_deref(),
+                json,
+            )
         }
         Command::Estimate {
             models,
@@ -4688,12 +4706,17 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             BranchAction::Show { name } => {
                 rocky_cli::commands::run_branch_show(&state_path, &name, json)
             }
-            BranchAction::Compare { name, filter } => {
+            BranchAction::Compare {
+                name,
+                filter,
+                pipeline,
+            } => {
                 rocky_cli::commands::run_branch_compare(
                     &state_path,
                     &cli.config,
                     &name,
                     filter.as_deref(),
+                    pipeline.as_deref(),
                     json,
                 )
                 .await
@@ -5156,7 +5179,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use std::sync::Mutex;
 
     // -----------------------------------------------------------------------
@@ -5215,6 +5238,61 @@ mod tests {
         assert_eq!(
             rocky_mcp::McpProfile::from(profile),
             rocky_mcp::McpProfile::Worker,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2027 — `--help` strings must describe the behaviour the code has
+    // -----------------------------------------------------------------------
+
+    /// `rocky init --help` must list every template `commands/init.rs`
+    /// actually accepts, not just three of the five.
+    #[test]
+    fn init_help_lists_all_five_templates() {
+        let mut init_cmd = command_with_big_stack()
+            .find_subcommand("init")
+            .expect("init subcommand exists")
+            .clone();
+        let help = init_cmd.render_long_help().to_string();
+        assert!(
+            help.contains("trino"),
+            "init --help must list trino: {help}"
+        );
+        assert!(
+            help.contains("bigquery"),
+            "init --help must list bigquery: {help}"
+        );
+    }
+
+    /// `rocky validate-migration --help` must say `--sample-size` is
+    /// ignored, not promise warehouse-based sampling that
+    /// `run_validate_migration` never performs (`_sample_size` is unused).
+    #[test]
+    fn validate_migration_help_says_sample_size_is_ignored() {
+        let mut sub = command_with_big_stack()
+            .find_subcommand("validate-migration")
+            .expect("validate-migration subcommand exists")
+            .clone();
+        let help = sub.render_long_help().to_string();
+        assert!(
+            help.contains("ignored"),
+            "validate-migration --help must say sample-size is ignored: {help}"
+        );
+    }
+
+    /// `rocky run --help` must not claim `s3`/`gcs` idempotency backends
+    /// error at flag-parse time — `IdempotencyBackend::from_state_config`
+    /// maps both to `ObjectStore` and attempts a conditional PUT instead.
+    #[test]
+    fn run_help_does_not_claim_object_store_backends_error_at_parse_time() {
+        let mut sub = command_with_big_stack()
+            .find_subcommand("run")
+            .expect("run subcommand exists")
+            .clone();
+        let help = sub.render_long_help().to_string();
+        assert!(
+            !help.contains("error at flag-parse time"),
+            "run --help must not claim s3/gcs error at parse time: {help}"
         );
     }
 
@@ -5306,6 +5384,22 @@ mod tests {
                 .expect("spawn parser thread")
                 .join()
                 .expect("parser thread panicked")
+        })
+    }
+
+    /// Same overflow, same fix, for building the `clap::Command` graph
+    /// itself rather than parsing through it (`Cli::command()` walks the
+    /// same subcommand tree `try_parse_with_big_stack` above documents —
+    /// confirmed by a `SIGABRT: stack overflow` on the default test-thread
+    /// stack when a `--help`-snapshot test called `Cli::command()` directly).
+    fn command_with_big_stack() -> clap::Command {
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(s, Cli::command)
+                .expect("spawn command-builder thread")
+                .join()
+                .expect("command-builder thread panicked")
         })
     }
 
@@ -5506,6 +5600,76 @@ mod tests {
             } => assert_eq!(expect_spec_digest, None),
             _ => panic!("expected Apply subcommand"),
         }
+    }
+
+    /// #2019: `rocky branch compare <name> --pipeline <name>` must parse —
+    /// clap rejected `--pipeline` on `branch compare` entirely before this
+    /// fix (`error: unexpected argument '--pipeline' found`), the flag
+    /// stays optional (a bare `branch compare <name>` still parses to
+    /// `pipeline: None`), and `rocky apply <plan-id>` still has NO
+    /// `--pipeline` flag — the fix reads it from the persisted plan instead,
+    /// per the issue's "don't add `--pipeline` to `apply`" constraint.
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the apply/--pipeline half expects a PARSE FAILURE, which the Cli-returning \
+                  big-stack helper cannot express; run on a scoped 8 MB thread instead"
+    )]
+    fn branch_compare_pipeline_flag_parses_and_apply_still_has_none() {
+        let cli = try_parse_with_big_stack(&[
+            "rocky",
+            "branch",
+            "compare",
+            "ci-demo",
+            "--pipeline",
+            "transform",
+        ]);
+        match cli.command {
+            Command::Branch { action } => match action {
+                BranchAction::Compare { name, pipeline, .. } => {
+                    assert_eq!(name, "ci-demo");
+                    assert_eq!(pipeline.as_deref(), Some("transform"));
+                }
+                _ => panic!("expected BranchAction::Compare"),
+            },
+            _ => panic!("expected Branch subcommand"),
+        }
+
+        // The flag stays optional.
+        let cli = try_parse_with_big_stack(&["rocky", "branch", "compare", "ci-demo"]);
+        match cli.command {
+            Command::Branch { action } => match action {
+                BranchAction::Compare { pipeline, .. } => assert_eq!(pipeline, None),
+                _ => panic!("expected BranchAction::Compare"),
+            },
+            _ => panic!("expected Branch subcommand"),
+        }
+
+        // `rocky apply <plan-id> --pipeline transform` must still be REJECTED
+        // — `apply` carries no such flag.
+        let msg = std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(s, || {
+                    match Cli::try_parse_from([
+                        "rocky",
+                        "apply",
+                        "abc123",
+                        "--pipeline",
+                        "transform",
+                    ]) {
+                        Ok(_) => panic!("`apply` must not accept `--pipeline`"),
+                        Err(e) => e.to_string(),
+                    }
+                })
+                .expect("spawn parser thread")
+                .join()
+                .expect("parser thread panicked")
+        });
+        assert!(
+            msg.contains("unexpected argument") || msg.contains("--pipeline"),
+            "expected an unrecognized-argument error naming --pipeline, got: {msg}"
+        );
     }
 
     /// FF-WP1: `rocky review --status` parses by its literal flag name, and

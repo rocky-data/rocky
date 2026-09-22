@@ -1589,6 +1589,24 @@ impl LanguageServer for RockyLsp {
                         });
                     }
                 }
+
+                // #1800: pipeline step keywords (`derive`, `take`, ...) are
+                // only legal in the DSL. Gate on the file extension rather
+                // than threading a new parameter through
+                // `get_completion_context` — the same server also completes
+                // `.sql` model files (`editors/vscode/src/lspClient.ts`
+                // registers both), and none of these words are valid SQL.
+                if uri_extension(&uri) == "rocky" {
+                    for &keyword in ROCKY_STEP_KEYWORDS {
+                        items.push(CompletionItem {
+                            label: keyword.to_string(),
+                            kind: Some(CompletionItemKind::KEYWORD),
+                            detail: Some(rocky_step_keyword_detail(keyword).to_string()),
+                            ..Default::default()
+                        });
+                    }
+                }
+
                 items
             }
         };
@@ -4215,6 +4233,27 @@ const ROCKY_STEP_KEYWORDS: &[&str] = &[
     "replicate",
 ];
 
+/// One-line doc for a [`ROCKY_STEP_KEYWORDS`] entry, shown as a completion
+/// item's `detail` (#1800). Mirrors the per-step sentence in
+/// `docs/src/content/docs/concepts/rocky-dsl.md`. The fallback arm is a
+/// safety net, not an expected path: it must never panic on a completion
+/// request, even if this list and `ROCKY_STEP_KEYWORDS` ever drift.
+fn rocky_step_keyword_detail(keyword: &str) -> &'static str {
+    match keyword {
+        "from" => "from <model> - Start the pipeline from a model or table",
+        "where" => "where <predicate> - Filter rows (HAVING after group)",
+        "group" => "group <keys> { ... } - Group rows and define aggregations",
+        "derive" => "derive { name: expr } - Add computed columns",
+        "select" => "select { col1, col2 } - Choose which columns to keep",
+        "join" => "join <model> on <key> - Join another model by key columns",
+        "sort" => "sort <col> [asc|desc] - Order results",
+        "take" => "take <n> - Limit the number of rows",
+        "distinct" => "distinct - Deduplicate rows",
+        "replicate" => "replicate - Shorthand for SELECT * (bronze passthrough)",
+        _ => "Rocky pipeline step",
+    }
+}
+
 /// A pipeline step found in a `.rocky` file.
 struct RockyPipelineStep {
     keyword: String,
@@ -5125,6 +5164,204 @@ mod tests {
         assert_eq!(uri_extension("file:///path/to/file.sql"), "sql");
         assert_eq!(uri_extension("file:///path/to/file.toml"), "toml");
         assert_eq!(uri_extension("file:///no-extension"), "");
+    }
+
+    // ── Completion: pipeline step keywords (#1800) ───────────────────────
+
+    /// Every entry in `ROCKY_STEP_KEYWORDS` must have its own detail, not
+    /// the generic `rocky_step_keyword_detail` fallback. Without this, an
+    /// 11th keyword added to the list without a matching `match` arm would
+    /// compile, ship a generic "Rocky pipeline step" detail, and nothing
+    /// would fail — this test is what turns that into a CI failure instead.
+    #[test]
+    fn every_step_keyword_has_its_own_detail() {
+        const GENERIC_FALLBACK: &str = "Rocky pipeline step";
+        for &keyword in ROCKY_STEP_KEYWORDS {
+            let detail = rocky_step_keyword_detail(keyword);
+            assert_ne!(
+                detail, GENERIC_FALLBACK,
+                "{keyword} has no specific detail in rocky_step_keyword_detail; \
+                 add a match arm for it"
+            );
+        }
+    }
+
+    /// Drives `textDocument/completion` over the real JSON-RPC service
+    /// (same harness as `a_failed_startup_compile_reaches_the_editor_as_an_error_message`
+    /// above), so what's observed is what an editor receives. Writes an
+    /// empty document at `root/<file_name>` and requests completion at
+    /// (0, 0) — the "no other context" position `get_completion_context`
+    /// resolves to `CompletionContext::Unknown`. Returns the raw response
+    /// items so callers can assert on `label` and `kind`.
+    async fn completion_items(
+        service: &mut LspService<RockyLsp>,
+        root: &std::path::Path,
+        file_name: &str,
+    ) -> Vec<serde_json::Value> {
+        use tower::Service as _;
+        use tower::ServiceExt as _;
+        use tower_lsp::jsonrpc::Request;
+
+        let path = root.join(file_name);
+        std::fs::write(&path, "").unwrap();
+        let uri = Url::from_file_path(&path).unwrap();
+        // The server keys completion behavior off the URI extension, not
+        // `languageId` — but an editor sends the language that matches the
+        // file it opened, so the fixture should too.
+        let language_id = if file_name.ends_with(".rocky") {
+            "rocky"
+        } else {
+            "sql"
+        };
+
+        let did_open = Request::build("textDocument/didOpen")
+            .params(serde_json::json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": language_id,
+                    "version": 1,
+                    "text": "",
+                }
+            }))
+            .finish();
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(did_open)
+            .await
+            .expect("didOpen is a notification");
+
+        let completion = Request::build("textDocument/completion")
+            .id(2)
+            .params(serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 0, "character": 0 },
+            }))
+            .finish();
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(completion)
+            .await
+            .expect("completion answers")
+            .expect("completion is a request, not a notification");
+        let result = response.result().cloned().unwrap_or_else(|| {
+            panic!("completion request failed: {:?}", response.error());
+        });
+        serde_json::from_value(result).expect("completion result is an item array")
+    }
+
+    /// `label` values from [`completion_items`], for the common "is this
+    /// keyword offered" assertions.
+    async fn completion_labels(
+        service: &mut LspService<RockyLsp>,
+        root: &std::path::Path,
+        file_name: &str,
+    ) -> Vec<String> {
+        completion_items(service, root, file_name)
+            .await
+            .into_iter()
+            .filter_map(|item| {
+                item.get("label")
+                    .and_then(|l| l.as_str())
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// `.rocky` files get all ten pipeline step keywords, each with
+    /// `kind: KEYWORD`, in the fallback completion context. `.sql` files —
+    /// served by this same LSP, since `editors/vscode/src/lspClient.ts`
+    /// registers both languages — must not, since `derive`/`take`/etc.
+    /// aren't legal SQL. `COUNT` (a `SQL_FUNCTIONS` entry) staying present
+    /// in both proves the new branch is additive, not a replacement.
+    #[tokio::test]
+    async fn completion_offers_step_keywords_only_in_rocky_files() {
+        use tower::Service as _;
+        use tower::ServiceExt as _;
+        use tower_lsp::jsonrpc::Request;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let (mut service, _socket) = LspService::new(|client| RockyLsp {
+            client,
+            compile_result: Arc::new(RwLock::new(None)),
+            models_dir: Arc::new(RwLock::new(None)),
+            documents: Arc::new(RwLock::new(HashMap::new())),
+            recompile_pending: Arc::new(AtomicBool::new(false)),
+            init_done: Arc::new(AtomicBool::new(false)),
+            init_notify: Arc::new(Notify::new()),
+            semantic_tokens_cache: Arc::new(RwLock::new(HashMap::new())),
+            schema_cache_throttle: SchemaCacheThrottle::new(),
+            config_diagnostic_published: Arc::new(AtomicBool::new(false)),
+            salsa_db: Arc::new(Mutex::new(RockyDatabase::default())),
+            salsa_sources: Arc::new(RwLock::new(HashMap::new())),
+        });
+
+        let root_uri = Url::from_directory_path(root).unwrap();
+        let initialize = Request::build("initialize")
+            .id(1)
+            .params(serde_json::json!({ "capabilities": {}, "rootUri": root_uri }))
+            .finish();
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(initialize)
+            .await
+            .expect("initialize answers");
+        let initialized = Request::build("initialized")
+            .params(serde_json::json!({}))
+            .finish();
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(initialized)
+            .await
+            .expect("initialized is a notification");
+
+        let rocky_items = completion_items(&mut service, root, "pipeline.rocky").await;
+        let rocky_labels: Vec<String> = rocky_items
+            .iter()
+            .filter_map(|item| item.get("label").and_then(|l| l.as_str()))
+            .map(str::to_string)
+            .collect();
+        for &keyword in ROCKY_STEP_KEYWORDS {
+            assert!(
+                rocky_labels.contains(&keyword.to_string()),
+                "expected {keyword} among .rocky completions, got {rocky_labels:?}"
+            );
+        }
+        assert!(
+            rocky_labels.contains(&"COUNT".to_string()),
+            "existing SQL_FUNCTIONS completions must be unaffected: {rocky_labels:?}"
+        );
+        // `CompletionItemKind::KEYWORD` is wire value 14 (lsp-types).
+        let derive_kind = rocky_items
+            .iter()
+            .find(|item| item.get("label").and_then(|l| l.as_str()) == Some("derive"))
+            .and_then(|item| item.get("kind").and_then(serde_json::Value::as_i64))
+            .expect("derive completion item has a kind");
+        assert_eq!(
+            derive_kind, 14,
+            "pipeline step keywords must be kind KEYWORD"
+        );
+
+        let sql_labels = completion_labels(&mut service, root, "pipeline.sql").await;
+        for &keyword in ROCKY_STEP_KEYWORDS {
+            assert!(
+                !sql_labels.contains(&keyword.to_string()),
+                "{keyword} must not be offered in a .sql file: {sql_labels:?}"
+            );
+        }
+        assert!(
+            sql_labels.contains(&"COUNT".to_string()),
+            "SQL completions must still work in .sql files: {sql_labels:?}"
+        );
     }
 
     // ── Formatting tests ───────────────────────────────────────────────

@@ -621,13 +621,16 @@ fn wrap_filter(
             validation::reject_statement_terminator(&context, f)?;
             // The filter is spliced into the same CTAS as the predicate, so it
             // reaches exactly as far. Guarding only `expression` would close
-            // one door and leave an identical one beside it.
+            // one door and leave an identical one beside it. `Filter` shares
+            // `SinglePredicate`'s rules exactly; it is a separate mode only
+            // so a refusal names the right field, not "an expression check"
+            // (#1971).
             let sql_dialect = rocky_sql::check_expression::dialect_for(dialect.name());
             rocky_sql::check_expression::validate_check_expression(
                 &context,
                 f,
                 sql_dialect.as_ref(),
-                ExpressionUse::SinglePredicate,
+                ExpressionUse::Filter,
             )?;
             Ok(format!(
                 "(CASE WHEN ({f}) THEN ({base_pred}) ELSE TRUE END)"
@@ -2138,6 +2141,28 @@ mod unit_tests {
         let msg = err.to_string();
         assert!(msg.contains("my_udf"), "must name the function: {msg}");
         assert!(msg.contains("`filter`"), "must name the field: {msg}");
+    }
+
+    /// A refused quarantine `filter` is described as a filter, not "an
+    /// expression check" — the noun used to come from the evaluation mode
+    /// (`SinglePredicate`), which the quarantine `expression` shares, rather
+    /// than the field kind (#1971).
+    #[test]
+    fn quarantine_filter_is_described_as_a_filter() {
+        let cfg = split_config();
+        let assertions = vec![assertion_with_filter(
+            TestType::NotNull,
+            Some("customer_id"),
+            Some("amount >"),
+        )];
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("A filter is one boolean expression over the row's columns"),
+            "{msg}"
+        );
+        assert!(!msg.contains("An expression check"), "{msg}");
     }
 
     /// The control: an ordinary filter still compiles.

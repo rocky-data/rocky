@@ -73,6 +73,28 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
         out.push(config_error_diagnostic(&err, config_path));
     }
 
+    // V002: a document with no `[adapter*]` and no `[pipeline.*]` at all has
+    // nothing for `rocky run`/`plan`/`discover` to act on — every one of
+    // them would exit having done nothing, silently. V010/V020 below already
+    // warn about each half separately (useful when only one is missing);
+    // this is the stronger, additional signal for the fully-empty case, and
+    // an error rather than a warning because there is no config here to run
+    // at all, not just a suboptimal one. Numbered right after V001 (the
+    // parse-success/failure code) since this is the next top-level check
+    // before any per-adapter or per-pipeline validation begins.
+    if cfg.adapters.is_empty() && cfg.pipelines.is_empty() {
+        out.push(ValidateMessage {
+            severity: "error".into(),
+            code: "V002".into(),
+            message: "rocky.toml defines no [adapter] and no [pipeline] — nothing to validate. \
+                      Add at least one [adapter.<name>] and [pipeline.<name>], or point --config \
+                      at a project that has them."
+                .into(),
+            file: Some(config_path.display().to_string()),
+            field: None,
+        });
+    }
+
     // Validate adapters
     if cfg.adapters.is_empty() {
         out.push(ValidateMessage {
@@ -279,7 +301,14 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
     };
 
     // --- Lint rules ---
-    lint_config(&cfg, &loaded_models, &mut out);
+    // Re-parses the file into the raw (normalized-shorthand, un-defaulted)
+    // document so L004/L006 can tell "the file sets this key" from "the
+    // struct defaulted it" — see `parse_rocky_config_raw`. `.ok()`: if this
+    // second parse somehow fails when the first one (above) just succeeded,
+    // the presence-gated lints simply stay silent rather than error the
+    // whole validate run over a lint.
+    let raw_doc = rocky_core::config::parse_rocky_config_raw(config_path).ok();
+    lint_config(&cfg, raw_doc.as_ref(), &loaded_models, &mut out);
 
     // --- Product specs (V050–V053) ---
     validate_products(config_path, &mut out);
@@ -1005,7 +1034,8 @@ fn validate_replication_pipeline(
     let mut ok = true;
 
     // Validate schema pattern
-    match pipeline.schema_pattern() {
+    let pattern_result = pipeline.schema_pattern();
+    match &pattern_result {
         Ok(_) => msgs.push(ValidateMessage {
             severity: "ok".into(),
             code: "V021".into(),
@@ -1021,6 +1051,88 @@ fn validate_replication_pipeline(
                 message: format!("pipeline.{name}: schema pattern error: {e}"),
                 file: None,
                 field: Some(format!("pipeline.{name}.source.schema_pattern")),
+            });
+        }
+    }
+
+    // V049: every `{placeholder}` in catalog_template / schema_template must
+    // name a component `schema_pattern.components` actually binds.
+    // `render_placeholders` (what `resolve_template` uses at run time) passes
+    // an unknown placeholder through UNCHANGED rather than rejecting it, so
+    // without this check `catalog_template = "{nope}"` reports `valid: true`
+    // and the run fails with an invalid-identifier error on the literal,
+    // unresolved text "{nope}" — `validate_identifier` rejects `{`/`}`, so
+    // the catalog is never created or written to (#2005).
+    if let Ok(pattern) = &pattern_result {
+        let known: Vec<&str> = pattern
+            .components
+            .iter()
+            .filter_map(|c| match c {
+                rocky_core::schema::PatternComponent::Fixed(_) => None,
+                rocky_core::schema::PatternComponent::Variable { name }
+                | rocky_core::schema::PatternComponent::VariableLength { name }
+                | rocky_core::schema::PatternComponent::Terminal { name } => Some(name.as_str()),
+            })
+            .collect();
+
+        for (field, template) in [
+            (
+                "catalog_template",
+                pipeline.target.catalog_template.as_str(),
+            ),
+            ("schema_template", pipeline.target.schema_template.as_str()),
+        ] {
+            let mut reported = std::collections::HashSet::new();
+            for placeholder in rocky_core::schema::template_placeholder_names(template) {
+                if !known.contains(&placeholder.as_str()) && reported.insert(placeholder.clone()) {
+                    ok = false;
+                    msgs.push(ValidateMessage {
+                        severity: "error".into(),
+                        code: "V049".into(),
+                        message: format!(
+                            "pipeline.{name}: target.{field} references unknown placeholder \
+                             '{{{placeholder}}}' — known components from \
+                             source.schema_pattern.components: {}",
+                            if known.is_empty() {
+                                "(none)".to_string()
+                            } else {
+                                known.join(", ")
+                            }
+                        ),
+                        file: None,
+                        field: Some(format!("pipeline.{name}.target.{field}")),
+                    });
+                }
+            }
+        }
+    }
+
+    // V056 (#2152 review): a `{placeholder}` with no closing `}` — e.g.
+    // `catalog_template = "{source"` — is silently copied through as
+    // literal text by the same scanner V049 relies on
+    // (`template_placeholder_names` reports NO name for it), so a typo'd
+    // brace otherwise reads as "no placeholder at all" rather than the
+    // malformed template it is. Runs regardless of whether the schema
+    // pattern itself parsed, since this is a purely textual check on the
+    // template strings.
+    for (field, template) in [
+        (
+            "catalog_template",
+            pipeline.target.catalog_template.as_str(),
+        ),
+        ("schema_template", pipeline.target.schema_template.as_str()),
+    ] {
+        if rocky_core::schema::has_unclosed_placeholder_brace(template) {
+            msgs.push(ValidateMessage {
+                severity: "warn".into(),
+                code: "V056".into(),
+                message: format!(
+                    "pipeline.{name}: target.{field} = '{template}' has an unmatched '{{' — a \
+                     placeholder must be closed with '}}', e.g. '{{name}}'. The stray brace is \
+                     treated as literal text at run time."
+                ),
+                file: None,
+                field: Some(format!("pipeline.{name}.target.{field}")),
             });
         }
     }
@@ -1068,6 +1180,54 @@ fn validate_replication_pipeline(
         });
     }
 
+    // V054: a DuckDB discovery adapter with no `path` runs discovery against
+    // an in-memory database — it finds nothing, silently (the discover step
+    // just returns empty). `AdapterConfig::path`'s own doc comment already
+    // says a persistent path is required when the adapter also serves as a
+    // discovery source; nothing enforced it (#2005). A warning, not an
+    // error: a compile-only project (a POC whose `run.sh` calls `validate`
+    // but never `run`, so discovery never actually executes) legitimately
+    // has no reason to set `path`, and an error here would break every such
+    // project's script and CI for a discovery that never happens. Only
+    // checked when the discovery adapter resolved (V024 above already
+    // reports an unknown one — no need to double-report).
+    //
+    // An absent `path` key AND an explicit `path = ":memory:"` (or `""`)
+    // are the same case: `catalog_name_for_path` treats both as DuckDB's
+    // own in-memory special case, so this check must too — otherwise an
+    // adapter that spells out `:memory:` explicitly would silently escape
+    // the warning that an equivalent unset `path` correctly triggers.
+    if let Some(ref disc) = pipeline.source.discovery
+        && let Some(disc_adapter) = cfg.adapters.get(&disc.adapter)
+        && disc_adapter.adapter_type == "duckdb"
+        && disc_adapter
+            .path
+            .as_deref()
+            .is_none_or(|p| p.is_empty() || p == ":memory:")
+    {
+        msgs.push(ValidateMessage {
+            severity: "warn".into(),
+            code: "V054".into(),
+            message: format!(
+                "pipeline.{name}: discovery adapter '{}' is a DuckDB adapter with no `path` — \
+                 discovery runs against an in-memory database and silently finds nothing. Set \
+                 `path` on [adapter.{}] to a persistent file.",
+                disc.adapter, disc.adapter
+            ),
+            file: None,
+            field: Some(format!("adapter.{}.path", disc.adapter)),
+        });
+    }
+
+    // V055: for a DuckDB target WITH a `path`, a literal (no placeholder)
+    // catalog_template that disagrees with the catalog name DuckDB actually
+    // assigns the file is a warning — `rocky run` fails with "Catalog Error:
+    // Catalog with name '<template>' does not exist!" (#2005). A warning,
+    // not an error: DuckDB itself doesn't reject the config, only the run.
+    if let Some(msg) = duckdb_catalog_template_mismatch(name, pipeline, cfg) {
+        msgs.push(msg);
+    }
+
     msgs.push(ValidateMessage {
         severity: "ok".into(),
         code: "V020".into(),
@@ -1080,6 +1240,62 @@ fn validate_replication_pipeline(
     });
 
     (ok, msgs)
+}
+
+/// Warns when a DuckDB target adapter has a persistent `path` AND
+/// `target.catalog_template` is a literal (no `{placeholder}`) that
+/// disagrees with the catalog name DuckDB will actually assign that file.
+///
+/// Only checked for a literal template — one containing a `{placeholder}`
+/// resolves to something this function can't predict without the runtime
+/// schema-pattern values, and V049 above already validates the placeholder
+/// itself.
+///
+/// Gated on the `duckdb` Cargo feature (default-on) because the derivation
+/// this compares against lives in `rocky-duckdb`, itself an optional
+/// dependency of this crate — see `#[cfg(feature = "duckdb")]` elsewhere in
+/// this file (e.g. `archive.rs`, `compile.rs`) for the same convention.
+#[cfg(feature = "duckdb")]
+fn duckdb_catalog_template_mismatch(
+    name: &str,
+    pipeline: &rocky_core::config::ReplicationPipelineConfig,
+    cfg: &rocky_core::config::RockyConfig,
+) -> Option<ValidateMessage> {
+    let target_adapter = cfg.adapters.get(&pipeline.target.adapter)?;
+    if target_adapter.adapter_type != "duckdb" {
+        return None;
+    }
+    let path = target_adapter.path.as_ref()?;
+    if !rocky_core::schema::template_placeholder_names(&pipeline.target.catalog_template).is_empty()
+    {
+        return None;
+    }
+    let expected = rocky_duckdb::dialect::catalog_name_for_path(path);
+    if pipeline.target.catalog_template == expected {
+        return None;
+    }
+    Some(ValidateMessage {
+        severity: "warn".into(),
+        code: "V055".into(),
+        message: format!(
+            "pipeline.{name}: target.catalog_template = '{}' but DuckDB names the catalog \
+             '{expected}' for adapter.{}'s path '{path}' (the file's base name, or \
+             '<name>_db' when that name collides with a reserved catalog) — `rocky run` will \
+             fail with a catalog-not-found error unless target.catalog_template matches.",
+            pipeline.target.catalog_template, pipeline.target.adapter
+        ),
+        file: None,
+        field: Some(format!("pipeline.{name}.target.catalog_template")),
+    })
+}
+
+#[cfg(not(feature = "duckdb"))]
+fn duckdb_catalog_template_mismatch(
+    _name: &str,
+    _pipeline: &rocky_core::config::ReplicationPipelineConfig,
+    _cfg: &rocky_core::config::RockyConfig,
+) -> Option<ValidateMessage> {
+    None
 }
 
 fn validate_transformation_pipeline(
@@ -1424,13 +1640,24 @@ fn validate_pipeline_dag(cfg: &rocky_core::config::RockyConfig, out: &mut Valida
 /// to simplify the configuration.
 fn lint_config(
     cfg: &rocky_core::config::RockyConfig,
+    raw: Option<&toml::Value>,
     models: &[rocky_core::models::Model],
     out: &mut ValidateOutput,
 ) {
     use std::collections::HashMap;
 
-    // L004: [state] backend="local" is the default
-    if cfg.state.backend == rocky_core::config::StateBackend::Local {
+    // L004: [state] backend="local" is the default. Only fires when the KEY
+    // is actually present in the document — a config that never writes
+    // [state] at all defaults to the exact same value, and telling the
+    // author to omit a key they already omitted is not a lint, it's noise
+    // (#2005). `raw` is `None` only if re-parsing the raw document failed,
+    // which should not happen given the structured parse already succeeded;
+    // treated as "can't tell", so the lint stays silent rather than guess.
+    let state_backend_present = raw
+        .and_then(|v| v.get("state"))
+        .and_then(|v| v.get("backend"))
+        .is_some();
+    if cfg.state.backend == rocky_core::config::StateBackend::Local && state_backend_present {
         out.push(ValidateMessage {
             severity: "lint".into(),
             code: "L004".into(),
@@ -1443,8 +1670,23 @@ fn lint_config(
     // Per-pipeline lint rules (dispatch by pipeline type)
     for (name, pc) in &cfg.pipelines {
         if let Some(pipeline) = pc.as_replication() {
-            // L006: auto_create_catalogs/schemas = false is the default
-            if !pipeline.target.governance.auto_create_catalogs {
+            // Both `[pipeline.<name>]` and `[pipelines.<name>]` spellings are
+            // accepted (RockyConfig's `alias`); the bare `[pipeline]`
+            // shorthand is already normalized to `pipeline.default` by
+            // `parse_rocky_config_raw`, so a plain name lookup covers all
+            // three shapes with cfg.pipelines' own keys.
+            let raw_governance = raw
+                .and_then(|v| v.get("pipeline").or_else(|| v.get("pipelines")))
+                .and_then(|v| v.get(name))
+                .and_then(|v| v.get("target"))
+                .and_then(|v| v.get("governance"));
+            let key_present = |key: &str| raw_governance.and_then(|g| g.get(key)).is_some();
+
+            // L006: auto_create_catalogs/schemas = false is the default —
+            // only when the document actually sets the key.
+            if !pipeline.target.governance.auto_create_catalogs
+                && key_present("auto_create_catalogs")
+            {
                 out.push(ValidateMessage {
                     severity: "lint".into(),
                     code: "L006".into(),
@@ -1453,7 +1695,8 @@ fn lint_config(
                     field: Some(format!("pipeline.{name}.target.governance.auto_create_catalogs")),
                 });
             }
-            if !pipeline.target.governance.auto_create_schemas {
+            if !pipeline.target.governance.auto_create_schemas && key_present("auto_create_schemas")
+            {
                 out.push(ValidateMessage {
                     severity: "lint".into(),
                     code: "L006".into(),
@@ -2405,6 +2648,167 @@ schema_template = "demo"
         );
     }
 
+    /// #2005 case 5: a DuckDB adapter with no `path` used as a pipeline's
+    /// discovery adapter runs discovery against an in-memory database and
+    /// silently finds nothing. A single-adapter project auto-wires
+    /// discovery to that one adapter even when `[source.discovery]` is
+    /// never written, so this is the common case, not an edge case.
+    ///
+    /// A warning, not an error (decided after the example sweep found 26
+    /// POCs whose `run.sh` calls `validate` but never `run` — a
+    /// compile-only project's discovery never actually executes, so it has
+    /// no reason to set `path`, and refusing would break all 26 scripts and
+    /// their CI for a discovery that never happens).
+    #[test]
+    fn test_duckdb_discovery_adapter_without_path_is_v054_warning() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "poc"
+schema_template = "demo"
+"#,
+        );
+        assert!(
+            out.valid,
+            "a pathless DuckDB discovery adapter is a warning, not an error: {:?}",
+            out.messages
+        );
+        let v054: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V054" && m.severity == "warn")
+            .collect();
+        assert_eq!(v054.len(), 1, "expected one V054: {:?}", out.messages);
+        assert_eq!(v054[0].field.as_deref(), Some("adapter.local.path"));
+    }
+
+    /// Counter-check: the same shape with `path` set must not fire V054.
+    #[test]
+    fn test_duckdb_discovery_adapter_with_path_is_not_v054() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = "warehouse.duckdb"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "warehouse"
+schema_template = "demo"
+"#,
+        );
+        assert!(
+            !out.messages.iter().any(|m| m.code == "V054"),
+            "a DuckDB discovery adapter with path must not trigger V054: {:?}",
+            out.messages
+        );
+    }
+
+    /// #2152 review: `path = ":memory:"` is DuckDB's own explicit spelling
+    /// of the in-memory case — the same thing an absent `path` means. V054
+    /// must fire for it exactly as it does for a fully absent `path`,
+    /// rather than being read as "a path is set" and escaping the warning.
+    #[test]
+    fn test_duckdb_discovery_adapter_with_explicit_memory_path_is_v054() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "memory"
+schema_template = "demo"
+"#,
+        );
+        let v054: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V054" && m.severity == "warn")
+            .collect();
+        assert_eq!(
+            v054.len(),
+            1,
+            "explicit path = ':memory:' must trigger V054 like an absent path: {:?}",
+            out.messages
+        );
+    }
+
+    /// #2152 review: `path = ":memory:"` with the CORRECT `catalog_template
+    /// = "memory"` must NOT trigger V055 — before the `catalog_name_for_path`
+    /// fix, the file-stem derivation treated `:memory:`'s base name as a
+    /// literal `":memory:"` catalog, so this exact correct config produced a
+    /// false mismatch warning naming `':memory:'` as the expected catalog.
+    #[test]
+    fn test_duckdb_target_memory_path_with_matching_template_is_not_v055() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "memory"
+schema_template = "demo"
+"#,
+        );
+        assert!(
+            !out.messages.iter().any(|m| m.code == "V055"),
+            "catalog_template = 'memory' must match path = ':memory:', no V055: {:?}",
+            out.messages
+        );
+    }
+
     #[test]
     fn test_multiple_kind_issues_all_surface() {
         // Two unrelated kind issues in the same file — both should
@@ -2445,6 +2849,7 @@ token = "t"
             r#"
 [adapter.local]
 type = "duckdb"
+path = "poc.duckdb"
 
 [pipeline.poc]
 type = "replication"
@@ -2565,6 +2970,7 @@ threshold = 1
             r#"
 [adapter.local]
 type = "duckdb"
+path = "poc.duckdb"
 
 [pipeline.poc]
 type = "replication"
@@ -2595,11 +3001,33 @@ schema_template = "demo"
         assert!(v035[0].message.contains("full_refresh"));
     }
 
+    /// An empty document is refused with V002 (#2005) — it used to report
+    /// `valid: true` with nothing but the two "no adapters"/"no pipelines"
+    /// warnings, which `rocky run`/`plan`/`discover` would all also accept
+    /// and then silently do nothing.
     #[test]
     fn test_empty_config() {
         let out = validate_toml("");
-        // Should warn about no adapters and no pipelines
-        assert!(out.valid); // warnings don't set valid=false
+        assert!(
+            !out.valid,
+            "an empty document must refuse: {:?}",
+            out.messages
+        );
+        let v002: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V002" && m.severity == "error")
+            .collect();
+        assert_eq!(
+            v002.len(),
+            1,
+            "expected exactly one V002 error: {:?}",
+            out.messages
+        );
+        assert!(v002[0].message.contains("[adapter]"));
+        assert!(v002[0].message.contains("[pipeline]"));
+        // V010/V020 still fire too — V002 is additive, not a replacement for
+        // the per-section warnings (useful when only one half is missing).
         let warns: Vec<_> = out
             .messages
             .iter()
@@ -2607,7 +3035,45 @@ schema_template = "demo"
             .collect();
         assert!(
             warns.len() >= 2,
-            "expected warnings for no adapters/pipelines"
+            "expected V010/V020 warnings alongside V002: {:?}",
+            out.messages
+        );
+    }
+
+    /// Counter-check: V002 must NOT fire once the document has both an
+    /// adapter and a pipeline — it is specifically the fully-empty case.
+    #[test]
+    fn test_v002_absent_on_populated_config() {
+        let out = validate_toml(MINIMAL_CONFIG);
+        assert!(
+            !out.messages.iter().any(|m| m.code == "V002"),
+            "V002 must not fire on a populated config: {:?}",
+            out.messages
+        );
+    }
+
+    /// Counter-check: a document with an adapter but no pipeline (or vice
+    /// versa) is the existing V010/V020-only case, not V002 — only the
+    /// fully-empty document is the new error.
+    #[test]
+    fn test_v002_absent_when_only_one_half_is_empty() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+"#,
+        );
+        assert!(
+            !out.messages.iter().any(|m| m.code == "V002"),
+            "V002 must not fire when adapters are present: {:?}",
+            out.messages
+        );
+        assert!(
+            out.messages
+                .iter()
+                .any(|m| m.code == "V020" && m.severity == "warn"),
+            "V020 must still fire for the missing pipelines: {:?}",
+            out.messages
         );
     }
 
@@ -2708,6 +3174,329 @@ schema_template = "demo"
             .filter(|m| m.code == "V021" && m.severity == "error")
             .collect();
         assert_eq!(schema_errors.len(), 1);
+    }
+
+    /// #2005 case 2: `catalog_template = "{nope}"` names a placeholder the
+    /// pipeline's `schema_pattern.components` never binds. Previously
+    /// `valid: true` — the run then fails with an invalid-identifier error
+    /// on the literal, unresolved `{nope}` (`validate_identifier` rejects
+    /// `{`/`}`, so it is refused before any write).
+    #[test]
+    fn test_unknown_catalog_template_placeholder_is_v049() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = "warehouse.duckdb"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "{nope}"
+schema_template = "demo"
+"#,
+        );
+        assert!(
+            !out.valid,
+            "unknown placeholder must refuse: {:?}",
+            out.messages
+        );
+        let v049: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V049" && m.severity == "error")
+            .collect();
+        assert_eq!(v049.len(), 1, "expected one V049: {:?}", out.messages);
+        assert!(v049[0].message.contains("{nope}"));
+        assert!(v049[0].message.contains("source"));
+        assert_eq!(
+            v049[0].field.as_deref(),
+            Some("pipeline.poc.target.catalog_template")
+        );
+    }
+
+    /// Counter-check: a placeholder that names a real component (including
+    /// one used in BOTH templates) is not an error.
+    #[test]
+    fn test_known_template_placeholder_is_not_v049() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = "warehouse.duckdb"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["tenant", "source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "{tenant}_warehouse"
+schema_template = "staging__{source}"
+"#,
+        );
+        assert!(
+            !out.messages.iter().any(|m| m.code == "V049"),
+            "known placeholders must not trigger V049: {:?}",
+            out.messages
+        );
+    }
+
+    /// #2152 review: an unclosed `{` (`"{source"`, no closing `}`) is
+    /// invisible to V049 — `render_placeholders` never recognizes it as a
+    /// placeholder at all, so `template_placeholder_names` reports no name
+    /// for it. V056 catches the stray brace directly.
+    #[test]
+    fn test_unclosed_placeholder_brace_is_v056_warning() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = "warehouse.duckdb"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "{source"
+schema_template = "demo"
+"#,
+        );
+        assert!(
+            out.valid,
+            "an unclosed brace is a warning, not an error: {:?}",
+            out.messages
+        );
+        let v056: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V056" && m.severity == "warn")
+            .collect();
+        assert_eq!(v056.len(), 1, "expected one V056: {:?}", out.messages);
+        assert_eq!(
+            v056[0].field.as_deref(),
+            Some("pipeline.poc.target.catalog_template")
+        );
+    }
+
+    /// Counter-check: a well-formed placeholder (closed brace) must not
+    /// trigger V056, whether or not its name is a known component.
+    #[test]
+    fn test_closed_placeholder_brace_is_not_v056() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = "warehouse.duckdb"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "{source}"
+schema_template = "demo"
+"#,
+        );
+        assert!(
+            !out.messages.iter().any(|m| m.code == "V056"),
+            "a closed brace must not trigger V056: {:?}",
+            out.messages
+        );
+    }
+
+    /// #2005 case 4: a literal `catalog_template` that disagrees with the
+    /// catalog name DuckDB actually assigns the target file is a warning —
+    /// `rocky run` fails with "Catalog with name '<template>' does not
+    /// exist!" once it tries to write there.
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn test_duckdb_catalog_template_mismatch_is_v055_warning() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = "warehouse.duckdb"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "other"
+schema_template = "demo"
+"#,
+        );
+        assert!(
+            out.valid,
+            "a catalog_template mismatch is a warning, not an error"
+        );
+        let v055: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V055" && m.severity == "warn")
+            .collect();
+        assert_eq!(v055.len(), 1, "expected one V055: {:?}", out.messages);
+        assert!(v055[0].message.contains("'other'"));
+        assert!(v055[0].message.contains("'warehouse'"));
+        assert_eq!(
+            v055[0].field.as_deref(),
+            Some("pipeline.poc.target.catalog_template")
+        );
+    }
+
+    /// Pins the DuckDB-specific "main" -> "main_db" reserved-catalog
+    /// derivation (the exact example in #2005) — not just "some" mismatch.
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn test_duckdb_catalog_template_main_reserved_name_is_v055() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = "main.duckdb"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "main"
+schema_template = "demo"
+"#,
+        );
+        let v055: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V055" && m.severity == "warn")
+            .collect();
+        assert_eq!(v055.len(), 1, "expected one V055: {:?}", out.messages);
+        assert!(
+            v055[0].message.contains("'main_db'"),
+            "must name the actual DuckDB catalog name, main_db: {}",
+            v055[0].message
+        );
+    }
+
+    /// Counter-check: a `catalog_template` that already matches the
+    /// DuckDB-derived name must not warn.
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn test_duckdb_catalog_template_match_is_not_v055() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = "warehouse.duckdb"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "warehouse"
+schema_template = "demo"
+"#,
+        );
+        assert!(
+            !out.messages.iter().any(|m| m.code == "V055"),
+            "a matching catalog_template must not warn: {:?}",
+            out.messages
+        );
+    }
+
+    /// Counter-check: a `catalog_template` with a placeholder is never
+    /// literal, so it must never trigger V055 regardless of what it would
+    /// resolve to — V049 above validates the placeholder itself.
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn test_duckdb_catalog_template_with_placeholder_is_not_v055() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = "warehouse.duckdb"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "{source}"
+schema_template = "demo"
+"#,
+        );
+        assert!(
+            !out.messages.iter().any(|m| m.code == "V055"),
+            "a templated catalog_template must not warn: {:?}",
+            out.messages
+        );
     }
 
     #[test]
@@ -3116,7 +3905,7 @@ target.adapter = "default"
         let cfg = rocky_core::config::load_rocky_config(f.path()).unwrap();
 
         let mut out = ValidateOutput::default();
-        lint_config(&cfg, std::slice::from_ref(&model), &mut out);
+        lint_config(&cfg, None, std::slice::from_ref(&model), &mut out);
 
         let l002: Vec<_> = out.messages.iter().filter(|m| m.code == "L002").collect();
         assert!(
@@ -3178,7 +3967,7 @@ target.adapter = "default"
         let cfg = rocky_core::config::load_rocky_config(f.path()).unwrap();
 
         let mut out = ValidateOutput::default();
-        lint_config(&cfg, std::slice::from_ref(&model), &mut out);
+        lint_config(&cfg, None, std::slice::from_ref(&model), &mut out);
 
         let l002: Vec<_> = out.messages.iter().filter(|m| m.code == "L002").collect();
         assert_eq!(
@@ -3195,6 +3984,7 @@ target.adapter = "default"
             r#"
 [adapter.local]
 type = "duckdb"
+path = "poc.duckdb"
 
 [pipeline.poc]
 type = "replication"
@@ -3242,6 +4032,96 @@ backend = "local"
         assert!(
             lint_codes.contains(&"L007"),
             "expected L007 (adapter repetition)"
+        );
+    }
+
+    /// #2005: L004 and L006 must fire only when the document actually
+    /// WRITES the key they're about — this config sets neither `[state]`
+    /// nor `auto_create_catalogs`/`auto_create_schemas`, so both are
+    /// silently defaulted, not something the author wrote and could omit.
+    /// Before the fix, both lints fired here anyway (reading the
+    /// post-default struct, which can't tell "written" from "defaulted").
+    #[test]
+    fn test_l004_l006_do_not_fire_when_the_keys_are_absent() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "poc"
+schema_template = "demo"
+"#,
+        );
+        let lint_codes: Vec<&str> = out
+            .messages
+            .iter()
+            .filter(|m| m.severity == "lint")
+            .map(|m| m.code.as_str())
+            .collect();
+        assert!(
+            !lint_codes.contains(&"L004"),
+            "L004 must not fire when [state] is absent: {:?}",
+            out.messages
+        );
+        assert!(
+            !lint_codes.contains(&"L006"),
+            "L006 must not fire when auto_create_catalogs/schemas are absent: {:?}",
+            out.messages
+        );
+    }
+
+    /// Counter-check pinned separately from `test_lint_fires_on_typical_poc`:
+    /// a config using the `[pipelines.<name>]` PLURAL spelling (a supported
+    /// alias) must resolve the raw-presence lookup the same way as the
+    /// singular `[pipeline.<name>]` spelling.
+    #[test]
+    fn test_l006_still_fires_with_plural_pipelines_spelling() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipelines.poc]
+type = "replication"
+
+[pipelines.poc.source]
+adapter = "local"
+
+[pipelines.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipelines.poc.target]
+adapter = "local"
+catalog_template = "poc"
+schema_template = "demo"
+
+[pipelines.poc.target.governance]
+auto_create_catalogs = false
+"#,
+        );
+        let l006: Vec<_> = out.messages.iter().filter(|m| m.code == "L006").collect();
+        assert_eq!(
+            l006.len(),
+            1,
+            "expected exactly one L006 (auto_create_catalogs only): {:?}",
+            out.messages
         );
     }
 

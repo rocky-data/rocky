@@ -416,7 +416,7 @@ See [Data quality checks](/concepts/data-quality-checks/) for what each one mean
 | `fail_on_error` | bool | `true` | When `false`, downgrades every `error`-severity assertion to a non-fatal result. |
 | `row_count` | bool | `false` | Compare row counts between source and target. |
 | `column_match` | bool | `false` | Verify source and target have the same column sets. |
-| `freshness` | table | | `{ threshold_seconds = N }`. The `overrides` map parses and validates, but nothing reads it: every table is checked against the single `threshold_seconds` ([#1620](https://github.com/rocky-data/rocky/issues/1620)). |
+| `freshness` | table | | `{ threshold_seconds = N }`. Every table is checked against the single `threshold_seconds`. There is no per-schema override. |
 | `null_rate` | table | | `{ columns = [...], threshold = 0.0–1.0, sample_percent = 10 }`. |
 | `custom` | list | `[]` | Custom SQL checks. Each entry has `name`, `sql`, and optional `threshold`. |
 | `anomaly_threshold_pct` | float | `50.0` | Row count deviation percentage that triggers an anomaly. Set to 0 (or a negative value) to disable detection. Must be a finite number: `nan` and `inf` are refused when the config loads. |
@@ -1197,15 +1197,12 @@ This block is separate from the [`[pipeline.NAME.checks]`](#pipelinenamechecks) 
 This block is gone. A config that still declares it fails to load, and the error says what to delete.
 
 ```
-the `[schema_evolution]` section was removed because nothing ever read it: drift
-detection never reported a column that disappeared from the source, so Rocky never
-dropped one and `grace_period_days` never took effect. Delete the
-`[schema_evolution]` section from this config; removing it changes no behaviour.
+the `[schema_evolution]` section was removed because nothing ever read it: drift detection never reported a column that disappeared from the source, so Rocky never dropped one and `grace_period_days` never took effect. Delete the `[schema_evolution]` section from this config; removing it changes no behaviour. A source-side column removal alone never schedules a DROP COLUMN, and there is no opt-in for that; a full refresh or a drift-driven table recreation can still discard a target-only column. See https://github.com/rocky-data/rocky/issues/1616.
 ```
 
 **What to do:** delete the section. Nothing about your pipeline changes. Rocky never dropped a column on the strength of that key, so there is no behaviour to replace.
 
-Grace-period column drops are tracked as their own feature. The detector, the `ALTER TABLE ... DROP COLUMN` generator, and the state-store record all exist; only the call site is missing. It will come back behind an explicit opt-in, because dropping a column is destructive and must not be a default.
+A source-side column removal alone never schedules `ALTER TABLE ... DROP COLUMN`. The detector and generator for that exist in the engine. So does a state table for tracking a grace period. Nothing calls either function, and nothing writes a record to the table. There is no opt-in for that today. A full refresh or a drift-driven table recreation can still discard a target-only column. Both rebuild the table from only the source's current columns.
 
 See [Schema drift](/concepts/schema-drift/) for the changes Rocky does detect and act on.
 
