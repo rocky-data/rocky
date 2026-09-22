@@ -61,7 +61,22 @@ export function ModelNode({ data, selected }: NodeProps<ModelFlowNode>) {
     <div
       className={`flex items-center gap-2 rounded-md border border-l-4 bg-white px-2.5 py-2 text-xs shadow-xs dark:bg-zinc-900 ${kindClass(data.kind)} ${
         openable ? "cursor-pointer" : "cursor-default"
-      } ${selected ? "border-sky-500" : "border-zinc-200 dark:border-zinc-700"}`}
+      } ${
+        // `border-{color}` and `dark:border-{color}` set the CSS `border-color`
+        // shorthand, which — whichever of it and `kindClass`'s `border-l-*`
+        // compiles later in Tailwind's stylesheet — resets `border-left-color`
+        // too, so the unselected card's neutral border silently ate the kind
+        // accent it was drawn next to (confirmed by inspecting the built CSS:
+        // `dark:border-zinc-700` compiles after every `border-l-{kind}-500`
+        // rule, so every card showed the same grey border-left in dark mode,
+        // whatever its kind). The neutral border is now three directional
+        // utilities, none of which touch the left side, so only `kindClass`
+        // ever sets it. Selected still uses the shorthand on purpose — the
+        // whole border, kind accent included, turns sky-500 to mark selection.
+        selected
+          ? "border-sky-500"
+          : "border-t-zinc-200 border-r-zinc-200 border-b-zinc-200 dark:border-t-zinc-700 dark:border-r-zinc-700 dark:border-b-zinc-700"
+      }`}
       // Both, not just the width. `layout.ts` declares this size to React
       // Flow, and `position()` spaces rows by it. Measured with the card left
       // to size itself: the wrapper was 184×46 and the card inside it 184×34,
