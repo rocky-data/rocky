@@ -1601,18 +1601,55 @@ impl ProjectFreshnessConfig {
     }
 }
 
-/// Freshness check configuration with optional per-schema overrides.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+/// Freshness check configuration.
+///
+/// A single scalar `threshold_seconds` applies to every checked table.
+/// There used to be an `overrides` key for per-schema thresholds; it parsed
+/// and validated but nothing on the check path ever read it, so it is now
+/// refused with a message naming the remedy (#1620).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FreshnessConfig {
     pub threshold_seconds: u64,
-    /// Per-schema freshness overrides. Key is a schema pattern (e.g., "raw__us_west__shopify"),
-    /// value overrides threshold_seconds for matching schemas.
-    #[serde(default)]
-    pub overrides: std::collections::HashMap<String, u64>,
     /// Severity reported when freshness lag exceeds the threshold.
     #[serde(default)]
     pub severity: crate::tests::TestSeverity,
+}
+
+/// Message returned when a config still declares the removed
+/// `[checks.freshness] overrides` key.
+///
+/// Says what was removed, why it never did anything, and what to do about
+/// it. Kept as a constant so the parse test asserts the exact text a user
+/// sees.
+pub const FRESHNESS_OVERRIDES_REMOVED: &str = "the `overrides` key under `[checks.freshness]` was removed because nothing ever read it: \
+     the freshness check only ever applied the single `threshold_seconds` scalar, and no \
+     per-schema lookup existed on the check path. Delete `overrides` from this `[checks.freshness]` \
+     block; removing it changes no behaviour. Whether a per-schema override should key on the \
+     target or the source schema was never decided, so the key stops parsing instead of promising \
+     a contract; re-add it once that question is answered. See \
+     https://github.com/rocky-data/rocky/issues/1620";
+
+impl<'de> Deserialize<'de> for FreshnessConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            threshold_seconds: u64,
+            #[serde(default)]
+            overrides: Option<serde::de::IgnoredAny>,
+            #[serde(default)]
+            severity: crate::tests::TestSeverity,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.overrides.is_some() {
+            return Err(serde::de::Error::custom(FRESHNESS_OVERRIDES_REMOVED));
+        }
+        Ok(FreshnessConfig {
+            threshold_seconds: raw.threshold_seconds,
+            severity: raw.severity,
+        })
+    }
 }
 
 /// Null rate check configuration: columns to check, threshold, and sample size.
@@ -7112,9 +7149,10 @@ pub struct LoadedConfig {
 /// Uses [`std::hash::DefaultHasher`] (SipHash with fixed keys), so the value
 /// is deterministic across processes for the same bytes — intra-release
 /// stable, not cross-release stable. Deliberately hashes the RAW bytes, never
-/// a serde serialization of the parsed config: `FreshnessConfig::overrides`
-/// is a `std::collections::HashMap` reachable from [`RockyConfig`], so a
-/// serialized form would have nondeterministic ordering across processes.
+/// a serde serialization of the parsed config: nothing in [`RockyConfig`]
+/// promises every field will avoid an unordered collection like
+/// `std::collections::HashMap`, whose iteration order a serialized form
+/// would expose as nondeterministic ordering across processes.
 ///
 /// This is the single hashing implementation behind both the CLI's
 /// path-based `config_fingerprint` (rocky-cli `output.rs`) and
@@ -8014,11 +8052,11 @@ mod tests {
     }
 
     /// WP-01 PR-B: `load_rocky_config_fingerprinted` is deterministic across
-    /// repeated loads — including for a config whose `FreshnessConfig::
-    /// overrides` `HashMap` carries multiple keys. The fingerprint hashes the
-    /// RAW file bytes (never a serde serialization), so `HashMap` iteration
-    /// order cannot leak into the value. A serialization-based fingerprint
-    /// would flake this test across processes/seeds.
+    /// repeated loads. The fingerprint hashes the RAW file bytes, never a
+    /// serde serialization of the parsed config, so it is independent of any
+    /// collection field's iteration order — a serialization-based
+    /// fingerprint would flake across processes/seeds the moment such a
+    /// field existed.
     #[test]
     fn fingerprinted_load_is_deterministic_across_repeated_loads() {
         let dir = tempfile::tempdir().unwrap();
@@ -8042,11 +8080,6 @@ enabled = true
 
 [pipeline.silver.checks.freshness]
 threshold_seconds = 3600
-
-[pipeline.silver.checks.freshness.overrides]
-"raw__us_west__shopify" = 7200
-"raw__eu__stripe" = 1800
-"raw__apac__ads" = 900
 "#,
         )
         .unwrap();
@@ -8060,10 +8093,8 @@ threshold_seconds = 3600
                 .freshness
                 .as_ref()
                 .unwrap()
-                .overrides
-                .len(),
-            3,
-            "the overrides HashMap must actually carry multiple keys"
+                .threshold_seconds,
+            3600
         );
         assert_eq!(
             first.fingerprint,
@@ -8661,6 +8692,172 @@ database = ":memory:"
         )
         .expect("a config without [schema_evolution] must still parse");
         assert!(cfg.schema_evolution.is_none());
+    }
+
+    /// A config that still declares `[checks.freshness] overrides` is
+    /// refused, and the message says what to delete and where the
+    /// unresolved question is tracked (N2 of #1620).
+    ///
+    /// The key parsed and validated before this change while nothing on the
+    /// check path ever read it. Swapping one silence for another (an
+    /// anonymous `unknown field` error) would repeat the defect, so the
+    /// removal carries its own remedy.
+    #[test]
+    fn removed_freshness_overrides_key_is_refused_with_the_remedy() {
+        let err = toml::from_str::<RockyConfig>(
+            r#"
+[adapter.wh]
+type = "duckdb"
+database = ":memory:"
+
+[pipeline.silver]
+type = "transformation"
+models = "models/**"
+
+[pipeline.silver.target]
+adapter = "wh"
+
+[pipeline.silver.checks]
+enabled = true
+
+[pipeline.silver.checks.freshness]
+threshold_seconds = 3600
+
+[pipeline.silver.checks.freshness.overrides]
+"raw__us_west__shopify" = 7200
+"#,
+        )
+        .expect_err("[checks.freshness] overrides must be refused, not ignored");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`overrides` key under `[checks.freshness]` was removed"),
+            "message must name the removed key, got: {msg}"
+        );
+        assert!(
+            msg.contains("Delete `overrides`"),
+            "message must name the remedy, got: {msg}"
+        );
+        assert!(
+            msg.contains("issues/1620"),
+            "message must point at the tracking issue, got: {msg}"
+        );
+    }
+
+    /// The remedy text survives the loader every executing path actually
+    /// calls — `load_rocky_config`, not `toml::from_str` directly. That
+    /// loader wraps a parse failure in `ConfigError::ParseToml`, whose
+    /// `Display` renders the inner `toml::de::Error`; this pins that the
+    /// wrap does not truncate or reformat away the remedy.
+    #[test]
+    fn removed_freshness_overrides_key_is_refused_with_the_remedy_through_the_real_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &path,
+            r#"
+[adapter.wh]
+type = "duckdb"
+database = ":memory:"
+
+[pipeline.silver]
+type = "transformation"
+models = "models/**"
+
+[pipeline.silver.target]
+adapter = "wh"
+
+[pipeline.silver.checks]
+enabled = true
+
+[pipeline.silver.checks.freshness]
+threshold_seconds = 3600
+
+[pipeline.silver.checks.freshness.overrides]
+"raw__us_west__shopify" = 7200
+"#,
+        )
+        .unwrap();
+
+        let err = load_rocky_config(&path)
+            .expect_err("[checks.freshness] overrides must be refused, not ignored");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`overrides` key under `[checks.freshness]` was removed"),
+            "message must name the removed key, got: {msg}"
+        );
+        assert!(
+            msg.contains("Delete `overrides`"),
+            "message must name the remedy, got: {msg}"
+        );
+        assert!(
+            msg.contains("issues/1620"),
+            "message must point at the tracking issue, got: {msg}"
+        );
+    }
+
+    /// An empty `overrides` table is refused too — the refusal is on the
+    /// key, not on any entry inside it.
+    #[test]
+    fn removed_freshness_overrides_key_is_refused_even_when_empty() {
+        let err = toml::from_str::<RockyConfig>(
+            r#"
+[adapter.wh]
+type = "duckdb"
+database = ":memory:"
+
+[pipeline.silver]
+type = "transformation"
+models = "models/**"
+
+[pipeline.silver.target]
+adapter = "wh"
+
+[pipeline.silver.checks]
+enabled = true
+
+[pipeline.silver.checks.freshness]
+threshold_seconds = 3600
+
+[pipeline.silver.checks.freshness.overrides]
+"#,
+        )
+        .expect_err("an empty overrides table must be refused");
+        assert!(err.to_string().contains("was removed"), "got: {err}");
+    }
+
+    /// A config that declares `[checks.freshness]` with only
+    /// `threshold_seconds` (no `overrides`) still loads.
+    #[test]
+    fn freshness_without_overrides_still_parses() {
+        let cfg = toml::from_str::<RockyConfig>(
+            r#"
+[adapter.wh]
+type = "duckdb"
+database = ":memory:"
+
+[pipeline.silver]
+type = "transformation"
+models = "models/**"
+
+[pipeline.silver.target]
+adapter = "wh"
+
+[pipeline.silver.checks]
+enabled = true
+
+[pipeline.silver.checks.freshness]
+threshold_seconds = 3600
+"#,
+        )
+        .expect("a config without overrides must still parse");
+        let freshness = cfg.pipelines["silver"]
+            .as_transformation()
+            .expect("transformation pipeline")
+            .checks
+            .freshness
+            .as_ref()
+            .expect("freshness block");
+        assert_eq!(freshness.threshold_seconds, 3600);
     }
 
     #[test]

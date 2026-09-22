@@ -47,8 +47,9 @@ class SourceInfo(BaseModel):
 class FreshnessConfig(BaseModel):
     """Freshness check configuration projected from ``rocky.toml`` ``[checks.freshness]``.
 
-    Per-schema overrides are intentionally not exposed yet — the Rocky-side
-    output omits them until the override-key semantics are nailed down.
+    Just the scalar threshold: ``[checks.freshness]`` has no per-schema
+    ``overrides`` key. One existed and parsed but nothing on the check path
+    ever read it, so it was removed rather than exposed here (#1620).
     """
 
     threshold_seconds: int
