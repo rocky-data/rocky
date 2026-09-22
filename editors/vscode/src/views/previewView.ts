@@ -29,6 +29,11 @@ export interface ActivePreview {
   lastDiffSummary?: {
     models_with_changes: number;
     models_unchanged: number;
+    /** Models whose row-count delta could not be computed on either side
+     *  (`PreviewDiffSummary.models_unknown`). Counted separately from
+     *  `models_unchanged` — folding the two together would silently drop
+     *  these models from both counts. */
+    models_unknown: number;
     total_rows_added: number;
     total_rows_removed: number;
     total_rows_changed: number;
@@ -225,8 +230,13 @@ export class PreviewDiffModelNode extends vscode.TreeItem {
     if (algo.kind === "sampled") {
       const s = algo.sampled;
       const parts: string[] = [];
-      if (s.rows_added > 0) parts.push(`+${s.rows_added}`);
-      if (s.rows_removed > 0) parts.push(`-${s.rows_removed}`);
+      // `rows_added`/`rows_removed` are `number | null | undefined` — `null`
+      // means the row count was unmeasured on one side (#2032), not zero.
+      // An explicit `!= null` guard (rather than `?? 0`) keeps the two
+      // states apart: an unmeasured delta is omitted here, never shown as
+      // "+0"/"-0" (a real no-op) or as a `NaN`/`null` comparison failure.
+      if (s.rows_added != null && s.rows_added > 0) parts.push(`+${s.rows_added}`);
+      if (s.rows_removed != null && s.rows_removed > 0) parts.push(`-${s.rows_removed}`);
       if (s.rows_changed > 0) parts.push(`~${s.rows_changed}`);
       return parts.join("/");
     }
@@ -429,6 +439,7 @@ export class PreviewTreeProvider
       patch.lastDiffSummary = {
         models_with_changes: diff.summary.models_with_changes,
         models_unchanged: diff.summary.models_unchanged,
+        models_unknown: diff.summary.models_unknown,
         total_rows_added: diff.summary.total_rows_added,
         total_rows_removed: diff.summary.total_rows_removed,
         total_rows_changed: diff.summary.total_rows_changed,
@@ -459,8 +470,10 @@ function buildBranchTooltip(preview: ActivePreview): string {
   }
   const diff = preview.lastDiffSummary;
   if (diff) {
+    const unknownSuffix =
+      diff.models_unknown > 0 ? `, ${diff.models_unknown} unknown` : "";
     lines.push(
-      `Diff: ${diff.models_with_changes} changed, ${diff.models_unchanged} unchanged`,
+      `Diff: ${diff.models_with_changes} changed, ${diff.models_unchanged} unchanged${unknownSuffix}`,
     );
     lines.push(
       `Rows: +${diff.total_rows_added} / -${diff.total_rows_removed} / ~${diff.total_rows_changed}`,
@@ -549,7 +562,7 @@ function formatModelDiffMarkdown(model: PreviewModelDiff): string {
     if (algo.kind === "sampled") {
       const s = algo.sampled;
       lines.push(
-        `Rows added: ${s.rows_added} · Removed: ${s.rows_removed} · Changed: ${s.rows_changed}`,
+        `Rows added: ${fmtRowCount(s.rows_added)} · Removed: ${fmtRowCount(s.rows_removed)} · Changed: ${s.rows_changed}`,
       );
       if (algo.sampling_window.coverage_warning) {
         lines.push("");
@@ -573,7 +586,7 @@ function formatModelDiffMarkdown(model: PreviewModelDiff): string {
     } else if (algo.kind === "bisection") {
       const d = algo.diff;
       lines.push(
-        `Rows added: ${d.rows_added} · Removed: ${d.rows_removed} · Changed: ${d.rows_changed}`,
+        `Rows added: ${fmtRowCount(d.rows_added)} · Removed: ${fmtRowCount(d.rows_removed)} · Changed: ${d.rows_changed}`,
       );
       if (algo.bisection_stats.depth_capped) {
         lines.push("");
@@ -585,6 +598,18 @@ function formatModelDiffMarkdown(model: PreviewModelDiff): string {
   }
 
   return lines.join("\n");
+}
+
+/**
+ * Render a row count for the diff markdown: `?` for `null`/`undefined`
+ * (unmeasured on one side — see `PreviewSampledRowDiff.rows_added`), the
+ * number otherwise. Mirrors the engine's `fmt_rows` (`preview.rs`) so both
+ * surfaces use the same marker. Interpolating a nullable count directly
+ * into a template string prints the literal text "null" — the exact
+ * false-clean this field exists to prevent (#2032).
+ */
+function fmtRowCount(v: number | null | undefined): string {
+  return v == null ? "?" : `${v}`;
 }
 
 function formatDuration(ms: number): string {

@@ -163,7 +163,10 @@ function makeCostOutput(branchName: string): PreviewCostOutput {
   };
 }
 
-function makeDiffOutput(branchName: string): PreviewDiffOutput {
+function makeDiffOutput(
+  branchName: string,
+  modelsUnknown = 0,
+): PreviewDiffOutput {
   return {
     base_ref: "main",
     branch_name: branchName,
@@ -198,6 +201,7 @@ function makeDiffOutput(branchName: string): PreviewDiffOutput {
       any_coverage_warning: false,
       models_with_changes: 1,
       models_unchanged: 0,
+      models_unknown: modelsUnknown,
       total_rows_added: 5,
       total_rows_changed: 2,
       total_rows_removed: 0,
@@ -302,6 +306,7 @@ describe("PreviewTreeProvider", () => {
       lastDiffSummary: {
         models_with_changes: 1,
         models_unchanged: 0,
+        models_unknown: 0,
         total_rows_added: 5,
         total_rows_removed: 0,
         total_rows_changed: 2,
@@ -313,6 +318,43 @@ describe("PreviewTreeProvider", () => {
     const node = roots[0] as PreviewBranchNode;
     expect(node.description).toContain("Δ$");
     expect(node.description).toContain("1 model");
+  });
+
+  it("PreviewBranchNode tooltip shows an unknown count when models_unknown is non-zero", () => {
+    const preview: ActivePreview = {
+      branchName: "pr",
+      createdAt: "2026-05-14T00:00:00Z",
+      lastDiffSummary: {
+        models_with_changes: 1,
+        models_unchanged: 2,
+        models_unknown: 3,
+        total_rows_added: 5,
+        total_rows_removed: 0,
+        total_rows_changed: 0,
+        any_coverage_warning: false,
+      },
+    };
+    const node = new PreviewBranchNode(preview);
+    expect(node.tooltip).toContain("Diff: 1 changed, 2 unchanged, 3 unknown");
+  });
+
+  it("PreviewBranchNode tooltip omits the unknown clause when models_unknown is zero", () => {
+    const preview: ActivePreview = {
+      branchName: "pr",
+      createdAt: "2026-05-14T00:00:00Z",
+      lastDiffSummary: {
+        models_with_changes: 1,
+        models_unchanged: 2,
+        models_unknown: 0,
+        total_rows_added: 5,
+        total_rows_removed: 0,
+        total_rows_changed: 0,
+        any_coverage_warning: false,
+      },
+    };
+    const node = new PreviewBranchNode(preview);
+    expect(node.tooltip).toContain("Diff: 1 changed, 2 unchanged");
+    expect(node.tooltip).not.toContain("unknown");
   });
 
   it("branch node children are Cost / Diff / Models Changed categories", async () => {
@@ -399,6 +441,46 @@ describe("PreviewTreeProvider", () => {
     expect((diffChildren[0] as PreviewDiffModelNode).diffStatus).toBe("added");
   });
 
+  it("per-model diff markdown shows an explicit unknown marker, never the string 'null', for an unmeasured row count", async () => {
+    const mgr = new PreviewStateManager(makeMemento());
+    await mgr.add({
+      branchName: "pr",
+      createdAt: "t",
+      perModelDiff: [
+        {
+          model_name: "orders",
+          structural: { added_columns: [], removed_columns: [], type_changes: [] },
+          algorithm: {
+            kind: "sampled",
+            sampled: {
+              // Unmeasured on one side (#2032) — must never render as the
+              // literal string "null" or as a fabricated "0".
+              rows_added: null,
+              rows_changed: 1,
+              rows_removed: 5,
+              samples: [],
+            },
+            sampling_window: {
+              coverage: "not_yet_sampled",
+              coverage_warning: true,
+              limit: 0,
+              ordered_by: "",
+            },
+          },
+        },
+      ],
+    });
+    const provider = new PreviewTreeProvider(mgr);
+    const roots = await provider.getChildren();
+    const branchNode = roots[0] as PreviewBranchNode;
+    const cats = await provider.getChildren(branchNode);
+    const diffCat = cats[1] as PreviewCategoryNode;
+    const [node] = (await provider.getChildren(diffCat)) as PreviewDiffModelNode[];
+    expect(node.markdownPayload).not.toContain("Rows added: null");
+    expect(node.markdownPayload).toContain("Rows added: ?");
+    expect(node.markdownPayload).toContain("Removed: 5");
+  });
+
   it("refresh fires onDidChangeTreeData", async () => {
     const mgr = new PreviewStateManager(makeMemento());
     const provider = new PreviewTreeProvider(mgr);
@@ -424,8 +506,26 @@ describe("PreviewTreeProvider", () => {
     const updated = mgr.getAll()[0];
     expect(updated.lastCostSummary?.delta_usd).toBe(0.002);
     expect(updated.lastDiffSummary?.models_with_changes).toBe(1);
+    // `models_unknown` must be carried through, not silently dropped
+    // (drain review of #2158, finding 2).
+    expect(updated.lastDiffSummary?.models_unknown).toBe(0);
     expect(updated.perModelCost).toHaveLength(1);
     expect(updated.perModelDiff).toHaveLength(1);
+  });
+
+  it("fetchBranch carries a non-zero models_unknown through to lastDiffSummary", async () => {
+    const mgr = new PreviewStateManager(makeMemento());
+    await mgr.add({ branchName: "pr", createdAt: "t" });
+    const provider = new PreviewTreeProvider(mgr);
+
+    mockRunRockyJson
+      .mockResolvedValueOnce(makeCostOutput("pr"))
+      .mockResolvedValueOnce(makeDiffOutput("pr", 2));
+
+    await provider.fetchBranch("pr");
+
+    const updated = mgr.getAll()[0];
+    expect(updated.lastDiffSummary?.models_unknown).toBe(2);
   });
 
   it("fetchAllBranches handles a failure on one branch gracefully", async () => {
