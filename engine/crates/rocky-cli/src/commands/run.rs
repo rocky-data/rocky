@@ -7145,7 +7145,7 @@ async fn run_batched_checks(
                             });
                         }
                         (Some(rows), Some(cell)) => {
-                            match cell.as_str().and_then(parse_freshness_timestamp) {
+                            match cell.as_str().and_then(parse_timestamp_cell) {
                                 Some(ts) => fresh_results.push(BatchFreshnessResult {
                                     table: br.clone(),
                                     max_timestamp: Some(ts),
@@ -7938,10 +7938,15 @@ async fn run_batched_checks(
     Ok(())
 }
 
-/// Reads a `MAX(timestamp_column)` cell the way the per-table freshness
-/// fallback always has: RFC 3339 first, then the `YYYY-MM-DD HH:MM:SS[.fff]`
-/// shape most warehouses render a timestamp in.
-fn parse_freshness_timestamp(s: &str) -> Option<DateTime<Utc>> {
+/// Reads a `MAX(timestamp_column)` cell: RFC 3339 first, then the
+/// `YYYY-MM-DD HH:MM:SS[.fff]` shape most warehouses render a timestamp in.
+/// Both directives accept a fractional-second suffix of any width, so a
+/// sub-second timestamp round-trips unchanged rather than being clamped to
+/// whole seconds. Shared by the per-table freshness fallback and
+/// [`query_target_max_timestamp`] (the incremental-replication watermark
+/// read) — see #2004: the two read the same column, and a watermark that
+/// loses the fraction re-copies the newest source rows on the next run.
+fn parse_timestamp_cell(s: &str) -> Option<DateTime<Utc>> {
     s.parse::<DateTime<Utc>>().ok().or_else(|| {
         chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
             .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
@@ -13670,21 +13675,12 @@ async fn query_target_max_timestamp(
             target.full_name()
         )
     })?;
-    let parsed = raw
-        .parse::<chrono::DateTime<Utc>>()
-        .ok()
-        .or_else(|| {
-            chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
-                .or_else(|_| chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S"))
-                .ok()
-                .map(|naive| naive.and_utc())
-        })
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "could not parse target-side watermark for {}: {raw}",
-                target.full_name()
-            )
-        })?;
+    let parsed = parse_timestamp_cell(raw).ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not parse target-side watermark for {}: {raw}",
+            target.full_name()
+        )
+    })?;
     Ok(Some(parsed))
 }
 
@@ -24229,6 +24225,137 @@ timestamp_column = "ts"
             got,
             vec![1, 2, 3],
             "the appended row (id=3) must not be skipped"
+        );
+    }
+
+    /// #2004: the shared cell parser (`parse_timestamp_cell`, used by both
+    /// the incremental-watermark read and the freshness-check fallback)
+    /// must keep a fractional second it receives, and must still accept a
+    /// whole-second value — state files written before this fix used
+    /// `WatermarkState.last_value` at whole-second precision, and those
+    /// still need to load.
+    #[test]
+    fn parse_timestamp_cell_round_trips_fractional_seconds() {
+        use chrono::Timelike;
+
+        let with_fraction = super::parse_timestamp_cell("2026-09-15T10:00:00.250Z")
+            .expect("RFC 3339 with a fractional second must parse");
+        assert_eq!(
+            with_fraction.nanosecond(),
+            250_000_000,
+            "the fractional second must round-trip unchanged, got {with_fraction:?}"
+        );
+
+        let whole_second = super::parse_timestamp_cell("2026-09-15T10:00:00Z")
+            .expect("RFC 3339 with no fractional second must still parse");
+        assert_eq!(whole_second.nanosecond(), 0);
+    }
+
+    /// #2004 repro: a source row stamped with a fractional second
+    /// (`10:00:00.250`, the shape every warehouse's `now()` produces) must
+    /// not be re-copied on the next incremental run. DuckDB's own
+    /// `Value::Timestamp` handling (`rocky-duckdb/src/lib.rs`) used to
+    /// integer-divide the raw tick count down to whole seconds and hand
+    /// `MAX(_loaded_at)` back to `resolve_new_watermark` /
+    /// `query_target_max_timestamp` already clamped to `:00` — one row
+    /// short of what it needs to exclude itself on the next run. This
+    /// drives the real SQL adapter + dialect + `resolve_new_watermark`
+    /// path across two consecutive incremental runs, the way the runner
+    /// does, and checks `row_count` the way the pipeline does.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn incremental_fractional_second_watermark_excludes_itself_on_next_run() {
+        use chrono::Timelike;
+        use rocky_core::traits::{SqlDialect, WarehouseAdapter};
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+        use rocky_ir::{MaterializationStrategy, TableRef};
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for ddl in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.t (id INTEGER, _loaded_at TIMESTAMP)",
+            "CREATE TABLE tgt.t (id INTEGER, _loaded_at TIMESTAMP)",
+            // The one row from the issue's repro: a fractional-second stamp.
+            "INSERT INTO src.t VALUES (1, TIMESTAMP '2026-09-15 10:00:00.250')",
+        ] {
+            adapter.execute_statement(ddl).await.unwrap();
+        }
+
+        let dialect = DuckDbSqlDialect;
+        let strategy = MaterializationStrategy::Incremental {
+            timestamp_column: "_loaded_at".to_string(),
+        };
+        let target = TableRef {
+            catalog: String::new(),
+            schema: "tgt".into(),
+            table: "t".into(),
+        };
+        let now = chrono::Utc::now();
+
+        // ── Run 1 ────────────────────────────────────────────────────────
+        let where1 = dialect.watermark_where("_loaded_at", None).unwrap();
+        adapter
+            .execute_statement(&format!("INSERT INTO tgt.t SELECT * FROM src.t {where1}"))
+            .await
+            .unwrap();
+        let wm1 = super::resolve_new_watermark(
+            &strategy,
+            &adapter as &dyn WarehouseAdapter,
+            &dialect as &dyn SqlDialect,
+            &target,
+            "_loaded_at",
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+        // The fix under test: the recorded watermark must keep the row's
+        // fractional second, not clamp it to `:00`.
+        assert_eq!(
+            wm1.nanosecond(),
+            250_000_000,
+            "watermark must carry the source row's fractional second, got {wm1:?}"
+        );
+
+        // ── Run 2 ────────────────────────────────────────────────────────
+        // Nothing changed in the source. `_loaded_at > wm1` must exclude the
+        // very row wm1 was read from — a strict `>` against an unrounded
+        // watermark does that; a watermark rounded down to `:00` does not.
+        let where2 = dialect.watermark_where("_loaded_at", Some(&wm1)).unwrap();
+        adapter
+            .execute_statement(&format!("INSERT INTO tgt.t SELECT * FROM src.t {where2}"))
+            .await
+            .unwrap();
+
+        let read_count = |cell: &serde_json::Value| -> u64 {
+            cell.as_u64()
+                .or_else(|| cell.as_str().and_then(|s| s.parse::<u64>().ok()))
+                .unwrap()
+        };
+        let source_count = read_count(
+            &adapter
+                .execute_query("SELECT COUNT(*) FROM src.t")
+                .await
+                .unwrap()
+                .rows[0][0],
+        );
+        let target_count = read_count(
+            &adapter
+                .execute_query("SELECT COUNT(*) FROM tgt.t")
+                .await
+                .unwrap()
+                .rows[0][0],
+        );
+        assert_eq!(
+            target_count, 1,
+            "run 2 re-copied the fractional-second row instead of excluding it"
+        );
+        let row_count_check = rocky_core::checks::check_row_count(source_count, target_count);
+        assert!(
+            row_count_check.passed,
+            "row_count must pass on an untouched source: {row_count_check:?}"
         );
     }
 

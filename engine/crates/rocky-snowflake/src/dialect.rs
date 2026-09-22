@@ -631,6 +631,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_watermark_where_with_fractional_prior_keeps_the_fraction() {
+        use chrono::TimeZone;
+        let d = dialect();
+        let prior = chrono::Utc.with_ymd_and_hms(2026, 9, 15, 10, 0, 0).unwrap()
+            + chrono::Duration::milliseconds(250);
+        let sql = d.watermark_where("_loaded_at", Some(&prior)).unwrap();
+        // #2004: a fractional-second watermark must render its fraction, or
+        // the row it was read from re-passes the next run's `>` filter.
+        assert_eq!(
+            sql,
+            "WHERE \"_loaded_at\" > '2026-09-15 10:00:00.250'::TIMESTAMP_NTZ"
+        );
+    }
+
     /// #1594: `value` is spliced raw into the CAST alongside `name` and
     /// `data_type`. The IR boundary (`rocky_ir::MetadataColumn::new`) refuses
     /// this input, so `new_unchecked` is the only way to build it — which is
