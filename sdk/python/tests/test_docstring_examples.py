@@ -16,13 +16,14 @@ from __future__ import annotations
 import ast
 import json
 import textwrap
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
 import pytest
 
-from rocky_sdk import RockyClient
+from rocky_sdk import RockyClient, RockyCommandError
 
 DOCUMENTED_METHODS = (
     "apply",
@@ -36,6 +37,14 @@ DOCUMENTED_METHODS = (
     "product_list",
     "product_journal",
 )
+
+# The four core methods, executed exactly as before (#1387): one fixture each,
+# no output assertion. The six `product_*` methods are NOT run this way: see
+# `PRODUCT_CASES` below, which drives each documented branch separately and
+# asserts on stdout, per the #2108 red-team finding that a single un-asserted
+# execution does not catch a renamed field once it feeds an optional attribute
+# or an untaken branch.
+CORE_METHODS = ("apply", "discover", "plan", "run")
 
 # Minimal but SCHEMA-VALID engine payloads. Every required field is present —
 # a fixture that fails validation would make these tests fail for a reason
@@ -90,109 +99,12 @@ RUN_PAYLOAD: dict[str, Any] = {
     "errors": [{"asset_key": ["raw", "orders"], "error": "boom", "failure_kind": "query"}],
 }
 
-PRODUCT_VERIFY_PAYLOAD: dict[str, Any] = {
-    "version": "1",
-    "command": "product verify",
-    "product_id": "product:orders_mart",
-    "spec_digest": "sha256:aa",
-    # `needs_input` exercises the example's `paste_block` branch.
-    "status": "needs_input",
-    "paste_block": '[policy]\nagent_apply = "deny"',
-    "reason": "classification tag unresolved",
-    "output_model": "orders_mart",
-}
-
-PRODUCT_COMPILE_PAYLOAD: dict[str, Any] = {
-    "version": "1",
-    "command": "product compile",
-    "product_id": "product:orders_mart",
-    "spec_digest": "sha256:aa",
-    "spec_path": "products/orders_mart.toml",
-    "output_model": "orders_mart",
-    "phase": "lowered_contract",
-    "manifest_path": "products/.rocky/orders_mart.manifest.json",
-    "artifacts": [{"path": "products/orders_mart.sql", "sha256": "sha256:bb"}],
-    # `False` exercises the example's supersession-warning branch.
-    "spec_matches_approval": False,
-}
-
-PRODUCT_APPROVE_PAYLOAD: dict[str, Any] = {
-    "version": "1",
-    "command": "product approve",
-    "product_id": "product:orders_mart",
-    "spec_digest": "sha256:aa",
-    "output_model": "orders_mart",
-    # `False` exercises the example's fresh-approval branch.
-    "already_approved": False,
-    "approved_at": "2026-09-22T00:00:00Z",
-    "approver": "hugo",
-    "snapshot_path": "products/.rocky/orders_mart.snapshot.json",
-    "state": "spec_approved",
-}
-
-PRODUCT_STATUS_PAYLOAD: dict[str, Any] = {
-    "version": "1",
-    "command": "product status",
-    "product": "orders_mart",
-    "spec_present": True,
-    "staging_journal_present": False,
-    "journal_rows": 3,
-    "artifact_problems": [],
-    "committed_phase": "lowered_contract",
-}
-
-PRODUCT_LIST_PAYLOAD: dict[str, Any] = {
-    "version": "1",
-    "command": "product list",
-    "count": 1,
-    "products": [
-        {
-            "name": "orders_mart",
-            "spec_present": True,
-            "staging_journal_present": False,
-            "journal_rows": 3,
-            "artifact_problems": 0,
-            "committed_phase": "lowered_contract",
-            "fulfill_state": "spec_approved",
-        }
-    ],
-}
-
-PRODUCT_JOURNAL_PAYLOAD: dict[str, Any] = {
-    "version": "1",
-    "command": "product journal",
-    "product": "orders_mart",
-    "product_id": "product:orders_mart",
-    "count": 1,
-    # A non-empty journal exercises the `for row in result.rows` branch.
-    # The example's `except RockyCommandError as exc` branch reads
-    # `exc.stderr_tail`, checked separately since this fixture returns a
-    # successful payload instead of raising.
-    "rows": [
-        {
-            "seq": 0,
-            "event": "spec approved",
-            "to_state": "spec_approved",
-            "at": "2026-09-22T00:00:00Z",
-        }
-    ],
-}
-
 # `rocky apply` of a run-shaped plan prints a RunOutput, so it reuses the payload.
-# `product <verb>` payloads are keyed by method name (`_payload_key` maps the
-# `["product", "<verb>", ...]` argv to it) since `args[0]` alone is `"product"`
-# for all six.
 PAYLOADS = {
     "discover": DISCOVER_PAYLOAD,
     "plan": PLAN_PAYLOAD,
     "run": RUN_PAYLOAD,
     "apply": RUN_PAYLOAD,
-    "product_verify": PRODUCT_VERIFY_PAYLOAD,
-    "product_compile": PRODUCT_COMPILE_PAYLOAD,
-    "product_approve": PRODUCT_APPROVE_PAYLOAD,
-    "product_status": PRODUCT_STATUS_PAYLOAD,
-    "product_list": PRODUCT_LIST_PAYLOAD,
-    "product_journal": PRODUCT_JOURNAL_PAYLOAD,
 }
 
 # Snippets that continue an earlier one (no `RockyClient(...)` of their own)
@@ -251,22 +163,8 @@ def _snippets(doc: str) -> list[str]:
     return [s for s in out if s.strip()]
 
 
-def _payload_key(args: list[str]) -> str:
-    """Map CLI argv to its ``PAYLOADS`` key.
-
-    ``args[0]`` alone (``"discover"``, ``"plan"``, ``"run"``, ``"apply"``) is
-    enough for the four core commands. ``rocky product <verb>`` needs the
-    subverb too, since ``args[0]`` is just ``"product"`` for all six. The key
-    becomes the method name, e.g. ``["product", "verify", "orders_mart"]`` ->
-    ``"product_verify"``.
-    """
-    if args[0] == "product":
-        return f"product_{args[1]}"
-    return args[0]
-
-
 def _fake_run_cli(self: RockyClient, args: list[str], **_kwargs: Any) -> str:
-    return json.dumps(PAYLOADS[_payload_key(args)])
+    return json.dumps(PAYLOADS[args[0]])
 
 
 @pytest.mark.parametrize("method", DOCUMENTED_METHODS)
@@ -282,7 +180,7 @@ def test_core_method_has_a_runnable_example(method: str) -> None:
     assert _snippets(doc), f"{method}'s Example: block has no extractable code"
 
 
-@pytest.mark.parametrize("method", DOCUMENTED_METHODS)
+@pytest.mark.parametrize("method", CORE_METHODS)
 def test_docstring_examples_execute_against_real_models(method: str) -> None:
     """Run each snippet with IO stubbed — a wrong field name fails here.
 
@@ -301,3 +199,275 @@ def test_docstring_examples_execute_against_real_models(method: str) -> None:
             if "RockyClient(" not in code:
                 exec(PRELUDE.get(method, ""), namespace)  # noqa: S102 - trusted docstring
             exec(code, namespace)  # noqa: S102 - trusted docstring
+
+
+# --------------------------------------------------------------------------- #
+# product_* branch cases (#2108 red-team fix)                                 #
+# --------------------------------------------------------------------------- #
+#
+# The single-fixture-per-method approach above caught a wrong field name only
+# when the executed branch's own attribute access raised. It missed two real
+# classes of bug, both found by an independent review of #2108:
+#
+# 1. An optional field is required to drive a branch (`paste_block`,
+#    `spec_matches_approval`, `spec_error`). Renaming that key in the fixture
+#    does not raise: pydantic silently defaults the model's field to `None`,
+#    so the branch that reads it either prints "None" or is silently
+#    skipped. Nothing failed, but nothing was proven either.
+# 2. `product_journal`'s `except RockyCommandError as exc: ... exc.stderr_tail`
+#    was never exercised at all: every fixture returned a successful payload,
+#    so the `except` block's body, the very thing added to fix the previous
+#    red-team finding, never ran, and a typo there (`stderr_tail` ->
+#    `stderr_tial`) passed clean.
+#
+# Each case below drives one specific branch and asserts the printed output
+# contains (or, for the untaken branch, omits) the exact value that branch's
+# fixture supplied, so a renamed or misspelled field fails a stdout assertion
+# instead of silently not being exercised.
+
+
+class _Raises:
+    """Sentinel: the mocked ``run_cli`` should raise this instead of returning JSON."""
+
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+
+
+PRODUCT_VERIFY_PASS: dict[str, Any] = {
+    "version": "1",
+    "command": "product verify",
+    "product_id": "product:orders_mart",
+    "spec_digest": "sha256:cafefeed",
+    "status": "pass",
+    "reason": "posture verified",
+    "output_model": "orders_mart",
+}
+
+PRODUCT_VERIFY_NEEDS_INPUT: dict[str, Any] = {
+    "version": "1",
+    "command": "product verify",
+    "product_id": "product:orders_mart",
+    "spec_digest": "sha256:aa",
+    "status": "needs_input",
+    "paste_block": '[policy]\nagent_apply = "deny"',
+    "reason": "classification tag unresolved",
+    "output_model": "orders_mart",
+}
+
+PRODUCT_VERIFY_FAIL: dict[str, Any] = {
+    "version": "1",
+    "command": "product verify",
+    "product_id": "product:orders_mart",
+    "spec_digest": "sha256:aa",
+    "status": "fail",
+    "reason": "agent apply resolves allow",
+    "output_model": "orders_mart",
+}
+
+PRODUCT_COMPILE_MATCHES: dict[str, Any] = {
+    "version": "1",
+    "command": "product compile",
+    "product_id": "product:orders_mart",
+    "spec_digest": "sha256:aa",
+    "spec_path": "products/orders_mart.toml",
+    "output_model": "orders_mart",
+    "phase": "lowered_contract",
+    "manifest_path": "products/.rocky/orders_mart.manifest.json",
+    "artifacts": [{"path": "products/orders_mart.sql", "sha256": "sha256:bb"}],
+    "spec_matches_approval": True,
+}
+
+PRODUCT_COMPILE_SUPERSEDED: dict[str, Any] = {
+    **PRODUCT_COMPILE_MATCHES,
+    "spec_matches_approval": False,
+}
+
+PRODUCT_APPROVE_FRESH: dict[str, Any] = {
+    "version": "1",
+    "command": "product approve",
+    "product_id": "product:orders_mart",
+    "spec_digest": "sha256:aa",
+    "output_model": "orders_mart",
+    "already_approved": False,
+    "approved_at": "2026-09-22T00:00:00Z",
+    "approver": "hugo",
+    "snapshot_path": "products/.rocky/orders_mart.snapshot.json",
+    "state": "spec_approved",
+}
+
+PRODUCT_STATUS_PRESENT: dict[str, Any] = {
+    "version": "1",
+    "command": "product status",
+    "product": "orders_mart",
+    "spec_present": True,
+    "staging_journal_present": False,
+    "journal_rows": 3,
+    "artifact_problems": [],
+    "committed_phase": "lowered_contract",
+}
+
+PRODUCT_STATUS_ABSENT: dict[str, Any] = {
+    "version": "1",
+    "command": "product status",
+    "product": "orders_mart",
+    "spec_present": False,
+    "staging_journal_present": False,
+    "journal_rows": 0,
+    "artifact_problems": [],
+    "spec_error": "products/orders_mart.toml: invalid TOML at line 4",
+}
+
+PRODUCT_LIST_ZERO: dict[str, Any] = {
+    "version": "1",
+    "command": "product list",
+    "count": 1,
+    "products": [
+        {
+            "name": "orders_mart",
+            "spec_present": True,
+            "staging_journal_present": False,
+            "journal_rows": 3,
+            "artifact_problems": 0,
+            "committed_phase": "lowered_contract",
+            "fulfill_state": "spec_approved",
+        }
+    ],
+}
+
+PRODUCT_LIST_NONZERO: dict[str, Any] = {
+    **PRODUCT_LIST_ZERO,
+    "products": [{**PRODUCT_LIST_ZERO["products"][0], "artifact_problems": 2}],
+}
+
+PRODUCT_JOURNAL_ROWS: dict[str, Any] = {
+    "version": "1",
+    "command": "product journal",
+    "product": "orders_mart",
+    "product_id": "product:orders_mart",
+    "count": 1,
+    "rows": [
+        {
+            "seq": 0,
+            "event": "spec approved",
+            "to_state": "spec_approved",
+            "at": "2026-09-22T00:00:00Z",
+        }
+    ],
+}
+
+PRODUCT_JOURNAL_EMPTY: dict[str, Any] = {
+    **PRODUCT_JOURNAL_ROWS,
+    "count": 0,
+    "rows": [],
+}
+
+PRODUCT_JOURNAL_UNKNOWN = _Raises(
+    RockyCommandError(1, stderr_tail="unknown product: orders_mart", command="product_journal")
+)
+
+
+@dataclass(frozen=True)
+class ProductCase:
+    """One documented branch of one `product_*` method's example."""
+
+    method: str
+    case_id: str
+    run_cli: Any  # a JSON-able payload dict, or a `_Raises` instance
+    expect: tuple[str, ...] = ()
+    """Substrings that MUST appear in stdout: the branch's driving value."""
+    forbid: tuple[str, ...] = ()
+    """Substrings that must NOT appear: proves the untaken branch stayed untaken."""
+
+
+PRODUCT_CASES: list[ProductCase] = [
+    ProductCase("product_verify", "pass", PRODUCT_VERIFY_PASS, expect=("sha256:cafefeed",)),
+    ProductCase(
+        "product_verify",
+        "needs_input",
+        PRODUCT_VERIFY_NEEDS_INPUT,
+        expect=('agent_apply = "deny"',),
+    ),
+    ProductCase(
+        "product_verify", "fail", PRODUCT_VERIFY_FAIL, expect=("agent apply resolves allow",)
+    ),
+    ProductCase(
+        "product_compile",
+        "matches",
+        PRODUCT_COMPILE_MATCHES,
+        expect=("lowered_contract",),
+        forbid=("moved past the approval",),
+    ),
+    ProductCase(
+        "product_compile",
+        "superseded",
+        PRODUCT_COMPILE_SUPERSEDED,
+        expect=("moved past the approval",),
+    ),
+    ProductCase("product_approve", "fresh", PRODUCT_APPROVE_FRESH, expect=("sha256:aa", "hugo")),
+    ProductCase("product_status", "present", PRODUCT_STATUS_PRESENT, expect=("lowered_contract",)),
+    ProductCase(
+        "product_status",
+        "absent",
+        PRODUCT_STATUS_ABSENT,
+        expect=("invalid TOML at line 4",),
+    ),
+    ProductCase(
+        "product_list",
+        "zero",
+        PRODUCT_LIST_ZERO,
+        expect=("orders_mart",),
+        forbid=("byte-verification problems",),
+    ),
+    ProductCase(
+        "product_list",
+        "nonzero",
+        PRODUCT_LIST_NONZERO,
+        expect=("byte-verification problems: 2",),
+    ),
+    ProductCase("product_journal", "rows", PRODUCT_JOURNAL_ROWS, expect=("spec approved",)),
+    ProductCase(
+        "product_journal",
+        "empty",
+        PRODUCT_JOURNAL_EMPTY,
+        expect=("has no fulfillment history yet",),
+    ),
+    ProductCase(
+        "product_journal",
+        "unknown_product",
+        PRODUCT_JOURNAL_UNKNOWN,
+        expect=("unknown product: orders_mart",),
+    ),
+]
+
+
+@pytest.mark.parametrize("case", PRODUCT_CASES, ids=lambda c: f"{c.method}__{c.case_id}")
+def test_product_example_branch_prints_the_driving_value(
+    case: ProductCase, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#2108 red-team fix: assert on stdout, not just on "did it raise".
+
+    Each case mocks ``run_cli`` to return (or raise) exactly the fixture that
+    drives one documented branch, then asserts the branch's own value shows up
+    in the printed output. A renamed fixture key, a flipped condition, or a
+    misspelled attribute inside a branch that only an exception path reaches
+    (`product_journal`'s ``except ... as exc: exc.stderr_tail``) now fails
+    here instead of passing silently.
+    """
+    doc = _docstrings()[case.method]
+    snippet = _snippets(doc)[0]
+    code = textwrap.dedent(snippet)
+
+    def fake_run_cli(self: RockyClient, args: list[str], **_kwargs: Any) -> str:
+        if isinstance(case.run_cli, _Raises):
+            raise case.run_cli.exc
+        return json.dumps(case.run_cli)
+
+    with mock.patch.object(RockyClient, "run_cli", fake_run_cli):
+        exec(code, {"__name__": "__doc_example__"})  # noqa: S102 - trusted docstring
+
+    out = capsys.readouterr().out
+    for token in case.expect:
+        assert token in out, f"{case.method}:{case.case_id} expected {token!r} in: {out!r}"
+    for token in case.forbid:
+        msg = f"{case.method}:{case.case_id} forbidden {token!r} found in: {out!r}"
+        assert token not in out, msg
