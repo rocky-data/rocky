@@ -5168,6 +5168,24 @@ mod tests {
 
     // ── Completion: pipeline step keywords (#1800) ───────────────────────
 
+    /// Every entry in `ROCKY_STEP_KEYWORDS` must have its own detail, not
+    /// the generic `rocky_step_keyword_detail` fallback. Without this, an
+    /// 11th keyword added to the list without a matching `match` arm would
+    /// compile, ship a generic "Rocky pipeline step" detail, and nothing
+    /// would fail — this test is what turns that into a CI failure instead.
+    #[test]
+    fn every_step_keyword_has_its_own_detail() {
+        const GENERIC_FALLBACK: &str = "Rocky pipeline step";
+        for &keyword in ROCKY_STEP_KEYWORDS {
+            let detail = rocky_step_keyword_detail(keyword);
+            assert_ne!(
+                detail, GENERIC_FALLBACK,
+                "{keyword} has no specific detail in rocky_step_keyword_detail; \
+                 add a match arm for it"
+            );
+        }
+    }
+
     /// Drives `textDocument/completion` over the real JSON-RPC service
     /// (same harness as `a_failed_startup_compile_reaches_the_editor_as_an_error_message`
     /// above), so what's observed is what an editor receives. Writes an
