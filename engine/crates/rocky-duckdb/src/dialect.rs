@@ -367,7 +367,10 @@ mod catalog_name_for_path_tests {
 
     #[test]
     fn query_suffix_is_stripped_before_splitting() {
-        assert_eq!(catalog_name_for_path("warehouse.duckdb?access_mode=ro"), "warehouse");
+        assert_eq!(
+            catalog_name_for_path("warehouse.duckdb?access_mode=ro"),
+            "warehouse"
+        );
     }
 }
 

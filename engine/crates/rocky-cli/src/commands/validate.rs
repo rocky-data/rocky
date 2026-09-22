@@ -1070,20 +1070,20 @@ fn validate_replication_pipeline(
                 rocky_core::schema::PatternComponent::Fixed(_) => None,
                 rocky_core::schema::PatternComponent::Variable { name }
                 | rocky_core::schema::PatternComponent::VariableLength { name }
-                | rocky_core::schema::PatternComponent::Terminal { name } => {
-                    Some(name.as_str())
-                }
+                | rocky_core::schema::PatternComponent::Terminal { name } => Some(name.as_str()),
             })
             .collect();
 
         for (field, template) in [
-            ("catalog_template", pipeline.target.catalog_template.as_str()),
+            (
+                "catalog_template",
+                pipeline.target.catalog_template.as_str(),
+            ),
             ("schema_template", pipeline.target.schema_template.as_str()),
         ] {
             let mut reported = std::collections::HashSet::new();
             for placeholder in rocky_core::schema::template_placeholder_names(template) {
-                if !known.contains(&placeholder.as_str()) && reported.insert(placeholder.clone())
-                {
+                if !known.contains(&placeholder.as_str()) && reported.insert(placeholder.clone()) {
                     ok = false;
                     msgs.push(ValidateMessage {
                         severity: "error".into(),
@@ -1223,8 +1223,7 @@ fn duckdb_catalog_template_mismatch(
         return None;
     }
     let path = target_adapter.path.as_ref()?;
-    if !rocky_core::schema::template_placeholder_names(&pipeline.target.catalog_template)
-        .is_empty()
+    if !rocky_core::schema::template_placeholder_names(&pipeline.target.catalog_template).is_empty()
     {
         return None;
     }
@@ -1653,8 +1652,7 @@ fn lint_config(
                     field: Some(format!("pipeline.{name}.target.governance.auto_create_catalogs")),
                 });
             }
-            if !pipeline.target.governance.auto_create_schemas
-                && key_present("auto_create_schemas")
+            if !pipeline.target.governance.auto_create_schemas && key_present("auto_create_schemas")
             {
                 out.push(ValidateMessage {
                     severity: "lint".into(),
@@ -2882,7 +2880,11 @@ schema_template = "demo"
     #[test]
     fn test_empty_config() {
         let out = validate_toml("");
-        assert!(!out.valid, "an empty document must refuse: {:?}", out.messages);
+        assert!(
+            !out.valid,
+            "an empty document must refuse: {:?}",
+            out.messages
+        );
         let v002: Vec<_> = out
             .messages
             .iter()
@@ -3075,7 +3077,11 @@ catalog_template = "{nope}"
 schema_template = "demo"
 "#,
         );
-        assert!(!out.valid, "unknown placeholder must refuse: {:?}", out.messages);
+        assert!(
+            !out.valid,
+            "unknown placeholder must refuse: {:?}",
+            out.messages
+        );
         let v049: Vec<_> = out
             .messages
             .iter()
@@ -3154,7 +3160,10 @@ catalog_template = "other"
 schema_template = "demo"
 "#,
         );
-        assert!(out.valid, "a catalog_template mismatch is a warning, not an error");
+        assert!(
+            out.valid,
+            "a catalog_template mismatch is a warning, not an error"
+        );
         let v055: Vec<_> = out
             .messages
             .iter()
@@ -3898,11 +3907,7 @@ schema_template = "demo"
 auto_create_catalogs = false
 "#,
         );
-        let l006: Vec<_> = out
-            .messages
-            .iter()
-            .filter(|m| m.code == "L006")
-            .collect();
+        let l006: Vec<_> = out.messages.iter().filter(|m| m.code == "L006").collect();
         assert_eq!(
             l006.len(),
             1,
