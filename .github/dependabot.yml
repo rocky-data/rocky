@@ -15,6 +15,16 @@ updates:
         update-types:
           - minor
           - patch
+    ignore:
+      # arrow and parquet follow the duckdb crate's arrow major: engine/Cargo.toml
+      # pins duckdb 1.10503, which ships against arrow 58, and duckdb's
+      # RecordBatch is that arrow's type. A standalone arrow or parquet major
+      # bump does not compile (#2097, #2098). Bump all three by hand, in
+      # lockstep, when duckdb moves to the next arrow major.
+      - dependency-name: "arrow"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "parquet"
+        update-types: ["version-update:semver-major"]
 
   # --- Docs site (Astro / npm) ---
   - package-ecosystem: npm
