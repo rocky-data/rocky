@@ -4910,11 +4910,19 @@ async fn run_apply_promote_plan(
         breaking_changes: None,
     });
 
-    // `rocky apply <promote-plan>` has no `--pipeline` selector, so the executor
-    // resolves the default pipeline's adapter (`None`) — a multi-pipeline config
-    // still requires the branch-promote entrypoints to disambiguate.
-    let (targets_out, overall_success) =
-        crate::commands::branch::run_promote_apply(&loaded, &promote_plan.targets, None).await?;
+    // `rocky apply <promote-plan>` has no `--pipeline` selector, but the plan
+    // carries the RESOLVED pipeline it was built against (#2019) — nothing
+    // about applying a recorded plan is ambiguous, so we thread that through
+    // instead of re-resolving from the config. A plan written before this
+    // field existed carries `None` and falls back to the old resolver
+    // behavior for that specific legacy plan (unchanged: still errors on a
+    // multi-pipeline config, as before).
+    let (targets_out, overall_success) = crate::commands::branch::run_promote_apply(
+        &loaded,
+        &promote_plan.targets,
+        promote_plan.pipeline.as_deref(),
+    )
+    .await?;
 
     audit.push(AuditEvent {
         kind: if overall_success {
@@ -7030,6 +7038,7 @@ effect = "deny"
         // once per entrypoint is a no-op.
         let make_plan = |table: &str| crate::output::PromotePlan {
             branch_name: "fix".to_string(),
+            pipeline: None,
             base_ref: "main".to_string(),
             head_ref: "deadbeef".to_string(),
             branch_state_hash: "hash".to_string(),
@@ -7755,6 +7764,7 @@ effect = "allow"
     fn promote_without_findings_gates_its_targets() {
         let promote = crate::output::PromotePlan {
             branch_name: "fix".to_string(),
+            pipeline: None,
             base_ref: "main".to_string(),
             head_ref: "abc".to_string(),
             branch_state_hash: "h".to_string(),
@@ -7789,6 +7799,7 @@ effect = "allow"
         use rocky_core::breaking_change::{BreakingChange, BreakingFinding, BreakingSeverity};
         let promote = crate::output::PromotePlan {
             branch_name: "fix".to_string(),
+            pipeline: None,
             base_ref: "main".to_string(),
             head_ref: "abc".to_string(),
             branch_state_hash: "h".to_string(),
@@ -7824,6 +7835,7 @@ effect = "allow"
     fn promote_with_no_targets_and_no_findings_is_empty() {
         let promote = crate::output::PromotePlan {
             branch_name: "fix".to_string(),
+            pipeline: None,
             base_ref: "main".to_string(),
             head_ref: "abc".to_string(),
             branch_state_hash: "h".to_string(),
@@ -7857,6 +7869,7 @@ effect = "allow"
 
         let promote = crate::output::PromotePlan {
             branch_name: "fix".to_string(),
+            pipeline: None,
             base_ref: "main".to_string(),
             head_ref: "abc".to_string(),
             branch_state_hash: "h".to_string(),
@@ -7909,6 +7922,7 @@ effect = "allow"
 
         let promote = crate::output::PromotePlan {
             branch_name: "fix".to_string(),
+            pipeline: None,
             base_ref: "main".to_string(),
             head_ref: "abc".to_string(),
             branch_state_hash: "h".to_string(),
@@ -7960,6 +7974,7 @@ effect = "allow"
 
         let promote = crate::output::PromotePlan {
             branch_name: "fix".to_string(),
+            pipeline: None,
             base_ref: "main".to_string(),
             head_ref: "abc".to_string(),
             branch_state_hash: "h".to_string(),

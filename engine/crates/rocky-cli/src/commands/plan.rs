@@ -2573,7 +2573,10 @@ pub(crate) async fn build_promote_plan_inner(
     }
 
     // Discover targets + build SQL at plan time (dialect-quoted, deterministic).
-    let planned_targets =
+    // The resolved pipeline name comes back too — never ambiguous, even when
+    // `pipeline_name` was `None` on a single-pipeline config — and is
+    // persisted onto the plan below so `rocky apply` never re-resolves it.
+    let (resolved_pipeline_name, planned_targets) =
         discover_branch_targets_for_plan(config_path, &record, filter, pipeline_name).await?;
 
     let head_ref = std::process::Command::new("git")
@@ -2613,6 +2616,7 @@ pub(crate) async fn build_promote_plan_inner(
 
     let promote_plan = PromotePlan {
         branch_name: branch_name.to_string(),
+        pipeline: Some(resolved_pipeline_name),
         base_ref: base_ref.to_string(),
         head_ref,
         branch_state_hash: branch_state_hash.clone(),
@@ -4213,6 +4217,7 @@ token = "${ROCKY_T_1625_PREVIEW_UNSET_2}"
     fn minimal_promote_plan(branch_name: &str) -> PromotePlan {
         PromotePlan {
             branch_name: branch_name.to_string(),
+            pipeline: None,
             base_ref: "main".to_string(),
             head_ref: "abc1234".to_string(),
             branch_state_hash: "deadbeef".repeat(8),
