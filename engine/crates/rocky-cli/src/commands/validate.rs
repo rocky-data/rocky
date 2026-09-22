@@ -1150,20 +1150,23 @@ fn validate_replication_pipeline(
     }
 
     // V054: a DuckDB discovery adapter with no `path` runs discovery against
-    // an in-memory database — it finds nothing, silently (`valid: true`
-    // today, the discover step just returns empty). `AdapterConfig::path`'s
-    // own doc comment already says a persistent path is required when the
-    // adapter also serves as a discovery source; nothing enforced it (#2005).
-    // Only checked when the discovery adapter resolved (V024 above already
+    // an in-memory database — it finds nothing, silently (the discover step
+    // just returns empty). `AdapterConfig::path`'s own doc comment already
+    // says a persistent path is required when the adapter also serves as a
+    // discovery source; nothing enforced it (#2005). A warning, not an
+    // error: a compile-only project (a POC whose `run.sh` calls `validate`
+    // but never `run`, so discovery never actually executes) legitimately
+    // has no reason to set `path`, and an error here would break every such
+    // project's script and CI for a discovery that never happens. Only
+    // checked when the discovery adapter resolved (V024 above already
     // reports an unknown one — no need to double-report).
     if let Some(ref disc) = pipeline.source.discovery
         && let Some(disc_adapter) = cfg.adapters.get(&disc.adapter)
         && disc_adapter.adapter_type == "duckdb"
         && disc_adapter.path.is_none()
     {
-        ok = false;
         msgs.push(ValidateMessage {
-            severity: "error".into(),
+            severity: "warn".into(),
             code: "V054".into(),
             message: format!(
                 "pipeline.{name}: discovery adapter '{}' is a DuckDB adapter with no `path` — \
@@ -2610,8 +2613,14 @@ schema_template = "demo"
     /// silently finds nothing. A single-adapter project auto-wires
     /// discovery to that one adapter even when `[source.discovery]` is
     /// never written, so this is the common case, not an edge case.
+    ///
+    /// A warning, not an error (decided after the example sweep found 26
+    /// POCs whose `run.sh` calls `validate` but never `run` — a
+    /// compile-only project's discovery never actually executes, so it has
+    /// no reason to set `path`, and refusing would break all 26 scripts and
+    /// their CI for a discovery that never happens).
     #[test]
-    fn test_duckdb_discovery_adapter_without_path_is_v054() {
+    fn test_duckdb_discovery_adapter_without_path_is_v054_warning() {
         let out = validate_toml(
             r#"
 [adapter.local]
@@ -2635,14 +2644,14 @@ schema_template = "demo"
 "#,
         );
         assert!(
-            !out.valid,
-            "a pathless DuckDB discovery adapter must refuse: {:?}",
+            out.valid,
+            "a pathless DuckDB discovery adapter is a warning, not an error: {:?}",
             out.messages
         );
         let v054: Vec<_> = out
             .messages
             .iter()
-            .filter(|m| m.code == "V054" && m.severity == "error")
+            .filter(|m| m.code == "V054" && m.severity == "warn")
             .collect();
         assert_eq!(v054.len(), 1, "expected one V054: {:?}", out.messages);
         assert_eq!(v054[0].field.as_deref(), Some("adapter.local.path"));
