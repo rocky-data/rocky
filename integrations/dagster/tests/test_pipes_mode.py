@@ -21,9 +21,12 @@ Exercises:
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import dagster as dg
+import pytest
+from dagster._core.pipes.context import PipesMessageHandler
 
 from dagster_rocky.resource import (
     RockyPipesMessageReader,
@@ -42,7 +45,9 @@ def _materialization_msg(asset_key: str) -> dict:
         "method": "report_asset_materialization",
         "params": {
             "asset_key": asset_key,
-            "metadata": {"rows_copied": 10},
+            # Wrapped wire shape (#2159) — a bare value here crashes
+            # Dagster's real message handler with a `TypeError`.
+            "metadata": {"rows_copied": {"raw_value": 10, "type": "__infer__"}},
             "data_version": None,
         },
     }
@@ -544,6 +549,12 @@ def test_handler_proxy_translates_anomaly_check_results():
 
     # One detected anomaly — fails, with the metric detail. Metadata keys
     # match `anomaly_check_results` in observability.py: fully rocky/-prefixed.
+    # Values are the wrapped wire shape (#2159) — `wrap_metadata` in
+    # pipes.rs puts every value in `{raw_value, type}` form; a bare value
+    # here crashes Dagster's real message handler with a `TypeError`.
+    def _wrapped(value):
+        return {"raw_value": value, "type": "__infer__"}
+
     anomaly_msg = {
         "__dagster_pipes_version": "0.1",
         "method": "report_asset_check",
@@ -553,16 +564,18 @@ def test_handler_proxy_translates_anomaly_check_results():
             "passed": False,
             "severity": "WARN",
             "metadata": {
-                "rocky/current_count": 5,
-                "rocky/baseline_avg": 376.25,
-                "rocky/deviation_pct": 98.67,
-                "rocky/reason": "row count 5 deviates 98.67% from baseline 376.25",
+                "rocky/current_count": _wrapped(5),
+                "rocky/baseline_avg": _wrapped(376.25),
+                "rocky/deviation_pct": _wrapped(98.67),
+                "rocky/reason": _wrapped("row count 5 deviates 98.67% from baseline 376.25"),
             },
         },
     }
     # One not-evaluated table — fails, with the engine's reason, not silence.
-    # `status` stays bare and `reason` is rocky/-prefixed, matching
-    # `anomaly_evaluation_results` in observability.py.
+    # `status` stays bare (unwrapped KEY NAME, not unwrapped VALUE — its
+    # value is wrapped like every other one here) and `reason` is
+    # rocky/-prefixed, matching `anomaly_evaluation_results` in
+    # observability.py.
     not_evaluated_msg = {
         "__dagster_pipes_version": "0.1",
         "method": "report_asset_check",
@@ -572,8 +585,8 @@ def test_handler_proxy_translates_anomaly_check_results():
             "passed": False,
             "severity": "WARN",
             "metadata": {
-                "status": "not_evaluated",
-                "rocky/reason": "no row count was measured for this table",
+                "status": _wrapped("not_evaluated"),
+                "rocky/reason": _wrapped("no row count was measured for this table"),
             },
         },
     }
@@ -588,11 +601,11 @@ def test_handler_proxy_translates_anomaly_check_results():
     assert forwarded_anomaly["params"]["asset_key"] == orders_key.to_user_string()
     assert forwarded_anomaly["params"]["check_name"] == "row_count_anomaly"
     assert forwarded_anomaly["params"]["passed"] is False
-    assert forwarded_anomaly["params"]["metadata"]["rocky/current_count"] == 5
+    assert forwarded_anomaly["params"]["metadata"]["rocky/current_count"] == _wrapped(5)
 
     assert forwarded_not_evaluated["params"]["asset_key"] == customers_key.to_user_string()
     assert forwarded_not_evaluated["params"]["passed"] is False
-    assert forwarded_not_evaluated["params"]["metadata"]["status"] == "not_evaluated"
+    assert forwarded_not_evaluated["params"]["metadata"]["status"] == _wrapped("not_evaluated")
 
 
 # ---------------------------------------------------------------------------
@@ -659,3 +672,102 @@ def test_run_filters_pipes_converts_drift_check_to_observation():
     assert observation.metadata["rocky/drift_table"].value == "acme.raw_orders"
     # The generic undeclared-check path (which would log this) must not fire.
     context.log.warning.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Wire-shape metadata (#2159) — through Dagster's REAL PipesMessageHandler,
+# not a MagicMock. Every other test in this file mocks the inner handler, so
+# none of them would have caught #2159 (bare metadata values crash Dagster's
+# real `metadata_map_from_external`) or #2163 (the engine never decoded a
+# real Dagster-issued DAGSTER_PIPES_MESSAGES at all, so no message stream
+# from a real launch ever reached this handler either). These two tests
+# drive the real handler against message streams captured from real
+# `RockyResource.run_pipes` launches (real dg.PipesSubprocessClient, real
+# subprocess, no mocks) of the anomaly-detection POC
+# (examples/playground/pocs/01-quality/03-anomaly-detection), after three
+# baseline runs so the incident capture includes a DETECTED anomaly (mixed
+# int/float/string metadata), not just an evaluated-clean verdict.
+#
+# fixtures_generated/pipes_wire/lane_incident.jsonl — captured with:
+#   dg.materialize([events], resources={"rocky": RockyResource(binary_path=<engine binary>, ...)})
+#   where `events` yields `rocky.run_pipes(context, filter="source=events",
+#   pipes_client=dg.PipesSubprocessClient(
+#       message_reader=dg.PipesFileMessageReader(path=<fixed path>, cleanup_file=False)
+#   )).get_results()`
+# against engine commit 6e0fb6b2 (both the #2159 metadata-wrap fix and the
+# #2163 zlib-decode fix; the decode fix only affects the env-var bootstrap,
+# not the message-file content this test reads).
+#
+# fixtures_generated/pipes_wire/bare_incident.jsonl — captured the identical
+# way, but with a temporary, never-committed edit on top of the same commit
+# reverting both `wrap_metadata(metadata)` call sites in
+# `engine/crates/rocky-cli/src/pipes.rs` to bare `metadata` (the pre-#2159
+# wire shape) — i.e. what every real Pipes run sent before this PR.
+# ---------------------------------------------------------------------------
+
+_PIPES_WIRE_FIXTURES = Path(__file__).parent / "fixtures_generated" / "pipes_wire"
+
+
+def _load_wire_capture(name: str) -> list[dict]:
+    path = _PIPES_WIRE_FIXTURES / name
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def _real_handler(context: dg.AssetExecutionContext | None = None) -> PipesMessageHandler:
+    """A REAL `dagster._core.pipes.context.PipesMessageHandler` -- the class
+    whose `_resolve_metadata` calls the real `metadata_map_from_external`.
+    The message_reader is never used for reading here (messages are fed
+    directly via `handle_message`), so a throwaway file path is fine."""
+    return PipesMessageHandler(
+        context or dg.build_asset_context(),
+        dg.PipesFileMessageReader(path="/dev/null"),
+    )
+
+
+def test_real_handler_decodes_the_wrapped_wire_shape_with_no_framework_exception():
+    """The wrapped shape (this PR's fix) decodes cleanly through Dagster's
+    real handler: one materialization, two check results (`row_count`
+    passing, `row_count_anomaly` failing with the detected-anomaly detail),
+    every metadata value a properly typed `MetadataValue` -- no
+    `TypeError`, no framework exception."""
+    handler = _real_handler()
+    proxy = _PipesHandlerProxy(handler, asset_key_fn=None, include_keys=None)
+
+    for message in _load_wire_capture("lane_incident.jsonl"):
+        proxy.handle_message(message)
+
+    results = handler.get_reported_results()
+    materializations = [r for r in results if isinstance(r, dg.MaterializeResult)]
+    checks = {r.check_name: r for r in results if isinstance(r, dg.AssetCheckResult)}
+
+    assert len(materializations) == 1
+    mat_metadata = materializations[0].metadata
+    assert isinstance(mat_metadata["strategy"], dg.TextMetadataValue)
+    assert mat_metadata["strategy"].text == "full_refresh"
+    assert isinstance(mat_metadata["duration_ms"], dg.IntMetadataValue)
+
+    assert set(checks) == {"row_count", "row_count_anomaly"}
+    assert checks["row_count"].passed is True
+    assert isinstance(checks["row_count"].metadata["source_count"], dg.IntMetadataValue)
+
+    anomaly = checks["row_count_anomaly"]
+    assert anomaly.passed is False
+    assert isinstance(anomaly.metadata["rocky/current_count"], dg.IntMetadataValue)
+    assert anomaly.metadata["rocky/current_count"].value == 5
+    assert isinstance(anomaly.metadata["rocky/baseline_avg"], dg.FloatMetadataValue)
+    assert isinstance(anomaly.metadata["rocky/deviation_pct"], dg.FloatMetadataValue)
+    assert isinstance(anomaly.metadata["rocky/reason"], dg.TextMetadataValue)
+    assert "98.7%" in anomaly.metadata["rocky/reason"].text
+
+
+def test_real_handler_raises_typeerror_on_the_pre_fix_bare_wire_shape():
+    """Mutation-check for the test above: the SAME real handler, fed the
+    bare (pre-#2159) shape captured the identical way, crashes with the
+    exact `TypeError` #2159 describes -- not a KeyError, not a validation
+    error. Confirms the assertion above is discriminating, not vacuous."""
+    handler = _real_handler()
+    proxy = _PipesHandlerProxy(handler, asset_key_fn=None, include_keys=None)
+
+    with pytest.raises(TypeError, match="not subscriptable"):
+        for message in _load_wire_capture("bare_incident.jsonl"):
+            proxy.handle_message(message)

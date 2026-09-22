@@ -1,0 +1,6 @@
+{"__dagster_pipes_version":"0.1","method":"log","params":{"level":"INFO","message":"rocky run starting"}}
+{"__dagster_pipes_version":"0.1","method":"report_asset_materialization","params":{"asset_key":"duckdb/events/events","data_version":null,"metadata":{"duration_ms":7,"strategy":"full_refresh","target_table_full_name":"poc.staging__events.events","watermark":"2026-09-22T21:10:58.358577+00:00"}}}
+{"__dagster_pipes_version":"0.1","method":"report_asset_check","params":{"asset_key":"duckdb/events/events","check_name":"row_count","metadata":{"name":"row_count","passed":true,"severity":"error","source_count":5,"target_count":5},"passed":true,"severity":"ERROR"}}
+{"__dagster_pipes_version":"0.1","method":"report_asset_check","params":{"asset_key":"duckdb/events/events","check_name":"row_count_anomaly","metadata":{"rocky/baseline_avg":376.25,"rocky/current_count":5,"rocky/deviation_pct":98.67109634551495,"rocky/reason":"row count dropped 98.7% (expected ~376, got 5)"},"passed":false,"severity":"WARN"}}
+{"__dagster_pipes_version":"0.1","method":"log","params":{"level":"INFO","message":"rocky run complete: 1 copied, 0 failed in 127ms"}}
+{"__dagster_pipes_version":"0.1","method":"closed","params":null}
