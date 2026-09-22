@@ -2503,9 +2503,6 @@ enum PreviewAction {
         /// Git ref to compare data against (default: main)
         #[arg(long, default_value = "main")]
         base: String,
-        /// Maximum rows to sample per model (default: 1000)
-        #[arg(long, default_value_t = 1000)]
-        sample_size: usize,
         /// Diff algorithm: `sampled` (default — structural delta from the
         /// run records) or `bisection` (exhaustive checksum-bisection on
         /// each Merge-strategy model with a single integer / numeric
@@ -3863,6 +3860,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     suffix: shadow_suffix,
                     schema_override: Some(record.schema_prefix),
                     cleanup_after: false,
+                    branch: Some(name.clone()),
                 })
             } else if shadow {
                 Some(rocky_core::shadow::ShadowConfig {
@@ -3877,6 +3875,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     // `false` deliberately: a named branch's objects are the
                     // point of the branch.
                     cleanup_after: true,
+                    branch: None,
                 })
             } else {
                 None
@@ -4019,6 +4018,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 suffix: shadow_suffix,
                 schema_override: shadow_schema,
                 cleanup_after: false,
+                branch: None,
             };
             rocky_cli::commands::compare(
                 &cli.config,
@@ -4917,7 +4917,6 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             PreviewAction::Diff {
                 name,
                 base,
-                sample_size,
                 algorithm,
                 models,
             } => {
@@ -4935,7 +4934,6 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     &models,
                     &name,
                     &base,
-                    sample_size,
                     algorithm,
                     json,
                 )
@@ -5277,6 +5275,67 @@ mod tests {
         assert!(
             help.contains("ignored"),
             "validate-migration --help must say sample-size is ignored: {help}"
+        );
+    }
+
+    /// #2032: `preview diff --sample-size` was accepted and silently
+    /// ignored (bound as `_sample_size`, never read). Unlike
+    /// `validate-migration --sample-size` (#2027, kept and documented as
+    /// ignored), no code path exists that the flag was ever meant to
+    /// drive, so it was REMOVED from clap rather than merely documented —
+    /// a caller passing it now gets a clear parse error instead of a
+    /// silently-discarded value. `--help` must not offer a flag that no
+    /// longer exists.
+    #[test]
+    fn preview_diff_help_does_not_offer_sample_size() {
+        let mut preview = command_with_big_stack()
+            .find_subcommand("preview")
+            .expect("preview subcommand exists")
+            .clone();
+        let diff = preview
+            .find_subcommand_mut("diff")
+            .expect("preview diff subcommand exists");
+        let help = diff.render_long_help().to_string();
+        assert!(
+            !help.contains("sample-size"),
+            "preview diff --help must not offer the removed --sample-size flag: {help}"
+        );
+    }
+
+    /// The removal is a hard parse error, not a quiet drop: a caller
+    /// (script, CI workflow) still passing `--sample-size` gets told so
+    /// immediately, rather than having the value silently discarded the
+    /// way it was before this fix (#2032).
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "expects a PARSE FAILURE, which the Cli-returning helper cannot express; the \
+                  call already runs on an 8 MB spawned thread"
+    )]
+    fn preview_diff_rejects_removed_sample_size_flag() {
+        let result = std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(s, || {
+                    Cli::try_parse_from([
+                        "rocky",
+                        "preview",
+                        "diff",
+                        "--name",
+                        "pr-preview-fix-price",
+                        "--sample-size",
+                        "500",
+                    ])
+                    .map(|_| ())
+                    .map_err(|e| e.kind())
+                })
+                .expect("spawn parser thread")
+                .join()
+                .expect("parser thread panicked")
+        });
+        assert!(
+            result.is_err(),
+            "--sample-size must no longer parse for `preview diff`"
         );
     }
 

@@ -1134,6 +1134,7 @@ pub(crate) fn audit_to_record(ctx: &AuditContext) -> RunRecordAudit {
         target_catalog: ctx.target_catalog.clone(),
         hostname: ctx.hostname.clone(),
         rocky_version: ctx.rocky_version.clone(),
+        rocky_branch: ctx.rocky_branch.clone(),
     }
 }
 
@@ -3112,10 +3113,12 @@ pub async fn run(
         // Audit context: model-only runs have no single target catalog
         // (we don't know which pipeline's templates are in scope), so
         // `target_catalog = None`. Every other audit field populates
-        // normally.
+        // normally, including `rocky_branch` when this model-only run was
+        // scoped with `--branch` (#2032).
         let audit_ctx = AuditContext::detect(
             idempotency_ctx.as_ref().map(|c| c.key.clone()),
             None,
+            shadow_config.and_then(|c| c.branch.clone()),
         );
         let audit = audit_to_record(&audit_ctx);
         let custody = RecordCustody::from_persisted(persist_run_record(
@@ -3811,6 +3814,7 @@ pub async fn run(
     let audit_ctx = AuditContext::detect(
         idempotency_ctx.as_ref().map(|c| c.key.clone()),
         Some(pipeline.target.catalog_template.clone()),
+        shadow_config.and_then(|c| c.branch.clone()),
     );
     let audit = audit_to_record(&audit_ctx);
 
@@ -9882,7 +9886,9 @@ pub(crate) async fn execute_backfill_set(
         output.populate_cost_summary(&adapter_type, &rocky_cfg.cost);
         let budget_result = output.check_and_record_budget(&rocky_cfg.budget, Some(&run_id));
 
-        let audit_ctx = AuditContext::detect(None, None);
+        // `rocky backfill` has no `--branch` / `ShadowConfig` parameter, so
+        // there is no Rocky branch to stamp here (#2032).
+        let audit_ctx = AuditContext::detect(None, None, None);
         let audit = audit_to_record(&audit_ctx);
         let custody = RecordCustody::from_persisted(persist_run_record(
             state_store.as_ref(),
@@ -16491,6 +16497,7 @@ token = "dapi-SECRET"
             suffix: "_rocky_shadow".to_string(),
             schema_override: Some("branch__feature".to_string()),
             cleanup_after: false,
+            branch: Some("feature".to_string()),
         };
 
         let scope = replication_resume_scope(
@@ -16611,6 +16618,7 @@ token = "dapi-SECRET"
             suffix: "_rocky_shadow".to_string(),
             schema_override: None,
             cleanup_after: false,
+            branch: None,
         };
         let shadowed = replication_resume_scope(
             "p1",
@@ -16691,6 +16699,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             suffix: "_rocky_shadow".to_string(),
             schema_override: Some("x".to_string()),
             cleanup_after: false,
+            branch: None,
         };
         let genuine = replication_resume_scope(
             "p1",
@@ -17662,6 +17671,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             suffix: "_rocky_shadow".to_string(),
             schema_override: Some("x".to_string()),
             cleanup_after: false,
+            branch: None,
         };
         let genuine = replication_resume_scope(
             "p1",
@@ -18101,6 +18111,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             suffix: "_rocky_shadow".to_string(),
             schema_override: Some("branch__feature".to_string()),
             cleanup_after: false,
+            branch: Some("feature".to_string()),
         };
         let adapter = test_duckdb_adapter(None);
         let pattern = test_schema_pattern();
@@ -18239,6 +18250,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             suffix: "_rocky_shadow".to_string(),
             schema_override: Some("branch__feature".to_string()),
             cleanup_after: false,
+            branch: Some("feature".to_string()),
         };
         let adapter = test_duckdb_adapter(None);
         let pattern = test_schema_pattern();
@@ -18416,6 +18428,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             suffix: "_rocky_shadow".to_string(),
             schema_override: Some("branch__feature".to_string()),
             cleanup_after: false,
+            branch: Some("feature".to_string()),
         };
         let adapter = test_duckdb_adapter(None);
         let scope = |pattern: &SchemaPattern| -> ResumeScope {
@@ -19215,6 +19228,7 @@ auto_create_schemas = true
             suffix: "_rocky_shadow".to_string(),
             schema_override: Some("branch__feature".to_string()),
             cleanup_after: false,
+            branch: Some("feature".to_string()),
         };
         let dir = tempfile::tempdir().unwrap();
         let (config_path, state_path, db_path) =
@@ -19656,7 +19670,7 @@ auto_create_schemas = true
             std::env::set_var("ROCKY_SUBMISSION_ID", "sub-xyz");
         }
         let output = RunOutput::new(String::new(), 0, 1);
-        let audit = audit_to_record(&AuditContext::detect(None, None));
+        let audit = audit_to_record(&AuditContext::detect(None, None, None));
         persist_run_record(
             Some(&store),
             &output,
@@ -27160,6 +27174,7 @@ backend = "local"
             suffix: "_shadow".to_string(),
             schema_override: None,
             cleanup_after: true,
+            branch: None,
         };
         assert_eq!(
             super::shadow_gate_target_names("orders", Some(&suffixed)),
@@ -27172,6 +27187,7 @@ backend = "local"
             suffix: "_shadow".to_string(),
             schema_override: Some("_rocky_shadow".to_string()),
             cleanup_after: true,
+            branch: None,
         };
         assert_eq!(
             super::shadow_gate_target_names("orders", Some(&schema_override)),
@@ -29735,6 +29751,7 @@ auto_create_schemas = true
             suffix: String::new(),
             cleanup_after: false,
             schema_override: None,
+            branch: None,
         };
         let err =
             super::apply_shadow_rewrite(&mut compiled, None, None, &empty_suffix, &dialect, false)
@@ -31654,6 +31671,7 @@ auto_create_schemas = true
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
         };
         state.record_run(&failed).unwrap();
 
@@ -34039,6 +34057,7 @@ auto_create_schemas = true
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
         };
         store.record_run(&run).unwrap();
         // The prior build's LIVE artifact — the ledger row the liveness gate
@@ -34237,6 +34256,7 @@ auto_create_schemas = true
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
         };
         store.record_run(&base_run).unwrap();
         store
@@ -34366,6 +34386,7 @@ auto_create_schemas = true
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
         };
         store.record_run(&run).unwrap();
 
@@ -35352,6 +35373,7 @@ auto_create_schemas = true
                 submission_id: None,
                 check_gate_failed: false,
                 verify_after_failed: false,
+                rocky_branch: None,
             };
             store.record_run(&run).unwrap();
             // The prior build's LIVE artifact row — the liveness gate resolves
@@ -35656,6 +35678,7 @@ auto_create_schemas = true
                     submission_id: None,
                     check_gate_failed: false,
                     verify_after_failed: false,
+                    rocky_branch: None,
                 })
                 .unwrap();
             // The prior live_d build's LIVE artifact-ledger row — the liveness

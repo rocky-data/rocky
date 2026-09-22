@@ -63,8 +63,15 @@ class PreviewDiffSummary(BaseModel):
     `true` if **any** per-model diff is either a sampled diff with `sampling_window.coverage_warning = true` or a bisection diff with `bisection_stats.depth_capped = true`. Both conditions indicate the row-level findings might be incomplete and a reviewer shouldn't infer "no change" from a clean result.
     """
     models_unchanged: conint(ge=0)
+    models_unknown: conint(ge=0)
+    """
+    Models whose row-count delta could not be computed — the warehouse adapter or materialization strategy reported no `rows_affected` on the branch side, the base side, or both (#2032). These are counted separately from `models_unchanged`: "no recorded delta" is not the same claim as "no change", and folding the two together is exactly the false-clean report this field exists to prevent. A model here contributes `null` (not `0`) to its own `rows_added`/`rows_removed` and is excluded from `total_rows_added`/`total_rows_removed`, so those totals are a floor, not an exact count, whenever this is > 0.
+    """
     models_with_changes: conint(ge=0)
     total_rows_added: conint(ge=0)
+    """
+    Sum of `rows_added` over models with a KNOWN delta only — models counted in `models_unknown` contribute nothing here (never `0`, which would be indistinguishable from a genuine no-op).
+    """
     total_rows_changed: conint(ge=0)
     total_rows_removed: conint(ge=0)
 
@@ -133,9 +140,15 @@ class PreviewSampledRowDiff(BaseModel):
     Sampled row-level diff. All counts are over the sampling window.
     """
 
-    rows_added: conint(ge=0)
+    rows_added: conint(ge=0) | None = None
+    """
+    `None` — emitted as JSON `null`, deliberately NOT omitted via `skip_serializing_if` — when the row count needed to compute this delta was unavailable on the branch side, the base side, or both (an ordinary transformation run's adapter/strategy reports no `rows_affected`). `Some(0)` means a genuine, measured no-op; `null` means unmeasured. Collapsing the two into `0` is the exact defect this field exists to prevent — a full-refresh model going from 10 rows to 20 must never report `rows_added: 0` (#2032).
+    """
     rows_changed: conint(ge=0)
-    rows_removed: conint(ge=0)
+    rows_removed: conint(ge=0) | None = None
+    """
+    Same absent-vs-zero contract as `rows_added`.
+    """
     samples: list[PreviewRowSample] | None = None
     """
     Up to `--max-samples` (default 5) representative changed rows for human review. Pure noise when sampling found no change.

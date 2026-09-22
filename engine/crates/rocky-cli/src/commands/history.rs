@@ -56,6 +56,7 @@ fn record_to_history(run: &RunRecord, audit: bool) -> RunHistoryRecord {
         target_catalog,
         hostname,
         rocky_version,
+        rocky_branch,
     ) = if audit {
         (
             run.triggering_identity.clone(),
@@ -66,9 +67,10 @@ fn record_to_history(run: &RunRecord, audit: bool) -> RunHistoryRecord {
             run.target_catalog.clone(),
             Some(run.hostname.clone()),
             Some(run.rocky_version.clone()),
+            run.rocky_branch.clone(),
         )
     } else {
-        (None, None, None, None, None, None, None, None)
+        (None, None, None, None, None, None, None, None, None)
     };
     RunHistoryRecord {
         run_id: run.run_id.clone(),
@@ -88,6 +90,7 @@ fn record_to_history(run: &RunRecord, audit: bool) -> RunHistoryRecord {
         target_catalog,
         hostname,
         rocky_version,
+        rocky_branch,
     }
 }
 
@@ -694,6 +697,9 @@ mod tests {
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            // Deliberately different from `git_branch` — the two are
+            // independent fields (#2032).
+            rocky_branch: Some("pr-preview-governance".to_string()),
         }
     }
 
@@ -708,6 +714,7 @@ mod tests {
         assert!(history.git_commit.is_none());
         assert!(history.hostname.is_none());
         assert!(history.rocky_version.is_none());
+        assert!(history.rocky_branch.is_none());
     }
 
     #[test]
@@ -725,6 +732,11 @@ mod tests {
         assert_eq!(history.target_catalog.as_deref(), Some("warehouse_main"));
         assert_eq!(history.hostname.as_deref(), Some("dev-laptop"));
         assert_eq!(history.rocky_version.as_deref(), Some("1.16.0"));
+        assert_eq!(
+            history.rocky_branch.as_deref(),
+            Some("pr-preview-governance"),
+            "rocky_branch must thread through independently of git_branch"
+        );
     }
 
     #[test]
@@ -785,6 +797,7 @@ mod tests {
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
         }
     }
 

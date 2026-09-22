@@ -98,6 +98,13 @@
             "null"
           ]
         },
+        "rocky_branch": {
+          "description": "The named Rocky branch this run wrote to (`rocky run --branch <name>`), or `None` for a production / plain-`--shadow` run. Distinct from `git_branch` — see `RunRecord::rocky_branch` (#2032).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "rocky_version": {
           "description": "`CARGO_PKG_VERSION` of the `rocky` binary, or `\"<pre-audit>\"` on schema-v5 rows that predate the audit trail.",
           "type": [

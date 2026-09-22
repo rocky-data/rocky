@@ -848,6 +848,7 @@ async fn execute_run_plan(
             suffix: shadow_suffix,
             schema_override: Some(record.schema_prefix),
             cleanup_after: false,
+            branch: Some(name.clone()),
         })
     } else if run_plan.shadow {
         Some(rocky_core::shadow::ShadowConfig {
@@ -858,6 +859,7 @@ async fn execute_run_plan(
             // that is what makes the ownership refusal sound. The branch
             // arm above stays persistent on purpose.
             cleanup_after: true,
+            branch: None,
         })
     } else {
         None
@@ -4304,6 +4306,7 @@ fn replication_shadow_config(
             suffix,
             schema_override: Some(record.schema_prefix),
             cleanup_after: false,
+            branch: Some(name.clone()),
         }));
     }
     Ok(if replication_plan.shadow {
@@ -4311,6 +4314,7 @@ fn replication_shadow_config(
             suffix,
             schema_override: replication_plan.shadow_schema.clone(),
             cleanup_after: false,
+            branch: None,
         })
     } else {
         None
@@ -10616,6 +10620,7 @@ schema_template = "s__{source}"
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
         };
         store.record_run(&record).unwrap();
     }

@@ -86,6 +86,10 @@ class RunHistoryRecord(BaseModel):
     """
     The pipeline this run executed (`rocky run --pipeline <name>`), when recorded. `None` for model-only or backfill runs. Not audit-gated — it is an operational join key, always emitted when present.
     """
+    rocky_branch: str | None = None
+    """
+    The named Rocky branch this run wrote to (`rocky run --branch <name>`), or `None` for a production / plain-`--shadow` run. Distinct from `git_branch` — see `RunRecord::rocky_branch` (#2032).
+    """
     rocky_version: str | None = None
     """
     `CARGO_PKG_VERSION` of the `rocky` binary, or `"<pre-audit>"` on schema-v5 rows that predate the audit trail.

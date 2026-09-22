@@ -2668,6 +2668,26 @@ pub struct RunRecord {
     /// `test_v25_run_record_forward_deserializes_verify_after_failed_false`.
     #[serde(default)]
     pub verify_after_failed: bool,
+
+    /// The named Rocky branch this run wrote to, when it ran with
+    /// `rocky run --branch <name>` (#2032). This is the literal `--branch`
+    /// value ([`crate::shadow::ShadowConfig::branch`]) — **not**
+    /// [`Self::git_branch`], which records `git symbolic-ref --short HEAD`
+    /// (the checkout's git branch) and is unrelated when `--branch` names a
+    /// PR-preview branch that differs from the checked-out git branch, e.g.
+    /// a PR's `fix-price` git branch running against the `pr-preview-fix-price`
+    /// Rocky branch. `None` for a production run, a `--shadow` /
+    /// `--shadow-schema` run, or a record written before this field existed.
+    ///
+    /// `rocky preview diff` / `rocky preview cost` select the branch-side run
+    /// by matching this field, not `git_branch`, so a run and its preview
+    /// pair correctly regardless of which git branch produced it.
+    ///
+    /// Serde-defaulted so records written before this field existed
+    /// forward-deserialize to `None` — no `CURRENT_SCHEMA_VERSION` bump.
+    /// Guarded by `test_pre_rocky_branch_run_record_forward_deserializes_to_none`.
+    #[serde(default)]
+    pub rocky_branch: Option<String>,
 }
 
 /// One executed data-quality check's pass/fail outcome, captured on a
@@ -7965,6 +7985,7 @@ mod tests {
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
         }
     }
 
@@ -8331,6 +8352,41 @@ mod tests {
                 .check_gate_failed,
             "a run with no gate must read back false"
         );
+    }
+
+    /// A `RunRecord` blob written before `rocky_branch` existed (#2032) has
+    /// no `rocky_branch` key at all. It must forward-deserialize with the
+    /// field `None` — never crash the read, and never fabricate a branch
+    /// name for a pre-upgrade record.
+    #[test]
+    fn test_pre_rocky_branch_run_record_forward_deserializes_to_none() {
+        let mut value = serde_json::to_value(minimal_run_record("run-pre-branch", vec![]))
+            .expect("serialize run record");
+        let obj = value.as_object_mut().expect("record is an object");
+        assert!(
+            obj.remove("rocky_branch").is_some(),
+            "precondition: the field is serialized, so removing it models a pre-upgrade blob"
+        );
+        let blob = serde_json::to_vec(&value).expect("reserialize without the field");
+
+        let record: RunRecord = serde_json::from_slice(&blob)
+            .expect("a pre-rocky_branch RunRecord must forward-deserialize");
+        assert_eq!(record.run_id, "run-pre-branch");
+        assert!(
+            record.rocky_branch.is_none(),
+            "a pre-upgrade record reads as no recorded Rocky branch"
+        );
+
+        // A record carrying the branch round-trips losslessly, and
+        // independently of `git_branch` — the two fields can legitimately
+        // disagree (a PR's git branch differs from its preview branch).
+        let mut branched = minimal_run_record("run-branched", vec![]);
+        branched.git_branch = Some("fix-price".to_string());
+        branched.rocky_branch = Some("pr-preview-fix-price".to_string());
+        let round: RunRecord =
+            serde_json::from_slice(&serde_json::to_vec(&branched).unwrap()).unwrap();
+        assert_eq!(round.git_branch.as_deref(), Some("fix-price"));
+        assert_eq!(round.rocky_branch.as_deref(), Some("pr-preview-fix-price"));
     }
 
     #[test]

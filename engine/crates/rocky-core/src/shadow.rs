@@ -24,6 +24,23 @@ pub struct ShadowConfig {
     /// Whether to drop shadow tables after comparison completes (default: `true`).
     #[serde(default = "default_cleanup")]
     pub cleanup_after: bool,
+
+    /// The named Rocky branch (`rocky run --branch <name>`) that produced this
+    /// shadow config, when this config came from a branch rather than a
+    /// one-off `--shadow` / `--shadow-schema` invocation. `None` for plain
+    /// shadow mode.
+    ///
+    /// This is the **literal name passed to `--branch`** (`BranchRecord.name`),
+    /// not the derived `schema_override` (`BranchRecord.schema_prefix`, e.g.
+    /// `branch__<name>`) — the two are related by a formatting convention
+    /// that could change, so recovering the name by stripping a `branch__`
+    /// prefix off `schema_override` would be fragile. Carried through to
+    /// [`rocky_core::state::RunRecord::rocky_branch`] via the CLI's audit
+    /// trail so `rocky preview diff` can find a `--branch`-scoped run
+    /// without relying on `git symbolic-ref`, which records the checkout's
+    /// git branch, not the Rocky branch (#2032).
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 fn default_suffix() -> String {
@@ -40,6 +57,7 @@ impl Default for ShadowConfig {
             suffix: default_suffix(),
             schema_override: None,
             cleanup_after: true,
+            branch: None,
         }
     }
 }

@@ -324,8 +324,11 @@ pub async fn run_transformation(
     // Transformation runs have no single target catalog (per-model targets
     // resolve from each model's sidecar), so `target_catalog = None` — the
     // same posture as the model-only path.
-    let audit_ctx =
-        super::run_audit::AuditContext::detect(idempotency_key.map(str::to_string), None);
+    let audit_ctx = super::run_audit::AuditContext::detect(
+        idempotency_key.map(str::to_string),
+        None,
+        shadow_config.and_then(|c| c.branch.clone()),
+    );
     let audit = super::run::audit_to_record(&audit_ctx);
     let custody = super::run::RecordCustody::from_persisted(super::run::persist_run_record(
         state_store.as_ref(),
@@ -905,7 +908,10 @@ pub async fn run_quality(
     // trigger are read from the environment inside `persist_run_record`.
     let store = StateStore::open(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-    let audit_ctx = super::run_audit::AuditContext::detect(None, None);
+    // `rocky run --branch` is not supported for quality pipelines (their
+    // targets do not carry a shadow/branch concept), so there is no
+    // `ShadowConfig` here to read a Rocky branch from.
+    let audit_ctx = super::run_audit::AuditContext::detect(None, None, None);
     let audit = super::run::audit_to_record(&audit_ctx);
     let recorded = super::run::persist_run_record(
         Some(&store),
@@ -1516,7 +1522,9 @@ pub async fn run_snapshot(
     // read from the environment inside `persist_run_record`.
     let store = StateStore::open(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-    let audit_ctx = super::run_audit::AuditContext::detect(None, None);
+    // `rocky run --branch` is not supported for snapshot pipelines either
+    // (same reasoning as `run_quality` above) — no `ShadowConfig` here.
+    let audit_ctx = super::run_audit::AuditContext::detect(None, None, None);
     let audit = super::run::audit_to_record(&audit_ctx);
     super::run::persist_run_record(
         Some(&store),
