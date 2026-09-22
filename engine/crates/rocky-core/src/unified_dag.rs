@@ -966,8 +966,21 @@ pub fn infer_runtime_dependencies(
                 .push((label.clone(), claimants.len()));
         }
         // The single-slot map's insert order made the LAST claimant the one
-        // whose edges the old code produced.
-        if let Some((last, _)) = claimants.last() {
+        // whose edges the old code produced. #1629 P2: when a seed, load, or
+        // legacy replication node's label collides with a TRANSFORMATION
+        // model's, the model always wins — never the seed/load — regardless
+        // of node build order. Node build order is an insertion-order
+        // artifact (seeds are always added before pipeline nodes; pipelines
+        // iterate in config order), not a semantic ranking, so it must not
+        // decide whether a reader is ordered after the model that renders
+        // the SQL it is compiled from, or after an unrelated same-named
+        // producer. The collision is still reported either way.
+        let winner = claimants
+            .iter()
+            .rev()
+            .find(|(_, kind)| *kind == NodeKind::Transformation)
+            .or_else(|| claimants.last());
+        if let Some((last, _)) = winner {
             legacy_winner.insert(label.as_str(), last.clone());
         }
     }
@@ -3240,6 +3253,58 @@ mod tests {
         assert!(
             !from_p0 && from_p1,
             "exactly the legacy (last) claimant's edge — main's graph"
+        );
+    }
+
+    /// #1629 P2: a seed (or load) whose label collides with a TRANSFORMATION
+    /// model's never wins the label — the model does, regardless of node
+    /// build order. Here the seed node is pushed after the transformation
+    /// nodes, so build order alone would make it the "last claimant"; the
+    /// policy must override that and still report the collision.
+    #[test]
+    fn a_colliding_seed_never_wins_the_label_over_a_model() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        let mut shared = model("shared", vec![], vec![]);
+        shared.sql = "SELECT 1 AS x".into();
+        let mut reader = model("reader", vec![], vec![]);
+        reader.sql = "SELECT x FROM shared".into();
+        let by_pipeline =
+            owned_by_sole_transformation(&config, vec![shared.clone(), reader.clone()]);
+        let mut dag = build_unified_dag(&config, &by_pipeline, &[]).expect("build dag");
+        // Pushed AFTER the transformation nodes: build order alone would
+        // make this the legacy ("last claimant") winner.
+        let seed_id = NodeId::new("seed", "shared");
+        dag.nodes.push(UnifiedNode {
+            id: seed_id.clone(),
+            kind: NodeKind::Seed,
+            label: "shared".into(),
+            pipeline: None,
+        });
+        let sql: HashMap<String, String> = HashMap::from([
+            ("shared".to_string(), shared.sql.clone()),
+            ("reader".to_string(), reader.sql.clone()),
+        ]);
+        let report = infer_runtime_dependencies(&mut dag, &sql);
+        assert_eq!(report.label_collisions, vec![("shared".to_string(), 2)]);
+        let reader_id = dag
+            .nodes
+            .iter()
+            .find(|n| n.label == "reader" && n.kind == NodeKind::Transformation)
+            .unwrap()
+            .id
+            .clone();
+        let model_id = NodeId::new("transformation", "shared");
+        let from_model = dag
+            .edges
+            .iter()
+            .any(|e| e.from == model_id && e.to == reader_id);
+        let from_seed = dag
+            .edges
+            .iter()
+            .any(|e| e.from == seed_id && e.to == reader_id);
+        assert!(
+            from_model && !from_seed,
+            "the model must win the label over the colliding seed: model={from_model} seed={from_seed}"
         );
     }
 

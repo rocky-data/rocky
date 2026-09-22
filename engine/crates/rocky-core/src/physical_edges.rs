@@ -214,10 +214,27 @@ pub fn derive_physical_edges(
         for r in refs {
             let parts: Vec<String> = r.split('.').map(fold_identifier).collect();
             let (tier, producers): (u8, Option<&Vec<&str>>) = match parts.len() {
-                3 => (
-                    0,
-                    by_three.get(&(parts[0].clone(), parts[1].clone(), parts[2].clone())),
-                ),
+                // A three-part read is matched against the exact
+                // (catalog, schema, table) index first. A model whose
+                // `[target]` omits catalog identity (`catalog = ""`, the
+                // common DuckDB single-catalog shape) is indexed under an
+                // empty catalog, so a `cat.schema.table` read naming the
+                // warehouse's real catalog never matches there and the true
+                // edge would silently disappear (#1629 P1). Falling back to
+                // the two-part (schema, table) index — the same lookup a
+                // native two-part read uses, hence the same tier — recovers
+                // it: this ignores the read's catalog component, which is
+                // the same "unnecessary constraint over a missed one" trade
+                // this module already makes elsewhere.
+                3 => {
+                    let exact =
+                        by_three.get(&(parts[0].clone(), parts[1].clone(), parts[2].clone()));
+                    if exact.is_some() {
+                        (0, exact)
+                    } else {
+                        (1, by_two.get(&(parts[1].clone(), parts[2].clone())))
+                    }
+                }
                 2 => (1, by_two.get(&(parts[0].clone(), parts[1].clone()))),
                 // A bare read resolves through connection state (search path /
                 // current schema) Rocky cannot observe. A bare MODEL-name
@@ -395,6 +412,30 @@ mod tests {
             vec![("mart_qualified".to_string(), "orders".to_string())]
         );
         assert!(d.skipped_cycle_edges.is_empty() && d.unparsed.is_empty());
+    }
+
+    /// #1629 P1: a model indexed under an empty catalog (`catalog = ""`,
+    /// the DuckDB single-catalog shape) is still found by a three-part read
+    /// that names the warehouse's real catalog — the two-part index
+    /// fallback recovers the edge the exact three-part lookup misses.
+    #[test]
+    fn a_three_part_read_falls_back_to_the_two_part_index_on_an_empty_catalog() {
+        let models = [
+            m("orders", "", "main", "orders", "SELECT 1 AS id"),
+            m(
+                "mart",
+                "db",
+                "main",
+                "mart",
+                "SELECT id FROM db.main.orders",
+            ),
+        ];
+        let d = derive_physical_edges(&models, &[]);
+        assert_eq!(
+            d.edges,
+            vec![("mart".to_string(), "orders".to_string())],
+            "{d:?}"
+        );
     }
 
     /// A renamed target (model name ≠ table name) still matches — the case
