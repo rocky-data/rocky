@@ -19,8 +19,13 @@ export function ReviewScreen({
   now?: number;
 }) {
   const segments = useSegments();
-  // `/ui/review` → [], `/ui/review/<id>` → ["<id>"].
-  const planId = segments[1] ?? null;
+  // `/ui/review` → [], `/ui/review/<id>` → ["<id>"]. The segment is still
+  // `encodeURIComponent`-escaped (`reviewPath` encodes it going in); decode it
+  // here the way `GovernorScreen` decodes its own subject segments, or a plan
+  // id with a character that escapes (`draft:orders`) reaches the loaders
+  // still encoded and the escalation filter compares against the wrong string
+  // (#2090).
+  const planId = segments[1] !== undefined ? decodeURIComponent(segments[1]) : null;
 
   if (planId !== null) {
     return <PlanDetail planId={planId} loaders={planLoaders} />;
