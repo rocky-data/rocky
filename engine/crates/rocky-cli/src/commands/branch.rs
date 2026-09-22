@@ -886,6 +886,12 @@ pub(crate) async fn run_promote_apply(
     // unchanged, so the builder's guard does not reach a plan written before
     // it. Re-check the names here, against the dialect this apply resolved
     // (#1939).
+    //
+    // This check reads `target` / `source` as recorded on the plan, not names
+    // parsed back out of `statement` — the two are not re-bound to each
+    // other. That is deliberate: `.rocky/plans/` is a trusted input (#1943),
+    // so the recorded names are what apply is entitled to trust in the first
+    // place.
     reject_unquotable_promote_names(adapter.dialect(), targets)?;
 
     let mut targets_out: Vec<crate::output::PromoteTarget> = Vec::new();
