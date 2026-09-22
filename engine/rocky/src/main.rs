@@ -892,7 +892,9 @@ enum Command {
         ///
         /// Supported on every state backend: `local` (a redb write
         /// transaction), `valkey`/`tiered` (`SET NX EX`), and `s3`/`gcs`
-        /// (an atomic conditional PUT).
+        /// (a conditional PUT). The initial claim is race-free on every
+        /// backend; recovery from a crashed prior claim is best-effort —
+        /// two callers can both adopt one stale claim.
         ///
         /// ⚠️ Keys are stored verbatim in the state store; do NOT put
         /// secrets in idempotency keys.
@@ -1066,7 +1068,9 @@ enum Command {
         ///
         /// Supported on every state backend: `local` (a redb write
         /// transaction), `valkey`/`tiered` (`SET NX EX`), and `s3`/`gcs`
-        /// (an atomic conditional PUT).
+        /// (a conditional PUT). The initial claim is race-free on every
+        /// backend; recovery from a crashed prior claim is best-effort —
+        /// two callers can both adopt one stale claim.
         ///
         /// ⚠️ Keys are stored verbatim in the state store; do NOT put
         /// secrets in idempotency keys.
@@ -1621,8 +1625,10 @@ enum Command {
         #[arg(long)]
         rocky_project: Option<PathBuf>,
         /// Number of rows to sample per table. Accepted but currently
-        /// ignored: `validate-migration` runs a compile-only comparison
-        /// and opens no warehouse adapter.
+        /// ignored: `validate-migration` imports the dbt project,
+        /// compares model names against the optional Rocky project, and
+        /// reports which dbt tests convert to Rocky contracts — it does
+        /// not verify Rocky-side checks and opens no warehouse adapter.
         #[arg(long)]
         sample_size: Option<usize>,
     },
