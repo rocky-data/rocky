@@ -197,6 +197,12 @@ jsonwebtoken = { version = "11.0", default-features = false, features = ["aws_lc
 rsa = { version = "0.9", features = ["pem"] }
 base64 = "0.23"
 
+# Zlib decompression for the Dagster Pipes bootstrap env vars (`dagster_pipes.decode_param`
+# always zlib-compresses before base64 — see `rocky-cli/src/pipes.rs::detect`). Version pinned
+# to what was already resolved transitively in Cargo.lock, so adding it as a direct dependency
+# causes no lockfile churn.
+flate2 = "1.1.9"
+
 # String similarity
 strsim = "0.11"
 
