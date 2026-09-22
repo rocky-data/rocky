@@ -422,6 +422,27 @@ pub fn inline_separators(template: &str) -> Vec<String> {
     found
 }
 
+/// Every placeholder NAME referenced in `template` — the `{name}` in
+/// `{name}` / `{name:SEP}`, in the order they appear, duplicates included.
+///
+/// Walks the template with the same parser that renders it, so this and
+/// what actually resolves at runtime cannot drift. Used by `rocky
+/// validate` (#2005) to catch a `catalog_template` / `schema_template`
+/// placeholder that names no component the pipeline's `schema_pattern`
+/// binds — [`render_placeholders`] otherwise passes an unknown
+/// placeholder through unchanged, so the mistake would only surface as a
+/// literal `{typo}` in a live catalog/schema name at run time.
+pub fn template_placeholder_names(template: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    render_placeholders(template, |name, _sep, _out| {
+        found.push(name.to_string());
+        // Leave the placeholder alone: this walk reads the template, it does
+        // not render it.
+        false
+    });
+    found
+}
+
 /// Walks `template` the way a name is rendered from it, so every reader of
 /// the placeholder grammar shares one implementation.
 ///

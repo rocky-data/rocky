@@ -1027,7 +1027,8 @@ fn validate_replication_pipeline(
     let mut ok = true;
 
     // Validate schema pattern
-    match pipeline.schema_pattern() {
+    let pattern_result = pipeline.schema_pattern();
+    match &pattern_result {
         Ok(_) => msgs.push(ValidateMessage {
             severity: "ok".into(),
             code: "V021".into(),
@@ -1044,6 +1045,57 @@ fn validate_replication_pipeline(
                 file: None,
                 field: Some(format!("pipeline.{name}.source.schema_pattern")),
             });
+        }
+    }
+
+    // V049: every `{placeholder}` in catalog_template / schema_template must
+    // name a component `schema_pattern.components` actually binds.
+    // `render_placeholders` (what `resolve_template` uses at run time) passes
+    // an unknown placeholder through UNCHANGED rather than rejecting it, so
+    // without this check `catalog_template = "{nope}"` reports `valid: true`
+    // and the literal text "{nope}" becomes the catalog name Rocky tries to
+    // create/write to at run time (#2005).
+    if let Ok(pattern) = &pattern_result {
+        let known: Vec<&str> = pattern
+            .components
+            .iter()
+            .filter_map(|c| match c {
+                rocky_core::schema::PatternComponent::Fixed(_) => None,
+                rocky_core::schema::PatternComponent::Variable { name }
+                | rocky_core::schema::PatternComponent::VariableLength { name }
+                | rocky_core::schema::PatternComponent::Terminal { name } => {
+                    Some(name.as_str())
+                }
+            })
+            .collect();
+
+        for (field, template) in [
+            ("catalog_template", pipeline.target.catalog_template.as_str()),
+            ("schema_template", pipeline.target.schema_template.as_str()),
+        ] {
+            let mut reported = std::collections::HashSet::new();
+            for placeholder in rocky_core::schema::template_placeholder_names(template) {
+                if !known.contains(&placeholder.as_str()) && reported.insert(placeholder.clone())
+                {
+                    ok = false;
+                    msgs.push(ValidateMessage {
+                        severity: "error".into(),
+                        code: "V049".into(),
+                        message: format!(
+                            "pipeline.{name}: target.{field} references unknown placeholder \
+                             '{{{placeholder}}}' — known components from \
+                             source.schema_pattern.components: {}",
+                            if known.is_empty() {
+                                "(none)".to_string()
+                            } else {
+                                known.join(", ")
+                            }
+                        ),
+                        file: None,
+                        field: Some(format!("pipeline.{name}.target.{field}")),
+                    });
+                }
+            }
         }
     }
 
@@ -2786,6 +2838,84 @@ schema_template = "demo"
             .filter(|m| m.code == "V021" && m.severity == "error")
             .collect();
         assert_eq!(schema_errors.len(), 1);
+    }
+
+    /// #2005 case 2: `catalog_template = "{nope}"` names a placeholder the
+    /// pipeline's `schema_pattern.components` never binds. Previously
+    /// `valid: true` — the run then fails, or worse, silently writes to a
+    /// catalog literally named `{nope}`.
+    #[test]
+    fn test_unknown_catalog_template_placeholder_is_v049() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = "warehouse.duckdb"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "{nope}"
+schema_template = "demo"
+"#,
+        );
+        assert!(!out.valid, "unknown placeholder must refuse: {:?}", out.messages);
+        let v049: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V049" && m.severity == "error")
+            .collect();
+        assert_eq!(v049.len(), 1, "expected one V049: {:?}", out.messages);
+        assert!(v049[0].message.contains("{nope}"));
+        assert!(v049[0].message.contains("source"));
+        assert_eq!(
+            v049[0].field.as_deref(),
+            Some("pipeline.poc.target.catalog_template")
+        );
+    }
+
+    /// Counter-check: a placeholder that names a real component (including
+    /// one used in BOTH templates) is not an error.
+    #[test]
+    fn test_known_template_placeholder_is_not_v049() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = "warehouse.duckdb"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["tenant", "source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "{tenant}_warehouse"
+schema_template = "staging__{source}"
+"#,
+        );
+        assert!(
+            !out.messages.iter().any(|m| m.code == "V049"),
+            "known placeholders must not trigger V049: {:?}",
+            out.messages
+        );
     }
 
     #[test]
