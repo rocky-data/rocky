@@ -360,8 +360,16 @@ fn newest_branch_and_base_runs(
                 )),
             ));
         }
+        // A NAMED base must match an ORDINARY run on that git branch, not a
+        // `--branch`-scoped one recorded there: `rocky run --branch scratch`
+        // executed from git checkout `main` records `git_branch:
+        // Some("main")`, `rocky_branch: Some("scratch")` — matching on
+        // `git_branch` alone would hand a `--base main` caller that scoped
+        // run instead of an ordinary main run.
         let by_branch = store
-            .list_runs_matching(1, |r| r.git_branch.as_deref() == Some(base_ref))?
+            .list_runs_matching(1, |r| {
+                r.git_branch.as_deref() == Some(base_ref) && r.rocky_branch.is_none()
+            })?
             .into_iter()
             .next();
         if let Some(run) = by_branch {
@@ -445,8 +453,18 @@ fn newest_branch_and_base_runs(
     // for the same reason (#2032): this must exclude the branch's OWN run
     // from becoming its own base, and only `rocky_branch` reliably identifies
     // that run.
+    //
+    // The second clause covers a record written BEFORE `rocky_branch`
+    // existed: it forward-deserializes with `rocky_branch: None`, so the
+    // first clause alone cannot see it — but if its `git_branch` happens to
+    // equal this preview's branch name, that is the shape a pre-#2032 branch
+    // run actually had (back when `git_branch` was the pairing key), and it
+    // must not be treated as an ordinary "not this branch" candidate.
     let fallback = store
-        .list_runs_matching(1, |r| r.rocky_branch.as_deref() != Some(branch_name))?
+        .list_runs_matching(1, |r| {
+            r.rocky_branch.as_deref() != Some(branch_name)
+                && !(r.rocky_branch.is_none() && r.git_branch.as_deref() == Some(branch_name))
+        })?
         .into_iter()
         .next();
     Ok((branch_run, fallback, None))
@@ -1027,9 +1045,6 @@ fn build_preview_diff(
     (summary, models)
 }
 
-/// Render a `PreviewDiffOutput` summary into the Markdown the PR-comment
-/// surface posts verbatim. Format is stable: changing it requires
-/// updating fixtures.
 /// Render a row count for the markdown table: `?` for `None` (unmeasured —
 /// see `PreviewSampledRowDiff::rows_added`), the number otherwise. Never
 /// prints `0` for a `None` — that would recreate the exact false-clean this
@@ -1041,6 +1056,9 @@ fn fmt_rows(v: Option<u64>) -> String {
     }
 }
 
+/// Render a `PreviewDiffOutput` summary into the Markdown the PR-comment
+/// surface posts verbatim. Format is stable: changing it requires
+/// updating fixtures.
 fn render_preview_diff_markdown(
     branch_name: &str,
     base_ref: &str,
@@ -2441,6 +2459,113 @@ mod tests {
             "cost keeps main's semantics, detached eligible"
         );
         assert!(cost_note.is_none());
+    }
+
+    /// Drain review of #2158, finding 3: the cost-preview (unnamed) fallback
+    /// matches on `rocky_branch`, not `git_branch`, same as the branch-side
+    /// selection. Every fixture above gave the branch's own run the SAME
+    /// `git_branch` and `rocky_branch` string, so reverting the predicate to
+    /// `git_branch` would still pass all of them — this fixture gives the
+    /// two fields DIFFERENT values (the documented PR shape: git checkout
+    /// `fix-price`, `rocky run --branch pr_preview_fix_price`) so a
+    /// reversion is actually caught: on `git_branch` alone the branch's own
+    /// (newer) run would satisfy "not this branch" and become its own cost
+    /// baseline.
+    #[test]
+    fn cost_baseline_excludes_the_branch_run_by_rocky_branch_not_git_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = chrono::Utc::now();
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut main_run = sample_run("main-run", base);
+            main_run.git_branch = Some("main".to_string());
+            store.record_run(&main_run).unwrap();
+            // Newer than the main run, so it wins the "newest eligible" race
+            // if it were wrongly treated as an eligible baseline candidate.
+            let mut branch_run = sample_run("branch-run", base + chrono::Duration::minutes(1));
+            branch_run.git_branch = Some("fix-price".to_string());
+            branch_run.rocky_branch = Some("pr_preview_fix_price".to_string());
+            store.record_run(&branch_run).unwrap();
+        }
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        let (_b, base_run, note) =
+            newest_branch_and_base_runs(&store, "pr_preview_fix_price", None).unwrap();
+        assert_eq!(
+            base_run.unwrap().run_id,
+            "main-run",
+            "the cost baseline must be the main run, not the branch's own run"
+        );
+        assert!(note.is_none());
+    }
+
+    /// Drain review of #2158, finding 4: a NAMED base match by git branch
+    /// must exclude a `--branch`-scoped run recorded on that git checkout.
+    /// `rocky run --branch scratch` executed from git branch `main` records
+    /// `git_branch: Some("main")`, `rocky_branch: Some("scratch")` —
+    /// matching `--base main` on `git_branch` alone would hand back that
+    /// scoped run instead of an ordinary `main` run.
+    #[test]
+    fn named_base_by_git_branch_excludes_a_branch_scoped_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = chrono::Utc::now();
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut ordinary = sample_run("ordinary-main", base);
+            ordinary.git_branch = Some("main".to_string());
+            store.record_run(&ordinary).unwrap();
+            // Newer, so it wins the "newest matching git_branch" race unless
+            // the `--branch`-scoped exclusion is applied.
+            let mut scoped = sample_run("scoped-scratch", base + chrono::Duration::minutes(1));
+            scoped.git_branch = Some("main".to_string());
+            scoped.rocky_branch = Some("scratch".to_string());
+            store.record_run(&scoped).unwrap();
+        }
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        let (_b, base_run, note) =
+            newest_branch_and_base_runs(&store, "feature", Some("main")).unwrap();
+        assert_eq!(
+            base_run.unwrap().run_id,
+            "ordinary-main",
+            "a --branch-scoped run recorded on the named git branch must not become the base"
+        );
+        assert!(note.is_none());
+    }
+
+    /// Drain review of #2158, finding 5: a `RunRecord` written before
+    /// `rocky_branch` existed (#2032) forward-deserializes with
+    /// `rocky_branch: None` (see
+    /// `test_pre_rocky_branch_run_record_forward_deserializes_to_none` in
+    /// `rocky-core`). If its `git_branch` happens to equal the preview's
+    /// branch name — the shape a pre-#2032 branch run actually had, back
+    /// when `git_branch` was the pairing key — the unnamed (cost) fallback
+    /// must not treat it as an ordinary "not this branch" candidate.
+    #[test]
+    fn cost_fallback_excludes_a_pre_rocky_branch_record_matching_by_git_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = chrono::Utc::now();
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut main_run = sample_run("main-run", base);
+            main_run.git_branch = Some("main".to_string());
+            store.record_run(&main_run).unwrap();
+            // Newer, no `rocky_branch` at all (pre-#2032 shape), but its
+            // `git_branch` literally equals the preview branch name.
+            let mut legacy = sample_run("legacy-branch-run", base + chrono::Duration::minutes(1));
+            legacy.git_branch = Some("pr-preview-fix-price".to_string());
+            store.record_run(&legacy).unwrap();
+        }
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        let (_b, base_run, note) =
+            newest_branch_and_base_runs(&store, "pr-preview-fix-price", None).unwrap();
+        assert_eq!(
+            base_run.unwrap().run_id,
+            "main-run",
+            "a pre-rocky_branch record matching by git_branch must not become the cost baseline"
+        );
+        assert!(note.is_none());
     }
 
     /// `--name X --base X` refuses up front — the same run diffed against

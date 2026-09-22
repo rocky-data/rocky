@@ -908,9 +908,13 @@ pub async fn run_quality(
     // trigger are read from the environment inside `persist_run_record`.
     let store = StateStore::open(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-    // `rocky run --branch` is not supported for quality pipelines (their
-    // targets do not carry a shadow/branch concept), so there is no
-    // `ShadowConfig` here to read a Rocky branch from.
+    // Quality pipelines ignore `--branch` today: unlike the snapshot/load
+    // dispatch (which calls `reject_unsupported_shadow` in `run.rs` and
+    // refuses the flag outright), the flag is never threaded into
+    // `run_quality` at all, so there is no `ShadowConfig` here to read a
+    // Rocky branch from and this run's record carries no branch. Nothing
+    // tells the caller their `--branch` was ignored — refusing it like
+    // snapshot/load do is tracked in #2161.
     let audit_ctx = super::run_audit::AuditContext::detect(None, None, None);
     let audit = super::run::audit_to_record(&audit_ctx);
     let recorded = super::run::persist_run_record(
@@ -2223,7 +2227,7 @@ auto_create_schemas = true
     /// key in its audit.
     ///
     /// Before the fix, `run_transformation` built its audit with
-    /// `AuditContext::detect(None, None)`, so the persisted `RunRecord`'s
+    /// `AuditContext::detect(None, None, None)`, so the persisted `RunRecord`'s
     /// `idempotency_key` was `None` even though the run finalized the
     /// idempotency entry under `K` — `rocky history --audit` showed
     /// `idempotency_key=-` instead of `K`. The model-only / replication paths
