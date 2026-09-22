@@ -1060,8 +1060,9 @@ fn validate_replication_pipeline(
     // `render_placeholders` (what `resolve_template` uses at run time) passes
     // an unknown placeholder through UNCHANGED rather than rejecting it, so
     // without this check `catalog_template = "{nope}"` reports `valid: true`
-    // and the literal text "{nope}" becomes the catalog name Rocky tries to
-    // create/write to at run time (#2005).
+    // and the run fails with an invalid-identifier error on the literal,
+    // unresolved text "{nope}" — `validate_identifier` rejects `{`/`}`, so
+    // the catalog is never created or written to (#2005).
     if let Ok(pattern) = &pattern_result {
         let known: Vec<&str> = pattern
             .components
@@ -1103,6 +1104,36 @@ fn validate_replication_pipeline(
                     });
                 }
             }
+        }
+    }
+
+    // V056 (#2152 review): a `{placeholder}` with no closing `}` — e.g.
+    // `catalog_template = "{source"` — is silently copied through as
+    // literal text by the same scanner V049 relies on
+    // (`template_placeholder_names` reports NO name for it), so a typo'd
+    // brace otherwise reads as "no placeholder at all" rather than the
+    // malformed template it is. Runs regardless of whether the schema
+    // pattern itself parsed, since this is a purely textual check on the
+    // template strings.
+    for (field, template) in [
+        (
+            "catalog_template",
+            pipeline.target.catalog_template.as_str(),
+        ),
+        ("schema_template", pipeline.target.schema_template.as_str()),
+    ] {
+        if rocky_core::schema::has_unclosed_placeholder_brace(template) {
+            msgs.push(ValidateMessage {
+                severity: "warn".into(),
+                code: "V056".into(),
+                message: format!(
+                    "pipeline.{name}: target.{field} = '{template}' has an unmatched '{{' — a \
+                     placeholder must be closed with '}}', e.g. '{{name}}'. The stray brace is \
+                     treated as literal text at run time."
+                ),
+                file: None,
+                field: Some(format!("pipeline.{name}.target.{field}")),
+            });
         }
     }
 
@@ -1160,10 +1191,19 @@ fn validate_replication_pipeline(
     // project's script and CI for a discovery that never happens. Only
     // checked when the discovery adapter resolved (V024 above already
     // reports an unknown one — no need to double-report).
+    //
+    // An absent `path` key AND an explicit `path = ":memory:"` (or `""`)
+    // are the same case: `catalog_name_for_path` treats both as DuckDB's
+    // own in-memory special case, so this check must too — otherwise an
+    // adapter that spells out `:memory:` explicitly would silently escape
+    // the warning that an equivalent unset `path` correctly triggers.
     if let Some(ref disc) = pipeline.source.discovery
         && let Some(disc_adapter) = cfg.adapters.get(&disc.adapter)
         && disc_adapter.adapter_type == "duckdb"
-        && disc_adapter.path.is_none()
+        && disc_adapter
+            .path
+            .as_deref()
+            .is_none_or(|p| p.is_empty() || p == ":memory:")
     {
         msgs.push(ValidateMessage {
             severity: "warn".into(),
@@ -2690,6 +2730,85 @@ schema_template = "demo"
         );
     }
 
+    /// #2152 review: `path = ":memory:"` is DuckDB's own explicit spelling
+    /// of the in-memory case — the same thing an absent `path` means. V054
+    /// must fire for it exactly as it does for a fully absent `path`,
+    /// rather than being read as "a path is set" and escaping the warning.
+    #[test]
+    fn test_duckdb_discovery_adapter_with_explicit_memory_path_is_v054() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "memory"
+schema_template = "demo"
+"#,
+        );
+        let v054: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V054" && m.severity == "warn")
+            .collect();
+        assert_eq!(
+            v054.len(),
+            1,
+            "explicit path = ':memory:' must trigger V054 like an absent path: {:?}",
+            out.messages
+        );
+    }
+
+    /// #2152 review: `path = ":memory:"` with the CORRECT `catalog_template
+    /// = "memory"` must NOT trigger V055 — before the `catalog_name_for_path`
+    /// fix, the file-stem derivation treated `:memory:`'s base name as a
+    /// literal `":memory:"` catalog, so this exact correct config produced a
+    /// false mismatch warning naming `':memory:'` as the expected catalog.
+    #[test]
+    fn test_duckdb_target_memory_path_with_matching_template_is_not_v055() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "memory"
+schema_template = "demo"
+"#,
+        );
+        assert!(
+            !out.messages.iter().any(|m| m.code == "V055"),
+            "catalog_template = 'memory' must match path = ':memory:', no V055: {:?}",
+            out.messages
+        );
+    }
+
     #[test]
     fn test_multiple_kind_issues_all_surface() {
         // Two unrelated kind issues in the same file — both should
@@ -3059,8 +3178,9 @@ schema_template = "demo"
 
     /// #2005 case 2: `catalog_template = "{nope}"` names a placeholder the
     /// pipeline's `schema_pattern.components` never binds. Previously
-    /// `valid: true` — the run then fails, or worse, silently writes to a
-    /// catalog literally named `{nope}`.
+    /// `valid: true` — the run then fails with an invalid-identifier error
+    /// on the literal, unresolved `{nope}` (`validate_identifier` rejects
+    /// `{`/`}`, so it is refused before any write).
     #[test]
     fn test_unknown_catalog_template_placeholder_is_v049() {
         let out = validate_toml(
@@ -3135,6 +3255,86 @@ schema_template = "staging__{source}"
         assert!(
             !out.messages.iter().any(|m| m.code == "V049"),
             "known placeholders must not trigger V049: {:?}",
+            out.messages
+        );
+    }
+
+    /// #2152 review: an unclosed `{` (`"{source"`, no closing `}`) is
+    /// invisible to V049 — `render_placeholders` never recognizes it as a
+    /// placeholder at all, so `template_placeholder_names` reports no name
+    /// for it. V056 catches the stray brace directly.
+    #[test]
+    fn test_unclosed_placeholder_brace_is_v056_warning() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = "warehouse.duckdb"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "{source"
+schema_template = "demo"
+"#,
+        );
+        assert!(
+            out.valid,
+            "an unclosed brace is a warning, not an error: {:?}",
+            out.messages
+        );
+        let v056: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V056" && m.severity == "warn")
+            .collect();
+        assert_eq!(v056.len(), 1, "expected one V056: {:?}", out.messages);
+        assert_eq!(
+            v056[0].field.as_deref(),
+            Some("pipeline.poc.target.catalog_template")
+        );
+    }
+
+    /// Counter-check: a well-formed placeholder (closed brace) must not
+    /// trigger V056, whether or not its name is a known component.
+    #[test]
+    fn test_closed_placeholder_brace_is_not_v056() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = "warehouse.duckdb"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "{source}"
+schema_template = "demo"
+"#,
+        );
+        assert!(
+            !out.messages.iter().any(|m| m.code == "V056"),
+            "a closed brace must not trigger V056: {:?}",
             out.messages
         );
     }

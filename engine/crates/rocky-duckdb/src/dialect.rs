@@ -287,12 +287,14 @@ impl SqlDialect for DuckDbSqlDialect {
 /// The catalog name DuckDB assigns when it attaches the database file at
 /// `path` as the primary database — mirrors
 /// `AttachedDatabase::ExtractDatabaseName` in DuckDB's own
-/// `src/main/attached_database.cpp` (checked against the bundled 1.10503
-/// source and confirmed live against the `duckdb` 1.5.5 CLI, #2005): the
-/// file's base name (any `?query` suffix stripped), split on every `.`, with
-/// empty pieces dropped — the FIRST remaining piece is the name. If that
-/// name collides with a catalog DuckDB reserves (`main`, `temp`, `system`),
-/// DuckDB appends `_db`.
+/// `src/main/attached_database.cpp` (checked against the bundled 1.10505.0
+/// source and confirmed live against the `duckdb` 1.5.5 CLI, #2005): an
+/// empty path or the literal `:memory:` names the catalog `"memory"` (the
+/// in-memory case — checked *before* the file-stem derivation below, exactly
+/// as DuckDB's own function does). Otherwise: the file's base name (any
+/// `?query` suffix stripped), split on every `.`, with empty pieces dropped
+/// — the FIRST remaining piece is the name. If that name collides with a
+/// catalog DuckDB reserves (`main`, `temp`, `system`), DuckDB appends `_db`.
 ///
 /// No such derivation existed anywhere in this crate before this function —
 /// `rocky-duckdb` just opens the file and lets the bundled DuckDB engine
@@ -305,7 +307,11 @@ impl SqlDialect for DuckDbSqlDialect {
 /// - `"main.duckdb"` -> `"main_db"` (collides with the reserved `main` catalog)
 /// - `"my.warehouse.duckdb"` -> `"my"` (DuckDB splits on the FIRST `.`, not the last —
 ///   this differs from [`std::path::Path::file_stem`], which would return `"my.warehouse"`)
+/// - `":memory:"` or `""` -> `"memory"`
 pub fn catalog_name_for_path(path: &str) -> String {
+    if path.is_empty() || path == ":memory:" {
+        return "memory".to_string();
+    }
     let base = std::path::Path::new(path)
         .file_name()
         .and_then(|s| s.to_str())
@@ -371,6 +377,27 @@ mod catalog_name_for_path_tests {
             catalog_name_for_path("warehouse.duckdb?access_mode=ro"),
             "warehouse"
         );
+    }
+
+    /// DuckDB's own `ExtractDatabaseName` checks `dbpath == IN_MEMORY_PATH`
+    /// (`":memory:"`) BEFORE the file-stem derivation, confirmed live
+    /// (`duckdb ":memory:"` prints `memory` for `current_catalog()`). It
+    /// must not fall through to the file-stem logic, which would
+    /// incorrectly treat `:memory:`'s base name as a literal `":memory:"`
+    /// catalog name — the bug a real config caught (#2152 review): `path =
+    /// ":memory:"` with the CORRECT `catalog_template = "memory"` produced
+    /// a false mismatch warning naming `":memory:"` as the expected catalog.
+    #[test]
+    fn memory_literal_path_names_the_memory_catalog() {
+        assert_eq!(catalog_name_for_path(":memory:"), "memory");
+    }
+
+    /// DuckDB's own function also checks `dbpath.empty()` — an empty path
+    /// string is the same in-memory case as `:memory:`, confirmed live (a
+    /// bare `duckdb` with no path argument also prints `memory`).
+    #[test]
+    fn empty_path_names_the_memory_catalog() {
+        assert_eq!(catalog_name_for_path(""), "memory");
     }
 }
 

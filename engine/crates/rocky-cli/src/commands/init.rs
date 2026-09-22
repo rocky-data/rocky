@@ -39,7 +39,23 @@ pub fn init(path: &str, template: Option<&str>) -> Result<()> {
 }
 
 fn init_duckdb(dir: &Path) -> Result<()> {
-    // rocky.toml — minimal, runnable
+    // rocky.toml — minimal, runnable.
+    //
+    // The catalog name below ("playground") MUST equal
+    // `rocky_duckdb::dialect::catalog_name_for_path("playground.duckdb")` —
+    // DuckDB names a file's catalog after its own base name (a DuckDB
+    // adapter has no separate "catalog" concept to configure), and every
+    // reference to that catalog below (`models/_defaults.toml`'s
+    // `[target].catalog`, and the sample model's `FROM` clause) must use
+    // the SAME name, because a single DuckDB file backs exactly one
+    // catalog: the replication step writes into it under this name, and
+    // both the transformation model's read and its own write need to land
+    // in that same catalog. This scaffold shipped with `catalog_template =
+    // "main"` (in reflex, `main` reads as "the primary database") while
+    // `"playground.duckdb"` -> catalog `"playground"`; `rocky run` failed
+    // with "Catalog with name main does not exist" (#2005 review).
+    // `init_duckdb_scaffold_catalog_matches_the_duckdb_derivation` below
+    // pins all three call sites to `catalog_name_for_path`'s answer.
     std::fs::write(
         dir.join("rocky.toml"),
         r#"# Rocky project — DuckDB local quickstart
@@ -52,7 +68,7 @@ path = "playground.duckdb"
 
 [pipeline]
 source.schema_pattern = { prefix = "raw__", separator = "__", components = ["source"] }
-target = { catalog_template = "main", schema_template = "staging__{source}" }
+target = { catalog_template = "playground", schema_template = "staging__{source}" }
 "#,
     )?;
 
@@ -63,7 +79,7 @@ target = { catalog_template = "main", schema_template = "staging__{source}" }
     std::fs::write(
         models_dir.join("_defaults.toml"),
         r#"[target]
-catalog = "main"
+catalog = "playground"
 schema = "silver"
 "#,
     )?;
@@ -77,7 +93,7 @@ schema = "silver"
     amount,
     status,
     _updated_at
-FROM main.staging__orders.orders
+FROM playground.staging__orders.orders
 "#,
     )?;
 
@@ -597,5 +613,49 @@ mod tests {
             init(dir.to_str().unwrap(), Some("nope")).expect_err("unknown template must error");
         let msg = format!("{err}");
         assert!(msg.contains("trino"), "error must list trino: {msg}");
+    }
+
+    /// #2005 (review, #2152): the `duckdb` template's `target.catalog_template`
+    /// must equal the catalog name DuckDB itself assigns `path` — it shipped
+    /// as `"main"` beside `path = "playground.duckdb"`, which DuckDB names
+    /// `"playground"`, so `rocky run` on a freshly-scaffolded project failed
+    /// with "Catalog with name main does not exist". Also pins the two other
+    /// call sites (`models/_defaults.toml`'s `[target].catalog`, and the
+    /// sample model's `FROM` clause) to the same name — a single DuckDB file
+    /// backs exactly one catalog, so all three must agree or the
+    /// transformation model reads (or writes) the wrong place.
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn init_duckdb_scaffold_catalog_matches_the_duckdb_derivation() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("proj");
+        init(dir.to_str().unwrap(), Some("duckdb")).unwrap();
+
+        let cfg = rocky_core::config::load_rocky_config(&dir.join("rocky.toml"))
+            .expect("generated duckdb rocky.toml must parse");
+        let adapter = &cfg.adapters["default"];
+        assert_eq!(adapter.adapter_type, "duckdb");
+        let path = adapter.path.as_deref().expect("duckdb template sets path");
+        let expected = rocky_duckdb::dialect::catalog_name_for_path(path);
+
+        let pipeline = cfg.pipelines["default"]
+            .as_replication()
+            .expect("duckdb template's pipeline is replication");
+        assert_eq!(
+            pipeline.target.catalog_template, expected,
+            "rocky.toml's target.catalog_template must equal catalog_name_for_path({path:?})"
+        );
+
+        let defaults = std::fs::read_to_string(dir.join("models/_defaults.toml")).unwrap();
+        assert!(
+            defaults.contains(&format!("catalog = \"{expected}\"")),
+            "models/_defaults.toml must target the same catalog: {defaults}"
+        );
+
+        let model_sql = std::fs::read_to_string(dir.join("models/stg_orders.sql")).unwrap();
+        assert!(
+            model_sql.contains(&format!("FROM {expected}.")),
+            "the sample model must read from the same catalog: {model_sql}"
+        );
     }
 }
