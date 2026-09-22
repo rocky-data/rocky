@@ -140,4 +140,34 @@ describe("ReviewScreen", () => {
     expect(statusCalls).toEqual([planId]);
     expect(diffCalls).toEqual([planId]);
   });
+
+  // `decodeURIComponent` throws on a segment that is not a valid
+  // percent-escape (a bare "%"), reachable from a hand-edited address bar,
+  // not only from this screen's own links. `render()` has no error boundary
+  // of its own, so an uncaught throw here fails the test the same way it
+  // would blank the whole shell in the app (ReviewScreen sits under one
+  // top-level boundary, not a per-screen one).
+  it("does not throw on a malformed escape, and falls back to the literal segment", async () => {
+    const malformed = "%";
+    at(`/ui/review/${malformed}`);
+
+    const statusCalls: string[] = [];
+    const loaders: PlanLoaders = {
+      ...PLAN_LOADERS,
+      status: vi.fn(async (id: string): Promise<ReviewStatusOutput> => {
+        statusCalls.push(id);
+        return {
+          version: "1.74.0",
+          command: "review_status",
+          plan_id: id,
+          kind: "backfill",
+          reviewed: false,
+        };
+      }),
+    };
+
+    expect(() => render(<ReviewScreen planLoaders={loaders} />)).not.toThrow();
+    await screen.findByText("backfill");
+    expect(statusCalls).toEqual([malformed]);
+  });
 });
