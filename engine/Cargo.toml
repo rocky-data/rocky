@@ -252,7 +252,7 @@ uuid = { version = "1", features = ["v4", "fast-rng"] }
 # versions: 0.33 pairs with opentelemetry 0.32 — pin the pair together.
 opentelemetry = "0.32"
 opentelemetry_sdk = "0.32"
-opentelemetry-otlp = "0.32"
+opentelemetry-otlp = "0.33"
 tracing-opentelemetry = "0.33"
 
 # gRPC stack — used by `rocky-bigquery`'s Storage Read API impl of
