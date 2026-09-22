@@ -62,6 +62,22 @@ use crate::validation::ValidationError;
 /// comparisons only, so this list is a starting point sized to plausible
 /// use, not a survey. A refusal names the function; extending the list is a
 /// one-line change here.
+///
+/// # What the allowlist does not guarantee
+///
+/// The allowlist matches a function's **name**, not the code it runs. A
+/// warehouse that lets a session rebind a built-in under an unqualified
+/// call routes the allowlisted call to the rebound body. Anyone who can
+/// create that binding already has arbitrary SQL access in the same
+/// place, so this guards against accidental non-determinism and volatile
+/// calls, not a hostile warehouse admin. Measured per dialect (#1935):
+///
+/// | Dialect | Unqualified rebind wins? | Measured on |
+/// |---|---|---|
+/// | DuckDB | Yes — an unqualified `CREATE MACRO` shadows the built-in, even for a new session | v1.5.5 |
+/// | Databricks | No — unqualified stays built-in; a qualified override exists but is already refused | Unity Catalog |
+/// | Snowflake | Not probed (no sandbox) | — |
+/// | BigQuery | Not probed (no sandbox) | — |
 pub const CHECK_EXPRESSION_FUNCTIONS: &[&str] = &[
     // null handling / conditionals
     "coalesce",
