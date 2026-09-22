@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The TextMate grammar highlights `let` and the window-frame keywords.** `let`, plus `over`, `partition`, `rows`, `range`, `unbounded` and `current` from window-frame clauses, are real syntax the parser consumes but rendered as plain identifiers. The combined join forms `left_join`, `right_join`, `full_join` and `cross_join` are now highlighted in full too. (#1799)
+
 ### Removed
 
 - **The `strategy-incremental` snippet, and `incremental` from the bundled sidecar schema.** The engine now refuses `type = "incremental"` on a transformation model (E037), because it appended every row again on each run. The snippet is gone, and `schemas/rocky-config.schema.json` no longer lists `incremental`. That schema is registered for JSON validation only, so it does not check `.toml` sidecars in the editor; `rocky compile` reports E037. (#1990)
