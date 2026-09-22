@@ -334,6 +334,125 @@ Upstream output has `"direction": "upstream"` (the default shape, unchanged). Th
 
 ---
 
+## `rocky lineage-diff`
+
+Report the downstream blast radius of a change between two git refs, for PR review. It combines the structural diff from `rocky ci-diff` with the downstream consumers from `rocky lineage --downstream`. Together they show which downstream columns each changed column reaches.
+
+Git selects the changed paths from committed history between `base_ref` and HEAD. The column schemas and the downstream trace, though, come from the current working tree, not a git checkout of HEAD. For a report that must describe HEAD exactly, commit your changes first, so the working tree matches HEAD.
+
+```bash
+rocky lineage-diff [base_ref] [flags]
+```
+
+### Arguments
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `base_ref` | `string` | `main` | Git ref to compare against. Uses the same git-diff mechanism as [`rocky ci-diff`](#rocky-ci-diff). |
+
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--models <PATH>` | `PathBuf` | `models` | Directory containing model files. |
+| `-o, --output <FORMAT>` | `json` \| `table` \| `md` | terminal-aware | `json` emits the full payload, including the pre-rendered report in a `markdown` field. `table` and `md` print that same report directly. |
+
+### Examples
+
+Diff the current branch against `main` and print the Markdown report:
+
+```bash
+rocky lineage-diff main --output table
+```
+
+```text
+Rocky Lineage Diff (main...HEAD)
+
+### Rocky Lineage Diff
+
+**2 row(s) changed** (2 modified, 0 added, 0 removed, 0 unchanged)
+
+<details>
+<summary><b>fct_revenue</b> — modified (3 column changes)</summary>
+
+| Column | Change | Old Type | New Type | Downstream consumers |
+|--------|--------|----------|----------|----------------------|
+| `total_revenue` | added | - | Unknown | _none_ |
+| `total_tax` | added | - | Unknown | _none_ |
+| `total` | removed | Unknown | - | _(removed; not traceable on HEAD)_ |
+
+</details>
+
+<details>
+<summary><b>stg_orders</b> — modified (3 column changes)</summary>
+
+| Column | Change | Old Type | New Type | Downstream consumers |
+|--------|--------|----------|----------|----------------------|
+| `amount_usd` | added | - | Unknown | `fct_revenue.total_revenue` |
+| `tax_amount_usd` | added | - | Unknown | `fct_revenue.total_tax` |
+| `amount` | removed | Unknown | - | _(removed; not traceable on HEAD)_ |
+
+</details>
+```
+
+The same diff as JSON, for a CI pipeline:
+
+```bash
+rocky lineage-diff main -o json
+```
+
+```json
+{
+  "version": "1.74.0",
+  "command": "lineage-diff",
+  "base_ref": "main",
+  "head_ref": "HEAD",
+  "summary": { "total_models": 2, "unchanged": 0, "modified": 2, "added": 0, "removed": 0 },
+  "results": [
+    {
+      "model_name": "fct_revenue",
+      "status": "modified",
+      "column_changes": [
+        { "column_name": "total_revenue", "change_type": "added", "new_type": "Unknown" },
+        { "column_name": "total_tax", "change_type": "added", "new_type": "Unknown" },
+        { "column_name": "total", "change_type": "removed", "old_type": "Unknown" }
+      ]
+    },
+    {
+      "model_name": "stg_orders",
+      "status": "modified",
+      "column_changes": [
+        {
+          "column_name": "amount_usd",
+          "change_type": "added",
+          "new_type": "Unknown",
+          "downstream_consumers": [{ "model": "fct_revenue", "column": "total_revenue" }]
+        },
+        {
+          "column_name": "tax_amount_usd",
+          "change_type": "added",
+          "new_type": "Unknown",
+          "downstream_consumers": [{ "model": "fct_revenue", "column": "total_tax" }]
+        },
+        { "column_name": "amount", "change_type": "removed", "old_type": "Unknown" }
+      ]
+    }
+  ],
+  "markdown": "### Rocky Lineage Diff\n\n..."
+}
+```
+
+A removed column has no downstream trace. The column no longer exists on HEAD's compile, so Rocky cannot walk its downstream reach. JSON omits `downstream_consumers` when it is empty, so a consumer should default a missing key to an empty list. The structural diff still reports the removal.
+
+`rocky lineage-diff` reports; it does not fail a build. Finding changed columns, however many, does not change the exit code. Only an error makes it exit non-zero: an invalid `base_ref`, a `git diff` that fails, or invalid or unreadable project configuration.
+
+### Related Commands
+
+- [`rocky ci-diff`](#rocky-ci-diff) -- the structural diff alone, without the downstream trace
+- [`rocky lineage`](#rocky-lineage) -- trace a single column's lineage directly
+
+---
+
 ## `rocky catalog`
 
 Emit a project-wide column-level lineage snapshot to disk. Walks every model in the SemanticGraph and serializes the result as persisted catalog artifacts (a `catalog.json` front door plus `edges.parquet` / `assets.parquet`) so downstream consumers (BI tools, governance dashboards, AI review bots) can query lineage without re-invoking the engine.
@@ -779,7 +898,7 @@ rocky ci-diff [base_ref] [flags]
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `base_ref` | `string` | `main` | Git ref to compare against. Rocky shells out to `git diff --name-only <base_ref> HEAD` to find changed `.sql`, `.rocky`, and sidecar `.toml` files. |
+| `base_ref` | `string` | `main` | Git ref to compare against. Rocky shells out to `git diff --name-status <base_ref>...HEAD` to find changed `.sql`, `.rocky`, and sidecar `.toml` files. |
 
 ### Flags
 
