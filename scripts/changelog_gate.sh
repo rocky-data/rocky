@@ -45,16 +45,19 @@ readonly MARKER_SHAPE='a line starting "Changelog: none" (case-insensitive), fol
 
 # Prints "start end" (1-indexed; end is the exclusive upper bound) marking
 # the line range strictly BETWEEN the `## [Unreleased]` heading and the
-# next level-2 heading (any `## ...`, not only this repo's current
-# `## [x.y.z] - date` shape -- a PR cannot dodge the boundary by using a
-# differently-formatted release heading) in $CHANGELOG_PATH's HEAD content.
-# Prints nothing if the file is missing or has no Unreleased heading.
+# next level-2 heading (any CommonMark ATX `##` heading -- 0-3 leading
+# spaces, a space or tab separator, not only this repo's current
+# unindented `## [x.y.z] - date` shape -- a PR cannot dodge the boundary
+# with a differently-formatted or merely reindented release heading; see
+# has_changelog_entry for why this was tightened) in $CHANGELOG_PATH's HEAD
+# content. Prints nothing if the file is missing or has no Unreleased
+# heading.
 unreleased_line_range() {
     [[ -f "$CHANGELOG_PATH" ]] || return 0
     awk '
         BEGIN { start = 0; end = 0 }
-        /^## \[Unreleased\]/ && start == 0 { start = NR; next }
-        start != 0 && end == 0 && /^## / { end = NR; exit }
+        /^ {0,3}##[ \t]+\[Unreleased\]/ && start == 0 { start = NR; next }
+        start != 0 && end == 0 && /^ {0,3}##([ \t]|$)/ { end = NR; exit }
         END {
             if (start != 0) {
                 if (end == 0) { end = NR + 1 }
@@ -64,15 +67,21 @@ unreleased_line_range() {
     ' "$CHANGELOG_PATH"
 }
 
-# Prints the HEAD (new-file) line number of every non-blank line the diff
-# added, one per line. Walks $CHANGELOG_DIFF's hunk headers
+# Prints the HEAD (new-file) line number of every non-blank content line the
+# diff added, one per line. Walks $CHANGELOG_DIFF's hunk headers
 # (`@@ -o,oc +n,nc @@`) to seed the new-file line counter, then advances it
 # by one for every context or added line (a removed `-` line does not exist
-# in the new file, so it does not advance the counter).
+# in the new file, so it does not advance the counter). Two things are
+# deliberately NOT counted as content: a `\ No newline at end of file`
+# marker (diff metadata, not a line in either file -- counting it shifted
+# every following line number by one) and anything before the first `@@`
+# (the `---`/`+++` file-header lines -- note this is NOT the same as
+# matching literal `+++`: a real added line that happens to start with `++`
+# is still content once a hunk is open, and an earlier version's blanket
+# `/^\+\+\+/` rule wrongly skipped it too).
 added_line_numbers() {
     awk '
         BEGIN { started = 0; new_line = 0 }
-        /^\+\+\+/ { next }
         /^@@/ {
             match($0, /\+[0-9]+/)
             new_line = substr($0, RSTART + 1, RLENGTH - 1) + 0
@@ -80,6 +89,7 @@ added_line_numbers() {
             next
         }
         !started { next }
+        /^\\ / { next }
         /^\+/ {
             content = substr($0, 2)
             sub(/\r$/, "", content)

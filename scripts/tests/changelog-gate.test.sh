@@ -108,6 +108,45 @@ write "$NON_BRACKET_HEAD" \
     '# Changelog' '' '## [Unreleased]' '' '## 1.74.0 - 2026-09-01' '' \
     '- Added a note to an old release retroactively. (#1938)' '- An old, already-released entry.'
 
+# Case 17 (Codex finding, medium): a genuine added content line that
+# happens to start with "++" must still count as a candidate -- an earlier
+# version's blanket `/^\+\+\+/` skip rule, meant only for the diff's own
+# file-header line, also matched a diff-prefixed "++..." content line
+# (which reads as "+++..." once the diff's own leading "+" is added) and
+# silently dropped it. This is the ONLY added line and it IS inside
+# Unreleased, so the bug and the fix disagree on the verdict, not just on
+# an internal line number.
+readonly PLUS_PLUS_BASE="$WORK/plus_plus_base.md"
+write "$PLUS_PLUS_BASE" \
+    '## [Unreleased]' '## [1.74.0]' '- old'
+readonly PLUS_PLUS_HEAD="$WORK/plus_plus_head.md"
+write "$PLUS_PLUS_HEAD" \
+    '## [Unreleased]' '++ this genuinely-added line happens to start with two plus signs' '## [1.74.0]' '- old'
+
+# Case 18 (Codex finding, medium): git's `\ No newline at end of file`
+# metadata line must not advance the new-file line counter -- it does not
+# correspond to a real line in either file. The base file's last line
+# lacks a trailing newline and is replaced (not merely appended after),
+# so the diff shows the metadata marker BEFORE the real added entry;
+# without the fix, that shifts the entry from line 2 (inside Unreleased,
+# range (1,3)) to line 3 (outside), flipping the verdict -- not just an
+# internal line number, same as case 17. Built with printf, not the
+# `write` helper, which always appends a trailing newline.
+readonly NO_TRAILING_NEWLINE_BASE="$WORK/no_trailing_newline_base.md"
+printf '## [Unreleased]\n## [1.74.0]' >"$NO_TRAILING_NEWLINE_BASE"
+readonly NO_TRAILING_NEWLINE_HEAD="$WORK/no_trailing_newline_head.md"
+printf '## [Unreleased]\n- the only entry, right at the boundary\n## [1.74.0]\n- old note' >"$NO_TRAILING_NEWLINE_HEAD"
+
+# Case 19 (Codex finding, medium): a release heading indented by one space
+# is still a valid CommonMark ATX heading (0-3 leading spaces allowed) and
+# must still close the Unreleased section, not widen it to end of file.
+readonly INDENTED_HEADING_BASE="$WORK/indented_heading_base.md"
+write "$INDENTED_HEADING_BASE" \
+    '## [Unreleased]' '## [1.74.0]' '- old'
+readonly INDENTED_HEADING_HEAD="$WORK/indented_heading_head.md"
+write "$INDENTED_HEADING_HEAD" \
+    '## [Unreleased]' ' ## [1.74.0]' '- old' '- sneaky bullet, should still be outside Unreleased'
+
 DIFF_WITH_ENTRY="$(gen_diff "$WITH_ENTRY_BASE" "$WITH_ENTRY_HEAD")"
 readonly DIFF_WITH_ENTRY
 DIFF_HEADER_ONLY="$(gen_diff "$NO_UNRELEASED_BASE" "$HEADER_ONLY_HEAD")"
@@ -120,6 +159,12 @@ DIFF_DUPLICATE_HEADING="$(gen_diff "$DUPLICATE_HEADING_BASE" "$DUPLICATE_HEADING
 readonly DIFF_DUPLICATE_HEADING
 DIFF_NON_BRACKET="$(gen_diff "$NON_BRACKET_BASE" "$NON_BRACKET_HEAD")"
 readonly DIFF_NON_BRACKET
+DIFF_PLUS_PLUS="$(gen_diff "$PLUS_PLUS_BASE" "$PLUS_PLUS_HEAD")"
+readonly DIFF_PLUS_PLUS
+DIFF_NO_TRAILING_NEWLINE="$(gen_diff "$NO_TRAILING_NEWLINE_BASE" "$NO_TRAILING_NEWLINE_HEAD")"
+readonly DIFF_NO_TRAILING_NEWLINE
+DIFF_INDENTED_HEADING="$(gen_diff "$INDENTED_HEADING_BASE" "$INDENTED_HEADING_HEAD")"
+readonly DIFF_INDENTED_HEADING
 readonly DIFF_EMPTY=''
 
 readonly BODY_NO_MARKER='## Summary
@@ -284,4 +329,32 @@ result="$(run_gate "$BODY_NO_MARKER" "$DIFF_NON_BRACKET" "$NON_BRACKET_HEAD" 2>&
 [[ "$out" -ne 0 ]] || fail "a non-bracket release heading must still close the Unreleased section (exit was 0): $result"
 echo "ok   16. a non-bracket release heading still closes the section"
 
-echo "changelog-gate decision logic: 16 cases ok"
+# --- 17. a genuine added "++"-prefixed content line is not swallowed -----
+# Caught in a third review round: an earlier blanket `/^\+\+\+/` rule, meant
+# only to skip the diff's own file-header line, also matched a real added
+# line starting with "++" and silently dropped it. It is the only added
+# line, and it IS inside Unreleased.
+out=0
+result="$(run_gate "$BODY_NO_MARKER" "$DIFF_PLUS_PLUS" "$PLUS_PLUS_HEAD" 2>&1)" || out=$?
+[[ "$out" -eq 0 ]] || fail "a genuine '++'-prefixed entry under Unreleased must pass: $result"
+echo "ok   17. a genuine '++'-prefixed content line does not defeat the check"
+
+# --- 18. a missing trailing newline does not shift the line counter -------
+# Caught in a third review round: git's "\ No newline at end of file"
+# metadata line fell through to the generic line-counter and advanced it as
+# if it were real content, shifting every subsequent line number by one.
+out=0
+result="$(run_gate "$BODY_NO_MARKER" "$DIFF_NO_TRAILING_NEWLINE" "$NO_TRAILING_NEWLINE_HEAD" 2>&1)" || out=$?
+[[ "$out" -eq 0 ]] || fail "a valid Unreleased addition beside a missing-trailing-newline file must pass: $result"
+echo "ok   18. a missing trailing newline does not shift the line counter"
+
+# --- 19. an indented release heading still closes the Unreleased section --
+# Caught in a third review round: the boundary regex required column 0, so
+# a release heading indented by as little as one space (still a valid
+# CommonMark ATX heading) left the section open to end of file.
+out=0
+result="$(run_gate "$BODY_NO_MARKER" "$DIFF_INDENTED_HEADING" "$INDENTED_HEADING_HEAD" 2>&1)" || out=$?
+[[ "$out" -ne 0 ]] || fail "an indented release heading must still close the Unreleased section (exit was 0): $result"
+echo "ok   19. an indented release heading still closes the section"
+
+echo "changelog-gate decision logic: 19 cases ok"
