@@ -164,7 +164,7 @@ Four methods deserve extra thought:
 - **`merge_into`**: return `AdapterError::not_supported("merge_into")` when your warehouse has no `MERGE`. Rocky's planner reads the capability flag and generates no merge plans, but the defensive implementation still helps if something bypasses the planner.
 - **`insert_overwrite_partition`**: returns `Vec<String>`, because some warehouses need a multi-statement transaction, such as Snowflake's `BEGIN; DELETE; INSERT; COMMIT`. The runtime executes the statements in order and rolls back on a partial failure.
 - **`row_hash_expr`**: Rocky uses this for change detection. ClickHouse uses `sipHash128(tuple(...))`. For hashes that compare across warehouses, see how `rocky-bigquery` and `rocky-snowflake` agree on a stable encoding.
-- **`watermark_where`**: the standard incremental filter, `col > (SELECT max(col) FROM target)`. Validate `timestamp_col` before you splice it in.
+- **`watermark_where`**: the caller supplies the watermark, not a subquery. Rocky reads the previous run's max source timestamp from its own state store and passes it in as a literal `DateTime<Utc>`; your dialect only formats that value as a warehouse-native timestamp literal in `col > <literal>`. `None` (first run, or after `delete_watermark`) means format the `1970-01-01` sentinel so the whole source is scanned. Validate `timestamp_col` before you splice it in.
 
 ## Auth and connection management
 
@@ -214,7 +214,7 @@ An adapter that talks to a REST API is tested with `wiremock` in-tree. See how `
 
 `rocky-adapter-sdk::conformance::run_conformance(&manifest, Some(adapter.dialect()))` returns a `ConformanceResult`. The result says which tests apply, based on your declared capabilities, and which were skipped.
 
-Pass a live dialect and the harness makes one real trait call, `SqlDialect::format_table_ref`. That call is the first step toward live execution. Pass `None` when you have no live adapter, and the harness reports the dialect-category checks as skipped rather than running them against a stub. `rocky test-adapter --adapter <name>` does exactly that: it validates the test plan without a warehouse.
+Pass a live dialect and the harness makes three real trait calls: `SqlDialect::format_table_ref`, `SqlDialect::watermark_where`, and `SqlDialect::row_hash_expr`. Those calls are the first step toward live execution. Pass `None` when you have no live adapter, and the harness reports the dialect-category checks as skipped rather than running them against a stub. `rocky test-adapter --adapter <name>` does exactly that: it validates the test plan without a warehouse.
 
 Every other check is still a plan entry, not a warehouse call. Treat the result as a checklist of behaviors your own unit tests should cover. Broader trait execution lands in later SDK releases.
 
