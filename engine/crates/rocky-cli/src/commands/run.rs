@@ -12580,6 +12580,74 @@ fn typed_model_ir(
     Ok(ir)
 }
 
+/// The warehouse-visible [`rocky_core::traits::ObjectKind`] a
+/// materialization strategy's `CREATE OR REPLACE` statement targets — for
+/// the two strategies the #2037 reconciliation check covers. `None` for
+/// every other strategy: see the call site in [`execute_one_plain_model`]
+/// for why the other eight strategies are out of scope for this binary
+/// table/view check.
+fn strategy_implies_object_kind(
+    strategy: &rocky_ir::MaterializationStrategy,
+) -> Option<rocky_core::traits::ObjectKind> {
+    use rocky_core::traits::ObjectKind;
+    use rocky_ir::MaterializationStrategy as S;
+    match strategy {
+        S::FullRefresh => Some(ObjectKind::Table),
+        S::View => Some(ObjectKind::View),
+        S::Incremental { .. }
+        | S::Merge { .. }
+        | S::MaterializedView
+        | S::DynamicTable { .. }
+        | S::TimeInterval { .. }
+        | S::Ephemeral
+        | S::DeleteInsert { .. }
+        | S::Microbatch { .. }
+        | S::ContentAddressed { .. } => None,
+    }
+}
+
+/// The target already exists, but as the other warehouse-visible kind
+/// (table vs view) than the model's materialization strategy implies
+/// (#2037). Raised by [`execute_one_plain_model`] BEFORE the strategy's
+/// `CREATE OR REPLACE <kind>` is generated or sent — `CREATE OR REPLACE`
+/// only ever replaces an object of that same kind, so sending it here
+/// would surface the warehouse's own "Existing object X is of type Y,
+/// trying to replace with type Z" catalog error, naming neither the cause
+/// nor the fix.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "target {target} exists as a {existing_kind}, but the strategy now asks for a \
+     {expected_kind}. Rocky does not drop an existing object implicitly. Run \
+     `DROP {existing_kind_sql} {target}` first, then re-run."
+)]
+struct StrategyKindMismatch {
+    target: String,
+    existing_kind: &'static str,
+    expected_kind: &'static str,
+    existing_kind_sql: &'static str,
+}
+
+/// Builds the `.context("model '<name>' failed")`-wrapped
+/// [`StrategyKindMismatch`], matching the wrapping every other runtime
+/// failure in [`execute_one_plain_model`] uses — so the printed chain
+/// reads `model '<name>' failed: target ... exists as a <kind> ...`
+/// exactly like the raw-warehouse-error case it replaces (#2037).
+fn strategy_kind_mismatch_error(
+    model_name: &str,
+    target: &str,
+    existing_kind: &'static str,
+    expected_kind: &'static str,
+    existing_kind_sql: &'static str,
+) -> anyhow::Error {
+    anyhow::Error::from(StrategyKindMismatch {
+        target: target.to_string(),
+        existing_kind,
+        expected_kind,
+        existing_kind_sql,
+    })
+    .context(format!("model '{model_name}' failed"))
+}
+
 /// Execute exactly one "plain" single-statement transformation model:
 /// bootstrap a MERGE target if missing, generate SQL, run the statements
 /// in order, and build the resulting [`MaterializationOutput`].
@@ -12629,6 +12697,70 @@ async fn execute_one_plain_model(
             &model_ir.target.table,
         )
         .map_err(anyhow::Error::from)?;
+
+    // Strategy/target-kind reconciliation (#2037, part 1: "say what
+    // happened"). `FullRefresh` and `View` each issue `CREATE OR REPLACE
+    // <kind>` further down — `TABLE` for `FullRefresh`, `VIEW` for `View`
+    // (`sql_gen::generate_transformation_sql_with_warehouse`) — and that
+    // statement only ever replaces an object of the SAME kind. Switching a
+    // model between `view` and a table-shaped strategy leaves the target as
+    // the OLD kind, and the warehouse refuses with its own catalog error
+    // ("Existing object X is of type Y, trying to replace with type Z")
+    // naming neither the cause nor the fix (#2037's repro). Check the
+    // target's actual kind here, before that statement is generated or
+    // sent, and fail with a Rocky diagnostic instead.
+    //
+    // Scoped to `FullRefresh`/`View` only: they are the two strategies
+    // whose SQL is *always* a `CREATE OR REPLACE <kind>` of the two kinds
+    // `ObjectKind` models (table, view). `Merge`/`Incremental`/
+    // `DeleteInsert`/`Microbatch` never replace an existing object (they
+    // bootstrap once via a non-replacing `CREATE TABLE` below and otherwise
+    // `INSERT`/`MERGE` into it); `MaterializedView`/`DynamicTable` are a
+    // third and fourth object kind this binary check does not model.
+    if let Some(expected_kind) = strategy_implies_object_kind(&model_ir.materialization) {
+        let target_table_struct = rocky_ir::TableRef {
+            catalog: model_ir.target.catalog.clone(),
+            schema: model_ir.target.schema.clone(),
+            table: model_ir.target.table.clone(),
+        };
+        // Advisory only: an adapter that doesn't implement the probe
+        // (`Ok(Unknown)`, the default — every adapter but DuckDB today) and
+        // a transport/permission failure asking for it (`Err`) are treated
+        // identically — skip the check. Neither is a safety regression: on
+        // "can't tell", the strategy's own `CREATE OR REPLACE` runs exactly
+        // as it did before this check existed, so a genuine mismatch still
+        // surfaces — just as the warehouse's own error, not yet this one.
+        let existing_kind = warehouse
+            .object_kind(&target_table_struct)
+            .await
+            .unwrap_or(rocky_core::traits::ObjectKind::Unknown);
+        // Exhaustive over `existing_kind` (no `_ =>`) so a future
+        // `ObjectKind` variant fails to compile here instead of silently
+        // falling into "skip" or "mismatch".
+        match existing_kind {
+            rocky_core::traits::ObjectKind::Unknown => {}
+            rocky_core::traits::ObjectKind::Table | rocky_core::traits::ObjectKind::View
+                if existing_kind == expected_kind => {}
+            rocky_core::traits::ObjectKind::Table => {
+                return Err(strategy_kind_mismatch_error(
+                    model_name,
+                    &target_ref,
+                    "table",
+                    "view",
+                    "TABLE",
+                ));
+            }
+            rocky_core::traits::ObjectKind::View => {
+                return Err(strategy_kind_mismatch_error(
+                    model_name,
+                    &target_ref,
+                    "view",
+                    "table",
+                    "VIEW",
+                ));
+            }
+        }
+    }
 
     let model_started_at = Utc::now();
     let mut bytes_scanned_acc: Option<u64> = None;
@@ -22050,6 +22182,226 @@ table = "fct_events"
             .await
             .unwrap();
         assert_eq!(rows.rows, vec![vec![serde_json::json!("99")]]);
+    }
+
+    /// #2037, part 1 ("say what happened"): a model run as `strategy =
+    /// "view"`, then switched to `strategy = "full_refresh"`, fails on the
+    /// next run — but with a Rocky diagnostic naming the target, the kind
+    /// mismatch, and the exact `DROP VIEW` that fixes it, never the raw
+    /// DuckDB catalog error ("Existing object X is of type Y, trying to
+    /// replace with type Z"). The pre-created `tgt.orders_view` VIEW stands
+    /// in for what `run 1` left behind; `execute_one_plain_model` is the
+    /// shared entry point both the serial and intra-layer-concurrent
+    /// full-pipeline paths call for `run 2`, so this exercises the
+    /// production dispatch target directly.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn strategy_switch_view_to_full_refresh_fails_with_rocky_diagnostic() {
+        use rocky_core::models::load_model_pair;
+        use rocky_core::traits::{ObjectKind, WarehouseAdapter};
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+        use rocky_ir::TableRef;
+
+        let warehouse = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for ddl in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.orders (id INTEGER)",
+            "INSERT INTO src.orders VALUES (1), (2)",
+            // What `run 1` (strategy = "view") left behind.
+            "CREATE VIEW tgt.orders_view AS SELECT * FROM src.orders",
+        ] {
+            warehouse.execute_statement(ddl).await.unwrap();
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("orders_view.toml"),
+            r#"
+name = "orders_view"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = ""
+schema = "tgt"
+table = "orders_view"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("orders_view.sql"),
+            "SELECT id FROM src.orders",
+        )
+        .unwrap();
+        let model = load_model_pair(
+            &dir.path().join("orders_view.sql"),
+            &dir.path().join("orders_view.toml"),
+            None,
+        )
+        .expect("load full_refresh model");
+
+        let dialect = DuckDbSqlDialect;
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+        };
+
+        let error = match super::execute_one_plain_model(
+            &model,
+            &warehouse as &dyn WarehouseAdapter,
+            &dialect as &dyn rocky_core::traits::SqlDialect,
+            "orders_view",
+            std::time::Instant::now(),
+            exec_ctx,
+        )
+        .await
+        {
+            Ok(_) => panic!(
+                "a view -> full_refresh strategy switch over a live view must fail, \
+                 not silently replace it"
+            ),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(
+                "target tgt.orders_view exists as a view, but the strategy now asks for a table"
+            ),
+            "message should name the cause: {message}"
+        );
+        assert!(
+            message.contains("DROP VIEW tgt.orders_view"),
+            "message should name the fix: {message}"
+        );
+        assert!(
+            !message.contains("trying to replace with type"),
+            "the raw warehouse catalog error must not reach the operator: {message}"
+        );
+
+        // Refused before anything was sent — the view survives untouched.
+        let kind = warehouse
+            .object_kind(&TableRef {
+                catalog: String::new(),
+                schema: "tgt".into(),
+                table: "orders_view".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(kind, ObjectKind::View);
+    }
+
+    /// #2037, part 1, the reverse direction: a model run as `strategy =
+    /// "full_refresh"`, then switched to `strategy = "view"`, fails with the
+    /// same Rocky diagnostic — this time naming `DROP TABLE` — never the raw
+    /// warehouse text. Mirrors the test above; see its doc comment.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn strategy_switch_full_refresh_to_view_fails_with_rocky_diagnostic() {
+        use rocky_core::models::load_model_pair;
+        use rocky_core::traits::{ObjectKind, WarehouseAdapter};
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+        use rocky_ir::TableRef;
+
+        let warehouse = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for ddl in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.orders (id INTEGER)",
+            "INSERT INTO src.orders VALUES (1), (2)",
+            // What `run 1` (strategy = "full_refresh") left behind.
+            "CREATE TABLE tgt.orders_view AS SELECT * FROM src.orders",
+        ] {
+            warehouse.execute_statement(ddl).await.unwrap();
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("orders_view.toml"),
+            r#"
+name = "orders_view"
+
+[strategy]
+type = "view"
+
+[target]
+catalog = ""
+schema = "tgt"
+table = "orders_view"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("orders_view.sql"),
+            "SELECT id FROM src.orders",
+        )
+        .unwrap();
+        let model = load_model_pair(
+            &dir.path().join("orders_view.sql"),
+            &dir.path().join("orders_view.toml"),
+            None,
+        )
+        .expect("load view model");
+
+        let dialect = DuckDbSqlDialect;
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+        };
+
+        let error = match super::execute_one_plain_model(
+            &model,
+            &warehouse as &dyn WarehouseAdapter,
+            &dialect as &dyn rocky_core::traits::SqlDialect,
+            "orders_view",
+            std::time::Instant::now(),
+            exec_ctx,
+        )
+        .await
+        {
+            Ok(_) => panic!(
+                "a full_refresh -> view strategy switch over a live table must fail, \
+                 not silently replace it"
+            ),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(
+                "target tgt.orders_view exists as a table, but the strategy now asks for a view"
+            ),
+            "message should name the cause: {message}"
+        );
+        assert!(
+            message.contains("DROP TABLE tgt.orders_view"),
+            "message should name the fix: {message}"
+        );
+        assert!(
+            !message.contains("trying to replace with type"),
+            "the raw warehouse catalog error must not reach the operator: {message}"
+        );
+
+        // Refused before anything was sent — the table survives untouched.
+        let kind = warehouse
+            .object_kind(&TableRef {
+                catalog: String::new(),
+                schema: "tgt".into(),
+                table: "orders_view".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(kind, ObjectKind::Table);
     }
 
     /// Fail-closed bootstrap — time_interval path (`execute_time_interval_model`).

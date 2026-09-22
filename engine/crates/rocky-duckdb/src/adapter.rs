@@ -16,7 +16,8 @@ use tokio::task::spawn_blocking;
 
 use rocky_core::failure_class::{FailureClass, TransientKind};
 use rocky_core::traits::{
-    AdapterError, AdapterResult, ExplainResult, QueryResult, SqlDialect, WarehouseAdapter,
+    AdapterError, AdapterResult, ExplainResult, ObjectKind, QueryResult, SqlDialect,
+    WarehouseAdapter,
 };
 use rocky_ir::{ColumnInfo, TableRef};
 use rocky_sql::validation;
@@ -218,6 +219,57 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
                 .collect();
 
             Ok(columns)
+        })
+        .await
+        .map_err(|e| join_error(&e))?
+    }
+
+    /// `information_schema.tables.table_type` distinguishes `'BASE TABLE'`
+    /// from `'VIEW'` for any attached catalog (#2037) — verified live:
+    /// `SELECT table_catalog, table_schema, table_name, table_type FROM
+    /// information_schema.tables` returns `BASE TABLE` / `VIEW` rows across
+    /// `ATTACH`ed databases, not just the default `memory` catalog. Mirrors
+    /// [`SqlDialect::list_tables_sql`]'s two-part vs three-part handling: an
+    /// empty `catalog` (unqualified target) omits the `table_catalog`
+    /// filter rather than matching a literal empty string.
+    async fn object_kind(&self, table: &TableRef) -> AdapterResult<ObjectKind> {
+        validation::validate_identifier(&table.schema).map_err(AdapterError::new)?;
+        validation::validate_identifier(&table.table).map_err(AdapterError::new)?;
+        let sql = if table.catalog.is_empty() {
+            format!(
+                "SELECT table_type FROM information_schema.tables \
+                 WHERE table_schema = '{}' AND table_name = '{}'",
+                table.schema, table.table
+            )
+        } else {
+            validation::validate_identifier(&table.catalog).map_err(AdapterError::new)?;
+            format!(
+                "SELECT table_type FROM information_schema.tables \
+                 WHERE table_catalog = '{}' AND table_schema = '{}' AND table_name = '{}'",
+                table.catalog, table.schema, table.table
+            )
+        };
+
+        let conn = Arc::clone(&self.connector);
+        spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
+            let result = conn.execute_sql(&sql).map_err(AdapterError::new)?;
+            let kind = result
+                .rows
+                .first()
+                .and_then(|row| row.first())
+                .and_then(|v| v.as_str())
+                .map(|table_type| match table_type {
+                    "VIEW" => ObjectKind::View,
+                    "BASE TABLE" => ObjectKind::Table,
+                    // A DuckDB `table_type` Rocky doesn't model (e.g. a
+                    // temporary table) — unknown, not a guess.
+                    _ => ObjectKind::Unknown,
+                })
+                .unwrap_or(ObjectKind::Unknown); // no row: target doesn't exist yet.
+            Ok(kind)
         })
         .await
         .map_err(|e| join_error(&e))?
