@@ -387,6 +387,7 @@ pub async fn run_with_dag(
         state_path: state_path.to_path_buf(),
         seeds_dir,
         node_pipelines,
+        seed_pipeline: sole_replication_pipeline(cfg),
         partition_opts: partition_opts.clone(),
         skip_opts: *skip_opts,
         shadow_config: shadow_config.cloned(),
@@ -600,6 +601,40 @@ pub(super) struct TransformationModels {
     pub contributing_roots: Vec<PathBuf>,
 }
 
+/// The pipeline to load a `Seed` node against, when the project gives enough
+/// context to say (#2018).
+///
+/// A seed has no pipeline of its own: `seeds_dir` is one project-global
+/// directory, not one per pipeline — `unified_dag::build_unified_dag` adds
+/// seed nodes as explicitly "pipeline-independent", and that stays true here.
+/// Standalone `rocky seed` without `--pipeline` already refuses unless the
+/// project has exactly one pipeline, because it has no other way to pick a
+/// target adapter. `--dag` has no operator to ask, so it resolves the one
+/// pipeline a seed's raw data plausibly belongs to: the sole *replication*
+/// pipeline, if the project has exactly one. Zero or several replication
+/// pipelines is exactly as ambiguous as "which pipeline" already is for the
+/// standalone verb, so this returns `None` and `run_seed` refuses the same
+/// way it always has — inferring a pipeline from a seed's downstream
+/// consumers was considered and rejected: `run_seed`'s `default_catalog`
+/// only resolves for a *replication* pipeline
+/// (`pipeline_cfg.as_replication()`), so handing it a transformation
+/// pipeline instead would silently fall back to catalog `"main"` for any
+/// seed without an explicit sidecar `[target]`.
+fn sole_replication_pipeline(cfg: &rocky_core::config::RockyConfig) -> Option<String> {
+    let mut names = cfg
+        .pipelines
+        .iter()
+        .filter(|(_, pipeline)| {
+            matches!(pipeline, rocky_core::config::PipelineConfig::Replication(_))
+        })
+        .map(|(name, _)| name.clone());
+    let first = names.next()?;
+    if names.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
 fn status_str(s: &NodeStatus) -> &'static str {
     match s {
         NodeStatus::Pending => "pending",
@@ -635,6 +670,10 @@ struct CliDispatcher {
     /// Maps each pipeline-bound node to its owning pipeline name. Seed and
     /// source-marker nodes carry no entry (their `pipeline` is `None`).
     node_pipelines: HashMap<NodeId, String>,
+    /// The pipeline `Seed` nodes load against — [`sole_replication_pipeline`]
+    /// resolved once for the whole DAG, since a seed has no pipeline of its
+    /// own to look up per node (#2018).
+    seed_pipeline: Option<String>,
     /// The outer DAG invocation's time-interval partition options, exactly as
     /// the caller passed them. [`Self::dispatch`] narrows them through
     /// [`sub_run_partition_opts`] on the way to each sub-run — the selection
@@ -799,11 +838,44 @@ impl NodeDispatcher for CliDispatcher {
                 // re-read (#1120), so a `rocky.toml` swap mid-DAG cannot make
                 // a warehouse-mutating seed node execute config B while the
                 // rest of the DAG runs A.
+                //
+                // `seed_pipeline` (#2018) is the sole replication pipeline
+                // when the project has exactly one; `None` when it has zero
+                // or several, in which case `run_seed` refuses exactly as
+                // standalone `rocky seed` (no `--pipeline`) already does on a
+                // multi-pipeline project — see `sole_replication_pipeline`.
                 let seeds_dir = self.seeds_dir.clone();
+                let seed_pipeline = self.seed_pipeline.clone();
                 Some(Box::pin(async move {
-                    super::seed::run_seed(&loaded, &seeds_dir, None, Some(&label), false)
-                        .await
-                        .map_err(|e| format!("{e:#}"))
+                    // `resolve_pipeline` inside `run_seed` is about to hit the
+                    // same "which pipeline" ambiguity standalone `rocky seed`
+                    // refuses on — but under `--dag` there is no `--pipeline`
+                    // flag to suggest, so reframe it in terms the operator can
+                    // act on here. Gated on the exact precondition for that
+                    // refusal (no resolvable pipeline AND more than one
+                    // pipeline in the project) so an unrelated `run_seed`
+                    // failure (a malformed CSV, a failed hook) is never
+                    // mislabeled as a pipeline-resolution problem.
+                    let ambiguous = seed_pipeline.is_none() && loaded.config.pipelines.len() != 1;
+                    let result = super::seed::run_seed(
+                        &loaded,
+                        &seeds_dir,
+                        seed_pipeline.as_deref(),
+                        Some(&label),
+                        false,
+                    )
+                    .await;
+                    let result = if ambiguous {
+                        result.with_context(|| {
+                            "rocky run --dag could not tell which pipeline this seed belongs \
+                             to (the project has no single replication pipeline to default \
+                             to); give it exactly one replication pipeline, or load this seed \
+                             outside --dag with `rocky seed --pipeline <name>`"
+                        })
+                    } else {
+                        result
+                    };
+                    result.map_err(|e| format!("{e:#}"))
                 }))
             }
             _ => {
@@ -938,6 +1010,7 @@ mod run_opts_threading_tests {
             state_path: std::path::PathBuf::from(".rocky-state.redb"),
             seeds_dir: std::path::PathBuf::from("seeds"),
             node_pipelines,
+            seed_pipeline: None,
             partition_opts,
             skip_opts,
             shadow_config,
@@ -1230,6 +1303,7 @@ mod state_turnstile_tests {
             state_path: std::path::PathBuf::from(state_path),
             seeds_dir: std::path::PathBuf::from("seeds"),
             node_pipelines,
+            seed_pipeline: None,
             partition_opts: PartitionRunOptions::default(),
             skip_opts: SkipRunOptions::default(),
             shadow_config: None,
@@ -1526,6 +1600,7 @@ mod tests {
             state_path: root.join(".rocky-state.redb"),
             seeds_dir: root.join("seeds"),
             node_pipelines: HashMap::new(),
+            seed_pipeline: None,
             partition_opts: PartitionRunOptions::default(),
             skip_opts: SkipRunOptions::default(),
             shadow_config: None,
@@ -1667,6 +1742,158 @@ mod tests {
             .execute_sql("SELECT COUNT(*) FROM proj.silver.dim_country")
             .unwrap();
         assert_eq!(cell_i64(&model_rows.rows[0][0]), 2, "model rows");
+    }
+
+    /// #2018: `rocky run --dag` must load a seed on a project with MORE THAN
+    /// ONE pipeline, not refuse with "multiple pipelines defined".
+    ///
+    /// Pre-fix, the `Seed` dispatch arm called `run_seed` with a hardcoded
+    /// `None` pipeline; `run_seed`'s `resolve_pipeline(None)` refuses unless
+    /// the project has exactly one pipeline — which this fixture, by design
+    /// (a replication pipeline `ingest` plus a transformation pipeline
+    /// `transform` depending on it), does not. The seed node then FAILED and
+    /// its dependent model was skipped as an upstream failure.
+    ///
+    /// Non-vacuous: `stg_orders` reads the table `ingest` replicates, so
+    /// asserting its row count also proves `ingest` itself completed — a
+    /// broken fix that leaves the seed unresolved would fail before this
+    /// model ever ran, not vacuously pass it.
+    #[tokio::test]
+    async fn seed_loads_on_a_dag_with_more_than_one_pipeline() {
+        use rocky_core::traits::WarehouseAdapter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+
+        let db_path = root.join("wh.duckdb");
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter.local]\n\
+                 type = \"duckdb\"\n\
+                 path = \"{}\"\n\n\
+                 [pipeline.ingest]\n\
+                 type = \"replication\"\n\
+                 strategy = \"full_refresh\"\n\n\
+                 [pipeline.ingest.source.discovery]\n\
+                 adapter = \"local\"\n\n\
+                 [pipeline.ingest.source.schema_pattern]\n\
+                 prefix = \"raw__\"\n\
+                 separator = \"__\"\n\
+                 components = [\"source\"]\n\n\
+                 [pipeline.ingest.target]\n\
+                 adapter = \"local\"\n\
+                 catalog_template = \"wh\"\n\
+                 schema_template = \"staging__{{source}}\"\n\n\
+                 [pipeline.ingest.target.governance]\n\
+                 auto_create_catalogs = true\n\
+                 auto_create_schemas = true\n\n\
+                 [pipeline.transform]\n\
+                 type = \"transformation\"\n\
+                 depends_on = [\"ingest\"]\n\n\
+                 [pipeline.transform.target]\n\
+                 adapter = \"local\"\n\n\
+                 [pipeline.transform.target.governance]\n\
+                 auto_create_catalogs = true\n\
+                 auto_create_schemas = true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        // Pre-existing "source" data `ingest` replicates — the schema_pattern
+        // above discovers it as source `shop`, table `orders_src`.
+        {
+            let seed_db = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+            seed_db
+                .execute_statement("CREATE SCHEMA raw__shop")
+                .await
+                .unwrap();
+            seed_db
+                .execute_statement(
+                    "CREATE TABLE raw__shop.orders_src AS SELECT 1 AS id, 100 AS amount",
+                )
+                .await
+                .unwrap();
+        }
+
+        std::fs::write(
+            root.join("seeds/orders.csv"),
+            "code,name\nUS,United States\nGB,United Kingdom\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("seeds/orders.toml"),
+            "name = \"orders\"\n\n\
+             [target]\n\
+             catalog = \"wh\"\n\
+             schema = \"seeds\"\n\
+             table = \"orders\"\n",
+        )
+        .unwrap();
+
+        // Reads BOTH the table `ingest` replicates and the seed's own
+        // table — no explicit `depends_on` (a seed is not a model the
+        // compiler's semantic graph knows about); `run_with_dag`'s SQL
+        // `FROM`-reference inference orders this model after both, mirroring
+        // the issue's repro where the seed's own failure skipped this node
+        // as an upstream failure.
+        std::fs::write(
+            root.join("models/stg_orders.sql"),
+            "SELECT o.id, o.amount, s.code \
+             FROM wh.staging__shop.orders_src o, wh.seeds.orders s\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("models/stg_orders.toml"),
+            "name = \"stg_orders\"\n\n\
+             [target]\n\
+             catalog = \"wh\"\n\
+             schema = \"silver\"\n\
+             table = \"stg_orders\"\n",
+        )
+        .unwrap();
+
+        let config_path = root.join("rocky.toml");
+        let state_path = root.join(".rocky-state.redb");
+        run_with_dag(
+            &config_path,
+            dag_snapshot(&config_path),
+            &state_path,
+            false,
+            &PartitionRunOptions::default(),
+            &crate::commands::run::SkipRunOptions::default(),
+            None,
+            None,
+        )
+        .await
+        .expect("run --dag must complete the seed node on a multi-pipeline project");
+
+        let adapter = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+
+        let seed_rows = guard
+            .execute_sql("SELECT COUNT(*) FROM wh.seeds.orders")
+            .unwrap();
+        assert_eq!(
+            cell_i64(&seed_rows.rows[0][0]),
+            2,
+            "seed node completed, not FAILED"
+        );
+
+        // The dependent model is not skipped: it materializes against the
+        // table `ingest` replicated.
+        let model_rows = guard
+            .execute_sql("SELECT COUNT(*) FROM wh.silver.stg_orders")
+            .unwrap();
+        assert_eq!(
+            cell_i64(&model_rows.rows[0][0]),
+            2,
+            "downstream model must not be skipped (1 replicated row x 2 seed rows)"
+        );
     }
 
     /// #1272 sentinel: `rocky run --dag --shadow` must not touch a production
