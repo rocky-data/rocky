@@ -209,15 +209,15 @@ impl PipesEmitter {
     ///
     /// `asset_key` is a slash-joined string (Dagster convention for
     /// the Pipes wire format), e.g. `"warehouse/marts/fct_orders"`.
-    /// `metadata` is a JSON object whose values are
-    /// [`PipesMetadataRawValue`](https://docs.dagster.io/api/dagster/pipes#dagster.PipesMetadataValue) —
-    /// in practice, plain JSON values that Dagster infers types for.
+    /// `metadata` is a JSON object of plain values — [`wrap_metadata`]
+    /// puts each one in the shape the wire protocol requires (see its
+    /// doc comment) before this is written.
     pub fn report_asset_materialization(&self, asset_key: &str, metadata: &Value) {
         self.write_message(
             "report_asset_materialization",
             &json!({
                 "asset_key": asset_key,
-                "metadata": metadata,
+                "metadata": wrap_metadata(metadata),
                 "data_version": Value::Null,
             }),
         );
@@ -256,7 +256,7 @@ impl PipesEmitter {
                 "check_name": check_name,
                 "passed": passed,
                 "severity": severity,
-                "metadata": metadata,
+                "metadata": wrap_metadata(metadata),
             }),
         );
     }
@@ -299,6 +299,63 @@ impl PipesEmitter {
         // the parent doesn't get streaming updates.
         let _ = channel.flush();
     }
+}
+
+/// Wrap every metadata value the way the real `dagster_pipes` SDK does
+/// before it reaches the wire.
+///
+/// Rocky implements the Pipes protocol natively rather than shelling out
+/// through the `dagster_pipes` Python package, so this crate is the only
+/// thing standing between a plain JSON value and the wire shape Dagster's
+/// reader expects. That reader — `PipesMessageHandler
+/// ::_handle_report_asset_check` / `_handle_report_asset_materialization`
+/// in `dagster/_core/pipes/context.py` — passes `metadata` straight to
+/// `metadata_map_from_external`
+/// (`dagster/_core/definitions/metadata/external_metadata.py`), which does
+/// `v["raw_value"]` and `v["type"]` on every value UNCONDITIONALLY. A bare
+/// value — what every `report_asset_check` / `report_asset_materialization`
+/// call sent before this fix — crashes it with `TypeError: '<type>' object
+/// is not subscriptable` the moment the message carries ANY non-empty
+/// metadata. That was already reachable on every materialization (its
+/// metadata is never empty — see `emit_pipes_events` in `commands/run.rs`)
+/// and on every declared check result, not just the anomaly/drift checks
+/// added in #2073.
+///
+/// The real SDK's own writer side normalizes the same way
+/// (`dagster_pipes/__init__.py::_normalize_param_metadata`, the installed
+/// 1.13.17 package, lines 379-403): a value that isn't already a dict with
+/// exactly `{raw_value, type}` becomes `{"raw_value": value, "type":
+/// "__infer__"}`. `"__infer__"` (`PIPES_METADATA_TYPE_INFER` on the SDK
+/// side, `EXTERNAL_METADATA_TYPE_INFER` on the reading side — the same
+/// string literal on both ends) tells Dagster to infer the `MetadataValue`
+/// subtype from the raw value's own JSON type, which is what this emitter
+/// wants: it never carries an explicit Dagster metadata type today.
+///
+/// A value already in the wrapped shape passes through unchanged — the
+/// SDK's own "already typed" branch. Nothing in this crate constructs one
+/// today; kept so a future explicitly-typed value (a URL, a Markdown
+/// blob) does not get double-wrapped.
+fn wrap_metadata(metadata: &Value) -> Value {
+    let Some(map) = metadata.as_object() else {
+        // Not an object (e.g. `Value::Null` for an empty/omitted
+        // metadata argument) — nothing to wrap per-key.
+        return metadata.clone();
+    };
+    let wrapped: serde_json::Map<String, Value> = map
+        .iter()
+        .map(|(key, value)| {
+            let already_wrapped = value.as_object().is_some_and(|obj| {
+                obj.len() == 2 && obj.contains_key("raw_value") && obj.contains_key("type")
+            });
+            let wire_value = if already_wrapped {
+                value.clone()
+            } else {
+                json!({"raw_value": value, "type": "__infer__"})
+            };
+            (key.clone(), wire_value)
+        })
+        .collect();
+    Value::Object(wrapped)
 }
 
 #[cfg(test)]
@@ -390,7 +447,40 @@ mod tests {
         assert_eq!(msg["method"], "report_asset_materialization");
         assert_eq!(msg["params"]["asset_key"], "warehouse/marts/fct_orders");
         assert_eq!(msg["params"]["data_version"], Value::Null);
-        assert_eq!(msg["params"]["metadata"]["rows_copied"], 1500);
+        // Wrapped shape (#2073) — see `wrap_metadata`'s doc comment. A bare
+        // `1500` here crashes Dagster's real message handler.
+        assert_eq!(
+            msg["params"]["metadata"]["rows_copied"],
+            json!({"raw_value": 1500, "type": "__infer__"})
+        );
+    }
+
+    /// Materialization metadata is never empty (`strategy` and
+    /// `duration_ms` are always set — see `emit_pipes_events` in
+    /// `commands/run.rs`), so this shape was the most commonly hit crash
+    /// before #2073's fix: every materialized table under Pipes mode hit
+    /// it, not just a check result.
+    #[test]
+    fn report_asset_materialization_wraps_metadata_for_the_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.txt");
+        let emitter = make_emitter_to(&path);
+
+        emitter.report_asset_materialization(
+            "warehouse/marts/fct_orders",
+            &json!({"strategy": "incremental", "duration_ms": 2300}),
+        );
+
+        let lines = read_lines(&path);
+        let metadata = &lines[0]["params"]["metadata"];
+        assert_eq!(
+            metadata["strategy"],
+            json!({"raw_value": "incremental", "type": "__infer__"})
+        );
+        assert_eq!(
+            metadata["duration_ms"],
+            json!({"raw_value": 2300, "type": "__infer__"})
+        );
     }
 
     #[test]
@@ -413,6 +503,66 @@ mod tests {
         assert_eq!(msg["params"]["check_name"], "row_count_anomaly");
         assert_eq!(msg["params"]["passed"], false);
         assert_eq!(msg["params"]["severity"], "WARN");
+    }
+
+    /// Pins the wrapped wire shape `wrap_metadata` produces
+    /// (`{"raw_value": <v>, "type": "__infer__"}` per value, #2073) against
+    /// the real `dagster_pipes` protocol — see that function's doc comment
+    /// for the exact source citation. Before this fix, every
+    /// `report_asset_check` with non-empty metadata (every declared check
+    /// result — `CheckResult`'s serialized form is never empty) crashed
+    /// Dagster's real message handler with `TypeError: 'int' object is not
+    /// subscriptable` the moment it tried to read a bare value as
+    /// `v["raw_value"]`.
+    #[test]
+    fn report_asset_check_wraps_metadata_for_the_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.txt");
+        let emitter = make_emitter_to(&path);
+
+        emitter.report_asset_check(
+            "warehouse/marts/fct_orders",
+            "row_count_anomaly",
+            false,
+            PipesCheckSeverity::Warn,
+            &json!({"current_count": 900, "reason": "deviated 40%"}),
+        );
+
+        let lines = read_lines(&path);
+        let metadata = &lines[0]["params"]["metadata"];
+        assert_eq!(
+            metadata["current_count"],
+            json!({"raw_value": 900, "type": "__infer__"})
+        );
+        assert_eq!(
+            metadata["reason"],
+            json!({"raw_value": "deviated 40%", "type": "__infer__"})
+        );
+    }
+
+    /// A value already in the wrapped shape passes through unchanged
+    /// instead of being wrapped a second time (`wrap_metadata`'s
+    /// "already typed" branch). Nothing in this crate constructs one
+    /// today; this pins the defensive branch so it doesn't silently rot.
+    #[test]
+    fn report_asset_check_does_not_double_wrap_an_already_typed_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.txt");
+        let emitter = make_emitter_to(&path);
+
+        emitter.report_asset_check(
+            "warehouse/marts/fct_orders",
+            "row_count_anomaly",
+            true,
+            PipesCheckSeverity::Warn,
+            &json!({"already_typed": {"raw_value": "https://example.com", "type": "url"}}),
+        );
+
+        let lines = read_lines(&path);
+        assert_eq!(
+            lines[0]["params"]["metadata"]["already_typed"],
+            json!({"raw_value": "https://example.com", "type": "url"})
+        );
     }
 
     #[test]

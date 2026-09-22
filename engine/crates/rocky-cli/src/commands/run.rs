@@ -20569,8 +20569,17 @@ auto_create_schemas = true
         assert_eq!(check["params"]["check_name"], "drift");
         assert_eq!(check["params"]["passed"], true);
         assert_eq!(check["params"]["severity"], "WARN");
-        assert_eq!(check["params"]["metadata"]["table"], "acme.raw_orders");
-        assert_eq!(check["params"]["metadata"]["action"], "add_column");
+        // Wrapped shape (#2073) — pipes.rs's `wrap_metadata` puts every
+        // metadata value in the `{raw_value, type}` form Dagster's real
+        // message handler requires; a bare value crashes it.
+        assert_eq!(
+            check["params"]["metadata"]["table"],
+            serde_json::json!({"raw_value": "acme.raw_orders", "type": "__infer__"})
+        );
+        assert_eq!(
+            check["params"]["metadata"]["action"],
+            serde_json::json!({"raw_value": "add_column", "type": "__infer__"})
+        );
 
         // Second: human-readable log
         let log = &lines[1];
@@ -20679,17 +20688,31 @@ auto_create_schemas = true
         }
 
         // Detected anomaly: fails, with the metric detail, rocky/-prefixed
-        // to match `anomaly_check_results` in observability.py.
+        // to match `anomaly_check_results` in observability.py. Wrapped
+        // shape (#2073) — see `wrap_metadata` in pipes.rs: a bare value
+        // here crashes Dagster's real message handler.
         let anomaly = &lines[0];
         assert_eq!(anomaly["params"]["asset_key"], "acme/raw_orders");
         assert_eq!(anomaly["params"]["passed"], false);
         assert_eq!(anomaly["params"]["severity"], "WARN");
-        assert_eq!(anomaly["params"]["metadata"]["rocky/current_count"], 40);
-        assert_eq!(anomaly["params"]["metadata"]["rocky/baseline_avg"], 100.0);
-        assert_eq!(anomaly["params"]["metadata"]["rocky/deviation_pct"], -60.0);
+        assert_eq!(
+            anomaly["params"]["metadata"]["rocky/current_count"],
+            serde_json::json!({"raw_value": 40, "type": "__infer__"})
+        );
+        assert_eq!(
+            anomaly["params"]["metadata"]["rocky/baseline_avg"],
+            serde_json::json!({"raw_value": 100.0, "type": "__infer__"})
+        );
+        assert_eq!(
+            anomaly["params"]["metadata"]["rocky/deviation_pct"],
+            serde_json::json!({"raw_value": -60.0, "type": "__infer__"})
+        );
         assert_eq!(
             anomaly["params"]["metadata"]["rocky/reason"],
-            "row count dropped 60% below baseline"
+            serde_json::json!({
+                "raw_value": "row count dropped 60% below baseline",
+                "type": "__infer__"
+            })
         );
 
         // Evaluated, no anomaly: passes.
@@ -20704,11 +20727,14 @@ auto_create_schemas = true
         assert_eq!(not_evaluated["params"]["severity"], "WARN");
         assert_eq!(
             not_evaluated["params"]["metadata"]["status"],
-            "not_evaluated"
+            serde_json::json!({"raw_value": "not_evaluated", "type": "__infer__"})
         );
         assert_eq!(
             not_evaluated["params"]["metadata"]["rocky/reason"],
-            "no row count was measured for this table"
+            serde_json::json!({
+                "raw_value": "no row count was measured for this table",
+                "type": "__infer__"
+            })
         );
     }
 
