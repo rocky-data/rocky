@@ -55,7 +55,7 @@ schema_template = "out"
 
 /// Spawn `server` on one end of a duplex pipe and return a connected client.
 ///
-/// The `()` handler requests `ClientInfo::default()`, whose `protocol_version`
+/// The `()` handler requests `ClientConfig::default()`, whose `protocol_version`
 /// is rmcp's `ProtocolVersion::LATEST` — `2025-11-25` today. Every test
 /// in this file that uses `connect` is therefore describing THAT negotiated
 /// version, which matters for `resultType`: see
@@ -73,8 +73,8 @@ async fn connect(server: RockyMcpServer) -> rmcp::service::RunningService<rmcp::
 /// A peer on `2026-07-28`, reached the way rmcp 3.2+ allows a client to: over
 /// the `server/discover` lifecycle, with no `initialize` at all.
 ///
-/// `impl ClientHandler for ClientInfo` returns the value itself from
-/// `get_info`, so handing rmcp a `ClientInfo` is the whole mechanism — no
+/// `impl ClientHandler for ClientConfig` returns the value itself from
+/// `get_info`, so handing rmcp a `ClientConfig` is the whole mechanism — no
 /// custom handler type is needed.
 ///
 /// Under rmcp 3.1 this helper sent an `initialize` naming `2026-07-28` and
@@ -85,7 +85,7 @@ async fn connect(server: RockyMcpServer) -> rmcp::service::RunningService<rmcp::
 /// reach a modern session any more (#1965).
 async fn connect_modern(
     server: RockyMcpServer,
-) -> rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientInfo> {
+) -> rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientConfig> {
     use rmcp::service::{ClientLifecycleMode, ClientServiceExt};
 
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
@@ -94,9 +94,9 @@ async fn connect_modern(
             let _ = svc.waiting().await;
         }
     });
-    // `ClientInfo::default()` is exactly what the `()` handler in [`connect`]
+    // `ClientConfig::default()` is exactly what the `()` handler in [`connect`]
     // sends, so the ONLY difference between the two clients is the lifecycle.
-    rmcp::model::ClientInfo::default()
+    rmcp::model::ClientConfig::default()
         .serve_with_lifecycle(
             client_io,
             ClientLifecycleMode::Discover {
@@ -5133,7 +5133,7 @@ async fn an_initialize_that_names_2026_07_28_is_answered_with_the_newest_handsha
             let _ = svc.waiting().await;
         }
     });
-    let asked_too_much = rmcp::model::ClientInfo::default()
+    let asked_too_much = rmcp::model::ClientConfig::default()
         .with_protocol_version(ProtocolVersion::V_2026_07_28)
         .serve(client_io)
         .await

@@ -11,7 +11,7 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     GetPromptResult, Implementation, PromptMessage, ProtocolVersion, Role, ServerCapabilities,
-    ServerInfo,
+    ServerConfig,
 };
 use rmcp::service::RequestContext;
 use rmcp::{
@@ -6379,7 +6379,7 @@ impl RockyMcpServer {
 #[tool_handler(router = self.tool_router)]
 #[prompt_handler(router = self.prompt_router)]
 impl ServerHandler for RockyMcpServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         // FF-WP1 fix round 2 (item 5a): the compiled skill is the FULL
         // authoring workflow, served to both profiles so the guidance never
         // forks from the canonical file — but under the worker profile it is
@@ -6394,7 +6394,7 @@ impl ServerHandler for RockyMcpServer {
         // default and approver profiles carry the skill text byte-unchanged,
         // the worker carries the derived banner + the projected body.
         let instructions = self.instructions.clone();
-        ServerInfo::new(
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_prompts()
