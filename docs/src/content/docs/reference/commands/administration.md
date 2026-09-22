@@ -307,36 +307,44 @@ rocky optimize
   "command": "optimize",
   "recommendations": [
     {
-      "model_name": "events",
-      "current_strategy": "unknown",
-      "recommended_strategy": "unknown",
+      "model_name": "stg_events",
+      "current_strategy": "view",
+      "recommended_strategy": "view",
       "estimated_monthly_savings": 0.0,
-      "reasoning": "current strategy is unknown (model not found in the compiled project); no recommendation",
-      "compute_cost_per_run": 0.000010666666666666669,
+      "reasoning": "insufficient history: 1 runs (need 5)",
+      "compute_cost_per_run": 2.6666666666666673e-6,
+      "storage_cost_per_month": 0.0023,
+      "downstream_references": 1
+    },
+    {
+      "model_name": "user_metrics",
+      "current_strategy": "table",
+      "recommended_strategy": "table",
+      "estimated_monthly_savings": 0.0,
+      "reasoning": "insufficient history: 1 runs (need 5)",
+      "compute_cost_per_run": 8.000000000000001e-6,
       "storage_cost_per_month": 0.0023,
       "downstream_references": 0
     }
   ],
-  "total_models_analyzed": 1
+  "total_models_analyzed": 2
 }
 ```
 
-`current_strategy` is `"unknown"` when Rocky cannot find the model in the compiled project, for example a model seen only in run history. Prices come from the project's `[cost]` block when it sets one, and fall back to Rocky's built-in rates otherwise.
+`rocky optimize` recommends `table` or `view`. A model needs at least 5 recorded runs; with fewer, it keeps its current strategy. Prices come from the project's `[cost]` block when it sets one, and fall back to Rocky's built-in rates otherwise.
 
-`rocky optimize` recommends `table` or `view`. A model needs at least 5 recorded runs; with fewer, it keeps its current strategy.
-
-A compiled model reports its real strategy. Here `stg_events` is declared `type = "view"`:
+`current_strategy` is `"unknown"` when Rocky cannot find the model in the compiled project, for example a model seen only in run history:
 
 ```json
 {
-  "model_name": "stg_events",
-  "current_strategy": "view",
-  "recommended_strategy": "view",
+  "model_name": "events",
+  "current_strategy": "unknown",
+  "recommended_strategy": "unknown",
   "estimated_monthly_savings": 0.0,
-  "reasoning": "insufficient history: 1 runs (need 5)",
-  "compute_cost_per_run": 0.0000026666666666666673,
+  "reasoning": "current strategy is unknown (model not found in the compiled project); no recommendation",
+  "compute_cost_per_run": 0.000010666666666666669,
   "storage_cost_per_month": 0.0023,
-  "downstream_references": 1
+  "downstream_references": 0
 }
 ```
 
