@@ -380,7 +380,7 @@ pub async fn run_with_dag(
         .iter()
         .filter_map(|n| n.pipeline.as_ref().map(|p| (n.id.clone(), p.clone())))
         .collect();
-    let seed_pipelines = resolve_seed_pipelines(cfg, &dag, &node_pipelines, &seeds, &sql_by_name);
+    let seed_pipeline = sole_adapter_pipeline(cfg);
 
     let dispatcher = CliDispatcher {
         config_path: config_path.to_path_buf(),
@@ -388,7 +388,7 @@ pub async fn run_with_dag(
         state_path: state_path.to_path_buf(),
         seeds_dir,
         node_pipelines,
-        seed_pipelines,
+        seed_pipeline,
         partition_opts: partition_opts.clone(),
         skip_opts: *skip_opts,
         shadow_config: shadow_config.cloned(),
@@ -602,174 +602,66 @@ pub(super) struct TransformationModels {
     pub contributing_roots: Vec<PathBuf>,
 }
 
-/// A seed's own physical target identity, known without reference to any
-/// pipeline — used to verify a candidate consumer actually reads THIS seed
-/// rather than a same-named table elsewhere (#2018 round 2).
-///
-/// `None` when the seed's sidecar has no explicit `[target]`: `run_seed`'s
-/// `default_catalog` for that case depends on WHICH pipeline is chosen
-/// (`pipeline_cfg.as_replication()`), so the seed's own catalog can't be
-/// known independently of the very question [`resolve_seed_pipelines`] is
-/// answering. Such a seed is left unresolved rather than guessed at.
-struct SeedIdentity<'a> {
-    catalog: Option<&'a str>,
-    schema: String,
-    table: String,
-}
-
-fn seed_identity(seed: &rocky_core::seeds::SeedFile) -> Option<SeedIdentity<'_>> {
-    let target = seed.config.target.as_ref()?;
-    Some(SeedIdentity {
-        catalog: target.catalog.as_deref(),
-        schema: target.schema.to_lowercase(),
-        table: target.table.as_deref().unwrap_or(&seed.name).to_lowercase(),
-    })
-}
-
-/// Whether a table reference from SQL (as [`rocky_sql::lineage::referenced_tables`]
-/// returns it — lowercased, however many dot-separated parts the SQL
-/// literally used) names `identity`.
-///
-/// Requires schema **and** table to match; a bare, unqualified reference
-/// (a single part, e.g. `orders`) never matches, however the schema/table
-/// compare — that is the exact ambiguity #2018's round-2 red-team pass
-/// found: `infer_runtime_dependencies` wires an edge off the reference's
-/// bare LAST segment alone, so a model reading an unrelated
-/// `some_catalog.some_schema.orders` would otherwise look identical to one
-/// reading this seed's `wh.seeds.orders`. When the reference carries a
-/// catalog part too, and the seed's own catalog is known, the catalog must
-/// also match.
-fn reference_matches_seed(reference: &str, identity: &SeedIdentity<'_>) -> bool {
-    let parts: Vec<&str> = reference.split('.').collect();
-    match parts.as_slice() {
-        [catalog, schema, table] => {
-            *table == identity.table
-                && *schema == identity.schema
-                && identity.catalog.is_none_or(|c| c == *catalog)
-        }
-        [schema, table] => *table == identity.table && *schema == identity.schema,
-        _ => false,
-    }
-}
-
-/// Resolve each `Seed` node's pipeline for `run_seed`'s adapter selection
-/// (#2018), one entry per seed the DAG can place unambiguously.
+/// The pipeline to load a `Seed` node against, for `run_seed`'s adapter
+/// selection (#2018).
 ///
 /// A seed has no pipeline of its own: `seeds_dir` is one project-global
 /// directory, not one per pipeline — `unified_dag::build_unified_dag` adds
-/// seed nodes as explicitly "pipeline-independent", and that stays true
-/// here. Standalone `rocky seed` without `--pipeline` already refuses unless
-/// the project has exactly one pipeline, because it has no other way to
-/// pick a target adapter. `--dag` has no operator to ask.
+/// seed nodes as explicitly "pipeline-independent". Standalone `rocky seed`
+/// without `--pipeline` already refuses unless the project has exactly one
+/// pipeline, because it has no other way to pick a target adapter. `--dag`
+/// has no operator to ask.
 ///
-/// Two rejected earlier versions, both from independent red-team passes:
+/// Resolves to a pipeline ONLY when every pipeline in the project shares
+/// ONE warehouse adapter name — in that case it does not matter which
+/// pipeline `run_seed` receives, because its pipeline argument's only
+/// functional effect is choosing `target_adapter()`, and there is only one
+/// value it could choose. Prefers a replication pipeline when one exists
+/// (matching `run_seed`'s own `default_catalog` fallback, which only
+/// resolves for a replication pipeline), else the first pipeline in config
+/// order.
 ///
-/// 1. Picking the project's sole *replication* pipeline: `run_seed`'s
-///    pipeline argument selects the *warehouse adapter* the seed loads
-///    into, and nothing says a project's replication pipeline shares an
-///    adapter with the pipeline that actually reads the seed. Two adapters,
-///    a replication pipeline on one and a transformation pipeline reading
-///    the seed on the other: the seed would refresh the unread adapter and
-///    leave a stale same-named table on the real reader's adapter
+/// Two more capable designs were tried and rejected, each by an independent
+/// red-team pass that found a route to a silently wrong warehouse:
+///
+/// 1. Picking the project's sole *replication* pipeline unconditionally: on
+///    a project with a replication pipeline on one adapter and the seed's
+///    real reader on a DIFFERENT one, the seed refreshes the unread adapter
+///    and leaves a stale same-named table on the reader's adapter
 ///    untouched — the DAG reports success over silently wrong data.
-/// 2. Resolving from the seed's direct consumers by BARE table name (any
-///    edge `infer_runtime_dependencies` wired): that inference matches on
-///    the last dot-separated segment of a SQL reference alone
-///    (`unified_dag.rs`'s `referenced_tables` bare-name match), so a model
-///    reading an unrelated `other_catalog.other_schema.orders` looks
-///    identical to one reading this seed's `wh.seeds.orders`. Resolving off
-///    that edge could send the seed into a warehouse nothing related
-///    actually reads, or past one that does, on nothing more than a
-///    same-named coincidence.
+/// 2. Resolving from the seed's downstream consumers, verified against the
+///    consumer's own SQL: still routed off a bare/qualified table-name
+///    match derived from `unified_dag`'s inference machinery, which cannot
+///    prove the matched name is physically the SAME adapter connection —
+///    two different DuckDB files can share a catalog *name* (as this file's
+///    own test fixtures do), so a same-named table on the WRONG adapter
+///    could still pass.
 ///
-/// This resolves from the seed's DIRECT downstream consumers in the built
-/// DAG (after SQL/physical-read inference has run), same as (2), but
-/// additionally re-parses each candidate consumer's own SQL and requires a
-/// qualified reference — schema **and** table, catalog too when the seed's
-/// own is known — that actually names this seed's resolved `[target]` (see
-/// [`seed_identity`], [`reference_matches_seed`]). A seed with no explicit
-/// `[target]`, no consumers verified this way, or verified consumers on
-/// different adapters, has no entry here, and `run_seed` refuses exactly as
-/// standalone `rocky seed` (no `--pipeline`) already does on an ambiguous
-/// project. `node_pipelines` is the same pipeline-bound-node map
-/// [`execute_unified_dag`] builds for its own dispatch; `sql_by_name` is the
-/// same model-name → SQL map it threads into `infer_runtime_dependencies`.
-///
-/// Not addressed: a project whose seed genuinely has readers on more than
-/// one adapter (each holding its own copy) has no single correct answer
-/// here and stays refused — the seed is `rocky seed --pipeline <name>`'s
-/// job outside `--dag` in that shape, once per adapter.
-fn resolve_seed_pipelines(
-    cfg: &rocky_core::config::RockyConfig,
-    dag: &unified_dag::UnifiedDag,
-    node_pipelines: &HashMap<NodeId, String>,
-    seeds: &[rocky_core::seeds::SeedFile],
-    sql_by_name: &HashMap<String, String>,
-) -> HashMap<NodeId, String> {
-    let seeds_by_name: HashMap<&str, &rocky_core::seeds::SeedFile> =
-        seeds.iter().map(|s| (s.name.as_str(), s)).collect();
-
-    let mut seed_pipelines = HashMap::new();
-    for node in &dag.nodes {
-        if node.kind != NodeKind::Seed {
-            continue;
-        }
-        let Some(seed) = seeds_by_name.get(node.label.as_str()) else {
-            continue;
-        };
-        let Some(identity) = seed_identity(seed) else {
-            continue;
-        };
-
-        // (pipeline name, adapter name) of the first VERIFIED consumer
-        // seen; any later one must agree on the adapter or the seed is
-        // left unresolved.
-        let mut resolved: Option<(&str, &str)> = None;
-        let mut ambiguous = false;
-        for edge in &dag.edges {
-            if edge.from != node.id {
-                continue;
-            }
-            let Some(consumer_pipeline) = node_pipelines.get(&edge.to) else {
-                continue;
-            };
-            // Verify: does this consumer's OWN SQL actually reference the
-            // seed's resolved target, or did it merely share a bare table
-            // name with something producing an edge for a different
-            // reason? Every edge a seed can have targets a Transformation
-            // node (`infer_runtime_dependencies` / `resolve_cross_step_deps`
-            // wire nothing else), whose label IS the model name `sql_by_name`
-            // is keyed by.
-            let Some(consumer_label) = dag.node(&edge.to).map(|n| n.label.as_str()) else {
-                continue;
-            };
-            let Some(sql) = sql_by_name.get(consumer_label) else {
-                continue;
-            };
-            let Ok(refs) = rocky_sql::lineage::referenced_tables(sql) else {
-                continue;
-            };
-            if !refs.iter().any(|r| reference_matches_seed(r, &identity)) {
-                continue;
-            }
-            let Some(pipeline_cfg) = cfg.pipelines.get(consumer_pipeline) else {
-                continue;
-            };
-            let adapter = pipeline_cfg.target_adapter();
-            match resolved {
-                None => resolved = Some((consumer_pipeline.as_str(), adapter)),
-                Some((_, prev_adapter)) if prev_adapter != adapter => {
-                    ambiguous = true;
-                    break;
-                }
-                Some(_) => {}
-            }
-        }
-        if !ambiguous && let Some((pipeline_name, _)) = resolved {
-            seed_pipelines.insert(node.id.clone(), pipeline_name.to_string());
-        }
+/// Both failure classes require more than one distinct adapter to exist at
+/// all. This rule sidesteps them by construction: when every pipeline
+/// shares one adapter, there is no wrong warehouse to route to, whichever
+/// pipeline name is passed. A project whose pipelines use different
+/// adapters has no single correct answer without knowing exactly which
+/// physical warehouse the seed's real reader sits on — a question this
+/// rule deliberately does not try to answer from the DAG — so it stays
+/// refused, exactly as `rocky seed` (no `--pipeline`) already refuses an
+/// ambiguous project.
+fn sole_adapter_pipeline(cfg: &rocky_core::config::RockyConfig) -> Option<String> {
+    let mut adapters = cfg
+        .pipelines
+        .values()
+        .map(rocky_core::config::PipelineConfig::target_adapter);
+    let first_adapter = adapters.next()?;
+    if !adapters.all(|adapter| adapter == first_adapter) {
+        return None;
     }
-    seed_pipelines
+    cfg.pipelines
+        .iter()
+        .find(|(_, pipeline)| {
+            matches!(pipeline, rocky_core::config::PipelineConfig::Replication(_))
+        })
+        .or_else(|| cfg.pipelines.iter().next())
+        .map(|(name, _)| name.clone())
 }
 
 fn status_str(s: &NodeStatus) -> &'static str {
@@ -807,13 +699,12 @@ struct CliDispatcher {
     /// Maps each pipeline-bound node to its owning pipeline name. Seed and
     /// source-marker nodes carry no entry (their `pipeline` is `None`).
     node_pipelines: HashMap<NodeId, String>,
-    /// Each `Seed` node's resolved pipeline — [`resolve_seed_pipelines`],
-    /// since a seed has no pipeline of its own to look up, and different
-    /// seeds can resolve to different pipelines depending on who reads them
-    /// (#2018). A seed with no entry here has no unambiguous consumer
-    /// adapter; `run_seed` refuses it exactly as standalone `rocky seed`
-    /// (no `--pipeline`) already does on an ambiguous project.
-    seed_pipelines: HashMap<NodeId, String>,
+    /// The pipeline `Seed` nodes load against — [`sole_adapter_pipeline`]
+    /// resolved once for the whole DAG, since every seed uses the same rule
+    /// (#2018). `None` when the project's pipelines don't all share one
+    /// warehouse adapter; `run_seed` refuses it exactly as standalone
+    /// `rocky seed` (no `--pipeline`) already does on an ambiguous project.
+    seed_pipeline: Option<String>,
     /// The outer DAG invocation's time-interval partition options, exactly as
     /// the caller passed them. [`Self::dispatch`] narrows them through
     /// [`sub_run_partition_opts`] on the way to each sub-run — the selection
@@ -979,14 +870,15 @@ impl NodeDispatcher for CliDispatcher {
                 // a warehouse-mutating seed node execute config B while the
                 // rest of the DAG runs A.
                 //
-                // `seed_pipeline` (#2018) is this seed's resolved consumer
-                // pipeline, when its downstream consumers agree on one
-                // warehouse adapter; absent when they don't (or there are
-                // none), in which case `run_seed` refuses exactly as
-                // standalone `rocky seed` (no `--pipeline`) already does on a
-                // multi-pipeline project — see `resolve_seed_pipelines`.
+                // `seed_pipeline` (#2018) is set only when every pipeline in
+                // the project shares one warehouse adapter — in which case
+                // it doesn't matter which of them is named, so every seed
+                // uses the same value. Absent otherwise, in which case
+                // `run_seed` refuses exactly as standalone `rocky seed`
+                // (no `--pipeline`) already does on a multi-pipeline project
+                // — see `sole_adapter_pipeline`.
                 let seeds_dir = self.seeds_dir.clone();
-                let seed_pipeline = self.seed_pipelines.get(id).cloned();
+                let seed_pipeline = self.seed_pipeline.clone();
                 Some(Box::pin(async move {
                     // `resolve_pipeline` inside `run_seed` is about to hit the
                     // same "which pipeline" ambiguity standalone `rocky seed`
@@ -1008,10 +900,11 @@ impl NodeDispatcher for CliDispatcher {
                     .await;
                     let result = if ambiguous {
                         result.with_context(|| {
-                            "rocky run --dag could not tell which pipeline this seed belongs \
-                             to (the project has no single replication pipeline to default \
-                             to); give it exactly one replication pipeline, or load this seed \
-                             outside --dag with `rocky seed --pipeline <name>`"
+                            "rocky run --dag cannot pick a warehouse adapter for this seed: \
+                             the project's pipelines do not all use the same adapter, so \
+                             there is no single pipeline to default to; give every pipeline \
+                             the same adapter, or load this seed outside --dag with \
+                             `rocky seed --pipeline <name>`"
                         })
                     } else {
                         result
@@ -1151,7 +1044,7 @@ mod run_opts_threading_tests {
             state_path: std::path::PathBuf::from(".rocky-state.redb"),
             seeds_dir: std::path::PathBuf::from("seeds"),
             node_pipelines,
-            seed_pipelines: HashMap::new(),
+            seed_pipeline: None,
             partition_opts,
             skip_opts,
             shadow_config,
@@ -1444,7 +1337,7 @@ mod state_turnstile_tests {
             state_path: std::path::PathBuf::from(state_path),
             seeds_dir: std::path::PathBuf::from("seeds"),
             node_pipelines,
-            seed_pipelines: HashMap::new(),
+            seed_pipeline: None,
             partition_opts: PartitionRunOptions::default(),
             skip_opts: SkipRunOptions::default(),
             shadow_config: None,
@@ -1741,7 +1634,7 @@ mod tests {
             state_path: root.join(".rocky-state.redb"),
             seeds_dir: root.join("seeds"),
             node_pipelines: HashMap::new(),
-            seed_pipelines: HashMap::new(),
+            seed_pipeline: None,
             partition_opts: PartitionRunOptions::default(),
             skip_opts: SkipRunOptions::default(),
             shadow_config: None,
@@ -2037,56 +1930,46 @@ mod tests {
         );
     }
 
-    /// #2018 red-team finding: a seed loads into the adapter its downstream
-    /// consumer actually reads, not the project's replication pipeline's
-    /// adapter, when the two differ.
+    /// #2018: a seed on a multi-pipeline project, all sharing ONE warehouse
+    /// adapter, refreshes a STALE same-named table rather than leaving it
+    /// (or writing beside it).
     ///
-    /// An earlier fix resolved every seed to the project's sole replication
-    /// pipeline. Here `ingest` (replication) and `transform`
-    /// (transformation, reading the seed) point at TWO DIFFERENT DuckDB
-    /// files — that fix would have refreshed `ingest`'s file (adapter `a`,
-    /// which nothing reads) and left a STALE same-named seed table on
-    /// `transform`'s file (adapter `b`) untouched, so the downstream model
-    /// would read old data while the DAG reported success.
-    ///
-    /// Non-vacuous: the stale table on `b` is seeded with a sentinel row
+    /// `ingest` (replication) and `transform` (transformation, reading the
+    /// seed) both point at the SAME DuckDB file — the only shape
+    /// `sole_adapter_pipeline` ever resolves without refusing. Non-vacuous:
+    /// the seed's own target table is seeded with a sentinel row
     /// (`code = "STALE"`) before the run. Asserting the model output holds
-    /// the FRESH seed rows, not the sentinel, proves adapter `b` was
-    /// refreshed; asserting `wh.seeds.orders` was never created on `a`
-    /// proves the seed did not also (or instead) write there.
+    /// the FRESH seed rows, not the sentinel, proves the seed node actually
+    /// ran (a node that dispatched but silently no-opped, or that raced the
+    /// model instead of ordering before it, would still leave the sentinel
+    /// visible).
     #[tokio::test]
-    async fn seed_resolves_to_its_consumers_adapter_not_the_replication_pipelines() {
+    async fn seed_refreshes_a_stale_table_when_all_pipelines_share_one_adapter() {
         use rocky_core::traits::WarehouseAdapter;
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        std::fs::create_dir_all(root.join("a")).unwrap();
-        std::fs::create_dir_all(root.join("b")).unwrap();
         std::fs::create_dir_all(root.join("models")).unwrap();
         std::fs::create_dir_all(root.join("seeds")).unwrap();
 
-        let db_a = root.join("a/wh.duckdb");
-        let db_b = root.join("b/wh.duckdb");
+        let db_path = root.join("wh.duckdb");
         std::fs::write(
             root.join("rocky.toml"),
             format!(
-                "[adapter.a]\n\
-                 type = \"duckdb\"\n\
-                 path = \"{}\"\n\n\
-                 [adapter.b]\n\
+                "[adapter.local]\n\
                  type = \"duckdb\"\n\
                  path = \"{}\"\n\n\
                  [pipeline.ingest]\n\
                  type = \"replication\"\n\
                  strategy = \"full_refresh\"\n\n\
                  [pipeline.ingest.source.discovery]\n\
-                 adapter = \"a\"\n\n\
+                 adapter = \"local\"\n\n\
                  [pipeline.ingest.source.schema_pattern]\n\
                  prefix = \"raw__\"\n\
                  separator = \"__\"\n\
                  components = [\"source\"]\n\n\
                  [pipeline.ingest.target]\n\
-                 adapter = \"a\"\n\
+                 adapter = \"local\"\n\
                  catalog_template = \"wh\"\n\
                  schema_template = \"staging__{{source}}\"\n\n\
                  [pipeline.ingest.target.governance]\n\
@@ -2096,21 +1979,20 @@ mod tests {
                  type = \"transformation\"\n\
                  depends_on = [\"ingest\"]\n\n\
                  [pipeline.transform.target]\n\
-                 adapter = \"b\"\n\n\
+                 adapter = \"local\"\n\n\
                  [pipeline.transform.target.governance]\n\
                  auto_create_catalogs = true\n\
                  auto_create_schemas = true\n",
-                db_a.display(),
-                db_b.display()
+                db_path.display()
             ),
         )
         .unwrap();
 
-        // Minimal source data so `ingest` (adapter A) has something to
-        // replicate; irrelevant to what this test pins beyond letting the
-        // DAG complete cleanly.
+        // Minimal source data so `ingest` has something to replicate;
+        // irrelevant to what this test pins beyond letting the DAG complete
+        // cleanly.
         {
-            let source_db = DuckDbWarehouseAdapter::open(&db_a).unwrap();
+            let source_db = DuckDbWarehouseAdapter::open(&db_path).unwrap();
             source_db
                 .execute_statement("CREATE SCHEMA raw__shop")
                 .await
@@ -2119,17 +2001,13 @@ mod tests {
                 .execute_statement("CREATE TABLE raw__shop.orders_src AS SELECT 1 AS id")
                 .await
                 .unwrap();
-        }
 
-        // A STALE same-named seed table already sitting on adapter B, the
-        // consumer's real adapter.
-        {
-            let stale_db = DuckDbWarehouseAdapter::open(&db_b).unwrap();
-            stale_db
+            // A STALE same-named seed table, as if left by an earlier run.
+            source_db
                 .execute_statement("CREATE SCHEMA wh.seeds")
                 .await
                 .unwrap();
-            stale_db
+            source_db
                 .execute_statement(
                     "CREATE TABLE wh.seeds.orders AS SELECT 'STALE' AS code, 'stale row' AS name",
                 )
@@ -2183,13 +2061,12 @@ mod tests {
             None,
         )
         .await
-        .expect("run --dag should resolve the seed to its consumer's adapter");
+        .expect("run --dag should complete the seed and its downstream model");
 
-        // Adapter B (the consumer) holds the FRESH rows, not the sentinel.
-        let b = DuckDbWarehouseAdapter::open(&db_b).unwrap();
-        let b_conn = b.shared_connector();
-        let b_guard = b_conn.lock().unwrap();
-        let model_rows = b_guard
+        let adapter = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        let model_rows = guard
             .execute_sql("SELECT code FROM wh.silver.stg_orders ORDER BY code")
             .unwrap();
         let codes: Vec<String> = model_rows
@@ -2200,50 +2077,33 @@ mod tests {
         assert_eq!(
             codes,
             vec!["GB".to_string(), "US".to_string()],
-            "the model must read the FRESH seed rows on adapter B, not the stale sentinel"
-        );
-
-        // Adapter A (the replication pipeline nothing reads the seed
-        // through) must never have received a seed table at all.
-        let a = DuckDbWarehouseAdapter::open(&db_a).unwrap();
-        let a_conn = a.shared_connector();
-        let a_guard = a_conn.lock().unwrap();
-        assert!(
-            a_guard
-                .execute_sql("SELECT * FROM wh.seeds.orders")
-                .is_err(),
-            "the seed must not have been written to the replication pipeline's adapter"
+            "the model must read the FRESH seed rows, not the stale sentinel"
         );
     }
 
-    /// #2018 red-team finding, round 2: a model that merely reads a table
-    /// with the SAME BARE NAME as a seed must not be treated as that seed's
-    /// consumer.
+    /// #2018: a project whose pipelines use DIFFERENT warehouse adapters has
+    /// no single correct answer for which one a seed belongs to, and
+    /// `--dag` must refuse rather than guess.
     ///
-    /// `infer_runtime_dependencies` wires an edge off the last dot-separated
-    /// segment of a SQL reference alone (`unified_dag.rs`), so a model
-    /// reading an unrelated `wh.raw.orders` gets an edge from a seed NAMED
-    /// `orders` even when that seed's own `[target]` resolves somewhere
-    /// else entirely (`wh.seeds.countries` here — deliberately different
-    /// from its name, the exact mismatch the finding named). Resolving the
-    /// seed's pipeline off that edge, unchecked, would send it into
-    /// whichever adapter the coincidentally-named reader happens to sit on.
+    /// Two independent red-team passes each found a way an earlier, more
+    /// capable resolution rule (the project's sole replication pipeline;
+    /// then a downstream consumer's own SQL, checked against the seed's
+    /// resolved target) could still route a multi-adapter project's seed to
+    /// the wrong warehouse. `sole_adapter_pipeline` only ever resolves when
+    /// every pipeline shares one adapter — on two DIFFERENT adapters it has
+    /// no candidate to offer at all, so the failure class cannot occur
+    /// here.
     ///
-    /// This seed's true target is read by nothing in the project, so the
-    /// correct outcome is the refusal `--dag` already gives an unresolvable
-    /// seed on a multi-pipeline project — NOT a guess. Asserts the DAG
-    /// fails, and that `wh.seeds.countries` was created on NEITHER adapter
-    /// (proving the seed was not silently routed to the false-positive
-    /// reader's adapter, or anywhere else).
+    /// Non-vacuous: asserts the DAG run fails AND that the seed's target
+    /// table was created on NEITHER adapter — proving the refusal happens
+    /// before any write, not that it merely failed for some other reason
+    /// after writing.
     #[tokio::test]
-    async fn seed_ignores_a_bare_name_collision_with_an_unrelated_table() {
-        use rocky_core::traits::WarehouseAdapter;
-
+    async fn seed_refuses_when_the_projects_pipelines_use_different_adapters() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("a")).unwrap();
         std::fs::create_dir_all(root.join("b")).unwrap();
-        std::fs::create_dir_all(root.join("models")).unwrap();
         std::fs::create_dir_all(root.join("seeds")).unwrap();
 
         let db_a = root.join("a/wh.duckdb");
@@ -2258,44 +2118,19 @@ mod tests {
                  type = \"duckdb\"\n\
                  path = \"{}\"\n\n\
                  [pipeline.alpha]\n\
-                 type = \"transformation\"\n\
-                 models = \"models/alpha/**\"\n\n\
+                 type = \"transformation\"\n\n\
                  [pipeline.alpha.target]\n\
                  adapter = \"a\"\n\n\
-                 [pipeline.alpha.target.governance]\n\
-                 auto_create_catalogs = true\n\
-                 auto_create_schemas = true\n\n\
                  [pipeline.beta]\n\
-                 type = \"transformation\"\n\
-                 models = \"models/beta/**\"\n\n\
+                 type = \"transformation\"\n\n\
                  [pipeline.beta.target]\n\
-                 adapter = \"b\"\n\n\
-                 [pipeline.beta.target.governance]\n\
-                 auto_create_catalogs = true\n\
-                 auto_create_schemas = true\n",
+                 adapter = \"b\"\n",
                 db_a.display(),
                 db_b.display()
             ),
         )
         .unwrap();
 
-        // Pre-existing, UNRELATED table on adapter A whose bare name happens
-        // to equal the seed's name below.
-        {
-            let unrelated_db = DuckDbWarehouseAdapter::open(&db_a).unwrap();
-            unrelated_db
-                .execute_statement("CREATE SCHEMA raw")
-                .await
-                .unwrap();
-            unrelated_db
-                .execute_statement("CREATE TABLE raw.orders AS SELECT 1 AS id")
-                .await
-                .unwrap();
-        }
-
-        // The seed is NAMED "orders" (so `infer_runtime_dependencies` indexes
-        // it under that label) but its `[target]` resolves to a completely
-        // different table, `wh.seeds.countries`.
         std::fs::write(
             root.join("seeds/orders.csv"),
             "code,name\nUS,United States\nGB,United Kingdom\n",
@@ -2307,29 +2142,7 @@ mod tests {
              [target]\n\
              catalog = \"wh\"\n\
              schema = \"seeds\"\n\
-             table = \"countries\"\n",
-        )
-        .unwrap();
-
-        std::fs::create_dir_all(root.join("models/alpha")).unwrap();
-        std::fs::create_dir_all(root.join("models/beta")).unwrap();
-
-        // Reads the UNRELATED `wh.raw.orders` — nothing to do with the
-        // seed's own target. Its bare last segment ("orders") still matches
-        // the seed's NAME, so this is exactly the coincidence the fix must
-        // not trust.
-        std::fs::write(
-            root.join("models/alpha/decoy.sql"),
-            "SELECT * FROM wh.raw.orders\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("models/alpha/decoy.toml"),
-            "name = \"decoy\"\n\n\
-             [target]\n\
-             catalog = \"wh\"\n\
-             schema = \"silver\"\n\
-             table = \"decoy\"\n",
+             table = \"orders\"\n",
         )
         .unwrap();
 
@@ -2348,7 +2161,8 @@ mod tests {
         .await;
         assert!(
             result.is_err(),
-            "an unresolvable seed on a multi-pipeline project must refuse, not guess: {result:?}"
+            "a seed on a project whose pipelines use different adapters must refuse, \
+             not guess: {result:?}"
         );
 
         for db in [&db_a, &db_b] {
@@ -2356,11 +2170,9 @@ mod tests {
             let conn = adapter.shared_connector();
             let guard = conn.lock().unwrap();
             assert!(
-                guard
-                    .execute_sql("SELECT * FROM wh.seeds.countries")
-                    .is_err(),
-                "the seed's real target must not have been written to {db:?} — \
-                 a false-positive edge off the bare-name collision must not route it anywhere"
+                guard.execute_sql("SELECT * FROM wh.seeds.orders").is_err(),
+                "the seed must not have been written to {db:?} — the refusal must \
+                 happen before any adapter is picked"
             );
         }
     }
