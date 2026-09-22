@@ -323,7 +323,9 @@ pub struct QualityGateFailure {
 /// violation is on a table this resume never re-copied, so it produced no
 /// check result to count. Reporting "0 error-severity check(s) failed" would
 /// be a lie about a run that is deliberately not green, so the message says
-/// which run raised the gate instead.
+/// which run raised the gate instead — and, per #1851, which checks that
+/// run's own record carries as failed (see
+/// [`recorded_failed_checks_clause`] for the "recorded, not blocking" caveat).
 #[derive(Debug)]
 pub struct CheckGateFailure {
     pub count: usize,
@@ -331,6 +333,11 @@ pub struct CheckGateFailure {
     /// The run whose standing check gate this one inherited, or `None` when
     /// the gate is this run's own.
     pub inherited_from: Option<String>,
+    /// `inherited_from`'s own [`rocky_core::state::CheckOutcome`] names where
+    /// `passed` is `false` (#1851). Always empty when `inherited_from` is
+    /// `None`; see [`InheritedCheckGate::failed_checks`] for what this can
+    /// and cannot claim.
+    pub inherited_failed_checks: Vec<String>,
 }
 
 impl std::fmt::Display for CheckGateFailure {
@@ -344,12 +351,13 @@ impl std::fmt::Display for CheckGateFailure {
                 self.count, self.run_id
             );
         };
+        let clause = recorded_failed_checks_clause(prior, &self.inherited_failed_checks);
         write!(
             f,
             "the check gate raised by run {prior} still stands (run_id: {}); this resume \
              re-ran none of those checks — it builds its check inputs only from the tables it \
-             copied — and added {} error-severity failure(s) of its own. Fix the data and \
-             re-run the pipeline; resuming again cannot clear the gate",
+             copied — and added {} error-severity failure(s) of its own. {clause} Fix the data \
+             and re-run the pipeline; resuming again cannot clear the gate",
             self.run_id, self.count
         )
     }
@@ -2383,12 +2391,31 @@ fn ensure_the_resume_would_do_work(
     )
 }
 
-/// The prior run whose still-standing check gate an admitted resume inherits.
+/// The prior run whose still-standing check gate an admitted resume inherits,
+/// plus the check names that run's own record carries (#1851).
 ///
-/// `Some(run_id)` when the run being resumed recorded
+/// `run_id` is the run being resumed, when it recorded
 /// [`rocky_core::state::RunRecord::check_gate_failed`]: an error-severity check
 /// failed (or could not be evaluated) while that pipeline's `fail_on_error`
 /// gate was on.
+///
+/// `failed_checks` is every [`rocky_core::state::CheckOutcome::name`] on that
+/// record where `passed` is `false` — including a `not_evaluated` outcome,
+/// which always carries `passed: false` except the one deliberate exception
+/// documented on [`rocky_core::state::CheckOutcome::not_evaluated`] (a
+/// keyless overlap sibling, which is not a failure and correctly excluded
+/// here too). These are named as *recorded*, never as *blocking*:
+/// `CheckOutcome` carries no severity, so a warning-severity check that
+/// failed under a `fail_on_error` pipeline sits in this list beside the
+/// error-severity one that actually raised the gate, and there is no way to
+/// tell them apart from the record alone (see
+/// [`ensure_the_resume_would_do_work`]'s doc for why the gate's own refusal
+/// decision does not consult this field either). `CheckOutcome` also carries
+/// no table/asset key, so two tables failing the same check name are
+/// indistinguishable in this list — `rocky history` is still how an operator
+/// finds which table. Empty for a pre-v27 record (`check_outcomes` did not
+/// exist yet) or the unobserved case of a gate standing over an all-`passed`
+/// record.
 ///
 /// # Why an admitted resume has to inherit it
 ///
@@ -2419,13 +2446,67 @@ fn ensure_the_resume_would_do_work(
 /// case [`ensure_run_is_resumable`] deliberately admits), or when the record
 /// predates state schema v25 — an unrecorded verdict reads `false`, so a
 /// pre-v25 run resumes exactly as it does today.
+struct InheritedCheckGate {
+    run_id: String,
+    failed_checks: Vec<String>,
+}
+
 fn inherited_check_gate(
     state_store: &StateStore,
     progress: Option<&RunProgress>,
-) -> Option<String> {
+) -> Option<InheritedCheckGate> {
     let progress = progress?;
     let record = state_store.get_run(&progress.run_id).ok().flatten()?;
-    record.check_gate_failed.then(|| progress.run_id.clone())
+    if !record.check_gate_failed {
+        return None;
+    }
+    let failed_checks = record
+        .check_outcomes
+        .iter()
+        .filter(|c| !c.passed)
+        .map(|c| c.name.clone())
+        .collect();
+    Some(InheritedCheckGate {
+        run_id: progress.run_id.clone(),
+        failed_checks,
+    })
+}
+
+/// The clause naming what a prior run's [`InheritedCheckGate::failed_checks`]
+/// recorded, for a message that must not claim the list is exactly what
+/// tripped the gate (#1851) — see that field's doc.
+fn recorded_failed_checks_clause(run_id: &str, failed_checks: &[String]) -> String {
+    if failed_checks.is_empty() {
+        // Not necessarily a pre-v27 record: `failed_checks` is also empty for
+        // a resume-of-a-resume whose own `check_outcomes` is empty (it
+        // inherited the gate and re-ran no check of its own), so this must
+        // not guess a reason.
+        return format!("Run {run_id}'s record does not carry check names for that gate.");
+    }
+    // `CheckOutcome` has no table/asset key (see this clause's caller's doc),
+    // so two tables failing the same check name arrive here as duplicate
+    // strings — collapsed here, in first-seen order, so a run with many
+    // identically-named per-table failures renders as one entry with a
+    // count instead of the same name repeated dozens of times.
+    let mut counted: Vec<(&str, usize)> = Vec::new();
+    for name in failed_checks {
+        match counted.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, count)) => *count += 1,
+            None => counted.push((name, 1)),
+        }
+    }
+    let rendered = counted
+        .into_iter()
+        .map(|(name, count)| {
+            if count > 1 {
+                format!("{name} (×{count})")
+            } else {
+                name.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Run {run_id} recorded these checks as failed: {rendered}.")
 }
 
 /// The prior run whose still-standing `verify_after` failure an admitted
@@ -4051,7 +4132,8 @@ pub async fn run(
     // The `false` is this run's OWN verdict, which is necessarily false here:
     // no check has run yet. Written through the same helper as the stamp
     // below so the two sites cannot drift apart.
-    output.check_gate_failed = resolved_check_gate(false, inherited_gate.as_ref());
+    output.check_gate_failed =
+        resolved_check_gate(false, inherited_gate.as_ref().map(|g| &g.run_id));
     // Same early stamp, same reason, for the inherited verification verdict:
     // an interrupted resume must persist it too, or a resume of THAT run
     // inherits nothing and can go green (#1732).
@@ -5985,7 +6067,8 @@ pub async fn run(
     // Without this `||` the resumed run derives `Success`, and
     // `latest_successful_run` starts matching it — the laundering path. `None`
     // on every run that is not a resume of a gated run, so nothing else moves.
-    output.check_gate_failed = resolved_check_gate(this_run_gated, inherited_gate.as_ref());
+    output.check_gate_failed =
+        resolved_check_gate(this_run_gated, inherited_gate.as_ref().map(|g| &g.run_id));
     // The inherited verification verdict rides alongside. This run's OWN
     // `verify_after` has not run yet — it runs after the record is persisted,
     // because it reads that record — so the failure branch there ORs itself in
@@ -6006,13 +6089,15 @@ pub async fn run(
     }
     if let Some(prior) = &inherited_gate {
         warn!(
-            resumed_from = prior.as_str(),
+            resumed_from = prior.run_id.as_str(),
             "resumed run inherits a standing check gate"
         );
+        let clause = recorded_failed_checks_clause(&prior.run_id, &prior.failed_checks);
         crate::status_line!(
-            "Check gate: run {prior} was gated by its checks and this resume re-ran none of \
-             them, so the gate still stands — this run cannot report success. Fix the data and \
-             re-run the pipeline."
+            "Check gate: run {run_id} was gated by its checks and this resume re-ran none of \
+             them, so the gate still stands — this run cannot report success. {clause} Fix the \
+             data and re-run the pipeline.",
+            run_id = prior.run_id,
         );
     }
 
@@ -6635,14 +6720,21 @@ pub async fn run(
             return Err(CheckGateFailure {
                 count,
                 run_id: run_id.clone(),
-                inherited_from: inherited_gate.clone(),
+                inherited_from: inherited_gate.as_ref().map(|g| g.run_id.clone()),
+                inherited_failed_checks: inherited_gate
+                    .as_ref()
+                    .map(|g| g.failed_checks.clone())
+                    .unwrap_or_default(),
             }
             .into());
         }
         if let Some(prior) = &inherited_gate {
+            let clause = recorded_failed_checks_clause(&prior.run_id, &prior.failed_checks);
             anyhow::bail!(
-                "the check gate raised by run {prior} still stands (run_id: {run_id}); this \
-                 resume re-ran none of those checks — fix the data and re-run the pipeline"
+                "the check gate raised by run {} still stands (run_id: {run_id}); this \
+                 resume re-ran none of those checks. {clause} Fix the data and re-run the \
+                 pipeline",
+                prior.run_id
             );
         }
         anyhow::bail!(
@@ -16693,6 +16785,35 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         store.record_run(&record).unwrap();
     }
 
+    /// A gated run's record, carrying the [`rocky_core::state::CheckOutcome`]
+    /// entries `to_run_record` would have flattened onto it (#1851). Each
+    /// tuple is `(name, passed)`; `not_evaluated` is left unset — the tests
+    /// that use this only care about `passed`.
+    fn seed_gated_run_record_with_checks(
+        store: &StateStore,
+        run_id: &str,
+        status: &str,
+        checks: &[(&str, bool)],
+    ) {
+        let check_outcomes: Vec<_> = checks
+            .iter()
+            .map(|(name, passed)| serde_json::json!({"name": name, "passed": passed}))
+            .collect();
+        let record: rocky_core::state::RunRecord = serde_json::from_value(serde_json::json!({
+            "run_id": run_id,
+            "started_at": "2026-08-30T00:00:00Z",
+            "finished_at": "2026-08-30T00:01:00Z",
+            "status": status,
+            "models_executed": [],
+            "trigger": "Manual",
+            "config_hash": "test",
+            "check_gate_failed": true,
+            "check_outcomes": check_outcomes,
+        }))
+        .expect("minimal RunRecord deserializes");
+        store.record_run(&record).unwrap();
+    }
+
     /// #1720. Every table this run planned copied, the checks gated it, AND a
     /// failed `models_executed` entry is present — the `<verify_after>` shape,
     /// which needs no `--all` and no model at all.
@@ -16919,11 +17040,54 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                 .expect("the checkpoint resolves");
             assert_eq!(progress.run_id, "run-1");
             assert_eq!(
-                super::inherited_check_gate(&store, Some(&progress)).as_deref(),
+                super::inherited_check_gate(&store, Some(&progress))
+                    .as_ref()
+                    .map(|g| g.run_id.as_str()),
                 Some("run-1"),
                 "the admitted resume must carry the standing gate forward"
             );
         }
+    }
+
+    /// #1851. The prior run's own record carries which checks it recorded as
+    /// failed, at zero extra query cost — `inherited_check_gate` must surface
+    /// every one of them (not just the run id) so the resume's refusal
+    /// message can name them instead of sending the operator to
+    /// `rocky history` for the prior run. A passing check must not appear.
+    ///
+    /// Fails without the fix: pre-#1851, `inherited_check_gate` returns only
+    /// the run id and this test does not compile against that shape.
+    #[test]
+    fn inherited_check_gate_names_every_check_the_prior_run_recorded_as_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        store
+            .init_run_progress("run-1", &planned_keys(3), Some(&scope))
+            .unwrap();
+        complete_tables(&store, "run-1", 2);
+        seed_gated_run_record_with_checks(
+            &store,
+            "run-1",
+            "PartialFailure",
+            &[
+                ("row_count", false),
+                ("not_null:email", false),
+                ("freshness", true),
+            ],
+        );
+
+        let progress = resolve_resume_progress(&store, Some("run-1"), false, &scope)
+            .expect("a gated run with a table left to copy still resumes")
+            .expect("the checkpoint resolves");
+        let inherited = super::inherited_check_gate(&store, Some(&progress))
+            .expect("the standing gate must be inherited");
+        assert_eq!(
+            inherited.failed_checks,
+            vec!["row_count".to_string(), "not_null:email".to_string()],
+            "both failed checks must be named and the passing one excluded: {:?}",
+            inherited.failed_checks
+        );
     }
 
     /// Control (#1720): an ungated failed run is untouched. `main`'s
@@ -24406,14 +24570,20 @@ backend = "local"
         // --- the resume: it copies the one table that failed, and nothing
         // else. It runs the checks for that table only, and they pass.
         let inherited = super::inherited_check_gate(&store, Some(&progress));
-        assert_eq!(inherited.as_deref(), Some("run-1"));
+        assert_eq!(inherited.as_ref().map(|g| g.run_id.as_str()), Some("run-1"));
+        assert_eq!(
+            inherited.as_ref().map(|g| g.failed_checks.as_slice()),
+            Some(["row_count".to_string()].as_slice()),
+            "the prior run's own recorded failed check must carry through (#1851)"
+        );
 
         let mut resumed = RunOutput::new(String::new(), 0, 1);
         resumed.tables_copied = 1;
         resumed.resumed_from = Some("run-1".to_string());
         let own_gate = super::replication_check_gate_failed(&resumed, &checks);
         assert!(!own_gate, "the resume re-ran none of the gating checks");
-        resumed.check_gate_failed = super::resolved_check_gate(own_gate, inherited.as_ref());
+        resumed.check_gate_failed =
+            super::resolved_check_gate(own_gate, inherited.as_ref().map(|g| &g.run_id));
 
         assert!(
             !matches!(resumed.derive_run_status(), RunStatus::Success),
@@ -24446,7 +24616,9 @@ backend = "local"
             .unwrap();
         let progress2 = store.get_run_progress("run-2").unwrap().unwrap();
         assert_eq!(
-            super::inherited_check_gate(&store, Some(&progress2)).as_deref(),
+            super::inherited_check_gate(&store, Some(&progress2))
+                .as_ref()
+                .map(|g| g.run_id.as_str()),
             Some("run-2"),
             "a resume of the resume inherits the same standing gate"
         );
@@ -24676,15 +24848,28 @@ backend = "local"
     /// the ordering is asserted over this file's own source, the shape
     /// `rocky-mcp`'s `tools.rs` already uses for a claim about its own text.
     ///
+    /// The needle is the whole ASSIGNMENT, `output.check_gate_failed =
+    /// resolved_check_gate(...)`, not just the call (#2132 red-team finding):
+    /// a needle of the call alone still matches a mutation that deletes
+    /// `output.check_gate_failed =` and leaves the call as a discarded
+    /// expression statement — the stamp is gone but the text this test
+    /// looked for is still there. The source is whitespace-normalised before
+    /// matching (`split_whitespace().join(" ")`) because rustfmt wraps the
+    /// assignment across two lines, and the needle has no such wrapping.
+    ///
     /// Both `find`s take the FIRST occurrence, which is the production site;
     /// the copies inside this test are thousands of lines later.
     #[test]
     fn the_inherited_gate_is_stamped_before_the_interrupt_path_persists() {
         let source = include_str!("run.rs");
-        let stamp = source
-            .find("output.check_gate_failed = resolved_check_gate(false, inherited_gate.as_ref());")
+        let normalized = source.split_whitespace().collect::<Vec<_>>().join(" ");
+        let stamp = normalized
+            .find(
+                "output.check_gate_failed = resolved_check_gate(false, \
+                 inherited_gate.as_ref().map(|g| &g.run_id));",
+            )
             .expect("the early inherited-gate stamp is gone — see #1720");
-        let interrupt_persist = source
+        let interrupt_persist = normalized
             .find("// Persist interrupted RunRecord")
             .expect("the interrupt path's persist comment moved; re-anchor this test");
         assert!(
@@ -24888,6 +25073,7 @@ backend = "local"
             count: 2,
             run_id: "run-1".to_string(),
             inherited_from: None,
+            inherited_failed_checks: Vec::new(),
         }
         .to_string();
         assert!(
@@ -24900,6 +25086,7 @@ backend = "local"
             count: 0,
             run_id: "run-2".to_string(),
             inherited_from: Some("run-1".to_string()),
+            inherited_failed_checks: Vec::new(),
         }
         .to_string();
         assert!(
@@ -24911,6 +25098,94 @@ backend = "local"
                 && inherited.contains("re-ran none of those checks")
                 && inherited.contains("resuming again cannot clear the gate"),
             "an inherited gate must name the run that raised it: {inherited}"
+        );
+    }
+
+    /// #1851. The prior run's own record carries which checks it recorded as
+    /// failed — the operator's next question after "the gate raised by run
+    /// X still stands" is "which check?", and answering it used to mean a
+    /// trip to `rocky history` for run X. Both names must appear, and the
+    /// wording must say "recorded", never "blocking" — `CheckOutcome` carries
+    /// no severity, so this list can hold a warning-severity name beside the
+    /// error-severity one that actually raised the gate.
+    #[test]
+    fn the_inherited_gate_message_names_every_check_the_prior_run_recorded() {
+        let inherited = super::CheckGateFailure {
+            count: 0,
+            run_id: "run-2".to_string(),
+            inherited_from: Some("run-1".to_string()),
+            inherited_failed_checks: vec!["row_count".to_string(), "not_null:email".to_string()],
+        }
+        .to_string();
+        assert!(
+            inherited.contains("row_count") && inherited.contains("not_null:email"),
+            "both check names run-1 recorded as failed must appear: {inherited}"
+        );
+        assert!(
+            inherited.contains("recorded these checks as failed"),
+            "the checks must be labelled as recorded, not as blocking: {inherited}"
+        );
+        assert!(
+            !inherited.contains("blocking"),
+            "the message must not claim the list is exactly what blocked the run: {inherited}"
+        );
+        // The existing assertions above still hold with the names inserted.
+        assert!(
+            inherited.contains("raised by run run-1")
+                && inherited.contains("re-ran none of those checks")
+                && inherited.contains("resuming again cannot clear the gate"),
+            "the pre-#1851 wording must survive unchanged around the new clause: {inherited}"
+        );
+    }
+
+    /// #1851. A record whose `check_outcomes` is empty despite a standing
+    /// gate — a pre-v27 record, OR a resume-of-a-resume that inherited the
+    /// gate and re-ran no check of its own, so its OWN record's
+    /// `check_outcomes` is empty too — must not render an empty check list.
+    /// The clause has to say honestly that no names are available, not print
+    /// "recorded these checks as failed: " with nothing after the colon, and
+    /// it must not guess which of the two reasons applies.
+    #[test]
+    fn the_inherited_gate_message_has_a_fallback_when_no_check_names_are_recorded() {
+        let inherited = super::CheckGateFailure {
+            count: 0,
+            run_id: "run-2".to_string(),
+            inherited_from: Some("run-1".to_string()),
+            inherited_failed_checks: Vec::new(),
+        }
+        .to_string();
+        assert!(
+            !inherited.contains("failed: ."),
+            "an empty check list must not render as an empty, punctuated list: {inherited}"
+        );
+        assert!(
+            inherited.contains("does not carry check names"),
+            "an empty check list must say so honestly instead of going silent: {inherited}"
+        );
+    }
+
+    /// #1851. `CheckOutcome` has no table/asset key, so N tables failing the
+    /// same check name arrive as N identical strings — asserted directly at
+    /// `the_default_concurrency_runs_every_table_assertion`, where 40 tables
+    /// all fail `not_null:id`. Printing the name 40 times would read as a
+    /// bug, not a list, so the clause collapses repeats in first-seen order
+    /// and appends a count instead.
+    #[test]
+    fn the_recorded_failed_checks_clause_collapses_duplicate_names_with_a_count() {
+        let failed_checks = vec![
+            "not_null:id".to_string(),
+            "not_null:id".to_string(),
+            "row_count".to_string(),
+            "not_null:id".to_string(),
+        ];
+        let clause = super::recorded_failed_checks_clause("run-1", &failed_checks);
+        assert!(
+            clause.contains("not_null:id (×3)"),
+            "three identical names must collapse into one entry with a count: {clause}"
+        );
+        assert!(
+            clause.contains("row_count") && !clause.contains("row_count (×"),
+            "a name seen once must render without a count: {clause}"
         );
     }
 
