@@ -1,0 +1,107 @@
+name: changelog-gate
+
+# Fails a pull request that touches engine/ and lands with no
+# engine/CHANGELOG.md entry and no explicit "Changelog: none" marker
+# explaining why. See #1938: 76 of the last 152 engine/ commits landed with
+# no usable entry, and the gap was not closing on its own.
+
+on:
+  # `edited` is included so fixing the PR body (adding or correcting the
+  # marker) re-runs this without a new commit.
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+    branches: [main]
+  # No `paths:` filter on pull_request -- deliberately, same reasoning as
+  # codegen-drift.yml (see its comment above the `pull_request:` trigger,
+  # lines 33-40 there): "Check the changelog" is meant to become a required
+  # merge context. A workflow-level path filter leaves it ABSENT on a PR
+  # that does not match, and an absent required check blocks the merge
+  # forever (#1563). Instead the `changes` job below detects whether the PR
+  # touches engine/**, and `gate` skips itself -- a job skipped by an `if:`
+  # conditional still reports, and satisfies a required check the way a
+  # workflow-level path filter cannot.
+
+# CI only reads the repo; restrict the token to the minimum.
+permissions:
+  contents: read
+
+# Cancel superseded in-progress runs on the same PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Computes whether this PR touches engine/**. Mirrors codegen-drift.yml's
+  # `changes` job: fail closed on any error computing the diff, so an
+  # unexpected git failure runs the check rather than silently skipping it.
+  changes:
+    name: Detect engine/ changes
+    runs-on: ubuntu-latest
+    outputs:
+      engine: ${{ steps.diff.outputs.engine }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The PR merge commit plus both of its parents: HEAD^1 is the base
+          # branch tip, HEAD is the test-merge commit `pull_request` checks
+          # out by default. Diffing HEAD^1..HEAD is content-equivalent to a
+          # `base...head` (merge-base) diff for path detection purposes, and
+          # it is the pattern codegen-drift.yml already uses -- copied
+          # rather than re-derived.
+          fetch-depth: 2
+      - name: Diff the merge commit against its base parent
+        id: diff
+        run: |
+          set -uo pipefail
+          engine=true
+          files=$(mktemp)
+          # --no-renames: a rename lists BOTH its old and its new path. -z:
+          # NUL-terminated paths, so an unusual byte in a filename cannot
+          # defeat the anchor. Same reasoning as codegen-drift.yml's `diff`
+          # step.
+          if git diff --no-renames --name-only -z HEAD^1 HEAD > "$files"; then
+            status=0
+            grep -zqE '^engine/' "$files" || status=$?
+            case "$status" in
+              0) engine=true ;;
+              1) engine=false ;;
+              *) echo "::warning::grep exited $status while matching changed paths; running the changelog gate to fail closed" ;;
+            esac
+          else
+            echo "::warning::could not diff the merge commit; running the changelog gate to fail closed"
+          fi
+          echo "engine=$engine" >> "$GITHUB_OUTPUT"
+          echo "engine=$engine"
+
+  gate:
+    name: Check for a changelog entry or marker
+    needs: changes
+    # Skip only on a positive "false" from the detection job. An empty
+    # output (the detection job itself failed) runs the check -- fail
+    # closed, same as codegen-drift.yml's `drift` job.
+    if: ${{ !cancelled() && needs.changes.outputs.engine != 'false' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Dependabot PRs pass automatically
+        if: ${{ github.actor == 'dependabot[bot]' }}
+        run: |
+          echo "Actor is dependabot[bot]: changelog-gate passes automatically, no check run."
+
+      - name: Check for a changelog entry or marker
+        if: ${{ github.actor != 'dependabot[bot]' }}
+        env:
+          # Read via an env var, never string-interpolated into the script:
+          # the PR body is attacker-controlled text, and embedding it
+          # directly in a `run:` block is the classic script-injection path.
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          CHANGELOG_DIFF="$(git diff --no-renames HEAD^1 HEAD -- engine/CHANGELOG.md)"
+          export CHANGELOG_DIFF
+          bash scripts/changelog_gate.sh
