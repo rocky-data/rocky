@@ -24848,15 +24848,28 @@ backend = "local"
     /// the ordering is asserted over this file's own source, the shape
     /// `rocky-mcp`'s `tools.rs` already uses for a claim about its own text.
     ///
+    /// The needle is the whole ASSIGNMENT, `output.check_gate_failed =
+    /// resolved_check_gate(...)`, not just the call (#2132 red-team finding):
+    /// a needle of the call alone still matches a mutation that deletes
+    /// `output.check_gate_failed =` and leaves the call as a discarded
+    /// expression statement — the stamp is gone but the text this test
+    /// looked for is still there. The source is whitespace-normalised before
+    /// matching (`split_whitespace().join(" ")`) because rustfmt wraps the
+    /// assignment across two lines, and the needle has no such wrapping.
+    ///
     /// Both `find`s take the FIRST occurrence, which is the production site;
     /// the copies inside this test are thousands of lines later.
     #[test]
     fn the_inherited_gate_is_stamped_before_the_interrupt_path_persists() {
         let source = include_str!("run.rs");
-        let stamp = source
-            .find("resolved_check_gate(false, inherited_gate.as_ref().map(|g| &g.run_id));")
+        let normalized = source.split_whitespace().collect::<Vec<_>>().join(" ");
+        let stamp = normalized
+            .find(
+                "output.check_gate_failed = resolved_check_gate(false, \
+                 inherited_gate.as_ref().map(|g| &g.run_id));",
+            )
             .expect("the early inherited-gate stamp is gone — see #1720");
-        let interrupt_persist = source
+        let interrupt_persist = normalized
             .find("// Persist interrupted RunRecord")
             .expect("the interrupt path's persist comment moved; re-anchor this test");
         assert!(
