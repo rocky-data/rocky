@@ -164,7 +164,7 @@ Four methods deserve extra thought:
 - **`merge_into`**: return `AdapterError::not_supported("merge_into")` when your warehouse has no `MERGE`. Rocky's planner reads the capability flag and generates no merge plans, but the defensive implementation still helps if something bypasses the planner.
 - **`insert_overwrite_partition`**: returns `Vec<String>`, because some warehouses need a multi-statement transaction, such as Snowflake's `BEGIN; DELETE; INSERT; COMMIT`. The runtime executes the statements in order and rolls back on a partial failure.
 - **`row_hash_expr`**: Rocky uses this for change detection. ClickHouse uses `sipHash128(tuple(...))`. For hashes that compare across warehouses, see how `rocky-bigquery` and `rocky-snowflake` agree on a stable encoding.
-- **`watermark_where`**: the standard incremental filter, `col > (SELECT max(col) FROM target)`. Validate `timestamp_col` before you splice it in.
+- **`watermark_where`**: the caller supplies the watermark, not a subquery. Rocky reads the previous run's max source timestamp from its own state store and passes it in as a literal `DateTime<Utc>`; your dialect only formats that value as a warehouse-native timestamp literal in `col > <literal>`. `None` (first run, or after `delete_watermark`) means format the `1970-01-01` sentinel so the whole source is scanned. Validate `timestamp_col` before you splice it in.
 
 ## Auth and connection management
 
