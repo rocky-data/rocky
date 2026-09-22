@@ -57,6 +57,10 @@ const RUN_PROGRESS_ENTRIES: TableDefinition<&str, &[u8]> =
 const PARTITIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("partitions");
 /// Grace-period tracking for columns dropped from the source.
 ///
+/// This describes the designed lifecycle, not current behavior: left
+/// unwired by decision (rocky-data/rocky#1616, 2026-09-17), so nothing
+/// writes a record here today.
+///
 /// Key format: `"{table_key}|{column_name}"` (e.g.
 /// `"acme_warehouse.staging.orders|old_col"`). Value: serialized
 /// `GracePeriodRecord`. When a column reappears in the source the record
@@ -5109,6 +5113,12 @@ impl StateStore {
 // ---------------------------------------------------------------------------
 // Grace-period column drop tracking
 // ---------------------------------------------------------------------------
+//
+// Built but unwired by decision (2026-09-17, rocky-data/rocky#1616): no
+// production code path detects a source-side column removal, so no record
+// is ever written here. The table is still created eagerly and is listed
+// in SNAPSHOT_TABLE_REGISTRY, so removing it would be a state-shape change.
+// Do not wire this path without revisiting that decision.
 
 /// Record for a column that exists in the target but has been dropped from
 /// the source. Stored in the `GRACE_PERIODS` redb table.
