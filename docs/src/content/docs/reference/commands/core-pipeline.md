@@ -782,12 +782,12 @@ rocky branch create <name> [--description <text>]
 rocky branch delete <name>
 rocky branch list
 rocky branch show <name>
-rocky branch compare <name> [--filter <key=value>]
+rocky branch compare <name> [--filter <key=value>] [--pipeline <name>]
 rocky branch approve <name> [--message <text>] [--out <path>]
 rocky branch promote <name> [--allow-breaking] [--base-ref <ref>]
                             [--models <path>] [--skip-approval]
-                            [--filter <key=value>]
-rocky branch promote <name> --plan <plan-id>   # canonical: plan + apply
+                            [--pipeline <name>] [--filter <key=value>]
+rocky branch promote <name> --plan <plan-id> [--pipeline <name>]   # canonical: plan + apply
 ```
 
 Branch names accept `[A-Za-z0-9_.\-]` up to 64 characters. The default schema prefix is `branch__<name>`. Deleting a branch removes the state-store entry but does **not** drop warehouse tables that were materialized under it.
@@ -808,6 +808,13 @@ Two limits sit outside this check and still apply:
 - Promote also refuses a plan in which two steps replace the same production table, whatever the names look like.
 
 The check runs when a promote plan is built and again when one is applied, because a plan stores its statement as ready-made text.
+
+### `branch compare` flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--filter <key=value>` | `string` | (none) | Filter the compared targets. See [the shared filter reference](/reference/filters/). |
+| `--pipeline <name>` | `string` | (none) | Which pipeline to compare, in a multi-pipeline project. Required when the project defines more than one pipeline. |
 
 ### `branch approve` flags
 
@@ -830,7 +837,7 @@ Writes a content-addressed approval artifact that binds the approver's git ident
 | `--base-ref <ref>` | `string` | `main` | Git ref to diff against for the breaking-change gate. |
 | `--models <path>` | `PathBuf` | `models` | Models directory used by the breaking-change gate. |
 | `--skip-approval` | flag | off | Bypass the approval gate. Always emits an `approval_skipped` audit event so the bypass leaves a paper trail. |
-| `--pipeline <name>` | `string` | (none) | Which pipeline to promote, in a multi-pipeline project. Optional when the project defines a single pipeline. |
+| `--pipeline <name>` | `string` | (none) | Which pipeline to promote, in a multi-pipeline project. Optional when the project defines a single pipeline, or when `--plan` names a promote plan that already recorded one — omit it to use the plan's pipeline. A value that disagrees with the plan's recorded pipeline is refused. |
 | `--filter <key=value>` | `string` | (none) | Filter the promote targets. Replication pipelines filter sources by schema-pattern component (e.g. `--filter client=acme`); transformation pipelines filter models by `table`, `model`, `catalog`, or `schema`. |
 
 `rocky branch promote` enumerates the pipeline's production targets and promotes each one. A replication pipeline finds the source connector's tables through the schema-pattern templates. A transformation pipeline walks the configured `models` glob and promotes one target per model, skipping ephemeral models. Rocky then runs the optional `[branch.approval]` gate, followed by the semantic breaking-change gate against `--base-ref`. For each target it dispatches `CREATE OR REPLACE TABLE prod.<x> AS SELECT * FROM branch__<name>.<x>`. Quality and snapshot pipelines are not supported and return a clear error.
@@ -884,9 +891,10 @@ Diff a branch's materialized tables against production (row counts + schemas):
 
 ```bash
 rocky branch compare fix-price
+rocky branch compare fix-price --pipeline shopify_us   # multi-pipeline project
 ```
 
-Internally this is `rocky compare` pointed at the branch's `schema_prefix` via `ShadowConfig.schema_override`, the same mechanism `rocky run --branch` uses for writes, so compare always hits exactly the tables the branch produced. Accepts the shared [`--filter`](/reference/filters/) flag.
+Internally this is `rocky compare` pointed at the branch's `schema_prefix` via `ShadowConfig.schema_override`, the same mechanism `rocky run --branch` uses for writes, so compare always hits exactly the tables the branch produced. Accepts the shared [`--filter`](/reference/filters/) flag, and `--pipeline <name>` to select the pipeline in a multi-pipeline project.
 
 ### Related Commands
 
