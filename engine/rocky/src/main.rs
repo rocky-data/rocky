@@ -4584,7 +4584,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             } else {
                 None
             };
-            rocky_cli::commands::run_optimize(&state_path, models_dir, model.as_deref(), json)
+            rocky_cli::commands::run_optimize(
+                &state_path,
+                &cli.config,
+                models_dir,
+                model.as_deref(),
+                json,
+            )
         }
         Command::Estimate {
             models,

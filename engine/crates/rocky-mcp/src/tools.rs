@@ -3114,6 +3114,7 @@ impl RockyMcpServer {
     async fn optimize(&self, params: Parameters<OptimizeArgs>) -> ToolResult<OptimizeResult> {
         let out = commands::optimize_output(
             &self.state_path(),
+            &self.config_path,
             Some(&self.models_dir),
             params.0.model.as_deref(),
         )
