@@ -36,22 +36,36 @@ export type NodeRoute =
   | { readonly state: "unknown-kind"; readonly kind: string };
 
 /**
- * One entry per variant of `NodeKind` in `unified_dag.rs`, in the order it
- * is declared there. `replication` is legacy: the parser expands a
- * replication pipeline into a `source` + `load` pair, and the variant
- * survives only so a stored DAG still deserializes. It is listed because a
- * stored DAG can still carry it.
+ * Every variant of `NodeKind` in `unified_dag.rs`, in the order it is
+ * declared there. `replication` is legacy: the parser expands a replication
+ * pipeline into a `source` + `load` pair, and the variant survives only so a
+ * stored DAG still deserializes. It is listed because a stored DAG can still
+ * carry it.
+ *
+ * The one place this list is written down (#1859): `ModelNode`'s per-kind
+ * glyph and accent table is keyed by `NodeKind` below, so a kind missing
+ * from either place fails to typecheck rather than silently drawing the
+ * default.
  */
-const KIND_TABLE = new Map<string, "servable" | "not-servable">([
-  ["source", "not-servable"],
-  ["replication", "not-servable"],
-  ["transformation", "servable"],
-  ["quality", "not-servable"],
-  ["snapshot", "not-servable"],
-  ["load", "not-servable"],
-  ["seed", "not-servable"],
-  ["test", "not-servable"],
-]);
+export const NODE_KINDS = [
+  "source",
+  "replication",
+  "transformation",
+  "quality",
+  "snapshot",
+  "load",
+  "seed",
+  "test",
+] as const;
+
+/** One of the values `NODE_KINDS` lists. */
+export type NodeKind = (typeof NODE_KINDS)[number];
+
+const SERVABLE_KIND: NodeKind = "transformation";
+
+const KIND_TABLE = new Map<string, "servable" | "not-servable">(
+  NODE_KINDS.map((kind) => [kind, kind === SERVABLE_KIND ? "servable" : "not-servable"]),
+);
 
 /** Every kind this module classifies. Read by the tests, not by the UI. */
 export const CLASSIFIED_KINDS: readonly string[] = [...KIND_TABLE.keys()];
