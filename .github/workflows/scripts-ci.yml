@@ -16,6 +16,13 @@ on:
       # guard absent for exactly the change that needs it (#1557, #1563).
       - ".github/workflows/engine-ci.yml"
       - ".github/workflows/codegen-drift.yml"
+      # Same reasoning: a PR editing only the changelog gate's workflow, or
+      # only the PR template text the decision-logic test also reads as a
+      # fixture (case 12 in changelog-gate.test.sh — the template must never
+      # accidentally satisfy the gate), should still run the test that
+      # guards it (#1938).
+      - ".github/workflows/changelog-gate.yml"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
   push:
     branches: [main]
     paths:
@@ -23,6 +30,8 @@ on:
       - ".github/workflows/scripts-ci.yml"
       - ".github/workflows/engine-ci.yml"
       - ".github/workflows/codegen-drift.yml"
+      - ".github/workflows/changelog-gate.yml"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
 
 permissions:
   contents: read
@@ -80,6 +89,21 @@ jobs:
         # developer's.
         run: bash scripts/tests/ci-change-detector.test.sh
 
+  changelog-gate-decision:
+    name: Changelog-gate decision logic
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Pin the changelog-entry / marker decision (#1938)
+        # changelog-gate.yml is a PR-triggered workflow and cannot be
+        # verified locally, so this exercises the script it calls against
+        # fixture PR bodies and fixture `git diff` text. No git repo, no
+        # GitHub Actions runner.
+        run: bash scripts/tests/changelog-gate.test.sh
+
   shellcheck:
     name: Shellcheck scripts
     runs-on: ubuntu-latest
@@ -91,7 +115,7 @@ jobs:
       - name: Shellcheck the soak harness (full severity)
         # The scripts this workflow exists to protect hold the full bar and
         # already meet it.
-        run: shellcheck scripts/soak-scheduler.sh scripts/tests/ci-change-detector.test.sh scripts/tests/regen-fixtures.test.sh
+        run: shellcheck scripts/soak-scheduler.sh scripts/tests/ci-change-detector.test.sh scripts/tests/regen-fixtures.test.sh scripts/changelog_gate.sh scripts/tests/changelog-gate.test.sh
       - name: Shellcheck everything else (error severity)
         # Six pre-existing scripts carry SC2155/SC2012/SC2015 warnings today
         # (release.sh, the vendor_* pair, regen_fixtures.sh, build_rocky_linux.sh).
