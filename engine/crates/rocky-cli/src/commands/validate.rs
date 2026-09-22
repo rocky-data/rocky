@@ -1142,6 +1142,33 @@ fn validate_replication_pipeline(
         });
     }
 
+    // V054: a DuckDB discovery adapter with no `path` runs discovery against
+    // an in-memory database — it finds nothing, silently (`valid: true`
+    // today, the discover step just returns empty). `AdapterConfig::path`'s
+    // own doc comment already says a persistent path is required when the
+    // adapter also serves as a discovery source; nothing enforced it (#2005).
+    // Only checked when the discovery adapter resolved (V024 above already
+    // reports an unknown one — no need to double-report).
+    if let Some(ref disc) = pipeline.source.discovery
+        && let Some(disc_adapter) = cfg.adapters.get(&disc.adapter)
+        && disc_adapter.adapter_type == "duckdb"
+        && disc_adapter.path.is_none()
+    {
+        ok = false;
+        msgs.push(ValidateMessage {
+            severity: "error".into(),
+            code: "V054".into(),
+            message: format!(
+                "pipeline.{name}: discovery adapter '{}' is a DuckDB adapter with no `path` — \
+                 discovery runs against an in-memory database and silently finds nothing. Set \
+                 `path` on [adapter.{}] to a persistent file.",
+                disc.adapter, disc.adapter
+            ),
+            file: None,
+            field: Some(format!("adapter.{}.path", disc.adapter)),
+        });
+    }
+
     msgs.push(ValidateMessage {
         severity: "ok".into(),
         code: "V020".into(),
@@ -2479,6 +2506,82 @@ schema_template = "demo"
         );
     }
 
+    /// #2005 case 5: a DuckDB adapter with no `path` used as a pipeline's
+    /// discovery adapter runs discovery against an in-memory database and
+    /// silently finds nothing. A single-adapter project auto-wires
+    /// discovery to that one adapter even when `[source.discovery]` is
+    /// never written, so this is the common case, not an edge case.
+    #[test]
+    fn test_duckdb_discovery_adapter_without_path_is_v054() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "poc"
+schema_template = "demo"
+"#,
+        );
+        assert!(
+            !out.valid,
+            "a pathless DuckDB discovery adapter must refuse: {:?}",
+            out.messages
+        );
+        let v054: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V054" && m.severity == "error")
+            .collect();
+        assert_eq!(v054.len(), 1, "expected one V054: {:?}", out.messages);
+        assert_eq!(v054[0].field.as_deref(), Some("adapter.local.path"));
+    }
+
+    /// Counter-check: the same shape with `path` set must not fire V054.
+    #[test]
+    fn test_duckdb_discovery_adapter_with_path_is_not_v054() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = "warehouse.duckdb"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "warehouse"
+schema_template = "demo"
+"#,
+        );
+        assert!(
+            !out.messages.iter().any(|m| m.code == "V054"),
+            "a DuckDB discovery adapter with path must not trigger V054: {:?}",
+            out.messages
+        );
+    }
+
     #[test]
     fn test_multiple_kind_issues_all_surface() {
         // Two unrelated kind issues in the same file — both should
@@ -2519,6 +2622,7 @@ token = "t"
             r#"
 [adapter.local]
 type = "duckdb"
+path = "poc.duckdb"
 
 [pipeline.poc]
 type = "replication"
@@ -2639,6 +2743,7 @@ threshold = 1
             r#"
 [adapter.local]
 type = "duckdb"
+path = "poc.duckdb"
 
 [pipeline.poc]
 type = "replication"
@@ -3403,6 +3508,7 @@ target.adapter = "default"
             r#"
 [adapter.local]
 type = "duckdb"
+path = "poc.duckdb"
 
 [pipeline.poc]
 type = "replication"
