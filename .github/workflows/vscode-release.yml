@@ -114,6 +114,21 @@ jobs:
         # unset VSCE_PAT is a missing or rotated secret, and a green run that
         # never reached the Marketplace would hide exactly that, so it fails
         # instead. engine-wasm-release.yml guards NPM_TOKEN the same way.
+        #
+        # Retries 3 times with backoff (60s, then 180s) because the
+        # Marketplace gallery has hung for a fixed 180s client-side timeout on
+        # `/_apis/gallery` before, with normal throughput to every other
+        # publisher at the same moment (#1961) — a transient network path,
+        # not a real failure, so a retry is enough. `timeout -k 30 300` bounds
+        # each attempt (SIGTERM at 300s, SIGKILL 30s later if `npx` doesn't
+        # forward it), so no single attempt can hang past that bound.
+        # `--packagePath` publishes the exact VSIX already built above and
+        # attached to the release, instead of bare `publish`, which
+        # re-packages and re-runs `vscode:prepublish`. `--skip-duplicate`
+        # makes every attempt safe even if a previous one partially landed,
+        # including a retry after a manual publish (as happened for 1.41.0):
+        # the version is already live, so vsce reports success instead of
+        # failing the job.
         run: |
           if [ -z "$VSCE_PAT" ]; then
             if [ "$GITHUB_REPOSITORY" = "rocky-data/rocky" ]; then
@@ -123,7 +138,72 @@ jobs:
             echo "VSCE_PAT not set — skipping marketplace publish (this is expected on forks)"
             exit 0
           fi
-          npx @vscode/vsce publish --pat "$VSCE_PAT"
+
+          shopt -s nullglob
+          artifacts=( ./*.vsix )
+          shopt -u nullglob
+          if (( ${#artifacts[@]} == 0 )); then
+            echo "::error::No .vsix found for Marketplace publish"
+            exit 1
+          fi
+          vsix="${artifacts[0]}"
+
+          # Guard against publishing the wrong version now that a retry can
+          # succeed via `--skip-duplicate`: if the tag and the packaged VSIX
+          # ever disagree (only possible through operator error, since
+          # `just release-vscode` bumps and tags together), vsce would treat
+          # the newer tag's older/mismatched VSIX as "already published",
+          # exit 0, and the unconditional "Publish the GitHub Release" step
+          # below would then make this tag's release public while the
+          # Marketplace still serves a different version — the exact
+          # dishonest state this workflow exists to prevent. Bare `publish`
+          # could not do this before, because a genuine duplicate failed
+          # the job outright.
+          #
+          # Compare against the version inside the VSIX manifest, not the
+          # filename: a filename suffix match (`*$tag_version.vsix`) is not
+          # anchored, so e.g. tag 1.2.3 would also match a VSIX packaged for
+          # 11.2.3, and an empty tag_version (a malformed `vscode-v` tag with
+          # no version) would match every .vsix. `extension/package.json`
+          # inside the zip is vsce's own package layout, confirmed locally
+          # against a real `vsce package` output. `jq` needs no extra setup
+          # step: engine-wasm-release.yml already calls bare `jq` on the same
+          # ubuntu-latest/ubuntu-24.04 runner image.
+          tag_version="${GITHUB_REF_NAME#vscode-v}"
+          if [ -z "$tag_version" ]; then
+            echo "::error::Empty version parsed from tag $GITHUB_REF_NAME — refusing to publish"
+            exit 1
+          fi
+          vsix_version="$(unzip -p "$vsix" extension/package.json | jq -r .version)"
+          if [ -z "$vsix_version" ] || [ "$vsix_version" = "null" ] || [ "$vsix_version" != "$tag_version" ]; then
+            echo "::error::VSIX $vsix has manifest version '$vsix_version', tag $GITHUB_REF_NAME expects '$tag_version' — refusing to publish"
+            exit 1
+          fi
+
+          attempts=3
+          delays=(60 180)
+          attempt=1
+          published=0
+          while [ "$attempt" -le "$attempts" ]; do
+            echo "Marketplace publish attempt $attempt/$attempts ($vsix)..."
+            if timeout -k 30 300 npx @vscode/vsce publish --packagePath "$vsix" --pat "$VSCE_PAT" --skip-duplicate; then
+              echo "Marketplace publish succeeded on attempt $attempt/$attempts"
+              published=1
+              break
+            fi
+            echo "Marketplace publish attempt $attempt/$attempts failed"
+            if [ "$attempt" -lt "$attempts" ]; then
+              delay="${delays[$((attempt - 1))]}"
+              echo "Waiting ${delay}s before retry..."
+              sleep "$delay"
+            fi
+            attempt=$((attempt + 1))
+          done
+
+          if [ "$published" -ne 1 ]; then
+            echo "::error::Marketplace publish gave up after $attempts attempts. The GitHub Release stays a draft."
+            exit 1
+          fi
 
       # Last on purpose: a failure in any step above leaves the release a
       # draft. `--latest=false` again here, because GitHub's API defaults

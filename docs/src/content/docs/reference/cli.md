@@ -35,7 +35,7 @@ One line each, for finding the right command. Commands with a section on this pa
 | `branch` | Create, list, promote, and drop isolated output branches. |
 | `compile` | Resolve dependencies, type-check, and validate contracts. |
 | `lineage` | Trace a column back through every transformation that feeds it. |
-| `lineage-diff` | Report the downstream blast radius of a change, for PR review. |
+| [`lineage-diff`](/reference/commands/modeling/#rocky-lineage-diff) | Report the downstream blast radius of a change, for PR review. |
 | `test` | Run declarative tests and fixture-driven unit tests. |
 | `ci` | Compile plus test, for a CI runner with no warehouse credentials. |
 | `ci-diff` | Compare a branch against a base and report what changed. |
