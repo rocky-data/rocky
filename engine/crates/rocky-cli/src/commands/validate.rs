@@ -132,9 +132,9 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
                     let (ok, msgs) = validate_snapshot_pipeline(name, pipeline, &cfg);
                     (ok, msgs, String::new(), String::new(), String::new())
                 }
-                rocky_core::config::PipelineConfig::Load(_pipeline) => {
-                    // Load pipeline validation not yet implemented
-                    (true, vec![], String::new(), String::new(), String::new())
+                rocky_core::config::PipelineConfig::Load(pipeline) => {
+                    let (ok, msgs) = validate_load_pipeline(name, pipeline, &cfg);
+                    (ok, msgs, String::new(), String::new(), String::new())
                 }
             };
             out.pipelines.push(ValidatePipelineStatus {
@@ -1283,6 +1283,61 @@ fn validate_snapshot_pipeline(
     (ok, msgs)
 }
 
+fn validate_load_pipeline(
+    name: &str,
+    pipeline: &rocky_core::config::LoadPipelineConfig,
+    cfg: &rocky_core::config::RockyConfig,
+) -> (bool, Vec<ValidateMessage>) {
+    let mut msgs = Vec::new();
+    let mut ok = true;
+
+    // Check target adapter exists
+    if !cfg.adapters.contains_key(&pipeline.target.adapter) {
+        ok = false;
+        msgs.push(ValidateMessage {
+            severity: "error".into(),
+            code: "V023".into(),
+            message: format!(
+                "pipeline.{name}: target adapter '{}' not found in [adapter]",
+                pipeline.target.adapter
+            ),
+            file: None,
+            field: Some(format!("pipeline.{name}.target.adapter")),
+        });
+    }
+
+    if pipeline.source_dir.trim().is_empty() {
+        ok = false;
+        msgs.push(ValidateMessage {
+            severity: "error".into(),
+            code: "V048".into(),
+            message: format!("pipeline.{name}: source_dir must not be empty"),
+            file: None,
+            field: Some(format!("pipeline.{name}.source_dir")),
+        });
+    }
+
+    msgs.push(ValidateMessage {
+        severity: "ok".into(),
+        code: "V020".into(),
+        message: format!(
+            "pipeline.{name}: load / {} -> {}.{}.{}",
+            pipeline.source_dir,
+            pipeline.target.catalog,
+            pipeline.target.schema,
+            pipeline
+                .target
+                .table
+                .as_deref()
+                .unwrap_or("<from file name>"),
+        ),
+        file: None,
+        field: None,
+    });
+
+    (ok, msgs)
+}
+
 /// Validates the pipeline dependency graph (depends_on references).
 ///
 /// Checks that all referenced pipeline names exist and that the graph is acyclic.
@@ -2026,6 +2081,89 @@ after = ["ingest"]
                 .iter()
                 .any(|m| m.code == "V045" && m.severity == "error"),
             "an `after` on a load pipeline must be rejected with V045: {:?}",
+            out.messages
+        );
+        assert!(!out.valid);
+    }
+
+    #[test]
+    fn load_pipeline_with_unknown_target_adapter_is_rejected_v023() {
+        let out = validate_toml(
+            r#"
+[adapter.db]
+type = "duckdb"
+[pipeline.ingest]
+type = "load"
+source_dir = "data/"
+[pipeline.ingest.target]
+adapter = "typo_not_an_adapter"
+catalog = ""
+schema = "main"
+table = "orders"
+"#,
+        );
+        assert!(
+            out.messages
+                .iter()
+                .any(|m| m.code == "V023" && m.severity == "error"),
+            "a load pipeline whose target adapter does not exist must be rejected with V023: {:?}",
+            out.messages
+        );
+        assert!(!out.valid);
+    }
+
+    #[test]
+    fn load_pipeline_with_known_target_adapter_gets_v020_ok_summary() {
+        let out = validate_toml(
+            r#"
+[adapter.db]
+type = "duckdb"
+[pipeline.ingest]
+type = "load"
+source_dir = "data/"
+[pipeline.ingest.target]
+adapter = "db"
+catalog = ""
+schema = "main"
+table = "orders"
+"#,
+        );
+        assert!(
+            out.messages
+                .iter()
+                .any(|m| m.code == "V020" && m.severity == "ok"),
+            "a valid load pipeline must get a V020 ok summary, like every other pipeline type: {:?}",
+            out.messages
+        );
+        assert!(
+            !out.messages.iter().any(|m| m.code == "V023"),
+            "a load pipeline with a known target adapter must not raise V023: {:?}",
+            out.messages
+        );
+        assert!(out.valid);
+    }
+
+    #[test]
+    fn load_pipeline_with_empty_source_dir_is_rejected_v048() {
+        let out = validate_toml(
+            r#"
+[adapter.db]
+type = "duckdb"
+[pipeline.ingest]
+type = "load"
+source_dir = ""
+[pipeline.ingest.target]
+adapter = "db"
+catalog = ""
+schema = "main"
+table = "orders"
+"#,
+        );
+        assert!(
+            out.messages
+                .iter()
+                .any(|m| m.code == "V048" && m.severity == "error"),
+            "a load pipeline with an empty source_dir must be rejected with V048: {:?}",
             out.messages
         );
         assert!(!out.valid);
