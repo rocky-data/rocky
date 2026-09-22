@@ -161,9 +161,9 @@ Atomicity holds per partition. If a statement fails mid-batch, the runtime
 issues `ROLLBACK` and marks the partition `Failed` in the state store.
 
 Before it runs any partition, Rocky checks that the target table exists. If
-not, it creates it empty by running the model SQL over an empty time window.
-The table gets the model's output columns and no rows. The partitions then
-run as below.
+not, it creates it by running the model SQL over an empty window, so a model
+that filters on the placeholders produces no rows. The table's columns come
+from that query. The partitions then run as below.
 
 ### Databricks (Delta Lake)
 
@@ -212,6 +212,24 @@ WHERE order_date >= '2026-04-07 00:00:00' AND order_date < '2026-04-08 00:00:00'
 INSERT INTO "marts"."fct_daily_orders"
 SELECT ... ;
 COMMIT;
+```
+
+### BigQuery
+
+One statement: a `BEGIN TRANSACTION` / `COMMIT TRANSACTION` script joining
+the delete and the insert into a single job. BigQuery's REST API is
+stateless. Each `jobs.query` call is its own session, so separate `BEGIN`
+and `COMMIT` statements fail with "Transaction control statements are
+supported only in scripts or sessions." One script keeps the delete and the
+insert atomic:
+
+```sql
+BEGIN TRANSACTION;
+DELETE FROM `warehouse`.`marts`.`fct_daily_orders`
+WHERE order_date >= '2026-04-07 00:00:00' AND order_date < '2026-04-08 00:00:00';
+INSERT INTO `warehouse`.`marts`.`fct_daily_orders`
+SELECT ... ;
+COMMIT TRANSACTION
 ```
 
 ## State store
@@ -296,9 +314,8 @@ The following are deferred:
 - **Rocky DSL placeholder syntax** — `@start_date` / `@end_date` are
   recognized in `.sql` files only. The `.rocky` parser will gain `@var`
   syntax in v1.1.
-- **BigQuery and Postgres adapters** — these adapters don't exist yet.
-  When they ship, BigQuery will use `MERGE ... WHEN NOT MATCHED BY SOURCE`
-  and Postgres will route via parent table + child partition truncate.
+- **Postgres adapter** — it doesn't exist yet. When it ships, `time_interval`
+  will route via a parent table plus a child-partition truncate.
 - **Sub-day granularities** below `hour` — belongs in streaming systems.
 - **Multi-column partitions** — single time column only in v1.
 - **Partition column transformations** — `time_column` must be a real

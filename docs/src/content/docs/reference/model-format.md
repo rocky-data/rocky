@@ -620,9 +620,9 @@ A transformation model cannot use `type = "incremental"`. Rocky has no watermark
 
 `rocky test`, `rocky ci` and `rocky emit-sql` fail on the same error. The SQL generator refuses the model too, so `rocky plan --model` and `rocky estimate` cannot produce SQL for it.
 
-`rocky run` records the model as a failed table and leaves its existing table alone. If an earlier run built that table, it keeps the rows those runs appended again. By default, Rocky also withholds every model that depends on the failed one through `depends_on`, directly or through another model. None of them build from that stale or missing table. `rocky run --dag` does not build them either.
+`rocky run` records the model as a failed table and leaves its existing table alone. If an earlier run built that table, it keeps the rows those runs appended again. By default, Rocky also withholds every model that depends on the failed one, directly or through another model. That includes an explicit `depends_on` entry and a bare, unqualified SQL read of the failed model's name. None of them build from that stale or missing table. `rocky run --dag` does not build them either.
 
-This boundary follows `depends_on`. By default, an undeclared read of the same table by its physical name can still use it. Add `depends_on` when that relationship must be withheld too. Set `contain_failures = true` under `[resilience]` to widen that hold to any model whose reads Rocky cannot prove are unrelated. Rebuild the table before you trust it, for example with one `full_refresh` run.
+This boundary follows the model graph: `depends_on` plus a bare-name read of another model. A read of the same table by its qualified physical name (`schema.table` or `catalog.schema.table`) still escapes it. Add `depends_on` when that relationship must be withheld too. Set `contain_failures = true` under `[resilience]` to widen the hold to any model whose reads Rocky cannot prove are unrelated. It also contains a runtime failure the same way, reporting `PartialFailure` instead of stopping the run. See [`[resilience]`](/reference/configuration/#resilience). Rebuild the table before you trust it, for example with one `full_refresh` run.
 
 Pick the strategy that matches what you need. These are the four the error names:
 
