@@ -810,15 +810,7 @@ pub async fn observe_max_time_column(
         let raw = value.as_str().ok_or_else(|| {
             anyhow::anyhow!("staleness observation returned a non-string value: {value}")
         })?;
-        let parsed = raw
-            .parse::<chrono::DateTime<chrono::Utc>>()
-            .ok()
-            .or_else(|| {
-                chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
-                    .or_else(|_| chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S"))
-                    .ok()
-                    .map(|naive| naive.and_utc())
-            })
+        let parsed = super::run::parse_timestamp_cell(raw)
             .with_context(|| format!("could not parse observed MAX({time_column}): {raw}"))?;
         Some(parsed)
     };
