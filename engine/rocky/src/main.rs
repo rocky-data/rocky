@@ -5235,12 +5235,15 @@ mod tests {
     /// actually accepts, not just three of the five.
     #[test]
     fn init_help_lists_all_five_templates() {
-        let mut init_cmd = Cli::command()
+        let mut init_cmd = command_with_big_stack()
             .find_subcommand("init")
             .expect("init subcommand exists")
             .clone();
         let help = init_cmd.render_long_help().to_string();
-        assert!(help.contains("trino"), "init --help must list trino: {help}");
+        assert!(
+            help.contains("trino"),
+            "init --help must list trino: {help}"
+        );
         assert!(
             help.contains("bigquery"),
             "init --help must list bigquery: {help}"
@@ -5252,7 +5255,7 @@ mod tests {
     /// `run_validate_migration` never performs (`_sample_size` is unused).
     #[test]
     fn validate_migration_help_says_sample_size_is_ignored() {
-        let mut sub = Cli::command()
+        let mut sub = command_with_big_stack()
             .find_subcommand("validate-migration")
             .expect("validate-migration subcommand exists")
             .clone();
@@ -5268,7 +5271,7 @@ mod tests {
     /// maps both to `ObjectStore` and attempts a conditional PUT instead.
     #[test]
     fn run_help_does_not_claim_object_store_backends_error_at_parse_time() {
-        let mut sub = Cli::command()
+        let mut sub = command_with_big_stack()
             .find_subcommand("run")
             .expect("run subcommand exists")
             .clone();
@@ -5367,6 +5370,22 @@ mod tests {
                 .expect("spawn parser thread")
                 .join()
                 .expect("parser thread panicked")
+        })
+    }
+
+    /// Same overflow, same fix, for building the `clap::Command` graph
+    /// itself rather than parsing through it (`Cli::command()` walks the
+    /// same subcommand tree `try_parse_with_big_stack` above documents —
+    /// confirmed by a `SIGABRT: stack overflow` on the default test-thread
+    /// stack when a `--help`-snapshot test called `Cli::command()` directly).
+    fn command_with_big_stack() -> clap::Command {
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(s, Cli::command)
+                .expect("spawn command-builder thread")
+                .join()
+                .expect("command-builder thread panicked")
         })
     }
 
