@@ -71,8 +71,12 @@ export function ModelNode({ data, selected }: NodeProps<ModelFlowNode>) {
         // rule, so every card showed the same grey border-left in dark mode,
         // whatever its kind). The neutral border is now three directional
         // utilities, none of which touch the left side, so only `kindClass`
-        // ever sets it. Selected still uses the shorthand on purpose — the
-        // whole border, kind accent included, turns sky-500 to mark selection.
+        // ever sets it. Selected keeps the shorthand on purpose: it is meant
+        // to override every accent, transformation's included, to mark
+        // selection — `layout.ts` only ever lets a transformation node
+        // become `selected` (`selectable: openable`), and transformation's
+        // own accent is already sky-500, so today the override and the kind
+        // accent agree rather than one visibly winning over the other.
         selected
           ? "border-sky-500"
           : "border-t-zinc-200 border-r-zinc-200 border-b-zinc-200 dark:border-t-zinc-700 dark:border-r-zinc-700 dark:border-b-zinc-700"
