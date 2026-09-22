@@ -146,6 +146,14 @@ it. That is the property to **preserve**, and it means the finding to look for i
   write-atomicity boundary — review any change to the commit / conditional-put ordering or version
   sequencing for duplicate or dropped commits.
 
+### Plan store trust boundary (`rocky-cli/src/plan_store.rs`, promote apply in `commands/branch.rs`)
+- **`.rocky/plans/` is a trusted input, ruled 2026-09-17 (#1943).** The `plan_id` blake3 digest and the
+  `AiAuthored` review marker are unkeyed and attacker-recomputable by anyone who can already write the
+  directory — that is documented, not a defect. Do not flag: a `Promote` plan's `statement` not being
+  re-derived from its recorded `target`/`source` names, or the marker not authenticating an approver.
+  Do flag: the digest failing to catch accidental corruption or a stale plan, which is what it is
+  actually for.
+
 ## Rust correctness hazards (compiler-grade bar)
 - **No `unwrap()`/`expect()`/`panic!` on any path reachable from user input.** A compiler *rejects* bad
   input with a diagnostic; it does not crash. Panics are for bugs in Rocky.
