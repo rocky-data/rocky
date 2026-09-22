@@ -6954,6 +6954,76 @@ async fn partition_overlap_key_carriers(
 /// Lifted out of `run()` so a test can drive it with a warehouse that fails
 /// a specific query; `run()` itself builds its adapters from the config and
 /// offers no seam for that.
+/// Refuse before any check runs if two check names THIS run will emit for
+/// the SAME materialized table sanitize to the same Dagster check name
+/// (#1941).
+///
+/// `validate_checks` (config load, `rocky-core/src/config.rs`) already
+/// catches every TABLE-INDEPENDENT collision (custom checks and `null_rate`
+/// columns both run on every table, so a collision between them is refused
+/// before this function — before discovery, before materialization) and
+/// every collision on a table an assertion names explicitly. What only this
+/// function can see is a collision that needs the ACTUALLY discovered
+/// table set: an assertion colliding with a custom/null_rate name on a
+/// table config never mentions by name, and any `cross_source_overlap`
+/// collision, since that name depends on runtime-discovered siblings.
+///
+/// Called from the top of [`run_batched_checks`], so it runs before the
+/// assertion, custom, null-rate and cross-source-overlap check loops — but
+/// `assertion_targets` is only complete after every table has been
+/// materialized (the copy already landed by the time checks run; see the
+/// comment above the assertions loop below), so this refusal cannot prevent
+/// the WRITE. It prevents a check RESULT from silently vanishing, which is
+/// the harm #1941 is about — Dagster drops the second of two colliding
+/// specs with only a log line.
+fn refuse_check_name_collisions(
+    pipeline: &ReplicationPipelineConfig,
+    assertion_targets: &[(TableRef, Vec<String>)],
+) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    // table -> one source_type per occurrence (duplicates signal siblings).
+    let mut siblings_by_table: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for (tref, asset_key) in assertion_targets {
+        siblings_by_table
+            .entry(tref.table.as_str())
+            .or_default()
+            .push(asset_key.first().cloned().unwrap_or_default());
+    }
+
+    let mut messages = Vec::new();
+    for (&table, sibling_source_types) in &siblings_by_table {
+        let names = rocky_core::config::resolved_check_names_for_table(
+            &pipeline.checks,
+            ReplicationPipelineConfig::EXECUTED_CHECK_KINDS,
+            table,
+            sibling_source_types,
+        );
+        for (a, b, sanitized) in rocky_core::config::resolved_check_name_collisions(&names) {
+            messages.push(format!(
+                "table '{table}': {a_kind} '{a_name}' and {b_kind} '{b_name}' both sanitize \
+                 to Dagster check name '{sanitized}'",
+                a_kind = a.kind.as_str(),
+                a_name = a.name,
+                b_kind = b.kind.as_str(),
+                b_name = b.name,
+            ));
+        }
+    }
+
+    if !messages.is_empty() {
+        anyhow::bail!(
+            "refusing to run checks: {} check-name collision(s) would sanitize to the same \
+             Dagster check name — Dagster keys check results by (asset_key, sanitized_name), \
+             so the first spec wins and the second is silently dropped. Rename one side of \
+             each pair.\n{}",
+            messages.len(),
+            messages.join("\n"),
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_batched_checks(
     warehouse: &dyn WarehouseAdapter,
@@ -6972,6 +7042,10 @@ async fn run_batched_checks(
     anomalies: &mut Vec<AnomalyOutput>,
     anomaly_evaluated: &mut Vec<AnomalyEvaluationOutput>,
 ) -> Result<()> {
+    // #1941: refuse BEFORE any check in this function runs — see the
+    // docstring on `refuse_check_name_collisions` above.
+    refuse_check_name_collisions(pipeline, assertion_targets)?;
+
     let row_count_enabled = pipeline.checks.row_count.enabled() && !source_batch_refs.is_empty();
     let freshness_enabled = pipeline.checks.freshness.is_some() && !freshness_batch_refs.is_empty();
 
@@ -35966,6 +36040,49 @@ table = "fct_events"
             "expected exactly one `{name}` result for {target_key}, got {found:?}"
         );
         found[0]
+    }
+
+    /// #1941: a custom check named to sanitize onto the same Dagster check
+    /// name as `null_rate:id` must refuse BEFORE any check runs — not run
+    /// the checks and silently drop one of the two results. Both producers
+    /// are table-independent (`[[checks.custom]]` has no `table` field,
+    /// `null_rate.columns` is a flat list), so `validate_checks` at config
+    /// load already refuses this in production; this fixture bypasses
+    /// config load entirely (`parse_pipeline` calls `toml::from_str`
+    /// directly), so it proves `run_batched_checks`'s OWN refusal is a real,
+    /// independent second line of defense, not dead code.
+    ///
+    /// Mutation that must turn this red: delete the
+    /// `refuse_check_name_collisions(pipeline, assertion_targets)?;` call at
+    /// the top of `run_batched_checks`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_custom_check_colliding_with_a_null_rate_column_is_refused_before_any_check_runs() {
+        let inner = seeded_duckdb().await;
+        let fx = BatchedCheckFixture::new(
+            r#"
+null_rate = { columns = ["id"], threshold = 0.1 }
+
+[[pipeline.bronze.checks.custom]]
+name = "null rate id"
+sql = "SELECT 0"
+threshold = 0
+"#,
+        );
+
+        let err = match fx.try_run(&inner, None, None).await {
+            Err(e) => e,
+            Ok(_) => panic!("a colliding custom/null_rate name pair must refuse the run"),
+        };
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("null rate id") && message.contains("null_rate:id"),
+            "the refusal must name both colliding sources: {message}"
+        );
+        assert!(
+            message.contains("null_rate_id"),
+            "the refusal must name the shared sanitized name: {message}"
+        );
     }
 
     /// #1602: a side whose query failed defaulted to zero. When both sides

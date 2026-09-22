@@ -1025,6 +1025,50 @@ def test_run_streaming_failure_raises_with_stderr_tail():
     assert "INFO line 0" in tail
 
 
+def test_run_streaming_check_name_collision_refusal_surfaces_as_a_failure():
+    """rocky-data/rocky#1941: two check names that sanitize alike (a custom
+    check and a `null_rate` column) now make the engine refuse to run any
+    check at all — exit non-zero, no `RunOutput` JSON, the collision named
+    on stderr — instead of running the checks and silently dropping the
+    second one (the old behavior this issue fixed).
+
+    This pins the CONSUMER side of that fix: `run_streaming` (what
+    `RockyComponent`'s default execution mode calls, via `_run_filters` in
+    `component.py`) must surface the refusal as a `dg.Failure` carrying the
+    collision message, not swallow it or return a partial result. Nothing
+    in `component.py::_add` or `_emit_results` ever runs in this case —
+    the run fails before any check spec or result exists to drop.
+    """
+    rocky = RockyResource()
+    context = _captured_log_context()
+    collision_message = (
+        "refusing to run checks: 1 check-name collision(s) would sanitize to the same "
+        "Dagster check name — Dagster keys check results by (asset_key, sanitized_name), "
+        "so the first spec wins and the second is silently dropped. Rename one side of "
+        "each pair.\n"
+        "table 'orders': custom 'null rate id' and null_rate 'null_rate:id' both sanitize "
+        "to Dagster check name 'null_rate_id'"
+    )
+    proc = _streaming_popen_mock(
+        stdout="",
+        stderr_lines=["INFO discovering sources", f"ERROR {collision_message}"],
+        returncode=1,
+    )
+
+    with (
+        patch.object(RockyResource, "_verify_engine_version"),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
+        pytest.raises(dg.Failure) as excinfo,
+    ):
+        rocky.run_streaming(context, filter="tenant=acme")
+
+    tail = excinfo.value.metadata["stderr_tail"].text
+    assert "null rate id" in tail and "null_rate:id" in tail, (
+        f"the failure must name both colliding sources: {tail}"
+    )
+    assert "null_rate_id" in tail, f"the failure must name the shared sanitized name: {tail}"
+
+
 def test_run_streaming_missing_binary_raises_failure():
     rocky = RockyResource(binary_path="/nonexistent/rocky")
     context = _captured_log_context()
@@ -1413,6 +1457,50 @@ def test_run_pipes_calls_pipes_client_with_built_command():
     # Phase 5 audit-artifact: plan id is also surfaced as Pipes extras
     # so Dagster shows it as run metadata.
     assert call_kwargs.get("extras") == {"plan_id": plan_id}
+
+
+def test_run_pipes_check_name_collision_refusal_propagates_from_the_apply_step():
+    """rocky-data/rocky#1941 on the Pipes path.
+
+    `run_pipes` always runs `rocky plan` then `rocky apply <plan_id>` —
+    even for a replication-only project (see the docstring on
+    `RockyResource.run_pipes`) — and `rocky apply` re-executes
+    `commands::run::run`, the SAME engine code the fused `rocky run`
+    (streaming/buffered) calls. So the new collision refusal fires here
+    too, mid-apply, surfaced by Dagster's own `PipesSubprocessClient` as an
+    exception from the underlying subprocess exiting non-zero.
+
+    `run_pipes` — and `_run_filters_pipes` in `component.py`, which calls
+    it with no try/except — has no seam that would catch and continue past
+    that exception, so this pins the observable contract: the Pipes path
+    fails the step instead of completing with the second colliding check
+    silently dropped. `component.py::_add`'s own duplicate-check-spec log
+    (a DIFFERENT, unrelated guard, at spec-declaration time) never runs in
+    this case, because `invocation.get_results()` is never reached.
+    """
+    rocky = RockyResource(config_path="rocky.toml")
+    context = MagicMock(spec=dg.AssetExecutionContext)
+    fake_client = MagicMock(spec=dg.PipesSubprocessClient)
+    collision_message = (
+        "refusing to run checks: 1 check-name collision(s) would sanitize to the same "
+        "Dagster check name — table 'orders': custom 'null rate id' and null_rate "
+        "'null_rate:id' both sanitize to Dagster check name 'null_rate_id'"
+    )
+    fake_client.run = MagicMock(
+        side_effect=dg.Failure(
+            description=f"rocky apply failed (exit 1): {collision_message}",
+        )
+    )
+
+    with (
+        _patch_pipes_plan_step(),
+        pytest.raises(dg.Failure, match="null_rate_id") as excinfo,
+    ):
+        rocky.run_pipes(context, filter="tenant=acme", pipes_client=fake_client)
+
+    assert "null rate id" in str(excinfo.value) and "null_rate:id" in str(excinfo.value), (
+        "the propagated failure must still name both colliding sources"
+    )
 
 
 def test_run_pipes_threads_all_routing_flags():
