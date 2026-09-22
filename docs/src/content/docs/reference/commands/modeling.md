@@ -896,7 +896,7 @@ rocky ci-diff [base_ref] [flags]
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `base_ref` | `string` | `main` | Git ref to compare against. Rocky shells out to `git diff --name-only <base_ref> HEAD` to find changed `.sql`, `.rocky`, and sidecar `.toml` files. |
+| `base_ref` | `string` | `main` | Git ref to compare against. Rocky shells out to `git diff --name-status <base_ref>...HEAD` to find changed `.sql`, `.rocky`, and sidecar `.toml` files. |
 
 ### Flags
 
