@@ -1,7 +1,9 @@
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import type { ModelFlowNode } from "./layout";
 import { NODE_HEIGHT, NODE_WIDTH } from "./layout";
-import { nodeRoute } from "./nodeRoute";
+
+/** Why a model node in the graph does not open: said on the card and in the list. */
+export const NOT_COMPILED = "not in the server's compile, so it has no detail";
 
 /** Accent by resource kind, the VS Code Inspector's idiom in the SPA's palette. */
 function kindClass(kind: string): string {
@@ -40,14 +42,18 @@ export function kindGlyph(kind: string): string {
 
 /** A rounded card: a kind glyph and the model name. Every value is text. */
 export function ModelNode({ data, selected }: NodeProps<ModelFlowNode>) {
-  const title = [data.target, data.strategy].filter((s) => s !== null).join(" · ");
-  // Only a node the detail route can serve invites a click.
-  const openable = nodeRoute(data).state === "servable";
+  // Only a node the detail route can serve invites a click. A model the
+  // server did not compile is drawn dashed, and its title says why.
+  const openable = data.route.state === "servable";
+  const notCompiled = data.route.state === "not-compiled";
+  const title = [data.target, data.strategy, notCompiled ? NOT_COMPILED : null]
+    .filter((s) => s !== null)
+    .join(" · ");
   return (
     <div
       className={`flex items-center gap-2 rounded-md border border-l-4 bg-white px-2.5 py-2 text-xs shadow-xs dark:bg-zinc-900 ${kindClass(data.kind)} ${
         openable ? "cursor-pointer" : "cursor-default"
-      } ${selected ? "border-sky-500" : "border-zinc-200 dark:border-zinc-700"}`}
+      } ${notCompiled ? "border-dashed" : ""} ${selected ? "border-sky-500" : "border-zinc-200 dark:border-zinc-700"}`}
       // Both, not just the width. `layout.ts` declares this size to React
       // Flow, and `position()` spaces rows by it. Measured with the card left
       // to size itself: the wrapper was 184×46 and the card inside it 184×34,
