@@ -5029,6 +5029,26 @@ pub async fn run(
         );
     }
 
+    // #1941: refuse a check-name collision over the COMPLETE, final table
+    // set this invocation will copy — after resume-filtering above (so a
+    // resumed run's already-completed tables, which will not be
+    // re-materialized or re-checked, don't false-positive into the
+    // comparison), but before `init_run_progress` below writes anything and
+    // before the spawn loop further down copies a single row. `target_table_name`
+    // and `asset_key_prefix` are set once per task when `tables_to_process`
+    // is built and are not touched by anything between here and the spawn
+    // loop, so this sees exactly the table set / sibling grouping the run
+    // will actually use.
+    refuse_check_name_collisions(
+        pipeline,
+        tables_to_process.iter().map(|task| {
+            (
+                task.target_table_name.as_str(),
+                task.asset_key_prefix.first().map(String::as_str).unwrap_or(""),
+            )
+        }),
+    )?;
+
     // Initialize run progress tracking, stamped with this invocation's
     // pipeline scope so a later resume can prove the checkpoint is its own
     // (#1549), and with the table keys it plans to copy so a later resume can
@@ -6951,44 +6971,50 @@ async fn partition_overlap_key_carriers(
 /// `anomaly_evaluated`, evaluated or not — an empty `anomalies` list alone
 /// cannot say which happened (#1790).
 ///
-/// Lifted out of `run()` so a test can drive it with a warehouse that fails
-/// a specific query; `run()` itself builds its adapters from the config and
-/// offers no seam for that.
-/// Refuse before any check runs if two check names THIS run will emit for
-/// the SAME materialized table sanitize to the same Dagster check name
-/// (#1941).
+/// Refuse if two check names THIS run will emit for the SAME table sanitize
+/// to the same Dagster check name (#1941).
 ///
 /// `validate_checks` (config load, `rocky-core/src/config.rs`) already
 /// catches every TABLE-INDEPENDENT collision (custom checks and `null_rate`
 /// columns both run on every table, so a collision between them is refused
 /// before this function — before discovery, before materialization) and
-/// every collision on a table an assertion names explicitly. What only this
-/// function can see is a collision that needs the ACTUALLY discovered
-/// table set: an assertion colliding with a custom/null_rate name on a
-/// table config never mentions by name, and any `cross_source_overlap`
-/// collision, since that name depends on runtime-discovered siblings.
+/// every collision on a table an assertion names explicitly. What this
+/// function catches, that config load cannot, is a collision that needs the
+/// ACTUALLY discovered table set: an assertion colliding with a
+/// custom/null_rate name on a table config never mentions by name, and any
+/// `cross_source_overlap` collision, since that name depends on
+/// runtime-discovered siblings.
 ///
-/// Called from the top of [`run_batched_checks`], so it runs before the
-/// assertion, custom, null-rate and cross-source-overlap check loops — but
-/// `assertion_targets` is only complete after every table has been
-/// materialized (the copy already landed by the time checks run; see the
-/// comment above the assertions loop below), so this refusal cannot prevent
-/// the WRITE. It prevents a check RESULT from silently vanishing, which is
-/// the harm #1941 is about — Dagster drops the second of two colliding
-/// specs with only a log line.
-fn refuse_check_name_collisions(
+/// `table_source_pairs` is one `(target table name, source_type)` pair per
+/// table this invocation will touch — duplicates on the same table signal a
+/// `cross_source_overlap` sibling group. Two callers supply this, at two
+/// different points in `run()`'s lifecycle:
+///
+/// - **Primary**: called from `run()` itself, over `tables_to_process`,
+///   immediately before the copy loop spawns any task and before
+///   `init_run_progress` writes anything — so a collision refuses the run
+///   with NOTHING copied and NO watermark advanced, matching what the issue
+///   asked for ("a run-start refusal, before anything is materialized").
+/// - **Defense-in-depth**: called from the top of [`run_batched_checks`],
+///   over `assertion_targets`. By the time that function runs, every table
+///   in THIS invocation has already been copied — the primary call above
+///   already refused before that happened, so this only fires for a caller
+///   that reaches `run_batched_checks` without going through `run()`'s
+///   pre-loop gate (a test driving it directly, or a future second
+///   entrypoint).
+fn refuse_check_name_collisions<'a>(
     pipeline: &ReplicationPipelineConfig,
-    assertion_targets: &[(TableRef, Vec<String>)],
+    table_source_pairs: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Result<()> {
     use std::collections::BTreeMap;
 
     // table -> one source_type per occurrence (duplicates signal siblings).
     let mut siblings_by_table: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for (tref, asset_key) in assertion_targets {
+    for (table, source_type) in table_source_pairs {
         siblings_by_table
-            .entry(tref.table.as_str())
+            .entry(table)
             .or_default()
-            .push(asset_key.first().cloned().unwrap_or_default());
+            .push(source_type.to_string());
     }
 
     let mut messages = Vec::new();
@@ -7013,10 +7039,10 @@ fn refuse_check_name_collisions(
 
     if !messages.is_empty() {
         anyhow::bail!(
-            "refusing to run checks: {} check-name collision(s) would sanitize to the same \
-             Dagster check name — Dagster keys check results by (asset_key, sanitized_name), \
-             so the first spec wins and the second is silently dropped. Rename one side of \
-             each pair.\n{}",
+            "refusing to run: {} check-name collision(s) would sanitize to the same Dagster \
+             check name — Dagster keys check results by (asset_key, sanitized_name), so the \
+             first spec wins and the second is silently dropped. Rename one side of each \
+             pair.\n{}",
             messages.len(),
             messages.join("\n"),
         );
@@ -7024,6 +7050,23 @@ fn refuse_check_name_collisions(
     Ok(())
 }
 
+/// Runs the batched replication checks against the tables copied this run
+/// and appends the results to `pending_checks`.
+///
+/// Row count and freshness go through the warehouse's `BatchCheckAdapter`
+/// when it has one that says it can batch that leg (one UNION ALL query),
+/// and fall back to one query per table otherwise — no adapter, or an
+/// adapter whose `supports_row_counts` / `supports_freshness` says no. The
+/// decision is per leg (#1719). Assertions, custom checks, null-rate checks and the
+/// cross-source overlap check run per table through the plain
+/// `WarehouseAdapter`. Row-count anomalies detected on the way are pushed to
+/// `anomalies`, and every table the detector considered is recorded in
+/// `anomaly_evaluated`, evaluated or not — an empty `anomalies` list alone
+/// cannot say which happened (#1790).
+///
+/// Lifted out of `run()` so a test can drive it with a warehouse that fails
+/// a specific query; `run()` itself builds its adapters from the config and
+/// offers no seam for that.
 #[allow(clippy::too_many_arguments)]
 async fn run_batched_checks(
     warehouse: &dyn WarehouseAdapter,
@@ -7042,9 +7085,22 @@ async fn run_batched_checks(
     anomalies: &mut Vec<AnomalyOutput>,
     anomaly_evaluated: &mut Vec<AnomalyEvaluationOutput>,
 ) -> Result<()> {
-    // #1941: refuse BEFORE any check in this function runs — see the
-    // docstring on `refuse_check_name_collisions` above.
-    refuse_check_name_collisions(pipeline, assertion_targets)?;
+    // #1941: defense-in-depth. `run()`'s own caller already refused this
+    // run over the complete `tables_to_process` set BEFORE the copy loop —
+    // see `refuse_check_name_collisions` above and its call site before the
+    // spawn loop in `run()`. That earlier call sees every table this
+    // invocation WILL copy; this one sees only `assertion_targets`, which is
+    // populated per materialized table as the copy loop completes, so by the
+    // time this function runs the copies (and any watermark advance) have
+    // already happened. Kept so a caller that reaches this function without
+    // going through `run()`'s pre-loop gate (a test driving it directly, or
+    // a future second entrypoint) still gets the refusal.
+    refuse_check_name_collisions(
+        pipeline,
+        assertion_targets
+            .iter()
+            .map(|(tref, asset_key)| (tref.table.as_str(), asset_key.first().map(String::as_str).unwrap_or(""))),
+    )?;
 
     let row_count_enabled = pipeline.checks.row_count.enabled() && !source_batch_refs.is_empty();
     let freshness_enabled = pipeline.checks.freshness.is_some() && !freshness_batch_refs.is_empty();
@@ -20717,6 +20773,161 @@ auto_create_schemas = true
         // binds `connectors`, and every catalog/schema creation happens in the
         // setup loop far below it. Refusing here is structurally before any
         // warehouse statement.
+    }
+
+    /// #1941: the check-name-collision refusal fires BEFORE any table is
+    /// copied — not after, the way the first version of this fix worked
+    /// (inside `run_batched_checks`, reachable only once every table's copy
+    /// had already landed and its watermark had already advanced).
+    ///
+    /// Uses a `cross_source_overlap` collision deliberately: that check name
+    /// depends on which tables discovery actually finds siblings for, so
+    /// `validate_checks` at config load cannot see it (no assertions are
+    /// declared here for it to hang a table off), which is exactly the case
+    /// this test needs to drive all the way through discovery and into
+    /// `run()`'s own pre-copy gate, not stop at config load. Two source
+    /// schemas (`raw__acme`, `raw__widgets`) both discover an `orders`
+    /// table under the same `duckdb` source type — a sibling pair — and a
+    /// custom check is named to sanitize onto
+    /// `cross_source_overlap:duckdb.orders`.
+    ///
+    /// Proves nothing was written: `auto_create_schemas = true` would
+    /// create both target schemas the moment the setup loop ran, so their
+    /// absence proves the setup loop — which runs strictly before the copy
+    /// loop — never reached either table.
+    ///
+    /// Mutation that must turn this red: move the
+    /// `refuse_check_name_collisions(pipeline, tables_to_process...)` call
+    /// (right before `init_run_progress`) back to after the copy loop, or
+    /// delete it and rely on the `run_batched_checks` call alone.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_collision_refusal_writes_nothing_the_target_table_never_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let db = dir.join("x.duckdb");
+        {
+            use rocky_core::traits::WarehouseAdapter;
+            let a = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db).unwrap();
+            for schema in ["raw__acme", "raw__widgets"] {
+                a.execute_statement(&format!("CREATE SCHEMA {schema}"))
+                    .await
+                    .unwrap();
+                a.execute_statement(&format!(
+                    "CREATE TABLE {schema}.orders AS SELECT 1 AS id"
+                ))
+                .await
+                .unwrap();
+            }
+        }
+        let config_path = dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[state]
+backend = "local"
+
+[pipeline.p]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.p.source.discovery]
+adapter = "default"
+
+[pipeline.p.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+adapter = "default"
+catalog_template = "x"
+schema_template = "staging__{{source}}"
+
+[pipeline.p.target.governance]
+auto_create_schemas = true
+
+[pipeline.p.checks]
+cross_source_overlap = {{ keys = ["id"] }}
+
+[[pipeline.p.checks.custom]]
+name = "cross source overlap duckdb orders"
+sql = "SELECT 0"
+threshold = 0
+"#,
+                db.display()
+            ),
+        )
+        .unwrap();
+
+        // Config load must NOT catch this one — it is the run-time-only
+        // collision this test exists to drive past config load.
+        let loaded = std::sync::Arc::new(
+            rocky_core::config::load_rocky_config_fingerprinted(&config_path)
+                .expect("a cross_source_overlap collision is invisible to config load"),
+        );
+
+        let state_path = dir.join("state.redb");
+        let opts = PartitionRunOptions::default();
+        let err = super::run(
+            &config_path,
+            loaded,
+            None,
+            None,
+            &state_path,
+            None,
+            false,
+            None,
+            false,
+            None,
+            false,
+            None,
+            &opts,
+            None,
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect_err("a check-name collision must refuse the run before copying anything");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cross source overlap duckdb orders")
+                && msg.contains("cross_source_overlap:duckdb.orders"),
+            "the refusal must name both colliding sources: {msg}"
+        );
+
+        let warehouse = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db).unwrap();
+        for schema in ["staging__acme", "staging__widgets"] {
+            let result = warehouse
+                .execute_query(&format!(
+                    "SELECT COUNT(*) FROM information_schema.tables \
+                     WHERE table_schema = '{schema}' AND table_name = 'orders'"
+                ))
+                .await
+                .unwrap();
+            let count = result.rows[0][0]
+                .as_u64()
+                .or_else(|| result.rows[0][0].as_str().and_then(|v| v.parse().ok()));
+            assert_eq!(
+                count,
+                Some(0),
+                "{schema}.orders must not exist — the refusal must fire before any copy"
+            );
+        }
     }
 
     #[tokio::test]
