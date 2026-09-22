@@ -301,7 +301,14 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
     };
 
     // --- Lint rules ---
-    lint_config(&cfg, &loaded_models, &mut out);
+    // Re-parses the file into the raw (normalized-shorthand, un-defaulted)
+    // document so L004/L006 can tell "the file sets this key" from "the
+    // struct defaulted it" — see `parse_rocky_config_raw`. `.ok()`: if this
+    // second parse somehow fails when the first one (above) just succeeded,
+    // the presence-gated lints simply stay silent rather than error the
+    // whole validate run over a lint.
+    let raw_doc = rocky_core::config::parse_rocky_config_raw(config_path).ok();
+    lint_config(&cfg, raw_doc.as_ref(), &loaded_models, &mut out);
 
     // --- Product specs (V050–V053) ---
     validate_products(config_path, &mut out);
@@ -1591,13 +1598,24 @@ fn validate_pipeline_dag(cfg: &rocky_core::config::RockyConfig, out: &mut Valida
 /// to simplify the configuration.
 fn lint_config(
     cfg: &rocky_core::config::RockyConfig,
+    raw: Option<&toml::Value>,
     models: &[rocky_core::models::Model],
     out: &mut ValidateOutput,
 ) {
     use std::collections::HashMap;
 
-    // L004: [state] backend="local" is the default
-    if cfg.state.backend == rocky_core::config::StateBackend::Local {
+    // L004: [state] backend="local" is the default. Only fires when the KEY
+    // is actually present in the document — a config that never writes
+    // [state] at all defaults to the exact same value, and telling the
+    // author to omit a key they already omitted is not a lint, it's noise
+    // (#2005). `raw` is `None` only if re-parsing the raw document failed,
+    // which should not happen given the structured parse already succeeded;
+    // treated as "can't tell", so the lint stays silent rather than guess.
+    let state_backend_present = raw
+        .and_then(|v| v.get("state"))
+        .and_then(|v| v.get("backend"))
+        .is_some();
+    if cfg.state.backend == rocky_core::config::StateBackend::Local && state_backend_present {
         out.push(ValidateMessage {
             severity: "lint".into(),
             code: "L004".into(),
@@ -1610,8 +1628,23 @@ fn lint_config(
     // Per-pipeline lint rules (dispatch by pipeline type)
     for (name, pc) in &cfg.pipelines {
         if let Some(pipeline) = pc.as_replication() {
-            // L006: auto_create_catalogs/schemas = false is the default
-            if !pipeline.target.governance.auto_create_catalogs {
+            // Both `[pipeline.<name>]` and `[pipelines.<name>]` spellings are
+            // accepted (RockyConfig's `alias`); the bare `[pipeline]`
+            // shorthand is already normalized to `pipeline.default` by
+            // `parse_rocky_config_raw`, so a plain name lookup covers all
+            // three shapes with cfg.pipelines' own keys.
+            let raw_governance = raw
+                .and_then(|v| v.get("pipeline").or_else(|| v.get("pipelines")))
+                .and_then(|v| v.get(name))
+                .and_then(|v| v.get("target"))
+                .and_then(|v| v.get("governance"));
+            let key_present = |key: &str| raw_governance.and_then(|g| g.get(key)).is_some();
+
+            // L006: auto_create_catalogs/schemas = false is the default —
+            // only when the document actually sets the key.
+            if !pipeline.target.governance.auto_create_catalogs
+                && key_present("auto_create_catalogs")
+            {
                 out.push(ValidateMessage {
                     severity: "lint".into(),
                     code: "L006".into(),
@@ -1620,7 +1653,9 @@ fn lint_config(
                     field: Some(format!("pipeline.{name}.target.governance.auto_create_catalogs")),
                 });
             }
-            if !pipeline.target.governance.auto_create_schemas {
+            if !pipeline.target.governance.auto_create_schemas
+                && key_present("auto_create_schemas")
+            {
                 out.push(ValidateMessage {
                     severity: "lint".into(),
                     code: "L006".into(),
@@ -3652,7 +3687,7 @@ target.adapter = "default"
         let cfg = rocky_core::config::load_rocky_config(f.path()).unwrap();
 
         let mut out = ValidateOutput::default();
-        lint_config(&cfg, std::slice::from_ref(&model), &mut out);
+        lint_config(&cfg, None, std::slice::from_ref(&model), &mut out);
 
         let l002: Vec<_> = out.messages.iter().filter(|m| m.code == "L002").collect();
         assert!(
@@ -3714,7 +3749,7 @@ target.adapter = "default"
         let cfg = rocky_core::config::load_rocky_config(f.path()).unwrap();
 
         let mut out = ValidateOutput::default();
-        lint_config(&cfg, std::slice::from_ref(&model), &mut out);
+        lint_config(&cfg, None, std::slice::from_ref(&model), &mut out);
 
         let l002: Vec<_> = out.messages.iter().filter(|m| m.code == "L002").collect();
         assert_eq!(
@@ -3779,6 +3814,100 @@ backend = "local"
         assert!(
             lint_codes.contains(&"L007"),
             "expected L007 (adapter repetition)"
+        );
+    }
+
+    /// #2005: L004 and L006 must fire only when the document actually
+    /// WRITES the key they're about — this config sets neither `[state]`
+    /// nor `auto_create_catalogs`/`auto_create_schemas`, so both are
+    /// silently defaulted, not something the author wrote and could omit.
+    /// Before the fix, both lints fired here anyway (reading the
+    /// post-default struct, which can't tell "written" from "defaulted").
+    #[test]
+    fn test_l004_l006_do_not_fire_when_the_keys_are_absent() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "poc"
+schema_template = "demo"
+"#,
+        );
+        let lint_codes: Vec<&str> = out
+            .messages
+            .iter()
+            .filter(|m| m.severity == "lint")
+            .map(|m| m.code.as_str())
+            .collect();
+        assert!(
+            !lint_codes.contains(&"L004"),
+            "L004 must not fire when [state] is absent: {:?}",
+            out.messages
+        );
+        assert!(
+            !lint_codes.contains(&"L006"),
+            "L006 must not fire when auto_create_catalogs/schemas are absent: {:?}",
+            out.messages
+        );
+    }
+
+    /// Counter-check pinned separately from `test_lint_fires_on_typical_poc`:
+    /// a config using the `[pipelines.<name>]` PLURAL spelling (a supported
+    /// alias) must resolve the raw-presence lookup the same way as the
+    /// singular `[pipeline.<name>]` spelling.
+    #[test]
+    fn test_l006_still_fires_with_plural_pipelines_spelling() {
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipelines.poc]
+type = "replication"
+
+[pipelines.poc.source]
+adapter = "local"
+
+[pipelines.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipelines.poc.target]
+adapter = "local"
+catalog_template = "poc"
+schema_template = "demo"
+
+[pipelines.poc.target.governance]
+auto_create_catalogs = false
+"#,
+        );
+        let l006: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "L006")
+            .collect();
+        assert_eq!(
+            l006.len(),
+            1,
+            "expected exactly one L006 (auto_create_catalogs only): {:?}",
+            out.messages
         );
     }
 
