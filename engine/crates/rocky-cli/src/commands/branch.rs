@@ -689,7 +689,14 @@ pub(crate) async fn discover_branch_targets_for_plan(
     let adapter = registry.warehouse_adapter(pipeline.target_adapter())?;
     let dialect = adapter.dialect();
 
-    let planned = discover_branch_targets(config_path, record, filter, pipeline_name).await?;
+    // Pass the ALREADY-RESOLVED name, not the raw (possibly `None`)
+    // `pipeline_name` argument: `discover_branch_targets` reloads the config
+    // and re-resolves independently, so passing the resolved name here
+    // guarantees the targets it builds and the name persisted onto
+    // `PromotePlan.pipeline` are provably one resolution, not two separate
+    // reads of a config that could — in principle — change between them.
+    let planned =
+        discover_branch_targets(config_path, record, filter, Some(&resolved_pipeline_name)).await?;
 
     let targets = planned
         .into_iter()
@@ -1768,6 +1775,24 @@ pub async fn run_branch_promote_from_plan(
         );
     }
 
+    // #2019: when the plan carries its own resolved pipeline, an explicit
+    // `--pipeline` on this call must agree with it — refused BEFORE the
+    // policy gate or any adapter resolution, mirroring the `branch_name`
+    // mismatch check above. Silently preferring the CLI value here would let
+    // `--pipeline staging` execute a `marts`-built plan's persisted SQL
+    // against staging's adapter — a destructive write at a destination other
+    // than the one the plan was built and reviewed against. A plan with no
+    // recorded pipeline (built before this field existed) falls back to the
+    // CLI selector unchanged, further down.
+    if let (Some(saved), Some(cli)) = (promote_plan.pipeline.as_deref(), pipeline_name)
+        && cli != saved
+    {
+        anyhow::bail!(
+            "--pipeline '{cli}' does not match the plan's recorded pipeline '{saved}'. \
+             Omit --pipeline or pass '{saved}'."
+        );
+    }
+
     // Route the `--plan` path through the canonical agent-policy gate BEFORE
     // any target SQL executes — the same gate `rocky apply <promote-plan>`
     // runs. Without this, an agent-authored Promote plan a `deny agent promote`
@@ -1810,8 +1835,23 @@ pub async fn run_branch_promote_from_plan(
         breaking_changes: None,
     });
 
-    let (targets_out, overall_success) =
-        run_promote_apply(&loaded, &promote_plan.targets, pipeline_name).await?;
+    // #2019 parity: the mismatch check above already refused a `--pipeline`
+    // that disagrees with the plan's recorded one, so by this point either
+    // they agree, or the CLI selector was omitted. Prefer the plan's own
+    // recorded pipeline (it is what the persisted SQL was built against);
+    // fall back to the CLI selector only for a plan with no recorded
+    // pipeline (built before this field existed). Without this fallback, the
+    // SAME plan_id applied via `rocky apply <plan-id>` (which always reads
+    // `promote_plan.pipeline`) and via `rocky branch promote --plan
+    // <plan-id>` (bare, no `--pipeline`) would disagree on a multi-pipeline
+    // project — exactly the inconsistency this fix exists to remove, on the
+    // one seam these entrypoints share.
+    let (targets_out, overall_success) = run_promote_apply(
+        &loaded,
+        &promote_plan.targets,
+        promote_plan.pipeline.as_deref().or(pipeline_name),
+    )
+    .await?;
 
     audit.push(AuditEvent {
         kind: if overall_success {
@@ -4572,6 +4612,183 @@ adapter = "default"
             count, 2,
             "`rocky apply` on the promote plan must copy both branch rows"
         );
+    }
+
+    /// #2019 (Codex finding, gpt-5.6-terra, high confidence): `rocky branch
+    /// promote <name> --plan <plan-id>` must behave exactly like `rocky apply
+    /// <plan-id>` on the SAME plan — read the plan's own recorded pipeline
+    /// rather than trusting a CLI `--pipeline` selector unconditionally.
+    ///
+    /// - Selector omitted: falls back to the plan's recorded pipeline and
+    ///   succeeds, even on a multi-pipeline config.
+    /// - Selector disagrees with the plan: refused BEFORE any adapter is
+    ///   opened or SQL executes. Silently preferring the CLI value would let
+    ///   `--pipeline staging` execute a `marts`-built plan's persisted SQL
+    ///   against staging's adapter — a destructive write at a destination
+    ///   other than the one the plan was built and reviewed against.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn branch_promote_from_plan_pipeline_selector_matches_or_refuses() {
+        use rocky_core::config::PolicyPrincipal;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let duckdb_path = dir.join("warehouse.duckdb");
+        let config_path = dir.join("rocky.toml");
+        let state_path = dir.join("state.redb");
+        let models_dir = dir.join("models");
+        std::fs::create_dir_all(models_dir.join("marts")).unwrap();
+        std::fs::create_dir_all(models_dir.join("staging")).unwrap();
+
+        for git_args in [
+            ["init", "-q", "."].as_slice(),
+            ["config", "user.email", "test@rocky.invalid"].as_slice(),
+            ["config", "user.name", "Rocky Test"].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(git_args)
+                .current_dir(dir)
+                .status()
+                .expect("git setup");
+            assert!(status.success(), "git {git_args:?} failed");
+        }
+
+        write_transformation_model(
+            &models_dir.join("marts"),
+            "fct_orders",
+            "warehouse",
+            "marts",
+            "fct_orders",
+            "SELECT 1 AS id",
+        );
+
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.marts]
+type = "transformation"
+models = "models/marts/**"
+
+[pipeline.marts.target]
+adapter = "default"
+
+[pipeline.marts.target.governance]
+auto_create_schemas = true
+
+[pipeline.staging]
+type = "transformation"
+models = "models/staging/**"
+
+[pipeline.staging.target]
+adapter = "default"
+"#,
+                duckdb_path.display()
+            ),
+        )
+        .unwrap();
+
+        run_branch_create(&state_path, "fix", None, false).unwrap();
+
+        {
+            let adapter = DuckDbWarehouseAdapter::open(&duckdb_path).expect("open duckdb");
+            for stmt in [
+                "CREATE SCHEMA IF NOT EXISTS warehouse",
+                "CREATE SCHEMA IF NOT EXISTS marts",
+                "CREATE SCHEMA IF NOT EXISTS branch__fix",
+                "CREATE TABLE branch__fix.fct_orders AS SELECT 1 AS id UNION ALL SELECT 2",
+            ] {
+                adapter.execute_statement(stmt).await.expect("seed");
+            }
+        }
+
+        let _cwd_guard = cwd_lock();
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+
+        // `rocky plan promote fix --pipeline marts` — disambiguates at
+        // plan-build time; the plan now records `pipeline: "marts"`.
+        let plan_id = crate::commands::plan::build_promote_plan_inner(
+            dir,
+            &config_path,
+            &models_dir,
+            "main",
+            "fix",
+            None,
+            Some("marts"),
+            false, // skip_approval_flag
+            true,  // allow_breaking (gate skips fail-open on a commit-less repo)
+            &state_path,
+            PolicyPrincipal::Human,
+        )
+        .await
+        .expect("plan build must succeed with --pipeline marts")
+        .plan_output
+        .plan_id
+        .expect("plan_id");
+
+        // Mismatch: `--pipeline staging` disagrees with the plan's recorded
+        // `marts` — must be refused, not silently executed against staging.
+        let mismatch = run_branch_promote_from_plan(
+            dir,
+            &config_path,
+            &plan_id,
+            None,
+            Some("staging"),
+            &state_path,
+            PolicyPrincipal::Human,
+            false,
+        )
+        .await;
+
+        // Omitted: falls back to the plan's recorded `marts` and succeeds —
+        // matching `rocky apply <plan-id>`'s behaviour on the same plan.
+        let omitted = run_branch_promote_from_plan(
+            dir,
+            &config_path,
+            &plan_id,
+            None,
+            None,
+            &state_path,
+            PolicyPrincipal::Human,
+            false,
+        )
+        .await;
+
+        std::env::set_current_dir(saved_cwd).unwrap();
+
+        let err =
+            mismatch.expect_err("--pipeline staging must be refused against a marts-built plan");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not match the plan's recorded pipeline"),
+            "expected the pipeline-mismatch refusal, got: {msg}"
+        );
+        assert!(
+            !msg.contains("multiple pipelines defined"),
+            "the mismatch must be its own refusal, not the generic ambiguity error: {msg}"
+        );
+
+        omitted.expect(
+            "omitting --pipeline must fall back to the plan's recorded pipeline and succeed",
+        );
+
+        let adapter = DuckDbWarehouseAdapter::open(&duckdb_path).expect("reopen duckdb");
+        let rows = adapter
+            .execute_query("SELECT CAST(COUNT(*) AS BIGINT) FROM warehouse.marts.fct_orders")
+            .await
+            .expect("prod table must exist after the fallback promote");
+        let v = &rows.rows[0][0];
+        let count = v
+            .as_i64()
+            .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+            .unwrap_or_else(|| panic!("count value not parseable: {v:?}"));
+        assert_eq!(count, 2, "the fallback promote must copy both branch rows");
     }
 
     /// 🔴 BLOCKER 2 (content): the bare verb's breaking-change block must still
