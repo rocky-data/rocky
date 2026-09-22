@@ -132,7 +132,7 @@ jobs:
 
 The CI workflow currently hardcodes three invocations (`--bench compile -p rocky-cli`, `--bench state_store -p rocky-core`, `--bench dag_execute -p rocky-core`). If you add a bench in, say, `rocky-sql`, the workflow won't invoke it. You have two options:
 
-1. **Add a second invocation to the workflow** (preferred) — append another `cargo bench` line and a second `github-action-benchmark` step with a different `output-file-path`. Review with Hugo since it extends the perf budget.
+1. **Add another invocation to the workflow** (preferred) — append another `cargo bench ... | tee -a bench-output.txt` line to the `Run benchmarks` step's `run:` block so its output lands in the same uploaded artifact (there is no `github-action-benchmark` step to duplicate — see the no-comparison-step note above). Review with Hugo since it extends the perf budget.
 2. **Put the bench in `rocky-cli/benches/compile.rs`** — acceptable if the bench is logically "compile-adjacent" and you can drive it through the existing compile entrypoint. Not acceptable for benchmarks that need to import from a crate `rocky-cli` doesn't already depend on.
 
 ## When to add a `perf`-labelled PR
