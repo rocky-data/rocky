@@ -425,7 +425,8 @@ enum Command {
         /// Project directory name
         #[arg(default_value = ".")]
         path: String,
-        /// Project template: duckdb (default), databricks-fivetran, snowflake
+        /// Project template: duckdb (default), databricks-fivetran,
+        /// snowflake, bigquery, trino
         #[arg(long, default_value = "duckdb")]
         template: String,
     },
@@ -889,9 +890,9 @@ enum Command {
         /// is a content-hash of the payload, so plans differing only by
         /// idempotency-key get distinct plan_ids — the hash discriminates.
         ///
-        /// Supported on `local`, `valkey`, and `tiered` state backends.
-        /// `s3`-only and `gcs`-only backends error at flag-parse time — use
-        /// `tiered` for multi-pod deployments.
+        /// Supported on every state backend: `local` (a redb write
+        /// transaction), `valkey`/`tiered` (`SET NX EX`), and `s3`/`gcs`
+        /// (an atomic conditional PUT).
         ///
         /// ⚠️ Keys are stored verbatim in the state store; do NOT put
         /// secrets in idempotency keys.
@@ -1063,9 +1064,9 @@ enum Command {
         /// work is done. If another caller currently holds the key's
         /// in-flight claim, exits with `skipped_in_flight`.
         ///
-        /// Supported on `local`, `valkey`, and `tiered` state backends.
-        /// `s3`-only and `gcs`-only backends error at flag-parse time — use
-        /// `tiered` for multi-pod deployments.
+        /// Supported on every state backend: `local` (a redb write
+        /// transaction), `valkey`/`tiered` (`SET NX EX`), and `s3`/`gcs`
+        /// (an atomic conditional PUT).
         ///
         /// ⚠️ Keys are stored verbatim in the state store; do NOT put
         /// secrets in idempotency keys.
@@ -1619,7 +1620,9 @@ enum Command {
         /// Path to Rocky project directory (optional, for side-by-side comparison)
         #[arg(long)]
         rocky_project: Option<PathBuf>,
-        /// Number of rows to sample per table (for warehouse-based validation)
+        /// Number of rows to sample per table. Accepted but currently
+        /// ignored: `validate-migration` runs a compile-only comparison
+        /// and opens no warehouse adapter.
         #[arg(long)]
         sample_size: Option<usize>,
     },
@@ -5162,7 +5165,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use std::sync::Mutex;
 
     // -----------------------------------------------------------------------
@@ -5221,6 +5224,58 @@ mod tests {
         assert_eq!(
             rocky_mcp::McpProfile::from(profile),
             rocky_mcp::McpProfile::Worker,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2027 — `--help` strings must describe the behaviour the code has
+    // -----------------------------------------------------------------------
+
+    /// `rocky init --help` must list every template `commands/init.rs`
+    /// actually accepts, not just three of the five.
+    #[test]
+    fn init_help_lists_all_five_templates() {
+        let mut init_cmd = Cli::command()
+            .find_subcommand("init")
+            .expect("init subcommand exists")
+            .clone();
+        let help = init_cmd.render_long_help().to_string();
+        assert!(help.contains("trino"), "init --help must list trino: {help}");
+        assert!(
+            help.contains("bigquery"),
+            "init --help must list bigquery: {help}"
+        );
+    }
+
+    /// `rocky validate-migration --help` must say `--sample-size` is
+    /// ignored, not promise warehouse-based sampling that
+    /// `run_validate_migration` never performs (`_sample_size` is unused).
+    #[test]
+    fn validate_migration_help_says_sample_size_is_ignored() {
+        let mut sub = Cli::command()
+            .find_subcommand("validate-migration")
+            .expect("validate-migration subcommand exists")
+            .clone();
+        let help = sub.render_long_help().to_string();
+        assert!(
+            help.contains("ignored"),
+            "validate-migration --help must say sample-size is ignored: {help}"
+        );
+    }
+
+    /// `rocky run --help` must not claim `s3`/`gcs` idempotency backends
+    /// error at flag-parse time — `IdempotencyBackend::from_state_config`
+    /// maps both to `ObjectStore` and attempts a conditional PUT instead.
+    #[test]
+    fn run_help_does_not_claim_object_store_backends_error_at_parse_time() {
+        let mut sub = Cli::command()
+            .find_subcommand("run")
+            .expect("run subcommand exists")
+            .clone();
+        let help = sub.render_long_help().to_string();
+        assert!(
+            !help.contains("error at flag-parse time"),
+            "run --help must not claim s3/gcs error at parse time: {help}"
         );
     }
 
