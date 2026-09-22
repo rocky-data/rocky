@@ -1197,17 +1197,12 @@ This block is separate from the [`[pipeline.NAME.checks]`](#pipelinenamechecks) 
 This block is gone. A config that still declares it fails to load, and the error says what to delete.
 
 ```
-the `[schema_evolution]` section was removed because nothing ever read it: drift
-detection never reported a column that disappeared from the source, so Rocky never
-dropped one and `grace_period_days` never took effect. Delete the
-`[schema_evolution]` section from this config; removing it changes no behaviour.
-Rocky does not drop a column the source lost; there is no opt-in. See
-https://github.com/rocky-data/rocky/issues/1616.
+the `[schema_evolution]` section was removed because nothing ever read it: drift detection never reported a column that disappeared from the source, so Rocky never dropped one and `grace_period_days` never took effect. Delete the `[schema_evolution]` section from this config; removing it changes no behaviour. A source-side column removal alone never schedules a DROP COLUMN, and there is no opt-in for that; a full refresh or a drift-driven table recreation can still discard a target-only column. See https://github.com/rocky-data/rocky/issues/1616.
 ```
 
 **What to do:** delete the section. Nothing about your pipeline changes. Rocky never dropped a column on the strength of that key, so there is no behaviour to replace.
 
-Rocky does not drop a column the source lost. The target keeps it. A detector and an `ALTER TABLE ... DROP COLUMN` generator exist in the engine. So does a state table for tracking a grace period, but nothing writes a record to it or calls either function. There is no opt-in for a source-driven drop today.
+A source-side column removal alone never schedules `ALTER TABLE ... DROP COLUMN`. The detector and generator for that exist in the engine. So does a state table for tracking a grace period. Nothing calls either function, and nothing writes a record to the table. There is no opt-in for that today. A full refresh or a drift-driven table recreation can still discard a target-only column. Both rebuild the table from only the source's current columns.
 
 See [Schema drift](/concepts/schema-drift/) for the changes Rocky does detect and act on.
 

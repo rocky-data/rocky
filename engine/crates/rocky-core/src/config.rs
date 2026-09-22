@@ -2014,8 +2014,9 @@ impl GovernanceOverride {
 pub const SCHEMA_EVOLUTION_REMOVED: &str = "the `[schema_evolution]` section was removed because nothing ever read it: \
      drift detection never reported a column that disappeared from the source, so Rocky never dropped one and \
      `grace_period_days` never took effect. Delete the `[schema_evolution]` section from this config; \
-     removing it changes no behaviour. Rocky does not drop a column the source lost; there is no opt-in. \
-     See https://github.com/rocky-data/rocky/issues/1616.";
+     removing it changes no behaviour. A source-side column removal alone never schedules a DROP COLUMN, \
+     and there is no opt-in for that; a full refresh or a drift-driven table recreation can still discard \
+     a target-only column. See https://github.com/rocky-data/rocky/issues/1616.";
 
 /// The removed `[schema_evolution]` section.
 ///
