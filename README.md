@@ -75,6 +75,11 @@ rocky compile && rocky test && rocky run
 
 No credentials needed — the playground runs on local DuckDB.
 
+The installer downloads a published engine release. Changes on `main` can arrive before the next release.
+Check `rocky --version` and the [release notes](https://github.com/rocky-data/rocky/releases) when following examples.
+
+[Share your first-run experience](https://github.com/rocky-data/rocky/issues/new?template=first_run_feedback.yml), including a successful attempt or where you stopped.
+
 For production deploys, use `rocky plan` (saves what will change) then `rocky apply <plan-id>` (runs it). For local work and automation, `rocky run` does it all in one step.
 
 ## Who Rocky is for
@@ -121,7 +126,7 @@ tells you `fct_revenue.total_revenue` reads it, before you merge.
 
 - [Schema drift recovery](examples/playground/pocs/02-performance/06-schema-drift-recover/): a source column changes type. Rocky spots it and rebuilds safely.
 - [Data contracts](examples/playground/pocs/01-quality/01-data-contracts-strict/): a known missing or dropped output column can refuse the affected model with `E010`, `E011`, or `E013`. An unresolved reference needs source schemas or a runtime check.
-- [BigQuery cost to the byte](examples/playground/pocs/07-adapters/05-bigquery-native-queries/): the run receipt matches your bill exactly. Needs credentials.
+- [BigQuery cost attribution](examples/playground/pocs/07-adapters/05-bigquery-native-queries/): `rocky cost` derives an allocation when a run records scanned bytes. Compare it with your bill yourself. Needs credentials.
 - [Named branches and replay](examples/playground/pocs/00-foundations/06-branches-replay-lineage/): run against an isolated copy, look at it, then drop or promote it.
 - [Agent policy](examples/playground/pocs/03-ai/07-policy/): decide what an agent may do alone. CI catches a rule you loosen by accident.
 - [Column lineage](examples/playground/pocs/06-developer-experience/01-lineage-column-level/): trace one column back to its source.
@@ -133,7 +138,8 @@ tells you `fct_revenue.total_revenue` reads it, before you merge.
 
 The checker runs as a language server in VS Code. You see type mismatches and broken references while you write, not later in CI. Column types show when you hover. Go-to-definition works across all your models.
 
-The Rocky Inspector shows a model's columns, where each column came from, its tests, its cost, and which columns hold sensitive data.
+The Rocky Inspector shows a model's columns, lineage, tests, available run
+metrics, and classified columns.
 
 <p align="center">
   <img src="editors/vscode/media/demo-inspector.gif" alt="The Rocky Inspector's Overview as a model trust dashboard, its Governance card flagging two classified columns with one left unmasked" width="900" />
@@ -149,7 +155,7 @@ A sketch of that panel:
 │    total_revenue   DECIMAL    from  stg_orders.amount    │
 │                                                          │
 │  Tests             2 passing                             │
-│  Cost              last run $0.04                        │
+│  Cost              allocation when data exists           │
 │                                                          │
 │  Governance        2 columns hold personal data          │
 │                    ⚠ 1 of them is not masked             │

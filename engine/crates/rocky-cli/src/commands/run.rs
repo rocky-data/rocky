@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,6 +25,7 @@ use rocky_core::traits::{
     MaskingPolicy, RowCountResult as BatchRowCountResult, TagTarget, WarehouseAdapter,
 };
 use rocky_ir::*;
+use sqlparser::ast::{ObjectName, SetExpr, Statement, TableFactor};
 
 use crate::output::*;
 use crate::registry::{self, AdapterRegistry};
@@ -800,6 +801,165 @@ pub struct DeferOptions {
     /// production home). When `Some(schema)`, every deferred reference is
     /// pointed at that schema instead (catalog + table preserved).
     pub defer_to: Option<String>,
+}
+
+/// Remove the local-model E039 check only after `--defer` has successfully
+/// rewritten the selected model's exact in-project references to external
+/// targets. Other diagnostics on the selected model remain errors.
+///
+/// E039's emitter admits exactly one plain in-project relation binding. Under
+/// the single-model defer path that binding is necessarily unselected and the
+/// successful rewrite externalizes it. The external target's schema remains
+/// unknown here: an invalid column still fails at warehouse execution.
+fn suppress_deferred_selected_e039(
+    compile_result: &mut rocky_compiler::compile::CompileResult,
+    selected: Option<&str>,
+    defer_enabled: bool,
+) {
+    let Some(selected) = selected.filter(|_| defer_enabled) else {
+        return;
+    };
+    let is_suppressed = |diagnostic: &rocky_compiler::diagnostic::Diagnostic| {
+        diagnostic.model == selected && diagnostic.code.as_ref() == rocky_compiler::diagnostic::E039
+    };
+    compile_result
+        .type_check
+        .diagnostics
+        .retain(|diagnostic| !is_suppressed(diagnostic));
+    compile_result
+        .diagnostics
+        .retain(|diagnostic| !is_suppressed(diagnostic));
+    compile_result.has_errors = compile_result
+        .diagnostics
+        .iter()
+        .any(rocky_compiler::diagnostic::Diagnostic::is_error);
+}
+
+/// Identify declared edges that this single-model defer run will actually
+/// externalize. A bare model binding is rewritten. Any qualified binding to
+/// the same local producer keeps the edge local, including a query that mixes
+/// bare and qualified reads.
+fn deferred_externalized_edges(
+    compile_result: &rocky_compiler::compile::CompileResult,
+    selected: Option<&str>,
+    defer_enabled: bool,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let Some(selected) = selected.filter(|_| defer_enabled) else {
+        return BTreeMap::new();
+    };
+    let Some(model) = compile_result.project.model(selected) else {
+        return BTreeMap::new();
+    };
+    let Some(node) = compile_result
+        .project
+        .dag_nodes
+        .iter()
+        .find(|node| node.name == selected)
+    else {
+        return BTreeMap::new();
+    };
+    if !rocky_sql::lineage_complete::lineage_is_provably_complete(&model.sql) {
+        return BTreeMap::new();
+    }
+    let Ok(Statement::Query(query)) = rocky_sql::parser::parse_single_statement(&model.sql) else {
+        return BTreeMap::new();
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return BTreeMap::new();
+    };
+    let relations: Vec<&ObjectName> = select
+        .from
+        .iter()
+        .flat_map(|table_with_joins| {
+            std::iter::once(&table_with_joins.relation)
+                .chain(table_with_joins.joins.iter().map(|join| &join.relation))
+        })
+        .filter_map(|relation| match relation {
+            TableFactor::Table {
+                name, args: None, ..
+            } => Some(name),
+            _ => None,
+        })
+        .collect();
+    let producers = super::containment::ProducerIndex::build(
+        compile_result.project.models.iter().map(|model| {
+            (
+                model.config.name.as_str(),
+                model.config.target.catalog.as_str(),
+                model.config.target.schema.as_str(),
+                model.config.target.table.as_str(),
+            )
+        }),
+    );
+    let mut externalized = BTreeSet::new();
+    for dependency in &node.depends_on {
+        let is_rewritten = |relation: &&ObjectName| {
+            relation.0.len() == 1
+                && relation.0[0]
+                    .as_ident()
+                    .is_some_and(|ident| ident.value == *dependency)
+        };
+        let was_rewritten = relations.iter().any(is_rewritten);
+        let retained_local_binding = relations
+            .iter()
+            .filter(|relation| !is_rewritten(relation))
+            .any(|relation| match producers.resolve(&relation.to_string()) {
+                super::containment::ReadResolution::Edges(models) => {
+                    models.iter().any(|model| model == dependency)
+                }
+                super::containment::ReadResolution::Ambiguous => true,
+                super::containment::ReadResolution::External => false,
+            });
+        if was_rewritten && !retained_local_binding {
+            externalized.insert(dependency.clone());
+        }
+    }
+    if externalized.is_empty() {
+        BTreeMap::new()
+    } else {
+        BTreeMap::from([(selected.to_string(), externalized)])
+    }
+}
+
+/// Return every declared-DAG descendant that must not execute because a model
+/// failed compilation. Values are the descendant's direct poisoned inputs.
+///
+/// The fixed point is deliberately limited to declared model edges. Physical
+/// reads and unknown read sets retain their existing opt-in containment policy.
+/// A selected model whose inputs were successfully externalized by `--defer`
+/// has no local declared input edge for this execution.
+fn compile_error_descendant_blocks(
+    dag_nodes: &[DagNode],
+    failed: &BTreeSet<String>,
+    externalized_edges: &BTreeMap<String, BTreeSet<String>>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut blocked = BTreeMap::<String, Vec<String>>::new();
+    loop {
+        let mut changed = false;
+        for node in dag_nodes {
+            if failed.contains(&node.name) {
+                continue;
+            }
+            let externalized = externalized_edges.get(&node.name);
+            let direct: Vec<String> = node
+                .depends_on
+                .iter()
+                .filter(|dependency| {
+                    !externalized.is_some_and(|edges| edges.contains(*dependency))
+                        && (failed.contains(dependency.as_str())
+                            || blocked.contains_key(*dependency))
+                })
+                .cloned()
+                .collect();
+            if !direct.is_empty() && blocked.get(&node.name) != Some(&direct) {
+                blocked.insert(node.name.clone(), direct);
+                changed = true;
+            }
+        }
+        if !changed {
+            return blocked;
+        }
+    }
 }
 
 /// CLI overlay for the run command's build-decision gates — the
@@ -9923,59 +10083,6 @@ pub(crate) async fn execute_models(
         })
         .context("invalid surrogate_key configuration")?;
 
-    // Freeze fence at the exec-fingerprint choke-point (governed paths): a
-    // freeze landing between the entry gate's LIST and this execution must
-    // withhold it before any model runs. The governance snapshot is not yet
-    // captured here, so a withhold records the failure and returns the
-    // default (empty) snapshot — mirroring the compile-failure exit above.
-    // Models that failed to compile are excluded from execution (the
-    // `compile_failed_models` set is built just below, after this
-    // choke-point), so a freeze on one must not withhold the run's valid
-    // models here either. Derived locally because that set does not exist yet.
-    let exec_compile_failed: std::collections::BTreeSet<&str> = if compile_result.has_errors {
-        compile_result
-            .diagnostics
-            .iter()
-            .filter(|d| d.is_error())
-            .map(|d| d.model.as_str())
-            .collect()
-    } else {
-        std::collections::BTreeSet::new()
-    };
-    if let Some(gate) = exec_fp_gate
-        && let Some(fence) = freeze_fence
-        && let Some(msg) = fence
-            .check_withhold(
-                // Only the EXECUTING models — the same `model_name_filter` /
-                // `model_set` / compile-failure narrowing the layer loop
-                // applies below — so a freeze on a model this run won't build
-                // (unselected, or failed to compile) never withholds the
-                // models it does build.
-                compile_result
-                    .project
-                    .models
-                    .iter()
-                    .map(|m| m.config.name.as_str())
-                    .filter(|name| model_name_filter.is_none_or(|target| target == *name))
-                    .filter(|name| model_set.is_none_or(|set| set.contains(*name)))
-                    .filter(|name| !exec_compile_failed.contains(name)),
-            )
-            .await
-    {
-        warn!(
-            plan_id = gate.plan_id.as_str(),
-            "freeze fence hit before execution"
-        );
-        output.tables_failed += 1;
-        output.errors.push(crate::output::TableErrorOutput {
-            asset_key: vec!["<freeze>".to_string()],
-            error: msg,
-            failure_kind: crate::output::FailureKind::Unknown,
-            cooldown_seconds: None,
-        });
-        return Ok(GovernanceSnapshot::default());
-    }
-
     // ‼️ Governed-apply TOCTOU gate (E) — the single execution choke-point. The
     // fingerprint is recomputed over the EXACT compiled set about to execute
     // (`compile_result`, before any defer-rewrite mutates SQL) and refuses on
@@ -10009,6 +10116,69 @@ pub(crate) async fn execute_models(
         gate.verify(&compile_result.project.models, &extras)?;
     }
 
+    // `--defer`: rewrite the selected model's exact upstream bindings before
+    // deciding which compile diagnostics apply to this execution. The governed
+    // fingerprint above intentionally covers the pre-rewrite project. This
+    // in-memory rewrite must succeed before E039 can be suppressed, and no
+    // warehouse write occurs before either step.
+    let externalized_defer_edges =
+        deferred_externalized_edges(&compile_result, model_name_filter, defer_opts.enabled);
+    if defer_opts.enabled {
+        apply_defer_rewrite(
+            &mut compile_result,
+            model_name_filter,
+            defer_opts,
+            warehouse.dialect(),
+        )?;
+    }
+    suppress_deferred_selected_e039(&mut compile_result, model_name_filter, defer_opts.enabled);
+
+    let compile_failed_models: BTreeSet<String> = compile_result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.is_error())
+        .map(|diagnostic| diagnostic.model.clone())
+        .collect();
+    let compile_blocked_models = compile_error_descendant_blocks(
+        &compile_result.project.dag_nodes,
+        &compile_failed_models,
+        &externalized_defer_edges,
+    );
+    let mut compile_excluded_models = compile_failed_models.clone();
+    compile_excluded_models.extend(compile_blocked_models.keys().cloned());
+
+    // Freeze fence after execution-only defer rewriting but before the first
+    // warehouse write. It sees the exact selected, compilable, unblocked set
+    // that the layer loop can execute.
+    if let Some(gate) = exec_fp_gate
+        && let Some(fence) = freeze_fence
+        && let Some(msg) = fence
+            .check_withhold(
+                compile_result
+                    .project
+                    .models
+                    .iter()
+                    .map(|model| model.config.name.as_str())
+                    .filter(|name| model_name_filter.is_none_or(|target| target == *name))
+                    .filter(|name| model_set.is_none_or(|set| set.contains(*name)))
+                    .filter(|name| !compile_excluded_models.contains(*name)),
+            )
+            .await
+    {
+        warn!(
+            plan_id = gate.plan_id.as_str(),
+            "freeze fence hit before execution"
+        );
+        output.tables_failed += 1;
+        output.errors.push(crate::output::TableErrorOutput {
+            asset_key: vec!["<freeze>".to_string()],
+            error: msg,
+            failure_kind: crate::output::FailureKind::Unknown,
+            cooldown_seconds: None,
+        });
+        return Ok(GovernanceSnapshot::default());
+    }
+
     // Per-model compile errors are first-class run failures, not silent
     // skips. Each model that fails to type-check (e.g. E020 — a
     // `time_interval` model whose `time_column` is absent from its SELECT
@@ -10035,10 +10205,8 @@ pub(crate) async fn execute_models(
     //     `DagExecutor` then skipped the healthy descendants of nodes that had
     //     actually materialized successfully. The broken model's OWN node
     //     still reports it, which is where it belongs.
-    let mut compile_failed_models: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
     if compile_result.has_errors {
-        let mut reported: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        let mut reported: BTreeSet<&str> = BTreeSet::new();
         for d in &compile_result.diagnostics {
             if d.is_error() {
                 warn!(
@@ -10047,8 +10215,6 @@ pub(crate) async fn execute_models(
                     message = &*d.message,
                     "compile error"
                 );
-                compile_failed_models.insert(d.model.clone());
-
                 let in_scope = model_name_filter.is_none_or(|selected| selected == d.model)
                     && model_set.is_none_or(|set| set.contains(d.model.as_str()));
                 if !in_scope {
@@ -10075,19 +10241,38 @@ pub(crate) async fn execute_models(
         );
     }
 
-    // `--defer`: rewrite the selected models' bare upstream `ref()`s to point
-    // at the defer target (production) for every model NOT in the selection.
-    // Lineage was already computed during compile, so mutating `.sql` now is
-    // safe — it only affects the SQL fed to `to_model_ir()` downstream. A
-    // no-op when `--defer` is off, when there's no `--model` selection, or
-    // when the selected models reference no deferred upstreams.
-    if defer_opts.enabled {
-        apply_defer_rewrite(
-            &mut compile_result,
-            model_name_filter,
-            defer_opts,
-            warehouse.dialect(),
-        )?;
+    let mut blocked_in_scope = Vec::new();
+    for (model, blocked_by) in &compile_blocked_models {
+        let in_scope = model_name_filter.is_none_or(|selected| selected == model)
+            && model_set.is_none_or(|set| set.contains(model));
+        if !in_scope {
+            continue;
+        }
+        blocked_in_scope.push((model, blocked_by));
+        output.contained.push(crate::output::ContainedModelOutput {
+            model: model.clone(),
+            blocked_by: blocked_by.clone(),
+            unblock_hint: super::containment::unblock_hint(blocked_by, false),
+        });
+    }
+    let root_error_in_scope = compile_result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.is_error()
+            && model_name_filter.is_none_or(|selected| selected == diagnostic.model)
+            && model_set.is_none_or(|set| set.contains(diagnostic.model.as_str()))
+    });
+    if !root_error_in_scope {
+        for (model, blocked_by) in blocked_in_scope {
+            output.tables_failed += 1;
+            output.errors.push(crate::output::TableErrorOutput {
+                asset_key: vec![model.clone()],
+                error: format!(
+                    "model '{model}' was withheld because upstream compile failure(s) affect: {}",
+                    blocked_by.join(", ")
+                ),
+                failure_kind: crate::output::FailureKind::CompileError,
+                cooldown_seconds: None,
+            });
+        }
     }
 
     // Shadow objects this run derived, in selection order. Empty on every
@@ -10249,7 +10434,7 @@ pub(crate) async fn execute_models(
             &compile_result.project.models,
             model_name_filter,
             model_set,
-            &compile_failed_models,
+            &compile_excluded_models,
         );
         for (catalog, schema) in &targets {
             if let Some(sql_result) = dialect.create_schema_sql(catalog, schema) {
@@ -10326,7 +10511,19 @@ pub(crate) async fn execute_models(
             .collect();
         for model in &compile_result.project.models {
             let name = model.config.name.as_str();
-            let ref_deps = dep_by_model.get(name).copied().unwrap_or(&[]);
+            let declared_ref_deps = dep_by_model.get(name).copied().unwrap_or(&[]);
+            let externalized = externalized_defer_edges.get(name);
+            let filtered_ref_deps: Vec<String>;
+            let ref_deps = if let Some(externalized) = externalized {
+                filtered_ref_deps = declared_ref_deps
+                    .iter()
+                    .filter(|dependency| !externalized.contains(*dependency))
+                    .cloned()
+                    .collect();
+                filtered_ref_deps.as_slice()
+            } else {
+                declared_ref_deps
+            };
             // Enumerate physical reads only when the read set is provably
             // complete; otherwise the model fails closed (`reads_complete =
             // false`), so it is withheld once a failure has occurred.
@@ -10337,6 +10534,15 @@ pub(crate) async fn execute_models(
                             l.source_tables
                                 .iter()
                                 .map(|t| t.name.to_lowercase())
+                                .filter(|read| {
+                                    !externalized.is_some_and(|externalized| {
+                                        matches!(
+                                            producers.resolve(read),
+                                            super::containment::ReadResolution::Edges(ref models)
+                                                if models.iter().all(|model| externalized.contains(model))
+                                        )
+                                    })
+                                })
                                 .collect(),
                             true,
                         ),
@@ -10441,7 +10647,7 @@ pub(crate) async fn execute_models(
                             model_name_filter.is_none_or(|target| target == name.as_str())
                         })
                         .filter(|name| model_set.is_none_or(|set| set.contains(name.as_str())))
-                        .filter(|name| !compile_failed_models.contains(name.as_str()))
+                        .filter(|name| !compile_excluded_models.contains(name.as_str()))
                         .map(String::as_str),
                 )
                 .await
@@ -10465,11 +10671,10 @@ pub(crate) async fn execute_models(
             // Supervised-backfill scope: restrict the build to the affected
             // closure. `None` (every non-backfill run) imposes no restriction.
             .filter(|name| model_set.is_none_or(|set| set.contains(name.as_str())))
-            // Exclude models that failed to compile — they're already
-            // recorded as failures in `output.errors` above. A downstream
-            // model that `ref()`s an excluded one will fail at execution
-            // (missing table) and surface through the normal error path.
-            .filter(|name| !compile_failed_models.contains(name.as_str()))
+            // Exclude compile failures and their declared-DAG descendants.
+            // Descendants keep any existing target untouched instead of
+            // rebuilding from a failed producer's stale output.
+            .filter(|name| !compile_excluded_models.contains(name.as_str()))
             .filter_map(|name| compile_result.project.model(name).map(|m| (name, m)))
             .enumerate()
             .map(|(idx, (name, model))| (idx, name, model))
@@ -14741,6 +14946,48 @@ fn post_copy_column_match(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn compile_error_blocks_declared_descendants_but_not_disjoint_or_deferred_selection() {
+        let dag = vec![
+            rocky_ir::DagNode {
+                name: "failed".into(),
+                depends_on: vec![],
+            },
+            rocky_ir::DagNode {
+                name: "child".into(),
+                depends_on: vec!["failed".into()],
+            },
+            rocky_ir::DagNode {
+                name: "grandchild".into(),
+                depends_on: vec!["child".into()],
+            },
+            rocky_ir::DagNode {
+                name: "healthy".into(),
+                depends_on: vec![],
+            },
+        ];
+        let failed = std::collections::BTreeSet::from(["failed".to_string()]);
+
+        let blocked = super::compile_error_descendant_blocks(
+            &dag,
+            &failed,
+            &std::collections::BTreeMap::new(),
+        );
+        assert_eq!(blocked.get("child"), Some(&vec!["failed".to_string()]));
+        assert_eq!(blocked.get("grandchild"), Some(&vec!["child".to_string()]));
+        assert!(!blocked.contains_key("healthy"));
+
+        let deferred_edges = std::collections::BTreeMap::from([(
+            "child".to_string(),
+            std::collections::BTreeSet::from(["failed".to_string()]),
+        )]);
+        let deferred = super::compile_error_descendant_blocks(&dag, &failed, &deferred_edges);
+        assert!(
+            deferred.is_empty(),
+            "the selected model's rewritten external input is not a local poisoned edge"
+        );
+    }
 
     /// Both drift reasons read from the type the table HAS to the type
     /// upstream now reports. The drop-and-recreate reason used to print the
@@ -30407,16 +30654,523 @@ auto_create_schemas = true
         );
     }
 
-    /// #1990 end to end through `execute_models`: an `incremental`
-    /// transformation model fails compile with E037 and is excluded from the
-    /// run, which records it as a failed table. It never loads, so the
-    /// duplication it caused cannot recur.
-    ///
-    /// Its dependent follows the existing compile-error policy (#1291), which
-    /// excludes only the failing model; downstream containment is opt-in. So
-    /// the dependent fails when the upstream table was never created, and
-    /// builds from the old table when one exists. This pins that policy for
-    /// E037 on purpose: changing it should be a deliberate edit here.
+    /// E039's production run path refreshes independent models but never lets
+    /// a declared descendant rebuild from the failed model's retained table.
+    /// Both the default path and opt-in physical-read containment preserve the
+    /// same declared-DAG boundary.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn an_e039_model_withholds_stale_descendants_and_runs_disjoint_models() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        for contain_failures in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).unwrap();
+            let db = tmp.path().join("e039.duckdb");
+            let state = StateStore::open(&tmp.path().join("state")).unwrap();
+            {
+                let warehouse = DuckDbWarehouseAdapter::open(&db).unwrap();
+                warehouse
+                    .execute_statement("CREATE SCHEMA IF NOT EXISTS main")
+                    .await
+                    .unwrap();
+                warehouse
+                    .execute_statement(
+                        "CREATE TABLE main.raw_orders AS SELECT * FROM \
+                         (VALUES (1, 12), (2, 20)) AS t(order_id, amount)",
+                    )
+                    .await
+                    .unwrap();
+                warehouse
+                    .execute_statement(
+                        "CREATE TABLE main.consumer AS SELECT order_id, amount \
+                         FROM main.raw_orders",
+                    )
+                    .await
+                    .unwrap();
+                warehouse
+                    .execute_statement(
+                        "CREATE TABLE main.descendant AS SELECT order_id, amount, \
+                         'initial' AS marker FROM main.consumer",
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            write_plain_model(
+                &models_dir,
+                "upstream",
+                "SELECT order_id, amount AS order_amount FROM main.raw_orders",
+            );
+            write_plain_model(
+                &models_dir,
+                "consumer",
+                "SELECT order_id, amount FROM upstream",
+            );
+            std::fs::write(
+                models_dir.join("consumer.toml"),
+                "depends_on = [\"upstream\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\n",
+            )
+            .unwrap();
+            write_plain_model(
+                &models_dir,
+                "descendant",
+                "SELECT order_id, amount, 'broken' AS marker FROM consumer",
+            );
+            std::fs::write(
+                models_dir.join("descendant.toml"),
+                "depends_on = [\"consumer\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\n",
+            )
+            .unwrap();
+            write_plain_model(&models_dir, "healthy", "SELECT 42 AS value");
+
+            let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+            let mut output = RunOutput::new(String::new(), 0, 1);
+            let result = super::execute_models(
+                &models_dir,
+                None,
+                &adapter as &dyn WarehouseAdapter,
+                Some(&state),
+                &PartitionRunOptions::default(),
+                "run-e039",
+                None,
+                None,
+                &mut output,
+                None,
+                None,
+                &rocky_core::config::SchemaCacheConfig::default(),
+                false,
+                None,
+                &DeferOptions::default(),
+                SkipGateConfig {
+                    feature_enabled: false,
+                    force_rebuild: false,
+                    rowcount_fallback: false,
+                    lag_tolerance_seconds: 0,
+                    shadow_or_branch: false,
+                },
+                false,
+                false,
+                &rocky_core::run_vars::RunVars::new(),
+                rocky_core::config::ResilienceConfig {
+                    contain_failures,
+                    ..Default::default()
+                },
+                false,
+                true,
+                None,
+                None,
+                false,
+            )
+            .await;
+            assert!(result.is_ok(), "healthy branches continue: {result:?}");
+            assert!(output.errors.iter().any(|error| {
+                error.asset_key == vec!["consumer".to_string()] && error.error.contains("[E039]")
+            }));
+            assert_eq!(
+                output
+                    .contained
+                    .iter()
+                    .map(|model| model.model.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["descendant"]
+            );
+            let materialized: std::collections::BTreeSet<&str> = output
+                .materializations
+                .iter()
+                .filter_map(|item| item.asset_key.last().map(String::as_str))
+                .collect();
+            assert!(materialized.contains("upstream"));
+            assert!(materialized.contains("healthy"));
+            assert!(!materialized.contains("consumer"));
+            assert!(!materialized.contains("descendant"));
+
+            let stale = adapter
+                .execute_query("SELECT DISTINCT marker FROM main.descendant")
+                .await
+                .unwrap();
+            assert_eq!(stale.rows[0][0].as_str(), Some("initial"));
+            let upstream = adapter
+                .execute_query(
+                    "SELECT column_name FROM information_schema.columns \
+                     WHERE table_schema = 'main' AND table_name = 'upstream' ORDER BY ordinal_position",
+                )
+                .await
+                .unwrap();
+            assert_eq!(upstream.rows[1][0].as_str(), Some("order_amount"));
+
+            let descendant_only = BTreeSet::from(["descendant".to_string()]);
+            let mut blocked_output = RunOutput::new(String::new(), 0, 1);
+            let blocked = super::execute_models(
+                &models_dir,
+                None,
+                &adapter as &dyn WarehouseAdapter,
+                Some(&state),
+                &PartitionRunOptions::default(),
+                "run-e039-descendant-only",
+                None,
+                Some(&descendant_only),
+                &mut blocked_output,
+                None,
+                None,
+                &rocky_core::config::SchemaCacheConfig::default(),
+                false,
+                None,
+                &DeferOptions::default(),
+                SkipGateConfig {
+                    feature_enabled: false,
+                    force_rebuild: false,
+                    rowcount_fallback: false,
+                    lag_tolerance_seconds: 0,
+                    shadow_or_branch: false,
+                },
+                false,
+                false,
+                &rocky_core::run_vars::RunVars::new(),
+                rocky_core::config::ResilienceConfig {
+                    contain_failures,
+                    ..Default::default()
+                },
+                false,
+                true,
+                None,
+                None,
+                false,
+            )
+            .await;
+            assert!(blocked.is_ok(), "the scoped refusal is carried in output");
+            assert_eq!(blocked_output.tables_failed, 1);
+            assert_eq!(
+                blocked_output
+                    .contained
+                    .iter()
+                    .map(|model| model.model.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["descendant"]
+            );
+            assert!(blocked_output.materializations.is_empty());
+            assert!(blocked_output.errors.iter().any(|error| {
+                error.asset_key == vec!["descendant".to_string()]
+                    && error.error.contains("upstream compile failure")
+            }));
+
+            let healthy_only = BTreeSet::from(["healthy".to_string()]);
+            let mut healthy_output = RunOutput::new(String::new(), 0, 1);
+            let healthy = super::execute_models(
+                &models_dir,
+                None,
+                &adapter as &dyn WarehouseAdapter,
+                Some(&state),
+                &PartitionRunOptions::default(),
+                "run-e039-healthy-only",
+                None,
+                Some(&healthy_only),
+                &mut healthy_output,
+                None,
+                None,
+                &rocky_core::config::SchemaCacheConfig::default(),
+                false,
+                None,
+                &DeferOptions::default(),
+                SkipGateConfig {
+                    feature_enabled: false,
+                    force_rebuild: false,
+                    rowcount_fallback: false,
+                    lag_tolerance_seconds: 0,
+                    shadow_or_branch: false,
+                },
+                false,
+                false,
+                &rocky_core::run_vars::RunVars::new(),
+                rocky_core::config::ResilienceConfig {
+                    contain_failures,
+                    ..Default::default()
+                },
+                false,
+                true,
+                None,
+                None,
+                false,
+            )
+            .await;
+            assert!(healthy.is_ok());
+            assert_eq!(healthy_output.tables_failed, 0);
+            assert!(healthy_output.errors.is_empty());
+            assert!(healthy_output.contained.is_empty());
+            assert_eq!(healthy_output.materializations.len(), 1);
+            assert_eq!(
+                healthy_output.materializations[0]
+                    .asset_key
+                    .last()
+                    .map(String::as_str),
+                Some("healthy")
+            );
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn defer_externalizes_the_selected_models_e039_binding() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        for contain_failures in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).unwrap();
+            let db = tmp.path().join("defer-e039.duckdb");
+            let state = StateStore::open(&tmp.path().join("state")).unwrap();
+            {
+                let warehouse = DuckDbWarehouseAdapter::open(&db).unwrap();
+                warehouse
+                    .execute_statement("CREATE SCHEMA prod")
+                    .await
+                    .unwrap();
+                warehouse
+                    .execute_statement(
+                        "CREATE TABLE main.raw_orders AS SELECT 1 AS order_id, 12 AS amount; \
+                         CREATE TABLE main.upstream AS \
+                         SELECT order_id, amount AS order_amount FROM main.raw_orders; \
+                         CREATE TABLE prod.upstream AS SELECT 1 AS order_id, 99 AS amount",
+                    )
+                    .await
+                    .unwrap();
+            }
+            write_plain_model(
+                &models_dir,
+                "upstream",
+                "SELECT order_id, amount AS order_amount FROM main.raw_orders",
+            );
+            write_plain_model(
+                &models_dir,
+                "consumer",
+                "SELECT order_id, amount FROM \"upstream\"",
+            );
+            std::fs::write(
+                models_dir.join("consumer.toml"),
+                "depends_on = [\"upstream\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\n",
+            )
+            .unwrap();
+            write_plain_model(
+                &models_dir,
+                "down_explicit",
+                "SELECT order_id, amount FROM main.consumer",
+            );
+            std::fs::write(
+                models_dir.join("down_explicit.toml"),
+                "depends_on = [\"consumer\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\n",
+            )
+            .unwrap();
+            write_plain_model(
+                &models_dir,
+                "down_mixed",
+                "SELECT bare.order_id, bare.amount FROM consumer AS bare \
+                 JOIN main.consumer AS qualified USING (order_id)",
+            );
+            std::fs::write(
+                models_dir.join("down_mixed.toml"),
+                "depends_on = [\"consumer\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\n",
+            )
+            .unwrap();
+
+            let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+            let mut output = RunOutput::new(String::new(), 0, 1);
+            let result = super::execute_models(
+                &models_dir,
+                None,
+                &adapter as &dyn WarehouseAdapter,
+                Some(&state),
+                &PartitionRunOptions::default(),
+                "run-e039-defer",
+                Some("consumer"),
+                None,
+                &mut output,
+                None,
+                None,
+                &rocky_core::config::SchemaCacheConfig::default(),
+                false,
+                None,
+                &DeferOptions {
+                    enabled: true,
+                    defer_to: Some("prod".to_string()),
+                },
+                SkipGateConfig {
+                    feature_enabled: false,
+                    force_rebuild: false,
+                    rowcount_fallback: false,
+                    lag_tolerance_seconds: 0,
+                    shadow_or_branch: false,
+                },
+                false,
+                false,
+                &rocky_core::run_vars::RunVars::new(),
+                rocky_core::config::ResilienceConfig {
+                    contain_failures,
+                    ..Default::default()
+                },
+                false,
+                true,
+                None,
+                None,
+                false,
+            )
+            .await;
+            assert!(
+                result.is_ok(),
+                "deferred production input is valid: {result:?}"
+            );
+            assert!(
+                output.errors.is_empty(),
+                "local E039 does not apply: {output:?}"
+            );
+            assert!(output.contained.is_empty());
+            assert_eq!(output.materializations.len(), 1);
+            assert_eq!(
+                output.materializations[0]
+                    .asset_key
+                    .last()
+                    .map(String::as_str),
+                Some("consumer")
+            );
+            let rows = adapter
+                .execute_query("SELECT amount FROM main.consumer")
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.rows[0][0].as_str(),
+                Some("99"),
+                "the selected model must read prod.upstream, not stale main.upstream"
+            );
+
+            for selected in ["down_explicit", "down_mixed"] {
+                let mut blocked_output = RunOutput::new(String::new(), 0, 1);
+                let blocked = super::execute_models(
+                    &models_dir,
+                    None,
+                    &adapter as &dyn WarehouseAdapter,
+                    Some(&state),
+                    &PartitionRunOptions::default(),
+                    "run-e039-defer-local-edge",
+                    Some(selected),
+                    None,
+                    &mut blocked_output,
+                    None,
+                    None,
+                    &rocky_core::config::SchemaCacheConfig::default(),
+                    false,
+                    None,
+                    &DeferOptions {
+                        enabled: true,
+                        defer_to: Some("prod".to_string()),
+                    },
+                    SkipGateConfig {
+                        feature_enabled: false,
+                        force_rebuild: false,
+                        rowcount_fallback: false,
+                        lag_tolerance_seconds: 0,
+                        shadow_or_branch: false,
+                    },
+                    false,
+                    false,
+                    &rocky_core::run_vars::RunVars::new(),
+                    rocky_core::config::ResilienceConfig {
+                        contain_failures,
+                        ..Default::default()
+                    },
+                    false,
+                    true,
+                    None,
+                    None,
+                    false,
+                )
+                .await;
+                assert!(blocked.is_ok(), "the scoped refusal is carried in output");
+                assert_eq!(blocked_output.tables_failed, 1);
+                assert_eq!(
+                    blocked_output
+                        .contained
+                        .iter()
+                        .map(|model| model.model.as_str())
+                        .collect::<Vec<_>>(),
+                    vec![selected]
+                );
+                assert!(blocked_output.materializations.is_empty());
+                assert!(blocked_output.errors.iter().any(|error| {
+                    error.asset_key == vec![selected.to_string()]
+                        && error.error.contains("upstream compile failure")
+                }));
+            }
+
+            adapter
+                .execute_statement(
+                    "DROP TABLE main.consumer; DROP TABLE prod.upstream; \
+                     CREATE TABLE prod.upstream AS SELECT 1 AS order_id, 99 AS order_amount",
+                )
+                .await
+                .unwrap();
+            let mut invalid_output = RunOutput::new(String::new(), 0, 1);
+            let invalid = super::execute_models(
+                &models_dir,
+                None,
+                &adapter as &dyn WarehouseAdapter,
+                Some(&state),
+                &PartitionRunOptions::default(),
+                "run-e039-defer-invalid-prod",
+                Some("consumer"),
+                None,
+                &mut invalid_output,
+                None,
+                None,
+                &rocky_core::config::SchemaCacheConfig::default(),
+                false,
+                None,
+                &DeferOptions {
+                    enabled: true,
+                    defer_to: Some("prod".to_string()),
+                },
+                SkipGateConfig {
+                    feature_enabled: false,
+                    force_rebuild: false,
+                    rowcount_fallback: false,
+                    lag_tolerance_seconds: 0,
+                    shadow_or_branch: false,
+                },
+                false,
+                false,
+                &rocky_core::run_vars::RunVars::new(),
+                rocky_core::config::ResilienceConfig {
+                    contain_failures,
+                    ..Default::default()
+                },
+                false,
+                true,
+                None,
+                None,
+                false,
+            )
+            .await;
+            assert!(
+                invalid.is_err() || invalid_output.tables_failed > 0,
+                "a missing production column must remain a failed run"
+            );
+            assert!(
+                invalid_output
+                    .errors
+                    .iter()
+                    .all(|error| !error.error.contains("[E039]")),
+                "the external warehouse, not the local schema, decides this failure"
+            );
+            assert!(invalid_output.materializations.is_empty());
+        }
+    }
+
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn an_e037_model_is_excluded_from_run_and_its_dependent_follows_policy() {
@@ -30537,40 +31291,36 @@ auto_create_schemas = true
                 "{case}: `up` must not materialize"
             );
 
+            assert!(
+                res.is_ok(),
+                "the compile failure is carried in output while disjoint work may continue: {:?}",
+                res.as_ref().err()
+            );
+            assert_eq!(
+                output
+                    .contained
+                    .iter()
+                    .map(|model| model.model.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["down"]
+            );
+            assert!(
+                !output
+                    .materializations
+                    .iter()
+                    .any(|m| m.asset_key.last().map(String::as_str) == Some("down")),
+                "the dependent must never build from a retained or missing failed output"
+            );
+            let verify = DuckDbWarehouseAdapter::open(&db).unwrap();
+            assert!(!table_exists(&verify, "down").await);
             if upstream_exists {
-                assert!(
-                    res.is_ok(),
-                    "with an old upstream table the run completes: {:?}",
-                    res.as_ref().err()
-                );
                 assert_eq!(
                     count_rows(&db, "up").await,
                     1,
                     "the old `up` table is untouched: no bootstrap, no append"
                 );
-                assert_eq!(
-                    count_rows(&db, "down").await,
-                    1,
-                    "policy (#1291): the dependent builds from the old upstream table"
-                );
             } else {
-                // The dependent fails for the right reason: the excluded model
-                // never created its table. Not silently skipped, not aborted early.
-                let err = format!(
-                    "{:#}",
-                    res.expect_err("with no upstream table the dependent must fail the run")
-                );
-                assert!(
-                    err.contains("model 'down' failed") && err.contains("does not exist"),
-                    "the failure names `down` and the missing upstream table: {err}"
-                );
-                assert!(
-                    !output
-                        .materializations
-                        .iter()
-                        .any(|m| m.asset_key.last().map(String::as_str) == Some("down")),
-                    "with no upstream table the dependent cannot build"
-                );
+                assert!(!table_exists(&verify, "up").await);
             }
         }
     }
@@ -30579,16 +31329,11 @@ auto_create_schemas = true
     /// compile with E038 and is excluded from the run, which records it as a
     /// failed table. It writes nothing, so nothing reads its rows by accident.
     ///
-    /// Its dependent follows the same compile-error policy (#1291) that E037
-    /// follows above: only the failing model is excluded, downstream
-    /// containment is opt-in. The ephemeral case differs in one way worth
-    /// naming — a table carrying the model's name was never written by the
-    /// model, because an ephemeral model never wrote one. So the dependent
-    /// that builds is reading an unrelated table. The run still fails
-    /// (`tables_failed >= 1`, never `Success`), which is what changed: before
-    /// E038 the same read happened with no diagnostic at all. This pins the
-    /// policy for E038 on purpose: changing it should be a deliberate edit
-    /// here, and it is tracked as its own decision.
+    /// Its declared dependent follows the same compile-error policy as E037:
+    /// the failing model and its declared descendants are withheld even when
+    /// an old table carries the failed model's name. The ephemeral case makes
+    /// the stale-read risk especially visible because the model itself never
+    /// writes that table.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn an_e038_model_is_excluded_from_run_and_its_dependent_follows_policy() {
@@ -30710,53 +31455,43 @@ auto_create_schemas = true
                 "{case}: `up` must not materialize"
             );
 
+            assert!(
+                res.is_ok(),
+                "the compile failure is carried in output while disjoint work may continue: {:?}",
+                res.as_ref().err()
+            );
+            assert_eq!(
+                output
+                    .contained
+                    .iter()
+                    .map(|model| model.model.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["down"]
+            );
+            assert!(
+                !output
+                    .materializations
+                    .iter()
+                    .any(|m| m.asset_key.last().map(String::as_str) == Some("down")),
+                "the dependent must never build from a retained or missing failed output"
+            );
+            let verify = DuckDbWarehouseAdapter::open(&db).unwrap();
+            assert!(!table_exists(&verify, "down").await);
             if upstream_exists {
-                assert!(
-                    res.is_ok(),
-                    "with an old upstream table the run completes: {:?}",
-                    res.as_ref().err()
-                );
                 assert_eq!(
                     count_rows(&db, "up").await,
                     1,
                     "the table that carries the name is untouched"
                 );
-                assert_eq!(
-                    count_rows(&db, "down").await,
-                    1,
-                    "policy (#1291): the dependent builds from whatever table \
-                     carries the name, and the run fails"
-                );
             } else {
-                // The dependent fails for the right reason: the excluded model
-                // never created its table. Not silently skipped, not aborted early.
-                let err = format!(
-                    "{:#}",
-                    res.expect_err("with no upstream table the dependent must fail the run")
-                );
-                assert!(
-                    err.contains("model 'down' failed") && err.contains("does not exist"),
-                    "the failure names `down` and the missing upstream table: {err}"
-                );
-                assert!(
-                    !output
-                        .materializations
-                        .iter()
-                        .any(|m| m.asset_key.last().map(String::as_str) == Some("down")),
-                    "with no upstream table the dependent cannot build"
-                );
+                assert!(!table_exists(&verify, "up").await);
             }
         }
     }
 
-    /// The containment knob already covers a refused strategy: with
-    /// `[resilience] contain_failures = true`, the E038 model's descendants
-    /// are withheld instead of building from whatever table carries the name.
-    ///
-    /// `run.rs` seeds the containment ledger's poison set from
-    /// `compile_failed_models`, so a compile-error exclusion poisons its
-    /// closure exactly as a runtime failure does. The knob defaults to
-    /// `false`, which is the case the test above pins.
+    /// Opt-in containment preserves the same declared compile-error boundary
+    /// while continuing disjoint work. Its ledger additionally covers physical
+    /// reads and unknown read sets.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn containment_withholds_the_dependent_of_an_e038_model() {

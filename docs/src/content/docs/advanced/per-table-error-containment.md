@@ -88,7 +88,7 @@ The loop is agnostic to the [adapter](/reference/glossary/#adapter), the plugin 
 | `transient` | Retry-worthy failure -- 5xx, network glitch, statement aborted by a transient warehouse condition, statement timeout, circuit-breaker open. | Yes. |
 | `quota-exceeded` | Rate limit hit or a configured cap reached -- 429, retry-budget exhaustion, account-level quota. | Yes, with extended backoff and an alert. |
 | `not-found` | Requested catalog / schema / table not present -- 404 from the warehouse, often an upstream rename. | No. Re-discovery or human triage needed. |
-| `compile-error` | The model failed to compile during the run -- a type error, unresolved reference, or other `Error`-severity diagnostic surfaced while building this model. No warehouse call was attempted. The diagnostic is carried in `error`. | No. Fix the model SQL or its upstream; re-running won't help. |
+| `compile-error` | The selected model has an `Error`-severity compile diagnostic, or Rocky withheld it after an upstream compile error. Rocky makes no warehouse call for it. Its declared descendants are withheld and listed in `contained[]`. Healthy branches can still run. Targets of failed or withheld models stay unchanged. The diagnostic or block reason is in `error`. | No. Fix the model SQL or its upstream; re-running without a change will not help. |
 | `unknown` | The failure could not be classified -- e.g. errors raised outside the connector layer that reach the output struct type-erased. | Depends. Surface the raw `error` string. |
 
 The classifier walks the `anyhow::Error` chain on each per-table failure. It downcasts to `AdapterError`, then probes `.inner()` for the typed connector enum.

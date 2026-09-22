@@ -146,7 +146,7 @@ export interface RunOutput {
   check_results: TableCheckOutput[];
   command: string;
   /**
-   * Models withheld this run because an upstream failed (or was itself withheld) and `[resilience] contain_failures` continued the disjoint subgraphs — the blast radius of the failures named in `errors[]`. Empty (and omitted) for a run that did not withhold anything: the default fail-fast run, and any successful run, record nothing here.
+   * Models withheld this run after an upstream compile failure, or while `[resilience] contain_failures` continues disjoint subgraphs after a runtime failure. This is the blast radius of failures in `errors[]`. Empty (and omitted) when no model was withheld.
    */
   contained?: ContainedModelOutput[];
   /**
