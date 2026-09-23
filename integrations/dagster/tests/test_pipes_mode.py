@@ -688,24 +688,29 @@ def test_run_filters_pipes_converts_drift_check_to_observation():
 # baseline runs so the incident capture includes a DETECTED anomaly (mixed
 # int/float/string metadata), not just an evaluated-clean verdict.
 #
-# fixtures_generated/pipes_wire/lane_incident.jsonl — captured with:
+# tests/fixtures/pipes_wire/lane_incident.jsonl — captured with:
 #   dg.materialize([events], resources={"rocky": RockyResource(binary_path=<engine binary>, ...)})
 #   where `events` yields `rocky.run_pipes(context, filter="source=events",
 #   pipes_client=dg.PipesSubprocessClient(
 #       message_reader=dg.PipesFileMessageReader(path=<fixed path>, cleanup_file=False)
 #   )).get_results()`
-# against engine commit 6e0fb6b2 (both the #2159 metadata-wrap fix and the
-# #2163 zlib-decode fix; the decode fix only affects the env-var bootstrap,
-# not the message-file content this test reads).
+# against engine commit 7f2e15ad (the #2159 metadata-wrap
+# fix, the #2163 zlib-decode fix, and the #2166 `opened`/`closed` fix —
+# the first line is now `opened`, matching a real launch exactly).
 #
-# fixtures_generated/pipes_wire/bare_incident.jsonl — captured the identical
+# tests/fixtures/pipes_wire/bare_incident.jsonl — captured the identical
 # way, but with a temporary, never-committed edit on top of the same commit
 # reverting both `wrap_metadata(metadata)` call sites in
 # `engine/crates/rocky-cli/src/pipes.rs` to bare `metadata` (the pre-#2159
 # wire shape) — i.e. what every real Pipes run sent before this PR.
+#
+# Not under `fixtures_generated/`: that tree is what `just regen-fixtures`
+# owns and the codegen-drift gate diffs; these two are hand-captured and
+# would be invisible to both, or worse, silently clobbered by the next
+# `regen-fixtures` run. `tests/fixtures/` is a plain, non-generated home.
 # ---------------------------------------------------------------------------
 
-_PIPES_WIRE_FIXTURES = Path(__file__).parent / "fixtures_generated" / "pipes_wire"
+_PIPES_WIRE_FIXTURES = Path(__file__).parent / "fixtures" / "pipes_wire"
 
 
 def _load_wire_capture(name: str) -> list[dict]:
@@ -771,3 +776,28 @@ def test_real_handler_raises_typeerror_on_the_pre_fix_bare_wire_shape():
     with pytest.raises(TypeError, match="not subscriptable"):
         for message in _load_wire_capture("bare_incident.jsonl"):
             proxy.handle_message(message)
+
+
+def test_real_handler_marks_received_opened_message_after_a_real_stream():
+    """#2166: before the engine sent `opened` as the first wire line, Dagster's
+    real handler tracked `received_opened_message = False` for the entire
+    session -- true even on a run that decoded every later message cleanly
+    (`test_real_handler_decodes_the_wrapped_wire_shape_with_no_framework_exception`
+    above). That flag, not "did we get any message at all", is exactly what
+    gates the "[pipes] did not receive any messages from external process"
+    warning (`dagster/_core/pipes/utils.py`, guarding
+    `open_dagster_pipes_session`'s `finally` block): it fired on every real
+    Pipes run before this fix, success or failure alike. Feeding the
+    `lane_incident.jsonl` capture (which now starts with `opened`) through the
+    real handler and checking the flag directly is the precise, non-circular
+    way to prove that warning can no longer fire -- reproducing the warning's
+    own log-output text would only prove a string didn't appear, not why."""
+    handler = _real_handler()
+    proxy = _PipesHandlerProxy(handler, asset_key_fn=None, include_keys=None)
+
+    assert handler.received_opened_message is False, "sanity: false before any message"
+
+    for message in _load_wire_capture("lane_incident.jsonl"):
+        proxy.handle_message(message)
+
+    assert handler.received_opened_message is True

@@ -432,7 +432,12 @@ fn wrap_metadata(metadata: &Value) -> Value {
     };
     let wrapped: serde_json::Map<String, Value> = map
         .iter()
-        .map(|(key, value)| (key.clone(), json!({"raw_value": value, "type": "__infer__"})))
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                json!({"raw_value": value, "type": "__infer__"}),
+            )
+        })
         .collect();
     Value::Object(wrapped)
 }

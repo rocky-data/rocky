@@ -324,7 +324,9 @@ impl SqlDialect for RecordingDialect {
 pub(crate) static PIPES_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 pub(crate) fn lock_pipes_env() -> std::sync::MutexGuard<'static, ()> {
-    PIPES_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    PIPES_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]

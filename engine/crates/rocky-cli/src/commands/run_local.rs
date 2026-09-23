@@ -3872,6 +3872,14 @@ auto_create_schemas = true
     /// this guard is about correctness under `cargo test`'s parallelism,
     /// not about that specific mutation), and returns the captured
     /// message stream.
+    // Holding a `std::sync::MutexGuard` across `f().await` is exactly the
+    // point: the lock must stay held for the WHOLE async operation under
+    // test, not just around the env-var writes, or a concurrent test could
+    // set the same env vars mid-run (the #2166 cross-test race this lock
+    // exists to prevent). Test-only code, not a `tokio::sync::Mutex`
+    // because `crate::testing::PIPES_ENV_LOCK` is shared with plain
+    // (non-async) `#[test]`s in `pipes.rs` / `run_audit.rs` too.
+    #[allow(clippy::await_holding_lock)]
     async fn run_with_pipes_capture<T, Fut: std::future::Future<Output = T>>(
         messages_path: &Path,
         f: impl FnOnce() -> Fut,
