@@ -336,11 +336,18 @@ fn newest_branch_and_base_runs(
         // Shorter refs resolve as branches first — branch names are
         // human-chosen and must not lose to a commit-prefix coincidence.
         if is_full_sha {
+            // A commit match must also be an ORDINARY run, not a
+            // `--branch`-scoped one: `.github/actions/rocky-preview` passes
+            // `--base <sha>` verbatim, and a `--branch`-scoped run recorded
+            // at that sha is not a valid stand-in for it any more than a
+            // `--branch`-scoped run on the named git branch was (see
+            // `by_branch` above) — same defect, different match key.
             let by_exact = store
                 .list_runs_matching(1, |r| {
                     r.git_commit
                         .as_deref()
                         .is_some_and(|c| c.eq_ignore_ascii_case(&base_lower))
+                        && r.rocky_branch.is_none()
                 })?
                 .into_iter()
                 .next();
@@ -375,11 +382,13 @@ fn newest_branch_and_base_runs(
         if let Some(run) = by_branch {
             return finish_named(branch_run, run, base_ref);
         }
+        // Same exclusion as `by_exact` above: an ordinary run only.
         let by_exact_commit = store
             .list_runs_matching(1, |r| {
                 r.git_commit
                     .as_deref()
                     .is_some_and(|c| c.eq_ignore_ascii_case(&base_lower))
+                    && r.rocky_branch.is_none()
             })?
             .into_iter()
             .next();
@@ -392,11 +401,17 @@ fn newest_branch_and_base_runs(
             // the same prefix. Two limit-1 scans — exhaustive over the whole
             // table (the store iterates it regardless) with O(1) kept rows,
             // so unbounded run retention cannot balloon this path.
+            // Same exclusion as `by_exact` above: an ordinary run only, on
+            // both the initial match and the uniqueness probe below — a
+            // `--branch`-scoped run at a second, distinct sha under this
+            // prefix must not manufacture a false ambiguity refusal for a
+            // prefix that names exactly one valid (ordinary) candidate.
             let first = store
                 .list_runs_matching(1, |r| {
                     r.git_commit
                         .as_deref()
                         .is_some_and(|c| c.to_ascii_lowercase().starts_with(&base_lower))
+                        && r.rocky_branch.is_none()
                 })?
                 .into_iter()
                 .next();
@@ -411,7 +426,7 @@ fn newest_branch_and_base_runs(
                         r.git_commit.as_deref().is_some_and(|c| {
                             let lower = c.to_ascii_lowercase();
                             lower.starts_with(&base_lower) && lower != first_sha
-                        })
+                        }) && r.rocky_branch.is_none()
                     })?
                     .into_iter()
                     .next();
@@ -2788,9 +2803,17 @@ mod tests {
         );
     }
 
-    /// A base sha that ALIASES the branch's own newest run refuses — the
-    /// string-inequality guard cannot see through a sha, so the selection
-    /// itself must.
+    /// A base sha that ALIASES the branch's own newest run refuses — not any
+    /// more through `finish_named`'s self-diff name (that guard cannot see
+    /// through a sha), but because the branch's own run is `--branch`-scoped
+    /// (`rocky_branch: Some(..)`) and every commit-matching arm now excludes
+    /// `--branch`-scoped runs from base candidacy outright (drain review of
+    /// #2158, finding 1). The only run recorded is the branch's own, so the
+    /// prefix resolves to "no run recorded" — the same wording an unrelated,
+    /// truly-absent commit would get. That is an acceptable, expected wording
+    /// change: a caller reading the message no longer learns it aliased the
+    /// branch specifically, but the outcome (refuse the self-diff) is
+    /// unchanged and the message still names the remedy.
     #[test]
     fn a_sha_alias_of_the_branch_run_refuses_self_comparison() {
         let dir = tempfile::tempdir().unwrap();
@@ -2809,9 +2832,56 @@ mod tests {
             newest_branch_and_base_runs(&store, "feature", Some("feedface")).unwrap();
         assert!(base_run.is_none(), "no self-diff through a sha alias");
         assert!(
-            note.unwrap().contains("branch's own newest run"),
-            "the alias must be named"
+            note.unwrap().contains("no run recorded for 'feedface'"),
+            "a --branch-scoped run is not a valid base candidate at all, so the alias reads \
+             as an absent commit, not a named self-diff"
         );
+    }
+
+    /// Drain review of #2158, finding 1 (second round): `.github/actions/rocky-preview`
+    /// passes `--base <sha>` verbatim, matching this shape — an ordinary
+    /// `rocky run` and a later `rocky run --branch scratch` from the SAME git
+    /// checkout record the SAME `git_commit` and differ only in
+    /// `rocky_branch`. The `--branch`-scoped run must not win the base slot
+    /// just for being newer, on either the full-sha or the ≥7-hex-prefix arm.
+    #[test]
+    fn a_commit_sha_base_excludes_a_branch_scoped_run_at_the_same_commit() {
+        let sha = "aaaabbbbccccddddeeeeffff0000111122223334";
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = chrono::Utc::now();
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut ordinary = sample_run("ordinary-commit-run", base);
+            ordinary.git_branch = Some("main".to_string());
+            ordinary.git_commit = Some(sha.to_string());
+            store.record_run(&ordinary).unwrap();
+            // Newer, same commit, but `--branch`-scoped — must not win.
+            let mut scoped = sample_run("scoped-scratch-run", base + chrono::Duration::minutes(1));
+            scoped.git_branch = Some("main".to_string());
+            scoped.git_commit = Some(sha.to_string());
+            scoped.rocky_branch = Some("scratch".to_string());
+            store.record_run(&scoped).unwrap();
+        }
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+
+        let (_b, by_full, note_full) =
+            newest_branch_and_base_runs(&store, "feature", Some(sha)).unwrap();
+        assert_eq!(
+            by_full.unwrap().run_id,
+            "ordinary-commit-run",
+            "full sha: a --branch-scoped run at the same commit must not become the base"
+        );
+        assert!(note_full.is_none());
+
+        let (_b, by_prefix, note_prefix) =
+            newest_branch_and_base_runs(&store, "feature", Some(&sha[..7])).unwrap();
+        assert_eq!(
+            by_prefix.unwrap().run_id,
+            "ordinary-commit-run",
+            "7-hex prefix: a --branch-scoped run at the same commit must not become the base"
+        );
+        assert!(note_prefix.is_none());
     }
 
     /// The production preview workflow passes the base COMMIT SHA — records

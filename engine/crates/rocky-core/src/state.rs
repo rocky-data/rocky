@@ -3384,13 +3384,10 @@ impl StateStore {
     /// the cap. A `started_at` bound is safe because it agrees with the
     /// ordering; nothing else is.
     ///
-    /// Two callers already do this and are wrong for it, both pre-existing:
-    /// `preview` scans the newest 50 for a run matching `git_branch`, so a
-    /// branch whose newest run is rank 51 reports as having none; and
-    /// [`Self::get_model_history`] filters `list_runs(100)` by model name, so
-    /// a model absent from the last 100 runs looks like it has no history.
-    /// Both need the predicate pushed into the scan rather than applied to
-    /// its result; tracked separately from the cost fix in #1304.
+    /// [`Self::get_model_history`] does this and is wrong for it, pre-existing:
+    /// it filters `list_runs(100)` by model name, so a model absent from the
+    /// last 100 runs looks like it has no history. It needs the predicate
+    /// pushed into the scan rather than applied to its result.
     pub fn list_runs(&self, limit: usize) -> Result<Vec<RunRecord>, StateError> {
         // Deliberately NOT `list_runs_matching(limit, |_| true)`. That variant
         // takes a predicate over a whole `RunRecord`, so it must decode a row

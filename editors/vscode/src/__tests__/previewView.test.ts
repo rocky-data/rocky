@@ -623,3 +623,51 @@ describe("PreviewDiffModelNode diffStatus heuristic", () => {
     expect(node.diffStatus).toBe("unchanged");
   });
 });
+
+// ---------------------------------------------------------------------------
+// PreviewDiffModelNode row-info rendering (drain review of #2158, finding 2)
+// ---------------------------------------------------------------------------
+
+describe("PreviewDiffModelNode row-info rendering", () => {
+  it("an unmeasured row delta shows '?' in the tree row instead of reading as unchanged", () => {
+    const model: import("../types/generated").PreviewModelDiff = {
+      model_name: "test",
+      structural: { added_columns: [], removed_columns: [], type_changes: [] },
+      algorithm: {
+        kind: "sampled",
+        // Unmeasured on both sides (#2032) with no structural change either
+        // — diffStatus alone reads "unchanged"; the row info must still say
+        // the delta is unmeasured, not silently agree with that verdict.
+        sampled: { rows_added: null, rows_changed: 0, rows_removed: null, samples: [] },
+        sampling_window: {
+          coverage: "not_yet_sampled",
+          coverage_warning: true,
+          limit: 0,
+          ordered_by: "",
+        },
+      },
+    };
+    const node = new PreviewDiffModelNode("br", model, "");
+    expect(node.diffStatus).toBe("unchanged");
+    expect(node.description).toContain("?");
+  });
+
+  it("buildDiffModelTooltip shows row counts, with '?' for an unmeasured side", () => {
+    const model: import("../types/generated").PreviewModelDiff = {
+      model_name: "orders",
+      structural: { added_columns: [], removed_columns: [], type_changes: [] },
+      algorithm: {
+        kind: "sampled",
+        sampled: { rows_added: null, rows_changed: 2, rows_removed: 5, samples: [] },
+        sampling_window: {
+          coverage: "not_yet_sampled",
+          coverage_warning: true,
+          limit: 0,
+          ordered_by: "",
+        },
+      },
+    };
+    const node = new PreviewDiffModelNode("br", model, "");
+    expect(node.tooltip).toContain("Rows: +? / -5 / ~2");
+  });
+});

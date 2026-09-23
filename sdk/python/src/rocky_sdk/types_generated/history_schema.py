@@ -88,7 +88,7 @@ class RunHistoryRecord(BaseModel):
     """
     rocky_branch: str | None = None
     """
-    The named Rocky branch this run wrote to (`rocky run --branch <name>`), or `None` for a production / plain-`--shadow` run. Distinct from `git_branch` — see `RunRecord::rocky_branch` (#2032).
+    The named Rocky branch this run wrote to (`rocky run --branch <name>`), or `None` for a production / plain-`--shadow` run. Distinct from `git_branch` — see `RunRecord::rocky_branch` (#2032). Not audit-gated — like [`Self::pipeline`], it is an operational join key (`rocky preview diff`/`preview cost` pair a run by this field), always emitted when present.
     """
     rocky_version: str | None = None
     """

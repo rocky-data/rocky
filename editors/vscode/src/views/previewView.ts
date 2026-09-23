@@ -232,11 +232,15 @@ export class PreviewDiffModelNode extends vscode.TreeItem {
       const parts: string[] = [];
       // `rows_added`/`rows_removed` are `number | null | undefined` — `null`
       // means the row count was unmeasured on one side (#2032), not zero.
-      // An explicit `!= null` guard (rather than `?? 0`) keeps the two
-      // states apart: an unmeasured delta is omitted here, never shown as
-      // "+0"/"-0" (a real no-op) or as a `NaN`/`null` comparison failure.
-      if (s.rows_added != null && s.rows_added > 0) parts.push(`+${s.rows_added}`);
-      if (s.rows_removed != null && s.rows_removed > 0) parts.push(`-${s.rows_removed}`);
+      // Omitting both silently reads as "unchanged" in the tree — the exact
+      // false-clean this type exists to prevent — so an unmeasured delta
+      // pushes an explicit `?` instead of nothing.
+      if (s.rows_added == null || s.rows_removed == null) {
+        parts.push("?");
+      } else {
+        if (s.rows_added > 0) parts.push(`+${s.rows_added}`);
+        if (s.rows_removed > 0) parts.push(`-${s.rows_removed}`);
+      }
       if (s.rows_changed > 0) parts.push(`~${s.rows_changed}`);
       return parts.join("/");
     }
@@ -518,6 +522,23 @@ function buildDiffModelTooltip(model: PreviewModelDiff): string {
   if ((type_changes?.length ?? 0) > 0) {
     for (const tc of type_changes ?? []) {
       lines.push(`Type change: ${tc.name} ${tc.from} → ${tc.to}`);
+    }
+  }
+  // Row counts were missing from this tooltip entirely — a reviewer hovering
+  // a model saw structural changes only, with no sense of the row-level
+  // delta `buildRowInfo`'s tree-row label already carries.
+  const algo = model.algorithm;
+  if (algo) {
+    if (algo.kind === "sampled") {
+      const s = algo.sampled;
+      lines.push(
+        `Rows: +${fmtRowCount(s.rows_added)} / -${fmtRowCount(s.rows_removed)} / ~${s.rows_changed}`,
+      );
+    } else if (algo.kind === "bisection") {
+      const d = algo.diff;
+      lines.push(
+        `Rows: +${fmtRowCount(d.rows_added)} / -${fmtRowCount(d.rows_removed)} / ~${d.rows_changed}`,
+      );
     }
   }
   return lines.join("\n");

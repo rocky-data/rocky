@@ -2537,6 +2537,14 @@ pub struct RunHistoryRecord {
     /// `TickOutput.executed[].submission_id`. `None` for manually launched runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub submission_id: Option<String>,
+    /// The named Rocky branch this run wrote to (`rocky run --branch
+    /// <name>`), or `None` for a production / plain-`--shadow` run. Distinct
+    /// from `git_branch` — see `RunRecord::rocky_branch` (#2032). Not
+    /// audit-gated — like [`Self::pipeline`], it is an operational join key
+    /// (`rocky preview diff`/`preview cost` pair a run by this field), always
+    /// emitted when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rocky_branch: Option<String>,
 
     // --- Governance audit trail (populated only with `--audit`) ---
     /// Resolved caller identity (Unix `$USER` / Windows `$USERNAME`).
@@ -2571,11 +2579,6 @@ pub struct RunHistoryRecord {
     /// on schema-v5 rows that predate the audit trail.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rocky_version: Option<String>,
-    /// The named Rocky branch this run wrote to (`rocky run --branch
-    /// <name>`), or `None` for a production / plain-`--shadow` run. Distinct
-    /// from `git_branch` — see `RunRecord::rocky_branch` (#2032).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rocky_branch: Option<String>,
 }
 
 /// Per-model execution record embedded in [`RunHistoryRecord`].

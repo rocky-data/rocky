@@ -56,7 +56,6 @@ fn record_to_history(run: &RunRecord, audit: bool) -> RunHistoryRecord {
         target_catalog,
         hostname,
         rocky_version,
-        rocky_branch,
     ) = if audit {
         (
             run.triggering_identity.clone(),
@@ -67,10 +66,9 @@ fn record_to_history(run: &RunRecord, audit: bool) -> RunHistoryRecord {
             run.target_catalog.clone(),
             Some(run.hostname.clone()),
             Some(run.rocky_version.clone()),
-            run.rocky_branch.clone(),
         )
     } else {
-        (None, None, None, None, None, None, None, None, None)
+        (None, None, None, None, None, None, None, None)
     };
     RunHistoryRecord {
         run_id: run.run_id.clone(),
@@ -82,6 +80,11 @@ fn record_to_history(run: &RunRecord, audit: bool) -> RunHistoryRecord {
         models,
         pipeline: run.pipeline.clone(),
         submission_id: run.submission_id.clone(),
+        // Not audit-gated, like `pipeline` above (#2158 drain review, finding
+        // 6): it is an operational join key `preview diff`/`preview cost`
+        // need to pair a run, not a governance-audit field, so it must not
+        // require `--audit` to appear.
+        rocky_branch: run.rocky_branch.clone(),
         triggering_identity,
         session_source,
         git_commit,
@@ -90,7 +93,6 @@ fn record_to_history(run: &RunRecord, audit: bool) -> RunHistoryRecord {
         target_catalog,
         hostname,
         rocky_version,
-        rocky_branch,
     }
 }
 
@@ -714,7 +716,14 @@ mod tests {
         assert!(history.git_commit.is_none());
         assert!(history.hostname.is_none());
         assert!(history.rocky_version.is_none());
-        assert!(history.rocky_branch.is_none());
+        // NOT an audit field (drain review of #2158, finding 6) — an
+        // operational join key like `pipeline`, so it survives the `!audit`
+        // gate that zeroes every true governance-audit field above.
+        assert_eq!(
+            history.rocky_branch.as_deref(),
+            Some("pr-preview-governance"),
+            "rocky_branch must be emitted even without --audit"
+        );
     }
 
     #[test]

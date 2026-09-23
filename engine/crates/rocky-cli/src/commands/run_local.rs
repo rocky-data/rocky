@@ -1526,8 +1526,12 @@ pub async fn run_snapshot(
     // read from the environment inside `persist_run_record`.
     let store = StateStore::open(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-    // `rocky run --branch` is not supported for snapshot pipelines either
-    // (same reasoning as `run_quality` above) — no `ShadowConfig` here.
+    // `rocky run --branch` / `--shadow` on a snapshot pipeline is refused in
+    // `run.rs` (`reject_unsupported_shadow`) before this function runs —
+    // unlike quality, which threads the flag through and silently ignores
+    // it (see the comment above `run_quality`'s own `AuditContext::detect`
+    // call). There is no `ShadowConfig` here because a run that reached
+    // this function was never given one.
     let audit_ctx = super::run_audit::AuditContext::detect(None, None, None);
     let audit = super::run::audit_to_record(&audit_ctx);
     super::run::persist_run_record(
