@@ -356,6 +356,7 @@ pub async fn run_transformation(
                 output.duration_ms,
             ),
         );
+        p.closed();
     }
 
     if output_json {
@@ -862,6 +863,7 @@ pub async fn run_quality(
 
     if let Some(p) = &pipes {
         super::run::emit_pipes_events(p, &output);
+        p.closed();
     }
 
     let (error_failures, warning_failures) = count_failures_by_severity(&output);
@@ -1497,6 +1499,7 @@ pub async fn run_snapshot(
 
     if let Some(p) = &pipes {
         super::run::emit_pipes_events(p, &output);
+        p.closed();
     }
 
     if output_json {

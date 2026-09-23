@@ -76,8 +76,12 @@ def test_drift_observations_yields_one_per_action():
             tables_checked=10,
             tables_drifted=2,
             actions_taken=[
-                DriftAction(table="orders", action="ALTER ADD COLUMN", reason="new col"),
-                DriftAction(table="payments", action="DROP+RECREATE", reason="type change"),
+                DriftAction(
+                    table="orders", asset_key=[], action="ALTER ADD COLUMN", reason="new col"
+                ),
+                DriftAction(
+                    table="payments", asset_key=[], action="DROP+RECREATE", reason="type change"
+                ),
             ],
         ),
     )
@@ -106,8 +110,8 @@ def test_drift_observations_skips_unresolved_tables():
             tables_checked=2,
             tables_drifted=2,
             actions_taken=[
-                DriftAction(table="orders", action="ALTER", reason="x"),
-                DriftAction(table="unknown", action="ALTER", reason="y"),
+                DriftAction(table="orders", asset_key=[], action="ALTER", reason="x"),
+                DriftAction(table="unknown", asset_key=[], action="ALTER", reason="y"),
             ],
         ),
     )
@@ -135,6 +139,7 @@ def test_anomaly_check_results_yields_warn_severity():
         anomalies=[
             AnomalyResult(
                 table="orders",
+                asset_key=[],
                 current_count=900,
                 baseline_avg=1500.0,
                 deviation_pct=40.0,
@@ -160,7 +165,9 @@ def test_anomaly_check_results_yields_warn_severity():
 
 def test_an_evaluated_table_with_no_anomaly_passes():
     """#1790: the detector ran and found nothing — an honest green."""
-    run = _build_run_result(anomaly_evaluated=[AnomalyEvaluation(table="orders", evaluated=True)])
+    run = _build_run_result(
+        anomaly_evaluated=[AnomalyEvaluation(table="orders", asset_key=[], evaluated=True)]
+    )
     resolver = _resolver({"orders": dg.AssetKey(["fivetran", "acme", "orders"])})
 
     results = list(anomaly_evaluation_results(run, key_resolver=resolver))
@@ -184,6 +191,7 @@ def test_a_table_the_detector_skipped_is_not_a_pass():
         anomaly_evaluated=[
             AnomalyEvaluation(
                 table="orders",
+                asset_key=[],
                 evaluated=False,
                 not_evaluated_reason=(
                     "row-count checks are off for this pipeline "
@@ -208,7 +216,9 @@ def test_a_table_the_detector_skipped_is_not_a_pass():
 
 def test_an_evaluation_without_a_reason_still_reports_not_evaluated():
     """A missing reason must not turn a not-evaluated verdict into a pass."""
-    run = _build_run_result(anomaly_evaluated=[AnomalyEvaluation(table="orders", evaluated=False)])
+    run = _build_run_result(
+        anomaly_evaluated=[AnomalyEvaluation(table="orders", asset_key=[], evaluated=False)]
+    )
     resolver = _resolver({"orders": dg.AssetKey(["fivetran", "acme", "orders"])})
 
     results = list(anomaly_evaluation_results(run, key_resolver=resolver))
@@ -219,7 +229,9 @@ def test_an_evaluation_without_a_reason_still_reports_not_evaluated():
 
 
 def test_anomaly_evaluation_results_skips_unresolved_tables():
-    run = _build_run_result(anomaly_evaluated=[AnomalyEvaluation(table="ghost", evaluated=True)])
+    run = _build_run_result(
+        anomaly_evaluated=[AnomalyEvaluation(table="ghost", asset_key=[], evaluated=True)]
+    )
     assert list(anomaly_evaluation_results(run, key_resolver=_resolver({}))) == []
 
 
@@ -228,6 +240,7 @@ def test_anomaly_check_results_skips_unresolved_tables():
         anomalies=[
             AnomalyResult(
                 table="ghost",
+                asset_key=[],
                 current_count=0,
                 baseline_avg=1.0,
                 deviation_pct=100.0,

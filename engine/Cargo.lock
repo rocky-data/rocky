@@ -4033,6 +4033,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "criterion",
+ "flate2",
  "fs4",
  "futures",
  "hostname",

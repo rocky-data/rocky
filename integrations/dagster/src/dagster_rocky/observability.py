@@ -58,6 +58,15 @@ if TYPE_CHECKING:
 #: that should expose anomaly detection in the UI before any run.
 ANOMALY_CHECK_NAME: str = "row_count_anomaly"
 
+#: Check name the engine uses for drift over Dagster Pipes (see
+#: ``emit_pipes_events`` in ``engine/crates/rocky-cli/src/commands/run.rs``).
+#: Never a declared check spec — drift is a structural change, not a
+#: pass/fail, so on the streaming path it is reported as an
+#: :class:`dg.AssetObservation` via :func:`drift_observations`, never as an
+#: :class:`dg.AssetCheckResult`. The Pipes path converts it the same way;
+#: see ``_drift_pipes_result_to_observation`` in ``component.py`` (#2073).
+DRIFT_CHECK_NAME: str = "drift"
+
 #: Canonical Dagster check name used to surface compliance exceptions from
 #: ``rocky compliance`` (governance Wave B). One check result is emitted per
 #: :class:`ComplianceException` in the rollup, keyed on the model that owns

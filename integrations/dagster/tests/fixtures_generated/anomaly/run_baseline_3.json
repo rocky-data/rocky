@@ -46,6 +46,11 @@
   "anomaly_evaluated": [
     {
       "table": "poc.staging__events.events",
+      "asset_key": [
+        "duckdb",
+        "events",
+        "events"
+      ],
       "evaluated": true
     }
   ],

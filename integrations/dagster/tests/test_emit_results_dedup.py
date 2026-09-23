@@ -153,6 +153,7 @@ def test_emit_results_dedupes_same_key_anomaly():
     check_specs = [dg.AssetCheckSpec(name=ANOMALY_CHECK_NAME, asset=orders)]
     anomaly = AnomalyResult(
         table="orders",
+        asset_key=[],
         current_count=900,
         baseline_avg=1500.0,
         deviation_pct=40.0,
@@ -192,13 +193,14 @@ def test_an_anomaly_beats_the_evaluated_pass_for_the_same_table():
         anomalies=[
             AnomalyResult(
                 table="orders",
+                asset_key=[],
                 current_count=900,
                 baseline_avg=1500.0,
                 deviation_pct=40.0,
                 reason="row count below baseline by 40%",
             )
         ],
-        anomaly_evaluated=[AnomalyEvaluation(table="orders", evaluated=True)],
+        anomaly_evaluated=[AnomalyEvaluation(table="orders", asset_key=[], evaluated=True)],
     )
 
     events = list(
@@ -230,6 +232,7 @@ def test_a_skipped_table_reports_not_evaluated_end_to_end():
         anomaly_evaluated=[
             AnomalyEvaluation(
                 table="orders",
+                asset_key=[],
                 evaluated=False,
                 not_evaluated_reason="this run has no state store",
             )
@@ -264,6 +267,7 @@ def test_emit_results_anomaly_yields_when_unique():
     check_specs = [dg.AssetCheckSpec(name=ANOMALY_CHECK_NAME, asset=orders)]
     anomaly = AnomalyResult(
         table="orders",
+        asset_key=[],
         current_count=900,
         baseline_avg=1500.0,
         deviation_pct=40.0,

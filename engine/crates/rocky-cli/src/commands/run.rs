@@ -7573,21 +7573,23 @@ async fn run_batched_checks(
         None
     };
     if let Some(reason) = detector_off_reason {
-        for (target_key, _) in batch_asset_keys {
+        for (target_key, asset_key) in batch_asset_keys {
             anomaly_evaluated.push(AnomalyEvaluationOutput {
                 table: target_key.clone(),
+                asset_key: asset_key.clone(),
                 evaluated: false,
                 not_evaluated_reason: Some(reason.clone()),
             });
         }
     } else if let Some(store) = state_store {
-        for (target_key, _) in batch_asset_keys {
+        for (target_key, asset_key) in batch_asset_keys {
             // Only a measured count enters the anomaly history. The 0 a
             // failed query used to record read as "the table emptied" and
             // skewed every later baseline.
             let Some(&tgt_count) = target_map.get(target_key) else {
                 anomaly_evaluated.push(AnomalyEvaluationOutput {
                     table: target_key.clone(),
+                    asset_key: asset_key.clone(),
                     evaluated: false,
                     not_evaluated_reason: Some(
                         "no row count was measured for this table, so there is nothing to \
@@ -7603,6 +7605,7 @@ async fn run_batched_checks(
             let Ok(history) = store.get_check_history(target_key) else {
                 anomaly_evaluated.push(AnomalyEvaluationOutput {
                     table: target_key.clone(),
+                    asset_key: asset_key.clone(),
                     evaluated: false,
                     not_evaluated_reason: Some(
                         "this table's row-count history could not be read from the state \
@@ -7615,6 +7618,7 @@ async fn run_batched_checks(
             {
                 anomaly_evaluated.push(AnomalyEvaluationOutput {
                     table: target_key.clone(),
+                    asset_key: asset_key.clone(),
                     evaluated: true,
                     not_evaluated_reason: None,
                 });
@@ -7644,6 +7648,7 @@ async fn run_batched_checks(
                         .await;
                     anomalies.push(AnomalyOutput {
                         table: anomaly.table,
+                        asset_key: asset_key.clone(),
                         current_count: anomaly.current_count,
                         baseline_avg: anomaly.baseline_avg,
                         deviation_pct: anomaly.deviation_pct,
@@ -8391,8 +8396,8 @@ async fn auto_sweep_retention_at_end_of_run(
     }
 }
 
-/// Emit Dagster Pipes messages for every materialization, check, and
-/// drift action in a completed `RunOutput`.
+/// Emit Dagster Pipes messages for every materialization, check, drift
+/// action, and row-count anomaly verdict in a completed `RunOutput`.
 ///
 /// This is the "batch at end of run" approach to Pipes streaming. The
 /// fully-streaming alternative (per-table events as they complete)
@@ -8474,8 +8479,15 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
     // into metadata so the UI doesn't fragment by action type.
     // Also emit a log line for human-readable visibility.
     for action in &output.drift.actions_taken {
+        // The Pipes `asset_key` argument is a Dagster asset key
+        // (slash-joined path); `action.table` is a bare
+        // `catalog.schema.table` string, not one — passing it directly
+        // used to report drift against a key Dagster never declared
+        // (#2073, the same shape of bug `check_results` avoids by
+        // carrying its own `asset_key`).
+        let asset_key = action.asset_key.join("/");
         pipes.report_asset_check(
-            &action.table,
+            &asset_key,
             "drift",
             true,
             crate::pipes::PipesCheckSeverity::Warn,
@@ -8492,6 +8504,77 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
                 action.table, action.action, action.reason,
             ),
         );
+    }
+
+    // Row-count anomalies → asset checks named "row_count_anomaly", matching
+    // `ANOMALY_CHECK_NAME` in `dagster_rocky/observability.py` and the
+    // streaming path's verdicts (#1790): a detected anomaly fails with the
+    // metric detail, an evaluated table with no anomaly passes, and a
+    // not-evaluated table reports why. Before this (#2073), Pipes mode
+    // emitted neither list, so a declared `row_count_anomaly` check was
+    // never reported at all — not even a false pass.
+    //
+    // Metadata keys match `anomaly_check_results` / `anomaly_evaluation_results`
+    // in `observability.py` exactly: the detected-anomaly metadata is fully
+    // `rocky/`-prefixed (`rocky/current_count`, `rocky/baseline_avg`,
+    // `rocky/deviation_pct`, `rocky/reason`); the evaluation verdicts keep
+    // `status` bare and prefix only `rocky/reason`, mirroring that module's
+    // own inconsistency rather than inventing a third convention.
+    //
+    // Anomalies are emitted first, and each anomalous table's RESOLVED
+    // asset key is recorded so the evaluation loop below can skip its
+    // `evaluated: true` entry: every anomalous table also appears in
+    // `anomaly_evaluated` (the detector did run), and reporting both would
+    // send a passing verdict for a table that just failed. Keyed on the
+    // resolved asset key, not the engine-native `table` string, because two
+    // native tables can fold onto the same Dagster asset key (the tenant
+    // coalesce); `_emit_results` on the streaming side dedups on the
+    // resolved `AssetKey` for the same reason (see `component.py`'s
+    // `yielded_checks` set).
+    let mut anomalous_asset_keys: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for anomaly in &output.anomalies {
+        let asset_key = anomaly.asset_key.join("/");
+        anomalous_asset_keys.insert(asset_key.clone());
+        pipes.report_asset_check(
+            &asset_key,
+            "row_count_anomaly",
+            false,
+            crate::pipes::PipesCheckSeverity::Warn,
+            &json!({
+                "rocky/current_count": anomaly.current_count,
+                "rocky/baseline_avg": anomaly.baseline_avg,
+                "rocky/deviation_pct": anomaly.deviation_pct,
+                "rocky/reason": anomaly.reason,
+            }),
+        );
+    }
+    for evaluation in &output.anomaly_evaluated {
+        let asset_key = evaluation.asset_key.join("/");
+        if anomalous_asset_keys.contains(&asset_key) {
+            continue;
+        }
+        if evaluation.evaluated {
+            pipes.report_asset_check(
+                &asset_key,
+                "row_count_anomaly",
+                true,
+                crate::pipes::PipesCheckSeverity::Warn,
+                &json!({"status": "evaluated against the row-count history; no anomaly"}),
+            );
+        } else {
+            let reason = evaluation
+                .not_evaluated_reason
+                .as_deref()
+                .unwrap_or("the engine gave no reason");
+            pipes.report_asset_check(
+                &asset_key,
+                "row_count_anomaly",
+                false,
+                crate::pipes::PipesCheckSeverity::Warn,
+                &json!({"status": "not_evaluated", "rocky/reason": reason}),
+            );
+        }
     }
 }
 
@@ -14190,6 +14273,7 @@ async fn process_table(
             let reason = drift_reason(&drift_result.drifted_columns, "changed");
             drift_action = Some(DriftActionOutput {
                 table: target_table.full_name(),
+                asset_key: asset_key.clone(),
                 action: "drop_and_recreate".into(),
                 reason,
             });
@@ -14235,6 +14319,7 @@ async fn process_table(
             let reason = drift_reason(&drift_result.drifted_columns, "widened");
             drift_action = Some(DriftActionOutput {
                 table: target_table.full_name(),
+                asset_key: asset_key.clone(),
                 action: "alter_column_types".into(),
                 reason,
             });
@@ -14272,6 +14357,7 @@ async fn process_table(
                 .join(", ");
             drift_action = Some(DriftActionOutput {
                 table: target_table.full_name(),
+                asset_key: asset_key.clone(),
                 action: "add_columns".into(),
                 reason,
             });
@@ -20444,6 +20530,7 @@ auto_create_schemas = true
                 tables_drifted: 1,
                 actions_taken: vec![DriftActionOutput {
                     table: "acme.raw_orders".into(),
+                    asset_key: vec!["acme".into(), "raw_orders".into()],
                     action: "add_column".into(),
                     reason: "column 'email' found in source but not target".into(),
                 }],
@@ -20474,11 +20561,25 @@ auto_create_schemas = true
         // First: structured check
         let check = &lines[0];
         assert_eq!(check["method"], "report_asset_check");
+        // The asset key on the wire must be the Dagster-style path
+        // (slash-joined, #2073), not the bare `table` string — Pipes'
+        // `asset_key` argument is a Dagster asset key, and `action.table`
+        // ("acme.raw_orders") is not one.
+        assert_eq!(check["params"]["asset_key"], "acme/raw_orders");
         assert_eq!(check["params"]["check_name"], "drift");
         assert_eq!(check["params"]["passed"], true);
         assert_eq!(check["params"]["severity"], "WARN");
-        assert_eq!(check["params"]["metadata"]["table"], "acme.raw_orders");
-        assert_eq!(check["params"]["metadata"]["action"], "add_column");
+        // Wrapped shape (#2073) — pipes.rs's `wrap_metadata` puts every
+        // metadata value in the `{raw_value, type}` form Dagster's real
+        // message handler requires; a bare value crashes it.
+        assert_eq!(
+            check["params"]["metadata"]["table"],
+            serde_json::json!({"raw_value": "acme.raw_orders", "type": "__infer__"})
+        );
+        assert_eq!(
+            check["params"]["metadata"]["action"],
+            serde_json::json!({"raw_value": "add_column", "type": "__infer__"})
+        );
 
         // Second: human-readable log
         let log = &lines[1];
@@ -20487,6 +20588,154 @@ auto_create_schemas = true
         let msg = log["params"]["message"].as_str().unwrap();
         assert!(msg.contains("acme.raw_orders"));
         assert!(msg.contains("add_column"));
+    }
+
+    /// Row-count anomalies and evaluation verdicts reach the Pipes wire as
+    /// `row_count_anomaly` asset checks (#2073). Before this, Pipes mode
+    /// walked neither `output.anomalies` nor `output.anomaly_evaluated`, so
+    /// a detected anomaly reached nobody and the declared check was never
+    /// reported at all — not even a false pass.
+    ///
+    /// Covers the three verdict shapes `component.py::_emit_results` gives
+    /// on the streaming side (#1790), so a Pipes user sees the same thing:
+    ///   - a detected anomaly            -> passed=false, WARN, metric detail
+    ///   - an evaluated table, no anomaly -> passed=true
+    ///   - a not-evaluated table          -> passed=false, WARN, reason
+    ///
+    /// Metadata keys are pinned against `observability.py`'s
+    /// `anomaly_check_results` / `anomaly_evaluation_results`: fully
+    /// `rocky/`-prefixed for a detected anomaly, `status` bare plus
+    /// `rocky/reason` for a not-evaluated table.
+    ///
+    /// Also pins the dedup: `acme.raw_orders_v2` is a DIFFERENT engine-native
+    /// table string that resolves to the SAME asset key as the anomaly
+    /// (`acme/raw_orders`) — the tenant-coalesce shape, where two native
+    /// tables fold onto one Dagster asset. Deduping on `table` alone would
+    /// miss it and send a second, contradictory passing verdict for the
+    /// asset that just failed; deduping on the resolved asset key catches it.
+    #[test]
+    fn test_emit_pipes_anomaly_events_cover_all_three_verdicts() {
+        use crate::output::{AnomalyEvaluationOutput, AnomalyOutput, RunOutput};
+        use crate::pipes::PipesEmitter;
+        use std::io::Read;
+        use std::sync::Mutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipes_anomaly.txt");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let emitter = PipesEmitter {
+            channel: Mutex::new(Box::new(file)),
+        };
+
+        let mut output = RunOutput::new("tenant=acme".into(), 0, 1);
+        output.anomalies = vec![AnomalyOutput {
+            table: "acme.raw_orders".into(),
+            asset_key: vec!["acme".into(), "raw_orders".into()],
+            current_count: 40,
+            baseline_avg: 100.0,
+            deviation_pct: -60.0,
+            reason: "row count dropped 60% below baseline".into(),
+        }];
+        output.anomaly_evaluated = vec![
+            // A DIFFERENT `table` string that folds onto the SAME asset key
+            // as the anomaly above — dedup must key on the resolved asset
+            // key, not `table`, or this sends a second, contradictory pass.
+            AnomalyEvaluationOutput {
+                table: "acme.raw_orders_v2".into(),
+                asset_key: vec!["acme".into(), "raw_orders".into()],
+                evaluated: true,
+                not_evaluated_reason: None,
+            },
+            AnomalyEvaluationOutput {
+                table: "acme.customers".into(),
+                asset_key: vec!["acme".into(), "customers".into()],
+                evaluated: true,
+                not_evaluated_reason: None,
+            },
+            AnomalyEvaluationOutput {
+                table: "acme.skipped".into(),
+                asset_key: vec!["acme".into(), "skipped".into()],
+                evaluated: false,
+                not_evaluated_reason: Some("no row count was measured for this table".into()),
+            },
+        ];
+
+        emit_pipes_events(&emitter, &output);
+
+        let mut content = String::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        let lines: Vec<serde_json::Value> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        // Exactly 3 messages: the anomaly, the clean evaluation, and the
+        // not-evaluated one. The duplicate `evaluated: true` entry for
+        // acme/raw_orders (under a different `table` string) must NOT
+        // produce a 4th message.
+        assert_eq!(lines.len(), 3, "unexpected messages: {content}");
+        for line in &lines {
+            assert_eq!(line["method"], "report_asset_check");
+            assert_eq!(line["params"]["check_name"], "row_count_anomaly");
+        }
+
+        // Detected anomaly: fails, with the metric detail, rocky/-prefixed
+        // to match `anomaly_check_results` in observability.py. Wrapped
+        // shape (#2073) — see `wrap_metadata` in pipes.rs: a bare value
+        // here crashes Dagster's real message handler.
+        let anomaly = &lines[0];
+        assert_eq!(anomaly["params"]["asset_key"], "acme/raw_orders");
+        assert_eq!(anomaly["params"]["passed"], false);
+        assert_eq!(anomaly["params"]["severity"], "WARN");
+        assert_eq!(
+            anomaly["params"]["metadata"]["rocky/current_count"],
+            serde_json::json!({"raw_value": 40, "type": "__infer__"})
+        );
+        assert_eq!(
+            anomaly["params"]["metadata"]["rocky/baseline_avg"],
+            serde_json::json!({"raw_value": 100.0, "type": "__infer__"})
+        );
+        assert_eq!(
+            anomaly["params"]["metadata"]["rocky/deviation_pct"],
+            serde_json::json!({"raw_value": -60.0, "type": "__infer__"})
+        );
+        assert_eq!(
+            anomaly["params"]["metadata"]["rocky/reason"],
+            serde_json::json!({
+                "raw_value": "row count dropped 60% below baseline",
+                "type": "__infer__"
+            })
+        );
+
+        // Evaluated, no anomaly: passes.
+        let clean = &lines[1];
+        assert_eq!(clean["params"]["asset_key"], "acme/customers");
+        assert_eq!(clean["params"]["passed"], true);
+
+        // Not evaluated: fails, with the engine's reason — not silence.
+        let not_evaluated = &lines[2];
+        assert_eq!(not_evaluated["params"]["asset_key"], "acme/skipped");
+        assert_eq!(not_evaluated["params"]["passed"], false);
+        assert_eq!(not_evaluated["params"]["severity"], "WARN");
+        assert_eq!(
+            not_evaluated["params"]["metadata"]["status"],
+            serde_json::json!({"raw_value": "not_evaluated", "type": "__infer__"})
+        );
+        assert_eq!(
+            not_evaluated["params"]["metadata"]["rocky/reason"],
+            serde_json::json!({
+                "raw_value": "no row count was measured for this table",
+                "type": "__infer__"
+            })
+        );
     }
 
     // -----------------------------------------------------------------------

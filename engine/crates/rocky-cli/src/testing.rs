@@ -301,6 +301,34 @@ impl SqlDialect for RecordingDialect {
     }
 }
 
+/// Serialises every test in this crate that mutates `DAGSTER_PIPES_CONTEXT`
+/// / `DAGSTER_PIPES_MESSAGES` — `pipes::tests`, `commands::run_local::tests`,
+/// and `commands::run_audit::tests` all read or set one or both, and
+/// `cargo test` runs a crate's tests in parallel threads within ONE process
+/// by default, so env vars are shared, process-global state across all of
+/// them. Each of those three modules used to keep its OWN private lock,
+/// which serialised its own tests against each other but not against the
+/// other two files — `commands::run_audit::tests`' own doc comment even
+/// asserted "the remaining engine test suite doesn't read these particular
+/// env vars in parallel", which a real run of `commands::run_local::tests`'
+/// new #2166 tests (long-running: real DuckDB I/O between setting the env
+/// vars and the code under test reading them) promptly falsified —
+/// corrupted, interleaved JSON in a captured messages file, not a
+/// hypothetical.
+///
+/// A panic in one env-mutating test (deliberate, in a mutation-check)
+/// poisons this lock for every test after it in the same run; the lock
+/// exists to serialise access to shared env vars, not to propagate one
+/// test's panic into unrelated ones, so every acquisition recovers the
+/// guard instead of unwrapping it.
+pub(crate) static PIPES_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+pub(crate) fn lock_pipes_env() -> std::sync::MutexGuard<'static, ()> {
+    PIPES_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
