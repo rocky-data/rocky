@@ -249,12 +249,14 @@ pub async fn run_transformation(
                     // `--output json` with empty stdout on a runtime failure. The
                     // terminal-status exit contract is honoured by
                     // `run_status_exit_result` below.
+                    let (failure_kind, cooldown_seconds) =
+                        crate::output::classify_anyhow_error_with_cooldown(&e);
                     output.tables_failed += 1;
                     output.errors.push(crate::output::TableErrorOutput {
                         asset_key: vec!["<runtime>".to_string()],
                         error: format!("{e:#}"),
-                        failure_kind: crate::output::FailureKind::Unknown,
-                        cooldown_seconds: None,
+                        failure_kind,
+                        cooldown_seconds,
                     });
                 }
             }
@@ -364,6 +366,7 @@ pub async fn run_transformation(
         // loop sets `COMPACT_JSON` to promise one compact object per line,
         // and a serializer called here never sees that flag (#1604).
         crate::output::print_json(&output)?;
+        super::run::capture_run_output_for_test(run_id, &output);
     } else {
         crate::status_line!(
             "transformation pipeline complete: {} model(s) executed in {}ms",

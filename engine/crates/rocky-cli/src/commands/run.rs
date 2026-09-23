@@ -464,19 +464,9 @@ pub(crate) fn run_status_exit_result(
 /// `RunOutput::new` default of `success`). A clean run still derives
 /// `Success`; a copy-only failure behaves exactly as before.
 fn merge_replication_compile_and_copy_errors(output: &mut RunOutput, table_errors: &[TableError]) {
-    // Retain `execute_models`' own records: compile failures (`CompileError`)
-    // and, when `[resilience] contain_failures` is on, contained-cause runtime
-    // failures (`Unknown` — the anyhow-erased bucket `record_contained_cause`
-    // uses). Copy failures arrive separately in `table_errors` and are appended
-    // below, so widening the retain never double-counts them. Byte-identical on
-    // the default fail-fast path: `execute_models` returns `Err` there, so no
-    // `Unknown` entry is ever present on `output.errors` before this merge.
-    output.errors.retain(|e| {
-        matches!(
-            e.failure_kind,
-            crate::output::FailureKind::CompileError | crate::output::FailureKind::Unknown
-        )
-    });
+    // Existing entries came from the model phase. Keep them regardless of
+    // failure kind: a contained connector error may be classified as auth or
+    // quota. Copy failures arrive separately in `table_errors` below.
     // Count distinct failed models from the retained entries rather than
     // inferring from `tables_failed`: the compile path records one `errors`
     // entry per diagnostic but bumps `tables_failed` once per model, so count
@@ -1162,6 +1152,30 @@ fn run_trigger_from_env() -> rocky_core::state::RunTrigger {
 #[cfg(test)]
 pub(crate) static FAIL_RECORD_WRITE_FOR_TEST: std::sync::Mutex<Option<String>> =
     std::sync::Mutex::new(None);
+
+/// Test hook (#2143): after a successful JSON emit, snapshot the serialized
+/// payload under the run ID. The production `print_json` writer goes
+/// directly to stdout, so a same-process test cannot read those bytes.
+#[cfg(test)]
+pub(crate) static CAPTURED_RUN_OUTPUT_FOR_TEST: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Snapshot the serialized output. This is called only after
+/// `print_json` succeeded; it costs nothing in a released binary.
+#[cfg(test)]
+pub(crate) fn capture_run_output_for_test(run_id: &str, output: &RunOutput) {
+    if let Ok(value) = serde_json::to_value(output) {
+        CAPTURED_RUN_OUTPUT_FOR_TEST
+            .lock()
+            .expect("capture mutex")
+            .insert(run_id.to_string(), value);
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+pub(crate) fn capture_run_output_for_test(_run_id: &str, _output: &RunOutput) {}
 
 /// Persist the run's terminal record, best-effort: a failed write is logged
 /// and the run goes on, because history is advisory for most of its readers.
@@ -3087,11 +3101,16 @@ pub async fn run(
             Ok(_) => {}
             Err(e) => {
                 output.tables_failed += 1;
+                // #2143: classify the same way the replication-table failure
+                // path does, so a wrapped connector error (auth/quota/a
+                // tripped breaker) reports its real kind and cooldown here
+                // too, instead of hard-coding `Unknown`.
+                let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(&e);
                 output.errors.push(crate::output::TableErrorOutput {
                     asset_key: vec![target_model.to_string()],
                     error: format!("{e:#}"),
-                    failure_kind: crate::output::FailureKind::Unknown,
-                    cooldown_seconds: None,
+                    failure_kind,
+                    cooldown_seconds,
                 });
             }
         }
@@ -3161,6 +3180,7 @@ pub async fn run(
         output.status = output.derive_run_status();
         if output_json {
             print_json(&output)?;
+            capture_run_output_for_test(&run_id, &output);
         }
         budget_result?;
         // Same run-status exit contract as the transformation path: a
@@ -6247,12 +6267,18 @@ pub async fn run(
                     // copy-failure block below fires `pipeline_error` + drains
                     // webhooks once for the accumulated failures), mirroring the
                     // model-only path.
+                    //
+                    // #2143: classify the same way the replication-table
+                    // failure path does, so a wrapped connector error
+                    // (auth/quota/a tripped breaker) reports its real kind
+                    // and cooldown here too, instead of hard-coding `Unknown`.
+                    let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(&e);
                     table_errors.push(TableError {
                         asset_key: vec![pipeline_name.to_string()],
                         error: format!("{e:#}"),
                         task_index: None,
-                        failure_kind: crate::output::FailureKind::Unknown,
-                        cooldown_seconds: None,
+                        failure_kind,
+                        cooldown_seconds,
                     });
                     None
                 }
@@ -6654,6 +6680,7 @@ pub async fn run(
 
     if output_json {
         print_json(&output)?;
+        capture_run_output_for_test(&run_id, &output);
     } else {
         if let Some(ref resumed_from) = output.resumed_from {
             crate::status_line!(
@@ -6725,18 +6752,13 @@ pub async fn run(
         );
     }
 
-    // Compile-only failure on the replication path. The block above only
-    // fires when at least one source *copy* failed; a `--models` run where a
-    // model fails to compile (E020) but every source copied cleanly leaves
-    // `table_errors` empty while `output.tables_failed` is non-zero from the
-    // merged compile errors. Without this guard such a run would print its
-    // JSON (already carrying the compile errors + a non-`success` status) and
-    // then fall through to `Ok(())` / exit 0 — exactly the silent skip this
-    // change closes. Re-derive the exit contract from the merged tallies so it
-    // fails loudly, matching the transformation / model-only paths.
+    // A compile failure or contained model runtime failure can leave every
+    // source copy clean. In that case `table_errors` is empty, but the model
+    // phase has already recorded a failure. Keep the nonzero exit and name
+    // both possible causes accurately; `errors[]` carries the specific one.
     if output.tables_failed > 0 {
         let msg = format!(
-            "{} model(s) failed to compile (run_id: {run_id}, see the `errors` array in the JSON output)",
+            "{} model(s) failed (run_id: {run_id}, see the `errors` array in the JSON output)",
             output.tables_failed
         );
         let _ = hook_registry
@@ -6749,7 +6771,7 @@ pub async fn run(
     // Check gate. Separate from both branches above on purpose: a failed
     // check is neither a failed table nor a failed model, so it is not folded
     // into `tables_failed` (a documented count of tables and models) and it
-    // never reaches the "N model(s) failed to compile" message above. The JSON
+    // never reaches the "N model(s) failed" message above. The JSON
     // `status` and the persisted `RunRecord` already say `PartialFailure` —
     // `output.check_gate_failed` fed `derive_run_status` before either was
     // written — so this is only the exit-code half of the same answer (#1598).
@@ -9684,21 +9706,21 @@ fn collect_auto_create_targets(
 ///
 /// Used only on the `[resilience] contain_failures` path — the fail-fast
 /// default returns `Err` from `execute_models` instead of continuing. The
-/// `errors[]` entry carries [`crate::output::FailureKind::Unknown`], the enum's
-/// own bucket for an `anyhow`-erased runtime error reaching this layer; the
-/// replication-path error merge retains it alongside compile failures.
+/// The `errors[]` entry keeps a typed connector failure and its cooldown when
+/// present; the replication-path error merge retains it alongside compile failures.
 fn record_contained_cause(
     output: &mut RunOutput,
     containment: &mut super::containment::ContainmentLedger,
     model_name: &str,
     err: &anyhow::Error,
 ) {
+    let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(err);
     output.tables_failed += 1;
     output.errors.push(crate::output::TableErrorOutput {
         asset_key: vec![model_name.to_string()],
         error: format!("{err:#}"),
-        failure_kind: crate::output::FailureKind::Unknown,
-        cooldown_seconds: None,
+        failure_kind,
+        cooldown_seconds,
     });
     containment.poison(model_name);
 }
@@ -9949,12 +9971,13 @@ pub(crate) async fn execute_backfill_set(
             // Soft model failure — skip governance/manifest, fall through.
             Ok(_) => {}
             Err(e) => {
+                let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(&e);
                 output.tables_failed += 1;
                 output.errors.push(crate::output::TableErrorOutput {
                     asset_key: vec!["backfill".to_string()],
                     error: format!("{e:#}"),
-                    failure_kind: crate::output::FailureKind::Unknown,
-                    cooldown_seconds: None,
+                    failure_kind,
+                    cooldown_seconds,
                 });
             }
         }
@@ -9987,6 +10010,7 @@ pub(crate) async fn execute_backfill_set(
         output.status = output.derive_run_status();
         if output_json {
             print_json(&output)?;
+            capture_run_output_for_test(&run_id, &output);
         }
         budget_result?;
         run_status_exit_result(&output, &run_id, custody)
@@ -21363,6 +21387,638 @@ adapter = "default"
         );
     }
 
+    #[cfg(feature = "duckdb")]
+    fn classified_failure_cases() -> [(&'static str, &'static str, Option<u64>); 3] {
+        [
+            ("auth", "auth-failed", None),
+            ("rate-limit", "quota-exceeded", None),
+            ("breaker", "quota-exceeded", Some(180)),
+        ]
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn seed_content_addressed_test_table(
+        store: &object_store::memory::InMemory,
+        prefix: &str,
+    ) {
+        use object_store::{ObjectStoreExt as _, PutPayload, path::Path as ObjPath};
+
+        let protocol = serde_json::json!({"protocol": {
+            "minReaderVersion": 2,
+            "minWriterVersion": 7,
+            "writerFeatures": ["columnMapping", "icebergCompatV2", "invariants", "appendOnly"]
+        }});
+        let metadata = serde_json::json!({"metaData": {
+            "id": "00000000-0000-0000-0000-000000000000",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": serde_json::to_string(&serde_json::json!({
+                "type": "struct", "fields": [{
+                    "name": "content_addressed_failure_probe", "type": "long",
+                    "nullable": false, "metadata": {
+                        "delta.columnMapping.id": 1,
+                        "delta.columnMapping.physicalName": "col-id-uuid"
+                    }
+                }]
+            })).unwrap(),
+            "partitionColumns": [],
+            "configuration": {
+                "delta.columnMapping.mode": "name",
+                "delta.universalFormat.enabledFormats": "iceberg",
+                "delta.enableIcebergCompatV2": "true"
+            },
+            "createdTime": 0
+        }});
+        let body = format!("{protocol}\n{metadata}\n");
+        store
+            .put(
+                &ObjPath::from(format!("{prefix}/_delta_log/00000000000000000000.json")),
+                PutPayload::from(body.into_bytes()),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The actual content-addressed executor, run classifier, and emitted
+    /// JSON must preserve a wrapped warehouse error across both SQL calls.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn content_addressed_warehouse_failures_emit_classified_json() {
+        use object_store::memory::InMemory;
+        use object_store::{ObjectStoreExt as _, path::Path as ObjPath};
+
+        let cases = [
+            (
+                "content-query-rate-limit",
+                "quota-exceeded",
+                None,
+                "execute_query failed",
+            ),
+            (
+                "content-query-breaker",
+                "quota-exceeded",
+                Some(180),
+                "execute_query failed",
+            ),
+            (
+                "content-msck-rate-limit",
+                "quota-exceeded",
+                None,
+                "MSCK REPAIR failed",
+            ),
+            (
+                "content-msck-breaker",
+                "quota-exceeded",
+                Some(180),
+                "MSCK REPAIR failed",
+            ),
+        ];
+        for contain_failures in [false, true] {
+            for (failure, expected_kind, expected_cooldown, context) in cases {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let dir = tmp.path();
+                let models = dir.join("models");
+                std::fs::create_dir_all(&models).unwrap();
+                std::fs::write(
+                    models.join("m.sql"),
+                    "SELECT content_addressed_failure_probe FROM raw.events\n",
+                )
+                .unwrap();
+                let prefix = format!("ca_failure_{}", uuid::Uuid::new_v4().simple());
+                let storage_prefix = format!("s3://test-bucket/{prefix}");
+                std::fs::write(
+                    models.join("m.toml"),
+                    format!(
+                        "[[sources]]\ncatalog = \"c\"\nschema = \"raw\"\ntable = \"events\"\n\n\
+                         [strategy]\ntype = \"content_addressed\"\nstorage_prefix = \"{storage_prefix}\"\n\n\
+                         [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n"
+                    ),
+                )
+                .unwrap();
+                let store = std::sync::Arc::new(InMemory::new());
+                seed_content_addressed_test_table(&store, &prefix).await;
+                super::super::run_content_addressed::register_test_object_store(
+                    &storage_prefix,
+                    store.clone(),
+                );
+
+                let config_path = dir.join("rocky.toml");
+                std::fs::write(
+                    &config_path,
+                    format!(
+                        "[adapter]\ntype = \"test-fail-write\"\npath = \"{failure}\"\n\n\
+                         [state]\nbackend = \"local\"\n\n\
+                         [resilience]\ncontain_failures = {contain_failures}\n\n\
+                         [pipeline.tx]\ntype = \"transformation\"\nmodels = '{}'\n\n\
+                         [pipeline.tx.target]\nadapter = \"default\"\n",
+                        models.join("**").display(),
+                    ),
+                )
+                .unwrap();
+                let state_path = dir.join("state.redb");
+                {
+                    use rocky_core::schema_cache::{
+                        SchemaCacheEntry, StoredColumn, schema_cache_key,
+                    };
+                    let state = rocky_core::state::StateStore::open(&state_path).unwrap();
+                    state
+                        .write_schema_cache_entry(
+                            &schema_cache_key("c", "raw", "events"),
+                            &SchemaCacheEntry {
+                                columns: vec![StoredColumn {
+                                    name: "content_addressed_failure_probe".to_string(),
+                                    data_type: "BIGINT".to_string(),
+                                    nullable: false,
+                                }],
+                                cached_at: chrono::Utc::now(),
+                            },
+                        )
+                        .unwrap();
+                }
+                let run_id = format!("test-content-error-{}", uuid::Uuid::new_v4());
+                let loaded = std::sync::Arc::new(
+                    rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+                );
+                let result = super::run(
+                    &config_path,
+                    loaded,
+                    None,
+                    None,
+                    &state_path,
+                    None,
+                    true,
+                    None,
+                    false,
+                    None,
+                    false,
+                    None,
+                    &PartitionRunOptions::default(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    &DeferOptions::default(),
+                    &SkipRunOptions::default(),
+                    &rocky_core::run_vars::RunVars::new(),
+                    Some(&run_id),
+                    None,
+                    false,
+                    None,
+                )
+                .await;
+                let commit_path =
+                    ObjPath::from(format!("{prefix}/_delta_log/00000000000000000001.json"));
+                assert_eq!(
+                    store.head(&commit_path).await.is_ok(),
+                    failure.starts_with("content-msck"),
+                    "query failure must precede commit; MSCK failure must follow it"
+                );
+                assert!(
+                    result.is_err(),
+                    "{failure}, contain={contain_failures}: {result:?}"
+                );
+                let captured = super::CAPTURED_RUN_OUTPUT_FOR_TEST
+                    .lock()
+                    .unwrap()
+                    .remove(&run_id)
+                    .expect("run() must emit terminal JSON");
+                assert_eq!(captured["status"], "Failure", "{failure}");
+                assert_eq!(captured["tables_failed"], 1, "{failure}");
+                let errors = captured["errors"].as_array().unwrap();
+                assert_eq!(errors.len(), 1, "{failure}: {errors:?}");
+                assert_eq!(errors[0]["failure_kind"], expected_kind, "{failure}");
+                assert_eq!(
+                    errors[0]
+                        .get("cooldown_seconds")
+                        .and_then(serde_json::Value::as_u64),
+                    expected_cooldown,
+                    "{failure}"
+                );
+                assert!(
+                    errors[0]["error"].as_str().unwrap().contains(context),
+                    "{failure}: {errors:?}"
+                );
+
+                let loaded =
+                    rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap();
+                let mut session = rocky_core::state_sync::RemoteStateSession::new(
+                    &loaded.config.state,
+                    &state_path,
+                    rocky_core::state_sync::FinalizeDurability::Durable,
+                    false,
+                );
+                let _authority = session.acquire().await.unwrap();
+                session.require_synced().unwrap();
+                let model_set = std::collections::BTreeSet::from(["m".to_string()]);
+                let backfill = super::execute_backfill_set(
+                    &loaded,
+                    session,
+                    &state_path,
+                    &models,
+                    &model_set,
+                    &PartitionRunOptions::default(),
+                    None,
+                    None,
+                    true,
+                )
+                .await;
+                super::super::run_content_addressed::remove_test_object_store(&storage_prefix);
+                assert!(backfill.is_err(), "backfill must fail: {failure}");
+                let state = rocky_core::state::StateStore::open(&state_path).unwrap();
+                let latest = state.list_runs(1).unwrap().remove(0);
+                let backfill_json = super::CAPTURED_RUN_OUTPUT_FOR_TEST
+                    .lock()
+                    .unwrap()
+                    .remove(&latest.run_id)
+                    .expect("backfill must emit terminal JSON");
+                assert_eq!(backfill_json["status"], "Failure", "{failure}");
+                let backfill_errors = backfill_json["errors"].as_array().unwrap();
+                assert_eq!(backfill_errors.len(), 1, "{failure}: {backfill_errors:?}");
+                assert_eq!(
+                    backfill_errors[0]["failure_kind"], expected_kind,
+                    "{failure}"
+                );
+                assert_eq!(
+                    backfill_errors[0]
+                        .get("cooldown_seconds")
+                        .and_then(serde_json::Value::as_u64),
+                    expected_cooldown,
+                    "{failure}"
+                );
+            }
+        }
+    }
+
+    /// Drives `run()` through the `--model` fail-fast path with a connector
+    /// error nested inside `rocky_core::traits::AdapterError`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn model_only_runtime_failure_reports_classified_failure_kind() {
+        for (failure, expected_kind, expected_cooldown) in classified_failure_cases() {
+            assert_transformation_runtime_failure(failure, expected_kind, expected_cooldown, true)
+                .await;
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn normal_transformation_dispatch_emits_classified_failure() {
+        for (failure, expected_kind, expected_cooldown) in classified_failure_cases() {
+            assert_transformation_runtime_failure(failure, expected_kind, expected_cooldown, false)
+                .await;
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn assert_transformation_runtime_failure(
+        failure: &str,
+        expected_kind: &str,
+        expected_cooldown: Option<u64>,
+        model_only: bool,
+    ) {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let config_dir = tmp.path();
+        let models = config_dir.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("m.sql"), "SELECT 1 AS x\n").unwrap();
+        std::fs::write(
+            models.join("m.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )
+        .unwrap();
+
+        let config_path = config_dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "test-fail-write"
+path = "{failure}"
+
+[state]
+backend = "local"
+
+[pipeline.tx]
+type = "transformation"
+models = '{}'
+
+[pipeline.tx.target]
+adapter = "default"
+"#,
+                models.join("**").display(),
+            ),
+        )
+        .unwrap();
+
+        let state_path = config_dir.join("state.redb");
+        let run_id = format!("test-2143-transformation-{model_only}-{failure}");
+
+        let loaded = std::sync::Arc::new(
+            rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+        );
+        let result = super::run(
+            &config_path,
+            loaded,
+            None,
+            None,
+            &state_path,
+            None,
+            true,
+            None,
+            false,
+            None,
+            false,
+            None,
+            &PartitionRunOptions::default(),
+            model_only.then_some("m"),
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            Some(&run_id),
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "the model write must fail: {failure}");
+
+        let captured = super::CAPTURED_RUN_OUTPUT_FOR_TEST
+            .lock()
+            .unwrap()
+            .remove(&run_id)
+            .expect("run() must capture emitted JSON for this run_id");
+        assert_eq!(captured["status"], "Failure");
+        assert_eq!(captured["tables_failed"], 1);
+        let errors = captured["errors"]
+            .as_array()
+            .expect("errors is a JSON array");
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected exactly one recorded error: {errors:?}"
+        );
+        assert_eq!(errors[0]["failure_kind"], expected_kind);
+        assert_eq!(
+            errors[0]
+                .get("cooldown_seconds")
+                .and_then(serde_json::Value::as_u64),
+            expected_cooldown
+        );
+        assert!(
+            errors[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains(match failure {
+                    "auth" => "injected auth failure",
+                    "rate-limit" => "injected rate limit",
+                    "breaker" => "circuit breaker tripped",
+                    _ => unreachable!(),
+                })
+        );
+    }
+
+    /// Drives `run()` through the replication `--models` tail model build.
+    /// Discovery finds no tables, so the injected failure occurs on the
+    /// model's target write.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn replication_models_tail_runtime_failure_reports_classified_failure_kind() {
+        for (failure, expected_kind, expected_cooldown) in classified_failure_cases() {
+            assert_replication_models_tail_runtime_failure(
+                failure,
+                expected_kind,
+                expected_cooldown,
+                false,
+            )
+            .await;
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn contained_replication_failures_stay_failed_in_terminal_json() {
+        for (failure, expected_kind, expected_cooldown) in classified_failure_cases() {
+            assert_replication_models_tail_runtime_failure(
+                failure,
+                expected_kind,
+                expected_cooldown,
+                true,
+            )
+            .await;
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn supervised_backfill_failures_emit_classified_json() {
+        for (failure, expected_kind, expected_cooldown) in classified_failure_cases() {
+            assert_supervised_backfill_failure(failure, expected_kind, expected_cooldown).await;
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn assert_supervised_backfill_failure(
+        failure: &str,
+        expected_kind: &str,
+        expected_cooldown: Option<u64>,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models = dir.join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(models.join("m.sql"), "SELECT 1 AS x\n").unwrap();
+        std::fs::write(
+            models.join("m.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )
+        .unwrap();
+        let config_path = dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter]\ntype = \"test-fail-write\"\npath = \"{failure}\"\n\n\
+                 [state]\nbackend = \"local\"\n\n[pipeline.tx]\ntype = \"transformation\"\n\
+                 models = '{}'\n\n[pipeline.tx.target]\nadapter = \"default\"\n",
+                models.join("**").display(),
+            ),
+        )
+        .unwrap();
+        let state_path = dir.join("state.redb");
+        let loaded = rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap();
+        let mut session = rocky_core::state_sync::RemoteStateSession::new(
+            &loaded.config.state,
+            &state_path,
+            rocky_core::state_sync::FinalizeDurability::Durable,
+            false,
+        );
+        let _authority = session.acquire().await.unwrap();
+        session.require_synced().unwrap();
+        let model_set = std::collections::BTreeSet::from(["m".to_string()]);
+        let result = super::execute_backfill_set(
+            &loaded,
+            session,
+            &state_path,
+            &models,
+            &model_set,
+            &PartitionRunOptions::default(),
+            None,
+            None,
+            true,
+        )
+        .await;
+        assert!(result.is_err(), "backfill must exit with failure");
+
+        let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+        let runs = store.list_runs(1).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, rocky_core::state::RunStatus::Failure);
+        let captured = super::CAPTURED_RUN_OUTPUT_FOR_TEST
+            .lock()
+            .unwrap()
+            .remove(&runs[0].run_id)
+            .expect("backfill must emit terminal JSON");
+        assert_eq!(captured["status"], "Failure");
+        assert_eq!(captured["tables_failed"], 1);
+        let errors = captured["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["failure_kind"], expected_kind);
+        assert_eq!(
+            errors[0]
+                .get("cooldown_seconds")
+                .and_then(serde_json::Value::as_u64),
+            expected_cooldown
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn assert_replication_models_tail_runtime_failure(
+        failure: &str,
+        expected_kind: &str,
+        expected_cooldown: Option<u64>,
+        contain_failures: bool,
+    ) {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let config_dir = tmp.path();
+        let models = config_dir.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("m.sql"), "SELECT 1 AS x\n").unwrap();
+        std::fs::write(
+            models.join("m.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )
+        .unwrap();
+
+        let config_path = config_dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter.src]
+type = "duckdb"
+
+[adapter.fail]
+type = "test-fail-write"
+path = "{failure}"
+
+[state]
+backend = "local"
+
+[resilience]
+contain_failures = {contain_failures}
+
+[pipeline.p]
+type = "replication"
+
+[pipeline.p.source.discovery]
+adapter = "src"
+
+[pipeline.p.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+adapter = "fail"
+catalog_template = "x"
+schema_template = "staging__{{source}}"
+"#
+            ),
+        )
+        .unwrap();
+
+        let state_path = config_dir.join("state.redb");
+        let run_id = format!("test-2143-replication-models-tail-{contain_failures}-{failure}");
+
+        let loaded = std::sync::Arc::new(
+            rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+        );
+        let result = super::run(
+            &config_path,
+            loaded,
+            None,
+            None,
+            &state_path,
+            None,
+            true,
+            Some(models.as_path()),
+            false,
+            None,
+            false,
+            None,
+            &PartitionRunOptions::default(),
+            None,
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            Some(&run_id),
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "the model write must fail: {failure}");
+
+        let captured = super::CAPTURED_RUN_OUTPUT_FOR_TEST
+            .lock()
+            .unwrap()
+            .remove(&run_id)
+            .expect("run() must capture emitted JSON for this run_id");
+        assert_eq!(captured["status"], "Failure");
+        assert_eq!(captured["tables_failed"], 1);
+        let errors = captured["errors"]
+            .as_array()
+            .expect("errors is a JSON array");
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected exactly one recorded error: {errors:?}"
+        );
+        assert_eq!(errors[0]["failure_kind"], expected_kind);
+        assert_eq!(
+            errors[0]
+                .get("cooldown_seconds")
+                .and_then(serde_json::Value::as_u64),
+            expected_cooldown
+        );
+        assert!(
+            errors[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains(match failure {
+                    "auth" => "injected auth failure",
+                    "rate-limit" => "injected rate limit",
+                    "breaker" => "circuit breaker tripped",
+                    _ => unreachable!(),
+                })
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Connected trace: `run`'s root span adopts an upstream `TRACEPARENT`.
     //
@@ -26609,9 +27265,9 @@ backend = "local"
     }
 
     /// On the replication path with `[resilience] contain_failures = true`,
-    /// `execute_models` records a contained-cause runtime failure (`Unknown`
-    /// kind) on `output.errors` and returns `Ok`. The merge must retain that
-    /// entry — the pre-fix `retain(CompileError)` would have silently dropped
+    /// `execute_models` records a classified contained-cause runtime failure
+    /// on `output.errors` and returns `Ok`. The merge must retain that
+    /// entry — a kind-based retain would silently drop
     /// it, flipping a real failure back toward `Success` — and count it exactly
     /// once alongside any copy failures (no double-count).
     #[test]
@@ -26623,8 +27279,8 @@ backend = "local"
         out.errors.push(crate::output::TableErrorOutput {
             asset_key: vec!["bad".to_string()],
             error: "model 'bad' failed: warehouse rejected SQL".to_string(),
-            failure_kind: crate::output::FailureKind::Unknown,
-            cooldown_seconds: None,
+            failure_kind: crate::output::FailureKind::QuotaExceeded,
+            cooldown_seconds: Some(180),
         });
         // No copy failures on this run — the containment cause is the only one.
         let no_copy_errors: Vec<TableError> = Vec::new();
@@ -26638,9 +27294,14 @@ backend = "local"
         assert_eq!(
             out.errors.len(),
             1,
-            "the Unknown-kind runtime failure survives the merge: {:?}",
+            "the classified runtime failure survives the merge: {:?}",
             out.errors
         );
+        assert_eq!(
+            out.errors[0].failure_kind,
+            crate::output::FailureKind::QuotaExceeded
+        );
+        assert_eq!(out.errors[0].cooldown_seconds, Some(180));
         assert!(matches!(
             out.status,
             rocky_core::state::RunStatus::PartialFailure
