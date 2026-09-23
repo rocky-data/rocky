@@ -355,14 +355,17 @@ Rocky measured this per target dialect instead of assuming it:
 | BigQuery | Not probed. | No sandbox available |
 | Trino | Not probed. | No environment available |
 
-Five names on the allowlist are refused in one particular shape, because that shape reads a Snowflake session parameter instead of only its arguments:
+Six names on the allowlist are refused in one particular shape, because that shape reads a Snowflake session parameter instead of only its arguments:
 
 | Function | Refused | Accepted |
 |---|---|---|
 | `to_date`, `to_timestamp`, `to_char` | called with one argument, e.g. `to_date(order_date)`, reads a session default format | called with an explicit format, e.g. `to_date(order_date, 'YYYY-MM-DD')` |
 | `date_trunc`, `datediff` (and its `date_diff` spelling) | a `week` date part, or a synonym (`w`, `wk`, `weekofyear`, `woy`, `wy`), reads `WEEK_START` | any other date part, e.g. `day`, `month`, `year`, or the fixed, Monday-start `week_iso` |
+| `date_part` | a `week` (`w`, `wk`, `weekofyear`, `woy`, `wy`) part reads `WEEK_START`; a `dayofweek` (`weekday`, `dow`, `dw`) or `yearofweek` part reads `WEEK_OF_YEAR_POLICY` and `WEEK_START` | any other date part, including `dayofyear`, the `epoch_*` and `timezone_*` parts `date_trunc`/`datediff` don't take, and every ISO-fixed variant (`week_iso`, `dayofweekiso`, `yearofweekiso`) |
 
 `to_char` was off the allowlist entirely until this rule shipped; it is back on now that its risky shape is refused rather than its name.
+
+`EXTRACT(<part> FROM <expr>)` — Snowflake's own documented alternative spelling of `date_part`, and also accepted as `EXTRACT(<part>, <expr>)` on Snowflake — is refused on the identical three part families, even though it parses as its own SQL construct rather than a function call.
 
 One position adds a rule, because the expression is used differently there:
 
