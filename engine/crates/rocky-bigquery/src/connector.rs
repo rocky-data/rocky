@@ -1084,23 +1084,10 @@ impl WarehouseAdapter for BigQueryAdapter {
             .map(|s| s.fields.iter().map(|f| f.name.clone()).collect())
             .unwrap_or_default();
 
-        // Which positional cells are a `TIMESTAMP` column, by the schema
-        // this same response carries (`f[]` and `schema.fields[]` share
-        // position — see `TableRow`/`TableFieldSchema`). Only those cells
-        // get `convert_bigquery_timestamp_cell` below: every other BQ type
-        // (INTEGER, STRING, DATE, ...) already round-trips as the plain
-        // string REST hands back, and must not be reinterpreted as an
-        // epoch number (#2150).
-        let timestamp_positions: Vec<bool> = response
-            .schema
-            .as_ref()
-            .map(|s| {
-                s.fields
-                    .iter()
-                    .map(|f| f.field_type.eq_ignore_ascii_case("TIMESTAMP"))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // `f[]` and `schema.fields[]` share position at every RECORD depth.
+        // Decode only schema-identified TIMESTAMP leaves, including those in
+        // REPEATED fields, after all inline/polled/paged rows are collected.
+        let fields = response.schema.as_ref().map(|s| s.fields.as_slice());
 
         let rows: Vec<Vec<serde_json::Value>> = response
             .rows
@@ -1112,10 +1099,9 @@ impl WarehouseAdapter for BigQueryAdapter {
                     .enumerate()
                     .map(|(i, cell)| {
                         let value = cell.v.clone().unwrap_or(serde_json::Value::Null);
-                        if timestamp_positions.get(i).copied().unwrap_or(false) {
-                            convert_bigquery_timestamp_cell(value)
-                        } else {
-                            value
+                        match fields.and_then(|fields| fields.get(i)) {
+                            Some(field) => convert_bigquery_field(value, field),
+                            None => value,
                         }
                     })
                     .collect()
@@ -1307,11 +1293,56 @@ impl WarehouseAdapter for BigQueryAdapter {
     }
 }
 
-/// Converts one `TIMESTAMP` cell from BigQuery's REST `jobs.query` /
-/// `jobs.getQueryResults` shape to an RFC 3339 UTC string. Only
-/// [`execute_query`]'s own cell loop calls this, and only for a column whose
-/// schema field type is `TIMESTAMP` — every other BigQuery type already
-/// round-trips as the plain string the REST API sends.
+/// Walk the BigQuery `v` representation using its field schema. REPEATED
+/// values are arrays of `{ "v": ... }` cells; RECORD/STRUCT values contain
+/// positional `{ "f": [{ "v": ... }, ...] }` cells. Unknown shapes and
+/// non-TIMESTAMP leaves pass through unchanged.
+fn convert_bigquery_field(value: serde_json::Value, field: &TableFieldSchema) -> serde_json::Value {
+    if field
+        .mode
+        .as_deref()
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("REPEATED"))
+    {
+        let serde_json::Value::Array(mut elements) = value else {
+            return value;
+        };
+        for element in &mut elements {
+            if let Some(inner) = element.get_mut("v") {
+                *inner = convert_bigquery_non_repeated(std::mem::take(inner), field);
+            }
+        }
+        return serde_json::Value::Array(elements);
+    }
+    convert_bigquery_non_repeated(value, field)
+}
+
+fn convert_bigquery_non_repeated(
+    value: serde_json::Value,
+    field: &TableFieldSchema,
+) -> serde_json::Value {
+    if field.field_type.eq_ignore_ascii_case("TIMESTAMP") {
+        return convert_bigquery_timestamp_cell(value);
+    }
+    if !field.field_type.eq_ignore_ascii_case("RECORD")
+        && !field.field_type.eq_ignore_ascii_case("STRUCT")
+    {
+        return value;
+    }
+    let serde_json::Value::Object(mut record) = value else {
+        return value;
+    };
+    if let Some(serde_json::Value::Array(cells)) = record.get_mut("f") {
+        for (cell, child_field) in cells.iter_mut().zip(&field.fields) {
+            if let Some(inner) = cell.get_mut("v") {
+                *inner = convert_bigquery_field(std::mem::take(inner), child_field);
+            }
+        }
+    }
+    serde_json::Value::Object(record)
+}
+
+/// Converts one schema-identified `TIMESTAMP` leaf from BigQuery's REST
+/// `jobs.query` / `jobs.getQueryResults` shape to an RFC 3339 UTC string.
 ///
 /// Every row-returning request sets `formatOptions.useInt64Timestamp=true`,
 /// so a TIMESTAMP cell is a signed int64 count of **microseconds** since the
@@ -2060,13 +2091,14 @@ struct TableSchema {
 struct TableFieldSchema {
     name: String,
     /// BigQuery's standard SQL type name (`"TIMESTAMP"`, `"STRING"`,
-    /// `"INTEGER"`, ...), read by `execute_query` to find which positional
-    /// cells need `convert_bigquery_timestamp_cell` (#2150).
+    /// `"INTEGER"`, ...), used with mode and nested fields to locate
+    /// TIMESTAMP leaves without converting other numeric strings (#2150).
     #[serde(rename = "type")]
     field_type: String,
-    #[allow(dead_code)]
     #[serde(default)]
     mode: Option<String>,
+    #[serde(default)]
+    fields: Vec<TableFieldSchema>,
 }
 
 #[derive(Debug, Deserialize)]

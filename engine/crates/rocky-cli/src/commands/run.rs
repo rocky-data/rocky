@@ -24862,8 +24862,10 @@ timestamp_column = "ts"
     }
 
     /// BigQuery's scalar MAX(ts) response must cross the real connector,
-    /// watermark resolver, and redb store without rounding a year-3000
-    /// timestamp upward. The next strict filter must use that same value.
+    /// watermark resolver, and redb store with exact year-3000 microseconds.
+    /// This probes the BigQuery int64 output path; Rocky's former decimal
+    /// parser used integer arithmetic. The next strict filter must use that
+    /// same value.
     #[tokio::test]
     async fn bigquery_target_max_persists_exact_microsecond_watermark() {
         use rocky_bigquery::auth::BigQueryAuth;

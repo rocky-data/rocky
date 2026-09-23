@@ -246,6 +246,184 @@ async fn timestamp_cell_converts_int64_microseconds_to_rfc3339() {
     );
 }
 
+fn nested_timestamp_schema() -> Value {
+    json!({"fields": [
+        {"name": "times", "type": "TIMESTAMP", "mode": "REPEATED"},
+        {"name": "detail", "type": "RECORD", "fields": [
+            {"name": "at", "type": "TIMESTAMP"},
+            {"name": "missing", "type": "TIMESTAMP"},
+            {"name": "count", "type": "INTEGER"}
+        ]},
+        {"name": "history", "type": "STRUCT", "mode": "REPEATED", "fields": [
+            {"name": "at", "type": "TIMESTAMP"},
+            {"name": "missing", "type": "TIMESTAMP"},
+            {"name": "label", "type": "STRING"}
+        ]}
+    ]})
+}
+
+fn nested_timestamp_wire_row() -> Value {
+    json!({"f": [
+        {"v": [{"v": "1757930400250001"}, {"v": null}]},
+        {"v": {"f": [
+            {"v": "32503680000000002"}, {"v": null}, {"v": "1757930400250001"}
+        ]}},
+        {"v": [
+            {"v": {"f": [
+                {"v": "-1"}, {"v": null}, {"v": "1757930400250001"}
+            ]}},
+            {"v": {"f": [
+                {"v": null}, {"v": "0"}, {"v": "plain text"}
+            ]}},
+            {"v": null}
+        ]}
+    ]})
+}
+
+fn expected_nested_timestamp_row() -> Vec<Value> {
+    vec![
+        json!([{"v": "2025-09-15T10:00:00.250001Z"}, {"v": null}]),
+        json!({"f": [
+            {"v": "3000-01-01T00:00:00.000002Z"},
+            {"v": null},
+            {"v": "1757930400250001"}
+        ]}),
+        json!([
+            {"v": {"f": [
+                {"v": "1969-12-31T23:59:59.999999Z"},
+                {"v": null},
+                {"v": "1757930400250001"}
+            ]}},
+            {"v": {"f": [
+                {"v": null},
+                {"v": "1970-01-01T00:00:00.000000Z"},
+                {"v": "plain text"}
+            ]}},
+            {"v": null}
+        ]),
+    ]
+}
+
+#[tokio::test]
+async fn inline_query_decodes_nested_timestamp_leaves_and_preserves_nulls() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(QUERIES_PATH))
+        .and(body_partial_json(
+            json!({"formatOptions": {"useInt64Timestamp": true}}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "schema": nested_timestamp_schema(),
+            "rows": [nested_timestamp_wire_row()],
+            "totalRows": "1"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = test_adapter(&server)
+        .execute_query("SELECT nested")
+        .await
+        .unwrap();
+    assert_eq!(result.columns, vec!["times", "detail", "history"]);
+    assert_eq!(result.rows, vec![expected_nested_timestamp_row()]);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn polled_and_paged_query_decodes_nested_timestamp_leaves() {
+    let server = MockServer::start().await;
+    let result_path = "/bigquery/v2/projects/test-project/queries/job-nested";
+    Mock::given(method("POST"))
+        .and(path(QUERIES_PATH))
+        .and(body_partial_json(
+            json!({"formatOptions": {"useInt64Timestamp": true}}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": false,
+            "jobReference": {"projectId": "test-project", "jobId": "job-nested"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(result_path))
+        .and(query_param("timeoutMs", "10000"))
+        .and(query_param("formatOptions.useInt64Timestamp", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "jobReference": {"projectId": "test-project", "jobId": "job-nested"},
+            "schema": nested_timestamp_schema(),
+            "rows": [nested_timestamp_wire_row()],
+            "totalRows": "2",
+            "pageToken": "page-two"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(result_path))
+        .and(query_param("pageToken", "page-two"))
+        .and(query_param("formatOptions.useInt64Timestamp", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "rows": [nested_timestamp_wire_row()]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = test_adapter(&server)
+        .execute_query("SELECT nested")
+        .await
+        .unwrap();
+    assert_eq!(result.columns, vec!["times", "detail", "history"]);
+    assert_eq!(result.rows, vec![expected_nested_timestamp_row(); 2]);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn later_page_schema_decodes_earlier_nested_timestamp_rows() {
+    let server = MockServer::start().await;
+    let result_path = "/bigquery/v2/projects/test-project/queries/job-late-schema";
+    Mock::given(method("POST"))
+        .and(path(QUERIES_PATH))
+        .and(body_partial_json(
+            json!({"formatOptions": {"useInt64Timestamp": true}}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "jobReference": {"projectId": "test-project", "jobId": "job-late-schema"},
+            "rows": [nested_timestamp_wire_row()],
+            "totalRows": "2",
+            "pageToken": "page-two"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(result_path))
+        .and(query_param("pageToken", "page-two"))
+        .and(query_param("formatOptions.useInt64Timestamp", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "schema": nested_timestamp_schema(),
+            "rows": [nested_timestamp_wire_row()]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = test_adapter(&server)
+        .execute_query("SELECT nested")
+        .await
+        .unwrap();
+    assert_eq!(result.columns, vec!["times", "detail", "history"]);
+    assert_eq!(result.rows, vec![expected_nested_timestamp_row(); 2]);
+    server.verify().await;
+}
+
 /// `maxResults` is a per-page limit, not a whole-query limit. A successful
 /// inline response with `pageToken` must be followed through
 /// `jobs.getQueryResults` before `execute_query` returns.
