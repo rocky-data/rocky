@@ -520,7 +520,13 @@ fn arg_literal(function: &Function, index: usize) -> Option<String> {
 }
 
 /// A numeric scale, not a date/time part, in TRUNC's second argument.
-fn second_arg_is_numeric_literal(function: &Function) -> bool {
+/// Snowflake documents both literal scales and `TRUNC(n, scale)` with a
+/// column scale. Its date/time overload takes a listed part, so a quoted or
+/// qualified column reference, or an unquoted identifier outside that list,
+/// can only be a numeric scale (or an invalid argument). Without column
+/// types, listed bare parts stay on the date/time path, where
+/// session-dependent `week` spellings are refused.
+fn second_arg_is_numeric_scale(function: &Function) -> bool {
     let FunctionArguments::List(list) = &function.args else {
         return false;
     };
@@ -529,6 +535,13 @@ fn second_arg_is_numeric_literal(function: &Function) -> bool {
     };
     match expr {
         Expr::Value(value) => matches!(value.value, Value::Number(..)),
+        Expr::Identifier(ident) if ident.quote_style.is_some() => true,
+        Expr::Identifier(ident) => {
+            let part = ident.value.to_ascii_lowercase();
+            !SAFE_DATE_TIME_PARTS.contains(&part.as_str())
+                && !["week", "w", "wk", "weekofyear", "woy", "wy"].contains(&part.as_str())
+        }
+        Expr::CompoundIdentifier(_) => true,
         Expr::UnaryOp {
             op: UnaryOperator::Plus | UnaryOperator::Minus,
             expr,
@@ -587,19 +600,21 @@ fn shape_refusal(name: &str, function: &Function) -> Option<&'static str> {
         }
         // Snowflake's date/time TRUNC and TRUNCATE reverse DATE_TRUNC's
         // arguments. A literal number in the second slot is a numeric scale;
-        // a date/time part must be a known safe string or identifier. A
-        // computed part could evaluate to `week`, so refuse ambiguous shapes.
+        // a noncomputed column reference is Snowflake's documented scale
+        // shape. A date/time part must be a known safe string or identifier.
+        // A computed second argument is ambiguous without types, so refuse it.
         "trunc" | "truncate"
             if positional_arg_count(function) >= 2
-                && !second_arg_is_numeric_literal(function)
+                && !second_arg_is_numeric_scale(function)
                 && !arg_literal(function, 1).is_some_and(|part| {
                     SAFE_DATE_TIME_PARTS.contains(&part.to_ascii_lowercase().as_str())
                 }) =>
         {
             Some(
-                "with a date part other than `week` (or one of its synonyms `w`, `wk`, \
-                 `weekofyear`, `woy`, `wy`), for example `trunc(x, 'day')`. A `week` \
-                 truncation depends on Snowflake's WEEK_START session parameter",
+                "with a safe date part (for example `trunc(x, 'day')`) or a numeric \
+                 scale (for example `trunc(amount, scale)`). A `week` part depends on \
+                 Snowflake's WEEK_START session parameter; a computed second argument \
+                 cannot be proven to be a numeric scale here",
             )
         }
         // Same risk, on the date-part argument of a three-argument call.
@@ -1822,17 +1837,19 @@ mod tests {
                     other => panic!("{name}(created_at, '{part}') must be refused: {other:?}"),
                 }
             }
-            let bare_week = check_on(
-                "snowflake",
-                &format!("{name}(created_at, week) IS NOT NULL"),
-            );
-            assert!(
-                matches!(
-                    bare_week,
-                    Err(ValidationError::ExpressionFunctionShapeNotAllowed { .. })
-                ),
-                "{name} with a bare week part must be refused: {bare_week:?}"
-            );
+            for part in ["week", "w", "wk", "weekofyear", "woy", "wy"] {
+                let bare_week = check_on(
+                    "snowflake",
+                    &format!("{name}(created_at, {part}) IS NOT NULL"),
+                );
+                assert!(
+                    matches!(
+                        bare_week,
+                        Err(ValidationError::ExpressionFunctionShapeNotAllowed { .. })
+                    ),
+                    "{name} with bare {part} must be refused: {bare_week:?}"
+                );
+            }
             let computed_week = check_on(
                 "snowflake",
                 &format!("{name}(created_at, lower('week')) IS NOT NULL"),
@@ -1856,6 +1873,21 @@ mod tests {
             .unwrap_or_else(|e| panic!("{name} with an ISO week part must pass: {e:?}"));
             check_on("snowflake", &format!("{name}(amount, 2) > 0"))
                 .unwrap_or_else(|e| panic!("{name} with a numeric scale must pass: {e:?}"));
+            check_on("snowflake", &format!("{name}(amount, scale) > 0"))
+                .unwrap_or_else(|e| panic!("{name} with a column scale must pass: {e:?}"));
+            check_on("snowflake", &format!("{name}(amount, \"scale\") > 0"))
+                .unwrap_or_else(|e| panic!("{name} with a quoted column scale must pass: {e:?}"));
+            check_on("snowflake", &format!("{name}(amount, t.scale) > 0")).unwrap_or_else(|e| {
+                panic!("{name} with a qualified column scale must pass: {e:?}")
+            });
+            let computed_scale = check_on("snowflake", &format!("{name}(amount, scale + 1) > 0"));
+            assert!(
+                matches!(
+                    computed_scale,
+                    Err(ValidationError::ExpressionFunctionShapeNotAllowed { .. })
+                ),
+                "{name} with a computed scale must be refused: {computed_scale:?}"
+            );
             check_on("snowflake", &format!("{name}(amount, -2) > 0"))
                 .unwrap_or_else(|e| panic!("{name} with a negative scale must pass: {e:?}"));
             check_on("snowflake", &format!("{name}(amount) > 0"))
