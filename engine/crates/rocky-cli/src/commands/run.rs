@@ -24861,6 +24861,91 @@ timestamp_column = "ts"
         );
     }
 
+    /// BigQuery's scalar MAX(ts) response must cross the real connector,
+    /// watermark resolver, and redb store without rounding a year-3000
+    /// timestamp upward. The next strict filter must use that same value.
+    #[tokio::test]
+    async fn bigquery_target_max_persists_exact_microsecond_watermark() {
+        use rocky_bigquery::auth::BigQueryAuth;
+        use rocky_bigquery::connector::BigQueryAdapter;
+        use rocky_bigquery::dialect::BigQueryDialect;
+        use rocky_core::redacted::RedactedString;
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::SqlDialect;
+        use rocky_ir::{MaterializationStrategy, TableRef, WatermarkState};
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bigquery/v2/projects/test-project/queries"))
+            .and(body_partial_json(serde_json::json!({
+                "query": "SELECT MAX(ts) FROM `test-project`.`dataset`.`events`",
+                "formatOptions": {"useInt64Timestamp": true}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jobComplete": true,
+                "schema": {"fields": [{"name": "f0_", "type": "TIMESTAMP"}]},
+                "rows": [{"f": [{"v": "32503680000000002"}]}],
+                "totalRows": "1"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let auth = BigQueryAuth::Bearer(RedactedString::new("test-token".into()));
+        let adapter = BigQueryAdapter::new("test-project", "EU", auth).with_base_url(server.uri());
+        let dialect = BigQueryDialect;
+        let target = TableRef {
+            catalog: "test-project".into(),
+            schema: "dataset".into(),
+            table: "events".into(),
+        };
+        let expected = chrono::DateTime::parse_from_rfc3339("3000-01-01T00:00:00.000002Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let resolved = super::resolve_new_watermark(
+            &MaterializationStrategy::Incremental {
+                timestamp_column: "ts".into(),
+            },
+            &adapter,
+            &dialect,
+            &target,
+            "ts",
+            None,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved, expected);
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let state = StateStore::open(&state_path).unwrap();
+        state
+            .set_watermark(
+                &target.state_key(),
+                &WatermarkState {
+                    last_value: resolved,
+                    updated_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+        drop(state);
+        let persisted = StateStore::open(&state_path)
+            .unwrap()
+            .get_watermark(&target.state_key())
+            .unwrap()
+            .unwrap()
+            .last_value;
+        assert_eq!(persisted, expected);
+        assert_eq!(
+            dialect.watermark_where("ts", Some(&persisted)).unwrap(),
+            "WHERE ts > TIMESTAMP '3000-01-01 00:00:00.000002'"
+        );
+        server.verify().await;
+    }
+
     /// #2004: the shared cell parser (`parse_timestamp_cell`, used by both
     /// the incremental-watermark read and the freshness-check fallback)
     /// must keep a fractional second it receives, and must still accept a

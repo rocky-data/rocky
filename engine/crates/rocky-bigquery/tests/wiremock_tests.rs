@@ -182,22 +182,24 @@ async fn happy_path_inline_result_parses_values() {
     assert_eq!(result.rows[1][2], json!("hi"));
 }
 
-/// A `TIMESTAMP` cell arrives as BigQuery's decimal-epoch-seconds string
-/// (`formatOptions.useInt64Timestamp` unset, so this is the only shape
-/// `execute_query`'s own request can receive) and must reach the caller as
-/// RFC 3339, with its fraction intact — the shape `parse_timestamp_cell` in
+/// A `TIMESTAMP` cell arrives as signed int64 microseconds because the POST
+/// requests `formatOptions.useInt64Timestamp=true`. It reaches the caller as
+/// exact RFC 3339, the shape `parse_timestamp_cell` in
 /// `rocky-cli` (the shared watermark reader) accepts. Before this fix the
 /// epoch string passed straight through unconverted (#2150): an incremental
 /// replication's watermark read failed on every run after the first.
 /// Every other column position is unaffected, pinning that the conversion
 /// is keyed off the schema's field type, not applied to every cell.
 #[tokio::test]
-async fn timestamp_cell_converts_epoch_seconds_to_rfc3339() {
+async fn timestamp_cell_converts_int64_microseconds_to_rfc3339() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path(QUERIES_PATH))
         .and(header("authorization", "Bearer test-bq-token"))
+        .and(body_partial_json(
+            json!({"formatOptions": {"useInt64Timestamp": true}}),
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jobComplete": true,
             "jobReference": {"projectId": "test-project", "jobId": "job-ts"},
@@ -209,12 +211,8 @@ async fn timestamp_cell_converts_epoch_seconds_to_rfc3339() {
                 ]
             },
             "rows": [
-                // A fractional-second epoch, the shape #2149's watermark
-                // fix depends on round-tripping intact.
-                {"f": [{"v": "1"}, {"v": "1757930400.25"}, {"v": null}]},
-                // A whole-second epoch (no fraction) is still an epoch
-                // string, not already RFC 3339 — same conversion applies.
-                {"f": [{"v": "2"}, {"v": "1757930400"}, {"v": null}]}
+                {"f": [{"v": "1"}, {"v": "1757930400250000"}, {"v": null}]},
+                {"f": [{"v": "2"}, {"v": "1757930400000000"}, {"v": null}]}
             ],
             "totalRows": "2"
         })))
@@ -233,8 +231,8 @@ async fn timestamp_cell_converts_epoch_seconds_to_rfc3339() {
     assert_eq!(result.rows[0][0], json!("1"));
     assert_eq!(
         result.rows[0][1],
-        json!("2025-09-15T10:00:00.250+00:00"),
-        "a fractional epoch-seconds cell must round-trip its fraction as RFC 3339"
+        json!("2025-09-15T10:00:00.250000Z"),
+        "a microsecond timestamp must round-trip exactly as RFC 3339"
     );
     // A NULL timestamp cell is not a string, so it must pass through as
     // Value::Null rather than being coerced into a conversion attempt.
@@ -243,8 +241,8 @@ async fn timestamp_cell_converts_epoch_seconds_to_rfc3339() {
     assert_eq!(result.rows[1][0], json!("2"));
     assert_eq!(
         result.rows[1][1],
-        json!("2025-09-15T10:00:00+00:00"),
-        "a whole-second epoch cell (no fraction) must still convert"
+        json!("2025-09-15T10:00:00.000000Z"),
+        "a whole-second timestamp must still use microsecond units"
     );
 }
 
@@ -277,6 +275,7 @@ async fn inline_query_collects_all_result_pages() {
         .and(query_param("location", "EU"))
         .and(query_param("maxResults", "10000"))
         .and(query_param("pageToken", "page-2"))
+        .and(query_param("formatOptions.useInt64Timestamp", "true"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jobComplete": true,
             "rows": [{"f": [{"v": "10000"}]}]
@@ -317,6 +316,7 @@ async fn deferred_query_collects_all_result_pages() {
     Mock::given(method("GET"))
         .and(path(poll_path))
         .and(query_param("timeoutMs", "10000"))
+        .and(query_param("formatOptions.useInt64Timestamp", "true"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jobComplete": true,
             "jobReference": {"projectId": "test-project", "jobId": "job-deferred-paged"},

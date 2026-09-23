@@ -380,6 +380,9 @@ impl BigQueryAdapter {
             location: self.location.clone(),
             timeout_ms: self.timeout_secs * 1000,
             max_results: MAX_RESULTS_PER_PAGE,
+            format_options: DataFormatOptions {
+                use_int64_timestamp: true,
+            },
         };
 
         debug!(sql = sql, project = %self.project_id, "executing BigQuery query");
@@ -468,6 +471,7 @@ impl BigQueryAdapter {
                     ("location", self.location.as_str()),
                     ("maxResults", "10000"),
                     ("timeoutMs", "10000"),
+                    ("formatOptions.useInt64Timestamp", "true"),
                 ])
                 .send()
                 .await?;
@@ -583,6 +587,7 @@ impl BigQueryAdapter {
                         ("location", self.location.as_str()),
                         ("maxResults", "10000"),
                         ("pageToken", page_token),
+                        ("formatOptions.useInt64Timestamp", "true"),
                     ])
                     .send()
                     .await?;
@@ -1308,23 +1313,12 @@ impl WarehouseAdapter for BigQueryAdapter {
 /// schema field type is `TIMESTAMP` — every other BigQuery type already
 /// round-trips as the plain string the REST API sends.
 ///
-/// # Why
-///
-/// Without `formatOptions.useInt64Timestamp` in the request — `QueryRequest`
-/// never sets it — BigQuery renders a `TIMESTAMP` cell as a decimal string
-/// of seconds since the Unix epoch, e.g. `"1757930400.25"`, never RFC 3339.
-/// `parse_timestamp_cell` in `rocky-cli` (the shared reader every adapter's
-/// watermark and freshness-check cell goes through) accepts RFC 3339 or a
-/// naive `%Y-%m-%d %H:%M:%S[.fff]` string; neither matches an epoch number,
-/// so an incremental replication on BigQuery could never read its watermark
-/// back — it failed loudly on every run after the first (#2150). Databricks,
-/// Snowflake and Trino already hand back RFC 3339 (verified by reading their
-/// connector code, #2149); this is BigQuery's matching conversion, added at
-/// the cell instead of widening `parse_timestamp_cell` to guess an epoch for
-/// every adapter.
+/// Every row-returning request sets `formatOptions.useInt64Timestamp=true`,
+/// so a TIMESTAMP cell is a signed int64 count of **microseconds** since the
+/// Unix epoch. Convert it before the shared CLI watermark reader sees it.
 ///
 /// A cell that is not a JSON string, or a string [`parse_bigquery_epoch_timestamp`]
-/// cannot read as either shape below, is returned completely unconverted —
+/// cannot read as signed int64 microseconds, is returned unconverted —
 /// a conversion this function cannot do must not manufacture a fact (e.g.
 /// `null`) the caller did not have before.
 fn convert_bigquery_timestamp_cell(value: serde_json::Value) -> serde_json::Value {
@@ -1332,91 +1326,20 @@ fn convert_bigquery_timestamp_cell(value: serde_json::Value) -> serde_json::Valu
         return value;
     };
     match parse_bigquery_epoch_timestamp(raw) {
-        Some(dt) => serde_json::Value::String(dt.to_rfc3339()),
+        Some(dt) => {
+            serde_json::Value::String(dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+        }
         None => value,
     }
 }
 
-/// Parses a BigQuery `TIMESTAMP` cell's decimal-epoch string into a UTC
-/// instant, keeping sub-second precision exactly via string/integer
-/// arithmetic rather than a float parse — `"1757930400.25".parse::<f64>()`
-/// does not round-trip every fractional value exactly, and a lost fraction
-/// here is the identical defect #2149 fixed on the DuckDB side of the same
-/// watermark read.
-///
-/// Accepts two shapes:
-/// - `["-"] <seconds> ["." <fraction>]` — the shape this connector's own
-///   requests always receive (no `formatOptions.useInt64Timestamp`). The
-///   fraction is right-padded or truncated to 9 digits (nanoseconds); a
-///   negative value with a fraction floors correctly (e.g. `"-0.25"` is
-///   250ms *before* the epoch, i.e. `-1s + 750_000_000ns`, not `-0.75s`).
-/// - a bare integer of magnitude >= 10^12, read as whole **microseconds**
-///   since the epoch instead of seconds — the shape
-///   `formatOptions.useInt64Timestamp=true` produces, which nothing in this
-///   crate requests today, but which this function tolerates rather than
-///   silently mis-scaling by 10^6 if a future caller sets it. BigQuery's
-///   `TIMESTAMP` range ends at the year 9999 (~2.5*10^11 seconds from
-///   epoch); 10^12 read as *seconds* is later than the year 33658, so a
-///   value at or past that floor can only be the microsecond shape.
-///
-/// Returns `None` for anything else (not a decimal number, or a malformed
-/// fraction) — the caller passes the original cell through unconverted
-/// rather than losing it.
+/// Parses a signed int64 count of **microseconds** since the Unix epoch.
+/// The unit is fixed by `formatOptions.useInt64Timestamp=true` on each
+/// row-returning request. No floating-point or magnitude inference is used.
+/// An invalid or out-of-range value remains unconverted for the caller to
+/// reject rather than being silently rounded into a different watermark.
 fn parse_bigquery_epoch_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    const MICROSECOND_MAGNITUDE_FLOOR: i64 = 1_000_000_000_000; // 10^12
-
-    let (negative, unsigned) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s),
-    };
-    if unsigned.is_empty() {
-        return None;
-    }
-
-    if let Some((int_part, frac_part)) = unsigned.split_once('.') {
-        if int_part.is_empty()
-            || frac_part.is_empty()
-            || !frac_part.bytes().all(|b| b.is_ascii_digit())
-        {
-            return None;
-        }
-        let magnitude_secs: i64 = int_part.parse().ok()?;
-        let mut nanos_digits = frac_part.to_string();
-        nanos_digits.truncate(9);
-        while nanos_digits.len() < 9 {
-            nanos_digits.push('0');
-        }
-        let frac_nanos: u32 = nanos_digits.parse().ok()?;
-
-        let (secs, nanos) = if negative && frac_nanos > 0 {
-            // -100.25s is 100.25s BEFORE the epoch: floor(-100.25) = -101,
-            // and the nanosecond remainder is measured forward from there
-            // (-101s + 0.75s = -100.25s), not -100s + 0.25s (-99.75s).
-            (-(magnitude_secs + 1), 1_000_000_000 - frac_nanos)
-        } else {
-            (
-                if negative {
-                    -magnitude_secs
-                } else {
-                    magnitude_secs
-                },
-                frac_nanos,
-            )
-        };
-        return chrono::DateTime::from_timestamp(secs, nanos);
-    }
-
-    if !unsigned.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let magnitude: i64 = unsigned.parse().ok()?;
-    if magnitude >= MICROSECOND_MAGNITUDE_FLOOR {
-        let micros = if negative { -magnitude } else { magnitude };
-        let secs = micros.div_euclid(1_000_000);
-        let rem_micros = micros.rem_euclid(1_000_000);
-        return chrono::DateTime::from_timestamp(secs, (rem_micros * 1_000) as u32);
-    }
-    chrono::DateTime::from_timestamp(if negative { -magnitude } else { magnitude }, 0)
+    chrono::DateTime::from_timestamp_micros(s.parse::<i64>().ok()?)
 }
 
 /// Verify the bisection runner passed K contiguous IntRange chunks and
@@ -1708,6 +1631,13 @@ struct QueryRequest {
     location: String,
     timeout_ms: u64,
     max_results: u32,
+    format_options: DataFormatOptions,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DataFormatOptions {
+    use_int64_timestamp: bool,
 }
 
 // -- load-job (`jobs.insert`) wire request --
@@ -2161,10 +2091,14 @@ mod tests {
             location: "US".to_string(),
             timeout_ms: 30000,
             max_results: MAX_RESULTS_PER_PAGE,
+            format_options: DataFormatOptions {
+                use_int64_timestamp: true,
+            },
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("useLegacySql"));
         assert!(json.contains("timeoutMs"));
+        assert!(json.contains("\"formatOptions\":{\"useInt64Timestamp\":true}"));
     }
 
     #[test]
@@ -2213,7 +2147,7 @@ mod tests {
                 ]
             },
             "rows": [
-                {"f": [{"v": "1"}, {"v": "1757930400.25"}]}
+                {"f": [{"v": "1"}, {"v": "1757930400250000"}]}
             ]
         }"#;
         let resp: BigQueryResponse = serde_json::from_str(json).unwrap();
@@ -2225,59 +2159,28 @@ mod tests {
         let converted = convert_bigquery_timestamp_cell(cell);
         assert_eq!(
             converted,
-            serde_json::Value::String("2025-09-15T10:00:00.250+00:00".to_string())
+            serde_json::Value::String("2025-09-15T10:00:00.250000Z".to_string())
         );
     }
 
     #[test]
-    fn epoch_timestamp_whole_seconds_has_no_fraction() {
-        let dt = parse_bigquery_epoch_timestamp("1757930400").unwrap();
-        assert_eq!(dt.to_rfc3339(), "2025-09-15T10:00:00+00:00");
+    fn epoch_timestamp_is_always_signed_microseconds() {
+        for (raw, expected) in [
+            ("-1", "1969-12-31T23:59:59.999999Z"),
+            ("0", "1970-01-01T00:00:00.000000Z"),
+            ("1", "1970-01-01T00:00:00.000001Z"),
+            ("1757930400250001", "2025-09-15T10:00:00.250001Z"),
+            ("32503680000000002", "3000-01-01T00:00:00.000002Z"),
+        ] {
+            assert_eq!(
+                convert_bigquery_timestamp_cell(serde_json::Value::String(raw.into())),
+                serde_json::Value::String(expected.into()),
+                "wrong conversion for {raw} microseconds"
+            );
+        }
     }
 
-    #[test]
-    fn epoch_timestamp_fraction_is_kept_exactly() {
-        let dt = parse_bigquery_epoch_timestamp("1757930400.25").unwrap();
-        assert_eq!(dt.to_rfc3339(), "2025-09-15T10:00:00.250+00:00");
-        // A single sub-second digit still keeps its true magnitude (100ms),
-        // not a truncated or rounded one.
-        let dt = parse_bigquery_epoch_timestamp("1757930400.1").unwrap();
-        assert_eq!(dt.to_rfc3339(), "2025-09-15T10:00:00.100+00:00");
-    }
-
-    /// A negative epoch (pre-1970) with a fraction must floor correctly:
-    /// `-0.25` is 250ms *before* the epoch, i.e. `1969-12-31T23:59:59.750Z`,
-    /// not `1969-12-31T23:59:59.250Z` (naive `-secs, +nanos` decomposition
-    /// would land on the wrong instant here).
-    #[test]
-    fn epoch_timestamp_negative_fraction_floors_correctly() {
-        let dt = parse_bigquery_epoch_timestamp("-0.25").unwrap();
-        assert_eq!(dt.to_rfc3339(), "1969-12-31T23:59:59.750+00:00");
-
-        // A negative value with NO fraction needs no floor adjustment.
-        let dt = parse_bigquery_epoch_timestamp("-100").unwrap();
-        assert_eq!(dt.to_rfc3339(), "1969-12-31T23:58:20+00:00");
-    }
-
-    /// `formatOptions.useInt64Timestamp=true` (which nothing in this crate
-    /// requests) would return whole microseconds instead of a decimal
-    /// seconds string. A magnitude at or past 10^12 can only be that shape —
-    /// read as seconds it would be later than the year 33658.
-    #[test]
-    fn epoch_timestamp_large_bare_integer_is_read_as_microseconds() {
-        let dt = parse_bigquery_epoch_timestamp("1757930400250000").unwrap();
-        assert_eq!(dt.to_rfc3339(), "2025-09-15T10:00:00.250+00:00");
-
-        // Just under the floor: still read as whole SECONDS (a huge but
-        // not-yet-implausible date), not silently rescaled.
-        let dt = parse_bigquery_epoch_timestamp("999999999999").unwrap();
-        assert_eq!(
-            dt,
-            chrono::DateTime::from_timestamp(999_999_999_999, 0).unwrap()
-        );
-    }
-
-    /// A malformed cell (not a decimal number in either shape) is left
+    /// A malformed cell (not signed int64 microseconds) is left
     /// completely unconverted rather than turned into `null` — a
     /// conversion this function cannot do must not manufacture a fact the
     /// caller did not have before.
@@ -2288,6 +2191,8 @@ mod tests {
         assert!(parse_bigquery_epoch_timestamp("1.2.3").is_none());
         assert!(parse_bigquery_epoch_timestamp("1.").is_none());
         assert!(parse_bigquery_epoch_timestamp(".5").is_none());
+        assert!(parse_bigquery_epoch_timestamp("32503680000.000002").is_none());
+        assert!(parse_bigquery_epoch_timestamp("9223372036854775808").is_none());
 
         // Already-RFC-3339 input (not a shape this connector's own
         // requests ever produce) is not a decimal number either, so it
