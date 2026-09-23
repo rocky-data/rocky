@@ -94,13 +94,10 @@ fn validate_branch_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Accept the former branch-name alphabet only for a record already stored.
-/// Callers here never interpolate its schema into unquoted SQL. Promote's
-/// `build_promote_sql` quotes every target part and checks unquotable delimiters.
-pub(crate) fn validate_existing_branch_name(state_path: &Path, name: &str) -> Result<()> {
-    if validate_branch_name(name).is_ok() {
-        return Ok(());
-    }
+/// Validate the former branch-name alphabet for an already persisted promote
+/// plan. Its SQL was built with quoted schema components at plan time, and
+/// deleting the branch record does not revoke that plan.
+pub(crate) fn validate_persisted_promote_branch_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.len() > 64
         || !name
@@ -109,6 +106,17 @@ pub(crate) fn validate_existing_branch_name(state_path: &Path, name: &str) -> Re
     {
         return validate_branch_name(name);
     }
+    Ok(())
+}
+
+/// Accept the former branch-name alphabet only for a record already stored.
+/// Callers here never interpolate its schema into unquoted SQL. Promote's
+/// `build_promote_sql` quotes every target part and checks unquotable delimiters.
+pub(crate) fn validate_existing_branch_name(state_path: &Path, name: &str) -> Result<()> {
+    if validate_branch_name(name).is_ok() {
+        return Ok(());
+    }
+    validate_persisted_promote_branch_name(name)?;
     let store = StateStore::open_read_only(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
     if store.get_branch(name)?.is_none() {
@@ -1851,7 +1859,7 @@ pub async fn run_branch_promote_from_plan(
     use crate::plan_store::{PlanKind, read_plan};
 
     if let Some(name) = name {
-        validate_existing_branch_name(state_path, name)?;
+        validate_persisted_promote_branch_name(name)?;
     }
 
     let plan =
@@ -1878,7 +1886,7 @@ pub async fn run_branch_promote_from_plan(
 
     let promote_plan: PromotePlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize promote plan payload")?;
-    validate_existing_branch_name(state_path, &promote_plan.branch_name)?;
+    validate_persisted_promote_branch_name(&promote_plan.branch_name)?;
 
     if let Some(n) = name
         && n != promote_plan.branch_name
@@ -3936,6 +3944,12 @@ auto_create_schemas = true
                 .all(|target| target.statement.contains("\"branch__fix-price\""))
         );
         let plan_id = planned.plan_output.plan_id.expect("persisted promote plan");
+        // A persisted promote plan remains valid after the branch record is
+        // deleted. Its source schema is already quoted in the stored SQL.
+        let store = StateStore::open(&state_path).unwrap();
+        assert!(store.delete_branch(legacy_name).unwrap());
+        assert!(store.get_branch(legacy_name).unwrap().is_none());
+        drop(store);
         crate::commands::apply::run_apply_in(
             dir,
             &config_path,
@@ -3946,7 +3960,57 @@ auto_create_schemas = true
             false,
         )
         .await
-        .expect("apply an existing legacy promote plan");
+        .expect("apply a legacy promote plan after its branch record was deleted");
+        let adapter = DuckDbWarehouseAdapter::open(&duckdb_path).expect("reopen duckdb");
+        let rows = adapter
+            .execute_query("SELECT CAST(COUNT(*) AS BIGINT) FROM warehouse.marts.fct_orders")
+            .await
+            .expect("query the table written by the persisted plan");
+        let count = rows.rows[0][0]
+            .as_i64()
+            .or_else(|| rows.rows[0][0].as_str().and_then(|s| s.parse::<i64>().ok()));
+        assert_eq!(count, Some(2));
+        drop(adapter);
+
+        // The alternate persisted-plan entry point uses the same rule, even
+        // when its optional positional name is supplied.
+        run_branch_promote_from_plan(
+            dir,
+            &config_path,
+            &plan_id,
+            Some(legacy_name),
+            None,
+            &state_path,
+            rocky_core::config::PolicyPrincipal::Human,
+            false,
+        )
+        .await
+        .expect("branch promote --plan must not require the deleted branch record");
+        run_branch_promote_from_plan(
+            dir,
+            &config_path,
+            &plan_id,
+            None,
+            None,
+            &state_path,
+            rocky_core::config::PolicyPrincipal::Human,
+            false,
+        )
+        .await
+        .expect("branch promote --plan without a name must not require the deleted record");
+
+        // Bare promote still builds a new plan and requires the live record.
+        let store = StateStore::open(&state_path).unwrap();
+        store
+            .put_branch(&BranchRecord {
+                name: legacy_name.to_string(),
+                schema_prefix: "branch__fix-price".to_string(),
+                created_by: "legacy".to_string(),
+                created_at: chrono::Utc::now(),
+                description: None,
+            })
+            .unwrap();
+        drop(store);
         run_branch_promote_from_plan(
             dir,
             &config_path,
