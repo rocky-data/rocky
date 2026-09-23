@@ -6391,15 +6391,79 @@ mod tests {
     ///   request 3   -> 200, the route recovers
     /// ```
     ///
-    /// The writer is unconditional and starts before the first assertion, so a
-    /// failing run still unblocks the read and the test FAILS rather than
-    /// hanging.
+    /// # #2153 / #2133: outliving this test is not the same as failing it
+    ///
+    /// `spawn_blocking` cannot be cancelled, so request 1's read above is
+    /// ABANDONED, not stopped, once its deadline fires: it keeps running on its
+    /// own OS thread. Dropping a `tokio::Runtime` waits, with no timeout, for
+    /// every such thread to finish. A one-shot writer (write once, then exit)
+    /// only answers that first, abandoned read -- sampling the hung test
+    /// binaries directly caught a SECOND read of this FIFO starting after this
+    /// test's writer had already exited, from a caller this test does not
+    /// otherwise pin down. That read found no writer, blocked forever, and the
+    /// runtime's drop hung the whole test BINARY with it (#2153; #2133 is the
+    /// duplicate that first hit it under load and killed the binary after it
+    /// sat hung for about 53 minutes).
+    ///
+    /// So the fix has two independent parts:
+    ///
+    /// - The writer is PERSISTENT: it keeps answering opens of the FIFO, not
+    ///   just the first one, for as long as this function lets it run.
+    /// - The runtime is built and dropped EXPLICITLY here (not via
+    ///   `#[tokio::test]`'s invisible epilogue), so this function -- not a
+    ///   macro -- controls exactly when that unbounded wait happens, and keeps
+    ///   the writer alive across it. Only once `drop(runtime)` has returned is
+    ///   the writer released and joined.
+    ///
+    /// A wall-clock watchdog thread is the backstop: if this function does not
+    /// finish within 60s regardless, it aborts the process so a regression here
+    /// fails the `Test` job in about a minute instead of hanging it for hours.
     ///
     /// Unix-only: it needs a FIFO. The repo already guards filesystem-shape
     /// tests this way.
     #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_stuck_config_read_is_bounded_refused_and_recovers() {
+    #[test]
+    fn a_stuck_config_read_is_bounded_refused_and_recovers() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // THE WATCHDOG. Its own OS thread, independent of the tokio runtime
+        // built below, so it can still act if THAT is what hangs.
+        // `_cancel_watchdog`'s `Drop` sends "done" on every exit from this
+        // function -- normal return, the re-raised panic at the bottom, or a
+        // panic in the setup before `catch_unwind` -- because unwinding runs
+        // local destructors. Only a genuine hang leaves it undropped, which is
+        // exactly when the watchdog must fire.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        struct CancelWatchdog(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for CancelWatchdog {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let _cancel_watchdog = CancelWatchdog(Some(done_tx));
+        std::thread::spawn(move || {
+            let bound = std::time::Duration::from_secs(60);
+            if done_rx.recv_timeout(bound).is_err() {
+                // libtest's output capture is inherited by a spawned thread,
+                // so a captured `eprintln!` here would sit in a buffer that
+                // only gets printed once the test function returns -- which,
+                // on the abort below, never happens, so the message would be
+                // lost with it. Writing the raw fd instead bypasses that
+                // capture and lands in the log immediately.
+                let _ = std::io::stderr().write_all(
+                    format!(
+                        "\nWATCHDOG: a_stuck_config_read_is_bounded_refused_and_recovers \
+                         did not finish within {bound:?}; aborting so CI fails fast instead \
+                         of hanging on Runtime::drop (#2153, #2133).\n"
+                    )
+                    .as_bytes(),
+                );
+                std::process::abort();
+            }
+        });
+
         // `keep()`, so the directory OUTLIVES A PANIC.
         //
         // With an ordinary `TempDir`, a failed assertion drops it during
@@ -6429,111 +6493,173 @@ mod tests {
             "could not create the FIFO this test needs"
         );
 
-        // THE FIFO MUST ALWAYS BE UNBLOCKED, including on a failed assertion.
+        // THE PERSISTENT WRITER. Answers every open of the FIFO for write, not
+        // just the first -- see "outliving this test" above for why one-shot
+        // was not enough: whatever reads the FIFO after this test's own body
+        // finishes, including the abandoned request-1 read once its deadline
+        // fires, still finds an answer, for as long as this thread runs. Only
+        // the explicit release at the bottom of this function stops it, and
+        // that happens after `drop(runtime)` -- the wait that used to be
+        // unbounded AND invisible -- has already returned.
         //
-        // `spawn_blocking` cannot be cancelled, and dropping a tokio runtime
-        // waits for its blocking tasks. So a panic while request 1 is parked in
-        // `read_to_string` leaves that task blocked forever and the test BINARY
-        // hangs instead of failing — which is how the first version of this
-        // test sat stuck for eight hours under a mutation rather than reporting
-        // the mutation.
-        //
-        // An unconditional writer, started before anything that can panic,
-        // removes that: whatever the test does, the read completes and the
-        // runtime can drop. It writes after the deadline below has elapsed, so
-        // it does not shorten the timeout it is there to let us observe.
-        let writer_path = fifo.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(7));
-            // Opening a FIFO for write blocks until a reader is present; the
-            // parked read IS that reader. If it already finished, this errors
-            // rather than blocking the process, and either way we ignore it.
-            // This only works because `root` is kept: a deleted FIFO would make
-            // this a silent no-op and strand the reader.
-            let _ = std::fs::write(&writer_path, "[adapter]\ntype = \"duckdb\"\n");
-        });
+        // The first write still waits 7s, same as before, so it does not
+        // shorten the deadline under test; every write after that answers as
+        // soon as a new reader shows up.
+        let stop_writer = std::sync::Arc::new(AtomicBool::new(false));
+        let writer_handle = {
+            let stop_writer = std::sync::Arc::clone(&stop_writer);
+            let writer_path = fifo.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(7));
+                loop {
+                    if stop_writer.load(Ordering::Acquire) {
+                        break;
+                    }
+                    // Opening a FIFO for write blocks until a reader is
+                    // present -- including, at release time below, the
+                    // read+write handle opened deliberately to unstick this
+                    // call. This only works because `root` is kept: a deleted
+                    // FIFO would make this a silent no-op and strand a reader.
+                    let _ = std::fs::write(&writer_path, "[adapter]\ntype = \"duckdb\"\n");
+                    // A real reader needs a moment to drain before the next
+                    // writer reopens, or it can be handed the payload twice
+                    // across two of its own read() calls.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            })
+        };
 
-        // No token configured, so the requests below need no header.
-        let state = ServerState::with_auth_and_webhook(
-            models_dir,
-            false,
-            None,
-            Some(fifo.clone()),
-            None,
-            Vec::new(),
-            None,
-            None,
-            None,
-            rocky_server::state::SettingsSnapshot {
-                bind_host: "127.0.0.1".to_string(),
-                ..Default::default()
-            },
-        );
-        assert!(state.settings.config_labels.get().is_none());
+        // The scenario itself runs on a runtime built here, not via
+        // `#[tokio::test]` -- see the doc comment above. `catch_unwind` means
+        // a failing assertion below still reaches the shutdown further down,
+        // rather than skipping straight to an unguarded `Runtime::drop` inside
+        // an invisible macro epilogue.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let body_fifo = fifo.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async move {
+                let fifo = body_fifo;
+                // No token configured, so the requests below need no header.
+                let state = ServerState::with_auth_and_webhook(
+                    models_dir,
+                    false,
+                    None,
+                    Some(fifo.clone()),
+                    None,
+                    Vec::new(),
+                    None,
+                    None,
+                    None,
+                    rocky_server::state::SettingsSnapshot {
+                        bind_host: "127.0.0.1".to_string(),
+                        ..Default::default()
+                    },
+                );
+                assert!(state.settings.config_labels.get().is_none());
 
-        let base = spawn_router(state.clone()).await;
-        let client = reqwest::Client::new();
-        let url = format!("{base}/api/v1/settings");
+                let base = spawn_router(state.clone()).await;
+                let client = reqwest::Client::new();
+                let url = format!("{base}/api/v1/settings");
 
-        // Request 1 parks inside the read, holding the permit.
-        let first = tokio::spawn({
-            let client = client.clone();
-            let url = url.clone();
-            async move { client.get(url).send().await.unwrap().status() }
-        });
+                // Request 1 parks inside the read, holding the permit.
+                let first = tokio::spawn({
+                    let client = client.clone();
+                    let url = url.clone();
+                    async move { client.get(url).send().await.unwrap().status() }
+                });
 
-        // Wait for it to actually take the lane.
-        let mut taken = false;
-        for _ in 0..400 {
-            if Arc::clone(&state.settings_reads)
-                .try_acquire_owned()
-                .is_err()
-            {
-                taken = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(taken, "the read never took the admission lane");
+                // Wait for it to actually take the lane.
+                let mut taken = false;
+                for _ in 0..400 {
+                    if Arc::clone(&state.settings_reads)
+                        .try_acquire_owned()
+                        .is_err()
+                    {
+                        taken = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                assert!(taken, "the read never took the admission lane");
 
-        // THE BOUND: a second caller is refused at once, not queued behind a
-        // read that may never return.
-        let second = client.get(&url).send().await.unwrap();
-        assert_eq!(
-            second.status(),
-            503,
-            "a second read must be refused, not queued"
-        );
-        assert!(second.headers().contains_key("retry-after"));
+                // THE BOUND: a second caller is refused at once, not queued
+                // behind a read that may never return.
+                let second = client.get(&url).send().await.unwrap();
+                assert_eq!(
+                    second.status(),
+                    503,
+                    "a second read must be refused, not queued"
+                );
+                assert!(second.headers().contains_key("retry-after"));
 
-        // The first caller gets its own deadline back -- 504, and deliberately
-        // NOT 503 with a retry hint, because this read will not finish on its
-        // own.
-        assert_eq!(
-            first.await.unwrap(),
-            504,
-            "the parked caller must time out rather than hang forever"
-        );
+                // The first caller gets its own deadline back -- 504, and
+                // deliberately NOT 503 with a retry hint, because this read
+                // will not finish on its own.
+                assert_eq!(
+                    first.await.unwrap(),
+                    504,
+                    "the parked caller must time out rather than hang forever"
+                );
 
-        // RECOVERY: once the writer above unblocks the read, it completes,
-        // caches, frees the lane, and the route works again.
-        let mut recovered = 0;
-        for _ in 0..600 {
-            let status = client.get(&url).send().await.unwrap().status();
-            if status == 200 {
-                recovered = 200;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        assert_eq!(
-            recovered, 200,
-            "the route must recover once the stuck read finally returns"
-        );
+                // RECOVERY: once the writer above unblocks the read, it
+                // completes, caches, frees the lane, and the route works
+                // again.
+                let mut recovered = 0;
+                for _ in 0..600 {
+                    let status = client.get(&url).send().await.unwrap().status();
+                    if status == 200 {
+                        recovered = 200;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                assert_eq!(
+                    recovered, 200,
+                    "the route must recover once the stuck read finally returns"
+                );
+            });
+        }));
+
+        // Drop the runtime EXPLICITLY, with the writer still answering opens
+        // -- this is the wait that used to be unbounded and invisible, run via
+        // an ordinary macro epilogue after a one-shot writer had already
+        // exited. Whatever reads the FIFO after the body above, the writer is
+        // still there to answer it, so this returns instead of hanging; the
+        // watchdog is the backstop if it somehow doesn't.
+        drop(runtime);
+
+        // Only now release the writer: set the flag, then open the FIFO
+        // read+write -- the one open mode a FIFO never blocks on, for either
+        // side -- to unstick a writer parked in `open(O_WRONLY)` waiting for a
+        // reader that will never come now. HOLD this handle across the join,
+        // not just the open call: if the writer hasn't reached its own
+        // `open(O_WRONLY)` yet, closing ours immediately would let it go back
+        // to sleep and try again with no reader left, hanging `join()` below
+        // (the watchdog would still catch that, but it would take down this
+        // whole ~2000-test binary over a bug in the cleanup, not the fix).
+        // Held open, it also gives the writer's last `write()` a reader, so
+        // that call cannot return `EPIPE`.
+        stop_writer.store(true, Ordering::Release);
+        let unstick = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo);
+        writer_handle.join().unwrap();
+        drop(unstick);
 
         // Reached only when every assertion above passed; a failing run leaves
-        // the directory behind on purpose.
-        let _ = std::fs::remove_dir_all(&root);
+        // the directory behind on purpose (see `keep()` above) -- and, now
+        // that the writer answers every read, it does so without stranding
+        // anything.
+        if result.is_ok() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     /// **Red team, round 1.** `build_cors_layer` drops an origin that is not a
