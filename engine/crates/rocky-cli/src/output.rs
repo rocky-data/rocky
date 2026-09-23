@@ -4781,7 +4781,6 @@ impl ChecksConfigOutput {
             threshold_seconds: f.threshold_seconds,
         });
 
-        let runs = |k: CheckKind| executed_kinds.contains(&k);
         let mut configured_checks: BTreeMap<String, Vec<ResolvedCheckNameOutput>> = BTreeMap::new();
 
         // (source_type, table) pairs across discovered sources.
@@ -4796,43 +4795,49 @@ impl ChecksConfigOutput {
         let unique_tables: std::collections::BTreeSet<&str> =
             pairs.iter().map(|(_, t)| t.as_str()).collect();
 
-        // Custom checks run against every materialized table.
-        if runs(CheckKind::Custom) {
-            for &table in &unique_tables {
-                for custom in &cfg.custom {
-                    configured_checks
-                        .entry(table.to_string())
-                        .or_default()
-                        .push(ResolvedCheckNameOutput {
-                            name: custom.name.clone(),
-                            kind: "custom".into(),
-                            candidate: false,
-                        });
-                }
+        // Every discovered table gets the full per-table derivation: custom,
+        // null_rate, assertions ON THIS TABLE, and cross_source_overlap when
+        // it has ≥2 siblings under the same source type. Shared with the
+        // pre-run collision guards (`rocky-core::config`, `rocky-cli`'s
+        // `run.rs`) so none of the three can disagree about which names a
+        // table emits (#1941).
+        for &table in &unique_tables {
+            let sibling_source_types: Vec<String> = pairs
+                .iter()
+                .filter(|(_, t)| t == table)
+                .map(|(source_type, _)| source_type.clone())
+                .collect();
+            let names = rocky_core::config::resolved_check_names_for_table(
+                cfg,
+                executed_kinds,
+                table,
+                &sibling_source_types,
+            );
+            if names.is_empty() {
+                continue;
             }
+            configured_checks
+                .entry(table.to_string())
+                .or_default()
+                .extend(names.into_iter().map(|n| ResolvedCheckNameOutput {
+                    name: n.name,
+                    kind: n.kind.as_str().to_string(),
+                    candidate: n.candidate,
+                }));
         }
 
-        // Null-rate: one result per configured column, per table.
-        if runs(CheckKind::NullRate)
-            && let Some(nr) = cfg.null_rate.as_ref()
-        {
-            for &table in &unique_tables {
-                for col in &nr.columns {
-                    configured_checks
-                        .entry(table.to_string())
-                        .or_default()
-                        .push(ResolvedCheckNameOutput {
-                            name: rocky_core::checks::null_rate_check_name(col),
-                            kind: "null_rate".into(),
-                            candidate: false,
-                        });
-                }
-            }
-        }
-
-        // Assertions attach to their specific target table.
-        if runs(CheckKind::Assertions) {
+        // An assertion whose table was NOT among the discovered tables still
+        // gets its resolved name projected — `rocky discover` declares the
+        // spec even though this snapshot didn't discover the table, so a
+        // consumer can pre-declare it before the table shows up. Unlike the
+        // discovered-table loop above this does not also add custom/null_rate
+        // entries for that table: those apply only once the table is
+        // actually materialized, which this snapshot has no evidence of.
+        if executed_kinds.contains(&CheckKind::Assertions) {
             for assertion in &cfg.assertions {
+                if unique_tables.contains(assertion.table.as_str()) {
+                    continue; // already covered by the loop above
+                }
                 configured_checks
                     .entry(assertion.table.clone())
                     .or_default()
@@ -4842,31 +4847,6 @@ impl ChecksConfigOutput {
                         candidate: false,
                     });
             }
-        }
-
-        // Cross-source overlap: candidate names for ≥2 (source_type, table)
-        // groups — marked `candidate` because the actual set depends on
-        // runtime-discovered siblings, which may differ from what discover sees.
-        if runs(CheckKind::CrossSourceOverlap) && cfg.cross_source_overlap.is_some() {
-            for (source_type, table) in
-                rocky_core::checks::cross_source_overlap_groups(pairs.iter().cloned())
-            {
-                configured_checks
-                    .entry(table.clone())
-                    .or_default()
-                    .push(ResolvedCheckNameOutput {
-                        name: rocky_core::checks::cross_source_overlap_name(&source_type, &table),
-                        kind: "cross_source_overlap".into(),
-                        candidate: true,
-                    });
-            }
-        }
-
-        // Dedup identical names per table (e.g. a custom check on a table name
-        // that appears under multiple sources), preserving declaration order.
-        for names in configured_checks.values_mut() {
-            let mut seen = std::collections::HashSet::new();
-            names.retain(|n| seen.insert(n.name.clone()));
         }
 
         if freshness.is_none() && configured_checks.is_empty() {

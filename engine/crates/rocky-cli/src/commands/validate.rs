@@ -547,6 +547,9 @@ fn config_error_diagnostic(
             "V046",
             Some(format!("pipeline.{pipeline}.checks.anomaly_threshold_pct")),
         ),
+        ConfigError::DuplicateCheckName { pipeline, .. } => {
+            ("V046", Some(format!("pipeline.{pipeline}.checks")))
+        }
         _ => ("V046", None),
     };
 
@@ -3689,6 +3692,66 @@ models = "{models_glob}"
             v047[0].field.as_deref(),
             Some("pipeline.silver.models"),
             "the field path must point an IDE at the offending key"
+        );
+    }
+
+    /// #1941: `rocky validate` refuses a config whose custom-check name
+    /// sanitizes onto the same Dagster check name as an assertion on the
+    /// same table, naming both sources. This is the STATIC half of the
+    /// guard — `validate_checks` (`rocky-core/src/config.rs`) catches it at
+    /// config load, before discovery runs. The run-time half (the complete
+    /// per-table check once discovery has found the actual materialized
+    /// tables) is covered by a separate test in `commands/run.rs`.
+    ///
+    /// Mutation that must turn this red: drop the per-table
+    /// `resolved_check_name_collisions` loop from `validate_checks`.
+    #[test]
+    fn a_static_check_name_collision_is_refused_naming_both_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[adapter]
+type = "duckdb"
+path = "wh.duckdb"
+
+[pipeline.dq]
+type = "quality"
+
+[pipeline.dq.target]
+adapter = "default"
+
+[[pipeline.dq.checks.custom]]
+name = "orders check"
+sql = "SELECT 0"
+threshold = 0
+
+[[pipeline.dq.checks.assertions]]
+table = "orders"
+name = "orders_check"
+type = "not_null"
+column = "id"
+"#,
+        )
+        .unwrap();
+
+        let out = validate_inner(&config_path).unwrap();
+
+        assert!(
+            !out.valid,
+            "a static check-name collision must fail validation; messages: {:?}",
+            out.messages
+        );
+        let msg = out
+            .messages
+            .iter()
+            .find(|m| m.message.contains("orders check") && m.message.contains("orders_check"))
+            .unwrap_or_else(|| panic!("must name both colliding sources: {:?}", out.messages));
+        assert!(
+            msg.message.contains("sanitize"),
+            "the message must explain why the two names collide: {}",
+            msg.message
         );
     }
 
