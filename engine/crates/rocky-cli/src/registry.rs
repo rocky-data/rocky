@@ -515,7 +515,7 @@ impl AdapterRegistry {
                 }
                 // Test-only, same exemption as "recording" above. Registers a
                 // `WarehouseAdapter` that wraps a real in-memory DuckDB
-                // adapter but fails every write with a fixed, typed
+                // adapter but fails the selected warehouse call with a typed
                 // Databricks `ConnectorError`, wrapped exactly the way
                 // production wraps a warehouse adapter's connector error
                 // (#2064) — so a test can drive a transformation model's
@@ -530,6 +530,18 @@ impl AdapterRegistry {
                         Some("auth") => crate::testing::FailingWriteKind::Auth,
                         Some("rate-limit") => crate::testing::FailingWriteKind::RateLimit,
                         Some("breaker") => crate::testing::FailingWriteKind::CircuitBreaker,
+                        Some("content-query-rate-limit") => {
+                            crate::testing::FailingWriteKind::ContentQueryRateLimit
+                        }
+                        Some("content-query-breaker") => {
+                            crate::testing::FailingWriteKind::ContentQueryCircuitBreaker
+                        }
+                        Some("content-msck-rate-limit") => {
+                            crate::testing::FailingWriteKind::ContentMsckRateLimit
+                        }
+                        Some("content-msck-breaker") => {
+                            crate::testing::FailingWriteKind::ContentMsckCircuitBreaker
+                        }
                         other => bail!("adapters.{name}: unknown test failure {other:?}"),
                     };
                     let adapter = Arc::new(crate::testing::FailingWriteWarehouseAdapter::new(

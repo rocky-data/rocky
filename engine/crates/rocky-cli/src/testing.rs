@@ -330,8 +330,7 @@ pub(crate) fn lock_pipes_env() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// A warehouse adapter that wraps a real in-memory DuckDB adapter but fails
-/// every write (`execute_statement`; `execute_statement_with_stats` inherits
-/// the failure through its default delegation) with a selected, typed
+/// the selected warehouse call with a typed
 /// Databricks `ConnectorError`, wrapped in
 /// `rocky_core::traits::AdapterError` — the same wrapper every
 /// `WarehouseAdapter` method actually returns in production (#2064).
@@ -339,11 +338,9 @@ pub(crate) fn lock_pipes_env() -> std::sync::MutexGuard<'static, ()> {
 /// Exists so a test can drive `rocky run`'s real `run()` entry point through
 /// a transformation model's runtime failure and assert the classified
 /// `failure_kind` / `cooldown_seconds` `run()` records (#2143), without a
-/// live Databricks credential. Every other call — `describe_table`,
-/// `execute_query`, `dialect`, `classify_failure` — delegates to the wrapped
-/// DuckDB adapter, so the pre-write bootstrap probe (and everything upstream
-/// of the model's actual write) behaves exactly as it does against a real
-/// warehouse; only the write itself fails.
+/// live Databricks credential. Content-addressed tests can instead fail the
+/// model query or post-commit MSCK. Unselected calls delegate to DuckDB,
+/// except the one source query the content-addressed fixture answers here.
 #[cfg(feature = "duckdb")]
 pub(crate) struct FailingWriteWarehouseAdapter {
     inner: rocky_duckdb::adapter::DuckDbWarehouseAdapter,
@@ -355,6 +352,10 @@ pub(crate) enum FailingWriteKind {
     Auth,
     RateLimit,
     CircuitBreaker,
+    ContentQueryRateLimit,
+    ContentQueryCircuitBreaker,
+    ContentMsckRateLimit,
+    ContentMsckCircuitBreaker,
 }
 
 #[cfg(feature = "duckdb")]
@@ -373,11 +374,15 @@ impl FailingWriteWarehouseAdapter {
                 status: 401,
                 body: "injected auth failure".to_string(),
             },
-            FailingWriteKind::RateLimit => ConnectorError::ApiError {
+            FailingWriteKind::RateLimit
+            | FailingWriteKind::ContentQueryRateLimit
+            | FailingWriteKind::ContentMsckRateLimit => ConnectorError::ApiError {
                 status: 429,
                 body: "injected rate limit".to_string(),
             },
-            FailingWriteKind::CircuitBreaker => ConnectorError::CircuitBreakerOpen {
+            FailingWriteKind::CircuitBreaker
+            | FailingWriteKind::ContentQueryCircuitBreaker
+            | FailingWriteKind::ContentMsckCircuitBreaker => ConnectorError::CircuitBreakerOpen {
                 consecutive_failures: 5,
                 cooldown_seconds: Some(180),
             },
@@ -393,11 +398,37 @@ impl WarehouseAdapter for FailingWriteWarehouseAdapter {
         self.inner.dialect()
     }
 
-    async fn execute_statement(&self, _sql: &str) -> AdapterResult<()> {
+    async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+        if matches!(
+            self.failure,
+            FailingWriteKind::ContentQueryRateLimit | FailingWriteKind::ContentQueryCircuitBreaker
+        ) {
+            return self.inner.execute_statement(sql).await;
+        }
+        if matches!(
+            self.failure,
+            FailingWriteKind::ContentMsckRateLimit | FailingWriteKind::ContentMsckCircuitBreaker
+        ) && !sql.starts_with("MSCK REPAIR TABLE ")
+        {
+            return self.inner.execute_statement(sql).await;
+        }
         Err(self.injected_error())
     }
 
     async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+        if matches!(
+            self.failure,
+            FailingWriteKind::ContentQueryRateLimit | FailingWriteKind::ContentQueryCircuitBreaker
+        ) && sql.contains("content_addressed_failure_probe")
+        {
+            return Err(self.injected_error());
+        }
+        if sql.contains("FROM raw.events") {
+            return Ok(QueryResult {
+                columns: vec!["content_addressed_failure_probe".to_string()],
+                rows: vec![vec![serde_json::json!(1)]],
+            });
+        }
         self.inner.execute_query(sql).await
     }
 

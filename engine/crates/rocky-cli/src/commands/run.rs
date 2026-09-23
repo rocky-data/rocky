@@ -21396,6 +21396,258 @@ adapter = "default"
         ]
     }
 
+    #[cfg(feature = "duckdb")]
+    async fn seed_content_addressed_test_table(
+        store: &object_store::memory::InMemory,
+        prefix: &str,
+    ) {
+        use object_store::{ObjectStoreExt as _, PutPayload, path::Path as ObjPath};
+
+        let protocol = serde_json::json!({"protocol": {
+            "minReaderVersion": 2,
+            "minWriterVersion": 7,
+            "writerFeatures": ["columnMapping", "icebergCompatV2", "invariants", "appendOnly"]
+        }});
+        let metadata = serde_json::json!({"metaData": {
+            "id": "00000000-0000-0000-0000-000000000000",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": serde_json::to_string(&serde_json::json!({
+                "type": "struct", "fields": [{
+                    "name": "content_addressed_failure_probe", "type": "long",
+                    "nullable": false, "metadata": {
+                        "delta.columnMapping.id": 1,
+                        "delta.columnMapping.physicalName": "col-id-uuid"
+                    }
+                }]
+            })).unwrap(),
+            "partitionColumns": [],
+            "configuration": {
+                "delta.columnMapping.mode": "name",
+                "delta.universalFormat.enabledFormats": "iceberg",
+                "delta.enableIcebergCompatV2": "true"
+            },
+            "createdTime": 0
+        }});
+        let body = format!("{protocol}\n{metadata}\n");
+        store
+            .put(
+                &ObjPath::from(format!("{prefix}/_delta_log/00000000000000000000.json")),
+                PutPayload::from(body.into_bytes()),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The actual content-addressed executor, run classifier, and emitted
+    /// JSON must preserve a wrapped warehouse error across both SQL calls.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn content_addressed_warehouse_failures_emit_classified_json() {
+        use object_store::memory::InMemory;
+        use object_store::{ObjectStoreExt as _, path::Path as ObjPath};
+
+        let cases = [
+            (
+                "content-query-rate-limit",
+                "quota-exceeded",
+                None,
+                "execute_query failed",
+            ),
+            (
+                "content-query-breaker",
+                "quota-exceeded",
+                Some(180),
+                "execute_query failed",
+            ),
+            (
+                "content-msck-rate-limit",
+                "quota-exceeded",
+                None,
+                "MSCK REPAIR failed",
+            ),
+            (
+                "content-msck-breaker",
+                "quota-exceeded",
+                Some(180),
+                "MSCK REPAIR failed",
+            ),
+        ];
+        for contain_failures in [false, true] {
+            for (failure, expected_kind, expected_cooldown, context) in cases {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let dir = tmp.path();
+                let models = dir.join("models");
+                std::fs::create_dir_all(&models).unwrap();
+                std::fs::write(
+                    models.join("m.sql"),
+                    "SELECT content_addressed_failure_probe FROM raw.events\n",
+                )
+                .unwrap();
+                let prefix = format!("ca_failure_{}", uuid::Uuid::new_v4().simple());
+                let storage_prefix = format!("s3://test-bucket/{prefix}");
+                std::fs::write(
+                    models.join("m.toml"),
+                    format!(
+                        "[[sources]]\ncatalog = \"c\"\nschema = \"raw\"\ntable = \"events\"\n\n\
+                         [strategy]\ntype = \"content_addressed\"\nstorage_prefix = \"{storage_prefix}\"\n\n\
+                         [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n"
+                    ),
+                )
+                .unwrap();
+                let store = std::sync::Arc::new(InMemory::new());
+                seed_content_addressed_test_table(&store, &prefix).await;
+                super::super::run_content_addressed::register_test_object_store(
+                    &storage_prefix,
+                    store.clone(),
+                );
+
+                let config_path = dir.join("rocky.toml");
+                std::fs::write(
+                    &config_path,
+                    format!(
+                        "[adapter]\ntype = \"test-fail-write\"\npath = \"{failure}\"\n\n\
+                         [state]\nbackend = \"local\"\n\n\
+                         [resilience]\ncontain_failures = {contain_failures}\n\n\
+                         [pipeline.tx]\ntype = \"transformation\"\nmodels = '{}'\n\n\
+                         [pipeline.tx.target]\nadapter = \"default\"\n",
+                        models.join("**").display(),
+                    ),
+                )
+                .unwrap();
+                let state_path = dir.join("state.redb");
+                {
+                    use rocky_core::schema_cache::{
+                        SchemaCacheEntry, StoredColumn, schema_cache_key,
+                    };
+                    let state = rocky_core::state::StateStore::open(&state_path).unwrap();
+                    state
+                        .write_schema_cache_entry(
+                            &schema_cache_key("c", "raw", "events"),
+                            &SchemaCacheEntry {
+                                columns: vec![StoredColumn {
+                                    name: "content_addressed_failure_probe".to_string(),
+                                    data_type: "BIGINT".to_string(),
+                                    nullable: false,
+                                }],
+                                cached_at: chrono::Utc::now(),
+                            },
+                        )
+                        .unwrap();
+                }
+                let run_id = format!("test-content-error-{}", uuid::Uuid::new_v4());
+                let loaded = std::sync::Arc::new(
+                    rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+                );
+                let result = super::run(
+                    &config_path,
+                    loaded,
+                    None,
+                    None,
+                    &state_path,
+                    None,
+                    true,
+                    None,
+                    false,
+                    None,
+                    false,
+                    None,
+                    &PartitionRunOptions::default(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    &DeferOptions::default(),
+                    &SkipRunOptions::default(),
+                    &rocky_core::run_vars::RunVars::new(),
+                    Some(&run_id),
+                    None,
+                    false,
+                    None,
+                )
+                .await;
+                let commit_path =
+                    ObjPath::from(format!("{prefix}/_delta_log/00000000000000000001.json"));
+                assert_eq!(
+                    store.head(&commit_path).await.is_ok(),
+                    failure.starts_with("content-msck"),
+                    "query failure must precede commit; MSCK failure must follow it"
+                );
+                assert!(
+                    result.is_err(),
+                    "{failure}, contain={contain_failures}: {result:?}"
+                );
+                let captured = super::CAPTURED_RUN_OUTPUT_FOR_TEST
+                    .lock()
+                    .unwrap()
+                    .remove(&run_id)
+                    .expect("run() must emit terminal JSON");
+                assert_eq!(captured["status"], "Failure", "{failure}");
+                assert_eq!(captured["tables_failed"], 1, "{failure}");
+                let errors = captured["errors"].as_array().unwrap();
+                assert_eq!(errors.len(), 1, "{failure}: {errors:?}");
+                assert_eq!(errors[0]["failure_kind"], expected_kind, "{failure}");
+                assert_eq!(
+                    errors[0]
+                        .get("cooldown_seconds")
+                        .and_then(serde_json::Value::as_u64),
+                    expected_cooldown,
+                    "{failure}"
+                );
+                assert!(
+                    errors[0]["error"].as_str().unwrap().contains(context),
+                    "{failure}: {errors:?}"
+                );
+
+                let loaded =
+                    rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap();
+                let mut session = rocky_core::state_sync::RemoteStateSession::new(
+                    &loaded.config.state,
+                    &state_path,
+                    rocky_core::state_sync::FinalizeDurability::Durable,
+                    false,
+                );
+                let _authority = session.acquire().await.unwrap();
+                session.require_synced().unwrap();
+                let model_set = std::collections::BTreeSet::from(["m".to_string()]);
+                let backfill = super::execute_backfill_set(
+                    &loaded,
+                    session,
+                    &state_path,
+                    &models,
+                    &model_set,
+                    &PartitionRunOptions::default(),
+                    None,
+                    None,
+                    true,
+                )
+                .await;
+                super::super::run_content_addressed::remove_test_object_store(&storage_prefix);
+                assert!(backfill.is_err(), "backfill must fail: {failure}");
+                let state = rocky_core::state::StateStore::open(&state_path).unwrap();
+                let latest = state.list_runs(1).unwrap().remove(0);
+                let backfill_json = super::CAPTURED_RUN_OUTPUT_FOR_TEST
+                    .lock()
+                    .unwrap()
+                    .remove(&latest.run_id)
+                    .expect("backfill must emit terminal JSON");
+                assert_eq!(backfill_json["status"], "Failure", "{failure}");
+                let backfill_errors = backfill_json["errors"].as_array().unwrap();
+                assert_eq!(backfill_errors.len(), 1, "{failure}: {backfill_errors:?}");
+                assert_eq!(
+                    backfill_errors[0]["failure_kind"], expected_kind,
+                    "{failure}"
+                );
+                assert_eq!(
+                    backfill_errors[0]
+                        .get("cooldown_seconds")
+                        .and_then(serde_json::Value::as_u64),
+                    expected_cooldown,
+                    "{failure}"
+                );
+            }
+        }
+    }
+
     /// Drives `run()` through the `--model` fail-fast path with a connector
     /// error nested inside `rocky_core::traits::AdapterError`.
     #[cfg(feature = "duckdb")]

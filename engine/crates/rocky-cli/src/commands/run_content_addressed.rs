@@ -23,6 +23,9 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
+use std::sync::{LazyLock, Mutex};
+
 use anyhow::{Context, Result, anyhow};
 use arrow::array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
@@ -94,6 +97,14 @@ fn parse_s3_url(storage_prefix: &str) -> Result<(String, String)> {
 /// `object_store` directly — operators must resolve a profile to the
 /// underlying env vars beforehand.
 pub(crate) fn build_object_store(storage_prefix: &str) -> Result<Arc<dyn ObjectStore>> {
+    #[cfg(test)]
+    if let Some(store) = TEST_OBJECT_STORES
+        .lock()
+        .expect("test object store registry mutex")
+        .get(storage_prefix)
+    {
+        return Ok(Arc::clone(store));
+    }
     let (bucket, _prefix) = parse_s3_url(storage_prefix)?;
     let region = std::env::var("AWS_DEFAULT_REGION")
         .or_else(|_| std::env::var("AWS_REGION"))
@@ -105,6 +116,27 @@ pub(crate) fn build_object_store(storage_prefix: &str) -> Result<Arc<dyn ObjectS
         .build()
         .with_context(|| format!("failed to build S3 store for {storage_prefix:?}"))?;
     Ok(Arc::new(store))
+}
+
+#[cfg(test)]
+static TEST_OBJECT_STORES: LazyLock<
+    Mutex<std::collections::HashMap<String, Arc<dyn ObjectStore>>>,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn register_test_object_store(storage_prefix: &str, store: Arc<dyn ObjectStore>) {
+    TEST_OBJECT_STORES
+        .lock()
+        .expect("test object store registry mutex")
+        .insert(storage_prefix.to_string(), store);
+}
+
+#[cfg(test)]
+pub(crate) fn remove_test_object_store(storage_prefix: &str) {
+    TEST_OBJECT_STORES
+        .lock()
+        .expect("test object store registry mutex")
+        .remove(storage_prefix);
 }
 
 /// Resolve `(key_prefix, table_relative_path)` for an artifact `file_path`
@@ -834,7 +866,7 @@ pub async fn execute_content_addressed_model(
     let result = warehouse
         .execute_query(&model_ir.sql)
         .await
-        .map_err(|e| anyhow!("execute_query failed: {e}"))?;
+        .context("execute_query failed")?;
 
     // 5. Convert rows → Arrow.
     let batch = query_result_to_record_batch(&model_ir.typed_columns, &result)?;
@@ -992,7 +1024,7 @@ pub(crate) async fn rederive_live_output_hash(
     let result = warehouse
         .execute_query(sql)
         .await
-        .map_err(|e| anyhow!("execute_query failed: {e}"))?;
+        .context("execute_query failed")?;
     let batch = query_result_to_record_batch(&model_ir.typed_columns, &result)?;
     let rows = batch.num_rows() as u64;
     let parquet = rocky_iceberg::uniform_writer::parquet_builder::build_parquet(&batch, &state)
@@ -1018,7 +1050,7 @@ async fn sync_iceberg_metadata(
     warehouse
         .execute_statement(&msck_sql)
         .await
-        .map_err(|e| anyhow!("MSCK REPAIR failed: {e}"))?;
+        .context("MSCK REPAIR failed")?;
     Ok(())
 }
 
