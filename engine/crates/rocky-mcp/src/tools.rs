@@ -4724,9 +4724,11 @@ impl RockyMcpServer {
         // bare top-level key) smuggled alongside a valid `[[tests]]` block is
         // rejected instead of being appended verbatim into the model's sidecar.
         validate_check_spec(&spec)?;
-        // Content gate for `expression` checks (#1524): refuse a bad
-        // expression when it is WRITTEN, not when it is later run.
-        validate_check_spec_expressions(&spec)?;
+        // Content gate for the user-supplied SQL fragments in the spec
+        // (#1524, #2144): refuse a bad `expression`, `filter`, or `key_expr`
+        // when it is WRITTEN, not when it is later refused at
+        // `rocky test --declarative`.
+        validate_check_spec_expressions(&spec, Some(&self.config_path))?;
         let paths = self.resolve_draft_paths(&args.model)?;
         if !self.model_source_exists(&paths.stem) {
             return Err(ToolError::model_not_found(&paths.stem));
@@ -7476,20 +7478,42 @@ fn validate_check_spec(spec: &str) -> Result<(), Json<ToolError>> {
     Ok(())
 }
 
-/// Content gate for the `expression` checks in a `draft_check` spec (#1524).
+/// Content gate for the user-supplied SQL fragments in a `draft_check` spec
+/// (#1524, #2144): an `expression` check's `expression`, any test's
+/// `filter`, and a `unique_expr` test's `key_expr`.
 ///
-/// Applies the same boundary `rocky test` enforces at generation time —
-/// one boolean expression, no subquery, no qualified function, only
-/// allowlisted pure scalar functions — but BEFORE the sidecar write, so an
-/// expression that can never run is refused at authoring time with the
-/// reason, rather than committed and refused later. Direct file writers
-/// bypass this tool entirely; the generation-time check is the backstop
-/// for them.
+/// Applies the same TWO gates `rocky test --declarative` runs at generation
+/// time, in the same order (`rocky-core/src/tests.rs`): first
+/// [`rocky_sql::validation::reject_statement_terminator`], a pre-parse scan
+/// that refuses a construct the warehouses read differently regardless of
+/// dialect (a backtick-quoted identifier, a `//`/`#` line comment, ...);
+/// then [`rocky_sql::check_expression::validate_check_expression`] — one
+/// boolean expression, no subquery, no qualified function, only allowlisted
+/// pure scalar functions, plus the stricter grouping-key rules (no volatile
+/// function, no `COLLATE`) for `key_expr`. Running the parse gate ALONE
+/// would miss the first: sqlparser accepts backtick identifiers the scanner
+/// refuses, so a filter or key using one would be a green draft and a red
+/// `rocky test --declarative` (#2144, round 2). Both gates run BEFORE the
+/// sidecar write, so a fragment that can never run is refused at authoring
+/// time with the reason, rather than committed and refused later. Direct
+/// file writers bypass this tool entirely; the generation-time checks are
+/// the backstop for them.
 ///
-/// Parses under the generic dialect: the MCP server does not resolve the
-/// target warehouse here. A broader dialect can only accept MORE syntax,
-/// and acceptance still has to clear the function and subquery walk.
-fn validate_check_spec_expressions(spec: &str) -> Result<(), Json<ToolError>> {
+/// Parses under the project's resolved default adapter dialect when
+/// `rocky.toml` loads and declares one (matching what generation itself
+/// parses under), falling back to the generic dialect otherwise — an
+/// absent, unresolvable, or ambiguous (no `default` key) config, same as no
+/// config at all. GENERIC IS THE PERMISSIVE ONE: it is not a safe stand-in
+/// for a stricter target dialect, because it can accept what a real target
+/// dialect would refuse outright (a construct a target's own parser does
+/// not have, or reads differently) — the opposite of the safe direction.
+/// This does not resolve a per-model adapter override (`ModelConfig.adapter`
+/// in a model's own sidecar): that needs `draft_check` to read the model's
+/// sidecar before this gate runs, which is a bigger change than this one.
+fn validate_check_spec_expressions(
+    spec: &str,
+    config_path: Option<&Path>,
+) -> Result<(), Json<ToolError>> {
     // `validate_check_spec` already proved this parses and holds a `tests`
     // array; a second parse is cheaper than threading the table through.
     let Ok(parsed) = toml::from_str::<toml::Table>(spec) else {
@@ -7498,12 +7522,89 @@ fn validate_check_spec_expressions(spec: &str) -> Result<(), Json<ToolError>> {
     let Some(tests) = parsed.get("tests").and_then(toml::Value::as_array) else {
         return Ok(());
     };
-    let dialect = rocky_sql::check_expression::dialect_for("generic");
+    // The project's default adapter (`[adapter]`, unnamed, wraps to this
+    // key), when the config loads and declares one; generic otherwise. A
+    // config that fails to load, or declares no `default` adapter, falls
+    // back the same way an absent config does -- this gate's job is
+    // content, not reporting a broken `rocky.toml` a caller already sees
+    // elsewhere.
+    let adapter_type = config_path
+        .and_then(|p| rocky_core::config::load_optional_project_config(Some(p)).ok())
+        .flatten()
+        .and_then(|cfg| cfg.adapters.get("default").map(|a| a.adapter_type.clone()))
+        .unwrap_or_else(|| "generic".to_string());
+    let dialect = rocky_sql::check_expression::dialect_for(&adapter_type);
     for (index, test) in tests.iter().enumerate() {
         let Some(table) = test.as_table() else {
             continue;
         };
-        if table.get("type").and_then(toml::Value::as_str) != Some("expression") {
+        let test_type = table.get("type").and_then(toml::Value::as_str);
+
+        // `filter` scopes which rows a check applies to and is spliced into
+        // the same generated statement for every test kind (`tests.rs`'s
+        // per-check `filter` handling), so it is gated regardless of `type`
+        // — unlike `expression` and `key_expr` below, this is NOT behind a
+        // `type` match. Trimmed and treated as absent when blank, mirroring
+        // `tests.rs`'s own `filter` handling exactly: the generator accepts
+        // `filter = ""` as "no filter", so this gate must not refuse it as
+        // an unparsable expression.
+        if let Some(filter) = table
+            .get("filter")
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let context = format!("draft_check `tests[{index}]` filter");
+            let advice = "A filter is one boolean expression over the row's columns \
+                 — comparisons, CASE, CAST, and pure scalar functions such as coalesce, \
+                 length, lower or date_trunc. It may not contain a subquery, a qualified \
+                 function, or a warehouse function that reads files, secrets, session state \
+                 or remote endpoints. It scopes which rows the check applies to; it does \
+                 not repeat the check's own condition.";
+            rocky_sql::validation::reject_statement_terminator(&context, filter)
+                .map_err(|err| ToolError::invalid_argument(err.to_string(), advice))?;
+            rocky_sql::check_expression::validate_check_expression(
+                &context,
+                filter,
+                dialect.as_ref(),
+                // Same boundary as `expression`: a filter is spliced into
+                // the same statement as the predicate it scopes, evaluated
+                // once. Separate variant only so a refusal names `filter`.
+                rocky_sql::check_expression::ExpressionUse::Filter,
+            )
+            .map_err(|err| ToolError::invalid_argument(err.to_string(), advice))?;
+        }
+
+        if test_type == Some("unique_expr") {
+            // A missing `key_expr` is the generator's own `EmptyKeyExpr`;
+            // this gate judges content, not presence.
+            if let Some(key_expr) = table.get("key_expr").and_then(toml::Value::as_str) {
+                let context = format!("draft_check `tests[{index}]` key_expr");
+                let advice = "A key expression is one expression over the row's own columns \
+                     that rows can be grouped by, e.g. `lower(email)`. It may not contain a \
+                     subquery, a qualified function, a warehouse function that reads \
+                     files, secrets, session state or remote endpoints, a volatile \
+                     function such as `now()` or `random()` (the key must not change \
+                     between evaluations), or an explicit `COLLATE` (it would change what \
+                     equality means for the grouping).";
+                rocky_sql::validation::reject_statement_terminator(&context, key_expr)
+                    .map_err(|err| ToolError::invalid_argument(err.to_string(), advice))?;
+                rocky_sql::check_expression::validate_check_expression(
+                    &context,
+                    key_expr,
+                    dialect.as_ref(),
+                    // A grouping key: unlike `expression`/`filter`, a
+                    // volatile value is refused (rows must group by
+                    // something that does not change between evaluations),
+                    // and so is `COLLATE` (it would change what equality
+                    // means for the grouping).
+                    rocky_sql::check_expression::ExpressionUse::GroupingKey,
+                )
+                .map_err(|err| ToolError::invalid_argument(err.to_string(), advice))?;
+            }
+        }
+
+        if test_type != Some("expression") {
             continue;
         }
         // A missing `expression` is the generator's `MissingExpression`;
@@ -7512,26 +7613,23 @@ fn validate_check_spec_expressions(spec: &str) -> Result<(), Json<ToolError>> {
             continue;
         };
         let context = format!("draft_check `tests[{index}]` expression");
+        let advice = "An expression check is one boolean expression over the model's own \
+                 columns — comparisons, CASE, CAST, and pure scalar functions such as \
+                 coalesce, length, lower or date_trunc. It may not contain a subquery, a \
+                 qualified function, or a warehouse function that reads files, secrets, \
+                 session state or remote endpoints.";
+        rocky_sql::validation::reject_statement_terminator(&context, expression)
+            .map_err(|err| ToolError::invalid_argument(err.to_string(), advice))?;
         rocky_sql::check_expression::validate_check_expression(
             &context,
             expression,
             dialect.as_ref(),
             // `draft_check` writes an `expression` test, which is evaluated
             // once in one statement — the same position as the checks path
-            // this mirrors. A drafted key or quarantine predicate would need
-            // a different mode; neither is reachable from this tool.
+            // this mirrors.
             rocky_sql::check_expression::ExpressionUse::SinglePredicate,
         )
-        .map_err(|err| {
-            ToolError::invalid_argument(
-                err.to_string(),
-                "An expression check is one boolean expression over the model's own columns \
-                 — comparisons, CASE, CAST, and pure scalar functions such as coalesce, \
-                 length, lower or date_trunc. It may not contain a subquery, a qualified \
-                 function, or a warehouse function that reads files, secrets, session state \
-                 or remote endpoints.",
-            )
-        })?;
+        .map_err(|err| ToolError::invalid_argument(err.to_string(), advice))?;
     }
     Ok(())
 }

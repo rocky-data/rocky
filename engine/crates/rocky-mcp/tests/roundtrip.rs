@@ -2311,6 +2311,244 @@ async fn draft_check_rejects_an_unbounded_expression_before_the_write() {
     client.cancel().await.unwrap();
 }
 
+/// #2144: a `filter` is spliced into the SAME generated statement as the
+/// check it scopes, on EVERY test kind, not just `expression` — so it must
+/// be gated regardless of `type`. This drafts a `not_null` test (which has
+/// no `expression` field at all) to prove the gate is not hiding behind the
+/// `type == "expression"` branch. An unparsable `filter` is refused with the
+/// same message `rocky test` would print for the same content.
+#[tokio::test]
+async fn draft_check_rejects_an_unparsable_filter_before_the_write() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let before = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    let spec = "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\nfilter = \"status = \"\n";
+    let args = serde_json::json!({ "model": "orders", "spec": spec })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .expect("draft_check call");
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "an unparsable filter is an error, even on a not_null test"
+    );
+    let err = result.structured_content.expect("structured envelope");
+    assert_eq!(err["code"], serde_json::json!("invalid_argument"));
+    assert!(
+        err["message"].as_str().unwrap().contains("does not parse"),
+        "the engine's own parse-failure message is surfaced: {err:?}"
+    );
+
+    let after = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    assert_eq!(after, before, "a refused filter writes nothing");
+
+    client.cancel().await.unwrap();
+}
+
+/// #2144: a `unique_expr` test's `key_expr` is a GROUPING key, so a volatile
+/// function is refused there even though the same call is fine in an
+/// `expression` check (`now() IS NOT NULL` is a legitimate freshness
+/// predicate). Before this fix, `draft_check` wrote this straight into the
+/// sidecar and only `rocky test` refused it -- a green draft for a red run.
+#[tokio::test]
+async fn draft_check_rejects_a_volatile_key_expr_before_the_write() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let before = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    let spec = "[[tests]]\ntype = \"unique_expr\"\nkey_expr = \"now()\"\n";
+    let args = serde_json::json!({ "model": "orders", "spec": spec })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .expect("draft_check call");
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a volatile key_expr is an error"
+    );
+    let err = result.structured_content.expect("structured envelope");
+    assert_eq!(err["code"], serde_json::json!("invalid_argument"));
+    let message = err["message"].as_str().unwrap();
+    assert!(
+        message.contains("now") && message.contains("cannot be a key"),
+        "the engine's own volatile-key message is surfaced: {err:?}"
+    );
+
+    let after = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    assert_eq!(after, before, "a refused key_expr writes nothing");
+
+    client.cancel().await.unwrap();
+}
+
+/// #2144, the other side: a `filter` and a `key_expr` that pass the SAME
+/// boundary are written, not just accepted structurally -- this is what
+/// distinguishes "gated" from "everything now refused".
+#[tokio::test]
+async fn draft_check_writes_a_valid_filter_and_key_expr() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let before = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    let spec = "[[tests]]\ntype = \"unique_expr\"\nkey_expr = \"lower(status)\"\n\
+                filter = \"status = 'COMPLETE'\"\n";
+    let args = serde_json::json!({ "model": "orders", "spec": spec })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .expect("draft_check call");
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "a deterministic key_expr and a parseable filter must be accepted: {:?}",
+        result.structured_content
+    );
+    let after = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    assert_ne!(after, before, "a valid spec must actually be written");
+    assert!(after.contains("lower(status)") && after.contains("status = 'COMPLETE'"));
+
+    client.cancel().await.unwrap();
+}
+
+/// #2144, round 2: sqlparser accepts a backtick-quoted identifier (a
+/// generic-dialect reading of Databricks/BigQuery quoting), but
+/// `reject_statement_terminator` -- the scanner `rocky test --declarative`
+/// also runs, before the parser -- refuses it outright, regardless of
+/// dialect, because the warehouses read it differently. Gating only with
+/// `validate_check_expression` would let this through as a green draft and
+/// a red run; both gates must run, in the engine's order.
+#[tokio::test]
+async fn draft_check_rejects_a_backtick_quoted_filter_before_the_write() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let before = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    let spec = "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n\
+                filter = \"`status` = 'COMPLETE'\"\n";
+    let args = serde_json::json!({ "model": "orders", "spec": spec })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .expect("draft_check call");
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a backtick-quoted identifier is refused, even though it parses"
+    );
+    let err = result.structured_content.expect("structured envelope");
+    assert_eq!(err["code"], serde_json::json!("invalid_argument"));
+    assert!(
+        err["message"]
+            .as_str()
+            .unwrap()
+            .contains("backtick-quoted identifier"),
+        "the engine's own scanner refusal is surfaced: {err:?}"
+    );
+
+    let after = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    assert_eq!(after, before, "a refused filter writes nothing");
+
+    client.cancel().await.unwrap();
+}
+
+/// #2144, round 2, the `//` half of the same gap: a Snowflake-only line
+/// comment. Every other warehouse keeps reading the rest of the line as
+/// live SQL, so `reject_statement_terminator` refuses it rather than guess
+/// which reading applies -- on a `key_expr`, not `filter`, to cover a
+/// different one of the three call sites this fix touches.
+#[tokio::test]
+async fn draft_check_rejects_a_key_expr_with_a_line_comment_before_the_write() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let before = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    let spec = "[[tests]]\ntype = \"unique_expr\"\nkey_expr = \"status // nasty\"\n";
+    let args = serde_json::json!({ "model": "orders", "spec": spec })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .expect("draft_check call");
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a `//` line comment is refused"
+    );
+    let err = result.structured_content.expect("structured envelope");
+    assert_eq!(err["code"], serde_json::json!("invalid_argument"));
+    assert!(
+        err["message"].as_str().unwrap().contains("line comment"),
+        "the engine's own scanner refusal is surfaced: {err:?}"
+    );
+
+    let after = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    assert_eq!(after, before, "a refused key_expr writes nothing");
+
+    client.cancel().await.unwrap();
+}
+
+/// #2144, round 2: the generator treats a blank `filter` as ABSENT
+/// (`tests.rs` trims it and skips the field entirely), so this gate must
+/// not refuse `filter = ""` as an unparsable expression -- that would
+/// refuse a spec the engine accepts.
+#[tokio::test]
+async fn draft_check_writes_an_empty_filter_as_absent() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let spec = "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\nfilter = \"\"\n";
+    let args = serde_json::json!({ "model": "orders", "spec": spec })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .expect("draft_check call");
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "a blank filter is absent, not a refusal: {:?}",
+        result.structured_content
+    );
+
+    client.cancel().await.unwrap();
+}
+
 /// A product spec whose output model is `orders`, so a worker draft of
 /// `orders` is a fulfillment draft with a loop waiting on it.
 fn write_owning_product(dir: &Path) {
