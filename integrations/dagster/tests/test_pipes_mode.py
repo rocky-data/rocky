@@ -694,7 +694,7 @@ def test_run_filters_pipes_converts_drift_check_to_observation():
 #   pipes_client=dg.PipesSubprocessClient(
 #       message_reader=dg.PipesFileMessageReader(path=<fixed path>, cleanup_file=False)
 #   )).get_results()`
-# against engine commit 7f2e15ad (the #2159 metadata-wrap
+# against engine commit 960e0308 (the #2159 metadata-wrap
 # fix, the #2163 zlib-decode fix, and the #2166 `opened`/`closed` fix —
 # the first line is now `opened`, matching a real launch exactly).
 #
