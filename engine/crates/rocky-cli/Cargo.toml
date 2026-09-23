@@ -70,6 +70,8 @@ rocky-core = { path = "../rocky-core", features = ["test-support"] }
 # Exposes the in-memory scheduler-metrics harness for the `run_one_tick`
 # emission tests. Test-only; the `rocky` binary build never sees it.
 rocky-observe = { path = "../rocky-observe", features = ["test-support"] }
+# Let the watermark test drive BigQuery's real REST connector against wiremock.
+rocky-bigquery = { path = "../rocky-bigquery", features = ["test-support"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
 # Capturing Layer for the `scheduler.tick` span assertions — the span surface
@@ -83,6 +85,7 @@ fs4 = { workspace = true }
 # and the golden API-vs-CLI parity tests spin up the axum router and hit it
 # over loopback with a real HTTP client.
 reqwest = { workspace = true }
+wiremock = { workspace = true }
 
 [[bench]]
 name = "compile"
