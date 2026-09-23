@@ -301,8 +301,16 @@ fn newest_branch_and_base_runs(
     Option<rocky_core::state::RunRecord>,
     Option<String>,
 )> {
+    // The branch side matches `RunRecord::rocky_branch` — the literal
+    // `rocky run --branch <name>` value — NOT `git_branch` (`git
+    // symbolic-ref --short HEAD`, the checkout's git branch). `--branch
+    // <name>` changes where a run WRITES; it does not touch the checked-out
+    // git branch, so on a PR whose git branch is e.g. `fix-price` running
+    // against the `pr-preview-fix-price` Rocky branch, the two disagree
+    // (#2032). Base-ref resolution below is unaffected: `--base` names a
+    // GIT ref, so it still reads `git_branch` / `git_commit`.
     let branch_run = store
-        .list_runs_matching(1, |r| r.git_branch.as_deref() == Some(branch_name))?
+        .list_runs_matching(1, |r| r.rocky_branch.as_deref() == Some(branch_name))?
         .into_iter()
         .next();
     // Select the base run from the ref the caller NAMED (#1345) — the old
@@ -328,11 +336,18 @@ fn newest_branch_and_base_runs(
         // Shorter refs resolve as branches first — branch names are
         // human-chosen and must not lose to a commit-prefix coincidence.
         if is_full_sha {
+            // A commit match must also be an ORDINARY run, not a
+            // `--branch`-scoped one: `.github/actions/rocky-preview` passes
+            // `--base <sha>` verbatim, and a `--branch`-scoped run recorded
+            // at that sha is not a valid stand-in for it any more than a
+            // `--branch`-scoped run on the named git branch was (see
+            // `by_branch` above) — same defect, different match key.
             let by_exact = store
                 .list_runs_matching(1, |r| {
                     r.git_commit
                         .as_deref()
                         .is_some_and(|c| c.eq_ignore_ascii_case(&base_lower))
+                        && r.rocky_branch.is_none()
                 })?
                 .into_iter()
                 .next();
@@ -352,18 +367,28 @@ fn newest_branch_and_base_runs(
                 )),
             ));
         }
+        // A NAMED base must match an ORDINARY run on that git branch, not a
+        // `--branch`-scoped one recorded there: `rocky run --branch scratch`
+        // executed from git checkout `main` records `git_branch:
+        // Some("main")`, `rocky_branch: Some("scratch")` — matching on
+        // `git_branch` alone would hand a `--base main` caller that scoped
+        // run instead of an ordinary main run.
         let by_branch = store
-            .list_runs_matching(1, |r| r.git_branch.as_deref() == Some(base_ref))?
+            .list_runs_matching(1, |r| {
+                r.git_branch.as_deref() == Some(base_ref) && r.rocky_branch.is_none()
+            })?
             .into_iter()
             .next();
         if let Some(run) = by_branch {
             return finish_named(branch_run, run, base_ref);
         }
+        // Same exclusion as `by_exact` above: an ordinary run only.
         let by_exact_commit = store
             .list_runs_matching(1, |r| {
                 r.git_commit
                     .as_deref()
                     .is_some_and(|c| c.eq_ignore_ascii_case(&base_lower))
+                    && r.rocky_branch.is_none()
             })?
             .into_iter()
             .next();
@@ -376,11 +401,17 @@ fn newest_branch_and_base_runs(
             // the same prefix. Two limit-1 scans — exhaustive over the whole
             // table (the store iterates it regardless) with O(1) kept rows,
             // so unbounded run retention cannot balloon this path.
+            // Same exclusion as `by_exact` above: an ordinary run only, on
+            // both the initial match and the uniqueness probe below — a
+            // `--branch`-scoped run at a second, distinct sha under this
+            // prefix must not manufacture a false ambiguity refusal for a
+            // prefix that names exactly one valid (ordinary) candidate.
             let first = store
                 .list_runs_matching(1, |r| {
                     r.git_commit
                         .as_deref()
                         .is_some_and(|c| c.to_ascii_lowercase().starts_with(&base_lower))
+                        && r.rocky_branch.is_none()
                 })?
                 .into_iter()
                 .next();
@@ -395,7 +426,7 @@ fn newest_branch_and_base_runs(
                         r.git_commit.as_deref().is_some_and(|c| {
                             let lower = c.to_ascii_lowercase();
                             lower.starts_with(&base_lower) && lower != first_sha
-                        })
+                        }) && r.rocky_branch.is_none()
                     })?
                     .into_iter()
                     .next();
@@ -430,10 +461,25 @@ fn newest_branch_and_base_runs(
     // Unnamed selection (the cost preview): newest run not on this branch —
     // byte-for-byte main's behavior, detached runs included. Cost baselines
     // from detached CI runs are deliberate (`run_audit` records
-    // `git_branch: None` there), and excluding them yielded an empty cost
+    // `rocky_branch: None` there), and excluding them yielded an empty cost
     // report mislabeled "No branch run yet".
+    //
+    // Matches on `rocky_branch`, same as the branch-side selection above and
+    // for the same reason (#2032): this must exclude the branch's OWN run
+    // from becoming its own base, and only `rocky_branch` reliably identifies
+    // that run.
+    //
+    // The second clause covers a record written BEFORE `rocky_branch`
+    // existed: it forward-deserializes with `rocky_branch: None`, so the
+    // first clause alone cannot see it — but if its `git_branch` happens to
+    // equal this preview's branch name, that is the shape a pre-#2032 branch
+    // run actually had (back when `git_branch` was the pairing key), and it
+    // must not be treated as an ordinary "not this branch" candidate.
     let fallback = store
-        .list_runs_matching(1, |r| r.git_branch.as_deref() != Some(branch_name))?
+        .list_runs_matching(1, |r| {
+            r.rocky_branch.as_deref() != Some(branch_name)
+                && !(r.rocky_branch.is_none() && r.git_branch.as_deref() == Some(branch_name))
+        })?
         .into_iter()
         .next();
     Ok((branch_run, fallback, None))
@@ -446,7 +492,6 @@ pub async fn run_preview_diff(
     models_dir: &Path,
     branch_name: &str,
     base_ref: &str,
-    _sample_size: usize,
     algorithm: PreviewDiffAlgorithmSelector,
     json: bool,
 ) -> Result<()> {
@@ -455,9 +500,6 @@ pub async fn run_preview_diff(
     let store = rocky_core::state::StateStore::open_read_only(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
-    // Tighter branch-vs-main partitioning lands when `git_branch` is plumbed
-    // through the state-store branch record (today the audit trail records
-    // `git_branch` on the RunRecord directly).
     // `--name X --base X` would select the same run for both sides and
     // subtract every execution from itself — a false-clean diff.
     anyhow::ensure!(
@@ -917,6 +959,7 @@ fn build_preview_diff(
 
     let mut models: Vec<PreviewModelDiff> = Vec::new();
     let mut models_with_changes: usize = 0;
+    let mut models_unknown: usize = 0;
     let mut total_rows_added: u64 = 0;
     let mut total_rows_removed: u64 = 0;
     let total_rows_changed: u64 = 0; // sampled-only; always 0 by default
@@ -931,21 +974,38 @@ fn build_preview_diff(
     for branch_exec in &branch.models_executed {
         let base_exec = base_by_name.get(branch_exec.model_name.as_str()).copied();
 
-        // Row delta: signed difference of `rows_affected`. None on either
-        // side surfaces as zero — the row-content layer catches
-        // unreported row changes.
-        let branch_rows = branch_exec.rows_affected.unwrap_or(0);
-        let base_rows = base_exec.and_then(|e| e.rows_affected).unwrap_or(0);
-        let (rows_added, rows_removed) = if branch_rows >= base_rows {
-            (branch_rows.saturating_sub(base_rows), 0_u64)
-        } else {
-            (0_u64, base_rows.saturating_sub(branch_rows))
+        // Row delta: signed difference of `rows_affected`. Absent for a
+        // model that ran only on the branch — reported as an "added"
+        // proxy per this fn's doc comment — is a DELIBERATE stand-in, not
+        // an unmeasured count: `base_exec.is_none()` means "no base
+        // execution to diff against", so `rows_removed` is genuinely `0`.
+        // But when a model ran on BOTH sides and either side's
+        // `rows_affected` is `None` (an ordinary transformation run's
+        // adapter/strategy reports no count — see `run.rs`'s
+        // `execute_transformation_model`), the delta itself is
+        // UNMEASURED: reporting it as `0` is the false-clean this fn
+        // exists to avoid (#2032), so both fields become `None` instead.
+        let (rows_added, rows_removed) = match base_exec {
+            None => (branch_exec.rows_affected, Some(0_u64)),
+            Some(base) => match (branch_exec.rows_affected, base.rows_affected) {
+                (Some(b), Some(p)) if b >= p => (Some(b.saturating_sub(p)), Some(0_u64)),
+                (Some(b), Some(p)) => (Some(0_u64), Some(p.saturating_sub(b))),
+                _ => (None, None),
+            },
         };
-        if rows_added > 0 || rows_removed > 0 {
-            models_with_changes = models_with_changes.saturating_add(1);
+        match (rows_added, rows_removed) {
+            (Some(a), Some(r)) => {
+                if a > 0 || r > 0 {
+                    models_with_changes = models_with_changes.saturating_add(1);
+                }
+                // Only a KNOWN delta contributes to the aggregate — an
+                // unknown model must not silently add 0 to a total a
+                // reader treats as exact (see `PreviewDiffSummary`'s doc).
+                total_rows_added = total_rows_added.saturating_add(a);
+                total_rows_removed = total_rows_removed.saturating_add(r);
+            }
+            _ => models_unknown = models_unknown.saturating_add(1),
         }
-        total_rows_added = total_rows_added.saturating_add(rows_added);
-        total_rows_removed = total_rows_removed.saturating_add(rows_removed);
 
         models.push(PreviewModelDiff {
             model_name: branch_exec.model_name.clone(),
@@ -987,13 +1047,28 @@ fn build_preview_diff(
 
     let summary = crate::output::PreviewDiffSummary {
         models_with_changes,
-        models_unchanged: models.len().saturating_sub(models_with_changes),
+        models_unchanged: models
+            .len()
+            .saturating_sub(models_with_changes)
+            .saturating_sub(models_unknown),
+        models_unknown,
         total_rows_added,
         total_rows_removed,
         total_rows_changed,
         any_coverage_warning: !models.is_empty(),
     };
     (summary, models)
+}
+
+/// Render a row count for the markdown table: `?` for `None` (unmeasured —
+/// see `PreviewSampledRowDiff::rows_added`), the number otherwise. Never
+/// prints `0` for a `None` — that would recreate the exact false-clean this
+/// type exists to prevent (#2032).
+fn fmt_rows(v: Option<u64>) -> String {
+    match v {
+        Some(n) => n.to_string(),
+        None => "?".to_string(),
+    }
 }
 
 /// Render a `PreviewDiffOutput` summary into the Markdown the PR-comment
@@ -1036,6 +1111,16 @@ fn render_preview_diff_markdown(
         summary.total_rows_added,
         summary.total_rows_removed,
     ));
+    if summary.models_unknown > 0 {
+        // A model in this bucket contributed NEITHER a change nor an
+        // "unchanged" verdict above — its row count was never measured, so
+        // the headline totals are a floor, not an exact count (#2032).
+        out.push_str(&format!(
+            "> ⚠️ {} model(s) have no recorded row count on one side and are excluded from the \
+             totals above — not counted as changed OR unchanged. See the `?` rows below.\n\n",
+            summary.models_unknown,
+        ));
+    }
     if let Some(note) = base_note {
         out.push_str(&format!("> ⚠️ {note}\n\n"));
     }
@@ -1063,7 +1148,10 @@ fn render_preview_diff_markdown(
                     };
                     out.push_str(&format!(
                         "| `{}` | sampled | {} | {} | 0 | — | — | — | {} |\n",
-                        m.model_name, sampled.rows_added, sampled.rows_removed, note,
+                        m.model_name,
+                        fmt_rows(sampled.rows_added),
+                        fmt_rows(sampled.rows_removed),
+                        note,
                     ));
                 }
                 PreviewModelDiffAlgorithm::Bisection {
@@ -1107,13 +1195,18 @@ fn render_preview_diff_markdown(
                 PreviewModelDiffAlgorithm::Bisection { .. } => {
                     // unreachable in this branch — `any_bisection` is
                     // false here. Defensive fallback so the renderer
-                    // doesn't panic if invariants change.
-                    (0, 0, ":white_check_mark: exhaustive")
+                    // doesn't panic if invariants change. `None` here
+                    // renders as `?`, not a fabricated `0` (#2032) — this
+                    // arm has no real count to report either way.
+                    (None, None, ":white_check_mark: exhaustive")
                 }
             };
             out.push_str(&format!(
                 "| `{}` | {} | {} | {} |\n",
-                m.model_name, rows_added, rows_removed, note,
+                m.model_name,
+                fmt_rows(rows_added),
+                fmt_rows(rows_removed),
+                note,
             ));
         }
     }
@@ -1980,6 +2073,7 @@ pub fn empty_diff_summary() -> PreviewDiffSummary {
     PreviewDiffSummary {
         models_with_changes: 0,
         models_unchanged: 0,
+        models_unknown: 0,
         total_rows_added: 0,
         total_rows_removed: 0,
         total_rows_changed: 0,
@@ -2197,6 +2291,9 @@ mod tests {
             // The branch's only run, older than everything else.
             let mut on_branch = sample_run("run-00000", base);
             on_branch.git_branch = Some("feature_x".to_string());
+            // The branch side is selected by `rocky_branch`, not
+            // `git_branch` (#2032) — see `newest_branch_and_base_runs`.
+            on_branch.rocky_branch = Some("feature_x".to_string());
             store.record_run(&on_branch).unwrap();
 
             // 80 newer runs on `main` — past the old 50-run window.
@@ -2224,6 +2321,63 @@ mod tests {
             "base is the NEWEST run on the NAMED base"
         );
         assert!(note.is_none());
+    }
+
+    /// #2032: `preview diff`/`preview cost` must find the branch run by its
+    /// recorded `rocky_branch` — the literal `rocky run --branch <name>`
+    /// value — not by `git_branch` (`git symbolic-ref --short HEAD`). On a
+    /// PR the two commonly differ: the git checkout is on e.g. `fix-price`,
+    /// but `rocky run --branch pr-preview-fix-price` writes under the Rocky
+    /// branch `pr-preview-fix-price`. A run whose `git_branch` is the
+    /// checkout name and whose `rocky_branch` is the preview name must still
+    /// be found by looking up the preview name.
+    #[test]
+    fn branch_run_is_found_by_rocky_branch_not_git_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = chrono::Utc::now();
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut run = sample_run("preview-run", base);
+            // The documented PR-preview shape (#2032): checked-out git
+            // branch and the `--branch` Rocky branch are different strings.
+            run.git_branch = Some("fix-price".to_string());
+            run.rocky_branch = Some("pr-preview-fix-price".to_string());
+            store.record_run(&run).unwrap();
+        }
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        let (branch_run, _base_run, _note) =
+            newest_branch_and_base_runs(&store, "pr-preview-fix-price", None).unwrap();
+        let branch_run = branch_run.expect(
+            "the run must be found by its recorded rocky_branch even though git_branch \
+             records a different (git checkout) branch name",
+        );
+        assert_eq!(branch_run.run_id, "preview-run");
+    }
+
+    /// The mirror case: a lookup by the CHECKOUT's git branch name must NOT
+    /// find a run whose `rocky_branch` differs — `git_branch` is no longer
+    /// the branch-selection key (#2032). Guards against a fix that matches
+    /// EITHER field (which would silently reintroduce false pairing).
+    #[test]
+    fn a_lookup_by_git_branch_name_does_not_match_a_differently_named_rocky_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = chrono::Utc::now();
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut run = sample_run("preview-run", base);
+            run.git_branch = Some("fix-price".to_string());
+            run.rocky_branch = Some("pr-preview-fix-price".to_string());
+            store.record_run(&run).unwrap();
+        }
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        let (branch_run, _base_run, _note) =
+            newest_branch_and_base_runs(&store, "fix-price", None).unwrap();
+        assert!(
+            branch_run.is_none(),
+            "a git-branch-named lookup must not match a run whose rocky_branch differs"
+        );
     }
 
     /// A branch with no runs at all reports none — so the test above is
@@ -2263,6 +2417,7 @@ mod tests {
             store.record_run(&t2).unwrap();
             let mut t3 = sample_run("t3", base + chrono::Duration::minutes(2));
             t3.git_branch = Some("feature".to_string());
+            t3.rocky_branch = Some("feature".to_string());
             store.record_run(&t3).unwrap();
         }
         let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
@@ -2295,6 +2450,7 @@ mod tests {
             store.record_run(&detached).unwrap();
             let mut feat = sample_run("feat-1", base + chrono::Duration::minutes(2));
             feat.git_branch = Some("feature".to_string());
+            feat.rocky_branch = Some("feature".to_string());
             store.record_run(&feat).unwrap();
         }
         let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
@@ -2320,6 +2476,113 @@ mod tests {
         assert!(cost_note.is_none());
     }
 
+    /// Drain review of #2158, finding 3: the cost-preview (unnamed) fallback
+    /// matches on `rocky_branch`, not `git_branch`, same as the branch-side
+    /// selection. Every fixture above gave the branch's own run the SAME
+    /// `git_branch` and `rocky_branch` string, so reverting the predicate to
+    /// `git_branch` would still pass all of them — this fixture gives the
+    /// two fields DIFFERENT values (the documented PR shape: git checkout
+    /// `fix-price`, `rocky run --branch pr_preview_fix_price`) so a
+    /// reversion is actually caught: on `git_branch` alone the branch's own
+    /// (newer) run would satisfy "not this branch" and become its own cost
+    /// baseline.
+    #[test]
+    fn cost_baseline_excludes_the_branch_run_by_rocky_branch_not_git_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = chrono::Utc::now();
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut main_run = sample_run("main-run", base);
+            main_run.git_branch = Some("main".to_string());
+            store.record_run(&main_run).unwrap();
+            // Newer than the main run, so it wins the "newest eligible" race
+            // if it were wrongly treated as an eligible baseline candidate.
+            let mut branch_run = sample_run("branch-run", base + chrono::Duration::minutes(1));
+            branch_run.git_branch = Some("fix-price".to_string());
+            branch_run.rocky_branch = Some("pr_preview_fix_price".to_string());
+            store.record_run(&branch_run).unwrap();
+        }
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        let (_b, base_run, note) =
+            newest_branch_and_base_runs(&store, "pr_preview_fix_price", None).unwrap();
+        assert_eq!(
+            base_run.unwrap().run_id,
+            "main-run",
+            "the cost baseline must be the main run, not the branch's own run"
+        );
+        assert!(note.is_none());
+    }
+
+    /// Drain review of #2158, finding 4: a NAMED base match by git branch
+    /// must exclude a `--branch`-scoped run recorded on that git checkout.
+    /// `rocky run --branch scratch` executed from git branch `main` records
+    /// `git_branch: Some("main")`, `rocky_branch: Some("scratch")` —
+    /// matching `--base main` on `git_branch` alone would hand back that
+    /// scoped run instead of an ordinary `main` run.
+    #[test]
+    fn named_base_by_git_branch_excludes_a_branch_scoped_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = chrono::Utc::now();
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut ordinary = sample_run("ordinary-main", base);
+            ordinary.git_branch = Some("main".to_string());
+            store.record_run(&ordinary).unwrap();
+            // Newer, so it wins the "newest matching git_branch" race unless
+            // the `--branch`-scoped exclusion is applied.
+            let mut scoped = sample_run("scoped-scratch", base + chrono::Duration::minutes(1));
+            scoped.git_branch = Some("main".to_string());
+            scoped.rocky_branch = Some("scratch".to_string());
+            store.record_run(&scoped).unwrap();
+        }
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        let (_b, base_run, note) =
+            newest_branch_and_base_runs(&store, "feature", Some("main")).unwrap();
+        assert_eq!(
+            base_run.unwrap().run_id,
+            "ordinary-main",
+            "a --branch-scoped run recorded on the named git branch must not become the base"
+        );
+        assert!(note.is_none());
+    }
+
+    /// Drain review of #2158, finding 5: a `RunRecord` written before
+    /// `rocky_branch` existed (#2032) forward-deserializes with
+    /// `rocky_branch: None` (see
+    /// `test_pre_rocky_branch_run_record_forward_deserializes_to_none` in
+    /// `rocky-core`). If its `git_branch` happens to equal the preview's
+    /// branch name — the shape a pre-#2032 branch run actually had, back
+    /// when `git_branch` was the pairing key — the unnamed (cost) fallback
+    /// must not treat it as an ordinary "not this branch" candidate.
+    #[test]
+    fn cost_fallback_excludes_a_pre_rocky_branch_record_matching_by_git_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = chrono::Utc::now();
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut main_run = sample_run("main-run", base);
+            main_run.git_branch = Some("main".to_string());
+            store.record_run(&main_run).unwrap();
+            // Newer, no `rocky_branch` at all (pre-#2032 shape), but its
+            // `git_branch` literally equals the preview branch name.
+            let mut legacy = sample_run("legacy-branch-run", base + chrono::Duration::minutes(1));
+            legacy.git_branch = Some("pr-preview-fix-price".to_string());
+            store.record_run(&legacy).unwrap();
+        }
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        let (_b, base_run, note) =
+            newest_branch_and_base_runs(&store, "pr-preview-fix-price", None).unwrap();
+        assert_eq!(
+            base_run.unwrap().run_id,
+            "main-run",
+            "a pre-rocky_branch record matching by git_branch must not become the cost baseline"
+        );
+        assert!(note.is_none());
+    }
+
     /// `--name X --base X` refuses up front — the same run diffed against
     /// itself reports every model unchanged, a false clean.
     #[tokio::test]
@@ -2333,7 +2596,6 @@ mod tests {
             std::path::Path::new("models"),
             "main",
             "main",
-            0,
             PreviewDiffAlgorithmSelector::Sampled,
             true,
         )
@@ -2541,9 +2803,17 @@ mod tests {
         );
     }
 
-    /// A base sha that ALIASES the branch's own newest run refuses — the
-    /// string-inequality guard cannot see through a sha, so the selection
-    /// itself must.
+    /// A base sha that ALIASES the branch's own newest run refuses — not any
+    /// more through `finish_named`'s self-diff name (that guard cannot see
+    /// through a sha), but because the branch's own run is `--branch`-scoped
+    /// (`rocky_branch: Some(..)`) and every commit-matching arm now excludes
+    /// `--branch`-scoped runs from base candidacy outright (drain review of
+    /// #2158, finding 1). The only run recorded is the branch's own, so the
+    /// prefix resolves to "no run recorded" — the same wording an unrelated,
+    /// truly-absent commit would get. That is an acceptable, expected wording
+    /// change: a caller reading the message no longer learns it aliased the
+    /// branch specifically, but the outcome (refuse the self-diff) is
+    /// unchanged and the message still names the remedy.
     #[test]
     fn a_sha_alias_of_the_branch_run_refuses_self_comparison() {
         let dir = tempfile::tempdir().unwrap();
@@ -2553,6 +2823,7 @@ mod tests {
             let store = rocky_core::state::StateStore::open(&state_path).unwrap();
             let mut feat = sample_run("f1", base);
             feat.git_branch = Some("feature".to_string());
+            feat.rocky_branch = Some("feature".to_string());
             feat.git_commit = Some("feedface00000000000000000000000000000000".to_string());
             store.record_run(&feat).unwrap();
         }
@@ -2561,9 +2832,56 @@ mod tests {
             newest_branch_and_base_runs(&store, "feature", Some("feedface")).unwrap();
         assert!(base_run.is_none(), "no self-diff through a sha alias");
         assert!(
-            note.unwrap().contains("branch's own newest run"),
-            "the alias must be named"
+            note.unwrap().contains("no run recorded for 'feedface'"),
+            "a --branch-scoped run is not a valid base candidate at all, so the alias reads \
+             as an absent commit, not a named self-diff"
         );
+    }
+
+    /// Drain review of #2158, finding 1 (second round): `.github/actions/rocky-preview`
+    /// passes `--base <sha>` verbatim, matching this shape — an ordinary
+    /// `rocky run` and a later `rocky run --branch scratch` from the SAME git
+    /// checkout record the SAME `git_commit` and differ only in
+    /// `rocky_branch`. The `--branch`-scoped run must not win the base slot
+    /// just for being newer, on either the full-sha or the ≥7-hex-prefix arm.
+    #[test]
+    fn a_commit_sha_base_excludes_a_branch_scoped_run_at_the_same_commit() {
+        let sha = "aaaabbbbccccddddeeeeffff0000111122223334";
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = chrono::Utc::now();
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut ordinary = sample_run("ordinary-commit-run", base);
+            ordinary.git_branch = Some("main".to_string());
+            ordinary.git_commit = Some(sha.to_string());
+            store.record_run(&ordinary).unwrap();
+            // Newer, same commit, but `--branch`-scoped — must not win.
+            let mut scoped = sample_run("scoped-scratch-run", base + chrono::Duration::minutes(1));
+            scoped.git_branch = Some("main".to_string());
+            scoped.git_commit = Some(sha.to_string());
+            scoped.rocky_branch = Some("scratch".to_string());
+            store.record_run(&scoped).unwrap();
+        }
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+
+        let (_b, by_full, note_full) =
+            newest_branch_and_base_runs(&store, "feature", Some(sha)).unwrap();
+        assert_eq!(
+            by_full.unwrap().run_id,
+            "ordinary-commit-run",
+            "full sha: a --branch-scoped run at the same commit must not become the base"
+        );
+        assert!(note_full.is_none());
+
+        let (_b, by_prefix, note_prefix) =
+            newest_branch_and_base_runs(&store, "feature", Some(&sha[..7])).unwrap();
+        assert_eq!(
+            by_prefix.unwrap().run_id,
+            "ordinary-commit-run",
+            "7-hex prefix: a --branch-scoped run at the same commit must not become the base"
+        );
+        assert!(note_prefix.is_none());
     }
 
     /// The production preview workflow passes the base COMMIT SHA — records
@@ -2674,8 +2992,8 @@ mod tests {
             },
             algorithm: PreviewModelDiffAlgorithm::Sampled {
                 sampled: PreviewSampledRowDiff {
-                    rows_added: 0,
-                    rows_removed: 0,
+                    rows_added: Some(0),
+                    rows_removed: Some(0),
                     rows_changed: 0,
                     samples: vec![],
                 },
@@ -2944,6 +3262,12 @@ mod tests {
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            // `build_preview_diff` (this helper's only caller) takes
+            // already-resolved branch/base records directly — no
+            // branch-name matching — so this field is inert for every
+            // `run_record()` test. `newest_branch_and_base_runs`'s
+            // selection tests use `sample_run()` instead.
+            rocky_branch: None,
         }
     }
 
@@ -2975,7 +3299,7 @@ mod tests {
         assert!(summary.any_coverage_warning);
         let by_name: HashMap<&str, &crate::output::PreviewModelDiff> =
             models.iter().map(|m| (m.model_name.as_str(), m)).collect();
-        let sampled = |m: &crate::output::PreviewModelDiff| -> (u64, u64) {
+        let sampled = |m: &crate::output::PreviewModelDiff| -> (Option<u64>, Option<u64>) {
             match &m.algorithm {
                 crate::output::PreviewModelDiffAlgorithm::Sampled { sampled, .. } => {
                     (sampled.rows_added, sampled.rows_removed)
@@ -2983,8 +3307,65 @@ mod tests {
                 _ => panic!("expected sampled arm"),
             }
         };
-        assert_eq!(sampled(by_name["a"]), (10, 0));
-        assert_eq!(sampled(by_name["b"]), (0, 10));
+        assert_eq!(sampled(by_name["a"]), (Some(10), Some(0)));
+        assert_eq!(sampled(by_name["b"]), (Some(0), Some(10)));
+    }
+
+    /// #2032: an ordinary transformation model reports no `rows_affected`
+    /// on the base side (the shape a full-refresh model going from 10 rows
+    /// to 20 actually produces — the content-addressed path is the only
+    /// one that carries a real count). The delta must be UNKNOWN, never a
+    /// fabricated `0` — `0` reads as "measured, no change", which is a
+    /// false clean for a model whose row count genuinely changed.
+    #[test]
+    fn diff_reports_unknown_not_zero_when_a_row_count_is_unavailable() {
+        let branch = run_record(
+            "br",
+            vec![exec("a", 100, Some(20), None)],
+            Some("feature_x"),
+        );
+        let base = run_record("ba", vec![exec("a", 100, None, None)], None);
+        let (summary, models) = build_preview_diff(&branch, &base);
+        assert_eq!(
+            summary.models_with_changes, 0,
+            "an unknown delta must not count as a change"
+        );
+        assert_eq!(
+            summary.models_unchanged, 0,
+            "an unknown delta must not count as unchanged either — that is the same false claim"
+        );
+        assert_eq!(summary.models_unknown, 1);
+        assert_eq!(
+            summary.total_rows_added, 0,
+            "an unknown delta contributes nothing to the total, not a fabricated 0-that-counts"
+        );
+        assert_eq!(summary.total_rows_removed, 0);
+
+        let sampled = match &models[0].algorithm {
+            crate::output::PreviewModelDiffAlgorithm::Sampled { sampled, .. } => sampled,
+            _ => panic!("expected sampled arm"),
+        };
+        assert_eq!(
+            sampled.rows_added, None,
+            "must serialize as JSON null, never a fabricated 0 (#2032)"
+        );
+        assert_eq!(sampled.rows_removed, None);
+    }
+
+    /// Both sides unavailable is the same unknown outcome, not a special
+    /// case — the mirror direction of the test above.
+    #[test]
+    fn diff_reports_unknown_when_both_sides_lack_a_row_count() {
+        let branch = run_record("br", vec![exec("a", 100, None, None)], Some("feature_x"));
+        let base = run_record("ba", vec![exec("a", 100, None, None)], None);
+        let (summary, models) = build_preview_diff(&branch, &base);
+        assert_eq!(summary.models_unknown, 1);
+        let sampled = match &models[0].algorithm {
+            crate::output::PreviewModelDiffAlgorithm::Sampled { sampled, .. } => sampled,
+            _ => panic!("expected sampled arm"),
+        };
+        assert_eq!(sampled.rows_added, None);
+        assert_eq!(sampled.rows_removed, None);
     }
 
     /// Identical row counts → no changes; coverage_warning still fires
@@ -3167,6 +3548,38 @@ mod tests {
         // Coverage-warning hint surfaces on the structural-only fallback
         // path. Wording is generic — no internal phase labels.
         assert!(md.contains("might not be fully surfaced"));
+    }
+
+    /// #2032: the markdown table — the exact text the `rocky-preview`
+    /// GitHub Action posts as a PR comment — renders `?` for an unknown
+    /// row-count delta, never `0`, and the headline calls out how many
+    /// models are excluded from the totals. This is the human-facing
+    /// half of the fix: a machine reader gets `null` in the JSON; a human
+    /// reading the PR comment gets `?` and an explicit warning, not a
+    /// silent "0 rows added" that reads as "no change".
+    #[test]
+    fn diff_markdown_renders_unknown_as_question_mark_not_zero() {
+        let branch = run_record(
+            "br",
+            vec![exec("a", 100, Some(20), None)],
+            Some("feature_x"),
+        );
+        let base = run_record("ba", vec![exec("a", 100, None, None)], None);
+        let (summary, models) = build_preview_diff(&branch, &base);
+        assert_eq!(summary.models_unknown, 1);
+        let md = render_preview_diff_markdown("feature_x", "main", None, &summary, &models);
+        assert!(
+            md.contains("| `a` | ? | ? |"),
+            "unknown delta must render as '?', never '0': {md}"
+        );
+        // The aggregate total genuinely is 0 here (nothing else
+        // contributes) — the point is the warning immediately below it,
+        // so a reader never mistakes "+0 rows" for "measured, no change".
+        assert!(md.contains("+0 / −0 rows"), "{md}");
+        assert!(
+            md.contains("1 model(s) have no recorded row count"),
+            "the headline must call out the excluded model count: {md}"
+        );
     }
 
     /// Empty diff path produces a "no paired runs" hint, not an empty

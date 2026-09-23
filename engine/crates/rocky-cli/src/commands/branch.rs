@@ -215,6 +215,7 @@ pub async fn run_branch_compare(
         suffix: "_rocky_shadow".to_string(),
         schema_override: Some(record.schema_prefix),
         cleanup_after: false,
+        branch: Some(branch_name.to_string()),
     };
     let thresholds = ComparisonThresholds::default();
 
@@ -1199,6 +1200,7 @@ async fn discover_replication_branch_targets(
         suffix: "_rocky_shadow".to_string(),
         schema_override: Some(record.schema_prefix.clone()),
         cleanup_after: false,
+        branch: Some(record.name.clone()),
     };
 
     let mut planned = Vec::new();
@@ -1281,6 +1283,7 @@ fn discover_transformation_branch_targets(
         suffix: "_rocky_shadow".to_string(),
         schema_override: Some(record.schema_prefix.clone()),
         cleanup_after: false,
+        branch: Some(record.name.clone()),
     };
 
     let mut planned = Vec::new();
@@ -1977,6 +1980,7 @@ mod tests {
             suffix: "_rocky_shadow".to_string(),
             schema_override: Some(record.schema_prefix.clone()),
             cleanup_after: false,
+            branch: Some(record.name.clone()),
         };
 
         assert_eq!(record.schema_prefix, "branch__fix-price");

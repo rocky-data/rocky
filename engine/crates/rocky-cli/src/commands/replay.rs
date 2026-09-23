@@ -2103,6 +2103,7 @@ mod tests {
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
         }
     }
 
@@ -2836,6 +2837,7 @@ mod tests {
                 submission_id: None,
                 check_gate_failed: false,
                 verify_after_failed: false,
+                rocky_branch: None,
             };
             store.record_run(&record).unwrap();
 

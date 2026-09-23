@@ -97,6 +97,7 @@ fn seed_state(state_path: &Path) {
             submission_id: None,
             check_gate_failed: false,
             verify_after_failed: false,
+            rocky_branch: None,
         })
         .unwrap();
 }

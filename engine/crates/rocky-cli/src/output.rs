@@ -2537,6 +2537,14 @@ pub struct RunHistoryRecord {
     /// `TickOutput.executed[].submission_id`. `None` for manually launched runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub submission_id: Option<String>,
+    /// The named Rocky branch this run wrote to (`rocky run --branch
+    /// <name>`), or `None` for a production / plain-`--shadow` run. Distinct
+    /// from `git_branch` — see `RunRecord::rocky_branch` (#2032). Not
+    /// audit-gated — like [`Self::pipeline`], it is an operational join key
+    /// (`rocky preview diff`/`preview cost` pair a run by this field), always
+    /// emitted when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rocky_branch: Option<String>,
 
     // --- Governance audit trail (populated only with `--audit`) ---
     /// Resolved caller identity (Unix `$USER` / Windows `$USERNAME`).
@@ -4976,6 +4984,10 @@ pub struct RunRecordAudit {
     pub target_catalog: Option<String>,
     pub hostname: String,
     pub rocky_version: String,
+    /// The named Rocky branch this run wrote to (`rocky run --branch
+    /// <name>`), or `None`. See `RunRecord::rocky_branch` (#2032) — this is
+    /// NOT `git_branch`.
+    pub rocky_branch: Option<String>,
 }
 
 impl RunRecordAudit {
@@ -4994,6 +5006,7 @@ impl RunRecordAudit {
             target_catalog: None,
             hostname: "output-test-host".to_string(),
             rocky_version: "0.0.0-test".to_string(),
+            rocky_branch: None,
         }
     }
 }
@@ -5386,6 +5399,7 @@ impl RunOutput {
             target_catalog: audit.target_catalog,
             hostname: audit.hostname,
             rocky_version: audit.rocky_version,
+            rocky_branch: audit.rocky_branch,
             check_outcomes,
             pipeline: None,
             submission_id: None,
@@ -10530,6 +10544,19 @@ pub struct PreviewDiffOutput {
 pub struct PreviewDiffSummary {
     pub models_with_changes: usize,
     pub models_unchanged: usize,
+    /// Models whose row-count delta could not be computed — the warehouse
+    /// adapter or materialization strategy reported no `rows_affected` on
+    /// the branch side, the base side, or both (#2032). These are counted
+    /// separately from `models_unchanged`: "no recorded delta" is not the
+    /// same claim as "no change", and folding the two together is exactly
+    /// the false-clean report this field exists to prevent. A model here
+    /// contributes `null` (not `0`) to its own `rows_added`/`rows_removed`
+    /// and is excluded from `total_rows_added`/`total_rows_removed`, so
+    /// those totals are a floor, not an exact count, whenever this is > 0.
+    pub models_unknown: usize,
+    /// Sum of `rows_added` over models with a KNOWN delta only — models
+    /// counted in `models_unknown` contribute nothing here (never `0`,
+    /// which would be indistinguishable from a genuine no-op).
     pub total_rows_added: u64,
     pub total_rows_removed: u64,
     pub total_rows_changed: u64,
@@ -10674,8 +10701,17 @@ pub struct PreviewColumnTypeChange {
 /// Sampled row-level diff. All counts are over the sampling window.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PreviewSampledRowDiff {
-    pub rows_added: u64,
-    pub rows_removed: u64,
+    /// `None` — emitted as JSON `null`, deliberately NOT omitted via
+    /// `skip_serializing_if` — when the row count needed to compute this
+    /// delta was unavailable on the branch side, the base side, or both
+    /// (an ordinary transformation run's adapter/strategy reports no
+    /// `rows_affected`). `Some(0)` means a genuine, measured no-op; `null`
+    /// means unmeasured. Collapsing the two into `0` is the exact defect
+    /// this field exists to prevent — a full-refresh model going from 10
+    /// rows to 20 must never report `rows_added: 0` (#2032).
+    pub rows_added: Option<u64>,
+    /// Same absent-vs-zero contract as `rows_added`.
+    pub rows_removed: Option<u64>,
     pub rows_changed: u64,
     /// Up to `--max-samples` (default 5) representative changed rows
     /// for human review. Pure noise when sampling found no change.

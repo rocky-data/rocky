@@ -324,8 +324,11 @@ pub async fn run_transformation(
     // Transformation runs have no single target catalog (per-model targets
     // resolve from each model's sidecar), so `target_catalog = None` — the
     // same posture as the model-only path.
-    let audit_ctx =
-        super::run_audit::AuditContext::detect(idempotency_key.map(str::to_string), None);
+    let audit_ctx = super::run_audit::AuditContext::detect(
+        idempotency_key.map(str::to_string),
+        None,
+        shadow_config.and_then(|c| c.branch.clone()),
+    );
     let audit = super::run::audit_to_record(&audit_ctx);
     let custody = super::run::RecordCustody::from_persisted(super::run::persist_run_record(
         state_store.as_ref(),
@@ -905,7 +908,14 @@ pub async fn run_quality(
     // trigger are read from the environment inside `persist_run_record`.
     let store = StateStore::open(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-    let audit_ctx = super::run_audit::AuditContext::detect(None, None);
+    // Quality pipelines ignore `--branch` today: unlike the snapshot/load
+    // dispatch (which calls `reject_unsupported_shadow` in `run.rs` and
+    // refuses the flag outright), the flag is never threaded into
+    // `run_quality` at all, so there is no `ShadowConfig` here to read a
+    // Rocky branch from and this run's record carries no branch. Nothing
+    // tells the caller their `--branch` was ignored — refusing it like
+    // snapshot/load do is tracked in #2161.
+    let audit_ctx = super::run_audit::AuditContext::detect(None, None, None);
     let audit = super::run::audit_to_record(&audit_ctx);
     let recorded = super::run::persist_run_record(
         Some(&store),
@@ -1516,7 +1526,13 @@ pub async fn run_snapshot(
     // read from the environment inside `persist_run_record`.
     let store = StateStore::open(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-    let audit_ctx = super::run_audit::AuditContext::detect(None, None);
+    // `rocky run --branch` / `--shadow` on a snapshot pipeline is refused in
+    // `run.rs` (`reject_unsupported_shadow`) before this function runs —
+    // unlike quality, which threads the flag through and silently ignores
+    // it (see the comment above `run_quality`'s own `AuditContext::detect`
+    // call). There is no `ShadowConfig` here because a run that reached
+    // this function was never given one.
+    let audit_ctx = super::run_audit::AuditContext::detect(None, None, None);
     let audit = super::run::audit_to_record(&audit_ctx);
     super::run::persist_run_record(
         Some(&store),
@@ -2215,7 +2231,7 @@ auto_create_schemas = true
     /// key in its audit.
     ///
     /// Before the fix, `run_transformation` built its audit with
-    /// `AuditContext::detect(None, None)`, so the persisted `RunRecord`'s
+    /// `AuditContext::detect(None, None, None)`, so the persisted `RunRecord`'s
     /// `idempotency_key` was `None` even though the run finalized the
     /// idempotency entry under `K` — `rocky history --audit` showed
     /// `idempotency_key=-` instead of `K`. The model-only / replication paths

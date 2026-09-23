@@ -457,6 +457,7 @@ mod retention_sweep_config_tests {
             check_outcomes: Vec::new(),
             pipeline: None,
             submission_id: None,
+            rocky_branch: None,
         }
     }
 
