@@ -33,9 +33,15 @@
 //! 4. any unqualified function not in [`CHECK_EXPRESSION_FUNCTIONS`];
 //! 5. an allowlisted function called in the one shape whose result is not a
 //!    function of its arguments alone: the bare one-argument form of
-//!    `to_date`, `to_timestamp` and `to_char`, and a `week`-shaped part in
-//!    `date_trunc` / `datediff`. All five read a Snowflake session
-//!    parameter in exactly that shape and nowhere else (#1942).
+//!    `to_date`, `to_timestamp` and `to_char`; a `week`-shaped part (or a
+//!    synonym) in `date_trunc` / `datediff`; and a `week`-, `dayofweek`- or
+//!    `yearofweek`-shaped part (or a synonym) in `date_part`. All eight read
+//!    a Snowflake session parameter in exactly that shape and nowhere else
+//!    (#1942, #2141);
+//! 6. `EXTRACT(<part> FROM <expr>)` on the same three unsafe part families
+//!    `date_part` refuses — `EXTRACT` is sqlparser's own AST node, not a
+//!    `Function` call, so it needs its own gate rather than inheriting
+//!    `date_part`'s (#2141).
 //!
 //! Refusal happens when the test SQL is generated, which is before execution
 //! on every path, so a refused check is visible in the deferred/executed
@@ -335,6 +341,151 @@ const SAFE_DATE_TIME_PARTS: &[&str] = &[
     "nseconds",
 ];
 
+/// Date/time parts for `date_part` (and `EXTRACT`) whose result does NOT
+/// depend on any Snowflake session parameter (#2141), lowercase.
+///
+/// `date_part` accepts every part `date_trunc`/`datediff` do (so this
+/// superset repeats [`SAFE_DATE_TIME_PARTS`]'s entries rather than sharing
+/// them — no `const fn` slice concatenation without a helper crate, and a
+/// second independent literal is what this module already does for that
+/// list), plus parts `date_trunc`/`datediff` don't take at all:
+/// `dayofweek(_iso)`, `dayofyear`, `yearofweek(iso)`, the `epoch_*` family
+/// and `timezone_hour`/`timezone_minute`. Confirmed against Snowflake's
+/// `DATE_PART` and "Supported date and time parts" pages (2026-09-23):
+///
+/// - `date_or_time_part` is `week` (or any of its variations) → controlled
+///   by `WEEK_START`.
+/// - `date_or_time_part` is `dayofweek` or `yearofweek` (or any of their
+///   variations) → controlled by `WEEK_OF_YEAR_POLICY` and `WEEK_START`.
+/// - `DAYOFWEEKISO`, `WEEKISO` and `YEAROFWEEKISO` (and their variations)
+///   are NOT controlled by either parameter — ISO weeks always start on
+///   Monday by the ISO 8601 standard.
+///
+/// So exactly three part families are excluded here and refused by
+/// [`shape_refusal`]: `week` (`w`, `wk`, `weekofyear`, `woy`, `wy`),
+/// `dayofweek` (`weekday`, `dow`, `dw`) and `yearofweek` (no documented
+/// synonym). Every other documented part, including every ISO variant, is
+/// safe and included.
+const SAFE_DATE_PART_PARTS: &[&str] = &[
+    // Year
+    "year",
+    "y",
+    "yy",
+    "yyy",
+    "yyyy",
+    "yr",
+    "years",
+    "yrs",
+    // Quarter
+    "quarter",
+    "q",
+    "qtr",
+    "qtrs",
+    "quarters",
+    // Month
+    "month",
+    "mm",
+    "mon",
+    "mons",
+    "months",
+    // Day of week (ISO) — fixed to Monday-start, NOT WEEK_START/
+    // WEEK_OF_YEAR_POLICY-dependent. `dayofweek` itself (and `weekday`,
+    // `dow`, `dw`) is EXCLUDED — it is session-dependent.
+    "dayofweek_iso",
+    "dayofweekiso",
+    "weekday_iso",
+    "dow_iso",
+    "dw_iso",
+    // Day of year — not week-related at all.
+    "dayofyear",
+    "yearday",
+    "doy",
+    "dy",
+    // Week (ISO) — fixed to Monday-start, NOT WEEK_START-dependent. Plain
+    // `week` (and its synonyms `w`, `wk`, `weekofyear`, `woy`, `wy`) is
+    // EXCLUDED — it is the session-dependent part this list exists to keep
+    // out.
+    "week_iso",
+    "weekiso",
+    "weekofyeariso",
+    "weekofyear_iso",
+    // Day
+    "day",
+    "d",
+    "dd",
+    "days",
+    "dayofmonth",
+    // Year of week (ISO) — fixed, NOT session-dependent. Plain `yearofweek`
+    // (no documented synonym) is EXCLUDED for the same reason as `week` and
+    // `dayofweek` above.
+    "yearofweekiso",
+    // Hour
+    "hour",
+    "h",
+    "hh",
+    "hr",
+    "hours",
+    "hrs",
+    // Minute
+    "minute",
+    "m",
+    "mi",
+    "min",
+    "minutes",
+    "mins",
+    // Second
+    "second",
+    "s",
+    "sec",
+    "seconds",
+    "secs",
+    // Millisecond
+    "millisecond",
+    "ms",
+    "msec",
+    "milliseconds",
+    // Microsecond
+    "microsecond",
+    "us",
+    "usec",
+    "microseconds",
+    // Nanosecond
+    "nanosecond",
+    "ns",
+    "nsec",
+    "nanosec",
+    "nsecond",
+    "nanoseconds",
+    "nanosecs",
+    "nseconds",
+    // Epoch — a count of elapsed time from a fixed origin, not a calendar
+    // field; no session parameter affects it.
+    "epoch_second",
+    "epoch",
+    "epoch_seconds",
+    "epoch_millisecond",
+    "epoch_milliseconds",
+    "epoch_microsecond",
+    "epoch_microseconds",
+    "epoch_nanosecond",
+    "epoch_nanoseconds",
+    // Timezone offset — a property of the value's offset, not the calendar.
+    "timezone_hour",
+    "tzh",
+    "timezone_minute",
+    "tzm",
+];
+
+/// Advice shared by `date_part` and `EXTRACT`'s week-family gate — see
+/// [`SAFE_DATE_PART_PARTS`] for the exact list and the Snowflake pages it
+/// is confirmed against (#2141).
+const DATE_PART_UNSAFE_PART_ADVICE: &str = "with a date/time part other than `week` (or one of \
+     its synonyms `w`, `wk`, `weekofyear`, `woy`, `wy`), `dayofweek` (or `weekday`, `dow`, `dw`), \
+     or `yearofweek` — for example `date_part('day', x)` or `EXTRACT(day FROM x)`. Those three \
+     depend on Snowflake's WEEK_START or WEEK_OF_YEAR_POLICY session parameters; every ISO-fixed \
+     variant (`dayofweekiso`, `weekiso`, `yearofweekiso`, and their synonyms) does not and stays \
+     admitted";
+
 /// The number of positional arguments a parsed function call carries.
 ///
 /// `FunctionArguments::None` (a niladic call with no parentheses, e.g. a bare
@@ -367,12 +518,14 @@ fn first_arg_literal(function: &Function) -> Option<String> {
     }
 }
 
-/// Per-function argument-shape rule for the five functions (six allowlist
+/// Per-function argument-shape rule for the six functions (seven allowlist
 /// entries — `datediff` and its `date_diff` spelling share one rule) whose
 /// BARE call form reads a Snowflake session parameter instead of being a
-/// function of their arguments alone (#1942). Checked in addition to, not
-/// instead of, [`CHECK_EXPRESSION_FUNCTIONS`] membership — a name has to
-/// clear both.
+/// function of their arguments alone (#1942, #2141). Checked in addition
+/// to, not instead of, [`CHECK_EXPRESSION_FUNCTIONS`] membership — a name
+/// has to clear both. `EXTRACT(<part> FROM <expr>)` shares `date_part`'s
+/// rule and safe-part list but is not a `Function` call at all, so it is
+/// gated separately in the `Walker` below, not here.
 ///
 /// Returns `Some(accepted_shape)` — the text
 /// [`ValidationError::ExpressionFunctionShapeNotAllowed`] reports — when
@@ -429,6 +582,24 @@ fn shape_refusal(name: &str, function: &Function) -> Option<&'static str> {
                  `weekofyear`, `woy`, `wy`), for example `datediff('day', a, b)`. A `week` \
                  difference depends on Snowflake's WEEK_START session parameter",
             )
+        }
+        // `date_part(part, x)` accepts more parts than `date_trunc`/
+        // `datediff` do (`dayofyear`, `dayofweekiso`, `yearofweekiso`,
+        // `epoch_second`, ...), so it gets its own safe list
+        // ([`SAFE_DATE_PART_PARTS`]) rather than reusing
+        // [`SAFE_DATE_TIME_PARTS`], which would refuse those valid parts
+        // outright. Three families are session-dependent here:  `week`,
+        // `dayofweek` and `yearofweek` (#2141) — one more than
+        // `date_trunc`/`datediff` refuse, because Snowflake's `DATE_PART`
+        // page documents `dayofweek`/`yearofweek` as `WEEK_OF_YEAR_POLICY`-
+        // and `WEEK_START`-dependent too, and neither part exists on
+        // `date_trunc`/`datediff` at all.
+        "date_part"
+            if !first_arg_literal(function).is_some_and(|part| {
+                SAFE_DATE_PART_PARTS.contains(&part.to_ascii_lowercase().as_str())
+            }) =>
+        {
+            Some(DATE_PART_UNSAFE_PART_ADVICE)
         }
         _ => None,
     }
@@ -810,6 +981,35 @@ impl Visitor for Walker<'_> {
                     use_: self.use_,
                     function: name,
                 })
+            }
+            // `EXTRACT(<part> FROM <expr>)` (or the comma form,
+            // `EXTRACT(<part>, <expr>)`) is Snowflake's own documented
+            // alternative spelling of `DATE_PART` — same parts, same
+            // session-parameter risk — but sqlparser gives it a dedicated
+            // `Expr::Extract` node rather than routing it through
+            // `Expr::Function`, so it never reaches the allowlist or
+            // `shape_refusal` above and was admitted unconditionally before
+            // this arm existed (#2141). `field`'s `Display` renders the
+            // known keyword spelling (`WEEK`) or, for a dialect-specific
+            // abbreviation sqlparser doesn't have a variant for, the
+            // original identifier text verbatim (`Custom`) — lowercasing
+            // either lands on the same strings [`SAFE_DATE_PART_PARTS`]
+            // matches for `date_part`. Continuing (not breaking) still
+            // walks into the inner `expr` — the traversal descends into an
+            // unhandled node's children automatically, same as every other
+            // arm here.
+            Expr::Extract { field, .. } => {
+                let part = field.to_string().to_ascii_lowercase();
+                if SAFE_DATE_PART_PARTS.contains(&part.as_str()) {
+                    ControlFlow::Continue(())
+                } else {
+                    ControlFlow::Break(ValidationError::ExpressionFunctionShapeNotAllowed {
+                        context: self.context.to_string(),
+                        use_: self.use_,
+                        function: "extract".to_string(),
+                        accepted_shape: DATE_PART_UNSAFE_PART_ADVICE,
+                    })
+                }
             }
             _ => ControlFlow::Continue(()),
         }
@@ -1607,6 +1807,160 @@ mod tests {
             }
             other => {
                 panic!("a week date_trunc inside a CASE branch must still be refused: {other:?}")
+            }
+        }
+    }
+
+    /// `date_part` refuses three session-dependent part families — `week`,
+    /// `dayofweek` and `yearofweek`, and every documented synonym of each —
+    /// and admits everything else, including every ISO-fixed counterpart
+    /// and the parts `date_trunc`/`datediff` don't take at all (#2141).
+    #[test]
+    fn date_part_refuses_week_dayofweek_yearofweek_families_and_admits_everything_else() {
+        for part in [
+            "week",
+            "WEEK",
+            "w",
+            "wk",
+            "weekofyear",
+            "woy",
+            "wy",
+            "dayofweek",
+            "weekday",
+            "dow",
+            "dw",
+            "yearofweek",
+        ] {
+            let refused = check_on("snowflake", &format!("date_part('{part}', created_at) > 0"));
+            assert!(
+                matches!(
+                    refused,
+                    Err(ValidationError::ExpressionFunctionShapeNotAllowed { .. })
+                ),
+                "'{part}' must be refused: {refused:?}"
+            );
+        }
+        for part in [
+            "day",
+            "month",
+            "year",
+            "quarter",
+            "hour",
+            "minute",
+            "second",
+            "week_iso",
+            "weekiso",
+            "dayofweekiso",
+            "dayofweek_iso",
+            "yearofweekiso",
+            "dayofyear",
+            "epoch_second",
+            "epoch",
+            "timezone_hour",
+            "tzh",
+        ] {
+            check_on("snowflake", &format!("date_part('{part}', created_at) > 0"))
+                .unwrap_or_else(|e| panic!("'{part}' must stay admitted: {e:?}"));
+        }
+    }
+
+    /// `date_part`'s bare identifier form (no quotes) hits the same rule —
+    /// `first_arg_literal` reads an `Expr::Identifier` the same way it reads
+    /// a string literal.
+    #[test]
+    fn date_part_bare_identifier_part_is_gated_the_same_as_a_quoted_one() {
+        let refused = check_on("snowflake", "date_part(week, created_at) > 0");
+        assert!(
+            matches!(
+                refused,
+                Err(ValidationError::ExpressionFunctionShapeNotAllowed { .. })
+            ),
+            "date_part(week, ..) must be refused: {refused:?}"
+        );
+        check_on("snowflake", "date_part(day, created_at) > 0")
+            .expect("date_part(day, ..) must stay admitted");
+    }
+
+    /// `EXTRACT(<part> FROM <expr>)` is Snowflake's documented alternative
+    /// spelling of `DATE_PART` and must be refused on the identical three
+    /// part families. Before this gate existed, `Expr::Extract` was not
+    /// matched anywhere in the walker, so every part — including `week` —
+    /// fell through to the default `_ => ControlFlow::Continue(())` arm and
+    /// was admitted unconditionally; this test's `week`/`dayofweek` cases
+    /// pin that gap closed (#2141).
+    #[test]
+    fn extract_is_gated_on_the_same_three_part_families_as_date_part() {
+        for part in ["week", "dayofweek", "weekday", "yearofweek"] {
+            let refused = check_on("snowflake", &format!("EXTRACT({part} FROM created_at) > 0"));
+            match refused {
+                Err(ValidationError::ExpressionFunctionShapeNotAllowed {
+                    ref function, ..
+                }) => {
+                    assert_eq!(function, "extract");
+                }
+                other => panic!("EXTRACT({part} FROM ..) must be refused: {other:?}"),
+            }
+        }
+        for part in [
+            "day",
+            "year",
+            "week_iso",
+            "dayofweekiso",
+            "yearofweekiso",
+            "epoch",
+        ] {
+            check_on("snowflake", &format!("EXTRACT({part} FROM created_at) > 0"))
+                .unwrap_or_else(|e| panic!("EXTRACT({part} FROM ..) must stay admitted: {e:?}"));
+        }
+    }
+
+    /// The comma form (`EXTRACT(part, expr)`, Snowflake's own documented
+    /// alternative to `EXTRACT(part FROM expr)` — sqlparser's
+    /// `ExtractSyntax::Comma`, gated per-dialect and NOT supported under
+    /// `BigQueryDialect`) is the same `Expr::Extract` AST node under a
+    /// different concrete syntax and must be gated identically to the
+    /// `FROM` form.
+    #[test]
+    fn extract_comma_syntax_is_gated_the_same_as_the_from_syntax() {
+        let refused = check_on("snowflake", "EXTRACT(week, created_at) > 0");
+        assert!(
+            matches!(
+                refused,
+                Err(ValidationError::ExpressionFunctionShapeNotAllowed { .. })
+            ),
+            "EXTRACT(week, ..) must be refused: {refused:?}"
+        );
+        check_on("snowflake", "EXTRACT(day, created_at) > 0")
+            .expect("EXTRACT(day, ..) must stay admitted");
+    }
+
+    /// The shape rule applies at any nesting depth for `date_part`/`EXTRACT`
+    /// too, same as the pre-existing `date_trunc` case above.
+    #[test]
+    fn date_part_and_extract_refusals_fire_at_any_nesting_depth() {
+        let nested_date_part = check_on(
+            "snowflake",
+            "CASE WHEN a > 0 THEN date_part('week', created_at) > 0 ELSE FALSE END",
+        );
+        match nested_date_part {
+            Err(ValidationError::ExpressionFunctionShapeNotAllowed { ref function, .. }) => {
+                assert_eq!(function, "date_part");
+            }
+            other => {
+                panic!("a week date_part inside a CASE branch must still be refused: {other:?}")
+            }
+        }
+
+        let nested_extract = check_on(
+            "snowflake",
+            "coalesce(NULL, EXTRACT(dayofweek FROM created_at))",
+        );
+        match nested_extract {
+            Err(ValidationError::ExpressionFunctionShapeNotAllowed { ref function, .. }) => {
+                assert_eq!(function, "extract");
+            }
+            other => {
+                panic!("a dayofweek EXTRACT nested in coalesce must still be refused: {other:?}")
             }
         }
     }
