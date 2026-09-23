@@ -250,15 +250,15 @@ const SESSION_IDENTITY_KEYWORDS: &[&str] = &[
     "current_session",
 ];
 
-/// Date/time parts for `date_trunc` / `datediff` whose result does NOT
+/// Date/time parts for `datediff` whose result does NOT
 /// depend on Snowflake's `WEEK_START` session parameter (#1942), lowercase.
 ///
 /// An allowlist, on purpose, matching the reasoning at the top of this
 /// module: Snowflake documents that `WEEK_START` controls the output
 /// "[w]hen `date_or_time_part` is `week` (or any of its variations)"
-/// (`DATE_TRUNC`, `DATEDIFF`). Denying just `"week"` would miss its
+/// (`DATEDIFF`). Denying just `"week"` would miss its
 /// documented synonyms (`w`, `wk`, `weekofyear`, `woy`, `wy`), so this is the
-/// complete set of every OTHER documented part and its synonyms instead —
+/// complete set of every OTHER documented `DATEDIFF` part and its synonyms instead —
 /// covering every real key/predicate shape this repo uses
 /// (`docs/src/content/docs/**`, `examples/**` grep clean of `week` parts as
 /// of #1942) without having to enumerate week's aliases correctly.
@@ -267,7 +267,7 @@ const SESSION_IDENTITY_KEYWORDS: &[&str] = &[
 /// an ISO week is fixed to start on Monday by the ISO 8601 standard, so
 /// Snowflake does not consult `WEEK_START` for it — only the plain `week`
 /// part is session-dependent.
-const SAFE_DATE_TIME_PARTS: &[&str] = &[
+const SAFE_DATEDIFF_PARTS: &[&str] = &[
     // Year
     "year",
     "y",
@@ -341,13 +341,92 @@ const SAFE_DATE_TIME_PARTS: &[&str] = &[
     "nseconds",
 ];
 
+/// DATE_TRUNC (and date/time TRUNC/TRUNCATE) also accepts the ISO-fixed
+/// `yearofweekiso` part; Snowflake does not list it for DATEDIFF.
+/// See the `yearofweekiso` row in "Supported date and time parts".
+const SAFE_TRUNCATION_PARTS: &[&str] = &[
+    // Year
+    "year",
+    "y",
+    "yy",
+    "yyy",
+    "yyyy",
+    "yr",
+    "years",
+    "yrs",
+    // Quarter
+    "quarter",
+    "q",
+    "qtr",
+    "qtrs",
+    "quarters",
+    // Month
+    "month",
+    "mm",
+    "mon",
+    "mons",
+    "months",
+    // Week (ISO) — fixed to Monday-start, NOT WEEK_START-dependent.
+    "week_iso",
+    "weekiso",
+    "weekofyeariso",
+    "weekofyear_iso",
+    // ISO year of week — fixed semantics; absent from DATEDIFF.
+    "yearofweekiso",
+    // Day
+    "day",
+    "d",
+    "dd",
+    "days",
+    "dayofmonth",
+    // Hour
+    "hour",
+    "h",
+    "hh",
+    "hr",
+    "hours",
+    "hrs",
+    // Minute
+    "minute",
+    "m",
+    "mi",
+    "min",
+    "minutes",
+    "mins",
+    // Second
+    "second",
+    "s",
+    "sec",
+    "seconds",
+    "secs",
+    // Millisecond
+    "millisecond",
+    "ms",
+    "msec",
+    "milliseconds",
+    // Microsecond
+    "microsecond",
+    "us",
+    "usec",
+    "microseconds",
+    // Nanosecond
+    "nanosecond",
+    "ns",
+    "nsec",
+    "nanosec",
+    "nsecond",
+    "nanoseconds",
+    "nanosecs",
+    "nseconds",
+];
+
 /// Date/time parts for `date_part` (and `EXTRACT`) whose result does NOT
 /// depend on any Snowflake session parameter (#2141), lowercase.
 ///
 /// `date_part` accepts every part `date_trunc`/`datediff` do (so this
-/// superset repeats [`SAFE_DATE_TIME_PARTS`]'s entries rather than sharing
-/// them — no `const fn` slice concatenation without a helper crate, and a
-/// second independent literal is what this module already does for that
+/// superset repeats [`SAFE_TRUNCATION_PARTS`]'s entries rather than sharing
+/// them — no `const fn` slice concatenation without a helper crate, and an
+/// independent literal is what this module already does for that
 /// list), plus parts `date_trunc`/`datediff` don't take at all:
 /// `dayofweek(_iso)`, `dayofyear`, `yearofweek(iso)`, the `epoch_*` family
 /// and `timezone_hour`/`timezone_minute`. Confirmed against Snowflake's
@@ -538,7 +617,7 @@ fn second_arg_is_numeric_scale(function: &Function) -> bool {
         Expr::Identifier(ident) if ident.quote_style.is_some() => true,
         Expr::Identifier(ident) => {
             let part = ident.value.to_ascii_lowercase();
-            !SAFE_DATE_TIME_PARTS.contains(&part.as_str())
+            !SAFE_TRUNCATION_PARTS.contains(&part.as_str())
                 && !["week", "w", "wk", "weekofyear", "woy", "wy"].contains(&part.as_str())
         }
         Expr::CompoundIdentifier(_) => true,
@@ -589,7 +668,7 @@ fn shape_refusal(name: &str, function: &Function) -> Option<&'static str> {
         // distinguish the safe shape here — the risk is in WHICH part.
         "date_trunc"
             if !arg_literal(function, 0).is_some_and(|part| {
-                SAFE_DATE_TIME_PARTS.contains(&part.to_ascii_lowercase().as_str())
+                SAFE_TRUNCATION_PARTS.contains(&part.to_ascii_lowercase().as_str())
             }) =>
         {
             Some(
@@ -607,7 +686,7 @@ fn shape_refusal(name: &str, function: &Function) -> Option<&'static str> {
             if positional_arg_count(function) >= 2
                 && !second_arg_is_numeric_scale(function)
                 && !arg_literal(function, 1).is_some_and(|part| {
-                    SAFE_DATE_TIME_PARTS.contains(&part.to_ascii_lowercase().as_str())
+                    SAFE_TRUNCATION_PARTS.contains(&part.to_ascii_lowercase().as_str())
                 }) =>
         {
             Some(
@@ -626,7 +705,7 @@ fn shape_refusal(name: &str, function: &Function) -> Option<&'static str> {
         // change is scoped to avoid.
         "datediff" | "date_diff"
             if !arg_literal(function, 0).is_some_and(|part| {
-                SAFE_DATE_TIME_PARTS.contains(&part.to_ascii_lowercase().as_str())
+                SAFE_DATEDIFF_PARTS.contains(&part.to_ascii_lowercase().as_str())
             }) =>
         {
             Some(
@@ -636,10 +715,10 @@ fn shape_refusal(name: &str, function: &Function) -> Option<&'static str> {
             )
         }
         // `date_part(part, x)` accepts more parts than `date_trunc`/
-        // `datediff` do (`dayofyear`, `dayofweekiso`, `yearofweekiso`,
+        // `datediff` do (`dayofyear`, `dayofweekiso`,
         // `epoch_second`, ...), so it gets its own safe list
         // ([`SAFE_DATE_PART_PARTS`]) rather than reusing
-        // [`SAFE_DATE_TIME_PARTS`], which would refuse those valid parts
+        // [`SAFE_TRUNCATION_PARTS`], which would refuse those valid parts
         // outright. Three families are session-dependent here:  `week`,
         // `dayofweek` and `yearofweek` (#2141) — one more than
         // `date_trunc`/`datediff` refuse, because Snowflake's `DATE_PART`
@@ -1804,7 +1883,15 @@ mod tests {
             );
         }
         for part in [
-            "day", "month", "year", "quarter", "hour", "minute", "second", "week_iso",
+            "day",
+            "month",
+            "year",
+            "quarter",
+            "hour",
+            "minute",
+            "second",
+            "week_iso",
+            "yearofweekiso",
         ] {
             check_on(
                 "snowflake",
@@ -1871,6 +1958,11 @@ mod tests {
                 &format!("{name}(created_at, 'week_iso') IS NOT NULL"),
             )
             .unwrap_or_else(|e| panic!("{name} with an ISO week part must pass: {e:?}"));
+            check_on(
+                "snowflake",
+                &format!("{name}(created_at, 'yearofweekiso') IS NOT NULL"),
+            )
+            .unwrap_or_else(|e| panic!("{name} with an ISO year-of-week part must pass: {e:?}"));
             check_on("snowflake", &format!("{name}(amount, 2) > 0"))
                 .unwrap_or_else(|e| panic!("{name} with a numeric scale must pass: {e:?}"));
             check_on("snowflake", &format!("{name}(amount, scale) > 0"))
@@ -1901,14 +1993,16 @@ mod tests {
     #[test]
     fn datediff_and_date_diff_share_the_week_rule() {
         for name in ["datediff", "date_diff"] {
-            let refused = check_on("snowflake", &format!("{name}('week', a, b) > 0"));
-            assert!(
-                matches!(
-                    refused,
-                    Err(ValidationError::ExpressionFunctionShapeNotAllowed { .. })
-                ),
-                "{name}('week', ..): {refused:?}"
-            );
+            for part in ["week", "yearofweekiso"] {
+                let refused = check_on("snowflake", &format!("{name}('{part}', a, b) > 0"));
+                assert!(
+                    matches!(
+                        refused,
+                        Err(ValidationError::ExpressionFunctionShapeNotAllowed { .. })
+                    ),
+                    "{name}('{part}', ..): {refused:?}"
+                );
+            }
             check_on("snowflake", &format!("{name}('day', a, b) > 0"))
                 .unwrap_or_else(|e| panic!("{name}('day', ..) must stay admitted: {e:?}"));
         }
