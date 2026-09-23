@@ -3513,12 +3513,18 @@ pub struct TableCompareResult {
     pub production_table: String,
     pub shadow_table: String,
     pub row_count_match: bool,
-    pub production_count: u64,
-    pub shadow_count: u64,
-    pub row_count_diff_pct: f64,
+    /// Null when the warehouse count could not be read.
+    pub production_count: Option<u64>,
+    /// Null when the warehouse count could not be read.
+    pub shadow_count: Option<u64>,
+    /// Null unless both counts were read.
+    pub row_count_diff_pct: Option<f64>,
     pub schema_match: bool,
     pub schema_diffs: Vec<String>,
     pub verdict: String,
+    /// Read errors for an `error` row, or threshold reasons for `warn`/`fail`.
+    /// Empty for `pass`.
+    pub reasons: Vec<String>,
 }
 
 /// JSON output for `rocky compact`.
@@ -10467,7 +10473,7 @@ pub struct PreviewCreateOutput {
     /// Branch name registered in the state store. Mirrors the `name`
     /// from `rocky branch create`.
     pub branch_name: String,
-    /// Schema prefix the branch run wrote into (e.g. `branch__fix-price`).
+    /// Schema prefix the branch run wrote into (e.g. `branch__fix_price`).
     pub branch_schema: String,
     /// Git ref the change set was computed against. Mirrors `--base`.
     pub base_ref: String,

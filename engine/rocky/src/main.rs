@@ -2486,7 +2486,7 @@ enum PreviewAction {
         #[arg(long, default_value = "main")]
         base: String,
         /// Branch name. When omitted, derived from the current git
-        /// branch via `pr-preview/<branch>` so PRs that re-run inherit
+        /// branch via `pr_preview_<branch>` so PRs that re-run inherit
         /// the same branch entry.
         #[arg(long)]
         name: Option<String>,
@@ -2785,7 +2785,7 @@ enum PlanSubcommand {
 enum BranchAction {
     /// Create a new branch
     Create {
-        /// Branch name (e.g., `fix-price`, `feature_new_join`)
+        /// Branch name (e.g., `fix_price`, `feature_new_join`)
         name: String,
         /// Optional description, surfaced in `rocky branch list`
         #[arg(long)]
@@ -3776,6 +3776,18 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             var,
             assume_fresh_state,
         } => {
+            // Resolve branch names before config or warehouse work. This is
+            // also the single name-to-schema funnel used by apply and compare.
+            let branch_shadow_config = branch
+                .as_ref()
+                .map(|name| {
+                    rocky_cli::commands::resolve_branch_shadow_config(
+                        &state_path,
+                        name,
+                        shadow_suffix.clone(),
+                    )
+                })
+                .transpose()?;
             // Parse `--var name=value` pairs into the run-variable map. A
             // malformed pair (no `=`, empty/invalid name) is a clear CLI error.
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
@@ -3846,22 +3858,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
 
             // Resolve --branch to the same machinery as --shadow. clap
             // guarantees branch can't coexist with `shadow` / `shadow_schema`.
-            let shadow_config = if let Some(name) = &branch {
-                let store = rocky_core::state::StateStore::open_read_only(&state_path)
-                    .with_context(|| {
-                        format!("failed to open state store at {}", state_path.display())
-                    })?;
-                let record = store.get_branch(name)?.with_context(|| {
-                    format!(
-                        "branch '{name}' not found — create it with `rocky branch create {name}`"
-                    )
-                })?;
-                Some(rocky_core::shadow::ShadowConfig {
-                    suffix: shadow_suffix,
-                    schema_override: Some(record.schema_prefix),
-                    cleanup_after: false,
-                    branch: Some(name.clone()),
-                })
+            let shadow_config = if let Some(config) = branch_shadow_config {
+                Some(config)
             } else if shadow {
                 Some(rocky_core::shadow::ShadowConfig {
                     suffix: shadow_suffix,
@@ -5322,7 +5320,7 @@ mod tests {
                         "preview",
                         "diff",
                         "--name",
-                        "pr-preview-fix-price",
+                        "pr_preview_fix_price",
                         "--sample-size",
                         "500",
                     ])

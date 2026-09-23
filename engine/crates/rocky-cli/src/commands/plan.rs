@@ -98,6 +98,9 @@ pub async fn plan(
     state_path: &Path,
     output_json: bool,
 ) -> Result<()> {
+    if let Some(branch_name) = run_options.branch.as_deref() {
+        crate::commands::branch::validate_branch_name_pub(branch_name)?;
+    }
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
         "failed to load config from {}",
         config_path.display()
@@ -2666,6 +2669,34 @@ pub(crate) async fn build_promote_plan_inner(
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn plan_branch_refuses_hyphen_before_config_io() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_config = temp.path().join("missing.toml");
+        let state = temp.path().join("missing.redb");
+        let options = super::PlanRunOptions {
+            branch: Some("pr-preview-x".to_string()),
+            ..Default::default()
+        };
+        let error = super::plan(
+            &missing_config,
+            None,
+            None,
+            None,
+            &options,
+            false,
+            "main",
+            &state,
+            false,
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("[A-Za-z0-9_]"), "{message}");
+        assert!(message.contains("pr_preview_x"), "{message}");
+        assert!(!message.contains("failed to load config"), "{message}");
+    }
 
     /// The identity must change across a state-schema version bump, because the
     /// remote ledger key embeds it. Without this a plan made under one version

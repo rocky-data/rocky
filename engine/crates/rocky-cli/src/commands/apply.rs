@@ -839,17 +839,11 @@ async fn execute_run_plan(
         .clone()
         .unwrap_or_else(|| "_rocky_shadow".to_string());
     let shadow_config = if let Some(ref name) = run_plan.branch {
-        let store = rocky_core::state::StateStore::open_read_only(state_path)
-            .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-        let record = store.get_branch(name)?.with_context(|| {
-            format!("branch '{name}' not found — create it with `rocky branch create {name}`")
-        })?;
-        Some(rocky_core::shadow::ShadowConfig {
-            suffix: shadow_suffix,
-            schema_override: Some(record.schema_prefix),
-            cleanup_after: false,
-            branch: Some(name.clone()),
-        })
+        Some(crate::commands::branch::resolve_branch_shadow_config(
+            state_path,
+            name,
+            shadow_suffix,
+        )?)
     } else if run_plan.shadow {
         Some(rocky_core::shadow::ShadowConfig {
             suffix: shadow_suffix,
@@ -3031,6 +3025,7 @@ pub(crate) fn gate_promote_plan(
     promote_plan: &PromotePlan,
     state_path: &Path,
 ) -> Result<std::sync::Arc<rocky_core::config::LoadedConfig>> {
+    crate::commands::branch::validate_branch_name_pub(&promote_plan.branch_name)?;
     // THE single fingerprinted config snapshot for the promote (#1120): the
     // pre-gate sync decision, the policy gate, AND — via the returned `Arc` —
     // the promote executor's adapter resolution all read THIS instance, so a
@@ -4297,17 +4292,9 @@ fn replication_shadow_config(
         .unwrap_or_else(|| "_rocky_shadow".to_string());
 
     if let Some(ref name) = replication_plan.branch {
-        let store = rocky_core::state::StateStore::open_read_only(state_path)
-            .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-        let record = store.get_branch(name)?.with_context(|| {
-            format!("branch '{name}' not found — create it with `rocky branch create {name}`")
-        })?;
-        return Ok(Some(rocky_core::shadow::ShadowConfig {
-            suffix,
-            schema_override: Some(record.schema_prefix),
-            cleanup_after: false,
-            branch: Some(name.clone()),
-        }));
+        return Ok(Some(crate::commands::branch::resolve_branch_shadow_config(
+            state_path, name, suffix,
+        )?));
     }
     Ok(if replication_plan.shadow {
         Some(rocky_core::shadow::ShadowConfig {

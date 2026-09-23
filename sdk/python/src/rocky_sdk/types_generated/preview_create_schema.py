@@ -52,7 +52,7 @@ class PreviewCreateOutput(BaseModel):
     """
     branch_schema: str
     """
-    Schema prefix the branch run wrote into (e.g. `branch__fix-price`).
+    Schema prefix the branch run wrote into (e.g. `branch__fix_price`).
     """
     command: str
     copy_set: list[PreviewCopiedModel]
