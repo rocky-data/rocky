@@ -55,7 +55,9 @@ use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 /// own test binary, so nothing outside it can observe the vars while held.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// `base64(zlib(json))` — what every real `dagster_pipes.encode_param` call
@@ -175,9 +177,11 @@ async fn run_transformation_pipes_path_opens_and_closes() {
         a.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
             .await
             .unwrap();
-        a.execute_statement("CREATE TABLE main.src AS SELECT * FROM (VALUES (1), (2), (3)) AS t(id)")
-            .await
-            .unwrap();
+        a.execute_statement(
+            "CREATE TABLE main.src AS SELECT * FROM (VALUES (1), (2), (3)) AS t(id)",
+        )
+        .await
+        .unwrap();
     }
     std::fs::write(models_dir.join("stg.sql"), "SELECT id FROM main.src\n").unwrap();
     std::fs::write(
