@@ -331,8 +331,8 @@ pub(crate) fn lock_pipes_env() -> std::sync::MutexGuard<'static, ()> {
 
 /// A warehouse adapter that wraps a real in-memory DuckDB adapter but fails
 /// every write (`execute_statement`; `execute_statement_with_stats` inherits
-/// the failure through its default delegation) with a fixed, typed
-/// Databricks `ConnectorError::CircuitBreakerOpen`, wrapped in
+/// the failure through its default delegation) with a selected, typed
+/// Databricks `ConnectorError`, wrapped in
 /// `rocky_core::traits::AdapterError` — the same wrapper every
 /// `WarehouseAdapter` method actually returns in production (#2064).
 ///
@@ -347,25 +347,42 @@ pub(crate) fn lock_pipes_env() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(feature = "duckdb")]
 pub(crate) struct FailingWriteWarehouseAdapter {
     inner: rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+    failure: FailingWriteKind,
+}
+
+#[cfg(feature = "duckdb")]
+pub(crate) enum FailingWriteKind {
+    Auth,
+    RateLimit,
+    CircuitBreaker,
 }
 
 #[cfg(feature = "duckdb")]
 impl FailingWriteWarehouseAdapter {
-    /// Wrap `inner` so every write fails with a tripped Databricks circuit
-    /// breaker (5 consecutive failures, a 180s cooldown) — the exact shape
-    /// #2143's tests prove `run()` classifies as `quota-exceeded` with
-    /// `cooldown_seconds: Some(180)` instead of hard-coding `unknown`.
-    pub(crate) fn new(inner: rocky_duckdb::adapter::DuckDbWarehouseAdapter) -> Self {
-        Self { inner }
+    pub(crate) fn new(
+        inner: rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+        failure: FailingWriteKind,
+    ) -> Self {
+        Self { inner, failure }
     }
 
-    fn injected_error() -> AdapterError {
-        AdapterError::new(
-            rocky_databricks::connector::ConnectorError::CircuitBreakerOpen {
+    fn injected_error(&self) -> AdapterError {
+        use rocky_databricks::connector::ConnectorError;
+        let error = match self.failure {
+            FailingWriteKind::Auth => ConnectorError::ApiError {
+                status: 401,
+                body: "injected auth failure".to_string(),
+            },
+            FailingWriteKind::RateLimit => ConnectorError::ApiError {
+                status: 429,
+                body: "injected rate limit".to_string(),
+            },
+            FailingWriteKind::CircuitBreaker => ConnectorError::CircuitBreakerOpen {
                 consecutive_failures: 5,
                 cooldown_seconds: Some(180),
             },
-        )
+        };
+        AdapterError::new(error)
     }
 }
 
@@ -377,7 +394,7 @@ impl WarehouseAdapter for FailingWriteWarehouseAdapter {
     }
 
     async fn execute_statement(&self, _sql: &str) -> AdapterResult<()> {
-        Err(Self::injected_error())
+        Err(self.injected_error())
     }
 
     async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {

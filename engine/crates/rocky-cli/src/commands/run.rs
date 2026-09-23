@@ -1163,28 +1163,23 @@ fn run_trigger_from_env() -> rocky_core::state::RunTrigger {
 pub(crate) static FAIL_RECORD_WRITE_FOR_TEST: std::sync::Mutex<Option<String>> =
     std::sync::Mutex::new(None);
 
-/// Test hook (#2143): snapshots `RunOutput.errors` right before each of
-/// `run()`'s terminal emits, keyed by `run_id`, so a test can assert on
-/// `failure_kind` / `cooldown_seconds` without spawning `rocky` as a
-/// subprocess. `print_json` writes straight to the process's real stdout via
-/// `println!` with no injectable writer, and neither `RunTermination` nor the
-/// persisted `RunRecord` carries the classification — this static is the only
-/// observable channel a same-process test has. Keyed so parallel tests never
-/// collide; a test picks a unique `run_id_override` and reads its own entry.
+/// Test hook (#2143): after a successful JSON emit, snapshot its serialized
+/// `errors` field under the run ID. The production `print_json` writer goes
+/// directly to stdout, so a same-process test cannot read those bytes.
 #[cfg(test)]
 pub(crate) static CAPTURED_RUN_ERRORS_FOR_TEST: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// Snapshot `output.errors` under [`CAPTURED_RUN_ERRORS_FOR_TEST`]. A no-op
-/// outside `cfg(test)`, so this costs nothing in a released binary.
+/// Snapshot the serialized output's `errors` field. This is called only after
+/// `print_json` succeeded; it costs nothing in a released binary.
 #[cfg(test)]
 fn capture_run_errors_for_test(run_id: &str, output: &RunOutput) {
-    if let Ok(value) = serde_json::to_value(&output.errors) {
+    if let Ok(value) = serde_json::to_value(output) {
         CAPTURED_RUN_ERRORS_FOR_TEST
             .lock()
             .expect("capture mutex")
-            .insert(run_id.to_string(), value);
+            .insert(run_id.to_string(), value["errors"].clone());
     }
 }
 
@@ -3193,9 +3188,9 @@ pub async fn run(
         // Stamp the terminal status so the JSON payload reports the run
         // outcome directly (a compile-failed target makes this `Failure`).
         output.status = output.derive_run_status();
-        capture_run_errors_for_test(&run_id, &output);
         if output_json {
             print_json(&output)?;
+            capture_run_errors_for_test(&run_id, &output);
         }
         budget_result?;
         // Same run-status exit contract as the transformation path: a
@@ -6467,7 +6462,6 @@ pub async fn run(
     // `--models` path instead of letting the copy bookkeeping clobber it back
     // to status=Success / exit 0.
     merge_replication_compile_and_copy_errors(&mut output, &table_errors);
-    capture_run_errors_for_test(&run_id, &output);
 
     // Populate per-model / per-run cost attribution and run the
     // configured `[budget]` check. Populate always; propagate the
@@ -6696,6 +6690,7 @@ pub async fn run(
 
     if output_json {
         print_json(&output)?;
+        capture_run_errors_for_test(&run_id, &output);
     } else {
         if let Some(ref resumed_from) = output.resumed_from {
             crate::status_line!(
@@ -21405,24 +21400,31 @@ adapter = "default"
         );
     }
 
-    /// #2143: a transformation model's runtime failure on the `--model`
-    /// single-model fail-fast path classifies through the same helper the
-    /// replication-table failure path uses (`classify_anyhow_error_with_cooldown`),
-    /// instead of hard-coding `failure_kind: Unknown`.
-    ///
-    /// Drives `run()` — the production entry point, not `execute_models` —
-    /// with a `test-fail-write` target adapter
-    /// (`crate::testing::FailingWriteWarehouseAdapter`), so the model's
-    /// build statement fails with a typed Databricks `CircuitBreakerOpen`
-    /// wrapped in `rocky_core::traits::AdapterError`, the same wrapper every
-    /// `WarehouseAdapter` method returns in production (#2064). Reads back
-    /// `RunOutput.errors` through the `CAPTURED_RUN_ERRORS_FOR_TEST` test
-    /// hook: neither `RunTermination` nor the persisted `RunRecord` carries
-    /// the classification, and `print_json` writes straight to the
-    /// process's real stdout with no injectable writer.
+    #[cfg(feature = "duckdb")]
+    fn classified_failure_cases() -> [(&'static str, &'static str, Option<u64>); 3] {
+        [
+            ("auth", "auth-failed", None),
+            ("rate-limit", "quota-exceeded", None),
+            ("breaker", "quota-exceeded", Some(180)),
+        ]
+    }
+
+    /// Drives `run()` through the `--model` fail-fast path with a connector
+    /// error nested inside `rocky_core::traits::AdapterError`.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn model_only_runtime_failure_reports_classified_failure_kind() {
+        for (failure, expected_kind, expected_cooldown) in classified_failure_cases() {
+            assert_model_only_runtime_failure(failure, expected_kind, expected_cooldown).await;
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn assert_model_only_runtime_failure(
+        failure: &str,
+        expected_kind: &str,
+        expected_cooldown: Option<u64>,
+    ) {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let config_dir = tmp.path();
         let models = config_dir.join("models");
@@ -21441,6 +21443,7 @@ adapter = "default"
                 r#"
 [adapter]
 type = "test-fail-write"
+path = "{failure}"
 
 [state]
 backend = "local"
@@ -21458,19 +21461,19 @@ adapter = "default"
         .unwrap();
 
         let state_path = config_dir.join("state.redb");
-        let run_id = "test-2143-model-only";
+        let run_id = format!("test-2143-model-only-{failure}");
 
         let loaded = std::sync::Arc::new(
             rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
         );
-        let _ = super::run(
+        let result = super::run(
             &config_path,
             loaded,
             None,
             None,
             &state_path,
             None,
-            false,
+            true,
             None,
             false,
             None,
@@ -21484,18 +21487,18 @@ adapter = "default"
             &DeferOptions::default(),
             &SkipRunOptions::default(),
             &rocky_core::run_vars::RunVars::new(),
-            Some(run_id),
+            Some(&run_id),
             None,
             false,
             None,
         )
         .await;
+        assert!(result.is_err(), "the model write must fail: {failure}");
 
         let captured = super::CAPTURED_RUN_ERRORS_FOR_TEST
             .lock()
             .unwrap()
-            .get(run_id)
-            .cloned()
+            .remove(&run_id)
             .expect("run() must capture output.errors for this run_id");
         let errors = captured.as_array().expect("errors is a JSON array");
         assert_eq!(
@@ -21503,24 +21506,48 @@ adapter = "default"
             1,
             "expected exactly one recorded error: {errors:?}"
         );
-        assert_eq!(errors[0]["failure_kind"], "quota-exceeded");
-        assert_eq!(errors[0]["cooldown_seconds"], 180);
+        assert_eq!(errors[0]["failure_kind"], expected_kind);
+        assert_eq!(
+            errors[0]
+                .get("cooldown_seconds")
+                .and_then(serde_json::Value::as_u64),
+            expected_cooldown
+        );
+        assert!(
+            errors[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains(match failure {
+                    "auth" => "injected auth failure",
+                    "rate-limit" => "injected rate limit",
+                    "breaker" => "circuit breaker tripped",
+                    _ => unreachable!(),
+                })
+        );
     }
 
-    /// #2143: a transformation model's runtime failure on the full-pipeline
-    /// (replication run with a `--models` selection) fail-fast path
-    /// classifies through the same helper, instead of hard-coding
-    /// `failure_kind: Unknown`.
-    ///
-    /// The replication side discovers zero tables (a fresh, empty in-memory
-    /// DuckDB source whose schemas never match the `raw__` prefix), so the
-    /// only `execute_statement` call the run makes lands on the
-    /// `test-fail-write` TARGET adapter for the compiled model's own
-    /// build — the tail `execute_models` call `run()` makes for a
-    /// replication pipeline invoked with a models selection.
+    /// Drives `run()` through the replication `--models` tail model build.
+    /// Discovery finds no tables, so the injected failure occurs on the
+    /// model's target write.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn replication_models_tail_runtime_failure_reports_classified_failure_kind() {
+        for (failure, expected_kind, expected_cooldown) in classified_failure_cases() {
+            assert_replication_models_tail_runtime_failure(
+                failure,
+                expected_kind,
+                expected_cooldown,
+            )
+            .await;
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn assert_replication_models_tail_runtime_failure(
+        failure: &str,
+        expected_kind: &str,
+        expected_cooldown: Option<u64>,
+    ) {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let config_dir = tmp.path();
         let models = config_dir.join("models");
@@ -21535,12 +21562,14 @@ adapter = "default"
         let config_path = config_dir.join("rocky.toml");
         std::fs::write(
             &config_path,
-            r#"
+            format!(
+                r#"
 [adapter.src]
 type = "duckdb"
 
 [adapter.fail]
 type = "test-fail-write"
+path = "{failure}"
 
 [state]
 backend = "local"
@@ -21560,24 +21589,25 @@ components = ["source"]
 adapter = "fail"
 catalog_template = "x"
 schema_template = "staging__{{source}}"
-"#,
+"#
+            ),
         )
         .unwrap();
 
         let state_path = config_dir.join("state.redb");
-        let run_id = "test-2143-replication-models-tail";
+        let run_id = format!("test-2143-replication-models-tail-{failure}");
 
         let loaded = std::sync::Arc::new(
             rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
         );
-        let _ = super::run(
+        let result = super::run(
             &config_path,
             loaded,
             None,
             None,
             &state_path,
             None,
-            false,
+            true,
             Some(models.as_path()),
             false,
             None,
@@ -21591,18 +21621,18 @@ schema_template = "staging__{{source}}"
             &DeferOptions::default(),
             &SkipRunOptions::default(),
             &rocky_core::run_vars::RunVars::new(),
-            Some(run_id),
+            Some(&run_id),
             None,
             false,
             None,
         )
         .await;
+        assert!(result.is_err(), "the model write must fail: {failure}");
 
         let captured = super::CAPTURED_RUN_ERRORS_FOR_TEST
             .lock()
             .unwrap()
-            .get(run_id)
-            .cloned()
+            .remove(&run_id)
             .expect("run() must capture output.errors for this run_id");
         let errors = captured.as_array().expect("errors is a JSON array");
         assert_eq!(
@@ -21610,8 +21640,24 @@ schema_template = "staging__{{source}}"
             1,
             "expected exactly one recorded error: {errors:?}"
         );
-        assert_eq!(errors[0]["failure_kind"], "quota-exceeded");
-        assert_eq!(errors[0]["cooldown_seconds"], 180);
+        assert_eq!(errors[0]["failure_kind"], expected_kind);
+        assert_eq!(
+            errors[0]
+                .get("cooldown_seconds")
+                .and_then(serde_json::Value::as_u64),
+            expected_cooldown
+        );
+        assert!(
+            errors[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains(match failure {
+                    "auth" => "injected auth failure",
+                    "rate-limit" => "injected rate limit",
+                    "breaker" => "circuit breaker tripped",
+                    _ => unreachable!(),
+                })
+        );
     }
 
     // -----------------------------------------------------------------------

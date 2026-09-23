@@ -526,8 +526,15 @@ impl AdapterRegistry {
                 "test-fail-write" => {
                     let inner = rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory()
                         .context(format!("adapters.{name}: in-memory DuckDB for test double"))?;
-                    let adapter =
-                        Arc::new(crate::testing::FailingWriteWarehouseAdapter::new(inner));
+                    let failure = match adapter_cfg.path.as_deref() {
+                        Some("auth") => crate::testing::FailingWriteKind::Auth,
+                        Some("rate-limit") => crate::testing::FailingWriteKind::RateLimit,
+                        Some("breaker") => crate::testing::FailingWriteKind::CircuitBreaker,
+                        other => bail!("adapters.{name}: unknown test failure {other:?}"),
+                    };
+                    let adapter = Arc::new(crate::testing::FailingWriteWarehouseAdapter::new(
+                        inner, failure,
+                    ));
                     warehouse.insert(name.clone(), adapter as Arc<dyn WarehouseAdapter>);
                 }
                 #[cfg(all(test, not(feature = "duckdb")))]
