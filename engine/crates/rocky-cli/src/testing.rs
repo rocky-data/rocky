@@ -329,6 +329,70 @@ pub(crate) fn lock_pipes_env() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// A warehouse adapter that wraps a real in-memory DuckDB adapter but fails
+/// every write (`execute_statement`; `execute_statement_with_stats` inherits
+/// the failure through its default delegation) with a fixed, typed
+/// Databricks `ConnectorError::CircuitBreakerOpen`, wrapped in
+/// `rocky_core::traits::AdapterError` — the same wrapper every
+/// `WarehouseAdapter` method actually returns in production (#2064).
+///
+/// Exists so a test can drive `rocky run`'s real `run()` entry point through
+/// a transformation model's runtime failure and assert the classified
+/// `failure_kind` / `cooldown_seconds` `run()` records (#2143), without a
+/// live Databricks credential. Every other call — `describe_table`,
+/// `execute_query`, `dialect`, `classify_failure` — delegates to the wrapped
+/// DuckDB adapter, so the pre-write bootstrap probe (and everything upstream
+/// of the model's actual write) behaves exactly as it does against a real
+/// warehouse; only the write itself fails.
+#[cfg(feature = "duckdb")]
+pub(crate) struct FailingWriteWarehouseAdapter {
+    inner: rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+}
+
+#[cfg(feature = "duckdb")]
+impl FailingWriteWarehouseAdapter {
+    /// Wrap `inner` so every write fails with a tripped Databricks circuit
+    /// breaker (5 consecutive failures, a 180s cooldown) — the exact shape
+    /// #2143's tests prove `run()` classifies as `quota-exceeded` with
+    /// `cooldown_seconds: Some(180)` instead of hard-coding `unknown`.
+    pub(crate) fn new(inner: rocky_duckdb::adapter::DuckDbWarehouseAdapter) -> Self {
+        Self { inner }
+    }
+
+    fn injected_error() -> AdapterError {
+        AdapterError::new(
+            rocky_databricks::connector::ConnectorError::CircuitBreakerOpen {
+                consecutive_failures: 5,
+                cooldown_seconds: Some(180),
+            },
+        )
+    }
+}
+
+#[cfg(feature = "duckdb")]
+#[async_trait::async_trait]
+impl WarehouseAdapter for FailingWriteWarehouseAdapter {
+    fn dialect(&self) -> &dyn SqlDialect {
+        self.inner.dialect()
+    }
+
+    async fn execute_statement(&self, _sql: &str) -> AdapterResult<()> {
+        Err(Self::injected_error())
+    }
+
+    async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+        self.inner.execute_query(sql).await
+    }
+
+    async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
+        self.inner.describe_table(table).await
+    }
+
+    fn classify_failure(&self, err: &AdapterError) -> rocky_core::failure_class::FailureClass {
+        self.inner.classify_failure(err)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

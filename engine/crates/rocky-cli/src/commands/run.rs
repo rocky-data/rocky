@@ -1163,6 +1163,35 @@ fn run_trigger_from_env() -> rocky_core::state::RunTrigger {
 pub(crate) static FAIL_RECORD_WRITE_FOR_TEST: std::sync::Mutex<Option<String>> =
     std::sync::Mutex::new(None);
 
+/// Test hook (#2143): snapshots `RunOutput.errors` right before each of
+/// `run()`'s terminal emits, keyed by `run_id`, so a test can assert on
+/// `failure_kind` / `cooldown_seconds` without spawning `rocky` as a
+/// subprocess. `print_json` writes straight to the process's real stdout via
+/// `println!` with no injectable writer, and neither `RunTermination` nor the
+/// persisted `RunRecord` carries the classification — this static is the only
+/// observable channel a same-process test has. Keyed so parallel tests never
+/// collide; a test picks a unique `run_id_override` and reads its own entry.
+#[cfg(test)]
+pub(crate) static CAPTURED_RUN_ERRORS_FOR_TEST: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Snapshot `output.errors` under [`CAPTURED_RUN_ERRORS_FOR_TEST`]. A no-op
+/// outside `cfg(test)`, so this costs nothing in a released binary.
+#[cfg(test)]
+fn capture_run_errors_for_test(run_id: &str, output: &RunOutput) {
+    if let Ok(value) = serde_json::to_value(&output.errors) {
+        CAPTURED_RUN_ERRORS_FOR_TEST
+            .lock()
+            .expect("capture mutex")
+            .insert(run_id.to_string(), value);
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+fn capture_run_errors_for_test(_run_id: &str, _output: &RunOutput) {}
+
 /// Persist the run's terminal record, best-effort: a failed write is logged
 /// and the run goes on, because history is advisory for most of its readers.
 ///
@@ -3087,11 +3116,16 @@ pub async fn run(
             Ok(_) => {}
             Err(e) => {
                 output.tables_failed += 1;
+                // #2143: classify the same way the replication-table failure
+                // path does, so a wrapped connector error (auth/quota/a
+                // tripped breaker) reports its real kind and cooldown here
+                // too, instead of hard-coding `Unknown`.
+                let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(&e);
                 output.errors.push(crate::output::TableErrorOutput {
                     asset_key: vec![target_model.to_string()],
                     error: format!("{e:#}"),
-                    failure_kind: crate::output::FailureKind::Unknown,
-                    cooldown_seconds: None,
+                    failure_kind,
+                    cooldown_seconds,
                 });
             }
         }
@@ -3159,6 +3193,7 @@ pub async fn run(
         // Stamp the terminal status so the JSON payload reports the run
         // outcome directly (a compile-failed target makes this `Failure`).
         output.status = output.derive_run_status();
+        capture_run_errors_for_test(&run_id, &output);
         if output_json {
             print_json(&output)?;
         }
@@ -6247,12 +6282,18 @@ pub async fn run(
                     // copy-failure block below fires `pipeline_error` + drains
                     // webhooks once for the accumulated failures), mirroring the
                     // model-only path.
+                    //
+                    // #2143: classify the same way the replication-table
+                    // failure path does, so a wrapped connector error
+                    // (auth/quota/a tripped breaker) reports its real kind
+                    // and cooldown here too, instead of hard-coding `Unknown`.
+                    let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(&e);
                     table_errors.push(TableError {
                         asset_key: vec![pipeline_name.to_string()],
                         error: format!("{e:#}"),
                         task_index: None,
-                        failure_kind: crate::output::FailureKind::Unknown,
-                        cooldown_seconds: None,
+                        failure_kind,
+                        cooldown_seconds,
                     });
                     None
                 }
@@ -6426,6 +6467,7 @@ pub async fn run(
     // `--models` path instead of letting the copy bookkeeping clobber it back
     // to status=Success / exit 0.
     merge_replication_compile_and_copy_errors(&mut output, &table_errors);
+    capture_run_errors_for_test(&run_id, &output);
 
     // Populate per-model / per-run cost attribution and run the
     // configured `[budget]` check. Populate always; propagate the
@@ -21361,6 +21403,215 @@ adapter = "default"
              Succeeded, not leave the InFlight claim for the TTL sweep to reap \
              (FR-004 F2 regression guard)"
         );
+    }
+
+    /// #2143: a transformation model's runtime failure on the `--model`
+    /// single-model fail-fast path classifies through the same helper the
+    /// replication-table failure path uses (`classify_anyhow_error_with_cooldown`),
+    /// instead of hard-coding `failure_kind: Unknown`.
+    ///
+    /// Drives `run()` — the production entry point, not `execute_models` —
+    /// with a `test-fail-write` target adapter
+    /// (`crate::testing::FailingWriteWarehouseAdapter`), so the model's
+    /// build statement fails with a typed Databricks `CircuitBreakerOpen`
+    /// wrapped in `rocky_core::traits::AdapterError`, the same wrapper every
+    /// `WarehouseAdapter` method returns in production (#2064). Reads back
+    /// `RunOutput.errors` through the `CAPTURED_RUN_ERRORS_FOR_TEST` test
+    /// hook: neither `RunTermination` nor the persisted `RunRecord` carries
+    /// the classification, and `print_json` writes straight to the
+    /// process's real stdout with no injectable writer.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn model_only_runtime_failure_reports_classified_failure_kind() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let config_dir = tmp.path();
+        let models = config_dir.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("m.sql"), "SELECT 1 AS x\n").unwrap();
+        std::fs::write(
+            models.join("m.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )
+        .unwrap();
+
+        let config_path = config_dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "test-fail-write"
+
+[state]
+backend = "local"
+
+[pipeline.tx]
+type = "transformation"
+models = '{}'
+
+[pipeline.tx.target]
+adapter = "default"
+"#,
+                models.join("**").display(),
+            ),
+        )
+        .unwrap();
+
+        let state_path = config_dir.join("state.redb");
+        let run_id = "test-2143-model-only";
+
+        let loaded = std::sync::Arc::new(
+            rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+        );
+        let _ = super::run(
+            &config_path,
+            loaded,
+            None,
+            None,
+            &state_path,
+            None,
+            false,
+            None,
+            false,
+            None,
+            false,
+            None,
+            &PartitionRunOptions::default(),
+            Some("m"),
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            Some(run_id),
+            None,
+            false,
+            None,
+        )
+        .await;
+
+        let captured = super::CAPTURED_RUN_ERRORS_FOR_TEST
+            .lock()
+            .unwrap()
+            .get(run_id)
+            .cloned()
+            .expect("run() must capture output.errors for this run_id");
+        let errors = captured.as_array().expect("errors is a JSON array");
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected exactly one recorded error: {errors:?}"
+        );
+        assert_eq!(errors[0]["failure_kind"], "quota-exceeded");
+        assert_eq!(errors[0]["cooldown_seconds"], 180);
+    }
+
+    /// #2143: a transformation model's runtime failure on the full-pipeline
+    /// (replication run with a `--models` selection) fail-fast path
+    /// classifies through the same helper, instead of hard-coding
+    /// `failure_kind: Unknown`.
+    ///
+    /// The replication side discovers zero tables (a fresh, empty in-memory
+    /// DuckDB source whose schemas never match the `raw__` prefix), so the
+    /// only `execute_statement` call the run makes lands on the
+    /// `test-fail-write` TARGET adapter for the compiled model's own
+    /// build — the tail `execute_models` call `run()` makes for a
+    /// replication pipeline invoked with a models selection.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn replication_models_tail_runtime_failure_reports_classified_failure_kind() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let config_dir = tmp.path();
+        let models = config_dir.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("m.sql"), "SELECT 1 AS x\n").unwrap();
+        std::fs::write(
+            models.join("m.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )
+        .unwrap();
+
+        let config_path = config_dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[adapter.src]
+type = "duckdb"
+
+[adapter.fail]
+type = "test-fail-write"
+
+[state]
+backend = "local"
+
+[pipeline.p]
+type = "replication"
+
+[pipeline.p.source.discovery]
+adapter = "src"
+
+[pipeline.p.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+adapter = "fail"
+catalog_template = "x"
+schema_template = "staging__{{source}}"
+"#,
+        )
+        .unwrap();
+
+        let state_path = config_dir.join("state.redb");
+        let run_id = "test-2143-replication-models-tail";
+
+        let loaded = std::sync::Arc::new(
+            rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+        );
+        let _ = super::run(
+            &config_path,
+            loaded,
+            None,
+            None,
+            &state_path,
+            None,
+            false,
+            Some(models.as_path()),
+            false,
+            None,
+            false,
+            None,
+            &PartitionRunOptions::default(),
+            None,
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            Some(run_id),
+            None,
+            false,
+            None,
+        )
+        .await;
+
+        let captured = super::CAPTURED_RUN_ERRORS_FOR_TEST
+            .lock()
+            .unwrap()
+            .get(run_id)
+            .cloned()
+            .expect("run() must capture output.errors for this run_id");
+        let errors = captured.as_array().expect("errors is a JSON array");
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected exactly one recorded error: {errors:?}"
+        );
+        assert_eq!(errors[0]["failure_kind"], "quota-exceeded");
+        assert_eq!(errors[0]["cooldown_seconds"], 180);
     }
 
     // -----------------------------------------------------------------------
