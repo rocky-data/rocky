@@ -161,9 +161,10 @@ Atomicity holds per partition. If a statement fails mid-batch, the runtime
 issues `ROLLBACK` and marks the partition `Failed` in the state store.
 
 Before it runs any partition, Rocky checks that the target table exists. If
-not, it creates it by running the model SQL over an empty window, so a model
-that filters on the placeholders produces no rows. The table's columns come
-from that query. The partitions then run as below.
+not, it creates it by running the model SQL over an empty window. The empty
+window means the model reads no upstream rows. A model with an ungrouped
+aggregate still writes one row; every other shape writes none. The table's
+columns come from that query. The partitions then run as below.
 
 ### Databricks (Delta Lake)
 
@@ -218,10 +219,10 @@ COMMIT;
 
 One statement: a `BEGIN TRANSACTION` / `COMMIT TRANSACTION` script joining
 the delete and the insert into a single job. BigQuery's REST API is
-stateless. Each `jobs.query` call is its own session, so separate `BEGIN`
-and `COMMIT` statements fail with "Transaction control statements are
-supported only in scripts or sessions." One script keeps the delete and the
-insert atomic:
+stateless. Each `jobs.query` call is its own session. Separate `BEGIN` and
+`COMMIT` statements fail with "Transaction control statements are supported
+only in scripts or sessions." One script keeps the delete and the insert
+atomic:
 
 ```sql
 BEGIN TRANSACTION;
