@@ -151,11 +151,15 @@ impl PipesEmitter {
             return None;
         }
         let raw_messages = env::var(ENV_PIPES_MESSAGES).ok()?;
-        let params = decode_pipes_param(&raw_messages)?;
+        let params = decode_pipes_param(&raw_messages, ENV_PIPES_MESSAGES)?;
         let channel = Self::open_channel(&params)?;
-        Some(PipesEmitter {
+        let emitter = PipesEmitter {
             channel: Mutex::new(channel),
-        })
+        };
+        // Must be the first line ever written to the channel — see
+        // `opened`'s doc comment.
+        emitter.opened();
+        Some(emitter)
     }
 
     /// Open the message channel based on the writer params.
@@ -204,6 +208,28 @@ impl PipesEmitter {
             );
             None
         }
+    }
+
+    /// Emit the `opened` handshake message. Must be the first message
+    /// written to the channel — the real `dagster_pipes` SDK writes it
+    /// this way too (`PipesContext.__init__`,
+    /// `self._message_channel.write_message(_make_message("opened",
+    /// opened_payload))`, immediately after opening the message writer,
+    /// before any user code runs). Envelope matches exactly:
+    /// `{"__dagster_pipes_version": ..., "method": "opened", "params":
+    /// {"extras": {}}}` (`PipesOpenedData` — `extras` is always empty;
+    /// nothing in this crate populates it).
+    ///
+    /// Dagster's reader tracks `received_opened_message` specifically
+    /// (`dagster/_core/pipes/context.py`, `_handle_opened` increments a
+    /// counter this property reads) to decide whether to warn "did not
+    /// receive any messages from external process" — not whether it
+    /// received anything at all. This crate never sent `opened` before
+    /// #2166, so that warning fired on every single Pipes run,
+    /// including ones where every other message decoded and reported
+    /// correctly.
+    fn opened(&self) {
+        self.write_message("opened", &json!({"extras": {}}));
     }
 
     /// Emit a `log` message. Mirrors
@@ -321,30 +347,36 @@ impl PipesEmitter {
 /// pre-2.0). Shared by [`PipesEmitter::detect`] and its tests so the
 /// decode logic has exactly one definition (#2163).
 ///
+/// `env_var_name` is only for the warning messages below — this
+/// function decodes the same shape regardless of which env var it
+/// came from, so it names whichever one the caller is decoding
+/// instead of hardcoding `DAGSTER_PIPES_MESSAGES` (today's only
+/// caller, but not a reason to bake its name into a generic decoder).
+///
 /// Every real Dagster producer encodes with `encode_param` — plain
 /// `base64(json)`, with no zlib step, is not a value any real launch
 /// ever sends, so there is no fallback for it here. Returns `None`
 /// (after a `tracing::warn!` naming which step failed) on any decode
 /// failure — base64, zlib, or JSON.
-fn decode_pipes_param(raw: &str) -> Option<Value> {
+fn decode_pipes_param(raw: &str, env_var_name: &str) -> Option<Value> {
     let decoded = match B64.decode(raw.as_bytes()) {
         Ok(bytes) => bytes,
         Err(e) => {
-            tracing::warn!(error = %e, "failed to base64-decode DAGSTER_PIPES_MESSAGES; falling back to non-Pipes mode");
+            tracing::warn!(error = %e, env_var = env_var_name, "failed to base64-decode Pipes param; falling back to non-Pipes mode");
             return None;
         }
     };
 
     let mut decompressed = Vec::new();
     if let Err(e) = ZlibDecoder::new(decoded.as_slice()).read_to_end(&mut decompressed) {
-        tracing::warn!(error = %e, "failed to zlib-decompress DAGSTER_PIPES_MESSAGES; falling back to non-Pipes mode");
+        tracing::warn!(error = %e, env_var = env_var_name, "failed to zlib-decompress Pipes param; falling back to non-Pipes mode");
         return None;
     }
 
     match serde_json::from_slice(&decompressed) {
         Ok(v) => Some(v),
         Err(e) => {
-            tracing::warn!(error = %e, "failed to JSON-parse DAGSTER_PIPES_MESSAGES; falling back to non-Pipes mode");
+            tracing::warn!(error = %e, env_var = env_var_name, "failed to JSON-parse Pipes param; falling back to non-Pipes mode");
             None
         }
     }
@@ -380,10 +412,18 @@ fn decode_pipes_param(raw: &str) -> Option<Value> {
 /// subtype from the raw value's own JSON type, which is what this emitter
 /// wants: it never carries an explicit Dagster metadata type today.
 ///
-/// A value already in the wrapped shape passes through unchanged — the
-/// SDK's own "already typed" branch. Nothing in this crate constructs one
-/// today; kept so a future explicitly-typed value (a URL, a Markdown
-/// blob) does not get double-wrapped.
+/// Every value is wrapped, unconditionally — there is no pass-through for
+/// a value that already looks like `{raw_value, type}`. An earlier version
+/// of this function had one (to avoid double-wrapping a hypothetical
+/// future explicitly-typed value, a URL or a Markdown blob), but nothing
+/// in this crate has ever constructed one, and passing an untrusted `type`
+/// straight to Dagster is a hazard, not a convenience: `type` is not
+/// validated here, and `metadata_value_from_external`
+/// (`dagster/_core/definitions/metadata/external_metadata.py`) does
+/// `check.failed(...)` on an unrecognised one, which crashes the reader
+/// thread exactly like the bare-value bug this module exists to prevent.
+/// No back-compat burden before 2.0 — delete the branch instead of trying
+/// to validate a shape nothing produces.
 fn wrap_metadata(metadata: &Value) -> Value {
     let Some(map) = metadata.as_object() else {
         // Not an object (e.g. `Value::Null` for an empty/omitted
@@ -392,17 +432,7 @@ fn wrap_metadata(metadata: &Value) -> Value {
     };
     let wrapped: serde_json::Map<String, Value> = map
         .iter()
-        .map(|(key, value)| {
-            let already_wrapped = value.as_object().is_some_and(|obj| {
-                obj.len() == 2 && obj.contains_key("raw_value") && obj.contains_key("type")
-            });
-            let wire_value = if already_wrapped {
-                value.clone()
-            } else {
-                json!({"raw_value": value, "type": "__infer__"})
-            };
-            (key.clone(), wire_value)
-        })
+        .map(|(key, value)| (key.clone(), json!({"raw_value": value, "type": "__infer__"})))
         .collect();
     Value::Object(wrapped)
 }
@@ -437,9 +467,12 @@ mod tests {
 
     // `detect()` reads process-global env vars, and `cargo test` runs this
     // crate's tests in parallel threads by default. Every test that touches
-    // DAGSTER_PIPES_CONTEXT / DAGSTER_PIPES_MESSAGES takes this lock first —
-    // same pattern as `commands::run_audit::tests::ENV_LOCK`.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // DAGSTER_PIPES_CONTEXT / DAGSTER_PIPES_MESSAGES takes the SHARED
+    // `crate::testing::PIPES_ENV_LOCK` first — shared, not file-scoped,
+    // because `commands::run_local::tests` and `commands::run_audit::tests`
+    // read/set the same two vars (see that lock's doc comment for why a
+    // per-file lock wasn't enough).
+    use crate::testing::lock_pipes_env as lock_env;
 
     /// base64(zlib(json)) of a small payload, matching what every real
     /// Dagster Pipes producer sends (`decode_pipes_param`'s only accepted
@@ -460,7 +493,7 @@ mod tests {
 
     #[test]
     fn detect_returns_none_when_env_vars_unset() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_env();
         // SAFETY: serialised by ENV_LOCK, this module's env lock (see its
         // doc comment). Not setting DAGSTER_PIPES_CONTEXT means detect()
         // returns None. We don't unset because other tests may rely on
@@ -496,8 +529,8 @@ mod tests {
         const CAPTURED_FROM_REAL_DAGSTER_PIPES: &str =
             "eJyrVipILMlQslJQ0i/JLdBPSUwvLkkt0i3ILEgt1s1NLS5OTAcySlKLS5RqAVZhD+E=";
 
-        let decoded =
-            decode_pipes_param(CAPTURED_FROM_REAL_DAGSTER_PIPES).expect("decode real Pipes param");
+        let decoded = decode_pipes_param(CAPTURED_FROM_REAL_DAGSTER_PIPES, ENV_PIPES_MESSAGES)
+            .expect("decode real Pipes param");
 
         assert_eq!(decoded, json!({"path": "/tmp/dagster-pipes-messages-test"}));
     }
@@ -508,7 +541,7 @@ mod tests {
     #[test]
     fn decode_pipes_param_rejects_plain_base64_json_with_no_zlib_step() {
         let plain = B64.encode(serde_json::to_vec(&json!({"path": "/tmp/x"})).unwrap());
-        assert!(decode_pipes_param(&plain).is_none());
+        assert!(decode_pipes_param(&plain, ENV_PIPES_MESSAGES).is_none());
     }
 
     /// End-to-end: `detect()` reads a zlib-encoded `DAGSTER_PIPES_MESSAGES`
@@ -518,7 +551,7 @@ mod tests {
     /// the channel is live.
     #[test]
     fn detect_opens_a_real_temp_file_channel_from_a_zlib_encoded_env_value() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_env();
 
         let dir = tempfile::tempdir().unwrap();
         let messages_path = dir.path().join("messages.jsonl");
@@ -554,10 +587,19 @@ mod tests {
         emitter.log("INFO", "hello from a real zlib-decoded channel");
 
         let lines = read_lines(&messages_path);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0]["method"], "log");
+        assert_eq!(lines.len(), 2);
+        // `detect()` writes `opened` itself, as the very first line on the
+        // channel (#2166) — before any caller has a chance to `log` or
+        // `report_*` anything. Dagster's real reader tracks
+        // `received_opened_message` specifically to decide whether "did
+        // not receive any messages from external process" fires; every
+        // real Pipes run used to trip that warning because this line
+        // never existed.
+        assert_eq!(lines[0]["method"], "opened");
+        assert_eq!(lines[0]["params"], json!({"extras": {}}));
+        assert_eq!(lines[1]["method"], "log");
         assert_eq!(
-            lines[0]["params"]["message"],
+            lines[1]["params"]["message"],
             "hello from a real zlib-decoded channel"
         );
     }
@@ -694,31 +736,6 @@ mod tests {
         assert_eq!(
             metadata["reason"],
             json!({"raw_value": "deviated 40%", "type": "__infer__"})
-        );
-    }
-
-    /// A value already in the wrapped shape passes through unchanged
-    /// instead of being wrapped a second time (`wrap_metadata`'s
-    /// "already typed" branch). Nothing in this crate constructs one
-    /// today; this pins the defensive branch so it doesn't silently rot.
-    #[test]
-    fn report_asset_check_does_not_double_wrap_an_already_typed_value() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("messages.txt");
-        let emitter = make_emitter_to(&path);
-
-        emitter.report_asset_check(
-            "warehouse/marts/fct_orders",
-            "row_count_anomaly",
-            true,
-            PipesCheckSeverity::Warn,
-            &json!({"already_typed": {"raw_value": "https://example.com", "type": "url"}}),
-        );
-
-        let lines = read_lines(&path);
-        assert_eq!(
-            lines[0]["params"]["metadata"]["already_typed"],
-            json!({"raw_value": "https://example.com", "type": "url"})
         );
     }
 

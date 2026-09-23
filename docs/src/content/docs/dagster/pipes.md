@@ -212,7 +212,9 @@ no external dependency. On a run it:
 1. Detects `DAGSTER_PIPES_CONTEXT` and `DAGSTER_PIPES_MESSAGES` env
    vars at the start of `rocky run`.
 2. Opens the messages channel (file path or stderr stream) per the
-   protocol params.
+   protocol params, and writes `opened` immediately (`params: {"extras":
+   {}}`) — the handshake Dagster's reader needs before it will report
+   anything at all.
 3. Emits one JSON-line message per progress event:
    - `log` at run start and completion
    - `report_asset_materialization` per `output.materializations` entry

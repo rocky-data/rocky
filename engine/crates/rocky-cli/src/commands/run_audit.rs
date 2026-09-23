@@ -204,21 +204,21 @@ fn detect_hostname() -> String {
 mod tests {
     use super::*;
 
-    // The env-var tests mutate process-global state. `cargo test` runs
-    // them in parallel by default, so we serialise via a crate-local
-    // mutex. Each test takes the lock before touching env vars.
-    use std::sync::Mutex;
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // The env-var tests mutate process-global state, including
+    // DAGSTER_PIPES_CONTEXT, which `pipes::tests` and
+    // `commands::run_local::tests` also read/set. `cargo test` runs a
+    // crate's tests in parallel by default, so all three modules
+    // serialise through the ONE shared `crate::testing::PIPES_ENV_LOCK`
+    // rather than a per-file lock — see that lock's doc comment: a
+    // per-file lock here left this module racing against the other two,
+    // which a real run of `run_local`'s #2166 tests then hit.
+    use crate::testing::lock_pipes_env;
 
-    /// SAFETY: these tests run under `ENV_LOCK`, which serialises every
-    /// env-mutating test in this module. Rust flags `std::env::set_var`
-    /// as unsafe from 2024 edition because it races with reads in
-    /// other threads; the lock closes that hole for *our* tests, not
-    /// for unrelated code running under `cargo test`. That's
-    /// considered acceptable here because (a) the remaining engine
-    /// test suite doesn't read these particular env vars in parallel,
-    /// and (b) the cost of a bug here is a misattributed audit stamp
-    /// in a unit test — not a production correctness issue.
+    /// SAFETY: these tests run under `crate::testing::PIPES_ENV_LOCK`,
+    /// which serialises every Pipes-env-mutating test in the crate, not
+    /// just this module. Rust flags `std::env::set_var` as unsafe from
+    /// 2024 edition because it races with reads in other threads; the
+    /// lock closes that hole.
     fn set_env(key: &str, value: &str) {
         unsafe {
             std::env::set_var(key, value);
@@ -246,7 +246,7 @@ mod tests {
 
     #[test]
     fn session_source_defaults_to_cli() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_pipes_env();
         remove_env(ENV_ROCKY_SESSION_SOURCE);
         remove_env(ENV_DAGSTER_PIPES_CONTEXT);
         assert_eq!(detect_session_source(), SessionSource::Cli);
@@ -254,7 +254,7 @@ mod tests {
 
     #[test]
     fn session_source_dagster_from_pipes_env() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_pipes_env();
         remove_env(ENV_ROCKY_SESSION_SOURCE);
         set_env(ENV_DAGSTER_PIPES_CONTEXT, "{}");
         assert_eq!(detect_session_source(), SessionSource::Dagster);
@@ -263,7 +263,7 @@ mod tests {
 
     #[test]
     fn session_source_explicit_override() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_pipes_env();
         remove_env(ENV_DAGSTER_PIPES_CONTEXT);
 
         set_env(ENV_ROCKY_SESSION_SOURCE, "http_api");
@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn session_source_explicit_overrides_pipes_env() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_pipes_env();
         set_env(ENV_DAGSTER_PIPES_CONTEXT, "{}");
         set_env(ENV_ROCKY_SESSION_SOURCE, "cli");
         assert_eq!(
