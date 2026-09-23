@@ -182,6 +182,72 @@ async fn happy_path_inline_result_parses_values() {
     assert_eq!(result.rows[1][2], json!("hi"));
 }
 
+/// A `TIMESTAMP` cell arrives as BigQuery's decimal-epoch-seconds string
+/// (`formatOptions.useInt64Timestamp` unset, so this is the only shape
+/// `execute_query`'s own request can receive) and must reach the caller as
+/// RFC 3339, with its fraction intact — the shape `parse_timestamp_cell` in
+/// `rocky-cli` (the shared watermark reader) accepts. Before this fix the
+/// epoch string passed straight through unconverted (#2150): an incremental
+/// replication's watermark read failed on every run after the first.
+/// Every other column position is unaffected, pinning that the conversion
+/// is keyed off the schema's field type, not applied to every cell.
+#[tokio::test]
+async fn timestamp_cell_converts_epoch_seconds_to_rfc3339() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(QUERIES_PATH))
+        .and(header("authorization", "Bearer test-bq-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "jobReference": {"projectId": "test-project", "jobId": "job-ts"},
+            "schema": {
+                "fields": [
+                    {"name": "id", "type": "INTEGER"},
+                    {"name": "loaded_at", "type": "TIMESTAMP"},
+                    {"name": "deleted_at", "type": "TIMESTAMP"}
+                ]
+            },
+            "rows": [
+                // A fractional-second epoch, the shape #2149's watermark
+                // fix depends on round-tripping intact.
+                {"f": [{"v": "1"}, {"v": "1757930400.25"}, {"v": null}]},
+                // A whole-second epoch (no fraction) is still an epoch
+                // string, not already RFC 3339 — same conversion applies.
+                {"f": [{"v": "2"}, {"v": "1757930400"}, {"v": null}]}
+            ],
+            "totalRows": "2"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let adapter = test_adapter(&server);
+    let result = adapter
+        .execute_query("SELECT id, loaded_at, deleted_at FROM t")
+        .await
+        .unwrap();
+
+    assert_eq!(result.columns, vec!["id", "loaded_at", "deleted_at"]);
+    // The non-TIMESTAMP column is untouched by the cell-type lookup.
+    assert_eq!(result.rows[0][0], json!("1"));
+    assert_eq!(
+        result.rows[0][1],
+        json!("2025-09-15T10:00:00.250+00:00"),
+        "a fractional epoch-seconds cell must round-trip its fraction as RFC 3339"
+    );
+    // A NULL timestamp cell is not a string, so it must pass through as
+    // Value::Null rather than being coerced into a conversion attempt.
+    assert_eq!(result.rows[0][2], Value::Null);
+
+    assert_eq!(result.rows[1][0], json!("2"));
+    assert_eq!(
+        result.rows[1][1],
+        json!("2025-09-15T10:00:00+00:00"),
+        "a whole-second epoch cell (no fraction) must still convert"
+    );
+}
+
 /// `maxResults` is a per-page limit, not a whole-query limit. A successful
 /// inline response with `pageToken` must be followed through
 /// `jobs.getQueryResults` before `execute_query` returns.
