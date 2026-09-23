@@ -42,6 +42,16 @@ from dagster_rocky.resource import (
     _validate_governance_override,
 )
 
+# A real stderr/exit-code capture from the rocky binary (rocky-data/rocky#1941 —
+# see the file's own "_comment" field for the exact command, engine commit, and
+# why config load — not the post-discovery run-time guard — is what refuses
+# this particular colliding pair). Loaded once at import time and reused by
+# both the run_streaming and run_pipes collision tests below so neither
+# hand-types a message that can drift from what the engine actually prints.
+_CHECK_NAME_COLLISION_FIXTURE = json.loads(
+    (Path(__file__).parent / "check_name_collision_1941_stderr.json").read_text()
+)
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -1025,6 +1035,70 @@ def test_run_streaming_failure_raises_with_stderr_tail():
     assert "INFO line 0" in tail
 
 
+def test_run_streaming_check_name_collision_refusal_surfaces_as_a_failure():
+    """rocky-data/rocky#1941: a custom check name and a `null_rate` column
+    name that sanitize alike now make the engine refuse to run at all —
+    exit non-zero, no `RunOutput` JSON, the collision named on stderr —
+    instead of running the checks and silently dropping the second one (the
+    old behavior this issue fixed).
+
+    Both producers here are table-independent (a custom check runs on
+    every materialized table; so does every `null_rate` column), so this
+    exact pair is refused at CONFIG LOAD
+    (`rocky_core::config::validate_checks` -> `ConfigError::DuplicateCheckName`)
+    — before `rocky run` ever reaches discovery. The newer post-discovery
+    `refuse_check_name_collisions` guard in `run.rs` (added for this same
+    issue, to catch a collision config load cannot see, e.g.
+    `cross_source_overlap`) never gets a chance to fire for this pair. An
+    earlier version of this test assumed that run-time guard fired instead
+    and hand-typed its message shape; verified against the real binary that
+    was the wrong guard for this pair — see
+    `check_name_collision_1941_stderr.json` for the real captured
+    stderr/exit-code this test now drives through the actual `run_streaming`
+    parsing path (`rocky_sdk.client.RockyClient.run_cli` ->
+    `forward_stderr_to_sink` -> `RockyCommandError.stderr_tail` ->
+    `_rocky_error_to_failure`).
+
+    This pins the CONSUMER side of that fix: `run_streaming` (what
+    `RockyComponent`'s default execution mode calls, via `_run_filters` in
+    `component.py`) must surface the refusal as a `dg.Failure` carrying the
+    collision message, not swallow it or return a partial result. Nothing
+    in `component.py::_add` or `_emit_results` ever runs in this case —
+    the run fails before any check spec or result exists to drop.
+    """
+    rocky = RockyResource()
+    context = _captured_log_context()
+    fixture = _CHECK_NAME_COLLISION_FIXTURE
+    proc = _streaming_popen_mock(
+        stdout=fixture["stdout"],
+        stderr_lines=fixture["stderr_lines"],
+        returncode=fixture["returncode"],
+    )
+
+    with (
+        patch.object(RockyResource, "_verify_engine_version"),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
+        pytest.raises(dg.Failure) as excinfo,
+    ):
+        rocky.run_streaming(context, filter="tenant=acme")
+
+    tail = excinfo.value.metadata["stderr_tail"].text
+    assert "null rate id" in tail and "null_rate:id" in tail, (
+        f"the failure must name both colliding sources: {tail}"
+    )
+    assert "null_rate_id" in tail, f"the failure must name the shared sanitized name: {tail}"
+    # The blank line between "Error: ..." and "Caused by:" is dropped by
+    # forward_stderr_to_sink (it skips empty lines) — assert the two
+    # surviving lines the real capture actually produces, not a
+    # reconstruction of the whole anyhow chain.
+    assert "Caused by:" in tail
+    # Every non-empty stderr line the fixture carries also reached
+    # context.log.info — the live-forwarding half of run_streaming that
+    # the old test never pinned.
+    forwarded = "\n".join(context.captured)
+    assert "null_rate_id" in forwarded, f"collision line must reach context.log: {forwarded}"
+
+
 def test_run_streaming_missing_binary_raises_failure():
     rocky = RockyResource(binary_path="/nonexistent/rocky")
     context = _captured_log_context()
@@ -1413,6 +1487,59 @@ def test_run_pipes_calls_pipes_client_with_built_command():
     # Phase 5 audit-artifact: plan id is also surfaced as Pipes extras
     # so Dagster shows it as run metadata.
     assert call_kwargs.get("extras") == {"plan_id": plan_id}
+
+
+def test_run_pipes_check_name_collision_refusal_propagates_from_the_plan_step():
+    """rocky-data/rocky#1941 on the Pipes path.
+
+    `run_pipes` always runs `rocky plan` first, via the buffered,
+    watchdog-bound `_run_rocky` (Phase 5), then hands `rocky apply
+    <plan_id>` to `PipesSubprocessClient`. For THIS colliding pair (a
+    custom check name and a `null_rate` column name — both
+    table-independent producers), config load refuses `rocky plan` itself
+    with the exact same message as `rocky run` (verified against the real
+    binary — see `check_name_collision_1941_stderr.json`), so the failure
+    surfaces from the PLAN step, before a `plan_id` exists and before
+    `client.run(...)` (the Pipes apply step) is ever reached.
+
+    An earlier version of this test assumed the failure instead surfaced
+    from the APPLY step (mocking the plan step to succeed and raising a
+    hand-built `dg.Failure` from the Pipes client), and asserted on
+    `str(excinfo.value)`. Both were wrong: `str(dg.Failure(...))` is only
+    its `description` ("Rocky command failed (exit 1)") — the collision
+    text lives in `metadata["stderr_tail"]`, never in `description` or
+    `str()`, for a `dg.Failure` `_rocky_error_to_failure` actually builds.
+
+    `run_pipes` has no try/except around `plan_stdout =
+    self._run_rocky(...)` — nor does `_run_filters_pipes` in
+    `component.py`, which calls `run_pipes` — so this pins the observable
+    contract: the Pipes path fails the step instead of completing with the
+    second colliding check silently dropped, and it does so without ever
+    invoking the Pipes client.
+    """
+    rocky = RockyResource(config_path="rocky.toml")
+    context = MagicMock(spec=dg.AssetExecutionContext)
+    fake_client = MagicMock(spec=dg.PipesSubprocessClient)
+    fixture = _CHECK_NAME_COLLISION_FIXTURE
+    proc = _streaming_popen_mock(
+        stdout=fixture["stdout"],
+        stderr_lines=fixture["stderr_lines"],
+        returncode=fixture["returncode"],
+    )
+
+    with (
+        patch.object(RockyResource, "_verify_engine_version"),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
+        pytest.raises(dg.Failure) as excinfo,
+    ):
+        rocky.run_pipes(context, filter="tenant=acme", pipes_client=fake_client)
+
+    tail = excinfo.value.metadata["stderr_tail"].text
+    assert "null rate id" in tail and "null_rate:id" in tail, (
+        f"the propagated failure must still name both colliding sources: {tail}"
+    )
+    assert "null_rate_id" in tail, f"the failure must name the shared sanitized name: {tail}"
+    fake_client.run.assert_not_called()
 
 
 def test_run_pipes_threads_all_routing_flags():
