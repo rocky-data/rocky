@@ -3025,7 +3025,7 @@ pub(crate) fn gate_promote_plan(
     promote_plan: &PromotePlan,
     state_path: &Path,
 ) -> Result<std::sync::Arc<rocky_core::config::LoadedConfig>> {
-    crate::commands::branch::validate_branch_name_pub(&promote_plan.branch_name)?;
+    crate::commands::branch::validate_existing_branch_name(state_path, &promote_plan.branch_name)?;
     // THE single fingerprinted config snapshot for the promote (#1120): the
     // pre-gate sync decision, the policy gate, AND — via the returned `Arc` —
     // the promote executor's adapter resolution all read THIS instance, so a

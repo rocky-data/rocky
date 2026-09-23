@@ -2,6 +2,96 @@
 
 use std::process::Command;
 
+use rocky_core::state::{BranchRecord, StateStore};
+
+#[test]
+fn preview_create_json_stdout_is_one_document() {
+    let temp = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(temp.path())
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&[
+        "-c",
+        "user.email=test@rocky.invalid",
+        "-c",
+        "user.name=Rocky Test",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--allow-empty",
+        "-qm",
+        "base",
+    ]);
+
+    let state = temp.path().join("state.redb");
+    let output = Command::new(env!("CARGO_BIN_EXE_rocky"))
+        .current_dir(temp.path())
+        .args([
+            "--state-path",
+            state.to_str().unwrap(),
+            "preview",
+            "create",
+            "--base",
+            "HEAD",
+            "--name",
+            "pr_2180_fix_price",
+            "--output",
+            "json",
+        ])
+        .output()
+        .expect("spawn rocky preview create");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("the complete stdout must be exactly one JSON value");
+    assert_eq!(document["branch_name"], "pr_2180_fix_price");
+    assert_eq!(document["command"], "preview-create");
+}
+
+#[test]
+fn existing_legacy_branch_cannot_be_created_or_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state.redb");
+    let store = StateStore::open(&state).unwrap();
+    store
+        .put_branch(&BranchRecord {
+            name: "fix-price".to_string(),
+            schema_prefix: "branch__fix-price".to_string(),
+            created_by: "legacy".to_string(),
+            created_at: chrono::Utc::now(),
+            description: None,
+        })
+        .unwrap();
+    drop(store);
+    for args in [
+        ["branch", "create", "fix-price"].as_slice(),
+        ["run", "--branch", "fix-price"].as_slice(),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_rocky"))
+            .current_dir(temp.path())
+            .args(["--state-path", state.to_str().unwrap()])
+            .args(args)
+            .output()
+            .expect("spawn rocky");
+        assert!(!output.status.success(), "{args:?} unexpectedly succeeded");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("[A-Za-z0-9_]"), "{args:?}: {stderr}");
+    }
+}
+
 #[test]
 fn sql_backed_entry_points_reject_hyphens_with_the_shared_rule() {
     let temp = tempfile::tempdir().unwrap();
@@ -11,11 +101,8 @@ fn sql_backed_entry_points_reject_hyphens_with_the_shared_rule() {
     let state = state.to_str().unwrap();
     let commands: &[&[&str]] = &[
         &["branch", "create", "fix-price"],
-        &["branch", "approve", "fix-price"],
         &["branch", "compare", "fix-price"],
-        &["branch", "promote", "fix-price"],
         &["plan", "--branch", "fix-price"],
-        &["plan", "promote", "fix-price"],
         &["run", "--branch", "fix-price"],
         &["preview", "create", "--name", "fix-price"],
         &["preview", "diff", "--name", "fix-price"],

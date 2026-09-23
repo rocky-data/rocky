@@ -47,9 +47,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// in the audit event and bypasses the gate.
 pub const APPROVAL_SKIP_ENV: &str = "ROCKY_BRANCH_APPROVAL_SKIP";
 
-/// Validate a branch name before creation or use as a SQL schema identifier
-/// (#2137): `branch create/compare/promote`, `run --branch`, `plan --branch`,
-/// and preview's branch-name arguments.
+/// Validate a branch name before creation or use in unquoted SQL (#2137):
+/// `branch create/compare`, `run --branch`, `plan --branch`, and preview create.
 ///
 /// A branch's schema is always `branch__<name>` (see [`run_branch_create`]),
 /// and that schema is read and written **unquoted** on the hot paths — `rocky
@@ -61,17 +60,13 @@ pub const APPROVAL_SKIP_ENV: &str = "ROCKY_BRANCH_APPROVAL_SKIP";
 /// every unquoted consumer downstream then refused, either loudly with a raw
 /// SQL error naming a mangled schema (`run --branch`) or silently as a
 /// read failure defaulted to a zero count (`branch compare`, before #2137).
-/// `branch promote` alone was safe, because it quotes the schema rather than
-/// interpolating it raw — but quoting is a defense for names that reach it
-/// from elsewhere (a legacy state-store record, a raw `--shadow-schema`), not
-/// a license to accept a name here that no other caller can use.
+/// Promote quotes the schema. Existing records with legacy names can still
+/// be approved and promoted; creation and unquoted consumers remain strict.
 ///
-/// Refusing the wider charset at creation and SQL-backed lookups means no
+/// Refusing the wider charset at creation and unquoted lookups means no
 /// branch can reach an unquoted consumer with a name it can't handle.
 ///
 /// `branch show`, `branch list`, and `branch delete` only access stored records.
-/// They remain available for legacy names so those records can be inspected
-/// and removed.
 fn validate_branch_name(name: &str) -> Result<()> {
     if name.is_empty() {
         anyhow::bail!(
@@ -87,7 +82,7 @@ fn validate_branch_name(name: &str) -> Result<()> {
             "invalid branch name '{name}': a branch's schema is `branch__<name>`, which must be \
              a valid SQL identifier — only [A-Za-z0-9_] characters are allowed (no hyphens or \
              dots). Try '{suggestion}' instead. Rename any existing branch with an old name \
-             before using it with Rocky."
+             before running under it. Existing legacy branches can still be approved and promoted."
         );
     }
     if name.len() > 64 {
@@ -95,6 +90,29 @@ fn validate_branch_name(name: &str) -> Result<()> {
             "branch name too long: {} chars (max 64); use a shorter [A-Za-z0-9_] name",
             name.len()
         );
+    }
+    Ok(())
+}
+
+/// Accept the former branch-name alphabet only for a record already stored.
+/// Callers here never interpolate its schema into unquoted SQL. Promote's
+/// `build_promote_sql` quotes every target part and checks unquotable delimiters.
+pub(crate) fn validate_existing_branch_name(state_path: &Path, name: &str) -> Result<()> {
+    if validate_branch_name(name).is_ok() {
+        return Ok(());
+    }
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return validate_branch_name(name);
+    }
+    let store = StateStore::open_read_only(state_path)
+        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+    if store.get_branch(name)?.is_none() {
+        anyhow::bail!("legacy branch '{name}' not found — see 'rocky branch list'");
     }
     Ok(())
 }
@@ -110,12 +128,11 @@ fn to_entry(record: &BranchRecord) -> BranchEntry {
 }
 
 /// `rocky branch create <name>` — register a new branch in the state store.
-pub fn run_branch_create(
+pub(crate) fn register_branch(
     state_path: &Path,
     name: &str,
     description: Option<&str>,
-    json: bool,
-) -> Result<()> {
+) -> Result<BranchRecord> {
     validate_branch_name(name)?;
 
     let store = StateStore::open(state_path)
@@ -135,6 +152,17 @@ pub fn run_branch_create(
     };
 
     store.put_branch(&record)?;
+    Ok(record)
+}
+
+/// `rocky branch create <name>` — register a new branch in the state store.
+pub fn run_branch_create(
+    state_path: &Path,
+    name: &str,
+    description: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let record = register_branch(state_path, name, description)?;
 
     if json {
         let output = BranchOutput {
@@ -1032,7 +1060,7 @@ pub fn run_branch_approve(
     out_override: Option<&Path>,
     json: bool,
 ) -> Result<()> {
-    validate_branch_name(branch_name)?;
+    validate_existing_branch_name(state_path, branch_name)?;
 
     let store = StateStore::open_read_only(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
@@ -1823,7 +1851,7 @@ pub async fn run_branch_promote_from_plan(
     use crate::plan_store::{PlanKind, read_plan};
 
     if let Some(name) = name {
-        validate_branch_name(name)?;
+        validate_existing_branch_name(state_path, name)?;
     }
 
     let plan =
@@ -1850,7 +1878,7 @@ pub async fn run_branch_promote_from_plan(
 
     let promote_plan: PromotePlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize promote plan payload")?;
-    validate_branch_name(&promote_plan.branch_name)?;
+    validate_existing_branch_name(state_path, &promote_plan.branch_name)?;
 
     if let Some(n) = name
         && n != promote_plan.branch_name
@@ -2035,45 +2063,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_backed_branch_commands_refuse_hyphen_before_io() {
+    async fn unquoted_branch_commands_refuse_hyphen_before_io() {
         let temp = TempDir::new().unwrap();
         let state = temp.path().join("missing.redb");
         let config = temp.path().join("missing.toml");
         let name = "pr-preview-x";
         let errors = [
             run_branch_create(&state, name, None, false).unwrap_err(),
-            run_branch_approve(&state, &config, name, None, None, false).unwrap_err(),
             run_branch_compare(&state, &config, name, None, None, false)
                 .await
                 .unwrap_err(),
-            run_branch_promote(
-                temp.path(),
-                &state,
-                &config,
-                &temp.path().join("models"),
-                "main",
-                name,
-                None,
-                None,
-                false,
-                false,
-                rocky_core::config::PolicyPrincipal::Human,
-                false,
-            )
-            .await
-            .unwrap_err(),
-            run_branch_promote_from_plan(
-                temp.path(),
-                &config,
-                "missing-plan",
-                Some(name),
-                None,
-                &state,
-                rocky_core::config::PolicyPrincipal::Human,
-                false,
-            )
-            .await
-            .unwrap_err(),
         ];
         for error in errors {
             let message = format!("{error:#}");
@@ -3774,7 +3773,7 @@ adapter = "default"
     /// the test level for that reason.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn run_branch_promote_transformation_e2e_succeeds() {
+    async fn legacy_branch_can_be_approved_planned_applied_and_promoted() {
         use rocky_core::traits::WarehouseAdapter;
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
@@ -3850,10 +3849,26 @@ auto_create_schemas = true
         )
         .unwrap();
 
-        // Register the branch in the state store.
-        run_branch_create(&state_path, "fix_price", None, false).unwrap();
+        // This record predates the stricter creation rule.
+        let legacy_name = "fix-price";
+        let error = run_branch_create(&state_path, legacy_name, None, false).unwrap_err();
+        assert!(error.to_string().contains("[A-Za-z0-9_]"));
+        let store = StateStore::open(&state_path).unwrap();
+        store
+            .put_branch(&BranchRecord {
+                name: legacy_name.to_string(),
+                schema_prefix: "branch__fix-price".to_string(),
+                created_by: "legacy".to_string(),
+                created_at: chrono::Utc::now(),
+                description: None,
+            })
+            .unwrap();
+        drop(store);
+        assert!(
+            resolve_branch_shadow_config(&state_path, legacy_name, "_rocky_shadow".into()).is_err()
+        );
 
-        // Seed the branch tables manually (simulates `rocky run --branch fix_price`):
+        // Seed the legacy branch tables manually (a pre-upgrade run).
         // both schemas are pre-created; the branch schema carries the rows
         // the promote will copy into prod.
         //
@@ -3871,18 +3886,18 @@ auto_create_schemas = true
                 .await
                 .expect("create prod schema");
             adapter
-                .execute_statement("CREATE SCHEMA IF NOT EXISTS \"branch__fix_price\"")
+                .execute_statement("CREATE SCHEMA IF NOT EXISTS \"branch__fix-price\"")
                 .await
                 .expect("create branch schema");
             adapter
                 .execute_statement(
-                    "CREATE TABLE \"branch__fix_price\".fct_orders AS SELECT 1 AS id UNION ALL SELECT 2",
+                    "CREATE TABLE \"branch__fix-price\".fct_orders AS SELECT 1 AS id UNION ALL SELECT 2",
                 )
                 .await
                 .expect("seed branch fct_orders");
             adapter
                 .execute_statement(
-                    "CREATE TABLE \"branch__fix_price\".dim_customers AS SELECT 'a' AS name",
+                    "CREATE TABLE \"branch__fix-price\".dim_customers AS SELECT 'a' AS name",
                 )
                 .await
                 .expect("seed branch dim_customers");
@@ -3895,13 +3910,62 @@ auto_create_schemas = true
         let _cwd_guard = cwd_lock();
         let saved_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir).unwrap();
+        run_branch_approve(&state_path, &config_path, legacy_name, None, None, false)
+            .expect("approve the stored legacy branch");
+        let planned = crate::commands::plan::build_promote_plan_inner(
+            dir,
+            &config_path,
+            &models_dir,
+            "main",
+            legacy_name,
+            None,
+            None,
+            false,
+            true,
+            &state_path,
+            rocky_core::config::PolicyPrincipal::Human,
+        )
+        .await
+        .expect("plan a legacy branch promote");
+        assert_eq!(planned.plan.targets.len(), 2);
+        assert!(
+            planned
+                .plan
+                .targets
+                .iter()
+                .all(|target| target.statement.contains("\"branch__fix-price\""))
+        );
+        let plan_id = planned.plan_output.plan_id.expect("persisted promote plan");
+        crate::commands::apply::run_apply_in(
+            dir,
+            &config_path,
+            &plan_id,
+            &state_path,
+            rocky_core::config::PolicyPrincipal::Human,
+            None,
+            false,
+        )
+        .await
+        .expect("apply an existing legacy promote plan");
+        run_branch_promote_from_plan(
+            dir,
+            &config_path,
+            &plan_id,
+            Some(legacy_name),
+            None,
+            &state_path,
+            rocky_core::config::PolicyPrincipal::Human,
+            false,
+        )
+        .await
+        .expect("promote an existing plan by legacy name");
         let result = run_branch_promote(
             dir, // root for the internal plan store (cwd is set to `dir` here)
             &state_path,
             &config_path,
             &models_dir,
             "main", // base_ref — repo is uninitialized so the gate skips
-            "fix_price",
+            legacy_name,
             None,                                       // no filter
             None,  // pipeline — only one pipeline, no need to disambiguate
             false, // skip_approval_flag
@@ -3938,13 +4002,13 @@ auto_create_schemas = true
             count_i64("SELECT CAST(COUNT(*) AS BIGINT) FROM warehouse.marts.fct_orders").await;
         assert_eq!(
             fct_count, 2,
-            "promote must copy all 2 rows from branch__fix_price.fct_orders to prod"
+            "promote must copy all 2 rows from branch__fix-price.fct_orders to prod"
         );
         let dim_count =
             count_i64("SELECT CAST(COUNT(*) AS BIGINT) FROM warehouse.marts.dim_customers").await;
         assert_eq!(
             dim_count, 1,
-            "promote must copy the row from branch__fix_price.dim_customers to prod"
+            "promote must copy the row from branch__fix-price.dim_customers to prod"
         );
     }
 

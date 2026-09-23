@@ -2490,11 +2490,11 @@ pub(crate) async fn build_promote_plan_inner(
     use crate::commands::branch::{
         APPROVAL_SKIP_ENV, approver_identity_pub, compute_branch_state_hash_pub,
         discover_branch_targets_for_plan, run_approval_gate, run_breaking_change_gate_for_plan,
-        validate_branch_name_pub,
+        validate_existing_branch_name,
     };
     use rocky_core::state::StateStore;
 
-    validate_branch_name_pub(branch_name)?;
+    validate_existing_branch_name(state_path, branch_name)?;
 
     // `state_path` is the namespace-aware path threaded from main.rs; the
     // branch record lives in whichever state file this invocation targets.

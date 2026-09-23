@@ -5,6 +5,12 @@ here=$(cd "$(dirname "$0")" && pwd)
 name() { bash "$here/name.sh" "$@"; }
 
 [[ $(name '' fix-price 42) == pr_42_fix_price ]] || exit 1
+# preview.yml supplies the PR number and head ref while leaving branch_name empty.
+[[ $(name '' 'feature/fix-price' 2180) == pr_2180_feature_fix_price ]] || exit 1
+if grep -Eq '^[[:space:]]*branch_name:' "$here/../../workflows/preview.yml"; then
+  echo 'preview.yml must leave branch_name empty for the PR-number default' >&2
+  exit 1
+fi
 [[ $(name '' fix_price 43) == pr_43_fix_price ]] || exit 1
 [[ $(name '' fix-price 42) != $(name '' fix_price 43) ]] || exit 1
 [[ $(name 'fix-price' '' '') == fix_price ]] || exit 1

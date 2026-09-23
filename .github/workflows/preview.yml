@@ -36,7 +36,6 @@ jobs:
         uses: ./.github/actions/rocky-preview
         with:
           base_ref: ${{ github.event.pull_request.base.sha }}
-          branch_name: ${{ github.event.pull_request.head.ref }}
           working_directory: examples/playground/pocs/06-developer-experience/10-pr-preview-and-data-diff
           models_dir: models
 

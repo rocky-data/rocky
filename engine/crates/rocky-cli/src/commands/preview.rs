@@ -142,15 +142,10 @@ pub async fn run_preview_create(
     // Step 6+7: register branch in state store. Idempotent — if the branch
     // already exists, surface a crisp error directing the user to
     // `rocky branch list`.
-    crate::commands::run_branch_create(
-        state_path,
-        &resolved_branch_name,
-        None,
-        /*json=*/ false,
-    )
-    .with_context(|| {
-        format!("failed to register preview branch '{resolved_branch_name}' in the state store")
-    })?;
+    crate::commands::branch::register_branch(state_path, &resolved_branch_name, None)
+        .with_context(|| {
+            format!("failed to register preview branch '{resolved_branch_name}' in the state store")
+        })?;
 
     let branch_schema = format!("branch__{resolved_branch_name}");
 
