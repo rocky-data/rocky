@@ -7,9 +7,10 @@ import type {
 } from "../types/generated";
 import { firePreviewCreated } from "../views/previewView";
 import { ensureWorkspace, promptForInput, showJsonInEditor } from "./ui";
+import { PREVIEW_NAME_EXAMPLE } from "./branchNames";
 
 const BASE_PLACEHOLDER = "e.g., main";
-const BRANCH_PLACEHOLDER = "e.g., preview-fix-price";
+const BRANCH_PLACEHOLDER = `e.g., ${PREVIEW_NAME_EXAMPLE}`;
 
 export async function previewCreate(): Promise<void> {
   if (!ensureWorkspace()) return;

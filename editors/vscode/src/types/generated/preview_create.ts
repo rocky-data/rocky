@@ -20,7 +20,7 @@ export interface PreviewCreateOutput {
    */
   branch_name: string;
   /**
-   * Schema prefix the branch run wrote into (e.g. `branch__fix-price`).
+   * Schema prefix the branch run wrote into (e.g. `branch__fix_price`).
    */
   branch_schema: string;
   command: string;

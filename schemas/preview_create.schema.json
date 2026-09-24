@@ -61,7 +61,7 @@
       "type": "string"
     },
     "branch_schema": {
-      "description": "Schema prefix the branch run wrote into (e.g. `branch__fix-price`).",
+      "description": "Schema prefix the branch run wrote into (e.g. `branch__fix_price`).",
       "type": "string"
     },
     "command": {

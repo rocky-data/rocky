@@ -692,8 +692,8 @@ This rule is not about whether the dialect quotes identifiers. Rocky renders Tri
 Or run against a named branch:
 
 ```bash
-rocky branch create fix-price --description "testing reprice migration"
-rocky run --filter client=acme --branch fix-price
+rocky branch create fix_price --description "testing reprice migration"
+rocky run --filter client=acme --branch fix_price
 ```
 
 Run in watch mode for the inner-loop developer workflow, where every save re-materializes the pipeline against the local DuckDB warehouse:
@@ -790,7 +790,7 @@ rocky branch promote <name> [--allow-breaking] [--base-ref <ref>]
 rocky branch promote <name> --plan <plan-id> [--pipeline <name>]   # canonical: plan + apply
 ```
 
-Branch names accept `[A-Za-z0-9_.\-]` up to 64 characters. The default schema prefix is `branch__<name>`. Deleting a branch removes the state-store entry but does **not** drop warehouse tables that were materialized under it.
+Branch names accept 1–64 `[A-Za-z0-9_]` characters. Rocky refuses other characters at the command entry point and suggests underscores. The default schema prefix is `branch__<name>`. Deleting a branch removes its state-store entry but leaves its warehouse tables.
 
 **Target names have their own limit.** `branch promote` writes each name into a `CREATE OR REPLACE TABLE` statement, quoted the way the warehouse quotes identifiers. Quoting is not escaping, so one character cannot survive it: the warehouse's own identifier quote. Promote refuses a catalog, schema or table name containing it, and names the character.
 
@@ -800,11 +800,11 @@ Branch names accept `[A-Za-z0-9_.\-]` up to 64 characters. The default schema pr
 | Databricks | `` ` `` | |
 | BigQuery | `` ` `` | `\` — BigQuery reads escape sequences inside a quoted identifier, so a trailing backslash consumes the closing quote |
 
-**No other character is refused by this check.** A hyphen or a dot passes it, which matters because branch names allow both. A backslash passes it everywhere except BigQuery.
+**No other character is refused by this quote check.** A hyphen or a dot in a target name passes it. Branch names follow the stricter rule above. A backslash passes it everywhere except BigQuery.
 
 Two limits sit outside this check and still apply:
 
-- A transformation model that takes its schema from its group's `schema_template` goes through the stricter identifier rule, `[A-Za-z0-9_]` only — whether or not the template carries a placeholder. A hyphen or a dot there is refused while the plan is being built, before promote quotes anything.
+- A transformation model that takes its schema from its group's `schema_template` follows `[A-Za-z0-9_]` too. This applies with or without a placeholder. A hyphen or a dot is refused while Rocky builds the plan, before promote quotes anything.
 - Promote also refuses a plan in which two steps replace the same production table, whatever the names look like.
 
 The check runs when a promote plan is built and again when one is applied, because a plan stores its statement as ready-made text.
@@ -849,7 +849,7 @@ The breaking-change gate vetoes the promote and exits non-zero when any finding 
 Create, list, run against, and delete a branch:
 
 ```bash
-rocky branch create fix-price --description "testing reprice migration"
+rocky branch create fix_price --description "testing reprice migration"
 ```
 
 ```json
@@ -857,8 +857,8 @@ rocky branch create fix-price --description "testing reprice migration"
   "version": "1.11.0",
   "command": "branch create",
   "branch": {
-    "name": "fix-price",
-    "schema_prefix": "branch__fix-price",
+    "name": "fix_price",
+    "schema_prefix": "branch__fix_price",
     "created_by": "hugo",
     "created_at": "2026-04-20T14:22:11+00:00",
     "description": "testing reprice migration"
@@ -876,22 +876,22 @@ rocky branch list
   "command": "branch list",
   "total": 2,
   "branches": [
-    { "name": "fix-price", "schema_prefix": "branch__fix-price", "created_by": "hugo", "created_at": "2026-04-20T14:22:11+00:00", "description": "testing reprice migration" },
-    { "name": "ingest-v2", "schema_prefix": "branch__ingest-v2", "created_by": "ci",   "created_at": "2026-04-18T09:05:00+00:00", "description": null }
+    { "name": "fix_price", "schema_prefix": "branch__fix_price", "created_by": "hugo", "created_at": "2026-04-20T14:22:11+00:00", "description": "testing reprice migration" },
+    { "name": "ingest_v2", "schema_prefix": "branch__ingest_v2", "created_by": "ci",   "created_at": "2026-04-18T09:05:00+00:00", "description": null }
   ]
 }
 ```
 
 ```bash
-rocky run --filter client=acme --branch fix-price
-rocky branch delete fix-price
+rocky run --filter client=acme --branch fix_price
+rocky branch delete fix_price
 ```
 
 Diff a branch's materialized tables against production (row counts + schemas):
 
 ```bash
-rocky branch compare fix-price
-rocky branch compare fix-price --pipeline shopify_us   # multi-pipeline project
+rocky branch compare fix_price
+rocky branch compare fix_price --pipeline shopify_us   # multi-pipeline project
 ```
 
 Internally this is `rocky compare` pointed at the branch's `schema_prefix` via `ShadowConfig.schema_override`, the same mechanism `rocky run --branch` uses for writes, so compare always hits exactly the tables the branch produced. Accepts the shared [`--filter`](/reference/filters/) flag, and `--pipeline <name>` to select the pipeline in a multi-pipeline project.
