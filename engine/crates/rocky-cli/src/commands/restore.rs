@@ -465,7 +465,7 @@ async fn rebuild_artifact_bytes(
     let result = warehouse
         .execute_query(&ir.sql)
         .await
-        .map_err(|e| anyhow!("re-execution query failed: {e}"))?;
+        .context("re-execution query failed")?;
     let batch = crate::commands::run_content_addressed::query_result_to_record_batch(
         &ir.typed_columns,
         &result,
