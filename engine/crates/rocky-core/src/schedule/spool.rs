@@ -55,6 +55,10 @@ const TMP_PREFIX: &str = ".tmp-";
 const DONE_SUFFIX: &str = ".done";
 const CORRUPT_INFIX: &str = ".corrupt-";
 
+/// The spool's sentinel: a file beside the spool directory, in `.rocky`,
+/// written at the first [`accept`] and never removed by the spool itself.
+const SENTINEL_NAME: &str = "pending-demands.sentinel";
+
 /// The webhook demand kind, which governs dedup and disposal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -209,6 +213,128 @@ pub fn spool_dir(rocky_dir: &Path) -> SpoolDir {
     SpoolDir(rocky_dir.join("pending-demands"))
 }
 
+/// The spool's sentinel file: `<.rocky>/pending-demands.sentinel` (#1903).
+///
+/// Its presence says "this spool has accepted a demand before". It lets a
+/// reader tell an empty spool from one it cannot see:
+///
+/// ```text
+///   spool dir reads as missing, and the path classifier says Absent
+///        |
+///        +-- sentinel missing  -> never accepted: absence, an empty queue
+///        +-- sentinel present  -> accepted before: UNREADABLE, refuse
+///        +-- sentinel unstatable -> absence unproven: refuse
+/// ```
+///
+/// It sits BESIDE the spool directory, not inside it, on purpose. The hole it
+/// closes is a filesystem that reports a denied lookup of the spool directory
+/// as `NotFound` (Windows ACLs, SMB access-based enumeration). There a file
+/// inside the directory is hidden by the same denial, so it could prove
+/// nothing. `.rocky` itself is readable in that case — the classifier's
+/// ancestor walk just found it searchable — so a file there is visible.
+///
+/// What it does not close: a `.rocky` that is itself masked the same way. The
+/// sentinel then reads as missing too, and the spool still reads as absent.
+pub fn sentinel_path(rocky_dir: &Path) -> PathBuf {
+    rocky_dir.join(SENTINEL_NAME)
+}
+
+/// Write the sentinel if it is missing, durably. Called by [`accept`].
+fn ensure_sentinel(rocky_dir: &Path) -> io::Result<()> {
+    let path = sentinel_path(rocky_dir);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::fs::write(
+        &path,
+        b"This file marks that the webhook spool beside it has accepted a demand.\n\
+          Rocky reads a missing spool directory as unreadable while this file exists.\n\
+          Delete it only together with the spool directory.\n",
+    )?;
+    fsync_path(&path)?;
+    fsync_dir(rocky_dir)
+}
+
+/// What a `NotFound` from reading the spool directory means (#1903).
+///
+/// [`classify_not_found`] first: a dangling symlink or an unsearchable
+/// ancestor is [`PathPresence::Present`]. When it answers
+/// [`PathPresence::Absent`], the sentinel decides — see [`sentinel_path`].
+///
+/// `rocky doctor` calls this too, so its spool check cannot disagree with the
+/// scan about whether a spool is there.
+pub fn classify_missing_spool(rocky_dir: &Path) -> PathPresence {
+    let dir = spool_dir(rocky_dir);
+    match classify_not_found(dir.as_path()) {
+        PathPresence::Absent => {}
+        present @ PathPresence::Present { .. } => return present,
+    }
+    let sentinel = sentinel_path(rocky_dir);
+    match std::fs::symlink_metadata(&sentinel) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => PathPresence::Absent,
+        Ok(_) => PathPresence::Present {
+            detail: format!(
+                "the directory reads as missing, but its sentinel '{}' says this spool has \
+                 accepted demands before, so it is there and this process cannot see it. \
+                 Check the permissions on the spool directory. If you removed the spool on \
+                 purpose, delete the sentinel too",
+                sentinel.display()
+            ),
+        },
+        Err(e) => PathPresence::Present {
+            detail: format!(
+                "the directory reads as missing, and its sentinel '{}' could not be \
+                 inspected: {e}",
+                sentinel.display()
+            ),
+        },
+    }
+}
+
+/// Read the spool directory's entries, or `None` for a proven-absent spool.
+///
+/// The one read every spool scan shares, so the sites cannot drift on what a
+/// `NotFound` means (#1713, #1903).
+///
+/// A readable spool that holds entries but has no sentinel predates the
+/// sentinel. It gets one here, best-effort: this is the one-time migration.
+/// A readable spool with no entries gets none — nothing says it ever
+/// accepted. A failed migration write is not an error: the listing itself
+/// succeeded, and a read-only caller (`rocky doctor`, the spool route) must
+/// not fail for a file it only writes as a courtesy.
+fn read_spool_entries(rocky_dir: &Path) -> io::Result<Option<Vec<std::fs::DirEntry>>> {
+    let dir = spool_dir(rocky_dir);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e.collect::<io::Result<Vec<_>>>()?,
+        // `NotFound` has two meanings here and only one of them is "no demand
+        // is pending". Ask the shared discriminator which one this is.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return match classify_missing_spool(rocky_dir) {
+                PathPresence::Absent => Ok(None),
+                PathPresence::Present { detail } => Err(unreadable_spool(&dir, &detail)),
+            };
+        }
+        Err(e) => return Err(e),
+    };
+    if !entries.is_empty() {
+        let sentinel = sentinel_path(rocky_dir);
+        if matches!(
+            std::fs::symlink_metadata(&sentinel),
+            Err(e) if e.kind() == io::ErrorKind::NotFound
+        ) && let Err(e) = ensure_sentinel(rocky_dir)
+        {
+            tracing::debug!(
+                sentinel = %sentinel.display(),
+                error = %e,
+                "could not write the webhook spool sentinel for an existing spool"
+            );
+        }
+    }
+    Ok(Some(entries))
+}
+
 /// The on-disk dedup filename: the hex `blake3` of the canonical
 /// `(pipeline, kind, token)` tuple, with each field length-prefixed so the hash
 /// input is unambiguous for any byte content.
@@ -332,6 +458,10 @@ pub fn accept_journaled(
 
     let dir = spool_dir(rocky_dir);
     std::fs::create_dir_all(&dir)?;
+    // Before any demand lands, so no spool ever holds a demand without it.
+    // An error is an error: without the sentinel a later reader could take
+    // this spool, unreadable, for an empty one (#1903).
+    ensure_sentinel(rocky_dir)?;
 
     let key_name = dedup_filename(pipeline, kind, token);
     let key_path = dir.join(&key_name);
@@ -411,6 +541,9 @@ pub fn accept_journaled(
 /// that as "no demand is pending" makes the scheduler idle through a spool it
 /// simply could not open (#1707).
 ///
+/// A spool directory that reads as missing while its sentinel exists is
+/// unreadable too, not absent: see [`sentinel_path`] (#1903).
+///
 /// # Errors
 ///
 /// Returns the underlying `read_dir`/`DirEntry` error, or — for a spool path
@@ -433,22 +566,11 @@ fn unreadable_spool(dir: &SpoolDir, detail: &str) -> io::Error {
 }
 
 pub fn list_pending_files(rocky_dir: &Path) -> io::Result<Vec<PathBuf>> {
-    let dir = spool_dir(rocky_dir);
     let mut out = Vec::new();
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        // `NotFound` has two meanings here and only one of them is "no demand
-        // is pending". Ask the shared discriminator which one this is.
-        Err(e) if e.kind() == io::ErrorKind::NotFound => match classify_not_found(dir.as_path()) {
-            PathPresence::Absent => return Ok(out),
-            PathPresence::Present { detail } => {
-                return Err(unreadable_spool(&dir, &detail));
-            }
-        },
-        Err(e) => return Err(e),
+    let Some(entries) = read_spool_entries(rocky_dir)? else {
+        return Ok(out);
     };
     for entry in entries {
-        let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue;
         }
@@ -575,18 +697,11 @@ pub fn quarantine(pending: &Path, now: DateTime<Utc>) -> io::Result<PathBuf> {
 /// directory listing. Wiring a caller needs a decision this function cannot
 /// make on its own: see #1712.
 pub fn count_corrupt(rocky_dir: &Path) -> io::Result<usize> {
-    let dir = spool_dir(rocky_dir);
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => match classify_not_found(dir.as_path()) {
-            PathPresence::Absent => return Ok(0),
-            PathPresence::Present { detail } => return Err(unreadable_spool(&dir, &detail)),
-        },
-        Err(e) => return Err(e),
+    let Some(entries) = read_spool_entries(rocky_dir)? else {
+        return Ok(0);
     };
     let mut n = 0;
     for entry in entries {
-        let entry = entry?;
         if entry.file_name().to_string_lossy().contains(CORRUPT_INFIX) {
             n += 1;
         }
@@ -631,14 +746,8 @@ pub struct TombstoneSweep {
 /// stamp written by another host — has no positive age, so it cannot be expired
 /// and is kept. That is the fail-safe direction: the dedup window stays closed.
 pub fn sweep_tombstones(rocky_dir: &Path) -> io::Result<TombstoneSweep> {
-    let dir = spool_dir(rocky_dir);
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => match classify_not_found(dir.as_path()) {
-            PathPresence::Absent => return Ok(TombstoneSweep::default()),
-            PathPresence::Present { detail } => return Err(unreadable_spool(&dir, &detail)),
-        },
-        Err(e) => return Err(e),
+    let Some(entries) = read_spool_entries(rocky_dir)? else {
+        return Ok(TombstoneSweep::default());
     };
     // `TOMBSTONE_TTL` is a 24-hour constant, so this conversion cannot fail;
     // falling back to an empty pass keeps the impossible branch panic-free.
@@ -648,7 +757,6 @@ pub fn sweep_tombstones(rocky_dir: &Path) -> io::Result<TombstoneSweep> {
     let wall_now = std::time::SystemTime::now();
     let mut sweep = TombstoneSweep::default();
     for entry in entries {
-        let entry = entry?;
         let name = entry.file_name();
         if !name.to_string_lossy().ends_with(DONE_SUFFIX) {
             continue;
@@ -1202,6 +1310,107 @@ mod tests {
             pending[0].exists(),
             "a failed stamp leaves the pending file intact for the next tick to retry"
         );
+    }
+
+    /// #1903. A spool that has accepted before and now reads as missing is
+    /// UNREADABLE, never empty.
+    ///
+    /// Removing the directory stands in for the masked shape a CI runner
+    /// cannot produce: a filesystem that answers a denied lookup of the spool
+    /// directory with `NotFound`. Both look identical to the reader — the
+    /// directory reads as missing and the classifier's ancestor walk finds
+    /// `.rocky` searchable, so it answers `Absent`. Before the sentinel, every
+    /// read site then reported an empty spool.
+    #[test]
+    fn a_spool_that_accepted_before_and_reads_as_missing_is_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rocky_dir = tmp.path().join(".rocky");
+        accept(&rocky_dir, "p", WebhookKind::Id, "d-1", "h", now()).unwrap();
+        assert!(
+            sentinel_path(&rocky_dir).exists(),
+            "accept writes the sentinel"
+        );
+
+        std::fs::remove_dir_all(spool_dir(&rocky_dir).as_path()).unwrap();
+        // PRECONDITION: the path classifier alone calls this absence. Without
+        // it the test would pass on the classifier, not the sentinel.
+        assert!(matches!(
+            classify_not_found(spool_dir(&rocky_dir).as_path()),
+            PathPresence::Absent
+        ));
+
+        let scan = list_pending_files(&rocky_dir).expect_err("the scan refuses");
+        let corrupt = count_corrupt(&rocky_dir).expect_err("count_corrupt refuses");
+        let sweep = sweep_tombstones(&rocky_dir).expect_err("the sweep refuses");
+        for (name, err) in [
+            ("scan", &scan),
+            ("count_corrupt", &corrupt),
+            ("sweep", &sweep),
+        ] {
+            let text = err.to_string();
+            assert!(text.contains("cannot be read"), "{name}: {text}");
+            assert!(text.contains("sentinel"), "{name} names the cause: {text}");
+            assert!(
+                text.contains("delete the sentinel"),
+                "{name} names the remedy: {text}"
+            );
+        }
+        assert!(matches!(
+            classify_missing_spool(&rocky_dir),
+            PathPresence::Present { .. }
+        ));
+    }
+
+    /// #1903 migration. A spool written before the sentinel existed gets one
+    /// at its first readable, non-empty scan, and is protected from then on.
+    #[test]
+    fn a_readable_spool_without_a_sentinel_gets_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rocky_dir = tmp.path().join(".rocky");
+        accept(&rocky_dir, "p", WebhookKind::Id, "d-1", "h", now()).unwrap();
+        // The pre-#1903 shape: a spool with a demand and no sentinel.
+        std::fs::remove_file(sentinel_path(&rocky_dir)).unwrap();
+
+        assert_eq!(list_pending_files(&rocky_dir).unwrap().len(), 1);
+        assert!(
+            sentinel_path(&rocky_dir).exists(),
+            "the scan migrates a readable, non-empty spool"
+        );
+
+        std::fs::remove_dir_all(spool_dir(&rocky_dir).as_path()).unwrap();
+        list_pending_files(&rocky_dir).expect_err("the migrated spool is protected");
+    }
+
+    /// The control for the migration: an EMPTY readable spool with no
+    /// sentinel says nothing about having accepted, so it gets none, and a
+    /// spool that never accepted still reads as empty after it goes away.
+    #[test]
+    fn an_empty_spool_without_a_sentinel_stays_absence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rocky_dir = tmp.path().join(".rocky");
+        std::fs::create_dir_all(spool_dir(&rocky_dir).as_path()).unwrap();
+
+        assert!(list_pending_files(&rocky_dir).unwrap().is_empty());
+        assert!(!sentinel_path(&rocky_dir).exists());
+
+        std::fs::remove_dir_all(spool_dir(&rocky_dir).as_path()).unwrap();
+        assert!(list_pending_files(&rocky_dir).unwrap().is_empty());
+        assert!(matches!(
+            classify_missing_spool(&rocky_dir),
+            PathPresence::Absent
+        ));
+    }
+
+    /// The sentinel is not a demand: it lives beside the spool directory, so
+    /// no scan lists it.
+    #[test]
+    fn the_sentinel_is_never_listed_as_a_demand() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rocky_dir = tmp.path().join(".rocky");
+        accept(&rocky_dir, "p", WebhookKind::Id, "d-1", "h", now()).unwrap();
+        let listed = list_pending_files(&rocky_dir).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed.iter().all(|p| p != &sentinel_path(&rocky_dir)));
     }
 
     /// A spool directory that was never created is the ordinary state of a

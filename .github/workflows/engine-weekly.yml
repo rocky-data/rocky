@@ -1,8 +1,8 @@
 name: engine-weekly
 
 # Expensive-but-advisory jobs that don't need to run on every PR.
-# Coverage (tarpaulin), the security audit, the POC smoke suite and a
-# Windows compile check run weekly on main and can be triggered manually
+# Coverage (tarpaulin), the security audit, the POC smoke suite, a
+# Windows compile check and a Windows spool probe run weekly on main and can be triggered manually
 # for one-off checks.
 
 on:
@@ -84,6 +84,31 @@ jobs:
           save-if: false
       - name: cargo check (x86_64-pc-windows-msvc)
         run: cargo check --workspace --all-targets --target x86_64-pc-windows-msvc
+
+  spool-probe-windows:
+    name: Windows spool probe (#1903)
+    runs-on: windows-latest
+    # Evidence, not a gate. #1903 asks one question no reading settles: on
+    # plain NTFS, does a denied directory listing report `NotFound` (the
+    # masked shape the spool sentinel exists for) or `PermissionDenied`
+    # (which the path classifier already refuses)? This runs ONE test in ONE
+    # crate. The test denies list access with `icacls /deny <user>:(RD)` and
+    # PRINTS the `SPOOL_PROBE` lines; it asserts nothing about the answer.
+    # Read the lines in the log, then add the assertion to the test.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          # Pinned like every other Rust job here. Bump deliberately.
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: engine
+          # Restore only, like the other weekly jobs.
+          save-if: false
+      - name: cargo test spool_probe (prints the classification)
+        run: cargo test -p rocky-core --test spool_probe -- --nocapture
 
   coverage:
     name: Coverage

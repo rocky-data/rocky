@@ -870,14 +870,15 @@ fn state_concurrency_check(
 /// never received a webhook has no spool directory and nothing to report, so
 /// emitting a healthy check there would be noise on every `rocky doctor` run.
 ///
-/// Absence is decided with [`rocky_core::path_presence::classify_not_found`],
-/// not `Path::exists()`. `exists()` follows symlinks, so a spool that is a
+/// Absence is decided with
+/// [`rocky_core::schedule::spool::classify_missing_spool`], not
+/// `Path::exists()`. `exists()` follows symlinks, so a spool that is a
 /// symlink to a deleted directory answers `false` and would be reported as
 /// "no webhooks here" — the shape of #1668/#1707/#1739. A path that is present
 /// but cannot be inspected is a WARNING, not silence: absence is unproven, and
 /// a spool nobody can read is exactly the state this check exists to surface.
 fn spool_check(config_path: &Path, suggestions: &mut Vec<String>) -> Option<HealthCheck> {
-    use rocky_core::path_presence::{PathPresence, classify_not_found};
+    use rocky_core::path_presence::PathPresence;
     use rocky_core::schedule::spool;
 
     let start = Instant::now();
@@ -885,9 +886,11 @@ fn spool_check(config_path: &Path, suggestions: &mut Vec<String>) -> Option<Heal
     let dir = spool::spool_dir(&rocky_dir);
 
     // Does the spool exist at all? `read_dir` answers NotFound for both "never
-    // created" and "the symlink dangles", so ask the discriminator.
+    // created" and "the symlink dangles", so ask the discriminator — the
+    // spool's own, which also reads the sentinel (#1903), so this check and
+    // the scan agree on whether a spool is there.
     if std::fs::read_dir(dir.as_path()).is_err() {
-        match classify_not_found(dir.as_path()) {
+        match spool::classify_missing_spool(&rocky_dir) {
             // Nothing here. No webhook has ever been spooled: stay silent.
             PathPresence::Absent => return None,
             PathPresence::Present { detail } => {
