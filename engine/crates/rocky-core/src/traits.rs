@@ -2238,29 +2238,59 @@ pub trait TypeMapper: Send + Sync {
 // Batch checks
 // ---------------------------------------------------------------------------
 
-/// Result of a batch row count query.
+/// Result of a batch row count query for one table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RowCountResult {
     pub table: TableRef,
-    pub count: u64,
+    /// The count, or why the adapter could not read it (#1928).
+    pub outcome: RowCountOutcome,
 }
 
-/// Result of a batch freshness query.
+/// What a batch row count query answered for one table.
+///
+/// One value per table, so a table is never both counted and unreadable,
+/// and the reason for an unreadable one reaches the check result instead of
+/// only the adapter's log (#1928).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RowCountOutcome {
+    /// `COUNT(*)` read as a non-negative integer.
+    Counted(u64),
+    /// The query answered for the table, but its count could not be read.
+    /// The string says why; the caller reports the check not evaluated.
+    Unreadable(String),
+}
+
+/// Result of a batch freshness query for one table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FreshnessResult {
     pub table: TableRef,
-    /// `MAX(<timestamp_column>)`. `None` is a SQL NULL, which the warehouse
-    /// answers both for an empty table and for a non-empty table whose
-    /// timestamp column holds no value; `row_count` is what tells them apart.
-    pub max_timestamp: Option<DateTime<Utc>>,
-    /// `COUNT(*)` measured in the same query as `max_timestamp`, when the
-    /// adapter asked for it. `None` means the adapter did not report a count
-    /// (a query written before #1930), so a NULL `max_timestamp` cannot be
-    /// told apart from an empty table and the caller treats it as one. An
-    /// adapter that counts must report the count on EVERY row it answers,
-    /// so the absent case stays distinguishable from a zero.
-    #[serde(default)]
-    pub row_count: Option<u64>,
+    /// The measurement, or why the adapter could not read it (#1928).
+    pub outcome: FreshnessOutcome,
+}
+
+/// What a batch freshness query answered for one table (#1928).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FreshnessOutcome {
+    /// The row read cleanly.
+    Measured {
+        /// `MAX(<timestamp_column>)`. `None` is a SQL NULL, which the
+        /// warehouse answers both for an empty table and for a non-empty
+        /// table whose timestamp column holds no value; `row_count` is what
+        /// tells them apart.
+        max_timestamp: Option<DateTime<Utc>>,
+        /// `COUNT(*)` measured in the same query as `max_timestamp`, when
+        /// the adapter asked for it. `None` means the adapter did not report
+        /// a count (a query written before #1930), so a NULL `max_timestamp`
+        /// cannot be told apart from an empty table and the caller treats it
+        /// as one. An adapter that counts must report the count on EVERY row
+        /// it answers, so the absent case stays distinguishable from a zero.
+        row_count: Option<u64>,
+    },
+    /// The query answered for the table, but a cell could not be read (a
+    /// timestamp that does not parse, a count that is not a number, a
+    /// missing cell). The string says why; the caller reports the check not
+    /// evaluated.
+    Unreadable(String),
 }
 
 /// Optional batch check execution for warehouses that support
@@ -2307,14 +2337,18 @@ pub trait BatchCheckAdapter: Send + Sync {
     ///
     /// Called only when [`supports_row_counts`](Self::supports_row_counts)
     /// returns `true`. An `Err` from here is a query that failed, never
-    /// "unimplemented".
+    /// "unimplemented". A table the query answered for but whose count will
+    /// not read is [`RowCountOutcome::Unreadable`] with the reason, not left
+    /// out (#1928).
     async fn batch_row_counts(&self, tables: &[TableRef]) -> AdapterResult<Vec<RowCountResult>>;
 
     /// Execute freshness queries for multiple tables in a single batch.
     ///
     /// Called only when [`supports_freshness`](Self::supports_freshness)
     /// returns `true`. An `Err` from here is a query that failed, never
-    /// "unimplemented".
+    /// "unimplemented". A table the query answered for but whose row will
+    /// not read is [`FreshnessOutcome::Unreadable`] with the reason, not left
+    /// out (#1928).
     async fn batch_freshness(
         &self,
         tables: &[TableRef],

@@ -45,11 +45,13 @@
 //!   the `rocky-ir` types, so SDK-only adapter trait objects can't yet
 //!   slot in. Unifying these types is the prerequisite for true
 //!   process-adapter pluggability.
-//! - `FreshnessResult` here lacks the `row_count` that
-//!   `rocky_core::traits::FreshnessResult` gained in #1930 (the `COUNT(*)`
-//!   beside `MAX`, which tells an empty table from rows with no value).
-//!   Nothing bridges the SDK's batch results into the core check runner
-//!   yet, so the field has no consumer here; add it when that bridge lands.
+//! - `FreshnessResult` and `RowCountResult` here are the pre-#1928 shapes.
+//!   `rocky_core::traits` now carries one outcome per table — a measurement
+//!   or an unreadable reason (#1928) — and its freshness measurement has the
+//!   `row_count` from #1930 (the `COUNT(*)` beside `MAX`, which tells an
+//!   empty table from rows with no value). Nothing bridges the SDK's batch
+//!   results into the core check runner yet, so neither has a consumer
+//!   here; align them when that bridge lands.
 
 use std::collections::BTreeMap;
 

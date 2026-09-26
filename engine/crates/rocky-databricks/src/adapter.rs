@@ -9,8 +9,9 @@ use rocky_catalog_core::{
     CatalogClient, CatalogError, TableRef as CatalogTableRef, TableSchema as CatalogTableSchema,
 };
 use rocky_core::traits::{
-    AdapterError, AdapterResult, BatchCheckAdapter, ChunkChecksum, ExecutionStats, FreshnessResult,
-    PkRange, QueryResult, RowCountResult, SqlDialect, WarehouseAdapter,
+    AdapterError, AdapterResult, BatchCheckAdapter, ChunkChecksum, ExecutionStats,
+    FreshnessOutcome, FreshnessResult, PkRange, QueryResult, RowCountResult, SqlDialect,
+    WarehouseAdapter,
 };
 use rocky_ir::{ColumnInfo, TableRef};
 use tracing::debug;
@@ -394,6 +395,29 @@ impl DatabricksBatchCheckAdapter {
     }
 }
 
+/// Parse a batched freshness maximum. Databricks returns timestamps as
+/// strings via `CAST(... AS STRING)`. Accept RFC 3339 first, then fall back
+/// to the Databricks default format "YYYY-MM-DD HH:MM:SS[.fff]".
+///
+/// `None` passes through: it is a genuine SQL NULL. A string that will not
+/// parse is `Err` with the reason, so the caller reports the table not
+/// evaluated and says why (#1929, #1928).
+fn parse_freshness_timestamp(ts: Option<String>) -> Result<Option<DateTime<Utc>>, String> {
+    let Some(ts) = ts else {
+        return Ok(None);
+    };
+    ts.parse::<DateTime<Utc>>()
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%d %H:%M:%S%.f")
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%d %H:%M:%S"))
+                .ok()
+                .map(|naive| naive.and_utc())
+        })
+        .map(Some)
+        .ok_or_else(|| format!("the freshness timestamp {ts:?} would not parse as a timestamp"))
+}
+
 fn table_refs_to_batch(tables: &[TableRef]) -> Vec<BatchTableRef> {
     tables
         .iter()
@@ -421,7 +445,7 @@ impl BatchCheckAdapter for DatabricksBatchCheckAdapter {
                     schema: r.schema,
                     table: r.table,
                 },
-                count: r.count,
+                outcome: r.count,
             })
             .collect())
     }
@@ -438,48 +462,30 @@ impl BatchCheckAdapter for DatabricksBatchCheckAdapter {
 
         Ok(results
             .into_iter()
-            .filter_map(|r| {
-                // Databricks returns timestamps as strings via `CAST(... AS STRING)`.
-                // Accept RFC 3339 first, then fall back to the Databricks default
-                // format "YYYY-MM-DD HH:MM:SS[.fff]" — matches the parse logic
-                // previously inlined in run.rs before this dispatch was lifted
-                // behind the BatchCheckAdapter trait.
-                //
-                // A string that will not parse OMITS the row (#1929). `None`
-                // passes through: it is a genuine SQL NULL.
-                let max_timestamp = match r.max_timestamp {
-                    None => None,
-                    Some(ts) => {
-                        let parsed = ts.parse::<DateTime<Utc>>().ok().or_else(|| {
-                            chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%d %H:%M:%S%.f")
-                                .or_else(|_| {
-                                    chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%d %H:%M:%S")
-                                })
-                                .ok()
-                                .map(|naive| naive.and_utc())
-                        });
-                        match parsed {
-                            Some(dt) => Some(dt),
-                            None => {
-                                tracing::warn!(
-                                    table = format!("{}.{}.{}", r.catalog, r.schema, r.table),
-                                    value = ts.as_str(),
-                                    "freshness timestamp would not parse — reporting the table as not evaluated"
-                                );
-                                return None;
-                            }
-                        }
-                    }
+            .map(|r| {
+                let table = TableRef {
+                    catalog: r.catalog,
+                    schema: r.schema,
+                    table: r.table,
                 };
-                Some(FreshnessResult {
-                    table: TableRef {
-                        catalog: r.catalog,
-                        schema: r.schema,
-                        table: r.table,
+                let outcome = match r.cells {
+                    Err(reason) => FreshnessOutcome::Unreadable(reason),
+                    Ok(cells) => match parse_freshness_timestamp(cells.max_timestamp) {
+                        Ok(max_timestamp) => FreshnessOutcome::Measured {
+                            max_timestamp,
+                            row_count: Some(cells.row_count),
+                        },
+                        Err(reason) => {
+                            tracing::warn!(
+                                table = table.full_name(),
+                                reason = reason.as_str(),
+                                "freshness timestamp would not parse — reporting the table as not evaluated"
+                            );
+                            FreshnessOutcome::Unreadable(reason)
+                        }
                     },
-                    max_timestamp,
-                    row_count: Some(r.row_count),
-                })
+                };
+                FreshnessResult { table, outcome }
             })
             .collect())
     }
