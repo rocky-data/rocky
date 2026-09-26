@@ -8,7 +8,7 @@
 //! Consumers (dagster-rocky) can build a complete, connected Dagster asset
 //! graph from a single `rocky dag --output json` call.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -44,6 +44,58 @@ enum LineageSource {
     /// No transformation models exist, so no lineage does either. Empty is the
     /// complete answer.
     NoModels,
+}
+
+/// One compile's models, for `rocky serve`'s `GET /api/v1/dag` (#2011).
+///
+/// The route builds its transformation nodes from these models, the ones the
+/// model routes read, instead of from the files on disk at request time. A
+/// model file this compile did not cover still becomes a node, from disk, and
+/// is marked [`DagNodeCompile::NotCompiled`].
+#[derive(Debug, Default)]
+pub struct CompiledModels {
+    /// Every model the compile loaded, as it loaded them.
+    pub models: Vec<Model>,
+    /// The models with an error diagnostic.
+    pub refused: BTreeSet<String>,
+}
+
+impl CompiledModels {
+    /// The models and refused set of one compile result.
+    pub fn from_compile(result: &rocky_compiler::compile::CompileResult) -> Self {
+        Self {
+            models: result.project.models.clone(),
+            refused: result
+                .diagnostics
+                .iter()
+                .filter(|d| d.is_error())
+                .map(|d| d.model.clone())
+                .collect(),
+        }
+    }
+
+    fn status(&self, model: &str) -> DagNodeCompile {
+        if !self.models.iter().any(|m| m.config.name == model) {
+            DagNodeCompile::NotCompiled
+        } else if self.refused.contains(model) {
+            DagNodeCompile::Refused
+        } else {
+            DagNodeCompile::Compiled
+        }
+    }
+
+    /// Replace each loaded model this compile covers with the compiled one.
+    fn overlay(&self, models: &mut [Model]) {
+        for model in models {
+            if let Some(compiled) = self
+                .models
+                .iter()
+                .find(|c| c.config.name == model.config.name)
+            {
+                *model = compiled.clone();
+            }
+        }
+    }
 }
 
 /// Execute `rocky dag`.
@@ -93,6 +145,31 @@ pub fn run_dag(
 pub fn dag_output(
     config_path: &Path,
     state_path: &Path,
+    models_dir: Option<&Path>,
+    seeds_dir: Option<&Path>,
+    contracts_dir: Option<&Path>,
+    include_column_lineage: bool,
+    cache_ttl_override: Option<u64>,
+) -> Result<DagOutput> {
+    dag_output_with_compile(
+        config_path,
+        state_path,
+        models_dir,
+        seeds_dir,
+        contracts_dir,
+        include_column_lineage,
+        cache_ttl_override,
+        None,
+    )
+}
+
+/// [`dag_output`], with transformation nodes taken from one compile when
+/// `compiled` is `Some` (`GET /api/v1/dag`, #2011). Each such node then
+/// carries [`DagNodeOutput::compile`].
+#[allow(clippy::too_many_arguments)]
+pub fn dag_output_with_compile(
+    config_path: &Path,
+    state_path: &Path,
     // `Some(dir)` is an explicit whole-project override (`rocky dag --models`):
     // every transformation pipeline is read from that one directory. `None`
     // means "no override" — each pipeline resolves its own configured
@@ -109,6 +186,7 @@ pub fn dag_output(
     contracts_dir: Option<&Path>,
     include_column_lineage: bool,
     cache_ttl_override: Option<u64>,
+    compiled: Option<&CompiledModels>,
 ) -> Result<DagOutput> {
     let cfg = rocky_core::config::load_rocky_config(config_path)?;
     // Apply `--cache-ttl` once up-front; the column-lineage compile
@@ -138,7 +216,7 @@ pub fn dag_output(
     // contributing root. Re-reading the directory here would ignore the
     // configured file glob and could emit lineage for a model absent from the
     // DAG, or lose all lineage to a malformed non-matching sidecar.
-    let (models, models_by_pipeline, lineage_source, missing_roots) = match models_dir {
+    let (mut models, mut models_by_pipeline, lineage_source, missing_roots) = match models_dir {
         // An explicit whole-project override: every transformation pipeline
         // genuinely does declare this one directory — and a project with two of
         // them is then refused by name, which is the honest answer to "these two
@@ -199,6 +277,15 @@ pub fn dag_output(
         }
     };
 
+    // One snapshot for the served routes (#2011): a model the server's compile
+    // covers is built from that compile, not re-read from disk.
+    if let Some(compiled) = compiled {
+        compiled.overlay(&mut models);
+        for pipeline_models in models_by_pipeline.values_mut() {
+            compiled.overlay(pipeline_models);
+        }
+    }
+
     // Load seeds if the directory exists. A discovery failure is propagated, not
     // flattened to "no seeds": the seed nodes and the seed→model edges are built
     // only from this list, so swallowing a malformed sidecar prints a DAG that
@@ -245,6 +332,7 @@ pub fn dag_output(
         state_path,
         &schema_cache_cfg,
         &missing_roots,
+        compiled,
     )
 }
 
@@ -262,6 +350,7 @@ fn build_dag_output(
     state_path: &Path,
     schema_cache_cfg: &rocky_core::config::SchemaCacheConfig,
     missing_roots: &[(String, std::path::PathBuf)],
+    compiled: Option<&CompiledModels>,
 ) -> Result<DagOutput> {
     // Build lookup maps.
     let model_map: HashMap<&str, &Model> =
@@ -336,6 +425,9 @@ fn build_dag_output(
                 freshness,
                 partition_shape,
                 depends_on,
+                compile: compiled
+                    .filter(|_| node.kind == NodeKind::Transformation)
+                    .map(|c| c.status(&node.label)),
             }
         })
         .collect();

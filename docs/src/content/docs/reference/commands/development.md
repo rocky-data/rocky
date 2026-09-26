@@ -380,6 +380,16 @@ Endpoints:
   GET /api/v1/dag                 - Full dependency graph
 ```
 
+`GET /api/v1/dag` builds its model nodes from the same compile the model routes read. Each model node carries `compile`:
+
+| Value | Meaning |
+|---|---|
+| `compiled` | The compile covers the model. `GET /api/v1/models/:name` serves it. |
+| `refused` | The compile covers the model and reports an error for it, for example `E038`. The model routes serve it, and no run builds it. |
+| `not_compiled` | The compile does not cover the file. This is a model of another pipeline's directory, or a file written after the last compile. `GET /api/v1/models/:name` answers `404`. |
+
+`rocky dag` does not set `compile`.
+
 Call an authenticated endpoint:
 
 ```bash

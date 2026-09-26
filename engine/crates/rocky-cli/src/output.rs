@@ -5949,6 +5949,33 @@ pub struct DagNodeOutput {
     /// Upstream node IDs (derived from DAG edges).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
+    /// Whether `rocky serve`'s compile covers this transformation model, and
+    /// how it judged it (#2011).
+    ///
+    /// Only `GET /api/v1/dag` sets it, and only on `transformation` nodes.
+    /// The route builds those nodes from the same compile that
+    /// `GET /api/v1/models` and `GET /api/v1/models/{name}` read, so a node is
+    /// `compiled` or `refused` exactly when the model routes can serve it. A
+    /// `not_compiled` node is a model file that compile did not cover (another
+    /// pipeline's root, or a file written since): the model routes answer
+    /// 404 for it. `rocky dag` has no server compile and leaves this out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compile: Option<DagNodeCompile>,
+}
+
+/// How `rocky serve`'s compile judged one DAG node's model. See
+/// [`DagNodeOutput::compile`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DagNodeCompile {
+    /// The compile covers the model and has no error for it.
+    Compiled,
+    /// The compile covers the model and refuses it with an error diagnostic
+    /// (E038, for example). The model routes still serve it; no run builds it.
+    Refused,
+    /// The compile does not cover the model's file. The model routes answer
+    /// 404 for it.
+    NotCompiled,
 }
 
 /// Partition shape metadata for time-interval nodes.

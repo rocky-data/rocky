@@ -24,9 +24,46 @@
       ],
       "type": "object"
     },
+    "DagNodeCompile": {
+      "description": "How `rocky serve`'s compile judged one DAG node's model. See [`DagNodeOutput::compile`].",
+      "oneOf": [
+        {
+          "description": "The compile covers the model and has no error for it.",
+          "enum": [
+            "compiled"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The compile covers the model and refuses it with an error diagnostic (E038, for example). The model routes still serve it; no run builds it.",
+          "enum": [
+            "refused"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The compile does not cover the model's file. The model routes answer 404 for it.",
+          "enum": [
+            "not_compiled"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "DagNodeOutput": {
       "description": "One node in the enriched DAG, projected for orchestrators.\n\nCross-references the engine's internal `UnifiedNode` with model configs, seeds, and pipeline configs to attach the metadata that orchestrators need (target, strategy, freshness, partition shape).",
       "properties": {
+        "compile": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DagNodeCompile"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Whether `rocky serve`'s compile covers this transformation model, and how it judged it (#2011).\n\nOnly `GET /api/v1/dag` sets it, and only on `transformation` nodes. The route builds those nodes from the same compile that `GET /api/v1/models` and `GET /api/v1/models/{name}` read, so a node is `compiled` or `refused` exactly when the model routes can serve it. A `not_compiled` node is a model file that compile did not cover (another pipeline's root, or a file written since): the model routes answer 404 for it. `rocky dag` has no server compile and leaves this out."
+        },
         "depends_on": {
           "description": "Upstream node IDs (derived from DAG edges).",
           "items": {

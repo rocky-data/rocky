@@ -99,7 +99,7 @@ use crate::commands::{
     policy_show_remote_backend, policy_show_unconsulted_ledger, read_policy_show_ledger,
 };
 use crate::commands::{
-    ScheduleStatusError, column_lineage_output, compile_output, dag_output, history_runs_output,
+    ScheduleStatusError, column_lineage_output, compile_output, history_runs_output,
     lineage_output, metrics_output, model_history_output, schedule_status_output, schemas_hash,
 };
 use crate::output::{
@@ -1303,9 +1303,14 @@ async fn trigger_compile(State(state): State<Arc<ServerState>>) -> impl IntoResp
 
 /// `GET /api/v1/dag` — canonical [`DagOutput`].
 ///
-/// Builds the unified DAG from disk through the same `dag_output` core the
-/// CLI's `rocky dag --output json` calls (no column lineage). Requires a
-/// resolved config; `engine_not_ready` when none was bound.
+/// Builds the unified DAG through the same `dag_output` core the CLI's
+/// `rocky dag --output json` calls (no column lineage). Requires a resolved
+/// config; `engine_not_ready` when none was bound.
+///
+/// One difference, and it is the point (#2011): each transformation node is
+/// built from the server's compile, the one `GET /api/v1/models` reads, and
+/// carries `compile` (`compiled`, `refused` or `not_compiled`). A client can
+/// then tell a node the model routes serve from one they answer 404 for.
 async fn full_dag(
     State(state): State<Arc<ServerState>>,
 ) -> Result<PrettyJson<DagOutput>, ApiError> {
@@ -1322,9 +1327,18 @@ async fn full_dag(
         .then(|| state.models_dir.clone());
     let contracts_dir = state.contracts_dir.clone();
     let state_path = state_path_for(&state);
+    // ONE snapshot with `GET /api/v1/models` and `/models/{name}` (#2011): the
+    // transformation nodes come from the compile those routes read. No
+    // compile result (none yet, or a failed one) covers no model, so every
+    // model node is `not_compiled`, and the model routes answer
+    // `engine_not_ready` for all of them.
+    let compiled = match state.compile_result.read().await.as_ref() {
+        Some(result) => crate::commands::CompiledModels::from_compile(result),
+        None => crate::commands::CompiledModels::default(),
+    };
 
     let output = store_read(&state, move || {
-        dag_output(
+        crate::commands::dag_output_with_compile(
             &config_path,
             &state_path,
             models_dir.as_deref(),
@@ -1332,6 +1346,7 @@ async fn full_dag(
             contracts_dir.as_deref(),
             false, // include_column_lineage
             None,  // cache_ttl_override
+            Some(&compiled),
         )
     })
     .await?
@@ -3058,6 +3073,7 @@ async fn get_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::dag_output;
     use std::io::Write;
     use std::path::PathBuf;
 
@@ -3235,6 +3251,17 @@ mod tests {
     /// `crate::output::print_json` emits by default (pretty + trailing `\n`).
     fn reference_bytes<T: Serialize>(output: &T) -> String {
         serde_json::to_string_pretty(output).unwrap() + "\n"
+    }
+
+    /// A `DagOutput` body without the `compile` field that only
+    /// `GET /api/v1/dag` sets (#2011). `rocky dag` has no server compile, so
+    /// that field is the one difference the parity tests allow.
+    fn without_compile_status(body: &str) -> serde_json::Value {
+        let mut value: serde_json::Value = serde_json::from_str(body).unwrap();
+        for node in value["nodes"].as_array_mut().unwrap() {
+            node.as_object_mut().unwrap().remove("compile");
+        }
+        value
     }
 
     /// The state path a test should pin, computed **directly**.
@@ -5620,7 +5647,93 @@ mod tests {
             )
             .unwrap(),
         );
-        assert_eq!(api, reference, "GET /dag must match `rocky dag`");
+        assert_eq!(
+            without_compile_status(&api),
+            without_compile_status(&reference),
+            "GET /dag must match `rocky dag`, apart from the serve-only `compile` field"
+        );
+    }
+
+    /// #2011 and #1630: `GET /api/v1/dag` answers from the compile the model
+    /// routes read. A second pipeline's model (`reporting/**`, which the
+    /// server's compile of `models/` does not cover) is `not_compiled`, and
+    /// the model route 404s for it. An E038 model is `refused`. A file written
+    /// after the compile is `not_compiled` too, and a sidecar edited after the
+    /// compile does not change its node: one snapshot, not one per route.
+    #[tokio::test]
+    async fn dag_nodes_carry_the_model_routes_compile() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        let reporting = dir.path().join("reporting");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::create_dir_all(&reporting).unwrap();
+        let write = |root: &std::path::Path, name: &str, extra: &str, table: &str| {
+            std::fs::write(root.join(format!("{name}.sql")), "SELECT 1 AS id").unwrap();
+            std::fs::write(
+                root.join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\n{extra}\n\
+                     [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{table}\"\n"
+                ),
+            )
+            .unwrap();
+        };
+        write(&models, "stg", "", "stg");
+        write(&models, "eph", "[strategy]\ntype = \"ephemeral\"\n", "eph");
+        write(&reporting, "rpt", "", "rpt");
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"test.duckdb\"\n\n\
+             [pipeline.silver]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.silver.target]\nadapter = \"default\"\n\n\
+             [pipeline.reporting]\ntype = \"transformation\"\nmodels = \"reporting/**\"\n\n\
+             [pipeline.reporting.target]\nadapter = \"default\"\n",
+        )
+        .unwrap();
+        let state_path = pinned_state_path(&models);
+        let state = pinned_server(models.clone(), Some(config_path), &state_path);
+        // The constructor spawns its own initial compile. Compiles serialise
+        // on one gate, so after two of ours that one has finished too, and
+        // no compile runs after the files below are written.
+        state.recompile().await;
+        state.recompile().await;
+
+        // After the compile: a new model file, and a sidecar edit.
+        write(&models, "late", "", "late");
+        write(&models, "stg", "", "stg_edited_after_compile");
+
+        let base = spawn_router(state).await;
+        let resp = reqwest::get(format!("{base}/api/v1/dag")).await.unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        assert_eq!(status, 200, "{body}");
+        let dag: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let node = |label: &str| {
+            dag["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["label"] == label)
+                .unwrap_or_else(|| panic!("node {label} in {dag}"))
+                .clone()
+        };
+        assert_eq!(node("stg")["compile"], "compiled");
+        assert_eq!(node("eph")["compile"], "refused");
+        assert_eq!(node("rpt")["compile"], "not_compiled");
+        assert_eq!(node("late")["compile"], "not_compiled");
+        assert_eq!(
+            node("stg")["target"]["table"],
+            "stg",
+            "a compiled node comes from the compile, not from the edited file"
+        );
+
+        for (name, status) in [("stg", 200), ("eph", 200), ("rpt", 404), ("late", 404)] {
+            let resp = reqwest::get(format!("{base}/api/v1/models/{name}"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), status, "GET /api/v1/models/{name}");
+        }
     }
 
     /// A project whose transformation pipeline declares a **custom** model root,
@@ -5710,7 +5823,11 @@ mod tests {
         let reference = reference_bytes(
             &dag_output(&config_path, &state_path, None, None, None, false, None).unwrap(),
         );
-        assert_eq!(api, reference, "GET /dag must match `rocky dag`");
+        assert_eq!(
+            without_compile_status(&api),
+            without_compile_status(&reference),
+            "GET /dag must match `rocky dag`, apart from the serve-only `compile` field"
+        );
 
         // A single custom root is still a root the compiler can read, so
         // `--column-lineage` must keep working here. Asserting on the EDGES,

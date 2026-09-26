@@ -27,6 +27,30 @@ class DagEdgeOutput(BaseModel):
     """
 
 
+class DagNodeCompile1(StrEnum):
+    """
+    The compile covers the model and has no error for it.
+    """
+
+    compiled = "compiled"
+
+
+class DagNodeCompile2(StrEnum):
+    """
+    The compile covers the model and refuses it with an error diagnostic (E038, for example). The model routes still serve it; no run builds it.
+    """
+
+    refused = "refused"
+
+
+class DagNodeCompile3(StrEnum):
+    """
+    The compile does not cover the model's file. The model routes answer 404 for it.
+    """
+
+    not_compiled = "not_compiled"
+
+
 class DagSummaryOutput(BaseModel):
     """
     Summary counts for the DAG.
@@ -319,6 +343,12 @@ class DagNodeOutput(BaseModel):
     Cross-references the engine's internal `UnifiedNode` with model configs, seeds, and pipeline configs to attach the metadata that orchestrators need (target, strategy, freshness, partition shape).
     """
 
+    compile: DagNodeCompile1 | DagNodeCompile2 | DagNodeCompile3 | None = None
+    """
+    Whether `rocky serve`'s compile covers this transformation model, and how it judged it (#2011).
+
+    Only `GET /api/v1/dag` sets it, and only on `transformation` nodes. The route builds those nodes from the same compile that `GET /api/v1/models` and `GET /api/v1/models/{name}` read, so a node is `compiled` or `refused` exactly when the model routes can serve it. A `not_compiled` node is a model file that compile did not cover (another pipeline's root, or a file written since): the model routes answer 404 for it. `rocky dag` has no server compile and leaves this out.
+    """
     depends_on: list[str] | None = None
     """
     Upstream node IDs (derived from DAG edges).

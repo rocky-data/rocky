@@ -127,7 +127,7 @@ pub use compile::{compile_output, run_compile};
 pub use completions::run_completions;
 pub use compliance::{compute_compliance, run_compliance};
 pub use cost::{CostGroupBy, compute_cost, run_cost};
-pub use dag::{dag_output, run_dag};
+pub use dag::{CompiledModels, dag_output, dag_output_with_compile, run_dag};
 pub use discover::discover;
 pub use docs::run_docs;
 pub use doctor::doctor;

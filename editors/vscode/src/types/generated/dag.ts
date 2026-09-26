@@ -6,6 +6,10 @@
  */
 
 /**
+ * How `rocky serve`'s compile judged one DAG node's model. See [`DagNodeOutput::compile`].
+ */
+export type DagNodeCompile = "compiled" | "refused" | "not_compiled";
+/**
  * Severity of a test failure.
  */
 export type TestSeverity = "error" | "warning";
@@ -199,6 +203,12 @@ export interface DagEdgeOutput {
  * Cross-references the engine's internal `UnifiedNode` with model configs, seeds, and pipeline configs to attach the metadata that orchestrators need (target, strategy, freshness, partition shape).
  */
 export interface DagNodeOutput {
+  /**
+   * Whether `rocky serve`'s compile covers this transformation model, and how it judged it (#2011).
+   *
+   * Only `GET /api/v1/dag` sets it, and only on `transformation` nodes. The route builds those nodes from the same compile that `GET /api/v1/models` and `GET /api/v1/models/{name}` read, so a node is `compiled` or `refused` exactly when the model routes can serve it. A `not_compiled` node is a model file that compile did not cover (another pipeline's root, or a file written since): the model routes answer 404 for it. `rocky dag` has no server compile and leaves this out.
+   */
+  compile?: DagNodeCompile | null;
   /**
    * Upstream node IDs (derived from DAG edges).
    */
