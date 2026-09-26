@@ -4,6 +4,10 @@
     "ChecksConfigOutput": {
       "description": "Pipeline-level checks configuration projected into the discover output.\n\nThis is intentionally a thin projection of `rocky_core::config::ChecksConfig` — only the fields downstream orchestrators currently consume are exposed. Add fields as new integrations need them.",
       "properties": {
+        "column_match": {
+          "description": "Whether the run emits the default `column_match` check (`column_match = true`). Same contract as `row_count`.",
+          "type": "boolean"
+        },
         "configured_checks": {
           "additionalProperties": {
             "items": {
@@ -23,8 +27,16 @@
               "type": "null"
             }
           ]
+        },
+        "row_count": {
+          "description": "Whether the run emits the default `row_count` check (`row_count = true` under `[pipeline.<name>.checks]`). A consumer declares the `row_count` check only when this is `true`: a declared check Rocky never produces fails a Dagster Pipes step (#2160).",
+          "type": "boolean"
         }
       },
+      "required": [
+        "column_match",
+        "row_count"
+      ],
       "type": "object"
     },
     "CollisionCandidateOutput": {
@@ -227,7 +239,7 @@
           "type": "null"
         }
       ],
-      "description": "Pipeline-level data quality check configuration. Present when the pipeline declares a `[checks]` block in `rocky.toml`. Downstream orchestrators (e.g. Dagster) consume this to attach asset-level freshness policies and check expectations without re-reading `rocky.toml` themselves."
+      "description": "Pipeline-level data quality check configuration. Always present since #2160, so a consumer can tell \"this check is off\" (a `false` toggle) from \"this binary predates the toggle\" (no `checks`). Downstream orchestrators (e.g. Dagster) consume this to attach asset-level freshness policies and check expectations without re-reading `rocky.toml` themselves."
     },
     "collision_candidates": {
       "description": "Groups of ≥2 discovered sources sharing the SAME external object id but resolving to DIFFERENT target paths — the same underlying object onboarded twice. Populated only when discovery's `on_collision` is `warn`/`error` and the adapter supplies `external_object_id`; empty (and omitted from the wire format) otherwise.",

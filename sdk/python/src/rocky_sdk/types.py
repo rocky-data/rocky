@@ -80,6 +80,12 @@ class ChecksConfig(BaseModel):
     the fields downstream orchestrators currently consume.
     """
 
+    #: Whether the run emits the default ``row_count`` check. ``None`` means
+    #: the engine predates the toggle (#2160) — not that the check is off.
+    row_count: bool | None = None
+    #: Whether the run emits the default ``column_match`` check. ``None``
+    #: means the engine predates the toggle (#2160).
+    column_match: bool | None = None
     freshness: FreshnessConfig | None = None
     #: Resolved per-model check names the pipeline emits as ``CheckResult.name``
     #: at run time, keyed by unqualified table/model name. Only the non-default

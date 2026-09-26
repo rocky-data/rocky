@@ -15,5 +15,9 @@
         }
       ]
     }
-  ]
+  ],
+  "checks": {
+    "row_count": false,
+    "column_match": false
+  }
 }

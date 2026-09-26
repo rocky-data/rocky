@@ -268,3 +268,23 @@ attributes:
   config_path: rocky.toml
   execution_mode: pipes
 ```
+
+### Every declared check gets a result
+
+A Pipes step fails when a declared check gets no result. Dagster raises
+`DagsterInvariantViolationError` and names the missing check. The component
+therefore closes each Pipes run with a pass over the declared checks:
+
+| What Rocky reported for the table | Check with no result from Rocky | Status metadata |
+|---|---|---|
+| A materialization | fails (WARN) | `not produced by rocky` |
+| No materialization | fails (WARN) | `not evaluated: rocky reported no materialization ...` |
+| A group check carried by a sibling | fails (WARN) | `not evaluated on this asset: ...` |
+
+None of these rows passes. Dagster still adds its own empty materialization
+for a table Rocky did not report. The component does not count that as a copy.
+
+The component declares `row_count` and `column_match` only when the pipeline
+turns them on. It reads that from the cached `rocky discover` state. An engine
+older than this change does not send the setting, so the component declares
+both, as before. Refresh the component state after you change `[checks]`.

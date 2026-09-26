@@ -114,11 +114,19 @@ class ChecksConfigOutput(BaseModel):
     This is intentionally a thin projection of `rocky_core::config::ChecksConfig` — only the fields downstream orchestrators currently consume are exposed. Add fields as new integrations need them.
     """
 
+    column_match: bool
+    """
+    Whether the run emits the default `column_match` check (`column_match = true`). Same contract as `row_count`.
+    """
     configured_checks: dict[str, list[ResolvedCheckNameOutput]] | None = None
     """
     Resolved per-model check names the pipeline will emit as `CheckResult.name` at run time, keyed by unqualified table/model name. Only the NON-default checks are listed — the four defaults (row_count/column_match/freshness/anomaly) are well-known and pre-declared by consumers. A consumer (e.g. Dagster) declares an asset-check spec per name so the spec name byte-matches the emitted result. Empty (and omitted) when no non-default checks are configured.
     """
     freshness: FreshnessConfigOutput | None = None
+    row_count: bool
+    """
+    Whether the run emits the default `row_count` check (`row_count = true` under `[pipeline.<name>.checks]`). A consumer declares the `row_count` check only when this is `true`: a declared check Rocky never produces fails a Dagster Pipes step (#2160).
+    """
 
 
 class SourceOutput(BaseModel):
@@ -151,7 +159,7 @@ class DiscoverOutput(BaseModel):
 
     checks: ChecksConfigOutput | None = None
     """
-    Pipeline-level data quality check configuration. Present when the pipeline declares a `[checks]` block in `rocky.toml`. Downstream orchestrators (e.g. Dagster) consume this to attach asset-level freshness policies and check expectations without re-reading `rocky.toml` themselves.
+    Pipeline-level data quality check configuration. Always present since #2160, so a consumer can tell "this check is off" (a `false` toggle) from "this binary predates the toggle" (no `checks`). Downstream orchestrators (e.g. Dagster) consume this to attach asset-level freshness policies and check expectations without re-reading `rocky.toml` themselves.
     """
     collision_candidates: list[CollisionCandidateOutput] | None = None
     """

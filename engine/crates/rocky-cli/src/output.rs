@@ -75,8 +75,9 @@ pub struct DiscoverOutput {
     pub version: String,
     pub command: String,
     pub sources: Vec<SourceOutput>,
-    /// Pipeline-level data quality check configuration. Present when the
-    /// pipeline declares a `[checks]` block in `rocky.toml`. Downstream
+    /// Pipeline-level data quality check configuration. Always present
+    /// since #2160, so a consumer can tell "this check is off" (a `false`
+    /// toggle) from "this binary predates the toggle" (no `checks`). Downstream
     /// orchestrators (e.g. Dagster) consume this to attach asset-level
     /// freshness policies and check expectations without re-reading
     /// `rocky.toml` themselves.
@@ -138,6 +139,14 @@ pub struct CollisionCandidateOutput {
 /// Add fields as new integrations need them.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ChecksConfigOutput {
+    /// Whether the run emits the default `row_count` check
+    /// (`row_count = true` under `[pipeline.<name>.checks]`). A consumer
+    /// declares the `row_count` check only when this is `true`: a declared
+    /// check Rocky never produces fails a Dagster Pipes step (#2160).
+    pub row_count: bool,
+    /// Whether the run emits the default `column_match` check
+    /// (`column_match = true`). Same contract as `row_count`.
+    pub column_match: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub freshness: Option<FreshnessConfigOutput>,
     /// Resolved per-model check names the pipeline will emit as
@@ -4800,7 +4809,9 @@ impl ChecksConfigOutput {
     /// only for kinds the runner will execute, so discover never advertises a
     /// check that won't produce a result. `sources` supplies the
     /// `(source_type, table)` pairs the projection (and the cross-source
-    /// overlap grouping) needs. Returns `None` when nothing is surfaced.
+    /// overlap grouping) needs. Always `Some` since #2160: the `row_count` /
+    /// `column_match` toggles must reach the consumer even when they are
+    /// both `false`, because an absent projection reads as an older binary.
     pub fn from_engine(
         cfg: &rocky_core::config::ChecksConfig,
         executed_kinds: &[rocky_core::checks::CheckKind],
@@ -4880,10 +4891,10 @@ impl ChecksConfigOutput {
             }
         }
 
-        if freshness.is_none() && configured_checks.is_empty() {
-            return None;
-        }
         Some(ChecksConfigOutput {
+            row_count: executed_kinds.contains(&CheckKind::RowCount) && cfg.row_count.enabled(),
+            column_match: executed_kinds.contains(&CheckKind::ColumnMatch)
+                && cfg.column_match.enabled(),
             freshness,
             configured_checks,
         })
@@ -4982,6 +4993,47 @@ column = "id"
             !names.iter().any(|n| n.starts_with("cross_source_overlap")),
             "cross_source_overlap must be gated out: {names:?}"
         );
+    }
+
+    /// #2160: the default-check toggles reach the consumer, including when
+    /// they are both off and nothing else is configured. The projection
+    /// used to be `None` then, which a consumer cannot tell from an older
+    /// binary, so Dagster declared `row_count` / `column_match` on every
+    /// asset and a Pipes step failed on the check Rocky never produced.
+    #[test]
+    fn projects_default_check_toggles_even_when_nothing_else_is_configured() {
+        let sources = vec![source("duckdb", "orders")];
+        let replication = rocky_core::config::ReplicationPipelineConfig::EXECUTED_CHECK_KINDS;
+
+        let off: rocky_core::config::ChecksConfig = toml::from_str("").unwrap();
+        let out = ChecksConfigOutput::from_engine(&off, replication, &sources)
+            .expect("projection present even with every check off");
+        assert!(!out.row_count);
+        assert!(!out.column_match);
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(
+            json["row_count"], false,
+            "an off toggle is serialized: {json}"
+        );
+        assert_eq!(
+            json["column_match"], false,
+            "an off toggle is serialized: {json}"
+        );
+
+        let mixed: rocky_core::config::ChecksConfig = toml::from_str(
+            "row_count = true\ncolumn_match = { enabled = false, severity = \"warning\" }",
+        )
+        .unwrap();
+        let out = ChecksConfigOutput::from_engine(&mixed, replication, &sources).unwrap();
+        assert!(out.row_count);
+        assert!(!out.column_match);
+
+        // A pipeline type that never runs `column_match` does not advertise it.
+        let on: rocky_core::config::ChecksConfig =
+            toml::from_str("row_count = true\ncolumn_match = true").unwrap();
+        let out = ChecksConfigOutput::from_engine(&on, &[CheckKind::RowCount], &sources).unwrap();
+        assert!(out.row_count);
+        assert!(!out.column_match);
     }
 }
 

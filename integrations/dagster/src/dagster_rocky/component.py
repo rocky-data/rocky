@@ -98,6 +98,7 @@ from .resource import DEFAULT_TIMEOUT_SECONDS, Resolver, RockyResource
 from .sensor import rocky_source_sensor
 from .translator import RockyDagsterTranslator, strip_tenant_component
 from .types import (
+    ChecksConfig,
     CompileResult,
     ContainedModel,
     DagResult,
@@ -208,6 +209,11 @@ EMPTY_FOR_PARTITION_METADATA_KEY: str = "rocky/empty_for_partition"
 #: :func:`~.freshness.freshness_is_configured` is ``True``. Declaring it
 #: unconditionally made :func:`_emit_placeholder_checks` report a check that
 #: never ran as ``passed=True`` on every materialized table (#1645).
+#:
+#: ``row_count`` and ``column_match`` are conditional too, on the
+#: ``row_count`` / ``column_match`` toggles the discover projection carries
+#: since #2160 — see :func:`_default_check_is_emitted`. Over Dagster Pipes a
+#: declared check Rocky never produces fails the whole step.
 DEFAULT_CHECK_NAMES: tuple[str, ...] = (
     "row_count",
     "column_match",
@@ -239,6 +245,24 @@ DEFAULT_CHECK_NAMES: tuple[str, ...] = (
 #: nothing (see ``_emit_governance_events``), so silence here means a scan
 #: that ran and found no exception.
 PASS_BY_ABSENCE_CHECK_NAMES: frozenset[str] = frozenset({COMPLIANCE_CHECK_NAME})
+
+
+def _default_check_is_emitted(checks: ChecksConfig | None, check_name: str) -> bool:
+    """Whether the engine emits the default ``row_count`` / ``column_match``
+    check, per the ``rocky discover`` projection (#2160).
+
+    ``True`` when the projection does not say: no ``checks`` at all, or a
+    ``None`` toggle, is an engine older than the toggle, which emitted the
+    check whenever the pipeline enabled it. Declaring it keeps that behaviour;
+    the placeholder pass still gives it a non-green verdict when it does not
+    arrive. Reads the CACHED discover state, with the same staleness caveat as
+    :func:`~.freshness.freshness_is_configured`: refresh the state after
+    changing ``[checks]``.
+    """
+    if checks is None:
+        return True
+    toggle = {"row_count": checks.row_count, "column_match": checks.column_match}[check_name]
+    return True if toggle is None else toggle
 
 
 @dataclass(frozen=True)
@@ -1553,6 +1577,8 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
             groups,
             contract_rules_by_model,
             declare_freshness=freshness_is_configured(discover.checks),
+            declare_row_count=_default_check_is_emitted(discover.checks, "row_count"),
+            declare_column_match=_default_check_is_emitted(discover.checks, "column_match"),
             surface_compliance=self.surface_compliance,
             configured_checks_by_model=configured_checks_by_model,
             group_check_names=group_check_names,
@@ -2344,6 +2370,8 @@ def _build_check_specs(
     contract_rules_by_model: dict[str, ContractRules] | None = None,
     *,
     declare_freshness: bool,
+    declare_row_count: bool = True,
+    declare_column_match: bool = True,
     surface_compliance: bool = False,
     configured_checks_by_model: dict[str, list[str]] | None = None,
     group_check_names: set[str] | None = None,
@@ -2361,9 +2389,10 @@ def _build_check_specs(
     :func:`~.freshness.freshness_is_configured` of the discover projection.
     Declared-but-never-produced made :func:`_emit_placeholder_checks` report
     ``passed=True`` on every materialized table (#1645). The other two
-    switchable defaults (``row_count`` / ``column_match``) cannot be gated the
-    same way yet: ``ChecksConfigOutput`` exposes no toggle for them, so Dagster
-    has no way to know they were switched off.
+    switchable defaults are gated by ``declare_row_count`` /
+    ``declare_column_match`` — pass :func:`_default_check_is_emitted` of the
+    same projection (#2160). They default to ``True``, the behaviour before
+    the engine projected the toggles.
 
     When ``contract_rules_by_model`` is provided, additionally emits one
     AssetCheckSpec per declared contract rule kind for assets whose
@@ -2447,9 +2476,14 @@ def _build_check_specs(
                 source_types_by_key[dagster_key].add(native_key[0])
 
         for spec in group.specs:
-            # Default checks (4 per asset, 3 without a freshness config)
+            # Default checks (up to 4 per asset; each switchable one only
+            # when the pipeline turns it on)
             for check_name in DEFAULT_CHECK_NAMES:
                 if check_name == FRESHNESS_CHECK_NAME and not declare_freshness:
+                    continue
+                if check_name == "row_count" and not declare_row_count:
+                    continue
+                if check_name == "column_match" and not declare_column_match:
                     continue
                 _add(
                     dg.AssetCheckSpec(
@@ -2866,19 +2900,42 @@ def _make_rocky_asset(
         }
 
         if execution_mode == "pipes":
-            yield from _run_filters_pipes(
+            reported_materialized_keys: set[dg.AssetKey] = set()
+            pipes_yielded_checks: set[tuple[dg.AssetKey, str]] = set()
+            for event in _run_filters_pipes(
                 context=context,
                 rocky=rocky,
                 filters=filters,
                 group=group,
                 selected_keys=selected_keys,
                 declared_check_pairs=declared_check_pairs,
-            )
-            # In pipes mode, the placeholder pass inside ``_emit_results``
-            # doesn't run — but we still need to yield the collected
-            # governance events so the surfaces are wired in both modes.
+                reported_materialized_keys=reported_materialized_keys,
+            ):
+                if (
+                    isinstance(event, dg.AssetCheckResult)
+                    and event.asset_key is not None
+                    and event.check_name is not None
+                ):
+                    pipes_yielded_checks.add((event.asset_key, event.check_name))
+                yield event
+            # ``_emit_results`` does not run in pipes mode, so the governance
+            # events are yielded here to wire the surfaces in both modes.
             yield from governance_events
             yield from contract_results
+            # Every declared check needs a result over Pipes: Dagster fails
+            # the whole step on one that yields nothing (#2160). Same pass as
+            # streaming, keyed on the tables Rocky EXPLICITLY reported — never
+            # Dagster's implicit materializations — so a table Rocky did not
+            # copy never gets a passing placeholder.
+            yield from _emit_placeholder_checks(
+                check_specs=check_specs,
+                selected_keys=selected_keys,
+                yielded_checks=pipes_yielded_checks | compliance_yielded | contract_yielded,
+                materialized_keys=reported_materialized_keys,
+                instance=context.instance,
+                log=context.log,
+                pipes=True,
+            )
         else:
             results, quota_breach_cooldown = _run_filters(context, rocky, filters)
 
@@ -2926,6 +2983,7 @@ def _run_filters_pipes(
     group: _GroupBuild,
     selected_keys: set[dg.AssetKey],
     declared_check_pairs: set[tuple[dg.AssetKey, str]],
+    reported_materialized_keys: set[dg.AssetKey] | None = None,
 ) -> Iterator[object]:
     """Execute ``rocky run`` for each filter over the Dagster Pipes protocol.
 
@@ -2948,6 +3006,13 @@ def _run_filters_pipes(
     made Dagster raise ``DagsterInvariantViolationError`` and FAIL THE STEP
     (#1673). They are now filtered out here and carried as an
     ``AssetObservation`` with a warning, the same as on the streaming path.
+
+    ``reported_materialized_keys``, when given, receives the key of every
+    materialization Rocky EXPLICITLY reported (#2160). Results are read with
+    ``implicit_materializations=False`` and the implicit ones Dagster would
+    add are yielded here instead, unchanged, so the caller can tell the two
+    apart: an implicit materialization is not evidence that Rocky copied the
+    table.
     """
     rocky_key_to_dagster_key = group.rocky_key_to_dagster_key
 
@@ -2995,7 +3060,19 @@ def _run_filters_pipes(
             asset_key_fn=asset_key_fn,
             include_keys=selected_keys,
         )
-        for result in invocation.get_results():
+        explicit = list(invocation.get_results(implicit_materializations=False))
+        reported_here = {r.asset_key for r in explicit if isinstance(r, dg.MaterializeResult)}
+        if reported_materialized_keys is not None:
+            reported_materialized_keys.update(k for k in reported_here if k is not None)
+        # Dagster's own implicit materializations (``PipesSession.get_results``):
+        # one bare ``MaterializeResult`` per selected key this invocation did
+        # not report. Rebuilt here so they stay out of the explicit set above.
+        implicit = [
+            dg.MaterializeResult(asset_key=key)
+            for key in context.selected_asset_keys
+            if key not in reported_here
+        ]
+        for result in [*explicit, *implicit]:
             # Drift is never a declared check spec (see DRIFT_CHECK_NAME) —
             # convert it to the same AssetObservation shape the streaming
             # path's `drift_observations` yields, before the generic
@@ -4057,6 +4134,7 @@ def _emit_placeholder_checks(
     contained_by_key: Mapping[dg.AssetKey, ContainedModel] = MappingProxyType({}),
     instance: dg.DagsterInstance | None = None,
     log: logging.Logger | dg.DagsterLogManager | None = None,
+    pipes: bool = False,
 ) -> Iterator[dg.AssetCheckResult]:
     """Emit placeholders for declared checks Rocky did not produce.
 
@@ -4091,6 +4169,12 @@ def _emit_placeholder_checks(
     evaluation" the original exclusion existed to avoid, only amber instead
     of green.
 
+    With ``pipes=True`` (the Pipes path, #2160) such a member gets a
+    ``passed=False`` WARN result naming the carrier instead. A Pipes step
+    runs with a typed event stream, and there Dagster fails the whole step
+    on any declared check that yields nothing — so "no result" is not an
+    option on that path.
+
     Yielding nothing is Dagster's own way to say "planned, did not run".
     Dagster writes an ``ASSET_CHECK_EVALUATION_PLANNED`` record for every
     declared check in the step; a check with no evaluation keeps status
@@ -4114,6 +4198,13 @@ def _emit_placeholder_checks(
     cause, mirroring the pruned-table special-case above. Still ``passed=False``
     / WARN — the model was not built and the check did not run; the hard error
     lives on the root-cause asset in ``errors``.
+
+    ``pipes=True`` also changes the "not materialized" reason. Over Pipes,
+    ``materialized_keys`` holds only the tables Rocky explicitly reported. A
+    table it did not report was not copied in this run (skipped as unchanged,
+    for example), and the integration cannot tell why. It is never reported as
+    passing: a copy that failed exits non-zero, which fails the step before
+    this pass runs, but the verdict does not rely on that.
     """
     # Which asset carried each check's verdict this run — the sibling the
     # engine reported a group check on. Built once, not scanned per spec.
@@ -4138,6 +4229,19 @@ def _emit_placeholder_checks(
                 if carriers
                 else "it was not evaluated in this run"
             )
+            if pipes:
+                yield dg.AssetCheckResult(
+                    asset_key=cs.asset_key,
+                    check_name=cs.name,
+                    passed=False,
+                    severity=dg.AssetCheckSeverity.WARN,
+                    metadata={
+                        "status": dg.MetadataValue.text(
+                            f"not evaluated on this asset: {where} (group check)"
+                        )
+                    },
+                )
+                continue
             (log or _log).info(
                 f"Group check {cs.name!r} has no verdict for "
                 f"{cs.asset_key.to_user_string()!r}: {where}. Rocky evaluates "
@@ -4210,7 +4314,12 @@ def _emit_placeholder_checks(
 
         materialized = cs.asset_key in materialized_keys
         if not materialized:
-            reason = "table not materialized"
+            reason = (
+                "not evaluated: rocky reported no materialization for this "
+                "table over Pipes in this run"
+                if pipes
+                else "table not materialized"
+            )
             severity = dg.AssetCheckSeverity.WARN
             passed = False
         elif cs.name in PASS_BY_ABSENCE_CHECK_NAMES:
