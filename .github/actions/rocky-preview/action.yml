@@ -1,8 +1,10 @@
 name: 'Rocky Preview'
 description: >-
-  Run rocky preview create + diff + cost against a pull request and post a
-  single Markdown comment summarising the prune set, structural diff, and
-  cost delta. Idempotent across pushes via comment upsert.
+  Run rocky preview create, rocky run --branch, then preview diff + cost
+  against a pull request and post a single Markdown comment summarising the
+  prune set, structural diff, and cost delta. Idempotent across pushes via
+  comment upsert. The diff and cost pair the branch run with a base run
+  recorded in the same state store, so the base must already have run there.
 
 inputs:
   base_ref:
@@ -70,9 +72,8 @@ outputs:
   delta_usd:
     description: >-
       Total branch-vs-base USD cost delta. Empty string when no paired runs
-      exist in the state store yet (e.g. before Phase 1.5 lands actual
-      branch-run execution, or on first preview against an unpopulated
-      base).
+      exist in the state store (e.g. the `rocky run --branch` stage failed,
+      or no base run is recorded in this state store yet).
     value: ${{ steps.run-preview.outputs.delta_usd }}
 
 runs:
@@ -118,12 +119,16 @@ runs:
         irm https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.ps1 | iex
         Add-Content -Path $env:GITHUB_PATH -Value "$env:LOCALAPPDATA\rocky\bin"
 
-    # --- Step 2: run the three preview commands -----------------------------
+    # --- Step 2: create the branch, run it, then diff and cost it ------------
     #
     # Each subcommand runs with `set +e` so a non-zero exit doesn't abort
     # the script — the action always wants to post something to the PR even
     # if one stage failed. Failures are collected into `_err` files that the
     # comment-rendering step reads to compose a failure section.
+    #
+    # `preview diff` and `preview cost` pair the run recorded under
+    # `--branch <name>` with a base run. `preview create` records no run, so
+    # the `rocky run --branch` stage is what gives them a branch side (#2162).
     #
     # The `markdown` field lives inside the JSON output for diff and cost
     # (no `--output markdown` flag exists). Create has no markdown field, so
@@ -177,6 +182,25 @@ runs:
         # failed before emitting JSON.
         if [ -z "$BRANCH_NAME" ] && [ -s "$WORK/create.json" ]; then
           BRANCH_NAME="$(jq -r '.branch_name // ""' "$WORK/create.json" 2>/dev/null || true)"
+        fi
+
+        # ---- run the branch ----
+        # Records the run under `--branch <name>` in the state store, the run
+        # `preview diff` and `preview cost` pair against the base run. It
+        # writes only the `branch__<name>` schema. It needs the branch that
+        # `preview create` registers, so it runs only after a create that
+        # succeeded.
+        : > "$WORK/run.out"
+        : > "$WORK/run.err"
+        if [ -n "$BRANCH_NAME" ] && [ ! -s "$WORK/create_failed" ]; then
+          if rocky run --branch "$BRANCH_NAME" > "$WORK/run.out" 2> "$WORK/run.err"; then
+            : > "$WORK/run_failed"
+          else
+            echo failed > "$WORK/run_failed"
+          fi
+        else
+          echo failed > "$WORK/run_failed"
+          echo "skipped: preview create did not register the branch" > "$WORK/run.err"
         fi
 
         # ---- preview diff ----
@@ -278,6 +302,19 @@ runs:
           if grep -q 'unknown revision\|bad revision\|not found' "$WORK_DIR/create.err" 2>/dev/null; then
             printf "> :information_source: Couldn't compute base — was the base branch fetched? Set \`fetch-depth: 0\` on \`actions/checkout\`.\n\n" >> "$BODY"
           fi
+        fi
+
+        # ---- branch run section ----
+        # Only a failure is shown; a branch run that succeeded speaks through
+        # the diff and cost sections below.
+        if [ -s "$WORK_DIR/run_failed" ]; then
+          printf -- '---\n\n### :x: `rocky run --branch %s` failed\n\n```\n' "${BRANCH_NAME:-?}" >> "$BODY"
+          if [ -s "$WORK_DIR/run.err" ]; then
+            head -c 8192 "$WORK_DIR/run.err" >> "$BODY"
+          else
+            printf '(no stderr captured)' >> "$BODY"
+          fi
+          printf '\n```\n\n' >> "$BODY"
         fi
 
         # ---- diff section ----
@@ -385,7 +422,7 @@ runs:
       run: |
         set -e
         FAILED=0
-        for f in create_failed diff_failed cost_failed; do
+        for f in create_failed run_failed diff_failed cost_failed; do
           if [ -s "$WORK_DIR/$f" ]; then
             echo "::error::rocky preview ${f%_failed} failed"
             FAILED=1

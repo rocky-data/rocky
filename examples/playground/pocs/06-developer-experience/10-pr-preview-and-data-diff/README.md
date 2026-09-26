@@ -3,7 +3,7 @@
 > **Category:** 06-developer-experience
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 30s
-> **Rocky features:** `rocky preview create`, `rocky preview diff`, `rocky preview cost`
+> **Rocky features:** `rocky preview create`, `rocky run --branch`, `rocky preview diff`, `rocky preview cost`
 
 ## What it shows
 
@@ -49,16 +49,20 @@ without committing it (POCs don't create commits). So in a local run:
 - With an empty prune set, `preview create` copies **all 5** models from
   the base schema via CTAS (`copy_strategy: "ctas"`) and re-runs none;
   `run_status` is `"planned"` with an empty `run_id`.
-- Because no model was re-run on the branch, there is no branch run in
-  the state store, so `preview diff` reports `models: []` (*"No paired
-  runs in the state store"*) and `preview cost` reports an empty
-  `branch_run_id` (*"No branch run yet"*).
+- `run.sh` then runs `rocky run --branch pr_preview_poc_10`, the same
+  step the composite GitHub Action runs after `preview create` (#2162).
+  It runs all 5 models, with the edited `fct_revenue`, into the branch
+  schema and records the branch run.
+- `preview diff` pairs that branch run with the base run from step 3 and
+  diffs every model the branch run executed.
+  `preview cost` reports the branch run's `branch_run_id` and a delta
+  versus the base run. `run.sh` fails if either finds no branch run.
 
 The local run therefore exercises the **CLI surface, branch
-registration, CTAS copy-from-base, and all three output schemas** — but
-the non-empty prune set, the row-level data diff, and the cost delta
-only light up when the change is a committed diff, which is how the
-composite GitHub Action drives `preview` in CI.
+registration, CTAS copy-from-base, the paired branch-vs-base diff and
+cost, and all output schemas**. Only the non-empty prune set needs a
+committed diff, which is how the composite GitHub Action drives
+`preview` in CI.
 
 ## Why it's distinctive
 

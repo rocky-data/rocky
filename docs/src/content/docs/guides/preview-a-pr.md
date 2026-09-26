@@ -223,7 +223,9 @@ A clean sample with `coverage_warning: true` is **not** evidence the PR is a no-
 
 ## Posting to a PR
 
-`rocky preview` ships a composite GitHub Action. It runs all three commands on every push to a pull request, and upserts a single Markdown comment carrying the prune/copy/skip plan, the structural diff, and the cost delta. The action lives at `.github/actions/rocky-preview/` in the [rocky-data repo](https://github.com/rocky-data/rocky/tree/main/.github/actions/rocky-preview). It is drop-in for any repo with a `rocky.toml` and a `models/` directory.
+`rocky preview` ships a composite GitHub Action. On every push to a pull request it runs `rocky preview create`, then `rocky run --branch <name>`, then `preview diff` and `preview cost`. It upserts a single Markdown comment carrying the prune/copy/skip plan, the structural diff, and the cost delta. The action lives at `.github/actions/rocky-preview/` in the [rocky-data repo](https://github.com/rocky-data/rocky/tree/main/.github/actions/rocky-preview). It is drop-in for any repo with a `rocky.toml` and a `models/` directory.
+
+The `rocky run --branch` step records the branch run that diff and cost compare. It runs the whole project into the branch schema, not only the prune set. Diff and cost also need a base run in the same state store. On a fresh CI runner, point `[state]` at a shared backend that your `main` runs write to. Otherwise diff and cost report that no base run is recorded.
 
 ### Setting up the GitHub Action
 
@@ -269,7 +271,7 @@ The first PR after you wire this in installs Rocky and posts a comment with the 
 | `working_directory` | `.` | Directory containing `rocky.toml`. The action `cd`s here before each subcommand. |
 | `rocky_version` | `latest` | Engine version. `latest` resolves the highest `engine-v*` tag; otherwise pass `1.74.0` or `engine-v1.74.0`. |
 | `comment_marker` | `<!-- rocky-preview -->` | Magic-string marker used for comment upsert. Override only if you run multiple preview workflows on the same PR. |
-| `fail_on_preview_error` | `false` | When `true`, fail the PR check if any `rocky preview` subcommand errors. The default keeps preview advisory: failures still post a section in the comment. |
+| `fail_on_preview_error` | `false` | When `true`, fail the PR check if any `rocky preview` subcommand or the `rocky run --branch` step errors. The default keeps preview advisory: failures still post a section in the comment. |
 | `github_token` | (required) | Token used to read the PR and upsert the comment. Pass `${{ github.token }}` from the workflow (or a PAT for cross-repo permissions). Required because composite actions cannot reference `${{ github.token }}` in input defaults. |
 
 ### Action outputs
@@ -278,13 +280,13 @@ The first PR after you wire this in installs Rocky and posts a comment with the 
 |---|---|
 | `comment_url` | HTML URL of the upserted PR comment. |
 | `prune_set_size` | Number of models in the prune set (changed + downstream-of-changed). |
-| `delta_usd` | Total branch-vs-base USD cost delta. Empty when no paired runs exist yet (e.g. first preview against an unpopulated base). |
+| `delta_usd` | Total branch-vs-base USD cost delta. Empty when no paired runs exist (for example, the `rocky run --branch` step failed, or no base run is recorded in the state store). |
 
 ### Failure modes
 
 By default the action never blocks a PR:
 
-- A `rocky preview <subcommand>` failure surfaces as an `:x:` section in the comment, with the captured stderr.
+- A `rocky preview <subcommand>` or `rocky run --branch` failure surfaces as an `:x:` section in the comment, with the captured stderr.
 - A missing or unfetched base ref produces a hint to add `fetch-depth: 0` to `actions/checkout`.
 - A PR that touches no model files renders a tight one-liner (`This PR does not change any pipeline models.`) instead of empty diff and cost tables.
 

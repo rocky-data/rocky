@@ -1,25 +1,26 @@
 #!/usr/bin/env bash
-# 10-pr-preview-and-data-diff — `rocky preview create / diff / cost` on a
-# 5-model DAG. Production path as of engine-v1.18.0. Earlier revisions of
-# this script wrapped each preview call in a stub-tolerating helper; that
-# scaffolding is gone.
+# 10-pr-preview-and-data-diff — `rocky preview create`, `rocky run
+# --branch`, then `rocky preview diff / cost` on a 5-model DAG. The same
+# order as the shipped `.github/actions/rocky-preview` action.
 #
 # Flow:
 #   1. Compile + seed DuckDB.
-#   2. Run the pipeline on the base ref (populates `poc.demo.*`).
+#   2. Run the pipeline on the base ref (populates `poc.demo.*`). This is
+#      the base run that diff and cost pair against.
 #   3. Capture HEAD as the preview's `--base`.
 #   4. Apply a synthetic (uncommitted) edit to `fct_revenue.sql`.
 #   5. `rocky preview create` registers a per-PR branch schema and copies
 #      base tables via DuckDB CTAS. NOTE: the prune set is derived from a
 #      committed `git diff <base>...HEAD`, so this working-tree edit is
-#      not seen — the prune set is empty and all 5 models are copied,
-#      none re-run. The full prune/re-run/diff path fires only on a real
-#      PR where the change is a committed diff (see README).
-#   6. `rocky preview diff` produces a structural + sampled-row diff
-#      between branch and base (empty here: no branch run to diff).
-#   7. `rocky preview cost` produces a per-model bytes/duration/USD
-#      delta versus the latest base-schema run.
-#   8. The synthetic change is reverted via `trap`, idempotent on re-run.
+#      not seen — the prune set is empty and all 5 models are copied.
+#   6. `rocky run --branch` runs the edited project into the branch
+#      schema and records the branch run (#2162). `preview create` records
+#      no run, so without this step diff and cost have nothing to pair.
+#   7. `rocky preview diff` pairs the branch run with the base run and
+#      diffs `fct_revenue`, the model the edit changed.
+#   8. `rocky preview cost` produces a per-model bytes/duration/USD
+#      delta versus the base run.
+#   9. The synthetic change is reverted via `trap`, idempotent on re-run.
 
 set -euo pipefail
 
@@ -93,42 +94,54 @@ echo "==> 6. rocky preview create --base $BASE_REF"
     --models models \
     > expected/preview_create.json
 
-echo "==> 7a. rocky preview diff --name $PREVIEW_BRANCH (sampled — default)"
+echo "==> 7. rocky run --branch $PREVIEW_BRANCH (records the branch run diff and cost pair)"
+"$ROCKY_BIN" -c rocky.toml -o json run --branch "$PREVIEW_BRANCH" \
+    > expected/run_branch.json
+
+echo "==> 8a. rocky preview diff --name $PREVIEW_BRANCH (sampled — default)"
 "$ROCKY_BIN" -c rocky.toml -o json preview diff \
     --name "$PREVIEW_BRANCH" \
     --base "$BASE_REF" \
     > expected/preview_diff.json
 
-echo "==> 7b. rocky preview diff --algorithm bisection --name $PREVIEW_BRANCH"
-# In this local run there is no branch run in the state store (empty
-# prune set → nothing re-run), so bisection has nothing to diff and the
-# tracing log records the skip. On a real PR, bisection additionally
-# requires a model declaring a single-column integer / numeric
-# `unique_key` on a `Merge` strategy; the POC's fct_revenue is
-# `full_refresh`, so the sampled diff is what applies there.
+echo "==> 8b. rocky preview diff --algorithm bisection --name $PREVIEW_BRANCH"
+# Bisection requires a model declaring a single-column integer / numeric
+# `unique_key` on a `Merge` strategy. The POC's fct_revenue is
+# `full_refresh`, so the sampled diff is what applies here.
 "$ROCKY_BIN" -c rocky.toml -o json preview diff \
     --name "$PREVIEW_BRANCH" \
     --base "$BASE_REF" \
     --algorithm bisection \
     > expected/preview_diff_bisection.json
 
-echo "==> 8. rocky preview cost --name $PREVIEW_BRANCH"
+echo "==> 9. rocky preview cost --name $PREVIEW_BRANCH"
 "$ROCKY_BIN" -c rocky.toml -o json preview cost \
     --name "$PREVIEW_BRANCH" \
     > expected/preview_cost.json
 
 # Quick non-empty sanity check; we don't pin the JSON shape here because
 # the example shapes already live in `expected/preview_*.example.json`.
-for f in expected/preview_create.json expected/preview_diff.json expected/preview_diff_bisection.json expected/preview_cost.json; do
+for f in expected/preview_create.json expected/run_branch.json expected/preview_diff.json expected/preview_diff_bisection.json expected/preview_cost.json; do
     if [[ ! -s "$f" ]]; then
         echo "FAIL: $f is empty" >&2
         exit 1
     fi
 done
 
+# The paired path: diff and cost must have found the branch run. Without
+# the `rocky run --branch` step both report no branch run.
+if ! jq -e '.models | length > 0' expected/preview_diff.json > /dev/null; then
+    echo "FAIL: preview diff paired no runs (expected/preview_diff.json)" >&2
+    exit 1
+fi
+if ! jq -e '(.branch_run_id // "") != ""' expected/preview_cost.json > /dev/null; then
+    echo "FAIL: preview cost found no branch run (expected/preview_cost.json)" >&2
+    exit 1
+fi
+
 # revert_change runs via trap.
 
 echo
-echo "POC complete: rocky preview create/diff/cost exercised end-to-end."
+echo "POC complete: preview create, run --branch, preview diff/cost paired end-to-end."
 echo "JSON output captured under expected/ (gitignored, regenerated each run)."
 echo "See the README for what a local run produces vs. a real committed-diff PR."
