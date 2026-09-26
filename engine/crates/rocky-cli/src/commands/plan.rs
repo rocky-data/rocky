@@ -32,6 +32,21 @@ use super::{filter_table_matches, matches_filter, parse_filter};
 #[error("model '{0}' not found (no transformation model with that name)")]
 pub struct ModelNotFound(pub String);
 
+/// The project has blocking compile diagnostics, so `rocky plan` refuses to
+/// persist a run plan (#2173).
+///
+/// Typed so [`plan`] can tell this refusal apart from a best-effort persist
+/// failure. Those degrade to a warning and fall through to the replication
+/// plan; this one must fail the command.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "refusing to persist a run plan: {} compile error(s) block it\n{}\n\
+     `rocky compile` reports the same errors. Fix them, then run `rocky plan` again.",
+    .0.len(),
+    .0.join("\n")
+)]
+pub struct CompileRefused(pub Vec<String>);
+
 /// Bundle of `rocky plan` execution flags persisted into `RunPlan` so
 /// `rocky apply <plan-id>` can honour them. Mirrors the flag surface of
 /// `rocky run`; `model` also scopes the SQL preview and model metadata.
@@ -508,6 +523,12 @@ pub async fn plan(
                 tracing::debug!(
                     "`models/` directory has no compiled models — building replication plan instead"
                 );
+            }
+            Err(e) if e.downcast_ref::<CompileRefused>().is_some() => {
+                // #2173: a blocking compile error fails the command. It must
+                // not fall through to the replication plan below, which would
+                // exit 0 over a project `rocky compile` refuses.
+                return Err(e);
             }
             Err(e) => {
                 if run_options.model.is_some() {
@@ -1164,6 +1185,8 @@ pub fn plan_preview_output(
 ///
 /// Returns `Ok(None)` when the compile succeeds but produces zero models —
 /// the caller falls through to the replication-plan branch in that case.
+/// Returns [`CompileRefused`] when a model in scope has an error diagnostic;
+/// the caller fails the command on it.
 ///
 /// Captures the full `rocky run` flag surface from `run_options` so apply-time
 /// replay is intent-preserving. `--missing` / `--resume-latest` are persisted
@@ -1199,6 +1222,20 @@ fn build_and_persist_run_plan(
         // `_defaults.toml` or stub files). Let the caller take the
         // replication-plan path.
         return Ok(None);
+    }
+
+    // #2173: respect blocking diagnostics the way `rocky compile` does — the
+    // whole project without `--model`, only the named model with it. A model
+    // the compiler refused must never enter a persisted plan.
+    let blocking: Vec<String> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.is_error())
+        .filter(|d| run_options.model.as_deref().is_none_or(|m| d.model == m))
+        .map(|d| format!("  {}: {d}", d.model))
+        .collect();
+    if !blocking.is_empty() {
+        return Err(anyhow::Error::new(CompileRefused(blocking)));
     }
 
     let (models, execution_layers) = if let Some(model) = run_options.model.as_deref() {
@@ -3462,6 +3499,111 @@ auto_create_schemas = true
             result.is_ok(),
             "plan must succeed on an existing, empty models/ dir: {:?}",
             result.err()
+        );
+    }
+
+    /// #2173: `rocky plan` without `--model` exited 0 and persisted a
+    /// `RunPlan` listing a model the compiler refused. The shape from the
+    /// issue: `eph` is `type = "ephemeral"` (E038), and `reader` reads it.
+    /// `rocky compile` exits 1 on it; `rocky plan` must refuse too, name the
+    /// diagnostic, and not fall back to a replication plan.
+    ///
+    /// Mutation that must turn this red: delete the `CompileRefused` return
+    /// in `build_and_persist_run_plan`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_refuses_a_project_with_blocking_compile_errors() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("warehouse.duckdb");
+        let config_path = dir.path().join("rocky.toml");
+        let state_path = dir.path().join("state.redb");
+
+        {
+            let warehouse = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+            warehouse
+                .execute_statement("CREATE SCHEMA src__shop")
+                .await
+                .unwrap();
+            warehouse
+                .execute_statement("CREATE TABLE src__shop.orders AS SELECT 1 AS id")
+                .await
+                .unwrap();
+        }
+
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.main]
+strategy = "full_refresh"
+
+[pipeline.main.source.discovery]
+adapter = "default"
+
+[pipeline.main.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.main.target]
+catalog_template = "warehouse"
+schema_template = "raw__{{source}}"
+"#,
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        for (name, sql, strategy) in [
+            ("eph", "SELECT 1 AS id", "ephemeral"),
+            ("reader", "SELECT id FROM eph", "full_refresh"),
+        ] {
+            std::fs::write(models_dir.join(format!("{name}.sql")), sql).unwrap();
+            std::fs::write(
+                models_dir.join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\n\n[strategy]\ntype = \"{strategy}\"\n\n\
+                     [target]\ncatalog = \"warehouse\"\nschema = \"silver\"\ntable = \"{name}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let result = plan(
+            &config_path,
+            None,
+            None,
+            None,
+            &PlanRunOptions::default(),
+            false,
+            "HEAD",
+            &state_path,
+            false,
+        )
+        .await;
+
+        let err = result.expect_err("a blocking compile error must refuse rocky plan");
+        assert!(
+            err.downcast_ref::<CompileRefused>().is_some(),
+            "the refusal must be the compile refusal, not a later failure: {err:#}"
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("E038") && msg.contains("eph"),
+            "the refusal must name the diagnostic and the model: {msg}"
+        );
+        assert!(
+            msg.contains("rocky compile"),
+            "and point at the remedy: {msg}"
         );
     }
 

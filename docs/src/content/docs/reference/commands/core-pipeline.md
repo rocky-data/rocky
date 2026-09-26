@@ -263,6 +263,8 @@ Two opt-in discover-time signals help catch onboarding problems before any catal
 
 Generate the replication SQL Rocky would run, without running it. The command needs a replication pipeline; it refuses a transformation-only project. It connects to the source to discover tables, then prints the copy SQL for each one. It does not print a transformation model's SQL. Add `--model <name>` for that, or use [`rocky emit-sql`](/reference/commands/modeling/#rocky-emit-sql). Rocky writes the plan to `.rocky/plans/<plan-id>.json` and prints the `plan_id`. For a `run` plan that file holds the settings the run needs, not the SQL. A reviewer reads the printed SQL. Then [`rocky apply <plan-id>`](#rocky-apply) recompiles the project and executes it with those settings.
 
+`rocky plan` refuses a project that `rocky compile` refuses. Without `--model`, an error in any model stops it. With `--model <name>`, only an error in that model stops it. The refusal lists each diagnostic, exits non-zero, and writes no plan file.
+
 `rocky plan` plus `rocky apply` is the canonical path for production and for gating a pull request. Nothing touches the warehouse between the two steps. For local iteration, [`rocky run`](#rocky-run) does the same work in one command and writes no plan file.
 
 ```bash
@@ -414,6 +416,8 @@ A model the preview could not render is listed in `skipped`, rather than left ou
 ```
 
 The `reason` is the generator's own error. A refused strategy puts a model there, and so does one that needs a live warehouse, such as a Snowflake dynamic table. The MCP `plan_preview` tool returns the same list. The key is absent when nothing was skipped.
+
+The example above comes from `plan_preview`. `rocky plan --model stg_events` refuses that model before it writes a plan, because `E038` is a compile error.
 
 Plan with table output and a custom config:
 
