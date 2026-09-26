@@ -3543,6 +3543,12 @@ pub async fn run(
             }
         }
         rocky_core::config::PipelineConfig::Quality(q) => {
+            // Quality checks read their tables by the configured names, and a
+            // quarantine mode rewrites them. Nothing routes either to a shadow
+            // target, so `--branch` / `--shadow` would read and write
+            // production. Refuse before any state is touched (#2161), as the
+            // snapshot and load arms below do (#1272).
+            reject_unsupported_shadow(shadow_config, "quality")?;
             // Wrap the quality dispatch in its OWN remote-state session (never
             // run()'s `session_opt`) so the `RunRecord` it now persists — for the
             // schedule reconciler's `after`/`freshness` demands and `rocky
@@ -8877,7 +8883,7 @@ fn rewrite_quote_style(dialect: &dyn rocky_core::traits::SqlDialect) -> Result<O
 /// routed.
 ///
 /// Transformation and replication rewrite their targets for a shadow run;
-/// snapshot and load do not. Accepting the flag on those kinds was not a partial
+/// quality, snapshot and load do not. Accepting the flag on those kinds was not a partial
 /// isolation, it was none at all — the run wrote production exactly as if the
 /// flag had been absent, which is the failure #1272 records. Refusing is the
 /// only honest answer until the routing exists: a user who asked to keep
@@ -15885,6 +15891,109 @@ max_retries = 0
             )
             .await
         })
+    }
+
+    /// #2161. `rocky run --branch` on a quality pipeline was accepted and
+    /// ignored: the checks read production and a quarantine mode rewrote it.
+    /// The quality arm now refuses the flag like snapshot and load (#1272).
+    ///
+    /// The pipeline's only table is missing, so an unrefused run fails its
+    /// check gate and persists a `Failure` record. The assertion that no
+    /// record exists is therefore the proof that the run stopped before it
+    /// touched state, not merely that it returned an error.
+    #[test]
+    fn a_quality_run_with_branch_is_refused_and_writes_nothing() {
+        let project = tempfile::tempdir().unwrap();
+        let config_path = project.path().join("rocky.toml");
+        let db_path = project.path().join("probe.duckdb");
+        let state_path = project.path().join("state.redb");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = '{}'
+
+[pipeline.dq]
+type = "quality"
+
+[pipeline.dq.target]
+adapter = "default"
+
+[[pipeline.dq.tables]]
+catalog = "probe"
+schema = "main"
+table = "missing"
+
+[pipeline.dq.checks]
+enabled = true
+row_count = true
+"#,
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        let branch = rocky_core::shadow::ShadowConfig {
+            suffix: "_rocky_shadow".to_string(),
+            schema_override: Some("branch__fix_price".to_string()),
+            cleanup_after: false,
+            branch: Some("fix_price".to_string()),
+        };
+        let rt = remote_state_test_runtime();
+        let outcome = rt.block_on(async {
+            let loaded = std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+            );
+            super::run(
+                &config_path,
+                loaded,
+                None,
+                None,
+                &state_path,
+                None,
+                true,
+                None,
+                false,
+                None,
+                false,
+                Some(&branch),
+                &PartitionRunOptions::default(),
+                None,
+                None,
+                None,
+                None,
+                &DeferOptions::default(),
+                &SkipRunOptions::default(),
+                &rocky_core::run_vars::RunVars::new(),
+                Some("quality-branch-refused"),
+                None,
+                false,
+                None,
+            )
+            .await
+        });
+        let err = outcome.expect_err("--branch on a quality pipeline must be refused");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("not supported for quality pipelines"),
+            "the refusal names the pipeline kind: {message}"
+        );
+        assert!(
+            !err.is::<super::QualityGateFailure>(),
+            "the run must stop before the checks run, not fail their gate: {message}"
+        );
+        if state_path.exists() {
+            let store = StateStore::open(&state_path).unwrap();
+            assert!(
+                store.get_run("quality-branch-refused").unwrap().is_none(),
+                "a refused run records nothing"
+            );
+            assert!(
+                store.list_runs(10).unwrap().is_empty(),
+                "a refused run records nothing"
+            );
+        }
     }
 
     fn remote_state_test_runtime() -> tokio::runtime::Runtime {

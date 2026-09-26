@@ -687,7 +687,7 @@ That last case deserves a word. To such a warehouse the two targets are distinct
 
 This rule is not about whether the dialect quotes identifiers. Rocky renders Trino targets double-quoted, yet treats two Trino targets that differ only by case as one object, so such a run proceeds there.
 
-`--shadow` and `--branch` isolate `rocky run` for transformation pipelines only. `rocky run --dag`, the snapshot pipeline kind, and the load pipeline kind accept both flags but still write production targets.
+`--shadow` and `--branch` isolate `rocky run` for transformation and replication pipelines only. `rocky run --dag` and the quality, snapshot and load pipeline kinds refuse both flags. They do not route their targets, so the run would read or write production. For a quality, snapshot or load pipeline, run it without the flag, or select a transformation or replication pipeline with `--pipeline`.
 
 Or run against a named branch:
 
