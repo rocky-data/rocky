@@ -3643,6 +3643,25 @@ def _emit_results(
                 return collapsed
         return dg.AssetKey(raw_key)
 
+    # `SkippedInFlight` (#1814): the engine did NOTHING — another run holds the
+    # idempotency claim for this key, and its outcome is unknown. Refuse before
+    # any event is yielded: the empty-output pass below would otherwise stamp a
+    # zero-row "materialization" on every selected key and the step would
+    # finish green over work that has not happened. `SkippedIdempotent` is not
+    # refused: a prior run already succeeded under the key.
+    in_flight = [r for r in results if _is_skipped_in_flight(r)]
+    if in_flight:
+        holders = sorted({r.skipped_by_run_id or "<unknown>" for r in in_flight})
+        raise dg.Failure(
+            description=(
+                "Rocky did not run: another run holds this idempotency key's in-flight "
+                f"claim (run {', '.join(holders)}), so nothing was materialized. Refusing "
+                "to report success for work that has not happened. Retry once that run "
+                "finishes."
+            ),
+            allow_retries=True,
+        )
+
     selected_resolver = _build_table_resolver(rocky_key_to_dagster_key, selected_keys)
 
     declared_checks: set[tuple[dg.AssetKey, str]] = {(cs.asset_key, cs.name) for cs in check_specs}
@@ -3973,6 +3992,31 @@ def _emit_results(
                 "gated." + detail
             ),
         )
+
+    # The same backstop for the post-apply `verify_after` gate (#1814). The
+    # engine exits non-zero, but `RockyClient.run` passes `allow_partial=True`,
+    # so the result comes back parsed and nothing above fails the step: the
+    # failure is a `<verify_after>` entry in `errors`, which maps to no asset.
+    # There is no check result that could explain it, so it always raises.
+    if any(r.verify_after_failed for r in results):
+        raise dg.Failure(
+            description=(
+                "Rocky auto-applied additive schema drift that its verify_after gate could "
+                "not confirm (verify_after_failed). The migration stands on the warehouse "
+                "(there is no rollback); review it, then re-run the pipeline. Refusing to "
+                "report green on a run the engine failed."
+            ),
+        )
+
+
+def _is_skipped_in_flight(result: RunResult) -> bool:
+    """Whether the engine short-circuited this run on a live in-flight claim.
+
+    Matches the wire value in either spelling (``SkippedInFlight`` or
+    ``skipped_in_flight``), the way ``health.py`` normalises statuses.
+    """
+    status = str(result.status or "").strip().lower().replace("_", "")
+    return status == "skippedinflight"
 
 
 def _empty_output_results(
