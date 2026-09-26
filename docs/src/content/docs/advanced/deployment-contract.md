@@ -92,10 +92,10 @@ Closing the tiered-backend seams tracked as issue 1242 does not make a rolling u
 
 The state store carries a schema version. Two directions:
 
-- **A newer engine opens an older store.** It migrates the store forward on first open. Every command does this; there is no separate migration step.
+- **A newer engine opens an older store.** It migrates the store forward on first open. Every command does this; there is no separate migration step. On a remote backend the newer engine first finds no object under its own schema-version key. It then downloads the newest older object (down to `v22`) and migrates that. The older object is never changed. See [Schema version bumps](/concepts/state-management/#schema-version-bumps).
 - **An older engine opens a newer store.** `rocky serve` and every inspection command (`state`, `history`, `doctor`, `metrics`, the branch commands) refuse to open it. `rocky run` and `rocky load` follow `[state] on_schema_mismatch`: the default, `recreate`, logs one warning, starts from a fresh local state, runs once as a full refresh, and never writes that downgraded state back to a shared backend; `fail` refuses like the rest.
 
-So a fleet mid-upgrade is safe in one direction only. Upgrade every process that shares a volume or a remote backend together, old stopped before new started, and keep a copy of the store from before the upgrade: rolling back with the history intact means restoring that copy under the older engine. The changelog names every release that changes the schema version.
+So a fleet mid-upgrade is safe in one direction only. Run one engine version per remote prefix. Upgrade every process that shares a volume or a remote backend together, old stopped before new started, and keep a copy of the store from before the upgrade: rolling back with the history intact means restoring that copy under the older engine. The changelog names every release that changes the schema version.
 
 ## Webhooks and timers
 

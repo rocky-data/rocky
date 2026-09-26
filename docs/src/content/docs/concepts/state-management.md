@@ -265,6 +265,26 @@ When `backend` is not `local`, Rocky syncs the state file around each run.
 
 If the download fails, Rocky logs a warning and starts fresh from target-table metadata. The [retry + failure policy](#retry-and-failure-policy) below governs what an upload failure does.
 
+### Schema version bumps
+
+Every remote state object sits under the state schema version, for example `<prefix>/v30/state.redb`. A release that changes the schema version reads and writes a new key. The first download after that upgrade finds nothing under the new key.
+
+Rocky then carries the old state forward. It looks for the newest older object, from one version below the current one down to `v22`, and downloads it. The normal open migrates it, and the normal upload writes it under the new key.
+
+```
+  1.73.0   writes  <prefix>/v23/state.redb
+  1.74.0   reads   <prefix>/v30/state.redb   ── absent
+           reads   <prefix>/v29 … v23        ── v23 found, carried forward
+           writes  <prefix>/v30/state.redb   (at the end of the run)
+```
+
+- Rocky never writes, moves, or deletes the older object. It stays as your copy from before the upgrade.
+- Rocky logs one warning that names both versions.
+- The `tiered` backend looks only in S3. The Valkey copy holds nothing S3 does not.
+- With no older object at all, the run is a fresh start, as before.
+
+Run one engine version per prefix. An older engine that keeps writing its own key after the upgrade is not read again. Its later writes do not reach the newer engine. The [deployment contract](/advanced/deployment-contract/#mixed-versions-during-an-upgrade) has the rollout rule.
+
 ### Retry and Failure Policy
 
 Every remote transfer runs inside a wall-clock budget, for uploads and downloads alike. Retries back off exponentially, and a three-state circuit breaker stops a failing backend from being hammered. This is the same machinery the Databricks and Snowflake adapters use. Configure it under `[state.retry]` in `rocky.toml`. The [configuration reference](/reference/configuration/#stateretry) lists every field.

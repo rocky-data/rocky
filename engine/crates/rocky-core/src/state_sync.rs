@@ -129,30 +129,59 @@ fn remote_state_key(local_path: &Path) -> String {
 /// each other's state through a shared tiered / object / Valkey backend. This
 /// is the durable fix for the rolling-upgrade strand: during a schema-changing
 /// bump, an old-binary pod resolves its keys under `vN` while already-upgraded
-/// pods use `vN+1`, so they never collide.
+/// pods use `vN+1`, so they never collide on a write.
 ///
 /// Qualifying by **schema** version, not binary version or hash, is
 /// deliberate: a patch bump that leaves the redb schema unchanged keeps the
 /// same segment and so keeps sharing state (no fleet-wide watermark reset).
 /// Only a schema-changing bump shifts the segment, after which the new version
-/// finds no state under its key and bootstraps once via the existing
-/// incremental-bootstrap path.
+/// finds no state under its key. It then carries the newest older object
+/// forward, reading it but never writing it ([`carry_forward_older_segment`],
+/// #1955), so the ledgers that nothing re-derives survive the bump.
 fn schema_version_segment() -> String {
-    format!("v{}", crate::state::current_schema_version())
+    schema_version_segment_at(crate::state::current_schema_version())
 }
+
+/// [`schema_version_segment`] for an explicit schema version. Only the
+/// carry-forward read ([`carry_forward_older_segment`]) names a version other
+/// than the current one, and it only ever READS under it.
+fn schema_version_segment_at(version: u32) -> String {
+    format!("v{version}")
+}
+
+/// The oldest schema version the carry-forward read probes (#1955).
+///
+/// Every table this binary reads existed by v22, so a store stamped v22 or
+/// later carries every table, and a read-write open migrates it in place by
+/// re-stamping it. 1.73.0 wrote v23 and 1.74.0 jumped to v30, so the
+/// previous segment is not always `current - 1`: the search walks down.
+const CARRY_FORWARD_FLOOR_SCHEMA_VERSION: u32 = 22;
 
 /// Schema-qualified object-store key: `v9/state.redb` (under the configured
 /// `<prefix>`). The version segment is a path component so the full object
 /// path reads `<prefix>/v9/state.redb`.
 fn object_store_state_key(remote_key: &str) -> String {
-    format!("{}/{remote_key}", schema_version_segment())
+    object_store_state_key_at(crate::state::current_schema_version(), remote_key)
+}
+
+/// [`object_store_state_key`] under an explicit schema version.
+fn object_store_state_key_at(version: u32, remote_key: &str) -> String {
+    format!("{}/{remote_key}", schema_version_segment_at(version))
 }
 
 /// Schema-qualified Valkey key: `<prefix>v9:state.redb` (e.g.
 /// `rocky:state:v9:state.redb`). The version segment is colon-delimited to
 /// match the Valkey prefix convention.
 fn valkey_state_key(prefix: &str, remote_key: &str) -> String {
-    format!("{prefix}{}:{remote_key}", schema_version_segment())
+    valkey_state_key_at(prefix, crate::state::current_schema_version(), remote_key)
+}
+
+/// [`valkey_state_key`] under an explicit schema version.
+fn valkey_state_key_at(prefix: &str, version: u32, remote_key: &str) -> String {
+    format!(
+        "{prefix}{}:{remote_key}",
+        schema_version_segment_at(version)
+    )
 }
 
 /// Build an `ObjectStoreProvider` rooted at `<scheme>://<bucket>/<prefix>`.
@@ -1464,7 +1493,9 @@ impl Drop for RemoteStateSession {
 ///   tables are snapshotted **before** the download and spliced back in
 ///   afterwards, so `jobs` / `schema_cache` survive a download that replaces the
 ///   replicated tables.
-/// - **Absent** — no remote object exists for this key. For a REMOTE backend the
+/// - **Absent** — no remote object exists for this key, and none under an older
+///   schema version either (an older one is carried forward as **Restored**,
+///   see [`carry_forward_older_segment`], #1955). For a REMOTE backend the
 ///   replicated tables must become **fresh** (empty) — a switch to an empty
 ///   prefix must not keep stale watermarks (finding 6) — while the local-only
 ///   tables are preserved. The pre-download snapshot already holds *only* the
@@ -1561,6 +1592,25 @@ async fn download_state_impl(
         }
     };
 
+    // 1b. No object under the current schema version: after a schema bump,
+    //     carry the newest older object forward (#1955). The staged file then
+    //     holds it, the normal open migrates it in place, and the normal
+    //     finalize uploads it under the current key. The CAS base stays `None`
+    //     (the current key is absent), so that first upload is a `Create`.
+    let outcome = match outcome {
+        DownloadOutcome::Restored => DownloadOutcome::Restored,
+        DownloadOutcome::Absent => {
+            match carry_forward_older_segment(config, &staged, &remote_key).await {
+                Ok(Some(_)) => DownloadOutcome::Restored,
+                Ok(None) => DownloadOutcome::Absent,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&staged);
+                    return Err(e);
+                }
+            }
+        }
+    };
+
     // 2. Acquire the StateStore writer lock so the snapshot + merge + publish
     //    serialize with concurrent writers/publishes (finding B). Released on
     //    drop, before this function returns.
@@ -1583,6 +1633,86 @@ async fn download_state_impl(
         DownloadOutcome::Restored => StateAuthority::Authoritative,
         DownloadOutcome::Absent => StateAuthority::FreshStart,
     })
+}
+
+/// Carry the newest older remote state object forward after a schema bump
+/// (#1955).
+///
+/// Every remote key is qualified by the schema version, so after a bump the
+/// current key has no object. Treating that as a fresh start empties every
+/// replicated table, and the policy ledger and the artifact ledger are
+/// history that nothing re-derives. So when the current key is absent, this
+/// probes `v{current-1}` down to [`CARRY_FORWARD_FLOOR_SCHEMA_VERSION`] and
+/// downloads the first object it finds into `dest_path`.
+///
+/// It only reads. It never writes, moves or deletes an older key: the older
+/// object stays as the copy from before the upgrade. The caller's normal
+/// read-write open re-stamps the file, and the normal finalize uploads it
+/// under the current key.
+///
+/// `tiered` probes its durable S3 leg only: the Valkey copy carries no
+/// independent truth. `local` transfers nothing. Returns the version carried,
+/// or `None` when no older object exists. A failed probe is an `Err`, like
+/// the current-key probe: an unreadable older object is not proof of absence.
+///
+/// The deployment contract is one engine version per prefix. An older engine
+/// that keeps writing its own key after a newer one carried it forward is
+/// not seen again: its later writes are lost to the newer engine.
+async fn carry_forward_older_segment(
+    config: &StateConfig,
+    dest_path: &Path,
+    remote_key: &str,
+) -> Result<Option<u32>, StateSyncError> {
+    let current = crate::state::current_schema_version();
+    // The object-store leg to probe, or `None` for Valkey.
+    let object_store = match config.backend {
+        StateBackend::Local => return Ok(None),
+        StateBackend::S3 | StateBackend::Tiered => {
+            let bucket = config.s3_bucket.as_deref().ok_or_else(|| {
+                StateSyncError::MissingConfig("s3".into(), "state.s3_bucket".into())
+            })?;
+            let prefix = config.s3_prefix.as_deref().unwrap_or(DEFAULT_S3_PREFIX);
+            Some(("s3", bucket, prefix))
+        }
+        StateBackend::Gcs => {
+            let bucket = config.gcs_bucket.as_deref().ok_or_else(|| {
+                StateSyncError::MissingConfig("gcs".into(), "state.gcs_bucket".into())
+            })?;
+            let prefix = config.gcs_prefix.as_deref().unwrap_or(DEFAULT_GCS_PREFIX);
+            Some(("gs", bucket, prefix))
+        }
+        StateBackend::Valkey => None,
+    };
+    for version in (CARRY_FORWARD_FLOOR_SCHEMA_VERSION..current).rev() {
+        let outcome = match object_store {
+            Some((scheme, bucket, prefix)) => {
+                download_from_object_store(
+                    scheme,
+                    bucket,
+                    prefix,
+                    dest_path,
+                    &object_store_state_key_at(version, remote_key),
+                    transfer_timeout(config),
+                    None,
+                )
+                .await?
+            }
+            None => download_from_valkey(config, dest_path, remote_key, version).await?,
+        };
+        match outcome {
+            DownloadOutcome::Restored => {
+                warn!(
+                    from = version,
+                    to = current,
+                    "no remote state under schema v{current}; carried v{version} forward. \
+                     The v{version} object is left in place and never written again."
+                );
+                return Ok(Some(version));
+            }
+            DownloadOutcome::Absent => {}
+        }
+    }
+    Ok(None)
 }
 
 /// Acquire the StateStore writer lock for `local_path` (the same lock
@@ -1865,7 +1995,11 @@ async fn download_state_inner(
                 bucket,
                 prefix,
                 dest_path,
-                remote_key,
+                // Qualified by schema version so a v7 pod and a v9 pod never
+                // collide on one object: `<prefix>/v9/state.redb`. `remote_key`
+                // is threaded from `download_state`, so a staging `dest_path`
+                // does not change which object we read.
+                &object_store_state_key(remote_key),
                 transfer_timeout(config),
                 gen_sink,
             )
@@ -1881,13 +2015,25 @@ async fn download_state_inner(
                 bucket,
                 prefix,
                 dest_path,
-                remote_key,
+                // Qualified by schema version so a v7 pod and a v9 pod never
+                // collide on one object: `<prefix>/v9/state.redb`. `remote_key`
+                // is threaded from `download_state`, so a staging `dest_path`
+                // does not change which object we read.
+                &object_store_state_key(remote_key),
                 transfer_timeout(config),
                 gen_sink,
             )
             .await
         }
-        StateBackend::Valkey => download_from_valkey(config, dest_path, remote_key).await,
+        StateBackend::Valkey => {
+            download_from_valkey(
+                config,
+                dest_path,
+                remote_key,
+                crate::state::current_schema_version(),
+            )
+            .await
+        }
         // Under `cas` the tiered read is generation-validated against the
         // durable tier — the Valkey copy may only short-circuit when it proves
         // it holds the object's CURRENT generation.
@@ -2987,7 +3133,9 @@ async fn download_from_object_store(
     bucket: &str,
     prefix: &str,
     dest_path: &Path,
-    remote_key: &str,
+    // The schema-qualified object key to read: the current version's, except
+    // for the carry-forward read of an older segment (#1955).
+    key: &str,
     timeout: Duration,
     // When `Some`, capture the downloaded object's [`Generation`] into the sink
     // from the SAME GET that fetched the bytes (never a separate HEAD — that
@@ -3002,11 +3150,6 @@ async fn download_from_object_store(
     gen_sink: Option<&mut Option<Generation>>,
 ) -> Result<DownloadOutcome, StateSyncError> {
     let provider = cloud_provider(scheme, bucket, prefix)?;
-    // Qualify the object key by schema version so a v7 pod and a v9 pod never
-    // collide on the same object — `<prefix>/v9/state.redb`, not
-    // `<prefix>/state.redb`. `remote_key` is threaded from `download_state` so a
-    // staging `dest_path` does not change which object we read.
-    let key = object_store_state_key(remote_key);
     let span = info_span!(
         "state.download",
         backend = %provider.scheme(),
@@ -3020,16 +3163,16 @@ async fn download_from_object_store(
         );
 
         with_transfer_timeout(timeout, async {
-            match probe_exists(&provider, &key).await {
+            match probe_exists(&provider, key).await {
                 Ok(true) => {
                     match gen_sink {
                         Some(sink) => {
                             *sink = provider
-                                .download_file_capturing_version(&key, dest_path)
+                                .download_file_capturing_version(key, dest_path)
                                 .await?;
                         }
                         None => {
-                            provider.download_file(&key, dest_path).await?;
+                            provider.download_file(key, dest_path).await?;
                         }
                     }
                     info!(
@@ -3260,6 +3403,7 @@ async fn download_from_valkey(
     config: &StateConfig,
     dest_path: &Path,
     remote_key: &str,
+    schema_version: u32,
 ) -> Result<DownloadOutcome, StateSyncError> {
     // Test seam: force a Valkey MISS without a live Valkey peer, so the tiered
     // fall-through-to-S3 path (and the "stale local file is not a hit" fix) can
@@ -3283,7 +3427,7 @@ async fn download_from_valkey(
     // `rocky:state:state.redb`, so a v7 reader and a v9 writer never share a key.
     // `remote_key` is threaded from `download_state` so a staging `dest_path`
     // does not change which key we read.
-    let key = valkey_state_key(&prefix, remote_key);
+    let key = valkey_state_key_at(&prefix, schema_version, remote_key);
     let local_path_owned = dest_path.to_path_buf();
     let timeout = transfer_timeout(config);
 
@@ -4805,6 +4949,211 @@ mod tests {
             "Absent must keep the local-only jobs (finding 7)"
         );
         assert_eq!(jobs[0].job_id, "job-local-1");
+    }
+
+    // -----------------------------------------------------------------------
+    // #1955 — a schema bump carries the newest older remote object forward
+    // -----------------------------------------------------------------------
+
+    /// A remote object stamped `version` that carries watermark `wm`, as an
+    /// older engine uploads it.
+    fn older_remote_object_bytes(dir: &Path, wm: &str, version: u32) -> Vec<u8> {
+        let now = chrono::Utc::now();
+        let seed = dir.join(format!("remote_seed_v{version}.redb"));
+        {
+            let store = StateStore::open(&seed).unwrap();
+            store
+                .set_watermark(
+                    wm,
+                    &rocky_ir::WatermarkState {
+                        last_value: now,
+                        updated_at: now,
+                    },
+                )
+                .unwrap();
+        }
+        crate::state::force_schema_version(&seed, &version.to_string());
+        let stripped = strip_local_only_tables(&seed, LOCAL_ONLY_TABLE_NAMES).unwrap();
+        let bytes = std::fs::read(&stripped).unwrap();
+        let _ = std::fs::remove_file(&stripped);
+        let _ = std::fs::remove_file(&seed);
+        bytes
+    }
+
+    fn s3_config() -> StateConfig {
+        StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        }
+    }
+
+    /// The real 1.73.0 → 1.74.0 case: the current key is absent and the only
+    /// history sits several versions down (v23, not `current - 1`). The
+    /// newest older object wins over an even older one, the normal open
+    /// migrates it in place, the normal upload writes the current key, and
+    /// the older objects stay byte-identical.
+    #[tokio::test]
+    async fn a_schema_bump_carries_the_newest_older_object_forward() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let remote_key = remote_state_key(&local);
+        let provider = test_support::install(ObjectStoreProvider::in_memory());
+
+        let v23 = older_remote_object_bytes(dir.path(), "ledger.v23", 23);
+        let v22 = older_remote_object_bytes(dir.path(), "ledger.v22", 22);
+        let v23_key = object_store_state_key_at(23, &remote_key);
+        let v22_key = object_store_state_key_at(22, &remote_key);
+        provider
+            .put(&v23_key, Bytes::from(v23.clone()))
+            .await
+            .unwrap();
+        provider
+            .put(&v22_key, Bytes::from(v22.clone()))
+            .await
+            .unwrap();
+
+        let authority = download_state(&s3_config(), &local, false)
+            .await
+            .expect("carry-forward download");
+        assert_eq!(authority, StateAuthority::Authoritative);
+        assert!(
+            !provider
+                .exists(&object_store_state_key(&remote_key))
+                .await
+                .unwrap(),
+            "the download itself writes no remote key"
+        );
+
+        {
+            let store = StateStore::open(&local).unwrap();
+            assert!(store.get_watermark("ledger.v23").unwrap().is_some());
+            assert!(
+                store.get_watermark("ledger.v22").unwrap().is_none(),
+                "the NEWEST older object wins"
+            );
+        }
+        assert_eq!(
+            StateStore::peek_schema_version(&local).unwrap(),
+            Some(crate::state::current_schema_version()),
+            "the normal read-write open migrates the carried store in place"
+        );
+
+        upload_state(&s3_config(), &local, false)
+            .await
+            .expect("upload under the current key");
+        test_support::clear();
+
+        let current = provider
+            .get(&object_store_state_key(&remote_key))
+            .await
+            .expect("the current key now holds the carried state");
+        assert!(!current.is_empty());
+        assert_eq!(
+            provider.get(&v23_key).await.unwrap().as_ref(),
+            v23.as_slice()
+        );
+        assert_eq!(
+            provider.get(&v22_key).await.unwrap().as_ref(),
+            v22.as_slice()
+        );
+    }
+
+    /// The search walks DOWN and stops at the floor: an object below v22 or
+    /// above the current version is never read, so the download is a fresh
+    /// start.
+    #[tokio::test]
+    async fn the_carry_forward_ignores_objects_below_the_floor_and_above_current() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let remote_key = remote_state_key(&local);
+        let provider = test_support::install(ObjectStoreProvider::in_memory());
+        let below = CARRY_FORWARD_FLOOR_SCHEMA_VERSION - 1;
+        let above = crate::state::current_schema_version() + 1;
+        for version in [below, above] {
+            provider
+                .put(
+                    &object_store_state_key_at(version, &remote_key),
+                    Bytes::from(older_remote_object_bytes(dir.path(), "x", 23)),
+                )
+                .await
+                .unwrap();
+        }
+
+        let authority = download_state(&s3_config(), &local, false).await;
+        test_support::clear();
+        assert!(
+            matches!(authority, Ok(StateAuthority::FreshStart)),
+            "got {authority:?}"
+        );
+        assert!(!local.exists());
+    }
+
+    /// Under `concurrency_control = "cas"` a carried object captures NO base
+    /// generation: the current key is absent, so the first finalize must be a
+    /// `Create` against it, never an `Update` against the older key.
+    #[tokio::test]
+    async fn a_carry_forward_under_cas_captures_no_base_generation() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let remote_key = remote_state_key(&local);
+        let provider = test_support::install(ObjectStoreProvider::in_memory());
+        provider
+            .put(
+                &object_store_state_key_at(23, &remote_key),
+                Bytes::from(older_remote_object_bytes(dir.path(), "ledger.v23", 23)),
+            )
+            .await
+            .unwrap();
+
+        let config = StateConfig {
+            concurrency_control: ConcurrencyControl::Cas,
+            ..s3_config()
+        };
+        let (authority, generation) = download_state_with_generation(&config, &local, false)
+            .await
+            .expect("carry-forward download under cas");
+        test_support::clear();
+        assert_eq!(authority, StateAuthority::Authoritative);
+        assert!(generation.is_none(), "got {generation:?}");
+        let store = StateStore::open(&local).unwrap();
+        assert!(store.get_watermark("ledger.v23").unwrap().is_some());
+    }
+
+    /// `tiered` probes its durable S3 leg only. `valkey_url` is unset, so a
+    /// carry-forward probe of the Valkey leg would fail with `MissingConfig`.
+    #[tokio::test]
+    async fn a_tiered_carry_forward_probes_the_s3_leg_only() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let remote_key = remote_state_key(&local);
+        let provider = test_support::install(ObjectStoreProvider::in_memory());
+        provider
+            .put(
+                &object_store_state_key_at(23, &remote_key),
+                Bytes::from(older_remote_object_bytes(dir.path(), "ledger.v23", 23)),
+            )
+            .await
+            .unwrap();
+        test_support::arm_valkey_miss_fault();
+
+        let config = StateConfig {
+            backend: StateBackend::Tiered,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        let authority = download_state(&config, &local, false).await;
+        test_support::clear();
+        assert!(
+            matches!(authority, Ok(StateAuthority::Authoritative)),
+            "got {authority:?}"
+        );
+        let store = StateStore::open(&local).unwrap();
+        assert!(store.get_watermark("ledger.v23").unwrap().is_some());
     }
 
     /// The copy primitive itself: it replaces ONLY the named (local-only) tables
