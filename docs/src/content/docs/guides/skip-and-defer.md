@@ -21,7 +21,7 @@ Both are **off by default**: a plain `rocky run` is byte-identical to one withou
 With the gate on, Rocky skips re-materializing a transformation model only when **both** of these hold since the model's last *successful* build.
 
 1. **Logic unchanged (B2).** The model's cosmetic-invariant logic key matches the one recorded on the prior successful build. That key is a hash of the model's normalised SQL plus its typed structural facts. Reformatting or re-commenting the SQL does not count as a change. Altering what the SQL computes does.
-2. **Upstream data unchanged (B3).** Every upstream is provably stable. That means an upstream Rocky model that was *skipped* this run, whose output is unchanged by definition. Or it means a raw source whose `MAX(<timestamp>)` matches the signature recorded on the prior build. When a source has no tracked timestamp column, an opt-in compares `COUNT(*)` instead.
+2. **Upstream data unchanged (B3).** Every upstream is provably stable. That means an upstream Rocky model that was *skipped* this run, whose output is unchanged by definition. Or it means a raw source whose `COUNT(*)` matches the one recorded on the prior build. That comparison is an opt-in (`skip_rowcount_fallback`). Without it, a model that reads a raw source always builds.
 
 If either is in doubt, the model builds.
 
@@ -117,12 +117,12 @@ Two `[run]` knobs adjust B3. Both default to the strict choice, the one that doe
 ```toml
 [run]
 skip_unchanged = true
-skip_rowcount_fallback = false   # default: a non-watermarkable upstream is NOT skip-eligible
-lag_tolerance_seconds = 0        # default: any MAX(ts) movement forces a rebuild
+skip_rowcount_fallback = false   # default: a model that reads a raw source always builds
+lag_tolerance_seconds = 0        # has no effect today; see below
 ```
 
-- `skip_rowcount_fallback` (default `false`) allows a `COUNT(*)`-only stability signal when an upstream has no tracked timestamp column. Rowcount equality is weaker than a watermark: it can miss a same-size in-place `UPDATE`, or a matched insert plus delete. So it stays behind this switch.
-- `lag_tolerance_seconds` (default `0`) treats an upstream `MAX(ts)` that moved by fewer than this many seconds as unchanged. It is the late-arriving-but-irrelevant micro-update analog of a freshness SLA threshold.
+- `skip_rowcount_fallback` (default `false`) allows a `COUNT(*)` stability signal for raw-source upstreams. Rowcount equality is a weak signal. It can miss a same-size in-place `UPDATE`, or a matched insert plus delete. So it stays behind this switch.
+- `lag_tolerance_seconds` (default `0`) has no effect today. It applied to an upstream `MAX(ts)` signal. No skip-eligible strategy tracks a timestamp column any more: `incremental` is refused on transformation models (`E037`), and `microbatch` is an alias of `time_interval`, which the gate does not cover. So the gate never reads `MAX(ts)`.
 
 The full `[run]` reference is in the [configuration reference](/reference/configuration/#run).
 

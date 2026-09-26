@@ -9,8 +9,8 @@
 //!   successful [`ModelExecution`].
 //! - **B3 — upstream data unchanged:** every upstream is provably stable —
 //!   an upstream Rocky model that was *skipped* (not built) this run, or a
-//!   raw source whose `MAX(ts)` (and, behind an opt-in, `COUNT(*)`) matches
-//!   the signature recorded on the prior build.
+//!   raw source whose `COUNT(*)` (behind the `skip_rowcount_fallback`
+//!   opt-in) matches the signature recorded on the prior build.
 //!
 //! # The load-bearing safety rule
 //!
@@ -168,7 +168,7 @@ pub(crate) struct SkipGate<'a> {
     /// Lowercased identities that belong to a **project model** — either the
     /// model's name or its `catalog.schema.table` target. Lets B3 classify a
     /// referenced table as "produced by a Rocky model" (→ recursion verdict)
-    /// vs "raw source" (→ `MAX(ts)`/`COUNT(*)` freshness probe).
+    /// vs "raw source" (→ `COUNT(*)` freshness probe).
     model_identities: std::collections::HashSet<String>,
     /// `model name` → resolved upstream **model** names (the DAG edges). The
     /// authoritative recursion signal — a name here is always a project model.
@@ -395,7 +395,9 @@ impl<'a> SkipGate<'a> {
     /// Compare a stored vs current upstream signature for stability.
     ///
     /// Stable iff the applicable signal proves no movement:
-    /// - `MAX(ts)`: both present and within `lag_tolerance_seconds`;
+    /// - `MAX(ts)`: both present and within `lag_tolerance_seconds`. The
+    ///   current probe never records a `MAX(ts)` (see
+    ///   [`Self::compute_upstream_sigs`]), so today this signal never fires;
     /// - else `COUNT(*)` (only when `skip_rowcount_fallback` and both present
     ///   and equal).
     ///
@@ -438,18 +440,16 @@ impl<'a> SkipGate<'a> {
     /// against an upstream we never examined is exactly the silent-staleness
     /// bug the gate exists to prevent.
     ///
-    /// For each raw source we read `MAX(<ts>)` when the model declares a
-    /// timestamp column (incremental / microbatch strategies) and `COUNT(*)`
-    /// when `skip_rowcount_fallback` is enabled. Read failures leave the
-    /// corresponding field `None` (⇒ that upstream is later judged unprovable
-    /// ⇒ build) — they never collapse to "stable".
+    /// For each raw source we read `COUNT(*)` when `skip_rowcount_fallback` is
+    /// enabled. There is no `MAX(<ts>)` read: no skip-eligible strategy names a
+    /// timestamp column (see the `max_ts` field below). A read failure leaves
+    /// the field `None` (⇒ that upstream is later judged unprovable ⇒ build) —
+    /// it never collapses to "stable".
     async fn compute_upstream_sigs(
         &self,
         model: &rocky_core::models::Model,
         warehouse: &dyn WarehouseAdapter,
     ) -> Option<Vec<UpstreamSig>> {
-        let ts_column = strategy_timestamp_column(&model.config.strategy);
-
         // Completeness gate (whitelist): trust the plain FROM/JOIN enumeration
         // only when the SQL is a shape for which that walk provably surfaces
         // *every* upstream — a single plain `SELECT` over bare tables, no CTEs,
@@ -488,12 +488,7 @@ impl<'a> SkipGate<'a> {
 
             // `name` is already a (possibly-qualified) table reference. It came
             // from the parsed AST, so the components are valid identifiers; we
-            // interpolate it directly (the per-component validation lives in
-            // `query_max_ts` for the ts column, the only user-typed part).
-            let max_ts = match ts_column {
-                Some(col) => query_max_ts(warehouse, name.as_str(), col).await,
-                None => None,
-            };
+            // interpolate it directly.
             let row_count = if self.cfg.rowcount_fallback {
                 query_row_count(warehouse, name.as_str()).await
             } else {
@@ -502,7 +497,11 @@ impl<'a> SkipGate<'a> {
 
             sigs.push(UpstreamSig {
                 upstream_key: lname,
-                max_ts,
+                // No `MAX(ts)` probe: no skip-eligible strategy tracks a
+                // timestamp. `incremental` is refused on transformation models
+                // (E037, #1990) and `microbatch` loads as `time_interval`
+                // (#2054), which clause (B) excludes.
+                max_ts: None,
                 row_count,
                 // The plain-strategy skip gate captures freshness only; the
                 // consumer-side per-column baseline is content-addressed-path
@@ -512,35 +511,6 @@ impl<'a> SkipGate<'a> {
         }
         Some(sigs)
     }
-}
-
-/// The timestamp column a strategy tracks, if any. Used to issue the B3
-/// `SELECT MAX(<col>)` watermark probe against raw sources.
-fn strategy_timestamp_column(strategy: &rocky_core::models::StrategyConfig) -> Option<&str> {
-    match strategy {
-        rocky_core::models::StrategyConfig::Incremental { timestamp_column }
-        | rocky_core::models::StrategyConfig::Microbatch {
-            timestamp_column, ..
-        } => Some(timestamp_column.as_str()),
-        _ => None,
-    }
-}
-
-/// `SELECT MAX(<ts>) FROM <ref>`, parsed to a UTC timestamp. `None` on any
-/// failure / NULL / unparseable value — the fail-safe so a flaky probe forces
-/// a rebuild rather than a wrong skip.
-async fn query_max_ts(
-    warehouse: &dyn WarehouseAdapter,
-    table_ref: &str,
-    ts_column: &str,
-) -> Option<chrono::DateTime<chrono::Utc>> {
-    if rocky_sql::validation::validate_identifier(ts_column).is_err() {
-        return None;
-    }
-    let sql = format!("SELECT MAX({ts_column}) FROM {table_ref}");
-    let result = warehouse.execute_query(&sql).await.ok()?;
-    let cell = result.rows.first().and_then(|r| r.first())?;
-    cell.as_str().and_then(super::run::parse_timestamp_cell)
 }
 
 /// `SELECT COUNT(*) FROM <ref>`. `None` on any failure / unparseable value.

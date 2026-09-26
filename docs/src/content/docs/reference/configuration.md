@@ -900,21 +900,21 @@ To fan out by **client/tenant** rather than by pipeline name, use the per-invoca
 Skip rebuilding a transformation model when neither its logic nor its upstream data appears to have moved since the last successful build. The gate is off unless you turn it on.
 
 :::caution[Best-effort, not a result-equivalence guarantee]
-Skipping is a best-effort optimization. It is **not** a promise that a fresh rebuild would produce identical bytes. It rests on two heuristics: a cosmetic-invariant IR hash for the logic, and `MAX(ts)` or rowcount movement for the upstream data. Every field defaults to the safe no-skip choice, and **any** missing, unreadable, or ambiguous input rebuilds. The feature stays off until you set `skip_unchanged = true` or pass `--skip-unchanged`.
+Skipping is a best-effort optimization. It is **not** a promise that a fresh rebuild would produce identical bytes. It rests on two heuristics: a cosmetic-invariant IR hash for the logic, and rowcount movement for the upstream data. Every field defaults to the safe no-skip choice, and **any** missing, unreadable, or ambiguous input rebuilds. The feature stays off until you set `skip_unchanged = true` or pass `--skip-unchanged`.
 :::
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `skip_unchanged` | bool | `false` | Master switch for the gate. `false` ⇒ every selected model always builds, exactly as before. The `--skip-unchanged` CLI flag turns the gate on for a single invocation regardless of this value; `--force-rebuild` overrides both. |
-| `skip_rowcount_fallback` | bool | `false` | Allow a rowcount-only (`COUNT(*)`) data-stability signal when an upstream has no tracked timestamp column. Default off: without this, a model whose upstreams are not watermarkable is never skip-eligible. Rowcount equality is weaker than a watermark — it can miss a same-size in-place `UPDATE` (or a matched insert+delete) that mutates values without changing the row count. |
-| `lag_tolerance_seconds` | integer | `0` | Treat an upstream `MAX(ts)` that moved by fewer than this many seconds as unchanged — the late-arriving-but-irrelevant micro-update analog of a freshness SLA threshold. Default `0`: any movement at all forces a rebuild. |
+| `skip_rowcount_fallback` | bool | `false` | Allow a rowcount (`COUNT(*)`) data-stability signal for raw-source upstreams. Default off: without this, a model that reads a raw source is never skipped. Rowcount equality is a weak signal. It can miss a same-size in-place `UPDATE` (or a matched insert+delete) that mutates values without changing the row count. |
+| `lag_tolerance_seconds` | integer | `0` | Has no effect today. It applied to an upstream `MAX(ts)` signal, and no skip-eligible strategy tracks a timestamp column any more (`incremental` is refused on transformation models with `E037`; `microbatch` is an alias of `time_interval`, which the gate does not cover). |
 | `strict_scheduling` | bool | `false` | Turn physical-read scheduling warnings into a run refusal. Rocky derives ordering edges from the physical `schema.table` names a model reads. It reports what it could not safely resolve: contradicting bare-read pairs, models whose reference extraction failed, colliding targets. `false` reports these as warnings and the run still exits `0`, so a consumer that ignores them can read a stale target and see success. `true` refuses the run instead. It lives on `[run]` rather than `[pipeline.NAME.execution]` because `rocky run --dag` derives ordering across pipelines, where a per-pipeline switch would have no single answer. |
 
 ```toml
 [run]
 skip_unchanged = true
 skip_rowcount_fallback = false   # default; only flip on if you accept the weaker signal
-lag_tolerance_seconds = 0        # default; any MAX(ts) movement rebuilds
+lag_tolerance_seconds = 0        # default; has no effect today
 strict_scheduling = false        # default; flip on for fail-closed ordering
 ```
 
