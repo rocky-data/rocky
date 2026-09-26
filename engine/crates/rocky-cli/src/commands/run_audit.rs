@@ -134,7 +134,15 @@ fn detect_triggering_identity() -> Option<String> {
 /// silently ignored — better to fall back to the env-detected default
 /// than to reject a run over a typo'd audit-stamp var.
 fn detect_session_source() -> SessionSource {
-    if let Ok(explicit) = std::env::var(ENV_ROCKY_SESSION_SOURCE) {
+    detect_session_source_from(|key| std::env::var(key).ok())
+}
+
+/// [`detect_session_source`] over an explicit lookup instead of the
+/// process environment. Tests use it so they never set
+/// `DAGSTER_PIPES_CONTEXT` process-wide: since #2164 a concurrent
+/// `rocky run` in another test would read it and refuse to run.
+fn detect_session_source_from(env: impl Fn(&str) -> Option<String>) -> SessionSource {
+    if let Some(explicit) = env(ENV_ROCKY_SESSION_SOURCE) {
         match explicit.to_ascii_lowercase().as_str() {
             "cli" => return SessionSource::Cli,
             "dagster" => return SessionSource::Dagster,
@@ -143,7 +151,7 @@ fn detect_session_source() -> SessionSource {
             _ => {}
         }
     }
-    if std::env::var(ENV_DAGSTER_PIPES_CONTEXT).is_ok() {
+    if env(ENV_DAGSTER_PIPES_CONTEXT).is_some() {
         return SessionSource::Dagster;
     }
     SessionSource::Cli
@@ -204,31 +212,15 @@ fn detect_hostname() -> String {
 mod tests {
     use super::*;
 
-    // The env-var tests mutate process-global state, including
-    // DAGSTER_PIPES_CONTEXT, which `pipes::tests` and
-    // `commands::run_local::tests` also read/set. `cargo test` runs a
-    // crate's tests in parallel by default, so all three modules
-    // serialise through the ONE shared `crate::testing::PIPES_ENV_LOCK`
-    // rather than a per-file lock — see that lock's doc comment: a
-    // per-file lock here left this module racing against the other two,
-    // which a real run of `run_local`'s #2166 tests then hit.
-    use crate::testing::lock_pipes_env;
-
-    /// SAFETY: these tests run under `crate::testing::PIPES_ENV_LOCK`,
-    /// which serialises every Pipes-env-mutating test in the crate, not
-    /// just this module. Rust flags `std::env::set_var` as unsafe from
-    /// 2024 edition because it races with reads in other threads; the
-    /// lock closes that hole.
-    fn set_env(key: &str, value: &str) {
-        unsafe {
-            std::env::set_var(key, value);
-        }
-    }
-
-    fn remove_env(key: &str) {
-        unsafe {
-            std::env::remove_var(key);
-        }
+    /// A fake environment for [`detect_session_source_from`]. The
+    /// session-source tests never mutate process env vars — see that
+    /// function's doc comment.
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |key| map.get(key).cloned()
     }
 
     #[test]
@@ -246,54 +238,37 @@ mod tests {
 
     #[test]
     fn session_source_defaults_to_cli() {
-        let _g = lock_pipes_env();
-        remove_env(ENV_ROCKY_SESSION_SOURCE);
-        remove_env(ENV_DAGSTER_PIPES_CONTEXT);
-        assert_eq!(detect_session_source(), SessionSource::Cli);
+        assert_eq!(detect_session_source_from(env_of(&[])), SessionSource::Cli);
     }
 
     #[test]
     fn session_source_dagster_from_pipes_env() {
-        let _g = lock_pipes_env();
-        remove_env(ENV_ROCKY_SESSION_SOURCE);
-        set_env(ENV_DAGSTER_PIPES_CONTEXT, "{}");
-        assert_eq!(detect_session_source(), SessionSource::Dagster);
-        remove_env(ENV_DAGSTER_PIPES_CONTEXT);
+        assert_eq!(
+            detect_session_source_from(env_of(&[(ENV_DAGSTER_PIPES_CONTEXT, "{}")])),
+            SessionSource::Dagster
+        );
     }
 
     #[test]
     fn session_source_explicit_override() {
-        let _g = lock_pipes_env();
-        remove_env(ENV_DAGSTER_PIPES_CONTEXT);
-
-        set_env(ENV_ROCKY_SESSION_SOURCE, "http_api");
-        assert_eq!(detect_session_source(), SessionSource::HttpApi);
-
-        set_env(ENV_ROCKY_SESSION_SOURCE, "lsp");
-        assert_eq!(detect_session_source(), SessionSource::Lsp);
-
-        set_env(ENV_ROCKY_SESSION_SOURCE, "DAGSTER");
-        assert_eq!(detect_session_source(), SessionSource::Dagster);
-
+        let explicit = |v| detect_session_source_from(env_of(&[(ENV_ROCKY_SESSION_SOURCE, v)]));
+        assert_eq!(explicit("http_api"), SessionSource::HttpApi);
+        assert_eq!(explicit("lsp"), SessionSource::Lsp);
+        assert_eq!(explicit("DAGSTER"), SessionSource::Dagster);
         // Garbage value falls through to env-detected default.
-        set_env(ENV_ROCKY_SESSION_SOURCE, "garbage_value");
-        assert_eq!(detect_session_source(), SessionSource::Cli);
-
-        remove_env(ENV_ROCKY_SESSION_SOURCE);
+        assert_eq!(explicit("garbage_value"), SessionSource::Cli);
     }
 
     #[test]
     fn session_source_explicit_overrides_pipes_env() {
-        let _g = lock_pipes_env();
-        set_env(ENV_DAGSTER_PIPES_CONTEXT, "{}");
-        set_env(ENV_ROCKY_SESSION_SOURCE, "cli");
         assert_eq!(
-            detect_session_source(),
+            detect_session_source_from(env_of(&[
+                (ENV_DAGSTER_PIPES_CONTEXT, "{}"),
+                (ENV_ROCKY_SESSION_SOURCE, "cli"),
+            ])),
             SessionSource::Cli,
             "explicit ROCKY_SESSION_SOURCE=cli must override DAGSTER_PIPES_CONTEXT"
         );
-        remove_env(ENV_DAGSTER_PIPES_CONTEXT);
-        remove_env(ENV_ROCKY_SESSION_SOURCE);
     }
 
     #[test]

@@ -302,8 +302,8 @@ impl SqlDialect for RecordingDialect {
 }
 
 /// Serialises every test in this crate that mutates `DAGSTER_PIPES_CONTEXT`
-/// / `DAGSTER_PIPES_MESSAGES` — `pipes::tests`, `commands::run_local::tests`,
-/// and `commands::run_audit::tests` all read or set one or both, and
+/// / `DAGSTER_PIPES_MESSAGES` — `pipes::tests` and `commands::run_local::tests`
+/// read or set one or both (`commands::run_audit::tests` did until #2164), and
 /// `cargo test` runs a crate's tests in parallel threads within ONE process
 /// by default, so env vars are shared, process-global state across all of
 /// them. Each of those three modules used to keep its OWN private lock,

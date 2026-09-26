@@ -2778,7 +2778,7 @@ pub async fn run(
     // DAGSTER_PIPES_CONTEXT and DAGSTER_PIPES_MESSAGES are set; we
     // emit structured events on the messages channel as the run
     // progresses. Outside Pipes mode, this is a no-op.
-    let pipes = crate::pipes::PipesEmitter::detect();
+    let pipes = crate::pipes::PipesEmitter::detect()?;
     if let Some(p) = &pipes {
         p.log("INFO", "rocky run starting");
     }

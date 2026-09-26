@@ -215,6 +215,12 @@ no external dependency. On a run it:
    protocol params, and writes `opened` immediately (`params: {"extras":
    {}}`) — the handshake Dagster's reader needs before it will report
    anything at all.
+   If `DAGSTER_PIPES_CONTEXT` is set but the channel cannot open, the run
+   stops before it copies anything and exits non-zero. The error names the cause.
+   The causes are: `DAGSTER_PIPES_MESSAGES` is missing or does not decode,
+   the channel is not a file path or `stderr` (S3 or GCS writers, for
+   example), or the file does not open. Unset `DAGSTER_PIPES_CONTEXT` to
+   run without Pipes.
 3. Emits one JSON-line message per progress event:
    - `log` at run start and completion
    - `report_asset_materialization` per `output.materializations` entry
@@ -236,8 +242,8 @@ no external dependency. On a run it:
      `AssetObservation` with `rocky/drift_*` metadata on receipt,
      matching what `execution_mode: streaming` yields.
    - `closed` at run end
-4. When env vars are not set, the entire path is a no-op; zero
-   overhead for non-Dagster callers.
+4. When `DAGSTER_PIPES_CONTEXT` is not set, the entire path is a no-op;
+   zero overhead for non-Dagster callers.
 
 The current engine emission is **batch at end of run**. Events emit right
 before the JSON output payload, not as each table completes. A future

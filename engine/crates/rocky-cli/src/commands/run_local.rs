@@ -126,7 +126,7 @@ pub async fn run_transformation(
 ) -> Result<()> {
     let start = Instant::now();
 
-    let pipes = crate::pipes::PipesEmitter::detect();
+    let pipes = crate::pipes::PipesEmitter::detect()?;
     if let Some(p) = &pipes {
         p.log("INFO", "rocky run starting (transformation pipeline)");
     }
@@ -562,7 +562,7 @@ pub async fn run_quality(
 ) -> Result<()> {
     let start = Instant::now();
 
-    let pipes = crate::pipes::PipesEmitter::detect();
+    let pipes = crate::pipes::PipesEmitter::detect()?;
     if let Some(p) = &pipes {
         p.log("INFO", "rocky run starting (quality pipeline)");
     }
@@ -1393,7 +1393,7 @@ pub async fn run_snapshot(
 ) -> Result<()> {
     let start = Instant::now();
 
-    let pipes = crate::pipes::PipesEmitter::detect();
+    let pipes = crate::pipes::PipesEmitter::detect()?;
     if let Some(p) = &pipes {
         p.log("INFO", "rocky run starting (snapshot pipeline)");
     }
