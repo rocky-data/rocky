@@ -6,6 +6,27 @@ from __future__ import annotations
 from pydantic import AwareDatetime, BaseModel, conint
 
 
+class LostRunRecord(BaseModel):
+    """
+    A replication run with a progress checkpoint and no run record (#1884).
+    """
+
+    pipeline: str | None = None
+    """
+    The pipeline named in the checkpoint's scope, when it recorded one.
+    """
+    run_id: str
+    started_at: AwareDatetime
+    tables_copied: conint(ge=0)
+    """
+    How many of them the checkpoint records as copied (`Success`).
+    """
+    tables_planned: conint(ge=0)
+    """
+    How many tables the run planned to copy.
+    """
+
+
 class RecipeIdentityView(BaseModel):
     """
     The recipe-identity triple surfaced on a model record — the answer to "what exact program, over what inputs, in what environment produced this?".
@@ -125,5 +146,9 @@ class HistoryOutput(BaseModel):
 
     command: str
     count: conint(ge=0)
+    lost_run_records: list[LostRunRecord] | None = None
+    """
+    Replication runs that left a progress checkpoint but no run record (#1884), newest first. The run crashed, is still running, or its record write failed — on another pod, which sees only uploaded state, usually the last. Not counted in `count`. Omitted when empty. Transformation, quality and snapshot runs write no checkpoint, so a lost record of theirs does not appear here.
+    """
     runs: list[RunHistoryRecord]
     version: str

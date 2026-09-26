@@ -1,6 +1,44 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "LostRunRecord": {
+      "description": "A replication run with a progress checkpoint and no run record (#1884).",
+      "properties": {
+        "pipeline": {
+          "description": "The pipeline named in the checkpoint's scope, when it recorded one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "started_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "tables_copied": {
+          "description": "How many of them the checkpoint records as copied (`Success`).",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tables_planned": {
+          "description": "How many tables the run planned to copy.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "run_id",
+        "started_at",
+        "tables_copied",
+        "tables_planned"
+      ],
+      "type": "object"
+    },
     "RecipeIdentityView": {
       "description": "The recipe-identity triple surfaced on a model record — the answer to \"what exact program, over what inputs, in what environment produced this?\".\n\nRead back from the persisted [`rocky_core::state::ModelExecution`]. Every field is optional: a record written before the triple was captured (state schema predating it) or a failed execution carries none of them, and the input side is absent on the default run path (which observes no inputs). The whole object is omitted from JSON when nothing was recorded — see [`Self::from_execution`] — so output for pre-triple records is unchanged.",
       "properties": {
@@ -216,6 +254,13 @@
       "format": "uint",
       "minimum": 0.0,
       "type": "integer"
+    },
+    "lost_run_records": {
+      "description": "Replication runs that left a progress checkpoint but no run record (#1884), newest first. The run crashed, is still running, or its record write failed — on another pod, which sees only uploaded state, usually the last. Not counted in `count`. Omitted when empty. Transformation, quality and snapshot runs write no checkpoint, so a lost record of theirs does not appear here.",
+      "items": {
+        "$ref": "#/definitions/LostRunRecord"
+      },
+      "type": "array"
     },
     "runs": {
       "items": {

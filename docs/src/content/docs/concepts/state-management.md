@@ -288,6 +288,16 @@ circuit_breaker_threshold = 5
 | `"skip"` (default) | Log a warning, mark the run successful, leave remote state stale. The next run re-derives watermarks from target-table metadata. | Most callers — the de-facto pre-1.13 behaviour. Trades state durability for run liveness. |
 | `"fail"` | Propagate a `StateSyncError::RetryBudgetExhausted` or `CircuitOpen` to the caller; the run fails. | Strict environments where re-deriving watermarks is prohibitively expensive (long-running backfills, multi-hour syncs). |
 
+**A lost run record follows the same setting.** A run can finish and upload its state but fail to write its own run record, for example on a full disk. The upload still happens, so the watermarks travel. The exit code depends on `on_upload_failure`:
+
+| Mode | Exit when the run record did not persist |
+|---|---|
+| `"skip"` (default) | 0, with a warning |
+| `"fail"` | Non-zero, after the upload |
+| Any mode, on a governed run (`rocky apply`) | Non-zero, after the upload |
+
+A replication run's progress checkpoint travels with the upload, so `rocky history` on any machine lists the run under [`lost_run_records`](/reference/commands/administration/#runs-with-no-run-record). A transformation run writes no checkpoint, so its lost record shows only as the warning and the exit code.
+
 **Terminal outcomes are structured.** Every `state.upload` and `state.download` event carries an `outcome` field. Alert on it instead of matching log messages with a regular expression:
 
 | `outcome` | Meaning |

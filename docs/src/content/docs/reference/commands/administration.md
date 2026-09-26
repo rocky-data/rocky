@@ -65,6 +65,27 @@ rocky history
 }
 ```
 
+#### Runs with no run record
+
+A replication run writes a progress checkpoint before its first copy. The checkpoint travels with the uploaded state. If the run then loses its run record, the checkpoint stays behind with no record next to it. `rocky history` lists those runs under `lost_run_records`:
+
+```json
+"lost_run_records": [
+  { "run_id": "run_20260402_010000", "started_at": "2026-04-02T01:00:00Z",
+    "pipeline": "shopify", "tables_planned": 20, "tables_copied": 20 }
+]
+```
+
+A run appears here for one of three reasons:
+
+- it crashed;
+- it is still running;
+- its record write failed (see [`on_upload_failure`](/concepts/state-management/#retry-and-failure-policy)).
+
+On another machine, which sees only uploaded state, the last reason is the usual one. The field is left out when the list is empty. `count` does not include these runs. A trigger filter never matches them, because a checkpoint records no trigger.
+
+Transformation, quality and snapshot runs write no checkpoint. A lost record of theirs does not appear here.
+
 Show one run by id. The document has the list's shape with `count` set to `1`; add `--audit` for its governance trail:
 
 ```bash

@@ -4045,6 +4045,44 @@ impl StateStore {
         Ok(entries.len())
     }
 
+    /// The run-progress checkpoints that have NO run record, newest first, at
+    /// most `limit` of them, with their per-table entries stitched in (#1884).
+    ///
+    /// A replication run writes its checkpoint header before its first copy,
+    /// and the header travels in the state upload. A header without a record
+    /// therefore marks a run whose record is missing: it crashed, it is still
+    /// running, or its record write failed. On another pod, which only sees
+    /// uploaded state, the last case is the usual one. Retention never sweeps
+    /// such a header (it follows `run_history` keys), so the mark stays.
+    /// Transformation, quality and snapshot runs write no header, so their
+    /// lost records do not show here.
+    pub fn list_record_less_run_progress(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RunProgress>, StateError> {
+        let txn = self.db.begin_read()?;
+        let headers = txn.open_table(RUN_PROGRESS)?;
+        let records = txn.open_table(RUN_HISTORY)?;
+        let entries_table = txn.open_table(RUN_PROGRESS_ENTRIES)?;
+        let mut lost = Vec::new();
+        for entry in headers.iter()? {
+            let (key, value) = entry?;
+            if records.get(key.value())?.is_some() {
+                continue;
+            }
+            lost.push(serde_json::from_slice::<RunProgress>(value.value())?);
+        }
+        lost.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        lost.truncate(limit);
+        for progress in &mut lost {
+            let entries = Self::read_progress_entries(&entries_table, &progress.run_id)?;
+            if !entries.is_empty() {
+                progress.tables = entries;
+            }
+        }
+        Ok(lost)
+    }
+
     /// The table keys that a run other than `current_run_id` checkpointed
     /// `Success` without a confirmed watermark flush (#1854).
     ///
@@ -11051,6 +11089,42 @@ mod tests {
         assert_eq!(latest.run_id, "run-002");
         assert_eq!(latest.tables.len(), 1);
         assert_eq!(latest.tables[0].table_key, "cat.sch.new");
+    }
+
+    /// #1884 B: a checkpoint header with no run record is listed; one whose
+    /// run recorded is not.
+    #[test]
+    fn test_list_record_less_run_progress() {
+        let (store, _dir) = temp_store();
+        store
+            .init_run_progress("recorded", &planned_keys(1), None)
+            .unwrap();
+        store
+            .init_run_progress("lost", &planned_keys(2), None)
+            .unwrap();
+        store
+            .record_table_progress(
+                "lost",
+                &progress_entry(0, "cat.sch.t0", TableStatus::Success),
+            )
+            .unwrap();
+        let record: RunRecord = serde_json::from_value(serde_json::json!({
+            "run_id": "recorded",
+            "started_at": "2026-08-30T00:00:00Z",
+            "finished_at": "2026-08-30T00:01:00Z",
+            "status": "Success",
+            "models_executed": [],
+            "trigger": "Manual",
+            "config_hash": "test",
+        }))
+        .unwrap();
+        store.record_run(&record).unwrap();
+
+        let lost = store.list_record_less_run_progress(50).unwrap();
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].run_id, "lost");
+        assert_eq!(lost[0].tables.len(), 1, "the entries are stitched in");
+        assert!(store.list_record_less_run_progress(0).unwrap().is_empty());
     }
 
     /// #1854: a header written before `flush_confirmed` existed reads as

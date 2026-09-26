@@ -389,6 +389,11 @@ pub(crate) enum SessionDisposition {
 /// The custody the sentinel now carries is what decides. Every other error is
 /// a pre-terminal hard exit and abandons, as before.
 pub(crate) fn session_disposition(error: &anyhow::Error) -> SessionDisposition {
+    // A succeeded run whose record alone was lost keeps its upload (#1884):
+    // the session carries its watermarks and other committed state.
+    if error.downcast_ref::<RunRecordNotPersisted>().is_some() {
+        return SessionDisposition::Finalize;
+    }
     let custody = error
         .downcast_ref::<RunFailed>()
         .map(|e| e.custody)
@@ -1228,11 +1233,14 @@ pub(crate) fn capture_run_output_for_test(_run_id: &str, _output: &RunOutput) {}
 /// sentinel as a [`RecordCustody`] so [`session_disposition`] decides on the
 /// fact rather than on the error type (#1836).
 ///
-/// A SUCCESSFUL run whose record write failed still finalizes and still exits
-/// 0. That is deliberate, not an oversight: its session also carries the run's
-/// other state writes, and abandoning to punish a lost record would discard
-/// those too. Making that run non-zero changes `rocky run`'s exit contract and
-/// is #1836's open half.
+/// A SUCCESSFUL run whose record write failed still finalizes: its session
+/// also carries the run's other state writes, and abandoning to punish a lost
+/// record would discard those too. Its exit code follows
+/// `[state] on_upload_failure` (#1884, option D): `skip` exits 0 with the
+/// warning below, while `fail`, or a governed run, exits non-zero after the
+/// upload — see [`ensure_run_record_persisted`]. A replication run's
+/// `run_progress` header, written before its first copy, rides the same
+/// upload, so `rocky history` on any pod shows the run as a lost record.
 pub(crate) fn persist_run_record(
     state_store: Option<&StateStore>,
     output: &RunOutput,
@@ -1285,16 +1293,93 @@ pub(crate) fn persist_run_record(
     #[cfg(not(test))]
     let written = store.record_run(&record);
     match written {
-        Ok(()) => true,
+        Ok(()) => {
+            // A later re-persist of the same run (the verify-after branch
+            // writes twice) that lands clears an earlier loss.
+            lost_run_records().remove(run_id);
+            true
+        }
         Err(e) => {
             warn!(
                 error = %e,
                 run_id = run_id,
                 "failed to record run to state store — history/replay/cost/trace will not surface this run"
             );
+            lost_run_records().insert(run_id.to_string());
             false
         }
     }
+}
+
+/// The run ids whose record write failed in this process (#1884).
+///
+/// [`persist_run_record`] is called from a dozen sites across the run arms,
+/// several of them nested in their own async blocks, and it is the one place
+/// that knows a write failed. It notes the loss here; the exit choke-point at
+/// the end of [`run`] takes it back out, AFTER every arm has made its terminal
+/// upload, and decides the exit code ([`ensure_run_record_persisted`]). Keyed
+/// by run id, which is unique per invocation, so concurrent runs in one
+/// process (tests, an embedder) cannot see each other's loss.
+fn lost_run_records() -> std::sync::MutexGuard<'static, std::collections::HashSet<String>> {
+    static LOST: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(Default::default);
+    LOST.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Sentinel error: a run that otherwise SUCCEEDED could not write its run
+/// record, and the configuration asks for that to fail the run (#1884,
+/// ruling 2026-09-26, option D).
+///
+/// Returned only after the run's state was uploaded — the watermarks and
+/// other committed state still travel, so another pod does not re-copy or
+/// duplicate rows. The JSON `RunOutput` was already emitted with the run's
+/// own status. Exit 1 (no `main.rs` mapping). `session_disposition` reads it
+/// as `Finalize` for any caller that still holds a session.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "run {run_id} finished and its state was uploaded, but its run record could not be \
+     written to the state store: `rocky history`, `replay`, `trace`, `cost` and schedule \
+     `after` / `freshness` demands will not see this run. Exiting non-zero because {reason}. \
+     Check the state store's disk space and permissions; the warning above names the write \
+     error"
+)]
+pub struct RunRecordNotPersisted {
+    pub run_id: String,
+    /// Why the loss fails the run: `[state] on_upload_failure = "fail"`, or a
+    /// governed run.
+    pub reason: &'static str,
+}
+
+/// Decide the exit of a run whose body returned `Ok` (#1884, option D).
+///
+/// `[state] on_upload_failure = "skip"` (the default) keeps today's contract:
+/// the lost record is a warning and the run exits 0. Under `"fail"`, or on a
+/// governed run (`rocky apply`), a lost record fails the run. Either way the
+/// upload has already happened; only the exit code differs.
+fn ensure_run_record_persisted(
+    run_id: &str,
+    on_upload_failure: rocky_core::config::StateUploadFailureMode,
+    governed: bool,
+) -> Result<()> {
+    if !lost_run_records().remove(run_id) {
+        return Ok(());
+    }
+    let reason = if governed {
+        "this is a governed run"
+    } else {
+        match on_upload_failure {
+            rocky_core::config::StateUploadFailureMode::Fail => {
+                "`[state] on_upload_failure = \"fail\"`"
+            }
+            rocky_core::config::StateUploadFailureMode::Skip => return Ok(()),
+        }
+    };
+    Err(RunRecordNotPersisted {
+        run_id: run_id.to_string(),
+        reason,
+    }
+    .into())
 }
 
 /// Context captured at idempotency claim time so the finalize path (every
@@ -7017,6 +7102,18 @@ pub async fn run(
                 .await;
         }
     }
+
+    // #1884 (option D): a run whose record write failed. Every arm has made
+    // its terminal upload by now, so the state it carries (watermarks above
+    // all) has travelled; only the exit code is decided here. Read even on an
+    // `Err` so the loss never outlives this run in the process-wide set.
+    let record_check = ensure_run_record_persisted(
+        &run_id,
+        loaded.config.state.on_upload_failure,
+        // Governed ⇔ `governed_ctx` (the arms key `Durable` on the same).
+        governed_ctx.is_some(),
+    );
+    let run_result = run_result.and(record_check);
 
     // Every exit of the body block ran (or no-oped) past the idempotency
     // gate; the skip terminations returned from `run()` directly, above.
@@ -16433,6 +16530,222 @@ max_retries = 0
                 rocky_core::state_sync::StateAuthority::FreshStart
             ),
             "the session must abandon, not publish a ledger without the run: {authority:?}"
+        );
+    }
+
+    /// Pod A of `harness` runs a replication pipeline that SUCCEEDS: one
+    /// DuckDB source table copied in full. `on_upload_failure` is the
+    /// `[state]` mode under test (#1884). Returns what `run` returned.
+    fn run_succeeding_replication_on_pod_a(
+        rt: &tokio::runtime::Runtime,
+        harness: &rocky_core::test_harness::CrossPodHarness,
+        project: &std::path::Path,
+        run_id: &str,
+        on_upload_failure: &str,
+    ) -> anyhow::Result<super::RunTermination> {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let db_path = project.join("rep.duckdb");
+        rt.block_on(async {
+            let warehouse = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+            for sql in [
+                "CREATE SCHEMA raw__acme",
+                "CREATE TABLE raw__acme.orders AS SELECT 1 AS id",
+            ] {
+                warehouse.execute_statement(sql).await.unwrap();
+            }
+        });
+        let config_path = project.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = '{}'
+
+[pipeline.rep]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.rep.source.discovery]
+adapter = "default"
+
+[pipeline.rep.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.rep.target]
+adapter = "default"
+catalog_template = "rep"
+schema_template = "staging__{{source}}"
+
+[pipeline.rep.target.governance]
+auto_create_schemas = true
+
+[state]
+backend = "s3"
+s3_bucket = "test"
+on_upload_failure = "{on_upload_failure}"
+
+[state.retry]
+max_retries = 0
+"#,
+                db_path.display(),
+            ),
+        )
+        .unwrap();
+        rt.block_on(async {
+            let loaded = std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+            );
+            super::run(
+                &config_path,
+                loaded,
+                None,
+                Some("rep"),
+                &harness.pod_a.state_path,
+                None,
+                true,
+                None,
+                false,
+                None,
+                false,
+                None,
+                &PartitionRunOptions::default(),
+                None,
+                None,
+                None,
+                None,
+                &DeferOptions::default(),
+                &SkipRunOptions::default(),
+                &rocky_core::run_vars::RunVars::new(),
+                Some(run_id),
+                None,
+                false,
+                None,
+            )
+            .await
+        })
+    }
+
+    /// #1884, ruling 2026-09-26 (D + B). A replication run SUCCEEDS but its
+    /// record write fails. Under both `[state] on_upload_failure` modes the
+    /// run keeps its upload, so pod B sees the run's checkpoint header — and
+    /// no record, which `rocky history` reports as a lost run record. Only
+    /// the exit differs: `skip` exits 0 as before, `fail` exits non-zero.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn a_succeeded_replication_whose_record_did_not_land_uploads_and_follows_on_upload_failure() {
+        use rocky_core::test_harness::CrossPodHarness;
+
+        for mode in ["skip", "fail"] {
+            let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+            let harness = CrossPodHarness::new_s3_like();
+            let project = tempfile::tempdir().unwrap();
+            let run_id = format!("replication-record-lost-{mode}");
+            let rt = remote_state_test_runtime();
+
+            *super::FAIL_RECORD_WRITE_FOR_TEST.lock().unwrap() = Some(run_id.clone());
+            let outcome =
+                run_succeeding_replication_on_pod_a(&rt, &harness, project.path(), &run_id, mode);
+            *super::FAIL_RECORD_WRITE_FOR_TEST.lock().unwrap() = None;
+
+            match mode {
+                "skip" => {
+                    outcome.expect("under `skip` a lost record warns and exits 0, as before");
+                }
+                _ => {
+                    let err = outcome.expect_err("under `fail` a lost record fails the run");
+                    let lost = err
+                        .downcast_ref::<super::RunRecordNotPersisted>()
+                        .expect("the typed sentinel");
+                    assert_eq!(lost.run_id, run_id);
+                    assert_eq!(
+                        super::session_disposition(&err),
+                        super::SessionDisposition::Finalize
+                    );
+                    assert!(format!("{err:#}").contains("on_upload_failure"), "{err:#}");
+                }
+            }
+
+            // Pod B, a fresh process elsewhere: the upload happened.
+            let authority = rt
+                .block_on(harness.download(&harness.pod_b))
+                .expect("pod B downloads the shared state");
+            assert!(
+                matches!(
+                    authority,
+                    rocky_core::state_sync::StateAuthority::Authoritative
+                ),
+                "[{mode}] the run keeps its upload: {authority:?}"
+            );
+            let remote = harness.open_store(&harness.pod_b);
+            assert!(remote.get_run(&run_id).unwrap().is_none());
+            let header = remote
+                .get_run_progress(&run_id)
+                .unwrap()
+                .expect("the checkpoint header rides the upload");
+            assert!(
+                header.flush_confirmed,
+                "[{mode}] the watermark flush landed and travelled"
+            );
+            drop(remote);
+            let history =
+                super::super::history::history_runs_output(&harness.pod_b.state_path, None, false)
+                    .unwrap();
+            assert!(history.runs.iter().all(|r| r.run_id != run_id));
+            let lost: Vec<&str> = history
+                .lost_run_records
+                .iter()
+                .map(|l| l.run_id.as_str())
+                .collect();
+            assert_eq!(
+                lost,
+                vec![run_id.as_str()],
+                "[{mode}] history shows the lost record"
+            );
+            assert_eq!(history.lost_run_records[0].pipeline.as_deref(), Some("rep"));
+            assert_eq!(history.lost_run_records[0].tables_copied, 1);
+        }
+    }
+
+    /// #1884 D, the negative control: a record that lands leaves the exit of
+    /// a successful run untouched under `fail`, and `rocky history` lists no
+    /// lost record.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn a_succeeded_replication_whose_record_landed_exits_zero_under_fail() {
+        use rocky_core::test_harness::CrossPodHarness;
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let project = tempfile::tempdir().unwrap();
+        let rt = remote_state_test_runtime();
+        run_succeeding_replication_on_pod_a(
+            &rt,
+            &harness,
+            project.path(),
+            "replication-record-landed",
+            "fail",
+        )
+        .expect("the record landed; the run succeeds");
+        let authority = rt.block_on(harness.download(&harness.pod_b)).unwrap();
+        assert!(matches!(
+            authority,
+            rocky_core::state_sync::StateAuthority::Authoritative
+        ));
+        let history =
+            super::super::history::history_runs_output(&harness.pod_b.state_path, None, false)
+                .unwrap();
+        assert!(history.lost_run_records.is_empty());
+        assert!(
+            history
+                .runs
+                .iter()
+                .any(|r| r.run_id == "replication-record-landed")
         );
     }
 

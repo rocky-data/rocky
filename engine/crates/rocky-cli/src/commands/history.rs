@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use rocky_core::state::{RunRecord, SessionSource, StateStore};
 
 use crate::output::{
-    HistoryOutput, ModelExecutionRecord, ModelHistoryOutput, RecipeExecutionRecord,
+    HistoryOutput, LostRunRecord, ModelExecutionRecord, ModelHistoryOutput, RecipeExecutionRecord,
     RecipeHistoryOutput, RecipeIdentityView, RollingDimension, RollingStats, RunHistoryRecord,
     RunModelRecord, print_json,
 };
@@ -193,12 +193,42 @@ pub fn history_runs_output_filtered(
         .iter()
         .map(|r| record_to_history(r, audit))
         .collect();
+    // A checkpoint carries no trigger, so a trigger filter cannot match one.
+    let lost_run_records = match trigger {
+        Some(_) => Vec::new(),
+        None => lost_run_records(&store, since_ts)?,
+    };
     Ok(HistoryOutput {
         version: VERSION.to_string(),
         command: "history".to_string(),
         count: runs.len(),
         runs,
+        lost_run_records,
     })
+}
+
+/// The replication runs whose checkpoint has no run record (#1884, option B),
+/// within the same 50-run window and `--since` cut as the records.
+fn lost_run_records(
+    store: &StateStore,
+    since: Option<DateTime<Utc>>,
+) -> Result<Vec<LostRunRecord>> {
+    Ok(store
+        .list_record_less_run_progress(50)?
+        .into_iter()
+        .filter(|p| since.is_none_or(|ts| p.started_at >= ts))
+        .map(|p| LostRunRecord {
+            tables_copied: p
+                .tables
+                .iter()
+                .filter(|t| t.status == rocky_core::state::TableStatus::Success)
+                .count(),
+            tables_planned: p.total_tables,
+            pipeline: p.scope.map(|scope| scope.pipeline),
+            started_at: p.started_at,
+            run_id: p.run_id,
+        })
+        .collect())
 }
 
 /// One run by id, as `rocky history --run <id>` prints it: a
@@ -217,6 +247,7 @@ pub fn history_run_output(state_path: &Path, run_id: &str, audit: bool) -> Resul
         command: "history".to_string(),
         count: runs.len(),
         runs,
+        lost_run_records: Vec::new(),
     })
 }
 
@@ -484,6 +515,24 @@ fn print_runs_table(output: &HistoryOutput) {
         );
     }
     println!("\nTotal runs: {}", output.runs.len());
+    if output.lost_run_records.is_empty() {
+        return;
+    }
+    println!(
+        "\nRuns with no run record ({}): a replication run left a checkpoint, then crashed, \
+         is still running, or failed to write its record:",
+        output.lost_run_records.len()
+    );
+    for lost in &output.lost_run_records {
+        println!(
+            "{:<24} {:<24} {:<16} {}/{} tables copied",
+            lost.run_id,
+            lost.started_at.format("%Y-%m-%d %H:%M:%S"),
+            lost.pipeline.as_deref().unwrap_or("-"),
+            lost.tables_copied,
+            lost.tables_planned,
+        );
+    }
 }
 
 fn print_audit_table(runs: &[RunRecord]) {

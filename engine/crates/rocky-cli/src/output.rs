@@ -2619,6 +2619,28 @@ pub struct HistoryOutput {
     pub command: String,
     pub runs: Vec<RunHistoryRecord>,
     pub count: usize,
+    /// Replication runs that left a progress checkpoint but no run record
+    /// (#1884), newest first. The run crashed, is still running, or its
+    /// record write failed — on another pod, which sees only uploaded state,
+    /// usually the last. Not counted in `count`. Omitted when empty.
+    /// Transformation, quality and snapshot runs write no checkpoint, so a
+    /// lost record of theirs does not appear here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lost_run_records: Vec<LostRunRecord>,
+}
+
+/// A replication run with a progress checkpoint and no run record (#1884).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LostRunRecord {
+    pub run_id: String,
+    pub started_at: DateTime<Utc>,
+    /// The pipeline named in the checkpoint's scope, when it recorded one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
+    /// How many tables the run planned to copy.
+    pub tables_planned: usize,
+    /// How many of them the checkpoint records as copied (`Success`).
+    pub tables_copied: usize,
 }
 
 /// JSON output for `rocky history --model <name>`.
