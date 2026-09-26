@@ -12,7 +12,8 @@
 //! [`rocky_sql::validation::validate_identifier`]. A `Token::Ident` cannot
 //! contain quotes, semicolons, dots, spaces, or any other SQL metacharacter.
 //!
-//! String literals are escaped (`'` → `''`) at the `Expr::StringLit` site;
+//! String literals are escaped (`'` → `''`) at the `Expr::StringLit` site,
+//! and the parser refuses a backslash in one (E040), so that is the whole escape;
 //! number and date literals are grammar-constrained. No `validate_*` call is
 //! threaded through this module because there is no reachable path from the
 //! parser to a `format!` here that admits an unsafe identifier.
@@ -444,6 +445,9 @@ fn lower_expr(expr: &Expr) -> String {
     match expr {
         Expr::Column(name) => name.clone(),
         Expr::QualifiedColumn(alias, col) => format!("{alias}.{col}"),
+        // Doubling the quote is the whole escape because the parser refuses
+        // a backslash in a string literal (E040, #1596). On Snowflake,
+        // Databricks and BigQuery a backslash would escape the next quote.
         Expr::StringLit(s) => {
             let escaped = s.replace('\'', "''");
             format!("'{escaped}'")

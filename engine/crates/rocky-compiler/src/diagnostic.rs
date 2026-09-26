@@ -168,6 +168,17 @@ pub const E038: &str = "E038";
 /// provenance, so their unresolved references remain conservative `Unknown`s.
 pub const E039: &str = "E039";
 
+/// A `.rocky` string literal contains a backslash (#1596).
+///
+/// Raised by the DSL parser (`rocky_lang::error::ParseError::BackslashInStringLiteral`),
+/// so it reaches `rocky compile` as a parse failure of that file. The DSL has
+/// no escape sequences, and lowering runs before a warehouse is known.
+/// Snowflake, Databricks and BigQuery read a backslash in a SQL literal as an
+/// escape; DuckDB and Trino do not. No one SQL text keeps the value on all
+/// five, so the literal is refused rather than silently changed. The escape
+/// hatch is a `.sql` model.
+pub const E040: &str = rocky_lang::error::BACKSLASH_IN_STRING_LITERAL;
+
 // Warnings
 /// Unused model (no downstream consumers).
 pub const W001: &str = "W001";

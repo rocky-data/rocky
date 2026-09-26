@@ -4013,6 +4013,7 @@ fn lsp_range_from_parse_error(err: &rocky_lang::ParseError, source: &str) -> (Ra
             Some(*offset),
             format!("expression nested too deeply: depth {depth} exceeds limit {limit}"),
         ),
+        ParseError::BackslashInStringLiteral { offset, .. } => (Some(*offset), err.to_string()),
     };
 
     let position = offset

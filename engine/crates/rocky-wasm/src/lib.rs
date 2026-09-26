@@ -172,6 +172,11 @@ pub fn get_parse_errors(source: &str) -> String {
                     format!("expression nested no deeper than {limit}"),
                     format!("depth {depth}"),
                 ),
+                rocky_lang::ParseError::BackslashInStringLiteral { offset, .. } => (
+                    *offset,
+                    "string literal without a backslash".to_string(),
+                    "backslash".to_string(),
+                ),
             };
 
             // Convert byte offset to line/column.
@@ -239,6 +244,11 @@ pub fn compile_rocky_model(source: &str) -> String {
                     *offset,
                     format!("expression nested no deeper than {limit}"),
                     format!("depth {depth}"),
+                ),
+                rocky_lang::ParseError::BackslashInStringLiteral { offset, .. } => (
+                    *offset,
+                    "string literal without a backslash".to_string(),
+                    "backslash".to_string(),
                 ),
             };
             let (line, col) = byte_offset_to_line_col(source, offset);

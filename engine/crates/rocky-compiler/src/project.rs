@@ -1152,6 +1152,34 @@ mod tests {
         assert_eq!(models[0].config.name, "agg");
     }
 
+    /// A `.rocky` model with a backslash in a string literal fails to load
+    /// with E040, naming the file, instead of lowering to SQL that changes
+    /// the value on Snowflake, Databricks and BigQuery (#1596).
+    #[test]
+    fn a_rocky_string_literal_with_a_backslash_fails_with_e040() {
+        let _guard = crate::salsa_compile::tests::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::write(
+            d.join("paths.rocky"),
+            "from files\nwhere path == 'C:\\tmp\\'\nselect { path }\n",
+        )
+        .unwrap();
+
+        let err = load_dir_models(d, None).expect_err("a backslash is refused");
+        let ProjectError::RockyParse { path, reason } = &err else {
+            panic!("expected RockyParse, got {err:?}");
+        };
+        assert!(path.ends_with("paths.rocky"), "{path}");
+        assert!(
+            reason.starts_with(&format!("{}: ", crate::diagnostic::E040)),
+            "{reason}"
+        );
+        assert!(reason.contains(".sql model"), "{reason}");
+    }
+
     /// A `.rocky` DSL model inherits the project `[freshness]` block, with
     /// and without a `.toml` sidecar.
     ///

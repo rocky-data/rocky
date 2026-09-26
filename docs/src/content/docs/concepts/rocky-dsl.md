@@ -197,6 +197,12 @@ from source.fivetran.orders
 replicate
 ```
 
+## String literals
+
+Write a string in `"…"` or `'…'`. A string has no escape sequences. A string must not contain a backslash: Rocky refuses it with `E040`.
+
+The reason is the warehouse. Snowflake, Databricks and BigQuery read a backslash in a SQL literal as an escape. DuckDB and Trino do not. So no one SQL literal keeps the value on every warehouse. To use a backslash, write the model as a `.sql` model.
+
 ## Date literals
 
 The `@` prefix creates date literals without quoting:

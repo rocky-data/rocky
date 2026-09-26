@@ -35,7 +35,30 @@ pub enum ParseError {
         limit: usize,
         offset: usize,
     },
+
+    /// A string literal holds a backslash (#1596). Diagnostic code
+    /// [`BACKSLASH_IN_STRING_LITERAL`].
+    ///
+    /// The DSL defines no escape sequences, so the backslash is part of the
+    /// value. The lowered SQL literal cannot carry it on every warehouse:
+    /// Snowflake, Databricks and BigQuery read a backslash in `'...'` as an
+    /// escape, DuckDB and Trino do not, and lowering runs before a warehouse
+    /// is known. So no single SQL text is right on all of them.
+    #[error(
+        "{BACKSLASH_IN_STRING_LITERAL}: string literal at offset {offset} contains a \
+         backslash. {BACKSLASH_REASON}"
+    )]
+    BackslashInStringLiteral { offset: usize, len: usize },
 }
+
+/// Diagnostic code for [`ParseError::BackslashInStringLiteral`]. Re-exported
+/// by `rocky-compiler` as `E040`.
+pub const BACKSLASH_IN_STRING_LITERAL: &str = "E040";
+
+/// Why a backslash is refused, and the escape hatch.
+const BACKSLASH_REASON: &str = "Rocky cannot lower it to one SQL literal that keeps \
+    the value on every warehouse: Snowflake, Databricks and BigQuery read a backslash \
+    as an escape. Write this model as a .sql model to control the literal yourself";
 
 /// A Rocky DSL parse error enriched with the original source text and file
 /// path, ready for miette rendering with source spans.
@@ -115,6 +138,14 @@ impl ParseError {
                      bindings or split the pipeline into smaller steps"
                         .to_string(),
                 ),
+            },
+            ParseError::BackslashInStringLiteral { offset, len } => RichParseError {
+                message: format!(
+                    "{BACKSLASH_IN_STRING_LITERAL}: string literal contains a backslash"
+                ),
+                src: named,
+                span: Some(miette::SourceSpan::new((*offset).into(), *len)),
+                help: Some(BACKSLASH_REASON.to_string()),
             },
         }
     }

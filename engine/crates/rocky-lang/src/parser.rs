@@ -875,7 +875,18 @@ impl Parser {
     fn parse_primary_inner(&mut self) -> Result<Expr, ParseError> {
         match self.peek().cloned() {
             Some(Token::StringLit(_)) => {
+                let offset = self.current_offset();
                 if let Some(Token::StringLit(s)) = self.advance() {
+                    // Refused here, not in `lower.rs`: this is the only place
+                    // an `Expr::StringLit` is built from source, and it knows
+                    // where the literal is (#1596).
+                    if s.contains('\\') {
+                        return Err(ParseError::BackslashInStringLiteral {
+                            offset,
+                            // The value plus its two quotes.
+                            len: s.len() + 2,
+                        });
+                    }
                     Ok(Expr::StringLit(s.to_string()))
                 } else {
                     unreachable!()
@@ -2626,5 +2637,40 @@ mod tests {
             }
             other => panic!("expected TooDeeplyNested, got {other:?}"),
         }
+    }
+
+    /// A backslash in a string literal is refused with E040, at the literal,
+    /// in either quote style (#1596).
+    ///
+    /// The DSL has no escapes, so `'C:\'` means the value `C:\`. Lowered as
+    /// `'C:\'`, Snowflake, Databricks and BigQuery read `\'` as an escaped
+    /// quote, so the literal never closes; lowered as `'C:\\'`, DuckDB and
+    /// Trino read two backslashes. Lowering has no warehouse to choose by.
+    #[test]
+    fn a_backslash_in_a_string_literal_is_refused() {
+        for (input, literal) in [
+            ("from files\nwhere path == 'C:\\'\n", "'C:\\'"),
+            ("from files\nwhere path == \"a\\d+\"\n", "\"a\\d+\""),
+        ] {
+            let err = parse(input).expect_err(input);
+            let ParseError::BackslashInStringLiteral { offset, len } = err else {
+                panic!("expected BackslashInStringLiteral, got {err:?}");
+            };
+            assert_eq!(&input[offset..offset + len], literal, "{input:?}");
+            let message = err.to_string();
+            assert!(message.starts_with("E040: "), "{message}");
+            assert!(message.contains(".sql model"), "{message}");
+
+            let rich = err.into_rich(input, "files.rocky");
+            assert_eq!(
+                rich.span.map(|s| (s.offset(), s.len())),
+                Some((offset, len))
+            );
+        }
+
+        // Control: the same literal without the backslash parses, and a quote
+        // inside the other quote style is still an ordinary value.
+        parse("from files\nwhere path == 'C:'\n").expect("no backslash");
+        parse("from files\nwhere name == \"it's\"\n").expect("apostrophe");
     }
 }

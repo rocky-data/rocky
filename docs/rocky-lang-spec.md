@@ -341,6 +341,12 @@ A string literal ends at its own quote character. It has no escape sequences,
 so write a double-quoted string to include an apostrophe. Rocky escapes the
 apostrophe for you: `"it's"` lowers to `'it''s'`.
 
+A string literal must not contain a backslash. Rocky refuses one with `E040`.
+Snowflake, Databricks and BigQuery read a backslash in a SQL literal as an
+escape. DuckDB and Trino do not. Lowering runs before Rocky knows the
+warehouse, so no one SQL literal keeps the value everywhere. To use a
+backslash, write the model as a `.sql` model.
+
 ### Date literals
 
 The `@` prefix marks a date literal. It accepts `@YYYY-MM-DD`, optionally
@@ -640,7 +646,7 @@ Terminals:
 |---|---|
 | `IDENT` | `[a-zA-Z_][a-zA-Z0-9_]*`, and not a reserved word |
 | `NUMBER` | `[0-9][0-9_]*` with an optional `.[0-9][0-9_]*` fraction |
-| `STRING` | `"…"` or `'…'`, with no escape sequences |
+| `STRING` | `"…"` or `'…'`, with no escape sequences and no backslash (`E040`) |
 | `DATE` | `@YYYY-MM-DD`, optionally `THH:MM:SS` and an optional `Z` |
 
 A `|` between two pipeline steps is skipped. A `--` comment and any whitespace
