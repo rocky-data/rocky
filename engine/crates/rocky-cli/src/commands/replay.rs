@@ -1829,6 +1829,20 @@ async fn replay_execute_warehouse_node(
                 )],
             );
         }
+        if !outcome.setting_dependent_refs.is_empty() {
+            return non_replayable_exec(
+                &cand.model_name,
+                cand.nondeterministic,
+                vec![format!(
+                    "table reference(s) {:?} read either a CTE or the recorded upstream of \
+                     that name. {} This replay reads a RECORDED run, so editing the model now \
+                     does not change what was recorded: fix the spelling, record a new run, and \
+                     replay that one",
+                    outcome.setting_dependent_refs,
+                    crate::commands::run::SETTING_DEPENDENT_CTE_REMEDY
+                )],
+            );
+        }
         if let Some(missing) = renames
             .keys()
             .find(|k| !outcome.rewritten_keys.contains(*k))

@@ -8995,10 +8995,10 @@ fn apply_defer_rewrite(
     // to the deferred model's target — a bare name matching a model name IS that
     // model (`resolve::classify_table_ref`).
     //
-    // Read that scope narrowly: there is no near-miss to report on this path and
-    // therefore no refusal, so the answer is acted on rather than checked. The
-    // note on `qualify_deferred_refs` says what is still assumed and what it
-    // costs.
+    // Read that scope narrowly: there is no near-miss to report on this path.
+    // The one refusal is a CTE whose binding to a deferred model's name depends
+    // on `QUOTED_IDENTIFIERS_IGNORE_CASE` (#1622); the note on
+    // `qualify_deferred_refs` says what is still assumed and what it costs.
     let case_rules = dialect_case_rules(dialect)?;
     let recursive_visibility = dialect_recursive_cte_visibility(dialect);
 
@@ -9026,7 +9026,15 @@ fn apply_defer_rewrite(
                 model.config.name,
             )
         })?;
-        model.sql = rewritten;
+        anyhow::ensure!(
+            rewritten.setting_dependent_refs.is_empty(),
+            "`--defer` cannot tell whether reference(s) {:?} in model '{}' read a CTE or the \
+             deferred model of that name. {}",
+            rewritten.setting_dependent_refs,
+            model.config.name,
+            SETTING_DEPENDENT_CTE_REMEDY
+        );
+        model.sql = rewritten.sql;
     }
 
     Ok(())
@@ -9252,6 +9260,16 @@ pub(crate) fn dialect_case_rules(
 /// What to tell an operator whose reference matched a routed upstream only when
 /// identifier case was ignored.
 ///
+/// Why a CTE binding that depends on `QUOTED_IDENTIFIERS_IGNORE_CASE` is refused,
+/// and what to change (#1622). Shared by the `--defer`, shadow and replay
+/// refusals so the three cannot drift.
+pub(crate) const SETTING_DEPENDENT_CTE_REMEDY: &str = "On Snowflake a CTE name and a \
+    reference that differ only in quoting or case (one quoted and one not, or both quoted \
+    in different case) bind only when QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE, and Rocky \
+    cannot see that setting for this statement, so either guess could read the wrong \
+    object. Spell the CTE name and the reference alike: both unquoted, or both quoted \
+    in the same case";
+
 /// Shared by the shadow and the replay refusal so the two cannot drift, and
 /// keyed on the dialect's own rules because the right advice differs.
 ///
@@ -9749,6 +9767,14 @@ fn apply_shadow_rewrite(
                 outcome.case_fold_only_refs,
                 model.config.name,
                 case_near_miss_remedy(case_rules)
+            );
+            anyhow::ensure!(
+                outcome.setting_dependent_refs.is_empty(),
+                "shadow mode cannot tell whether reference(s) {:?} in model '{}' read a CTE or \
+                 the upstream of that name routed by this run. {}",
+                outcome.setting_dependent_refs,
+                model.config.name,
+                SETTING_DEPENDENT_CTE_REMEDY
             );
             // Every reference actually redirected is now a read of a table
             // THIS run produces, so it is a real dependency regardless of what
@@ -31856,17 +31882,15 @@ auto_create_schemas = true
     /// wiring rather than the rule: it runs `apply_defer_rewrite` with the real
     /// Snowflake dialect.
     ///
-    /// The behaviour is a change and is disclosed as one. A quoted lowercase CTE
-    /// alias no longer hides an unquoted reference, because Snowflake does not
-    /// bind those two names. The reference is then a table reference, and a bare
-    /// name matching a model name is that model, so `--defer` qualifies it to
-    /// the deferred model's target. There is no refusal on this path — the
-    /// qualifier substitutes on an exact model-name match and reports no
-    /// near-miss — so the scope answer has to be the warehouse's own.
+    /// A quoted lowercase CTE alias and an unquoted reference bind only under
+    /// `QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE`. Before #1622 `--defer` took the
+    /// default's answer and qualified the reference to the deferred model, so
+    /// on a `TRUE` account it silently read a table instead of the CTE. It now
+    /// refuses, and says how to spell the pair.
     #[cfg(feature = "duckdb")]
     #[test]
-    fn defer_on_snowflake_qualifies_a_reference_a_quoted_cte_does_not_bind() {
-        fn deferred_sql(mart_sql: &str) -> String {
+    fn defer_on_snowflake_refuses_a_cte_binding_that_depends_on_a_setting() {
+        fn deferred_sql(mart_sql: &str) -> anyhow::Result<String> {
             let tmp = tempfile::TempDir::new().expect("temp dir");
             let models_dir = tmp.path().join("models");
             std::fs::create_dir(&models_dir).expect("mkdir models");
@@ -31886,38 +31910,87 @@ auto_create_schemas = true
                     defer_to: None,
                 },
                 &rocky_snowflake::dialect::SnowflakeSqlDialect,
-            )
-            .expect("defer rewrite must succeed");
-            compiled
+            )?;
+            Ok(compiled
                 .project
                 .models
                 .iter()
                 .find(|m| m.config.name == "mart")
                 .expect("mart missing")
                 .sql
-                .clone()
+                .clone())
         }
 
-        // Quoted alias, unquoted reference: Snowflake does not bind them, so the
-        // reference is the deferred model and is qualified to its target.
-        let freed = deferred_sql("WITH \"orders\" AS (SELECT 1 AS id) SELECT * FROM orders");
+        // Quoted alias, unquoted reference: the binding depends on the setting.
+        let err = deferred_sql("WITH \"orders\" AS (SELECT 1 AS id) SELECT * FROM orders")
+            .expect_err("a setting-dependent binding is refused");
+        let message = format!("{err:#}");
+        assert!(message.contains("'mart'"), "{message}");
         assert!(
-            freed.contains("\"main\".\"orders\""),
-            "a quoted alias does not bind an unquoted reference: {freed}"
+            message.contains("QUOTED_IDENTIFIERS_IGNORE_CASE"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Spell the CTE name and the reference alike"),
+            "{message}"
         );
 
-        // The other direction, and the one the disclosure has to cover too. The
-        // reference must still spell the model name exactly, because the
-        // deferred lookup is by model name and stays exact — only the ALIAS
-        // differs by case here. Two unquoted spellings are ONE name on
-        // Snowflake, so the CTE hides the reference and nothing is qualified.
-        // Under the previous exact alias comparison they were two names, the
-        // reference was not hidden, and it WAS qualified.
-        let hidden = deferred_sql("WITH Orders AS (SELECT 1 AS id) SELECT * FROM orders");
+        // Spelled alike, the pair binds under every reading: no refusal, and the
+        // CTE hides the reference. Two unquoted spellings are ONE name on
+        // Snowflake. The deferred lookup is by model name and stays exact, so
+        // only the ALIAS differs by case here.
+        let hidden = deferred_sql("WITH Orders AS (SELECT 1 AS id) SELECT * FROM orders")
+            .expect("an unquoted pair binds under every reading");
         assert!(
             !hidden.contains("\"main\".\"orders\""),
             "an unquoted alias differing only by case is the same name, so it hides the \
              reference: {hidden}"
+        );
+
+        // No CTE of that name: the reference is the deferred model, qualified.
+        let free = deferred_sql("WITH other AS (SELECT 1 AS id) SELECT * FROM orders")
+            .expect("a free reference is qualified");
+        assert!(free.contains("\"main\".\"orders\""), "{free}");
+    }
+
+    /// Shadow mode refuses the same setting-dependent pair (#1622): the
+    /// reference is the routed upstream under the default and the CTE under
+    /// `QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE`.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_on_snowflake_refuses_a_cte_binding_that_depends_on_a_setting() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "MAIN", "ORDERS");
+        write_model_with_target(
+            &models_dir,
+            "mart",
+            "WITH \"orders\" AS (SELECT 1 AS id) SELECT id FROM orders",
+            "MAIN",
+            "mart",
+        );
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+        let err = super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            None,
+            &rocky_core::shadow::ShadowConfig::default(),
+            &rocky_snowflake::dialect::SnowflakeSqlDialect,
+            false,
+        )
+        .expect_err("a setting-dependent binding is refused");
+        let message = format!("{err:#}");
+        assert!(message.contains("'mart'"), "{message}");
+        assert!(message.contains("read a CTE or the upstream"), "{message}");
+        assert!(
+            message.contains("Spell the CTE name and the reference alike"),
+            "{message}"
         );
     }
 

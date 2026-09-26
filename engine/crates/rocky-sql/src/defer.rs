@@ -105,18 +105,17 @@ impl DeferTarget {
 /// `defer_cte_alias_comparison_follows_dialect_identity`.
 ///
 /// Under `QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE` that parameter folds a
-/// DOUBLE-QUOTED identifier to upper case too, so the CTE does bind and this
-/// qualification is wrong — silently, because nothing here can refuse. Clearing
-/// the axis does NOT close that: the same pair is then mis-bound under the
-/// DEFAULT instead, which is what the rules before #1282 did. The change moves
-/// the error from the default configuration to an opt-out one; it does not
-/// create it. Closing it properly needs a three-valued binding — bound, free, or
-/// setting-dependent, refusing the third. #1281's probe reads the parameter but
-/// is not on its own a closure: its answer describes the probe's own request and
-/// does not govern a later one unless the setting is pinned for the statement
-/// being decided — see `WarehouseAdapter::identifier_case_significance`. Tracked
-/// in #1622; deliberately not built here on an unverified reading of how that
-/// parameter treats a CTE alias.
+/// DOUBLE-QUOTED identifier to upper case too, so the CTE may bind. The binding
+/// is therefore three-valued (#1622): bound, free, or setting-dependent — free
+/// under the default, bound when quoted names fold too. A setting-dependent
+/// reference whose name is a deferred model is NOT qualified; it is reported in
+/// [`DeferQualifyOutcome::setting_dependent_refs`] and the caller refuses. That
+/// is safe whatever the parameter does to a CTE alias, an effect not verified
+/// on a live account: `TRUE` only merges names, so refusing a pair it might
+/// merge never refuses a pair that binds the same way under both readings.
+/// #1281's probe does not replace this: its answer describes the probe's own
+/// request and does not govern a later one — see
+/// `WarehouseAdapter::identifier_case_significance`.
 ///
 /// Unlike [`rewrite_upstream_refs`] this reports no case near-misses, and that
 /// asymmetry is deliberate rather than an omission. That matcher compares a
@@ -141,9 +140,12 @@ pub fn qualify_deferred_refs(
     deferred: &HashMap<String, DeferTarget>,
     case_rules: IdentifierCaseRules,
     recursive_visibility: RecursiveCteVisibility,
-) -> Result<String, ParseError> {
+) -> Result<DeferQualifyOutcome, ParseError> {
     if deferred.is_empty() {
-        return Ok(sql.to_string());
+        return Ok(DeferQualifyOutcome {
+            sql: sql.to_string(),
+            setting_dependent_refs: Vec::new(),
+        });
     }
 
     let mut statement = parse_single_statement(sql)?;
@@ -157,10 +159,27 @@ pub fn qualify_deferred_refs(
     let mut rewriter = DeferRewriter {
         deferred,
         scopes: CteScopeStack::new(case_rules, recursive_visibility),
+        setting_dependent_refs: Vec::new(),
     };
     let _: ControlFlow<()> = statement.visit(&mut rewriter);
 
-    Ok(statement.to_string())
+    Ok(DeferQualifyOutcome {
+        sql: statement.to_string(),
+        setting_dependent_refs: rewriter.setting_dependent_refs,
+    })
+}
+
+/// Outcome of [`qualify_deferred_refs`].
+#[derive(Debug)]
+pub struct DeferQualifyOutcome {
+    /// The statement re-serialized after qualifying.
+    pub sql: String,
+    /// Bare references to a deferred model that a CTE in scope hides only
+    /// when Snowflake's `QUOTED_IDENTIFIERS_IGNORE_CASE` is `TRUE` (#1622).
+    /// Left unqualified. Rocky cannot tell which reading the statement gets,
+    /// so callers must refuse on any. Always empty unless the rules set
+    /// [`IdentifierCaseRules::unquoted_uppercases`].
+    pub setting_dependent_refs: Vec<String>,
 }
 
 /// Whether each component of a qualified name carries case as part of object
@@ -431,6 +450,11 @@ pub struct UpstreamRewriteOutcome {
     /// Callers that require isolation must fail closed on any. Always empty when
     /// `case_rules` is [`IdentifierCaseRules::all_insensitive`].
     pub case_fold_only_refs: Vec<String>,
+    /// Bare references that match a rename key (in any case) and that a CTE
+    /// in scope hides only when Snowflake's `QUOTED_IDENTIFIERS_IGNORE_CASE` is
+    /// `TRUE` (#1622). Left as parsed. Under the default the reference is the
+    /// upstream; under `TRUE` it is the CTE. Callers must refuse on any.
+    pub setting_dependent_refs: Vec<String>,
 }
 
 /// Rewrite references to known upstream tables — bare, `schema.table`, or
@@ -473,6 +497,7 @@ pub fn rewrite_upstream_refs(
         rewritten_keys: HashSet::new(),
         ambiguous_refs: Vec::new(),
         case_fold_only_refs: Vec::new(),
+        setting_dependent_refs: Vec::new(),
     };
     let _: ControlFlow<()> = statement.visit(&mut rewriter);
 
@@ -480,6 +505,7 @@ pub fn rewrite_upstream_refs(
         rewritten_keys,
         ambiguous_refs,
         case_fold_only_refs,
+        setting_dependent_refs,
         ..
     } = rewriter;
     Ok(UpstreamRewriteOutcome {
@@ -487,6 +513,7 @@ pub fn rewrite_upstream_refs(
         rewritten_keys,
         ambiguous_refs,
         case_fold_only_refs,
+        setting_dependent_refs,
     })
 }
 
@@ -502,6 +529,7 @@ struct UpstreamRewriter<'a> {
     rewritten_keys: HashSet<TargetIdentity>,
     ambiguous_refs: Vec<String>,
     case_fold_only_refs: Vec<String>,
+    setting_dependent_refs: Vec<String>,
 }
 
 /// Whether a dialect lets a CTE inside a `WITH RECURSIVE` clause reference an
@@ -683,12 +711,46 @@ impl CteScopeStack {
     }
 
     /// Whether `value` names a CTE in scope at this point of the walk.
-    fn is_shadowed(&self, value: &str, quoted: bool) -> bool {
+    ///
+    /// Three-valued on a dialect that upper-cases unquoted identifiers
+    /// (Snowflake, #1622). The frames hold each alias as the DEFAULT
+    /// `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE` resolves it. Under `TRUE` a
+    /// quoted identifier folds upper as well, so every name's alternate form is
+    /// its upper-case form: the unquoted ones already are. A pair that matches
+    /// only in that form is [`CteBinding::SettingDependent`].
+    fn binding(&self, value: &str, quoted: bool) -> CteBinding {
         let name = self.lookup_form(value, quoted);
-        self.frames
-            .iter()
-            .any(|frame| frame.visible(self.recursive_visibility).contains(&name))
+        let visible = || {
+            self.frames
+                .iter()
+                .flat_map(|frame| frame.visible(self.recursive_visibility))
+        };
+        if visible().any(|alias| *alias == name) {
+            return CteBinding::Bound;
+        }
+        if self.case_rules.unquoted_uppercases {
+            let folded = name.to_uppercase();
+            if visible().any(|alias| alias.to_uppercase() == folded) {
+                return CteBinding::SettingDependent;
+            }
+        }
+        CteBinding::Free
     }
+}
+
+/// Whether a bare name refers to a CTE in scope. See [`CteScopeStack::binding`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CteBinding {
+    /// A CTE in scope has this name under every reading.
+    Bound,
+    /// No CTE in scope has this name under any reading.
+    Free,
+    /// A CTE in scope has this name only when Snowflake's
+    /// `QUOTED_IDENTIFIERS_IGNORE_CASE` is `TRUE`: one side quoted and the
+    /// other not, or both quoted and differing in case. Rocky cannot see the
+    /// setting for the statement it decides, so a caller refuses rather than
+    /// guess.
+    SettingDependent,
 }
 
 impl VisitorMut for UpstreamRewriter<'_> {
@@ -720,12 +782,28 @@ impl VisitorMut for UpstreamRewriter<'_> {
             return ControlFlow::Continue(());
         }
         // A bare name shadowed by a CTE in scope refers to the CTE.
-        if spelled_parts.len() == 1
-            && self
-                .scopes
-                .is_shadowed(spelled_parts[0].0, spelled_parts[0].1)
-        {
-            return ControlFlow::Continue(());
+        if spelled_parts.len() == 1 {
+            match self.scopes.binding(spelled_parts[0].0, spelled_parts[0].1) {
+                CteBinding::Bound => return ControlFlow::Continue(()),
+                CteBinding::Free => {}
+                // The CTE or the upstream, depending on a session setting.
+                // Refused only when the name is also a rename key, compared
+                // without case: otherwise nothing here would rewrite it under
+                // either reading, and the statement reads the same object.
+                CteBinding::SettingDependent => {
+                    let bare = [spelled_parts[0].0];
+                    if self.renames.iter().any(|(key_exact, _, _)| {
+                        tail_matches_with_case(
+                            *key_exact,
+                            &bare,
+                            IdentifierCaseRules::all_insensitive(),
+                        )
+                    }) {
+                        self.setting_dependent_refs.push(relation.to_string());
+                    }
+                    return ControlFlow::Continue(());
+                }
+            }
         }
         // Resolve each part to the name the warehouse will actually look up.
         let resolved: Vec<String> = spelled_parts
@@ -809,6 +887,7 @@ impl VisitorMut for UpstreamRewriter<'_> {
 struct DeferRewriter<'a> {
     deferred: &'a HashMap<String, DeferTarget>,
     scopes: CteScopeStack,
+    setting_dependent_refs: Vec<String>,
 }
 
 impl VisitorMut for DeferRewriter<'_> {
@@ -833,11 +912,22 @@ impl VisitorMut for DeferRewriter<'_> {
         let Some(ident) = relation.0[0].as_ident() else {
             return ControlFlow::Continue(());
         };
-        if self
+        match self
             .scopes
-            .is_shadowed(&ident.value, ident.quote_style.is_some())
+            .binding(&ident.value, ident.quote_style.is_some())
         {
-            return ControlFlow::Continue(());
+            CteBinding::Bound => return ControlFlow::Continue(()),
+            CteBinding::Free => {}
+            // The CTE under one reading of the session setting, the deferred
+            // model under the other. Not qualified, and reported so the caller
+            // refuses. A name that is not a deferred model is left as parsed
+            // under both readings, so it needs no report (#1622).
+            CteBinding::SettingDependent => {
+                if self.deferred.contains_key(&ident.value) {
+                    self.setting_dependent_refs.push(relation.to_string());
+                }
+                return ControlFlow::Continue(());
+            }
         }
         // ‼️ EXACT, and deliberately not routed through `case_rules`. These keys
         // are Rocky MODEL names, not warehouse identifiers, and
@@ -911,7 +1001,8 @@ mod tests {
             IdentifierCaseRules::all_insensitive(),
             RecursiveCteVisibility::PrecedingAndSelf,
         )
-        .unwrap();
+        .unwrap()
+        .sql;
         assert_eq!(out, "SELECT * FROM prod.orders");
     }
 
@@ -924,7 +1015,8 @@ mod tests {
             IdentifierCaseRules::all_insensitive(),
             RecursiveCteVisibility::PrecedingAndSelf,
         )
-        .unwrap();
+        .unwrap()
+        .sql;
         assert_eq!(out, "SELECT * FROM warehouse.prod.orders");
     }
 
@@ -940,7 +1032,8 @@ mod tests {
             IdentifierCaseRules::all_insensitive(),
             RecursiveCteVisibility::PrecedingAndSelf,
         )
-        .unwrap();
+        .unwrap()
+        .sql;
         // The table name is qualified; the alias `o` and the `o.col` column
         // refs are untouched (they were never in relation position).
         assert!(out.contains("prod.orders"), "got: {out}");
@@ -962,7 +1055,8 @@ mod tests {
             IdentifierCaseRules::all_insensitive(),
             RecursiveCteVisibility::PrecedingAndSelf,
         )
-        .unwrap();
+        .unwrap()
+        .sql;
         assert!(out.contains("FROM prod.orders"), "got: {out}");
         assert!(out.contains("JOIN prod.customers"), "got: {out}");
     }
@@ -979,7 +1073,8 @@ mod tests {
             IdentifierCaseRules::all_insensitive(),
             RecursiveCteVisibility::PrecedingAndSelf,
         )
-        .unwrap();
+        .unwrap()
+        .sql;
         assert!(
             out.contains("prod.orders"),
             "subquery ref must be qualified: {out}"
@@ -998,7 +1093,8 @@ mod tests {
             IdentifierCaseRules::all_insensitive(),
             RecursiveCteVisibility::PrecedingAndSelf,
         )
-        .unwrap();
+        .unwrap()
+        .sql;
         assert!(
             !out.contains("prod.orders"),
             "CTE shadowing a model name must not be qualified: {out}"
@@ -1019,7 +1115,8 @@ mod tests {
             IdentifierCaseRules::all_insensitive(),
             RecursiveCteVisibility::PrecedingAndSelf,
         )
-        .unwrap();
+        .unwrap()
+        .sql;
         assert!(
             !out.contains("prod.orders"),
             "CTE inside a derived-table subquery must shadow the deferred ref: {out}"
@@ -1040,7 +1137,8 @@ mod tests {
             IdentifierCaseRules::all_insensitive(),
             RecursiveCteVisibility::PrecedingAndSelf,
         )
-        .unwrap();
+        .unwrap()
+        .sql;
         assert!(
             !out.contains("prod.orders"),
             "CTE inside an IN-subquery must shadow the deferred ref: {out}"
@@ -1060,7 +1158,8 @@ mod tests {
             IdentifierCaseRules::all_insensitive(),
             RecursiveCteVisibility::PrecedingAndSelf,
         )
-        .unwrap();
+        .unwrap()
+        .sql;
         assert!(
             !out.contains("prod.orders"),
             "CTE inside a UNION branch must shadow the deferred ref: {out}"
@@ -1078,7 +1177,8 @@ mod tests {
             IdentifierCaseRules::all_insensitive(),
             RecursiveCteVisibility::PrecedingAndSelf,
         )
-        .unwrap();
+        .unwrap()
+        .sql;
         assert!(
             out.contains("prod.orders"),
             "top-level deferred ref with no shadow must be qualified: {out}"
@@ -1100,7 +1200,8 @@ mod tests {
             IdentifierCaseRules::all_insensitive(),
             RecursiveCteVisibility::PrecedingAndSelf,
         )
-        .unwrap();
+        .unwrap()
+        .sql;
         // Exactly one occurrence of the qualified production ref (the outer
         // FROM); the inner CTE ref stays bare.
         assert_eq!(
@@ -1130,7 +1231,8 @@ mod tests {
             IdentifierCaseRules::all_insensitive(),
             RecursiveCteVisibility::PrecedingAndSelf,
         )
-        .unwrap();
+        .unwrap()
+        .sql;
         assert_eq!(out, "SELECT * FROM `my-gcp-project-123`.`prod`.`orders`");
     }
 
@@ -1145,7 +1247,8 @@ mod tests {
             IdentifierCaseRules::all_insensitive(),
             RecursiveCteVisibility::PrecedingAndSelf,
         )
-        .unwrap();
+        .unwrap()
+        .sql;
         assert!(out.contains("staging.orders"), "got: {out}");
         assert!(!out.contains("prod.orders"), "got: {out}");
     }
@@ -1161,7 +1264,8 @@ mod tests {
             IdentifierCaseRules::all_insensitive(),
             RecursiveCteVisibility::PrecedingAndSelf,
         )
-        .unwrap();
+        .unwrap()
+        .sql;
         assert!(out.contains("prod.orders"), "got: {out}");
         // `customers` (not in the deferred set) stays bare.
         assert!(
@@ -1180,7 +1284,8 @@ mod tests {
             IdentifierCaseRules::all_insensitive(),
             RecursiveCteVisibility::PrecedingAndSelf,
         )
-        .unwrap();
+        .unwrap()
+        .sql;
         assert_eq!(out, sql);
     }
 
@@ -1193,7 +1298,8 @@ mod tests {
             IdentifierCaseRules::all_insensitive(),
             RecursiveCteVisibility::PrecedingAndSelf,
         )
-        .unwrap();
+        .unwrap()
+        .sql;
         // Both occurrences qualified; aliases `a`/`b` preserved.
         assert!(out.contains("FROM prod.orders a"), "got: {out}");
         assert!(out.contains("JOIN prod.orders b"), "got: {out}");
@@ -1311,7 +1417,8 @@ mod tests {
             rules,
             RecursiveCteVisibility::PrecedingAndSelf,
         )
-        .unwrap();
+        .unwrap()
+        .sql;
         assert!(
             out.contains("FROM prod.up"),
             "a later CTE must not shadow an earlier body's upstream read: {out}"
@@ -1324,7 +1431,8 @@ mod tests {
             rules,
             RecursiveCteVisibility::PrecedingAndSelf,
         )
-        .unwrap();
+        .unwrap()
+        .sql;
         assert!(
             !out.contains("prod.up"),
             "an earlier CTE must shadow a later body's reference: {out}"
@@ -1337,7 +1445,8 @@ mod tests {
             rules,
             RecursiveCteVisibility::PrecedingAndSelf,
         )
-        .unwrap();
+        .unwrap()
+        .sql;
         assert!(!out.contains("prod.up"), "the body sees every CTE: {out}");
 
         // 4. RECURSIVE: in scope for its own body.
@@ -1348,7 +1457,8 @@ mod tests {
             rules,
             RecursiveCteVisibility::PrecedingAndSelf,
         )
-        .unwrap();
+        .unwrap()
+        .sql;
         assert!(
             !out.contains("prod.up"),
             "a recursive CTE shadows its own self-reference: {out}"
@@ -1362,7 +1472,8 @@ mod tests {
             rules,
             RecursiveCteVisibility::PrecedingAndSelf,
         )
-        .unwrap();
+        .unwrap()
+        .sql;
         assert!(
             out.contains("FROM prod.up"),
             "a later recursive alias must not shadow an earlier body's read: {out}"
@@ -1389,14 +1500,17 @@ mod tests {
                 IdentifierCaseRules::all_insensitive(),
                 RecursiveCteVisibility::PrecedingAndSelf,
             )
-            .unwrap();
+            .unwrap()
+            .sql;
             assert!(
                 !out.contains("prod.orders"),
                 "CTE {cte} must shadow {reference} on a folding dialect: {out}"
             );
         }
 
-        // Snowflake shape: quoted alias, unquoted reference -> different names.
+        // Snowflake shape: quoted alias, unquoted reference. Different names
+        // under the default, one name under QUOTED_IDENTIFIERS_IGNORE_CASE =
+        // TRUE, so neither shadowed nor qualified: reported (#1622).
         let out = qualify_deferred_refs(
             "WITH \"orders\" AS (SELECT 1 AS id) SELECT * FROM orders",
             &deferred,
@@ -1404,10 +1518,8 @@ mod tests {
             RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
-        assert!(
-            out.contains("prod.orders"),
-            "a quoted alias must not shadow an unquoted reference there: {out}"
-        );
+        assert!(!out.sql.contains("prod.orders"), "{}", out.sql);
+        assert_eq!(out.setting_dependent_refs, vec!["orders".to_string()]);
     }
 
     /// E4 — the `deferred` lookup itself stays EXACT, on every dialect.
@@ -1430,7 +1542,8 @@ mod tests {
                 rules,
                 RecursiveCteVisibility::PrecedingAndSelf,
             )
-            .unwrap();
+            .unwrap()
+            .sql;
             assert_eq!(
                 out, "SELECT * FROM orders",
                 "a differently-cased bare name is not a ModelRef, so it is not qualified"
@@ -1871,7 +1984,8 @@ mod tests {
             IdentifierCaseRules::uniform_uppercasing(true),
             RecursiveCteVisibility::PrecedingAndSelf,
         )
-        .unwrap();
+        .unwrap()
+        .sql;
         assert!(
             !unquoted_alias.contains("prod"),
             "an unquoted alias still shadows: {unquoted_alias}"
@@ -1885,7 +1999,8 @@ mod tests {
             IdentifierCaseRules::uniform(true),
             RecursiveCteVisibility::PrecedingAndSelf,
         )
-        .unwrap();
+        .unwrap()
+        .sql;
         assert!(
             !before.contains("prod"),
             "premise: the old rules treated the quoted alias as hiding the reference: {before}"
@@ -1898,47 +2013,133 @@ mod tests {
         )
         .unwrap();
         assert!(
-            after.contains("prod"),
-            "Snowflake does not bind a quoted alias to a bare reference, so the reference is \
-             the deferred model: {after}"
+            !after.sql.contains("prod"),
+            "Snowflake binds a quoted alias to a bare reference only under \
+             QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE, so the reference is neither the CTE nor the \
+             deferred model for certain, and it is not qualified: {}",
+            after.sql
+        );
+        assert_eq!(
+            after.setting_dependent_refs,
+            vec!["orders".to_string()],
+            "reported, so the caller refuses (#1622)"
         );
     }
 
     /// The shadow/replay matcher DOES honour the axis in its CTE scope, and it
     /// can, because it fails closed.
     ///
-    /// On Snowflake a quoted lowercase CTE alias does not hide an unquoted
-    /// reference — the warehouse does not bind those two names. So the reference
-    /// reaches the matcher. Against an UPPERCASE routed target it resolves onto
-    /// it and routes, which is the fix: before, the CTE was treated as hiding it
-    /// and the read stayed on production while the model wrote its shadow.
-    /// Against a lowercase target it is reported as a near-miss and the caller
-    /// refuses. Neither outcome is silent.
+    /// On Snowflake a quoted lowercase CTE alias hides an unquoted reference
+    /// only under `QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE`. Under the default the
+    /// reference is the routed upstream; under `TRUE` it is the CTE. So when
+    /// the name is a rename key, in any case, the reference is reported as
+    /// setting-dependent and left as parsed, and the caller refuses (#1622).
+    /// Neither outcome is silent.
     #[test]
     fn shadow_cte_scope_honours_the_quoting_axis_and_fails_closed() {
         let rules = IdentifierCaseRules::uniform_uppercasing(true);
         let sql = "WITH \"orders\" AS (SELECT 1 AS id) SELECT * FROM orders";
 
-        let upper = renames_map(&[("CAT.RAW.ORDERS", target("CAT", "SHADOW", "ORDERS"))]);
-        let out =
-            rewrite_upstream_refs(sql, &upper, rules, RecursiveCteVisibility::PrecedingAndSelf)
-                .unwrap();
-        assert!(
-            out.sql.contains("CAT.SHADOW.ORDERS"),
-            "the unquoted reference names the routed upstream, so it must route: {}",
-            out.sql
-        );
+        for key in [
+            ("CAT.RAW.ORDERS", target("CAT", "SHADOW", "ORDERS")),
+            ("cat.raw.orders", target("cat", "shadow", "orders")),
+        ] {
+            let renames = renames_map(&[key]);
+            let out = rewrite_upstream_refs(
+                sql,
+                &renames,
+                rules,
+                RecursiveCteVisibility::PrecedingAndSelf,
+            )
+            .unwrap();
+            assert!(out.rewritten_keys.is_empty(), "{}", out.sql);
+            assert!(!out.sql.contains("SHADOW") && !out.sql.contains("shadow"));
+            assert_eq!(
+                out.setting_dependent_refs,
+                vec!["orders".to_string()],
+                "reported so the caller refuses, never rewritten silently"
+            );
+        }
 
-        let lower = renames_map(&[("cat.raw.orders", target("cat", "shadow", "orders"))]);
-        let out =
-            rewrite_upstream_refs(sql, &lower, rules, RecursiveCteVisibility::PrecedingAndSelf)
-                .unwrap();
+        // Both sides unquoted: bound under every reading, nothing to report.
+        let renames = renames_map(&[("CAT.RAW.ORDERS", target("CAT", "SHADOW", "ORDERS"))]);
+        let out = rewrite_upstream_refs(
+            "WITH orders AS (SELECT 1 AS id) SELECT * FROM orders",
+            &renames,
+            rules,
+            RecursiveCteVisibility::PrecedingAndSelf,
+        )
+        .unwrap();
         assert!(out.rewritten_keys.is_empty());
-        assert_eq!(
-            out.case_fold_only_refs,
-            vec!["orders".to_string()],
-            "a near-miss must be reported so the caller refuses, never rewritten silently"
+        assert!(out.setting_dependent_refs.is_empty());
+    }
+
+    /// The three-valued binding on Snowflake's rules, every shape (#1622).
+    ///
+    /// `QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE` only merges names, so a pair
+    /// that binds under the default binds under both readings, and a pair that
+    /// differs under `TRUE` differs under both. Only the pairs in between are
+    /// reported, and only when the name is a deferred model. Other dialects
+    /// never report.
+    #[test]
+    fn a_cte_binding_that_depends_on_quoted_identifiers_ignore_case_is_reported() {
+        let deferred = deferred_map(&[
+            ("orders", target("cat", "prod", "orders")),
+            ("ORDERS", target("cat", "prod", "ORDERS")),
+        ]);
+        let snowflake = IdentifierCaseRules::uniform_uppercasing(true);
+        let run = |sql: &str, rules| {
+            qualify_deferred_refs(
+                sql,
+                &deferred,
+                rules,
+                RecursiveCteVisibility::PrecedingAndSelf,
+            )
+            .unwrap()
+        };
+
+        // (CTE alias, reference, reported?)
+        for (alias, reference, reported) in [
+            ("\"orders\"", "orders", true),      // quoted lower vs unquoted
+            ("orders", "\"orders\"", true),      // unquoted vs quoted lower
+            ("\"Orders\"", "\"orders\"", true),  // both quoted, case differs
+            ("orders", "ORDERS", false),         // both unquoted: always bound
+            ("\"ORDERS\"", "orders", false),     // quoted upper = unquoted: bound
+            ("\"orders\"", "\"orders\"", false), // identical quoted: bound
+            ("\"orders\"", "customers", false),  // different name: free
+        ] {
+            let sql = format!("WITH {alias} AS (SELECT 1 AS id) SELECT * FROM {reference}");
+            let out = run(&sql, snowflake);
+            assert_eq!(
+                !out.setting_dependent_refs.is_empty(),
+                reported,
+                "{sql}: {:?}",
+                out.setting_dependent_refs
+            );
+            if reported {
+                assert!(!out.sql.contains("prod"), "not qualified: {}", out.sql);
+            }
+        }
+
+        // A setting-dependent name that is no deferred model is left alone
+        // under both readings, so it is not reported.
+        let out = run(
+            "WITH \"payments\" AS (SELECT 1 AS id) SELECT * FROM payments",
+            snowflake,
         );
+        assert!(out.setting_dependent_refs.is_empty());
+
+        // No other dialect has the setting.
+        for rules in [
+            IdentifierCaseRules::uniform(true),
+            IdentifierCaseRules::all_insensitive(),
+        ] {
+            let out = run(
+                "WITH \"Orders\" AS (SELECT 1 AS id) SELECT * FROM \"orders\"",
+                rules,
+            );
+            assert!(out.setting_dependent_refs.is_empty(), "{rules:?}");
+        }
     }
 
     /// A CTE still shadows a bare name before any of this runs.

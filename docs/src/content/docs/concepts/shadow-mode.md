@@ -194,25 +194,23 @@ default `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE`. Four pairs change answer:
 |---|---|---|---|
 | `orders` | `ORDERS` | free | hidden |
 | `Orders` | `orders` | free | hidden |
-| `"orders"` | `orders` | hidden | free |
-| `orders` | `"orders"` | hidden | free |
+| `"orders"` | `orders` | hidden | refused |
+| `orders` | `"orders"` | hidden | refused |
 
 An unquoted alias with an identically spelled unquoted reference still hides it,
 which is the ordinary shape and does not change.
 
-In a shadow or branch run the freed reference goes to the matcher, which routes
-it or refuses it. `--defer` has no matcher and no refusal: the freed reference is
-a table reference, and a bare name that matches a model name is that model, so
-`--defer` qualifies it to that model's target.
-
 With `QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE` a double-quoted identifier folds to
-upper case too, so `WITH "orders"` does hide `FROM orders` and Rocky's answer is
-wrong. On `--defer` that is silent, because nothing on that path can refuse.
-Rocky can *observe* the setting on a connection, but that answer describes one
-request and does not govern the next one, so it cannot decide this. The rule
-before this one had the mirror of that problem under the default setting, so the
-error now falls on an opt-out configuration rather than the common one. Tracked
-in issue #1622.
+upper case too. So some pairs bind only under that setting: one side quoted and
+the other not, or both quoted in different case. Rocky cannot see the setting
+for the statement it rewrites. Rocky refuses such a pair when the bare name is
+also a model it would reroute. That applies to `--defer`, shadow and branch
+runs, and `rocky replay --execute`.
+
+Rocky can observe the setting on a connection. That answer describes one
+request and does not govern the next one, so it cannot decide this. To fix a
+refusal, spell the CTE name and the reference alike: both unquoted, or both
+quoted in the same case.
 
 ## Shadow target rewriting
 
