@@ -719,6 +719,14 @@ struct TableTask {
     /// `[policy]` block is configured; `None` otherwise, in which case the
     /// drift path runs unconditionally exactly as before (default-off).
     auto_apply_gate: Option<super::drift_governance::DriftGovernor>,
+    /// An earlier run checkpointed this table `Success` but never confirmed
+    /// its watermark flush (#1854), so the stored watermark may predate rows
+    /// already in the target. `process_table` then re-derives `MAX(ts)` from
+    /// the target before it builds the incremental filter. Set only when the
+    /// target adapter is on the allow-list
+    /// ([`WarehouseAdapter::commits_insert_select_atomically`]); always
+    /// `false` otherwise, which is the behaviour before #1854.
+    watermark_unconfirmed: bool,
 }
 
 /// CLI selection state for `time_interval` partition execution.
@@ -1154,6 +1162,34 @@ fn run_trigger_from_env() -> rocky_core::state::RunTrigger {
 #[cfg(test)]
 pub(crate) static FAIL_RECORD_WRITE_FOR_TEST: std::sync::Mutex<Option<String>> =
     std::sync::Mutex::new(None);
+
+/// Test hook (#1854): make [`flush_watermarks_for_run`] fail for this run
+/// id, as a failed redb commit would, so a test can drive the real run path
+/// through a watermark flush that never lands. One id at a time.
+#[cfg(test)]
+pub(crate) static FAIL_WATERMARK_FLUSH_FOR_TEST: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+/// Write a replication run's queued watermarks and confirm its flush in one
+/// transaction ([`StateStore::flush_run_watermarks`], #1854).
+fn flush_watermarks_for_run(
+    store: &StateStore,
+    run_id: &str,
+    entries: &[(&str, &rocky_ir::WatermarkState)],
+) -> std::result::Result<usize, StateError> {
+    #[cfg(test)]
+    if FAIL_WATERMARK_FLUSH_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_deref()
+        == Some(run_id)
+    {
+        return Err(StateError::from(
+            serde_json::from_str::<()>("injected watermark-flush failure").unwrap_err(),
+        ));
+    }
+    store.flush_run_watermarks(run_id, entries)
+}
 
 /// Test hook (#2143): after a successful JSON emit, snapshot the serialized
 /// payload under the run ID. The production `print_json` writer goes
@@ -4978,6 +5014,9 @@ pub async fn run(
                         // marker-only freeze must refuse auto-apply too.
                         &entry_marker_freezes,
                     ),
+                    // Decided after the plan settles, from the state store
+                    // and the adapter (`mark_unconfirmed_watermarks`).
+                    watermark_unconfirmed: false,
                 });
             }
             if skipped_source_missing > 0 {
@@ -5111,6 +5150,17 @@ pub async fn run(
     state_store
         .init_run_progress(&run_id, &planned_table_keys, Some(&resume_scope))
         .context("failed to initialize run progress")?;
+
+    // #1854: a table an earlier run checkpointed `Success` without a confirmed
+    // watermark flush may have a stale watermark. On an adapter whose
+    // `INSERT ... SELECT` is all-or-nothing, `process_table` re-derives it
+    // from the target. Elsewhere nothing is marked: today's behaviour.
+    mark_unconfirmed_watermarks(
+        warehouse_adapter.as_ref(),
+        &state_store,
+        &run_id,
+        &mut tables_to_process,
+    )?;
 
     // --- Process tables concurrently ---
     let fail_fast = pipeline.execution.fail_fast;
@@ -5728,11 +5778,13 @@ pub async fn run(
                 .zip(materialized.iter())
                 .map(|(wm, state_val)| (wm.state_key.as_str(), state_val))
                 .collect();
-            if let Err(e) = shared_state.batch_set_watermarks(&entries) {
+            if let Err(e) = flush_watermarks_for_run(&shared_state, &shared_run_id, &entries) {
                 tracing::warn!(
                     error = %e,
                     count = entries.len(),
-                    "failed to persist watermarks for interrupted run",
+                    "failed to persist watermarks for interrupted run; the checkpoint \
+                     stays unconfirmed, so the next run re-derives them from the \
+                     target on adapters that allow it (#1854)",
                 );
             }
         }
@@ -5982,20 +6034,27 @@ pub async fn run(
         })
         .collect();
     let count = owned.len();
+    let flush_run_id = shared_run_id.clone();
     let res = tokio::task::spawn_blocking(move || {
         let entries: Vec<(&str, &WatermarkState)> = owned
             .iter()
             .map(|(k, v)| (k.as_str(), v))
             .collect();
-        store.batch_set_watermarks(&entries)
+        flush_watermarks_for_run(&store, &flush_run_id, &entries)
     })
     .await;
     match res {
-        // `batch_set_watermarks` returns the count written; ignore it here.
+        // The flush returns the count written; ignore it here.
         Ok(Ok(_)) => {}
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, count, "failed to persist watermarks for run")
-        }
+        // The confirmation commits in the same transaction, so the checkpoint
+        // stays unconfirmed and the next run re-derives these watermarks from
+        // the target on adapters that allow it (#1854). The exit code does
+        // not change.
+        Ok(Err(e)) => tracing::warn!(
+            error = %e,
+            count,
+            "failed to persist watermarks for run; the checkpoint stays unconfirmed"
+        ),
         Err(e) => tracing::warn!(error = %e, "watermark flush task panicked"),
     }
 
@@ -14261,6 +14320,35 @@ async fn checkpoint_planned_table(
     .await;
 }
 
+/// Mark every planned table whose watermark flush an earlier run never
+/// confirmed (#1854), when the target adapter is on the allow-list.
+///
+/// The allow-list is [`WarehouseAdapter::commits_insert_select_atomically`]:
+/// DuckDB, Databricks, Snowflake and BigQuery. Trino and process adapters
+/// answer `false`, nothing is marked, and a stale watermark behaves as it did
+/// before #1854. A state read failure fails the run: without the answer the
+/// runner cannot tell a stale watermark from a good one.
+fn mark_unconfirmed_watermarks(
+    warehouse: &dyn WarehouseAdapter,
+    state: &StateStore,
+    run_id: &str,
+    tasks: &mut [TableTask],
+) -> Result<()> {
+    if !warehouse.commits_insert_select_atomically() {
+        return Ok(());
+    }
+    let unconfirmed = state
+        .unconfirmed_flush_table_keys(run_id)
+        .context("failed to read which checkpoints have an unconfirmed watermark flush")?;
+    if unconfirmed.is_empty() {
+        return Ok(());
+    }
+    for task in tasks.iter_mut() {
+        task.watermark_unconfirmed = unconfirmed.contains(&table_key(task));
+    }
+    Ok(())
+}
+
 #[tracing::instrument(skip_all, fields(table = %task.target_table_name))]
 async fn process_table(
     warehouse: &dyn WarehouseAdapter,
@@ -14402,6 +14490,43 @@ async fn process_table(
     }
 
     let target_exists = !target_cols.is_empty();
+
+    // #1854: an earlier run copied this table and checkpointed it `Success`,
+    // but its watermark flush was never confirmed — it crashed first, or the
+    // flush failed. The stored watermark may then be the one from BEFORE that
+    // copy, and `WHERE ts > <it>` would insert the same rows again. The target
+    // already holds them, and on this adapter the copy was all-or-nothing, so
+    // the target's `MAX(ts)` is a true watermark. Take the later of the two:
+    // re-derivation only moves a watermark forward. With no stored watermark
+    // or no target, the table refreshes in full below and nothing is appended.
+    // A failed read fails the table rather than append on a stale watermark.
+    let prior_watermark = match (prior_watermark, watermark_timestamp_column(&strategy)) {
+        (Some(stored), Some(ts_col)) if task.watermark_unconfirmed && target_exists => {
+            let rederived = query_target_max_timestamp(warehouse, dialect, &target_table, ts_col)
+                .await
+                .with_context(|| {
+                    format!(
+                        "could not re-derive the watermark of {} from the target; an \
+                         earlier run copied it but never confirmed its watermark flush",
+                        target_table.full_name()
+                    )
+                })?;
+            match rederived {
+                Some(target_max) if target_max > stored => {
+                    info!(
+                        table = target_table.full_name(),
+                        stored = %stored,
+                        rederived = %target_max,
+                        "watermark flush of an earlier run was never confirmed; \
+                         re-derived the watermark from the target"
+                    );
+                    Some(target_max)
+                }
+                Some(_) | None => Some(stored),
+            }
+        }
+        (prior, _) => prior,
+    };
 
     let mut use_full_refresh = !target_exists || (uses_watermark && prior_watermark.is_none());
     let mut drift_action: Option<DriftActionOutput> = None;
@@ -17650,6 +17775,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                     .collect(),
                 scope: None,
                 planned_tables: planned.map(|keys| keys.into_iter().map(str::to_string).collect()),
+                flush_confirmed: false,
             }
         };
 
@@ -18940,6 +19066,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             prefetched_target_cols: None,
             effective_override: ResolvedTableOverride::default(),
             auto_apply_gate: None,
+            watermark_unconfirmed: false,
         }
     }
 
@@ -19838,6 +19965,351 @@ auto_create_schemas = true
         assert_eq!(
             resumed.total_tables, 0,
             "the resumed run had nothing left to copy"
+        );
+    }
+
+    /// A one-pipeline DuckDB project with an INCREMENTAL replication of
+    /// `raw__acme.events (id, ts)` into `warehouse.staging__acme.events`, for
+    /// the #1854 watermark tests. Returns `(config_path, state_path, db_path)`.
+    #[cfg(feature = "duckdb")]
+    async fn write_incremental_project(
+        dir: &std::path::Path,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let db_path = dir.join("warehouse.duckdb");
+        {
+            let warehouse = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+            for sql in [
+                "CREATE SCHEMA raw__acme",
+                "CREATE TABLE raw__acme.events (id INTEGER, ts TIMESTAMP)",
+                "INSERT INTO raw__acme.events VALUES (1, TIMESTAMP '2026-03-01 10:00:00')",
+            ] {
+                warehouse.execute_statement(sql).await.unwrap();
+            }
+        }
+        let config_path = dir.join("rocky.toml");
+        let state_path = dir.join("state.redb");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{db}"
+
+[state]
+backend = "local"
+
+[pipeline.inc]
+type = "replication"
+strategy = "incremental"
+timestamp_column = "ts"
+
+[pipeline.inc.source.discovery]
+adapter = "default"
+
+[pipeline.inc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.inc.target]
+adapter = "default"
+catalog_template = "warehouse"
+schema_template = "staging__{{source}}"
+
+[pipeline.inc.target.governance]
+auto_create_schemas = true
+"#,
+                db = db_path.display(),
+            ),
+        )
+        .unwrap();
+        (config_path, state_path, db_path)
+    }
+
+    /// Runs the `inc` pipeline under a caller-chosen run id, so a test can aim
+    /// [`super::FAIL_WATERMARK_FLUSH_FOR_TEST`] at exactly one run.
+    #[cfg(feature = "duckdb")]
+    async fn drive_incremental_run(
+        config_path: &std::path::Path,
+        state_path: &std::path::Path,
+        run_id: &str,
+    ) -> anyhow::Result<()> {
+        super::run(
+            config_path,
+            std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(config_path).unwrap(),
+            ),
+            None,
+            Some("inc"),
+            state_path,
+            None,
+            true,
+            None,
+            false,
+            None,
+            false,
+            None,
+            &PartitionRunOptions::default(),
+            None,
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            Some(run_id),
+            None,
+            false,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn count_rows_1854(db_path: &std::path::Path, table: &str) -> u64 {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let warehouse = DuckDbWarehouseAdapter::open(db_path).unwrap();
+        let result = warehouse
+            .execute_query(&format!("SELECT COUNT(*) FROM {table}"))
+            .await
+            .unwrap();
+        result.rows[0][0]
+            .as_u64()
+            .or_else(|| result.rows[0][0].as_str().and_then(|v| v.parse().ok()))
+            .unwrap()
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn exec_duckdb(db_path: &std::path::Path, sql: &str) {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        DuckDbWarehouseAdapter::open(db_path)
+            .unwrap()
+            .execute_statement(sql)
+            .await
+            .unwrap();
+    }
+
+    /// #1854, the failed-flush half, end to end on DuckDB. Run 2 copies two
+    /// new rows and checkpoints the table `Success`, then its watermark flush
+    /// fails. Before the fix, run 3 read the stale watermark and inserted the
+    /// same two rows again. Now run 2's checkpoint stays unconfirmed, and run
+    /// 3 re-derives the watermark from the target.
+    ///
+    /// ```text
+    ///   run 1   full refresh           target 1 row    watermark 03-01  confirmed
+    ///   source  +2 rows (03-02, 03-03)
+    ///   run 2   INSERT ts > 03-01      target 3 rows   flush FAILS      unconfirmed
+    ///   run 3   re-derive MAX = 03-03  INSERT ts > 03-03  target 3 rows (not 5)
+    /// ```
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_failed_watermark_flush_does_not_duplicate_rows_on_the_next_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, state_path, db_path) = write_incremental_project(dir.path()).await;
+        let target = "warehouse.staging__acme.events";
+
+        drive_incremental_run(&config_path, &state_path, "run-1854-a1")
+            .await
+            .expect("run 1 bootstraps the target");
+        assert_eq!(count_rows_1854(&db_path, target).await, 1);
+
+        exec_duckdb(
+            &db_path,
+            "INSERT INTO raw__acme.events VALUES \
+                (2, TIMESTAMP '2026-03-02 10:00:00'), (3, TIMESTAMP '2026-03-03 10:00:00')",
+        )
+        .await;
+        *super::FAIL_WATERMARK_FLUSH_FOR_TEST.lock().unwrap() = Some("run-1854-a2".into());
+        let run2 = drive_incremental_run(&config_path, &state_path, "run-1854-a2").await;
+        *super::FAIL_WATERMARK_FLUSH_FOR_TEST.lock().unwrap() = None;
+        run2.expect("a failed flush still warns and exits 0; the exit code is unchanged");
+        assert_eq!(count_rows_1854(&db_path, target).await, 3);
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            let progress = store.get_run_progress("run-1854-a2").unwrap().unwrap();
+            assert!(
+                !progress.flush_confirmed,
+                "a failed flush must leave the checkpoint unconfirmed"
+            );
+            let stale = store.get_watermark(target).unwrap().unwrap().last_value;
+            assert_eq!(
+                stale.format("%Y-%m-%d").to_string(),
+                "2026-03-01",
+                "the flush failed, so the stored watermark is still run 1's"
+            );
+        }
+
+        drive_incremental_run(&config_path, &state_path, "run-1854-a3")
+            .await
+            .expect("run 3 succeeds");
+        assert_eq!(
+            count_rows_1854(&db_path, target).await,
+            3,
+            "run 3 must re-derive the watermark from the target, not re-insert run 2's rows"
+        );
+        let store = StateStore::open(&state_path).unwrap();
+        assert!(
+            store
+                .get_run_progress("run-1854-a3")
+                .unwrap()
+                .unwrap()
+                .flush_confirmed
+        );
+        assert!(
+            store
+                .get_run_progress("run-1854-a2")
+                .unwrap()
+                .unwrap()
+                .flush_confirmed,
+            "run 3 flushed a watermark for every table run 2 copied, so run 2's \
+             checkpoint is resolved"
+        );
+        assert!(
+            store
+                .unconfirmed_flush_table_keys("none")
+                .unwrap()
+                .is_empty(),
+            "nothing is left to re-derive"
+        );
+    }
+
+    /// #1854, the crash half: a run copied rows and checkpointed the table
+    /// `Success`, then died before the flush ever ran. Seeded directly — the
+    /// rows are in the target, the checkpoint says `Success`, the header was
+    /// never confirmed, and the watermark is the one from before the copy.
+    /// The next run must not insert those rows again.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_crash_before_the_watermark_flush_does_not_duplicate_rows_on_the_next_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, state_path, db_path) = write_incremental_project(dir.path()).await;
+        let target = "warehouse.staging__acme.events";
+
+        drive_incremental_run(&config_path, &state_path, "run-1854-b1")
+            .await
+            .expect("run 1 bootstraps the target");
+        // The crashed run: its copy of the two new rows committed in the
+        // warehouse, its table checkpoint landed, and nothing after it did.
+        exec_duckdb(
+            &db_path,
+            "INSERT INTO raw__acme.events VALUES \
+                (2, TIMESTAMP '2026-03-02 10:00:00'), (3, TIMESTAMP '2026-03-03 10:00:00')",
+        )
+        .await;
+        exec_duckdb(
+            &db_path,
+            "INSERT INTO warehouse.staging__acme.events \
+                SELECT * FROM raw__acme.events WHERE id > 1",
+        )
+        .await;
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            let scope = store
+                .get_run_progress("run-1854-b1")
+                .unwrap()
+                .unwrap()
+                .scope;
+            store
+                .init_run_progress("run-1854-crashed", &[target.to_string()], scope.as_ref())
+                .unwrap();
+            store
+                .record_table_progress(
+                    "run-1854-crashed",
+                    &table_entry(0, target, rocky_core::state::TableStatus::Success),
+                )
+                .unwrap();
+        }
+        assert_eq!(count_rows_1854(&db_path, target).await, 3);
+
+        drive_incremental_run(&config_path, &state_path, "run-1854-b3")
+            .await
+            .expect("the next run succeeds");
+        assert_eq!(
+            count_rows_1854(&db_path, target).await,
+            3,
+            "the next run must re-derive the watermark, not re-insert the crashed run's rows"
+        );
+    }
+
+    /// #1854, the allow-list is the gate. The same unconfirmed checkpoint on
+    /// an adapter that does NOT answer `commits_insert_select_atomically`
+    /// marks nothing, so the table keeps today's behaviour and trusts its
+    /// stored watermark. Stands in for Trino and process adapters.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn an_adapter_off_the_allow_list_does_not_rederive_watermarks() {
+        use async_trait::async_trait;
+        use rocky_core::traits::{AdapterResult, QueryResult, SqlDialect, WarehouseAdapter};
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        struct NotAtomic<'a> {
+            inner: &'a DuckDbWarehouseAdapter,
+        }
+
+        #[async_trait]
+        impl WarehouseAdapter for NotAtomic<'_> {
+            fn dialect(&self) -> &dyn SqlDialect {
+                self.inner.dialect()
+            }
+            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+                self.inner.execute_statement(sql).await
+            }
+            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+                self.inner.execute_query(sql).await
+            }
+            async fn describe_table(
+                &self,
+                table: &rocky_ir::TableRef,
+            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+                self.inner.describe_table(table).await
+            }
+        }
+
+        let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
+        assert!(
+            inner.commits_insert_select_atomically(),
+            "DuckDB is on the allow-list"
+        );
+        let off_list = NotAtomic { inner: &inner };
+        assert!(!off_list.commits_insert_select_atomically());
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let mut tasks = vec![planned_task("orders")];
+        let key = table_key(&tasks[0]);
+        store
+            .init_run_progress(
+                "run-crashed",
+                std::slice::from_ref(&key),
+                Some(&test_resume_scope("p1")),
+            )
+            .unwrap();
+        store
+            .record_table_progress(
+                "run-crashed",
+                &table_entry(0, &key, rocky_core::state::TableStatus::Success),
+            )
+            .unwrap();
+
+        mark_unconfirmed_watermarks(&off_list, &store, "run-now", &mut tasks).unwrap();
+        assert!(
+            !tasks[0].watermark_unconfirmed,
+            "off the allow-list: today's behaviour"
+        );
+
+        mark_unconfirmed_watermarks(&inner, &store, "run-now", &mut tasks).unwrap();
+        assert!(
+            tasks[0].watermark_unconfirmed,
+            "on the allow-list: re-derive"
         );
     }
 
@@ -23415,6 +23887,7 @@ merge_keys = ["id"]
             prefetched_target_cols: None,
             effective_override: ResolvedTableOverride::default(),
             auto_apply_gate: None,
+            watermark_unconfirmed: false,
         };
 
         let (source_table, target_table) = super::copy_endpoints(&task);
@@ -23476,6 +23949,7 @@ merge_keys = ["id"]
             prefetched_target_cols: None,
             effective_override: ResolvedTableOverride::default(),
             auto_apply_gate: None,
+            watermark_unconfirmed: false,
         };
 
         let model_ir = super::replication_model_ir(
@@ -23597,6 +24071,7 @@ timestamp_column = "ts"
             prefetched_target_cols: None,
             effective_override: ResolvedTableOverride::default(),
             auto_apply_gate: None,
+            watermark_unconfirmed: false,
         };
 
         let failing = FailTargetDescribe {
@@ -24700,6 +25175,7 @@ timestamp_column = "ts"
             prefetched_target_cols: None,
             effective_override: ResolvedTableOverride::default(),
             auto_apply_gate: None,
+            watermark_unconfirmed: false,
         };
 
         let outcome = process_table(&adapter, &state, &pipeline, &task, false)
@@ -24780,6 +25256,7 @@ timestamp_column = "ts"
             prefetched_target_cols: None,
             effective_override: ResolvedTableOverride::default(),
             auto_apply_gate: None,
+            watermark_unconfirmed: false,
         }
     }
 
@@ -25753,6 +26230,7 @@ timestamp_column = "ts"
             prefetched_target_cols: None,
             effective_override: ResolvedTableOverride::default(),
             auto_apply_gate: None,
+            watermark_unconfirmed: false,
         };
 
         let failing = FailMaxDuckDb { inner: &inner };

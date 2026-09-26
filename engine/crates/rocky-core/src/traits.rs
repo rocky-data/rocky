@@ -574,6 +574,35 @@ pub trait WarehouseAdapter: Send + Sync {
         false
     }
 
+    /// Whether one `INSERT INTO t SELECT ...` statement, sent as one call,
+    /// commits all of its rows or none of them.
+    ///
+    /// The replication runner relies on this to repair a watermark whose flush
+    /// was lost (#1854). A crash between a table's `Success` checkpoint and
+    /// the end-of-run watermark flush leaves the stored watermark behind the
+    /// rows already in the target. When the insert is all-or-nothing, the
+    /// target's `MAX(ts)` is a true watermark, and the next run re-derives it
+    /// from the target instead of re-inserting those rows. When a target can
+    /// hold PART of a window, a gap may sit below its `MAX(ts)`, and
+    /// re-deriving would skip the missing rows for good — so the runner keeps
+    /// the stored watermark.
+    ///
+    /// This is the allow-list, and it is opt-in. The default is `false`, so a
+    /// new adapter keeps the old behaviour until someone checks its vendor
+    /// guarantee and overrides this. Evidence behind each answer (2026-09-22):
+    ///
+    /// | adapter | answer | why |
+    /// |---|---|---|
+    /// | DuckDB | `true` | autocommit: one transaction per statement |
+    /// | Databricks | `true` | each statement is one atomic Delta commit |
+    /// | Snowflake | `true` | autocommit; a failed statement rolls back |
+    /// | BigQuery | `true` | a DML job is ACID |
+    /// | Trino | `false` | depends on the connector behind the catalog (Hive has no such guarantee), and Rocky cannot probe it |
+    /// | process / SDK adapters | `false` | a third-party process; not Rocky's to guarantee |
+    fn commits_insert_select_atomically(&self) -> bool {
+        false
+    }
+
     /// Compute warehouse name, if this adapter has one.
     ///
     /// Used by SQL generators that emit `WAREHOUSE = …` clauses (currently

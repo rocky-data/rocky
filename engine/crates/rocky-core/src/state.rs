@@ -3268,6 +3268,24 @@ pub struct RunProgress {
     /// identical to pre-v30.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planned_tables: Option<Vec<String>>,
+    /// Whether this run's watermark flush is durable (#1854).
+    ///
+    /// A table is checkpointed `Success` as soon as its copy commits, but its
+    /// new watermark is queued in memory and written once, after the copy
+    /// loop, by [`StateStore::flush_run_watermarks`]. That same write
+    /// transaction sets this field. So `false` on a checkpoint with `Success`
+    /// tables means the watermarks of those tables may still be the ones from
+    /// BEFORE the copy: the run crashed before the flush, or the flush failed.
+    ///
+    /// Absent reads as `false` (unconfirmed). A checkpoint written before this
+    /// field existed therefore reads as "not proven", which is the safe
+    /// direction: the next run re-derives `MAX(ts)` from the target for its
+    /// tables, and re-derivation only moves a watermark forward. No schema
+    /// version bump: the field is `#[serde(default)]` on the blob, the
+    /// `ModelExecution::tenant` precedent (a bump restarts every remote
+    /// backend from an empty ledger, see `state_sync::schema_version_segment`).
+    #[serde(default)]
+    pub flush_confirmed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -3784,6 +3802,7 @@ impl StateStore {
             tables: Vec::new(),
             scope: scope.cloned(),
             planned_tables: Some(planned_tables.to_vec()),
+            flush_confirmed: false,
         };
         let bytes = serde_json::to_vec(&progress)?;
         let txn = self.db.begin_write()?;
@@ -3947,6 +3966,119 @@ impl StateStore {
             progress.tables = entries;
         }
         Ok(Some(progress))
+    }
+}
+
+impl StateStore {
+    /// Write a replication run's queued watermarks and confirm the flush
+    /// (#1854) in ONE write transaction.
+    ///
+    /// The transaction does three things:
+    ///
+    /// 1. Inserts every `(table_key, watermark)` entry, as
+    ///    [`Self::batch_set_watermarks`] does (one fsync for the run, §P1.6).
+    /// 2. Sets [`RunProgress::flush_confirmed`] on `run_id`'s header.
+    /// 3. Confirms any OLDER unconfirmed header whose every `Success` table
+    ///    has a watermark in `entries`. This run's copy of that table read the
+    ///    target afresh, so the older run's lost watermark no longer matters.
+    ///
+    /// Because the watermarks and the confirmation commit together, a
+    /// confirmed header proves its watermarks are durable. A crash before this
+    /// call, or a failed commit, leaves the header unconfirmed, and the next
+    /// run re-derives the watermark from the target instead of trusting it
+    /// (on the adapters that allow it, see
+    /// `WarehouseAdapter::commits_insert_select_atomically`).
+    ///
+    /// A header that does not decode is left alone rather than failing the
+    /// flush: step 3 is housekeeping, and it must never cost this run its
+    /// watermarks. Returns the number of watermarks written.
+    pub fn flush_run_watermarks(
+        &self,
+        run_id: &str,
+        entries: &[(&str, &WatermarkState)],
+    ) -> Result<usize, StateError> {
+        let flushed: std::collections::HashSet<&str> = entries.iter().map(|(k, _)| *k).collect();
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(WATERMARKS)?;
+            for (key, watermark) in entries {
+                let bytes = serde_json::to_vec(*watermark)?;
+                table.insert(*key, bytes.as_slice())?;
+            }
+        }
+        {
+            let entries_table = txn.open_table(RUN_PROGRESS_ENTRIES)?;
+            let mut headers = txn.open_table(RUN_PROGRESS)?;
+            let mut confirmed: Vec<(String, Vec<u8>)> = Vec::new();
+            for entry in headers.iter()? {
+                let (key, value) = entry?;
+                let Ok(mut progress) = serde_json::from_slice::<RunProgress>(value.value()) else {
+                    continue;
+                };
+                if progress.flush_confirmed {
+                    continue;
+                }
+                let resolved = progress.run_id == run_id || {
+                    // A pre-v8 header keeps its tables inline; read those
+                    // when the run has no per-entry rows.
+                    let entries = Self::read_progress_entries(&entries_table, &progress.run_id)?;
+                    let tables = if entries.is_empty() {
+                        &progress.tables
+                    } else {
+                        &entries
+                    };
+                    tables
+                        .iter()
+                        .filter(|t| t.status == TableStatus::Success)
+                        .all(|t| flushed.contains(t.table_key.as_str()))
+                };
+                if resolved {
+                    progress.flush_confirmed = true;
+                    confirmed.push((key.value().to_string(), serde_json::to_vec(&progress)?));
+                }
+            }
+            for (key, bytes) in confirmed {
+                headers.insert(key.as_str(), bytes.as_slice())?;
+            }
+        }
+        self.commit_write(txn)?;
+        Ok(entries.len())
+    }
+
+    /// The table keys that a run other than `current_run_id` checkpointed
+    /// `Success` without a confirmed watermark flush (#1854).
+    ///
+    /// For each of these tables the stored watermark may predate rows that are
+    /// already in the target. The replication runner re-derives `MAX(ts)`
+    /// from the target for them before it builds the incremental filter.
+    /// A header with [`RunProgress::flush_confirmed`] absent counts as
+    /// unconfirmed, so a checkpoint from an older binary is included.
+    pub fn unconfirmed_flush_table_keys(
+        &self,
+        current_run_id: &str,
+    ) -> Result<std::collections::HashSet<String>, StateError> {
+        let txn = self.db.begin_read()?;
+        let headers = txn.open_table(RUN_PROGRESS)?;
+        let entries_table = txn.open_table(RUN_PROGRESS_ENTRIES)?;
+        let mut keys = std::collections::HashSet::new();
+        for entry in headers.iter()? {
+            let (_, value) = entry?;
+            let progress: RunProgress = serde_json::from_slice(value.value())?;
+            if progress.flush_confirmed || progress.run_id == current_run_id {
+                continue;
+            }
+            let mut tables = Self::read_progress_entries(&entries_table, &progress.run_id)?;
+            if tables.is_empty() {
+                tables = progress.tables;
+            }
+            keys.extend(
+                tables
+                    .into_iter()
+                    .filter(|t| t.status == TableStatus::Success)
+                    .map(|t| t.table_key),
+            );
+        }
+        Ok(keys)
     }
 }
 
@@ -10907,6 +11039,101 @@ mod tests {
         assert_eq!(latest.tables[0].table_key, "cat.sch.new");
     }
 
+    /// #1854: a header written before `flush_confirmed` existed reads as
+    /// UNCONFIRMED, so its `Success` tables are re-derived (the safe side).
+    #[test]
+    fn test_flush_confirmed_absent_reads_as_unconfirmed() {
+        let json = serde_json::json!({
+            "run_id": "old",
+            "started_at": "2026-08-30T00:00:00Z",
+            "total_tables": 1,
+            "tables": [],
+        });
+        let progress: RunProgress = serde_json::from_value(json).unwrap();
+        assert!(!progress.flush_confirmed);
+    }
+
+    /// #1854: the flush writes the watermarks and confirms the run's own
+    /// header in one transaction, and it resolves an older unconfirmed header
+    /// only when every `Success` table of that header got a watermark here.
+    #[test]
+    fn test_flush_run_watermarks_confirms_own_and_covered_headers() {
+        let (store, _dir) = temp_store();
+        let wm = WatermarkState {
+            last_value: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        // Two crashed runs: one copied `a`, the other copied `a` and `z`.
+        for (run, keys) in [
+            ("crashed-a", vec!["c.s.a"]),
+            ("crashed-az", vec!["c.s.a", "c.s.z"]),
+        ] {
+            store
+                .init_run_progress(
+                    run,
+                    &keys.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
+                    None,
+                )
+                .unwrap();
+            for (i, key) in keys.iter().enumerate() {
+                store
+                    .record_table_progress(run, &progress_entry(i, key, TableStatus::Success))
+                    .unwrap();
+            }
+        }
+        // A failed table queues no watermark and needs none.
+        store
+            .record_table_progress(
+                "crashed-a",
+                &progress_entry(1, "c.s.f", TableStatus::Failed),
+            )
+            .unwrap();
+        store
+            .init_run_progress("now", &planned_keys(1), None)
+            .unwrap();
+
+        let pending = store.unconfirmed_flush_table_keys("now").unwrap();
+        assert_eq!(
+            pending,
+            ["c.s.a", "c.s.z"].iter().map(|k| k.to_string()).collect()
+        );
+
+        assert_eq!(
+            store
+                .flush_run_watermarks("now", &[("c.s.a", &wm)])
+                .unwrap(),
+            1
+        );
+        assert!(store.get_watermark("c.s.a").unwrap().is_some());
+        assert!(
+            store
+                .get_run_progress("now")
+                .unwrap()
+                .unwrap()
+                .flush_confirmed
+        );
+        assert!(
+            store
+                .get_run_progress("crashed-a")
+                .unwrap()
+                .unwrap()
+                .flush_confirmed,
+            "every Success table of crashed-a got a fresh watermark"
+        );
+        assert!(
+            !store
+                .get_run_progress("crashed-az")
+                .unwrap()
+                .unwrap()
+                .flush_confirmed,
+            "c.s.z got no watermark, so crashed-az stays unconfirmed"
+        );
+        assert_eq!(
+            store.unconfirmed_flush_table_keys("none").unwrap(),
+            ["c.s.a", "c.s.z"].iter().map(|k| k.to_string()).collect()
+        );
+    }
+
     #[test]
     fn test_get_run_progress_falls_back_to_inline_header_tables() {
         // A run recorded by a pre-v8 binary carries its entries inline in the
@@ -10923,6 +11150,7 @@ mod tests {
             ],
             scope: None,
             planned_tables: None,
+            flush_confirmed: false,
         };
         let bytes = serde_json::to_vec(&legacy).unwrap();
         {

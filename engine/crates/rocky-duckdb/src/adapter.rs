@@ -118,6 +118,12 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
         &self.dialect
     }
 
+    /// On the #1854 allow-list: DuckDB autocommits, one transaction per
+    /// statement, so a failed `INSERT ... SELECT` leaves no rows behind.
+    fn commits_insert_select_atomically(&self) -> bool {
+        true
+    }
+
     /// DuckDB folds identifier case, so this is a dialect constant and needs
     /// no round trip (#1281).
     ///

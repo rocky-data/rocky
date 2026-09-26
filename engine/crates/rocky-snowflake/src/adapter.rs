@@ -58,6 +58,12 @@ impl WarehouseAdapter for SnowflakeWarehouseAdapter {
         &self.dialect
     }
 
+    /// On the #1854 allow-list: a statement runs under autocommit, and a
+    /// failed DML statement is rolled back whole.
+    fn commits_insert_select_atomically(&self) -> bool {
+        true
+    }
+
     fn warehouse_name(&self) -> Option<&str> {
         Some(self.connector.warehouse())
     }

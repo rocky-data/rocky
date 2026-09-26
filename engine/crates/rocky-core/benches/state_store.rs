@@ -63,6 +63,7 @@ fn naive_record_table_progress(db: &Database, run_id: &str, progress: &TableProg
                 tables: Vec::new(),
                 scope: None,
                 planned_tables: None,
+                flush_confirmed: false,
             },
         }
     };

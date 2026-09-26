@@ -1028,6 +1028,12 @@ impl WarehouseAdapter for BigQueryAdapter {
         &self.dialect
     }
 
+    /// On the #1854 allow-list: one query job runs one DML statement, and
+    /// BigQuery DML is ACID.
+    fn commits_insert_select_atomically(&self) -> bool {
+        true
+    }
+
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
         self.run_query(sql)
             .await

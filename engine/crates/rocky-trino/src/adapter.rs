@@ -51,6 +51,15 @@ impl WarehouseAdapter for TrinoAdapter {
         &self.dialect
     }
 
+    /// Deliberately OFF the #1854 allow-list. Whether one `INSERT ... SELECT`
+    /// commits all or nothing depends on the connector behind the catalog
+    /// (Iceberg swaps metadata atomically, Hive does not), and Rocky has no
+    /// probe for which connector that is. Stated here, not inherited, so the
+    /// decision stays visible.
+    fn commits_insert_select_atomically(&self) -> bool {
+        false
+    }
+
     /// Trino folds identifier case, so this is a dialect constant and needs
     /// no round trip (#1281).
     ///

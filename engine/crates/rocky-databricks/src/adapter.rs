@@ -135,6 +135,12 @@ impl WarehouseAdapter for DatabricksWarehouseAdapter {
         &self.dialect
     }
 
+    /// On the #1854 allow-list: one Statement Execution API call runs one
+    /// statement, and each statement is one atomic Delta transaction.
+    fn commits_insert_select_atomically(&self) -> bool {
+        true
+    }
+
     /// Databricks folds identifier case, so this is a dialect constant and needs
     /// no round trip (#1281).
     ///

@@ -126,6 +126,28 @@ At the start of each table's replication, Rocky reads the watermark from the sta
    ```
 3. **Update.** After a successful copy, Rocky advances the watermark to the current timestamp, and the next run picks up from there.
 
+### When the watermark save is lost
+
+Rocky marks each table done as soon as its copy commits. It saves the new watermarks later, in one write after the last table. A crash in between, or a failed save, leaves the old watermark in place. The next run would then copy the same rows again.
+
+```
+  copy table ──▶ checkpoint "done" ──▶ ... ──▶ save watermarks + mark save confirmed
+                                     ▲
+                        crash here: rows copied, watermark old
+```
+
+Rocky records whether the save landed. The mark is written in the same write as the watermarks. On the next run, a table whose earlier save was never confirmed gets its watermark re-read from the target: `SELECT MAX(<timestamp_column>)`. Rocky keeps the later of that value and the stored one. A watermark only moves forward.
+
+This repair runs only where one `INSERT ... SELECT` commits all its rows or none:
+
+| Target adapter | Watermark repair |
+|---|---|
+| DuckDB, Databricks, Snowflake, BigQuery | Yes |
+| Trino | No. It depends on the connector behind the catalog, and Rocky cannot check that. |
+| Process (SDK) adapters | No. Rocky cannot check the other process. |
+
+On Trino and process adapters, a lost save behaves as before: check the watermarks with `rocky state` before you re-run an incremental pipeline. A failed save is still a warning; it does not change the exit code.
+
 ## Inspecting state
 
 Run `rocky state` to view the current state:
