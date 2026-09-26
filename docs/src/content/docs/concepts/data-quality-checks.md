@@ -398,7 +398,7 @@ mode = "split"   # or "tag" or "drop"
 | Mode | Behavior |
 |---|---|
 | `split` | Rocky materializes two new tables: `<target>__valid` with the passing rows and `<target>__quarantine` with the failing rows (plus per-assertion `_error_<name>` label columns marking which assertion each row failed). When the run completes, and the two suffixes name two different tables in your warehouse, each row lands in exactly one of them. The original `<target>` is left untouched; point downstream models at `<target>__valid`. Not available on Trino. |
-| `tag` | Rocky rewrites `<target>` in place, adding a per-assertion `_error_<name>` column populated on failing rows (NULL on passing rows). Every row stays in the table. Useful for observation without a second table — rewrites the source, so use with care on a raw replication target. |
+| `tag` | Rocky rewrites `<target>` in place, adding a per-assertion `_error_<name>` column populated on failing rows (NULL on passing rows). Every row stays in the table. Useful for observation without a second table — rewrites the source, so use with care on a raw replication target. Not available on Trino. |
 | `drop` | Only `<target>__valid` (the passing rows) is written; failing rows are discarded. Quarantine count is still reported in `check_results[]`. |
 
 Set-based, table-level, and referential assertions are never quarantinable. They run as after-the-fact checks whatever the mode.
@@ -408,6 +408,10 @@ Rocky builds the quarantine predicate from every quarantinable assertion, combin
 `split` evaluates that predicate once. It writes the source rows, plus one label column per assertion, to a new table in the source's schema named `_quarantine_labels_<token>`. It builds `__valid` and `__quarantine` from those labels, then drops the label table. The token is a random UUID for each run, so two runs never share a label table. A run killed between those statements leaves the label table behind. Two runs of one pipeline at the same time can still overwrite each other's `__valid` and `__quarantine` tables.
 
 `__valid` keeps exactly the source's columns. Rocky writes it with `SELECT * EXCLUDE (...)` on DuckDB and Snowflake, and `SELECT * EXCEPT (...)` on Databricks and BigQuery. A dialect with no such form refuses `split` with a `quarantine:compile` check. Trino is one, and so is any adapter whose dialect does not provide it.
+
+`tag` rewrites its source with one statement that reads and replaces it. A dialect whose `CREATE TABLE ... AS` cannot replace a table refuses `tag` with a `quarantine:compile` check. So does a dialect with no star-exclusion form. Trino is both. Use `drop` there.
+
+On Trino, `CREATE TABLE ... AS` cannot replace a table. So before it writes `__valid`, `drop` runs `DROP TABLE IF EXISTS` on it. A second run then replaces the table instead of failing. The check names that statement's role `pre_drop`.
 
 A quarantine that fails or is refused fails the run, whatever `fail_on_error` says. The table counts in `tables_failed` and is listed in `errors`. What the failure leaves behind depends on when it happened:
 

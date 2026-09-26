@@ -69,6 +69,18 @@ pub enum QuarantineError {
     )]
     SplitNeedsStarExclusion { dialect: &'static str },
 
+    /// `tag` rewrites its source with one statement that reads and replaces
+    /// it, and this warehouse cannot do that (#2063).
+    #[error(
+        "quarantine mode = \"tag\" is not supported on {dialect}: {reason}. \
+         Use mode = \"drop\" instead"
+    )]
+    TagNotSupported {
+        dialect: &'static str,
+        /// The capability the warehouse lacks.
+        reason: &'static str,
+    },
+
     /// Two tables a mode writes, or one it writes and the source it reads,
     /// resolve to the same name.
     #[error(
@@ -109,6 +121,10 @@ pub struct QuarantinePlan {
     /// valid CTAS. Quarantine runs before valid so a partial failure leaves
     /// a stray quarantine table (cheap to inspect) rather than a stale
     /// valid table downstream pipelines might read.
+    ///
+    /// On a warehouse whose CTAS cannot replace a table (Trino), each CTAS
+    /// that replaces a table is preceded by a [`StatementRole::PreDrop`] of
+    /// its target (#2063).
     pub statements: Vec<QuarantineStatement>,
     /// `split` only: the statement that drops the intermediate label table.
     /// `None` for `drop` and `tag`, which write no intermediate table.
@@ -136,8 +152,8 @@ pub struct QuarantinePlan {
 #[derive(Debug, Clone)]
 pub struct QuarantineStatement {
     /// Human-readable role of this statement (`"label"`, `"quarantine"`,
-    /// `"valid"`, `"tag"`, `"drop_labels"`). Used for logging and row-effect
-    /// attribution.
+    /// `"valid"`, `"tag"`, `"drop_labels"`, `"pre_drop"`). Used for logging
+    /// and row-effect attribution.
     pub role: StatementRole,
     /// Fully-qualified table name this statement writes to.
     pub target: String,
@@ -161,6 +177,11 @@ pub enum StatementRole {
     /// `split` only: drops the intermediate table the [`Self::Label`]
     /// statement wrote.
     DropLabels,
+    /// `DROP TABLE IF EXISTS` of the table the next statement writes. Only
+    /// on a warehouse whose CTAS cannot replace a table
+    /// ([`SqlDialect::full_refresh_needs_predrop`], Trino), so a second run
+    /// does not fail with "already exists" (#2063).
+    PreDrop,
 }
 
 /// Compile a quarantine plan for one table.
@@ -302,21 +323,29 @@ fn compile_with_token(
                 &working,
                 dialect,
             ));
-            statements.push(build_split_quarantine_ctas(
-                &quarantine_table,
-                &intermediate_table,
-                &labeled,
-                &working,
-                &without_labels,
+            push_replacing(
+                &mut statements,
+                build_split_quarantine_ctas(
+                    &quarantine_table,
+                    &intermediate_table,
+                    &labeled,
+                    &working,
+                    &without_labels,
+                    dialect,
+                ),
                 dialect,
-            ));
-            statements.push(build_split_valid_ctas(
-                &valid_table,
-                &intermediate_table,
-                &working,
-                &without_labels,
+            );
+            push_replacing(
+                &mut statements,
+                build_split_valid_ctas(
+                    &valid_table,
+                    &intermediate_table,
+                    &working,
+                    &without_labels,
+                    dialect,
+                ),
                 dialect,
-            ));
+            );
             drop_intermediate = Some(QuarantineStatement {
                 role: StatementRole::DropLabels,
                 sql: dialect.drop_table_sql(&intermediate_table),
@@ -329,14 +358,14 @@ fn compile_with_token(
                 .map(|p| p.valid_pred.as_str())
                 .collect::<Vec<_>>()
                 .join(" AND ");
-            statements.push(build_valid_ctas(
-                &valid_table,
-                &source_table,
-                &valid_where,
+            push_replacing(
+                &mut statements,
+                build_valid_ctas(&valid_table, &source_table, &valid_where, dialect),
                 dialect,
-            ));
+            );
         }
         QuarantineMode::Tag => {
+            refuse_tag_without_replace(dialect)?;
             let names: Vec<&str> = labeled.iter().map(|p| p.label.as_str()).collect();
             statements.push(build_label_ctas(
                 StatementRole::Tag,
@@ -365,6 +394,48 @@ fn compile_with_token(
         statements,
         drop_intermediate,
     }))
+}
+
+/// Push a CTAS that replaces its target, preceded by a
+/// [`StatementRole::PreDrop`] of that target when the warehouse's CTAS cannot
+/// replace (Trino). The same two-statement shape a full refresh uses in
+/// `sql_gen.rs`. Safe to repeat: the drop is `DROP TABLE IF EXISTS`.
+fn push_replacing(
+    statements: &mut Vec<QuarantineStatement>,
+    ctas: QuarantineStatement,
+    dialect: &dyn SqlDialect,
+) {
+    if dialect.full_refresh_needs_predrop() {
+        statements.push(QuarantineStatement {
+            role: StatementRole::PreDrop,
+            sql: dialect.drop_table_sql(&ctas.target),
+            target: ctas.target.clone(),
+        });
+    }
+    statements.push(ctas);
+}
+
+/// Refuse `tag` on a warehouse that cannot run it (#2063).
+///
+/// `tag`'s target is its source. A pre-drop would delete the source before
+/// the CTAS reads it, so a warehouse whose CTAS cannot replace has no safe
+/// one-statement form. And a label replaces a source column of the same name
+/// through star exclusion (#2065), so a warehouse without it cannot run a
+/// second `tag` over its own output. Decided by capability, not by name.
+fn refuse_tag_without_replace(dialect: &dyn SqlDialect) -> Result<(), QuarantineError> {
+    let reason = if dialect.full_refresh_needs_predrop() {
+        "tag rewrites its source table in place, and this warehouse's \
+         CREATE TABLE ... AS cannot replace a table that exists"
+    } else if dialect.star_excluding(&["_error_"]).is_none() {
+        "tag replaces label columns left by an earlier run with \
+         `SELECT * EXCEPT (<labels>)`, and this warehouse has no such form"
+    } else {
+        return Ok(());
+    };
+    Err(QuarantineError::TagNotSupported {
+        dialect: dialect.name(),
+        reason,
+    })
 }
 
 struct LabeledPredicate {
@@ -1164,16 +1235,221 @@ mod unit_tests {
             "{err:?}"
         );
 
-        // `drop` and `tag` never needed it.
-        for mode in [QuarantineMode::Drop, QuarantineMode::Tag] {
-            let cfg = QuarantineConfig {
-                mode,
-                ..split_config()
-            };
-            compile_quarantine_sql(&assertions, "orders", &table(), &dialect, &cfg)
-                .unwrap_or_else(|e| panic!("{mode:?} does not exclude columns: {e:?}"))
-                .expect("a plan");
+        // `drop` never needed it.
+        let cfg = QuarantineConfig {
+            mode: QuarantineMode::Drop,
+            ..split_config()
+        };
+        compile_quarantine_sql(&assertions, "orders", &table(), &dialect, &cfg)
+            .unwrap_or_else(|e| panic!("drop does not exclude columns: {e:?}"))
+            .expect("a plan");
+
+        // `tag` needs it since #2065: a label replaces a source column of the
+        // same name, which a second `tag` over its own output always has.
+        let cfg = QuarantineConfig {
+            mode: QuarantineMode::Tag,
+            ..split_config()
+        };
+        let err =
+            compile_quarantine_sql(&assertions, "orders", &table(), &dialect, &cfg).unwrap_err();
+        assert!(
+            matches!(err, QuarantineError::TagNotSupported { .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("EXCEPT"), "{err}");
+    }
+
+    /// A dialect whose CTAS is a plain `CREATE TABLE` and needs a pre-drop,
+    /// like Trino's, but that has star exclusion, so only the pre-drop
+    /// capability is under test.
+    struct PredropDialect;
+
+    impl SqlDialect for PredropDialect {
+        fn name(&self) -> &'static str {
+            "predrop"
         }
+        fn full_refresh_needs_predrop(&self) -> bool {
+            true
+        }
+        fn literal_escape(&self) -> crate::traits::LiteralEscape {
+            TestDialect.literal_escape()
+        }
+        fn format_table_ref(&self, c: &str, s: &str, t: &str) -> AdapterResult<String> {
+            TestDialect.format_table_ref(c, s, t)
+        }
+        fn create_table_as(&self, target: &str, select_sql: &str) -> String {
+            format!("CREATE TABLE {target} AS\n{select_sql}")
+        }
+        fn insert_into(&self, a: &str, b: &str) -> String {
+            TestDialect.insert_into(a, b)
+        }
+        fn merge_into(
+            &self,
+            a: &str,
+            b: &str,
+            c: &[std::sync::Arc<str>],
+            d: &ColumnSelection,
+        ) -> AdapterResult<String> {
+            TestDialect.merge_into(a, b, c, d)
+        }
+        fn select_clause(
+            &self,
+            a: &ColumnSelection,
+            b: &[MetadataColumn],
+        ) -> AdapterResult<String> {
+            TestDialect.select_clause(a, b)
+        }
+        fn watermark_where(
+            &self,
+            a: &str,
+            b: Option<&chrono::DateTime<chrono::Utc>>,
+        ) -> AdapterResult<String> {
+            TestDialect.watermark_where(a, b)
+        }
+        fn describe_table_sql(&self, t: &str) -> String {
+            TestDialect.describe_table_sql(t)
+        }
+        fn drop_table_sql(&self, t: &str) -> String {
+            TestDialect.drop_table_sql(t)
+        }
+        fn create_catalog_sql(&self, c: &str) -> Option<AdapterResult<String>> {
+            TestDialect.create_catalog_sql(c)
+        }
+        fn create_schema_sql(&self, c: &str, s: &str) -> Option<AdapterResult<String>> {
+            TestDialect.create_schema_sql(c, s)
+        }
+        fn tablesample_clause(&self, p: u32) -> Option<String> {
+            TestDialect.tablesample_clause(p)
+        }
+        fn insert_overwrite_partition(
+            &self,
+            a: &str,
+            b: &str,
+            c: &str,
+        ) -> AdapterResult<Vec<String>> {
+            TestDialect.insert_overwrite_partition(a, b, c)
+        }
+        fn regex_match_predicate(&self, column: &str, pattern: &str) -> AdapterResult<String> {
+            TestDialect.regex_match_predicate(column, pattern)
+        }
+        fn star_excluding(&self, columns: &[&str]) -> Option<String> {
+            TestDialect.star_excluding(columns)
+        }
+    }
+
+    /// On a warehouse whose CTAS cannot replace a table, `drop` drops its
+    /// valid table first, so a second run does not fail with "already
+    /// exists", and `tag` is refused before any SQL runs (#2063).
+    ///
+    /// `tag` must never be pre-dropped: its target is its source, so the
+    /// drop would delete the rows the CTAS is about to read.
+    #[test]
+    fn a_ctas_that_cannot_replace_is_pre_dropped_and_tag_is_refused() {
+        let assertions = vec![assertion(
+            None,
+            TestType::NotNull,
+            Some("customer_id"),
+            TestSeverity::Error,
+        )];
+        let cfg = |mode| QuarantineConfig {
+            mode,
+            ..split_config()
+        };
+
+        let plan = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &PredropDialect,
+            &cfg(QuarantineMode::Drop),
+        )
+        .unwrap()
+        .unwrap();
+        let roles: Vec<StatementRole> = plan.statements.iter().map(|s| s.role).collect();
+        assert_eq!(roles, vec![StatementRole::PreDrop, StatementRole::Valid]);
+        assert_eq!(
+            plan.statements[0].sql,
+            "DROP TABLE IF EXISTS poc.staging__orders.orders__valid"
+        );
+        assert_eq!(plan.statements[0].target, plan.statements[1].target);
+        assert!(
+            plan.statements[1]
+                .sql
+                .starts_with("CREATE TABLE poc.staging__orders.orders__valid AS"),
+            "{}",
+            plan.statements[1].sql
+        );
+
+        // `split` pre-drops both tables it replaces, never its own new
+        // intermediate table or the source.
+        let plan = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &PredropDialect,
+            &cfg(QuarantineMode::Split),
+        )
+        .unwrap()
+        .unwrap();
+        let steps: Vec<(StatementRole, &str)> = plan
+            .statements
+            .iter()
+            .map(|s| (s.role, s.target.as_str()))
+            .skip(1)
+            .collect();
+        assert_eq!(
+            steps,
+            vec![
+                (
+                    StatementRole::PreDrop,
+                    "poc.staging__orders.orders__quarantine"
+                ),
+                (
+                    StatementRole::Quarantine,
+                    "poc.staging__orders.orders__quarantine"
+                ),
+                (StatementRole::PreDrop, "poc.staging__orders.orders__valid"),
+                (StatementRole::Valid, "poc.staging__orders.orders__valid"),
+            ]
+        );
+        assert_eq!(plan.statements[0].role, StatementRole::Label);
+
+        let err = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &PredropDialect,
+            &cfg(QuarantineMode::Tag),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, QuarantineError::TagNotSupported { .. }),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("cannot replace"), "{message}");
+        assert!(
+            message.ends_with("Use mode = \"drop\" instead"),
+            "{message}"
+        );
+
+        // Control: a dialect whose CTAS replaces gets no pre-drop.
+        let plan = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg(QuarantineMode::Drop),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            plan.statements
+                .iter()
+                .all(|s| s.role != StatementRole::PreDrop),
+            "{:?}",
+            plan.statements
+        );
     }
 
     /// Two plans for the same table name different working objects, and the

@@ -1340,6 +1340,7 @@ fn role_label(role: rocky_core::quarantine::StatementRole) -> &'static str {
         StatementRole::Valid => "valid",
         StatementRole::Tag => "tag",
         StatementRole::DropLabels => "drop_labels",
+        StatementRole::PreDrop => "pre_drop",
     }
 }
 

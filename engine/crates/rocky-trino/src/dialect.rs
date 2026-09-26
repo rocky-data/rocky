@@ -344,6 +344,81 @@ mod tests {
         assert!(d.full_refresh_needs_predrop());
     }
 
+    /// Quarantine on Trino (#2063): `drop` pre-drops its valid table so a
+    /// second run does not hit "already exists"; `tag` and `split` are
+    /// refused before any SQL runs.
+    #[test]
+    fn quarantine_pre_drops_drop_mode_and_refuses_tag_and_split() {
+        use rocky_core::config::{QualityAssertion, QuarantineConfig, QuarantineMode};
+        use rocky_core::quarantine::{QuarantineError, StatementRole, compile_quarantine_sql};
+        use rocky_core::tests::{TestDecl, TestSeverity, TestType};
+
+        let d = TrinoDialect::new();
+        let assertions = vec![QualityAssertion {
+            table: "orders".into(),
+            name: None,
+            test: TestDecl {
+                test_type: TestType::NotNull,
+                column: Some("id".into()),
+                severity: TestSeverity::Error,
+                filter: None,
+            },
+        }];
+        let table = rocky_ir::TableRef {
+            catalog: "memory".into(),
+            schema: "default".into(),
+            table: "orders".into(),
+        };
+        let compile = |mode| {
+            compile_quarantine_sql(
+                &assertions,
+                "orders",
+                &table,
+                &d,
+                &QuarantineConfig {
+                    enabled: true,
+                    mode,
+                    ..QuarantineConfig::default()
+                },
+            )
+        };
+
+        let plan = compile(QuarantineMode::Drop).unwrap().unwrap();
+        let sql: Vec<(StatementRole, &str)> = plan
+            .statements
+            .iter()
+            .map(|s| (s.role, s.sql.as_str()))
+            .collect();
+        assert_eq!(sql.len(), 2, "{sql:#?}");
+        assert_eq!(
+            sql[0],
+            (
+                StatementRole::PreDrop,
+                "DROP TABLE IF EXISTS \"memory\".\"default\".\"orders__valid\""
+            )
+        );
+        assert_eq!(sql[1].0, StatementRole::Valid);
+        assert!(
+            sql[1]
+                .1
+                .starts_with("CREATE TABLE \"memory\".\"default\".\"orders__valid\" AS"),
+            "{}",
+            sql[1].1
+        );
+
+        let tag = compile(QuarantineMode::Tag).unwrap_err();
+        assert!(
+            matches!(tag, QuarantineError::TagNotSupported { .. }),
+            "{tag:?}"
+        );
+        assert!(tag.to_string().contains("mode = \"drop\""), "{tag}");
+        let split = compile(QuarantineMode::Split).unwrap_err();
+        assert!(
+            matches!(split, QuarantineError::SplitNeedsStarExclusion { .. }),
+            "{split:?}"
+        );
+    }
+
     #[test]
     fn insert_into_keeps_select_intact() {
         let d = TrinoDialect::new();
