@@ -1853,9 +1853,11 @@ pub(crate) async fn run_gc_apply_in_with(
         );
     }
 
-    let seam_cas = remote_state && rocky_core::state_sync::cas_effective(&state_cfg);
-    let output = if seam_cas {
-        // CAS ledger seam (#1242; ADR-CONCURRENCY D1 seam class = RETRY): the
+    let output = if remote_state {
+        // Ledger seam (#1242; ADR-CONCURRENCY D1 seam class = RETRY). Without
+        // effective CAS the session keeps the legacy shape — one download, one
+        // transition, a forced-`Fail` unconditional upload — so there is no
+        // second publish path to keep in step (#1228). Under CAS the
         // whole transition replays per attempt against the freshly downloaded
         // winner. `execute_gc_apply` re-derives candidates, refcounts, and
         // both liveness reads from that fresh store — a winner that re-added
@@ -1948,33 +1950,10 @@ pub(crate) async fn run_gc_apply_in_with(
                 format!("failed to commit gc apply '{plan_id}' to shared remote state")
             })?
     } else {
+        // Local backend: the on-disk file is the state; nothing to publish.
         let store = StateStore::open(state_path)
             .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-        let output = execute_gc_apply(&store, oracle.as_ref(), plan_id, &plan, Utc::now()).await?;
-        // Drop the store to release the advisory lock / flush the file before upload.
-        drop(store);
-
-        // SEAM-SCOPED SYNC — upload half, FAIL-CLOSED. Durability is the whole
-        // point of the seam: an eviction that commits locally but never reaches
-        // the remote would be silently reverted by the next run's start-download
-        // while this command reported success. So the upload is forced to `Fail`
-        // regardless of the configured `on_upload_failure` (default `skip`) — a
-        // failed upload aborts (finding 5). Without effective CAS this remains
-        // the legacy last-writer-wins half-seam (#1228's residual exposure —
-        // keep one writer per `[state]` prefix).
-        if remote_state {
-            // WP-01 PR-B (2b): the half-seam owns the forced-`Fail` durability
-            // policy (previously a local `StateConfig` clone here).
-            rocky_core::state_sync::RemoteStateSession::upload_only_fail_closed(
-                &state_cfg,
-                state_path,
-                "gc apply",
-                replicate_schema_cache,
-            )
-            .await
-            .with_context(|| "failed to upload remote state after gc apply")?;
-        }
-        output
+        execute_gc_apply(&store, oracle.as_ref(), plan_id, &plan, Utc::now()).await?
     };
 
     if json {

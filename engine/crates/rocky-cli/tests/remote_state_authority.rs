@@ -293,10 +293,11 @@ async fn resume_refuses_indeterminate_remote_state() {
 }
 
 /// (d) Seam regression: the pre-gate download seams keep their fail-closed
-/// `?`-bail with the existing context on a failed download — the PR-A
-/// `let _authority` bind is behavior-inert. Pinned through `policy freeze`
-/// (the kill switch), whose download half must abort the command rather than
-/// record a freeze a later remote download would clobber.
+/// `?`-bail on a failed download — the PR-A `let _authority` bind is
+/// behavior-inert. Pinned through `policy freeze` (the kill switch), whose
+/// ledger seam must abort the command rather than record a freeze a later
+/// remote download would clobber. Since #1242 the freeze runs through
+/// `LedgerSeamSession` with or without CAS, so the context is the seam's.
 #[test]
 fn policy_freeze_download_failure_fails_closed() {
     let _serial = remote_testing::serial_guard();
@@ -325,8 +326,9 @@ fn policy_freeze_download_failure_fails_closed() {
 
     harness.faults.clear();
     assert!(
-        format!("{err:#}")
-            .contains("failed to download remote state before recording the policy freeze"),
+        format!("{err:#}").contains(
+            "failed to commit the policy freeze ledger transition to shared remote state"
+        ),
         "the freeze seam must keep its existing fail-closed context; got: {err:#}"
     );
     assert_eq!(

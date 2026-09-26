@@ -1369,9 +1369,10 @@ impl RemoteStateSession {
     // Half-seams — download-XOR-upload lifecycle shapes (WP-01 PR-B §1)
     // -----------------------------------------------------------------------
 
-    /// Half-seam download for legacy single-record ledger paths (policy freeze
-    /// when CAS is inert, gc apply, restore apply, the governed-apply pre-gate
-    /// sync): pull the authoritative remote ledger before the seam reads it.
+    /// Half-seam download for the pre-gate syncs (gc apply, restore apply, the
+    /// governed-apply gate): pull the authoritative remote ledger before a gate
+    /// reads it. There is no upload half: every ledger write to shared remote
+    /// state goes through [`LedgerSeamSession`] (#1242).
     ///
     /// A *lifecycle shape*, not a session: no `acquire`/`finalize` pairing, no
     /// Drop tripwire. [`StateBackend::Local`] is a zero-I/O
@@ -1394,42 +1395,6 @@ impl RemoteStateSession {
             return Ok(StateAuthority::Authoritative);
         }
         download_state(cfg, state_path, replicate_schema_cache).await
-    }
-
-    /// Half-seam upload for the single-record ledger seams: push the local
-    /// ledger to the remote backend with `on_upload_failure` **forced to
-    /// [`Fail`][StateUploadFailureMode::Fail]**, regardless of the configured
-    /// liveness default — a ledger mutation (freeze row, gc tombstone,
-    /// restore custody, budget pair) that commits locally but never reaches
-    /// the remote would be silently reverted by the next run's
-    /// start-download while the command reported success.
-    ///
-    /// [`StateBackend::Local`] is a no-op. `reason` names the seam in the
-    /// upload's structured log line; error context stays with the caller.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the upload failure (never swallowed — the forced `Fail`
-    /// disables the configured `skip` liveness contract for this seam).
-    ///
-    /// TODO(#1228): keep this unconditional half-seam until the remaining gc
-    /// and apply callers migrate to [`LedgerSeamSession`]; remove it only with
-    /// the last seam migration.
-    pub async fn upload_only_fail_closed(
-        cfg: &StateConfig,
-        state_path: &Path,
-        reason: &str,
-        replicate_schema_cache: bool,
-    ) -> Result<(), StateSyncError> {
-        if matches!(cfg.backend, StateBackend::Local) {
-            return Ok(());
-        }
-        debug!(reason, "fail-closed ledger upload (half-seam)");
-        let upload_cfg = StateConfig {
-            on_upload_failure: StateUploadFailureMode::Fail,
-            ..cfg.clone()
-        };
-        upload_state(&upload_cfg, state_path, replicate_schema_cache).await
     }
 }
 
@@ -2114,13 +2079,11 @@ async fn download_state_inner(
 // never be able to answer with something the durable tier disagrees with.
 //
 // Scope, stated up front: this covers the end-of-run upload
-// (`RemoteStateSession::finalize`) and policy freeze's effective-CAS
-// [`LedgerSeamSession`] path. The remaining `upload_only_fail_closed` callers
-// (`gc apply` and `apply`) still write the shared blob unconditionally on
-// every backend, so they can overwrite a CAS-committed object without raising
-// a conflict. That is the remaining ADR-CONCURRENCY D1 rollout tracked by
-// #1228; the behaviour is identical on `s3`/`gcs`, so enabling `cas` on
-// `tiered` brings it to parity rather than closing D1.
+// (`RemoteStateSession::finalize`) and every ledger seam (`policy`, `gc
+// apply`, `restore`, the governed `apply` decision rows), which all commit
+// through [`LedgerSeamSession`] since #1242. The unconditional half-seam
+// upload is gone, so under effective CAS no production writer publishes the
+// shared blob without a condition.
 //
 // The mechanism is a FRESHNESS-CHECKED cache entry: the generation the durable
 // CAS committed at is framed into the cached value itself, in one atomic

@@ -725,7 +725,17 @@ What it does not do is reconcile the two runs. You re-run the loser yourself. Ro
 
 It needs a backend with a durable object tier: `s3`, `gcs`, or `tiered`. On `local` and `valkey` it downgrades to `off` with a warning, because neither offers a conditional write. Turning it on also stops the mid-run periodic uploader on every backend. A crashed run then leaves the remote ledger at its last committed generation instead of a partial mid-run snapshot.
 
-**What `cas` does not yet cover.** It protects the end-of-run state upload, the `rocky policy freeze` / `unfreeze` ledger write, which retries onto the winner when it loses a race, and `rocky gc`, which commits through the same seam. Two writers stay outside it. The **restore** path uploads unconditionally on every remote backend, after execution, including a failed one. That path is the same whether you reach it with `rocky restore` or by applying its plan with `rocky apply <plan-id>`, so a restore-shaped `rocky apply` is unconditional too. A **run-shaped** `rocky apply` uploads unconditionally only for the rows it writes when a `[policy]` rule sets `verify_after`. Either can overwrite a run's committed state without raising a conflict and still exit zero. This is tracked as [issue #1228](https://github.com/rocky-data/rocky/issues/1228) and applies equally to `s3`, `gcs`, and `tiered`. Until it is closed, keep the orchestrator-level rule of one writer per `[state]` prefix for `rocky restore` and `rocky apply`.
+**What `cas` covers.** Every remote state write Rocky makes goes through it:
+
+- the end-of-run state upload;
+- the `rocky policy freeze` / `unfreeze` ledger write;
+- `rocky gc`;
+- `rocky restore`, and `rocky apply` of a restore plan;
+- the policy rows a governed `rocky apply` writes before and after its run.
+
+The ledger writes (all but the first) retry onto the winner when they lose a race. Each retry downloads the winner again and repeats the whole change, including the policy check. A freeze or an exhausted budget that landed in between therefore refuses the write. After three lost races the command exits non-zero and the winner stays as it is.
+
+**What `cas` cannot do.** It protects only the processes that set it. One process on the same `[state]` prefix with `concurrency_control = "off"` still overwrites state unconditionally, and `off` is the default. Set `cas` on every process that shares the prefix. Until you have, keep one writer per `[state]` prefix. [Issue #1228](https://github.com/rocky-data/rocky/issues/1228) tracks when `rocky doctor` may report this as healthy.
 
 **On `tiered`,** `cas` additionally makes the Valkey tier coherent with the durable object. The compare-and-swap runs against S3 first; only after it commits is the Valkey copy written, stored together with the generation it was committed at. A read may use the cached copy only after confirming that generation is still the durable object's — otherwise it reads S3. So a Valkey write that fails, a process that dies between the two, or a cache entry left over from an earlier run can no longer shadow durable state. Cached copies are held under a separate key from the `off` path's, so a fleet can move pods from `off` to `cas` one at a time.
 

@@ -657,39 +657,25 @@ async fn collect_health_checks(
 /// - `concurrency_control = "cas"` on a backend that **cannot** honour it — you
 ///   enabled it and the engine silently downgrades to an unconditional upload,
 ///   so the config claims a protection the deployment does not have.
-/// - `concurrency_control = "cas"` on a backend that **does** honour it — runs
-///   are compare-and-swap protected, but the ledger-seam writers still are not.
+/// - `concurrency_control = "cas"` on a backend that **does** honour it — every
+///   writer in this process is compare-and-swap protected, but the check cannot
+///   see the other processes that share the prefix.
 ///
 /// # No remote deployment is fully protected yet
 ///
 /// `docs/adr/ADR-CONCURRENCY.md` is normative: compare-and-swap applies to
-/// *every* remote state write, split by writer class. Most of it is now
-/// implemented — the end-of-run upload, `rocky policy` freeze/unfreeze, and
-/// (since #1372) `rocky gc` all commit through the compare-and-swap seam.
+/// *every* remote state write, split by writer class. Since #1242 every writer
+/// is implemented: the end-of-run upload, and every ledger seam — `rocky
+/// policy` freeze/unfreeze, `rocky gc`, `rocky restore` (and `rocky apply` of a
+/// restore plan), and the governed `rocky apply` decision and verify-after
+/// custody rows — commits through `LedgerSeamSession`. No production path
+/// publishes the shared blob without a condition under effective CAS.
 ///
-/// What is left is narrower than this arm used to claim, and the exposed set
-/// is not the one it named:
-///
-/// * `rocky restore` calls the unconditional
-///   [`upload_state`][rocky_core::state_sync::upload_state] on **every**
-///   remote backend, on every restore apply, including a failing one.
-/// * `rocky apply` of a RESTORE plan reaches the same unconditional upload,
-///   on every remote backend and with no `verify_after` involved: the
-///   `PlanKind::Restore` arm routes into `run_restore_apply_in`, which calls
-///   `upload_remote_ledger_fail_closed` on every path. "Fail-closed" there
-///   names the DURABILITY policy (the command fails if the upload fails), not
-///   a compare-and-swap — it funnels into the same `upload_state`.
-/// * `rocky apply` of any OTHER plan kind reaches that upload only for its
-///   verify-after custody rows, which are gated on a non-empty `verify_after`
-///   — so a project with no `[policy]` block never reaches it.
-///
-/// A concurrent restore can still silently erase a run's just-committed state.
-///
-/// That exposure is backend-independent, which is why `cas` on a
-/// conditional-write backend earns a Warning rather than a Healthy: a green
-/// verdict there would overclaim exactly as much as it would anywhere else.
-/// Issue #1228 tracks closing the seam half; when it lands, this arm is the one
-/// that becomes Healthy.
+/// The arm still warns. The protection is fleet-wide or it is nothing: one
+/// process on the same prefix with `concurrency_control = "off"` still uploads
+/// unconditionally, and `off` is the default. This check reads one config and
+/// cannot see the others. Whether this arm may report Healthy is the open
+/// closure question on issue #1228.
 fn state_concurrency_check(
     config_path: &Path,
     verbose: bool,
@@ -735,29 +721,29 @@ fn state_concurrency_check(
     let cas_supported = rocky_core::state_sync::cas_supported_on(backend);
 
     let (status, message) = match (config.state.concurrency_control, cas_supported) {
-        // The best configuration available today, and still not Healthy: the
-        // remaining ledger-seam writers bypass CAS on every backend, so a green
-        // here would certify a protection no deployment currently has. This is
-        // the arm that flips to Healthy once the last seam lands.
+        // The best configuration available: every writer in this process
+        // commits through compare-and-swap (#1242). Still not Healthy — one
+        // process on the same prefix with `cas` off overwrites unconditionally,
+        // and this check cannot see it. The Healthy flip is #1228's open
+        // closure question.
         (ConcurrencyControl::Cas, true) => {
             suggestions.push(
-                "state_concurrency: end-of-run uploads, the `rocky policy` freeze/unfreeze \
-                 ledger write and `rocky gc` are compare-and-swap protected. `rocky restore` \
-                 still writes state unconditionally, as does `rocky apply` when `verify_after` \
-                 is configured — until issue #1228 lands, do not run those two concurrently \
-                 with a pipeline run"
+                "state_concurrency: every state writer in this project is compare-and-swap \
+                 protected. Set concurrency_control = \"cas\" on EVERY process that shares \
+                 this [state] prefix — one process with it off still overwrites state \
+                 unconditionally (issue #1228)"
                     .into(),
             );
             (
                 HealthStatus::Warning,
                 format!(
-                    "[state] concurrency_control = \"cas\" protects this writer's end-of-run \
-                     upload, the `rocky policy` freeze/unfreeze ledger write and `rocky gc` on \
-                     the '{backend}' backend. `rocky restore` still uploads state \
-                     unconditionally on every backend, and `rocky apply` does so when \
-                     `verify_after` is configured — a concurrent one can silently overwrite a \
-                     run's committed state. Avoid running those alongside a pipeline run; \
-                     tracked in issue #1228"
+                    "[state] concurrency_control = \"cas\" protects every state write this \
+                     project makes on the '{backend}' backend: the end-of-run upload, `rocky \
+                     policy` freeze/unfreeze, `rocky gc`, `rocky restore` and the governed \
+                     `rocky apply` ledger rows. The protection holds only if every process that \
+                     shares this [state] prefix also sets it — a writer with it off still \
+                     overwrites state unconditionally, and this check cannot see other \
+                     processes; tracked in issue #1228"
                 ),
             )
         }
@@ -1437,9 +1423,9 @@ mod tests {
     }
 
     /// `cas` on a conditional-write backend is the best configuration available
-    /// today and still must not report Healthy: the ledger-seam writers bypass
-    /// compare-and-swap on every backend, so a green here would certify a
-    /// protection no deployment currently has.
+    /// and still must not report Healthy: the check cannot see the other
+    /// processes on the prefix, and one with `cas` off still overwrites
+    /// unconditionally (#1228's open closure question).
     #[tokio::test]
     async fn cas_on_an_object_store_backend_warns_about_the_seam_writers() {
         let checks = state_concurrency_checks(
@@ -1460,26 +1446,29 @@ mod tests {
             "the message must say what IS protected: {}",
             check.message,
         );
-        // Pin the CORRECTED writer list (#1372 migrated gc; restore is what is
-        // left). A `contains("rocky gc") && contains("unconditionally")` check
-        // passes against BOTH the old and the corrected message — `rocky gc`
-        // now appears in the protected list and `unconditionally` refers to
-        // restore — so it cannot tell the true claim from the false one.
-        assert!(
-            check.message.contains("rocky restore") && check.message.contains("unconditionally"),
-            "the message must name `rocky restore`, the only unconditionally exposed \
-             writer left, as bypassing CAS: {}",
-            check.message,
-        );
-        let protected_half = check
+        // Pin the CORRECTED writer list (#1242 migrated restore and apply, the
+        // last seams): every writer sits in the PROTECTED half, and the only
+        // residual named is a process on the prefix with `cas` off.
+        let (protected_half, residual_half) = check
             .message
-            .split("still uploads state")
-            .next()
-            .unwrap_or("");
+            .split_once("The protection holds only if")
+            .expect("the message separates what is protected from the residual");
+        for writer in ["rocky policy", "rocky gc", "rocky restore", "rocky apply"] {
+            assert!(
+                protected_half.contains(writer),
+                "`{writer}` is compare-and-swap protected since #1242, so it must appear \
+                 in the PROTECTED half: {}",
+                check.message,
+            );
+            assert!(
+                !residual_half.contains(writer),
+                "`{writer}` must not be named as a residual bypass: {}",
+                check.message,
+            );
+        }
         assert!(
-            protected_half.contains("rocky gc"),
-            "`rocky gc` has been compare-and-swap protected since #1372, so it must appear \
-             in the PROTECTED half of the message, not among the bypassing writers: {}",
+            residual_half.contains("unconditionally"),
+            "the residual — a writer with `cas` off — must be named: {}",
             check.message,
         );
         assert!(
