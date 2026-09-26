@@ -5394,6 +5394,82 @@ mod tests {
         assert_eq!(resp.status(), 200, "without --ui the guard is off");
     }
 
+    /// #2042. A malformed BRACKETED authority is refused by a running
+    /// `--ui` server, not only by the guard's unit tests.
+    ///
+    /// `ui.rs` proves `host_allowed` / `origin_allowed` directly, which skips
+    /// the HTTP parser. Whether hyper normalises or rejects these values before
+    /// the guard reads them is the question only a real request answers. So
+    /// each request here is written to the socket by hand: no client can
+    /// rewrite the header on the way.
+    ///
+    /// `rocky.internal` and `fd00::1` are allowed hosts, and the bind host is
+    /// `127.0.0.1`, so every refused value is one bracket trick away from a
+    /// name the server trusts (#1993: `[rocky.internal]evil` once reduced to
+    /// `rocky.internal`). The two well-formed spellings at the end are the
+    /// control: without them, a server that refused everything would pass.
+    #[tokio::test]
+    async fn ui_mode_refuses_malformed_bracketed_hosts_and_origins_end_to_end() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let base = spawn_router(ui_state(&["rocky.internal", "fd00::1"], &[])).await;
+        let addr = base.trim_start_matches("http://").to_string();
+        // One raw HTTP/1.1 request; the status code and the whole response.
+        let send = |host: String, origin: Option<&'static str>| {
+            let addr = addr.clone();
+            async move {
+                let mut request = format!("GET /ui/ HTTP/1.1\r\nHost: {host}\r\n");
+                if let Some(origin) = origin {
+                    request.push_str(&format!("Origin: {origin}\r\n"));
+                }
+                request.push_str("Connection: close\r\n\r\n");
+                let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+                stream.write_all(request.as_bytes()).await.unwrap();
+                let mut buf = Vec::new();
+                stream.read_to_end(&mut buf).await.unwrap();
+                let response = String::from_utf8_lossy(&buf).into_owned();
+                let status = response.split(' ').nth(1).unwrap_or("").to_string();
+                (status, response)
+            }
+        };
+
+        for host in [
+            "[rocky.internal]evil",
+            "[localhost]x",
+            "[127.0.0.1]x",
+            "[::1]extra",
+            "[fd00::1]:notaport",
+        ] {
+            let (status, response) = send(host.to_string(), None).await;
+            assert_eq!(status, "421", "Host: {host}\n{response}");
+            assert!(
+                response.contains("host_not_allowed"),
+                "Host: {host} must be refused by the guard, not elsewhere\n{response}"
+            );
+        }
+
+        // The Origin sink, behind a Host the server does accept.
+        for origin in [
+            "http://[fd00::1]evil",
+            "http://[::1]extra",
+            "http://[rocky.internal]evil",
+            "http://[localhost]x",
+        ] {
+            let (status, response) = send(addr.clone(), Some(origin)).await;
+            assert_eq!(status, "403", "Origin: {origin}\n{response}");
+            assert!(
+                response.contains("origin_not_allowed"),
+                "Origin: {origin} must be refused by the guard, not elsewhere\n{response}"
+            );
+        }
+
+        // The control: the well-formed spellings of the same names pass.
+        let (status, response) = send("[fd00::1]:8080".to_string(), None).await;
+        assert_eq!(status, "200", "a well-formed bracketed host\n{response}");
+        let (status, response) = send(addr.clone(), Some("http://[fd00::1]:8080")).await;
+        assert_eq!(status, "200", "a well-formed bracketed origin\n{response}");
+    }
+
     /// A body over the limit is refused with the envelope before any
     /// handler; a body under it reaches the handler. Every mode.
     #[tokio::test]
