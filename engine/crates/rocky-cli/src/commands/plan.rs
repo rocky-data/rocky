@@ -153,7 +153,28 @@ pub async fn plan(
     // where the same collision refuses) would then reject — late, and
     // outside the bounded, watchdog-covered plan step Dagster Pipes relies
     // on for this check.
+    //
+    // #2174: the pairs follow `run()`'s own preflight, so the plan refuses
+    // what the apply refuses and nothing more:
+    //   * `--model` skips the guard: `run()` with a model filter never
+    //     enters the replication path.
+    //   * the table name carries the shadow suffix when the run's does —
+    //     `--shadow` without `--shadow-schema`. A `--branch` run writes to
+    //     a schema override, so its names are unchanged.
+    //   * one known asymmetry stays: `run()` skips a discovered table the
+    //     source listing lacks (`missing_from_source`). The plan does not
+    //     list source tables, so it still counts that table, exactly as its
+    //     statements still render it. The plan can then refuse a pair the
+    //     run would not; it never misses one.
     let mut collision_check_pairs: Vec<(String, String)> = Vec::new();
+    let collision_suffix =
+        (run_options.shadow && run_options.shadow_schema.is_none() && run_options.branch.is_none())
+            .then(|| {
+                run_options
+                    .shadow_suffix
+                    .clone()
+                    .unwrap_or_else(|| "_rocky_shadow".to_string())
+            });
 
     // Detect whether this dialect supports catalogs. Dialects without catalog
     // support (DuckDB, Postgres, ...) return `None` from `create_catalog_sql`,
@@ -264,7 +285,14 @@ pub async fn plan(
                 });
                 continue;
             }
-            collision_check_pairs.push((table.name.clone(), conn.source_type.clone()));
+            collision_check_pairs.push((
+                format!(
+                    "{}{}",
+                    table.name,
+                    collision_suffix.as_deref().unwrap_or("")
+                ),
+                conn.source_type.clone(),
+            ));
 
             // Resolved AFTER the exclusion branches, mirroring `rocky run`,
             // which preflights the same value only for a table that survives
@@ -345,14 +373,17 @@ pub async fn plan(
     }
 
     // #1941: refuse before this plan is persisted (`plan_id` below) — see
-    // the comment where `collision_check_pairs` is declared above.
-    refuse_check_name_collisions(
-        name,
-        pipeline,
-        collision_check_pairs
-            .iter()
-            .map(|(t, s)| (t.as_str(), s.as_str())),
-    )?;
+    // the comment where `collision_check_pairs` is declared above. Skipped
+    // under `--model`, which never runs the replication path (#2174).
+    if run_options.model.is_none() {
+        refuse_check_name_collisions(
+            name,
+            pipeline,
+            collision_check_pairs
+                .iter()
+                .map(|(t, s)| (t.as_str(), s.as_str())),
+        )?;
+    }
 
     // --- Governance preview (Wave A + C-1 + C-2) -------------------------
     //
@@ -3607,26 +3638,13 @@ schema_template = "raw__{{source}}"
         );
     }
 
-    /// #1941: `rocky plan` must refuse the SAME check-name collision `rocky
-    /// run` refuses, and refuse it BEFORE persisting a plan. Without this,
-    /// `rocky plan` exits 0 and persists a `plan_id` for a set `rocky apply`
-    /// — which re-executes `run()`, where the same collision refuses —
-    /// would then reject: late, and outside the bounded, watchdog-covered
-    /// plan step Dagster Pipes relies on for this check.
-    ///
-    /// Uses the same `cross_source_overlap` collision as
-    /// `a_collision_refusal_writes_nothing_the_target_table_never_exists`
-    /// in `commands::run`: config load cannot see it (no assertions are
-    /// declared here for it to hang a table off), so this drives all the
-    /// way through discovery and into `plan()`'s own guard call, not
-    /// config load.
-    ///
-    /// Mutation that must turn this red: delete the
-    /// `refuse_check_name_collisions(name, pipeline,
-    /// collision_check_pairs...)` call in `plan()`.
+    /// The #1941 fixture: two source schemas each discover an `orders`
+    /// table under source type `duckdb`, and a custom check sanitizes onto
+    /// `cross_source_overlap:duckdb.orders`. Returns the temp dir (keep it
+    /// alive), the config path and the state path.
     #[cfg(feature = "duckdb")]
-    #[tokio::test]
-    async fn plan_refuses_a_check_name_collision_before_persisting_a_plan() {
+    async fn check_name_collision_project()
+    -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         use rocky_core::traits::WarehouseAdapter;
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
@@ -3690,6 +3708,31 @@ threshold = 0
         )
         .unwrap();
 
+        (dir, config_path, state_path)
+    }
+
+    /// #1941: `rocky plan` must refuse the SAME check-name collision `rocky
+    /// run` refuses, and refuse it BEFORE persisting a plan. Without this,
+    /// `rocky plan` exits 0 and persists a `plan_id` for a set `rocky apply`
+    /// — which re-executes `run()`, where the same collision refuses —
+    /// would then reject: late, and outside the bounded, watchdog-covered
+    /// plan step Dagster Pipes relies on for this check.
+    ///
+    /// Uses the same `cross_source_overlap` collision as
+    /// `a_collision_refusal_writes_nothing_the_target_table_never_exists`
+    /// in `commands::run`: config load cannot see it (no assertions are
+    /// declared here for it to hang a table off), so this drives all the
+    /// way through discovery and into `plan()`'s own guard call, not
+    /// config load.
+    ///
+    /// Mutation that must turn this red: delete the
+    /// `refuse_check_name_collisions(name, pipeline,
+    /// collision_check_pairs...)` call in `plan()`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_refuses_a_check_name_collision_before_persisting_a_plan() {
+        let (_dir, config_path, state_path) = check_name_collision_project().await;
+
         let run_options = PlanRunOptions::default();
         let result = plan(
             &config_path,
@@ -3715,6 +3758,79 @@ threshold = 0
             msg.contains("pipeline \"p\""),
             "the refusal must name the pipeline: {msg}"
         );
+    }
+
+    /// #2174: a `--model` plan never runs the replication path at apply
+    /// time — `run()` with a model filter skips it — so the plan must not
+    /// refuse a replication check-name collision either. The plan still
+    /// fails here (the fixture has no `models/`), but for that reason, not
+    /// for the collision.
+    ///
+    /// Mutation that must turn this red: drop the `run_options.model.is_none()`
+    /// gate around `refuse_check_name_collisions` in `plan()`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_model_plan_does_not_refuse_a_replication_check_name_collision() {
+        let (_dir, config_path, state_path) = check_name_collision_project().await;
+        let run_options = PlanRunOptions {
+            model: Some("some_model".to_string()),
+            ..Default::default()
+        };
+        let err = plan(
+            &config_path,
+            None,
+            None,
+            None,
+            &run_options,
+            false,
+            "HEAD",
+            &state_path,
+            false,
+        )
+        .await
+        .expect_err("the fixture has no models directory");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("check-name collision"),
+            "a --model plan must not refuse a replication collision: {msg}"
+        );
+        assert!(msg.contains("models directory"), "{msg}");
+    }
+
+    /// #2174: a `--shadow` run names each target `<table><suffix>`, so its
+    /// overlap check is `cross_source_overlap:duckdb.orders_rocky_shadow`,
+    /// which the custom check `cross source overlap duckdb orders` no
+    /// longer collides with. `run()` accepts it, so the plan must too.
+    ///
+    /// Mutation that must turn this red: push `table.name` instead of the
+    /// suffixed name into `collision_check_pairs` in `plan()`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_shadow_plan_checks_the_suffixed_table_names() {
+        let (_dir, config_path, state_path) = check_name_collision_project().await;
+        let run_options = PlanRunOptions {
+            shadow: true,
+            ..Default::default()
+        };
+        let result = plan(
+            &config_path,
+            None,
+            None,
+            None,
+            &run_options,
+            false,
+            "HEAD",
+            &state_path,
+            false,
+        )
+        .await;
+        if let Err(err) = result {
+            let msg = format!("{err:#}");
+            assert!(
+                !msg.contains("check-name collision"),
+                "the shadow run emits no colliding pair, so the plan must not refuse: {msg}"
+            );
+        }
     }
 
     #[test]

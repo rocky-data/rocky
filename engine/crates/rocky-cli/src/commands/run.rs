@@ -5082,20 +5082,15 @@ pub async fn run(
         );
     }
 
-    // #1941: refuse a check-name collision over the COMPLETE, final table
-    // set this invocation will copy — after resume-filtering above (so a
-    // resumed run's already-completed tables, which will not be
-    // re-materialized or re-checked, don't false-positive into the
-    // comparison), but before `init_run_progress` below writes anything and
-    // before the spawn loop further down copies a single row. `target_table_name`
-    // and `asset_key_prefix` are set once per task when `tables_to_process`
-    // is built and are not touched by anything between here and the spawn
-    // loop, so this sees exactly the table set / sibling grouping the run
-    // will actually use. `governance_setup` has already run by this point —
-    // the earlier call inside the `#1461` preflight block, over the
-    // unfiltered candidate set, is what stops a collision from mutating
-    // catalogs/schemas/tags/grants; this call is the authoritative one for
-    // what a resume will actually copy.
+    // #1941: defense-in-depth only. This call cannot fire today (#2174).
+    // `tables_to_process` is a subset of the `#1461` preflight's table set,
+    // with the same (target table name, source_type) derivation, and a
+    // collision needs two siblings — a smaller set cannot add one. So a
+    // resumed run is refused over the UNFILTERED surviving set, by the
+    // preflight, by design: a table the resume skips still counts. This
+    // call stays so a future change that lets the collection loop drift
+    // from the preflight still refuses before `init_run_progress` writes
+    // anything and before the spawn loop copies a row.
     refuse_check_name_collisions(
         pipeline_name,
         pipeline,
@@ -7017,20 +7012,6 @@ async fn partition_overlap_key_carriers(
     partition
 }
 
-/// Runs the batched replication checks against the tables copied this run
-/// and appends the results to `pending_checks`.
-///
-/// Row count and freshness go through the warehouse's `BatchCheckAdapter`
-/// when it has one that says it can batch that leg (one UNION ALL query),
-/// and fall back to one query per table otherwise — no adapter, or an
-/// adapter whose `supports_row_counts` / `supports_freshness` says no. The
-/// decision is per leg (#1719). Assertions, custom checks, null-rate checks and the
-/// cross-source overlap check run per table through the plain
-/// `WarehouseAdapter`. Row-count anomalies detected on the way are pushed to
-/// `anomalies`, and every table the detector considered is recorded in
-/// `anomaly_evaluated`, evaluated or not — an empty `anomalies` list alone
-/// cannot say which happened (#1790).
-///
 /// Refuse if two check names THIS run will emit for the SAME table sanitize
 /// to the same Dagster check name (#1941).
 ///
@@ -7047,8 +7028,8 @@ async fn partition_overlap_key_carriers(
 ///
 /// `table_source_pairs` is one `(target table name, source_type)` pair per
 /// table this invocation will touch — duplicates on the same table signal a
-/// `cross_source_overlap` sibling group. Three callers supply this, at three
-/// different points in `run()`'s lifecycle:
+/// `cross_source_overlap` sibling group. Four callers supply this — three
+/// at different points in `run()`'s lifecycle, and `rocky plan`:
 ///
 /// - **Earliest**: called from inside the `#1461` preflight block, over
 ///   every table surviving that block's own three skip conditions — before
@@ -7056,22 +7037,22 @@ async fn partition_overlap_key_carriers(
 ///   tags, binds workspaces or applies grants. This is the call that
 ///   actually stops a collision from mutating access control; see that
 ///   block's own comment.
-/// - **Primary**: called from `run()` itself, over `tables_to_process`
+/// - **Post-resume**: called from `run()` itself, over `tables_to_process`
 ///   AFTER resume-filtering, immediately before the copy loop spawns any
-///   task and before `init_run_progress` writes anything. By this point
-///   `governance_setup` has already run — the earliest call above is what
-///   stops that — but this is the authoritative check over the exact table
-///   set a resume will actually copy (which the earliest call, running
-///   before resume-filtering, does not see), and it still refuses before
-///   any table is copied or any watermark advanced.
+///   task. It cannot fire today: its set is a subset of the earliest call's
+///   set, with the same pair derivation, and a smaller set cannot add a
+///   collision. A resumed run is therefore refused over the unfiltered
+///   surviving set, by design. The call guards against the two sets
+///   drifting apart later (#2174).
 /// - **Defense-in-depth**: called from the top of [`run_batched_checks`],
 ///   over `assertion_targets`. By the time that function runs, every table
 ///   in THIS invocation has already been copied — both calls above already
 ///   refused before that happened, so this only fires for a caller that
 ///   reaches `run_batched_checks` without going through `run()`'s pre-loop
 ///   gates (a test driving it directly, or a future second entrypoint).
-/// - **`rocky plan`** (`commands/plan.rs`) calls this too, over the planned
-///   table set, for the same reason `apply`/Pipes needs it bounded to the
+/// - **`rocky plan`** (`commands/plan.rs`), over the planned table set,
+///   derived like the earliest call's (see the asymmetry noted there), for
+///   the same reason `apply`/Pipes needs it bounded to the
 ///   plan step: without it, `rocky plan` exits 0 and persists a `plan_id`
 ///   for a set `rocky apply` (which re-executes `run()`) then refuses —
 ///   late, and outside the plan step's own watchdog/timeout budget.
@@ -7159,11 +7140,10 @@ async fn run_batched_checks(
     anomalies: &mut Vec<AnomalyOutput>,
     anomaly_evaluated: &mut Vec<AnomalyEvaluationOutput>,
 ) -> Result<()> {
-    // #1941: defense-in-depth. `run()`'s own caller already refused this
-    // run over the complete `tables_to_process` set BEFORE the copy loop —
-    // see `refuse_check_name_collisions` above and its call site before the
-    // spawn loop in `run()`. That earlier call sees every table this
-    // invocation WILL copy; this one sees only `assertion_targets`, which is
+    // #1941: defense-in-depth. `run()` already refused this run BEFORE the
+    // copy loop, in the `#1461` preflight — see `refuse_check_name_collisions`
+    // above. That earlier call sees every table this invocation WILL copy;
+    // this one sees only `assertion_targets`, which is
     // populated per materialized table as the copy loop completes, so by the
     // time this function runs the copies (and any watermark advance) have
     // already happened. Kept so a caller that reaches this function without
