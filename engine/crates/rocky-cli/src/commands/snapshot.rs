@@ -69,6 +69,39 @@ pub async fn run_snapshot(
 
     let mut steps: Vec<SnapshotStepOutput> = Vec::new();
 
+    // Step 0: create the target schema when the pipeline asks for it, as the
+    // replication and transformation paths do. Without it, `initial_load`
+    // fails on a fresh warehouse with "Schema ... does not exist" (#2012).
+    if snapshot_cfg.target.governance.auto_create_schemas
+        && let Some(sql_result) =
+            dialect.create_schema_sql(&config.target.catalog, &config.target.schema)
+    {
+        let schema_sql = sql_result
+            .map_err(anyhow::Error::from)
+            .context("failed to generate CREATE SCHEMA for the snapshot target")?;
+        if dry_run {
+            steps.push(SnapshotStepOutput {
+                step: "create_schema".into(),
+                sql: schema_sql,
+                status: "dry_run".into(),
+                duration_ms: 0,
+                error: None,
+            });
+        } else {
+            let step_start = Instant::now();
+            if let Err(e) = adapter.execute_statement(&schema_sql).await {
+                anyhow::bail!("creating the target schema failed: {e:#}");
+            }
+            steps.push(SnapshotStepOutput {
+                step: "create_schema".into(),
+                sql: schema_sql,
+                status: "ok".into(),
+                duration_ms: step_start.elapsed().as_millis() as u64,
+                error: None,
+            });
+        }
+    }
+
     // Step 1: Ensure the target table exists (initial load DDL).
     let init_sql = generate_initial_load_sql(&config, dialect)
         .context("failed to generate initial load SQL")?;

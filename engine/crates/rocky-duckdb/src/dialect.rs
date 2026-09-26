@@ -9,7 +9,9 @@
 
 use std::fmt::Write;
 
-use rocky_core::traits::{AdapterError, AdapterResult, LiteralEscape, SqlDialect};
+use rocky_core::traits::{
+    AdapterError, AdapterResult, LiteralEscape, SnapshotMergeInsert, SqlDialect,
+};
 use rocky_ir::{ColumnSelection, MetadataColumn};
 use rocky_sql::validation;
 
@@ -55,6 +57,12 @@ impl SqlDialect for DuckDbSqlDialect {
 
     fn insert_into(&self, target: &str, select_sql: &str) -> String {
         format!("INSERT INTO {target}\n{select_sql}")
+    }
+
+    /// DuckDB's MERGE rejects `INSERT (*) VALUES (source.*, ...)` with a
+    /// parser error (#2012), so the snapshot MERGE inserts by name.
+    fn snapshot_merge_insert(&self) -> SnapshotMergeInsert {
+        SnapshotMergeInsert::ByName
     }
 
     /// Render a DuckDB-native `MERGE INTO ... USING ... WHEN MATCHED ... WHEN NOT MATCHED`.

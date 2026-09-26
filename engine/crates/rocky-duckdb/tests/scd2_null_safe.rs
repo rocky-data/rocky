@@ -78,11 +78,9 @@ async fn duckdb_null_safe_neq_captures_null_value_transitions() {
 /// End-to-end contract: a row whose tracked column transitions from
 /// NULL → value is captured by the generated SCD2 change predicate.
 /// Drives `generate_snapshot_sql` to produce the predicate against the
-/// DuckDB dialect, then exercises the predicate directly via a join +
-/// UPDATE (DuckDB's MERGE doesn't accept `INSERT (*) VALUES (source.*,
-/// ...)` — the SCD2 generator targets Databricks/Snowflake MERGE
-/// surfaces, where this lives in production). The UPDATE shape is the
-/// part this fix actually touched.
+/// DuckDB dialect, then exercises the predicate directly via a join.
+/// The whole MERGE runs end to end in `rocky/tests/snapshot_duckdb.rs`
+/// (#2012); this test isolates the predicate.
 #[tokio::test]
 async fn scd2_change_predicate_captures_null_to_value_on_duckdb() {
     let adapter = DuckDbWarehouseAdapter::in_memory().expect("in-memory DuckDB");

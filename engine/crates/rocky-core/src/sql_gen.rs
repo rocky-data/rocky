@@ -1107,14 +1107,18 @@ pub fn generate_snapshot_sql(
         &format!("source.{updated_at}"),
         &format!("target.{updated_at}"),
     );
+    let (using, insert) = crate::snapshots::scd2_merge_using_and_insert(
+        dialect.snapshot_merge_insert(),
+        &source,
+        &[("CURRENT_TIMESTAMP", "valid_from"), ("NULL", "valid_to")],
+    );
     let merge = format!(
         "MERGE INTO {target} AS target \
-         USING {source} AS source \
+         USING {using} \
          ON {join_cond} AND target.valid_to IS NULL \
          WHEN MATCHED AND {change_predicate} THEN \
            UPDATE SET valid_to = CURRENT_TIMESTAMP \
-         WHEN NOT MATCHED THEN \
-           INSERT (*) VALUES (source.*, CURRENT_TIMESTAMP, NULL)",
+         WHEN NOT MATCHED THEN {insert}",
     );
     stmts.push(merge);
 
@@ -1153,7 +1157,7 @@ pub fn generate_snapshot_sql(
     // Statement 4 (optional): Invalidate hard-deleted rows
     if model_ir.invalidate_hard_deletes {
         let invalidate = format!(
-            "UPDATE {target} SET valid_to = CURRENT_TIMESTAMP \
+            "UPDATE {target} AS target SET valid_to = CURRENT_TIMESTAMP \
              WHERE valid_to IS NULL \
              AND NOT EXISTS (\
                SELECT 1 FROM {source} AS source \

@@ -235,19 +235,26 @@ pub fn generate_snapshot_sql(
     let mut stmts = Vec::new();
 
     // Statement 1: MERGE — close changed rows and insert new keys.
+    let sid_literal = format!("'{snapshot_id}'");
+    let (using, insert) = scd2_merge_using_and_insert(
+        dialect.snapshot_merge_insert(),
+        &source,
+        &[
+            ("CURRENT_TIMESTAMP", COL_VALID_FROM),
+            ("CAST(NULL AS TIMESTAMP)", COL_VALID_TO),
+            ("TRUE", COL_IS_CURRENT),
+            (&sid_literal, COL_SNAPSHOT_ID),
+        ],
+    );
     let merge = format!(
         "MERGE INTO {target} AS target \
-         USING {source} AS source \
+         USING {using} \
          ON {join_cond} AND target.{ic} = TRUE \
          WHEN MATCHED AND ({change_predicate}) THEN \
            UPDATE SET {vt} = CURRENT_TIMESTAMP, {ic} = FALSE \
-         WHEN NOT MATCHED THEN \
-           INSERT (*) VALUES (\
-             source.*, CURRENT_TIMESTAMP, CAST(NULL AS TIMESTAMP), TRUE, '{sid}'\
-           )",
+         WHEN NOT MATCHED THEN {insert}",
         ic = COL_IS_CURRENT,
         vt = COL_VALID_TO,
-        sid = snapshot_id,
     );
     stmts.push(merge);
 
@@ -284,10 +291,11 @@ pub fn generate_snapshot_sql(
     );
     stmts.push(insert_updated);
 
-    // Statement 3 (optional): Invalidate hard-deleted rows.
+    // Statement 3 (optional): Invalidate hard-deleted rows. The target
+    // carries the `target` alias the join condition names (#2012).
     if config.invalidate_hard_deletes {
         let invalidate = format!(
-            "UPDATE {target} SET \
+            "UPDATE {target} AS target SET \
              {vt} = CURRENT_TIMESTAMP, \
              {ic} = FALSE \
              WHERE {ic} = TRUE \
@@ -307,6 +315,41 @@ pub fn generate_snapshot_sql(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The `USING` source and the `WHEN NOT MATCHED` insert of an SCD2 MERGE.
+///
+/// `scd2` pairs each SCD2 value with its column, in the target's column
+/// order after the source columns. [`SnapshotMergeInsert::StarValues`]
+/// appends the values to `source.*`; [`SnapshotMergeInsert::ByName`] adds
+/// them as named columns of a `USING` subquery, so `INSERT BY NAME` can
+/// match every column without the generator knowing the source columns.
+pub(crate) fn scd2_merge_using_and_insert(
+    style: crate::traits::SnapshotMergeInsert,
+    source: &str,
+    scd2: &[(&str, &str)],
+) -> (String, String) {
+    use crate::traits::SnapshotMergeInsert;
+    match style {
+        SnapshotMergeInsert::StarValues => {
+            let values = scd2.iter().map(|(v, _)| *v).collect::<Vec<_>>().join(", ");
+            (
+                format!("{source} AS source"),
+                format!("INSERT (*) VALUES (source.*, {values})"),
+            )
+        }
+        SnapshotMergeInsert::ByName => {
+            let columns = scd2
+                .iter()
+                .map(|(v, c)| format!("{v} AS {c}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            (
+                format!("(SELECT *, {columns} FROM {source}) AS source"),
+                "INSERT BY NAME".to_string(),
+            )
+        }
+    }
+}
 
 /// Generate a unique snapshot ID from the current timestamp and target table.
 ///

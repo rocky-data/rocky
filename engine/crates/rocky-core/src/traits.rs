@@ -1281,6 +1281,14 @@ pub trait SqlDialect: Send + Sync {
         Ok(parts.join("."))
     }
 
+    /// How an SCD2 snapshot MERGE inserts the first version of a new key.
+    /// See [`SnapshotMergeInsert`].
+    ///
+    /// Default: [`SnapshotMergeInsert::StarValues`], the Databricks form.
+    fn snapshot_merge_insert(&self) -> SnapshotMergeInsert {
+        SnapshotMergeInsert::StarValues
+    }
+
     /// Build a NULL-safe inequality predicate: `lhs` differs from `rhs`,
     /// treating two NULLs as equal and a single NULL as a real difference.
     /// Used by SCD2 change detection on the watermark / check columns —
@@ -1460,6 +1468,23 @@ pub trait SqlDialect: Send + Sync {
 // ---------------------------------------------------------------------------
 // Governance
 // ---------------------------------------------------------------------------
+
+/// How an SCD2 snapshot MERGE inserts the first version of a new key.
+///
+/// The history table holds every source column plus the SCD2 columns
+/// (`valid_from`, `valid_to`, ...). The generator does not know the source
+/// columns, so it cannot write an explicit column list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotMergeInsert {
+    /// `USING <source> AS source ... WHEN NOT MATCHED THEN INSERT (*)
+    /// VALUES (source.*, <scd2 values>)`. Databricks accepts it.
+    StarValues,
+    /// `USING (SELECT *, <scd2 values> AS <scd2 columns> FROM <source>) AS
+    /// source ... WHEN NOT MATCHED THEN INSERT BY NAME`. DuckDB rejects the
+    /// `INSERT (*)` form with a parser error (#2012), and matches columns by
+    /// name here instead.
+    ByName,
+}
 
 /// Target for a tag operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]

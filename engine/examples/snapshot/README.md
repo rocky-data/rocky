@@ -18,14 +18,20 @@ invalidate_hard_deletes = true
 - `updated_at` is the column Rocky compares to detect a change.
 - `invalidate_hard_deletes` closes rows that vanished from the source.
 
-The source is `main.raw.customers`. The target is
-`main.history.customers_history`.
+The source is `warehouse.raw.customers`. The target is
+`warehouse.history.customers_history`. DuckDB names a file database's
+catalog after the file, so `path = "warehouse.duckdb"` gives the catalog
+`warehouse`.
 
-## The four statements Rocky generates
+`auto_create_schemas = true` under `[pipeline.customers_history.target.governance]`
+makes Rocky create the `history` schema before the first load.
+
+## The statements Rocky generates
 
 ```
-  main.raw.customers                    main.history.customers_history
+  warehouse.raw.customers               warehouse.history.customers_history
          │                                          │
+         │  create_schema ── CREATE SCHEMA IF NOT EXISTS history
          │  initial_load ─── CREATE TABLE IF NOT EXISTS, source columns
          │                   plus valid_from, valid_to, is_current, snapshot_id
          │                                          │
@@ -42,37 +48,46 @@ The source is `main.raw.customers`. The target is
 
 ## Try it
 
-Run these from the repository root:
+Run these from the repository root. The seed needs the
+[DuckDB CLI](https://duckdb.org/docs/installation/).
 
 ```bash
 cd engine/examples/snapshot
+duckdb warehouse.duckdb < seed.sql
 rocky snapshot --dry-run
+rocky snapshot
 ```
 
-`--dry-run` prints the four statements and executes none of them. It still
+`--dry-run` prints the statements and executes none of them. It still
 builds the target adapter, because the adapter chooses the SQL dialect. It
-reads no rows from `main.raw.customers`.
+reads no rows from `warehouse.raw.customers`.
 
-It does write one directory. Rocky creates `.rocky/` here and logs the run to
+`rocky snapshot` creates `history.customers_history` and writes the first
+version of each customer. Change a row and run it again:
+
+```bash
+duckdb warehouse.duckdb "UPDATE raw.customers SET name = 'Ada L.', updated_at = TIMESTAMP '2026-02-01' WHERE customer_id = 1"
+rocky snapshot
+duckdb warehouse.duckdb "SELECT customer_id, name, is_current FROM history.customers_history ORDER BY customer_id, valid_from"
+```
+
+Customer 1 now has two rows. The old row has `is_current = false` and a
+`valid_to`. The new row is current.
+
+Rocky also writes one directory. It creates `.rocky/` here and logs the run to
 `.rocky/traces/{timestamp}-{pid}.jsonl`, one file per process. It also writes
 `.rocky/.gitignore`, which holds a comment and a single `*`, so git ignores
-the whole directory. Delete `.rocky/` when you are done.
+the whole directory. Delete `.rocky/` and `warehouse.duckdb` when you are done.
+
+For machine-readable output:
 
 ```bash
 rocky --output json snapshot --dry-run
 ```
 
-This example is dry-run only on DuckDB. Without `--dry-run`, `rocky snapshot`
-executes the statements against the configured adapter, and on DuckDB that
-fails:
-
-- DuckDB has no catalog named `main`, so `initial_load` stops with
-  `Catalog with name main does not exist!`.
-- `merge_1` uses `INSERT (*) VALUES (source.*, ...)`. DuckDB rejects it with
-  `Parser Error: syntax error at or near "*"`, even after you point the
-  pipeline at a real catalog and schema.
-
-Issue [#2012](https://github.com/rocky-data/rocky/issues/2012) tracks the fix.
+On DuckDB, `merge_1` inserts new keys with `INSERT BY NAME` from a source
+subquery that adds the history columns. DuckDB's MERGE rejects the
+`INSERT (*) VALUES (source.*, ...)` form that Databricks accepts.
 
 ## The four history columns
 

@@ -666,6 +666,10 @@ table = "customers_history"
 - **Timestamp.** Detects changes by comparing the `updated_at` column between source and target. Efficient when the source maintains a reliable last-modified timestamp.
 - **Check.** Detects changes by comparing specified columns between source and target. Used when there is no reliable timestamp.
 
+To create the target schema before the first load, set `auto_create_schemas = true` under `[pipeline.NAME.target.governance]`. The run then starts with a `create_schema` step.
+
+On DuckDB, point the adapter at a file (`path = "warehouse.duckdb"`) and use the file name as the `catalog`. DuckDB names a file database's catalog after the file.
+
 **Generated SQL steps:**
 
 1. **Initial load.** `CREATE TABLE IF NOT EXISTS` with SCD2 columns added

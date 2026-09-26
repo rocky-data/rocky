@@ -3,7 +3,7 @@ CREATE TABLE IF NOT EXISTS tgtwarehouse.snapshots__demo.dim_customers_history AS
 
 -- --- next statement ---
 
-MERGE INTO tgtwarehouse.snapshots__demo.dim_customers_history AS target USING tgtwarehouse.marts__demo.dim_customers AS source ON target.customer_id = source.customer_id AND target.valid_to IS NULL WHEN MATCHED AND source.updated_at IS DISTINCT FROM target.updated_at THEN UPDATE SET valid_to = CURRENT_TIMESTAMP WHEN NOT MATCHED THEN INSERT (*) VALUES (source.*, CURRENT_TIMESTAMP, NULL)
+MERGE INTO tgtwarehouse.snapshots__demo.dim_customers_history AS target USING (SELECT *, CURRENT_TIMESTAMP AS valid_from, NULL AS valid_to FROM tgtwarehouse.marts__demo.dim_customers) AS source ON target.customer_id = source.customer_id AND target.valid_to IS NULL WHEN MATCHED AND source.updated_at IS DISTINCT FROM target.updated_at THEN UPDATE SET valid_to = CURRENT_TIMESTAMP WHEN NOT MATCHED THEN INSERT BY NAME
 ;
 
 -- --- next statement ---
@@ -13,4 +13,4 @@ INSERT INTO tgtwarehouse.snapshots__demo.dim_customers_history SELECT source.*, 
 
 -- --- next statement ---
 
-UPDATE tgtwarehouse.snapshots__demo.dim_customers_history SET valid_to = CURRENT_TIMESTAMP WHERE valid_to IS NULL AND NOT EXISTS (SELECT 1 FROM tgtwarehouse.marts__demo.dim_customers AS source WHERE target.customer_id = source.customer_id)
+UPDATE tgtwarehouse.snapshots__demo.dim_customers_history AS target SET valid_to = CURRENT_TIMESTAMP WHERE valid_to IS NULL AND NOT EXISTS (SELECT 1 FROM tgtwarehouse.marts__demo.dim_customers AS source WHERE target.customer_id = source.customer_id)
