@@ -499,6 +499,7 @@ impl ServerState {
         let config = CompilerConfig {
             models_dir: self.models_dir.clone(),
             contracts_dir: self.contracts_dir.clone(),
+            required_explicit_contract_model: None,
             source_schemas,
             mask,
             allow_unmasked,

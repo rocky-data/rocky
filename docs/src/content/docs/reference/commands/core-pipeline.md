@@ -561,6 +561,7 @@ rocky run [flags]
 | `--filter <key=value>` | `string` | | Filter sources by component value (e.g., `client=acme`). |
 | `--pipeline <NAME>` | `string` | | Pipeline name (required if multiple pipelines are defined). |
 | `--model <NAME>` | `string` | | Execute a single compiled model by name and skip replication. An alternative to `--filter` for model-only execution. |
+| `--contracts <PATH>` | `PathBuf` | | Check the selected model against its contract in this directory during the run's own compile. Requires `--model` and `--pipeline`. |
 | `--governance-override <JSON>` | `string` | | Additional governance config as inline JSON or `@file.json`, merged with defaults. |
 | `--models <PATH>` | `PathBuf` | | Models directory for transformation execution. |
 | `--all` | `bool` | `false` | Execute both replication and compiled models. |
@@ -581,6 +582,18 @@ rocky run [flags]
 :::caution[`--defer` SQL-rewrite limitation]
 `--defer` rewrites each selected model's SQL to qualify deferred upstream references, and the rewrite parses the model with the Databricks dialect. Constructs the parser does not support (`SELECT * EXCEPT (...)`, trailing-comma select lists, and `STRUCT(...)` literals) cannot be rewritten and fail with a clear error. Build those models without `--defer`. With `--defer` off (the default), runs are byte-identical to before the flag existed.
 :::
+
+### Guard one model with a contract
+
+Use `--contracts` when you build one `full_refresh` transformation model:
+
+```bash
+rocky run --pipeline transform --model int_order_lines --contracts contracts -o json
+```
+
+The directory must exist and contain `int_order_lines.contract.toml`. Rocky checks that contract in the compile that supplies the model SQL for this run. An error such as `E010` fails the run before Rocky replaces the selected table. The failure JSON includes the compile error and has no materialization for that model.
+
+This first route does not cover a whole pipeline, `--dag`, `--all`, `rocky apply`, a branch, or a deferred run. It refuses selected models that use a strategy other than `full_refresh` or add a `surrogate_key` after compilation. It also refuses idempotency and skip options that could report success without rebuilding. A failed contract can still update run history or state synchronization. `I003` means Rocky could not infer a declared column type and did not check that type; required-column checks still run.
 
 ### Pipeline Stages
 

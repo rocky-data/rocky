@@ -962,6 +962,10 @@ enum Command {
         /// Alternative to --filter for model-only execution.
         #[arg(long)]
         model: Option<String>,
+        /// Check an explicitly selected model contract in the same compile
+        /// that supplies the model executed by this run.
+        #[arg(long, requires_all = ["model", "pipeline"])]
+        contracts: Option<PathBuf>,
         /// Additional governance config (JSON or @file.json), merged with defaults
         #[arg(long)]
         governance_override: Option<String>,
@@ -3747,6 +3751,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             filter,
             pipeline,
             model,
+            contracts,
             governance_override,
             models: models_dir,
             all: run_all,
@@ -3780,6 +3785,35 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             // malformed pair (no `=`, empty/invalid name) is a clear CLI error.
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if contracts.is_some() {
+                anyhow::ensure!(
+                    model.is_some()
+                        && pipeline.is_some()
+                        && filter.is_none()
+                        && models_dir.is_none()
+                        && !run_all
+                        && resume.is_none()
+                        && !resume_latest
+                        && !shadow
+                        && shadow_schema.is_none()
+                        && branch.is_none()
+                        && partition.is_none()
+                        && from.is_none()
+                        && to.is_none()
+                        && !latest
+                        && !missing
+                        && lookback.is_none()
+                        && !dag
+                        && !watch
+                        && !defer
+                        && defer_to.is_none()
+                        && !skip_unchanged
+                        && !no_prune
+                        && idempotency_key.is_none()
+                        && !assume_fresh_state,
+                    "--contracts supports only a fresh --model/--pipeline run; remove mixed, skip, defer, partition, shadow, resume, idempotency, and other unsupported flags"
+                );
+            }
             // `--var` is only threaded through the standard run path. The `--dag`
             // and `--watch` dispatch paths compile their sub-runs with an empty
             // `RunVars`, so a supplied `--var` would be silently dropped —
@@ -3997,6 +4031,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     &skip_opts,
                     &run_vars,
                     assume_fresh_state,
+                    contracts.as_deref(),
                 )
                 .await
             }

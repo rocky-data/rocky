@@ -976,6 +976,7 @@ pub fn plan_preview_output(
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
+        required_explicit_contract_model: None,
         source_schemas: std::collections::HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
@@ -1181,6 +1182,7 @@ fn build_and_persist_run_plan(
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
+        required_explicit_contract_model: None,
         source_schemas: std::collections::HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
@@ -1806,6 +1808,7 @@ pub fn populate_governance_actions(
     let compile = rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
+        required_explicit_contract_model: None,
         source_schemas: std::collections::HashMap::new(),
         mask: cfg.mask.clone(),
         allow_unmasked: cfg.classifications.allow_unmasked.clone(),
@@ -1907,6 +1910,7 @@ async fn check_plan_budget(
     let compile_cfg = rocky_compiler::compile::CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
+        required_explicit_contract_model: None,
         source_schemas: HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],

@@ -39,7 +39,7 @@ Four more words appear across the rows, always with the same meaning:
 
 | Capability | Who enforces it |
 |---|---|
-| [Contract columns, types, required, protected](#contracts-columns-types-required-protected) | Rocky-guaranteed: enforced at compile (E010–E013), with two stated limits |
+| [Contract columns, types, required, protected](#contracts-columns-types-required-protected) | Enforced at compile (E010–E013). An opt-in selected-model run checks its contract in its own compile. Other run routes do not. |
 | [Classification tag completeness](#classification-tag-completeness) | Not enforced: Rocky warns (W004). Nothing blocks. |
 | [Masking application](#masking-application) | Adapter-dependent: Databricks only, attempted |
 | [Freshness](#freshness) | Declared metadata, not enforced. One opt-in run-time check, replication pipelines only. |
@@ -59,6 +59,8 @@ runs, and fails on any of these four errors:
 - `E011`: a column's type does not match.
 - `E012`: the contract says non-nullable, the model output is nullable.
 - `E013`: a protected column was removed.
+
+`rocky run --pipeline <NAME> --model <NAME> --contracts <DIR>` checks one selected `full_refresh` model in the compile that supplies its SQL. A contract error prevents that model's table write. The guard does not cover a whole pipeline, DAG, `rocky apply`, branches, or deferred runs. It refuses models with a post-compile surrogate key. A failed run can still record state and history.
 
 Two limits, stated plainly:
 
