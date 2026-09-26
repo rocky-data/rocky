@@ -161,7 +161,9 @@ function BriefBody({ brief, now }: { brief: BriefOutput; now?: number }) {
               entry.principal,
               entry.capability,
               entry.model,
-              entry.effect,
+              // Only evaluation rows carry a policy verdict; the rest show
+              // their kind so a freeze never reads as a deny (#2043).
+              entry.kind === "evaluation" ? entry.effect : `${entry.kind} (${entry.effect})`,
               entry.rule_id === null || entry.rule_id === undefined ? "default" : `rule ${entry.rule_id}`,
               entry.decision_ref,
               entry.reason,

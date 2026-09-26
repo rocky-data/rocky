@@ -40,11 +40,11 @@ use crate::commands::audit::plan_file_path;
 use crate::commands::review::select_outstanding;
 use crate::output::{
     BriefActiveFreeze, BriefAgentActivitySection, BriefAutonomySection, BriefBudgetStatus,
-    BriefCostSection, BriefDecisionEntry, BriefDegradedRule, BriefDriftEntry, BriefDriftSection,
-    BriefEscalationsSection, BriefFailedModel, BriefFreshnessEntry, BriefFreshnessSection,
-    BriefOutput, BriefPrincipalActivity, BriefQualityEntry, BriefQualitySection, BriefRunCost,
-    BriefRunEntry, BriefRunsSection, BriefSchedulerFailureEntry, BriefSchedulerSection,
-    BriefSinceMode, SectionAvailability, print_json,
+    BriefCostSection, BriefDecisionEntry, BriefDecisionKind, BriefDegradedRule, BriefDriftEntry,
+    BriefDriftSection, BriefEscalationsSection, BriefFailedModel, BriefFreshnessEntry,
+    BriefFreshnessSection, BriefOutput, BriefPrincipalActivity, BriefQualityEntry,
+    BriefQualitySection, BriefRunCost, BriefRunEntry, BriefRunsSection, BriefSchedulerFailureEntry,
+    BriefSchedulerSection, BriefSinceMode, SectionAvailability, print_json,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -334,6 +334,7 @@ fn decision_entry(d: &PolicyDecisionRecord) -> BriefDecisionEntry {
         capability: d.capability,
         model: d.model.clone(),
         effect: d.effect,
+        kind: d.kind().into(),
         rule_id: d.rule_id,
         reason: d.reason.clone(),
     }
@@ -357,7 +358,12 @@ fn build_agent_activity(decisions: &[&PolicyDecisionRecord]) -> BriefAgentActivi
     // Per-principal counts `[total, allow, review, deny]`, keyed by a rank
     // so the digest lists human before agent deterministically.
     let mut per_principal: BTreeMap<u8, [u64; 4]> = BTreeMap::new();
-    for d in decisions {
+    // Only evaluations carry a policy verdict (#2043). A freeze is not a
+    // deny and a failed verification is not a deny; those rows stay in the
+    // list below with their kind. `rocky audit` counts by the same rule.
+    let mut total = 0u64;
+    for d in decisions.iter().filter(|d| d.is_evaluation()) {
+        total += 1;
         let bucket = per_principal
             .entry(principal_rank(d.principal))
             .or_default();
@@ -392,7 +398,7 @@ fn build_agent_activity(decisions: &[&PolicyDecisionRecord]) -> BriefAgentActivi
     BriefAgentActivitySection {
         availability: SectionAvailability::Available,
         note: None,
-        total: decisions.len() as u64,
+        total,
         allow,
         require_review,
         deny,
@@ -1416,13 +1422,23 @@ fn render_markdown(out: &BriefOutput) -> String {
             }
             s.push_str("\nDecisions:\n");
             for d in &out.agent_activity.decisions {
+                // A non-evaluation row prints its kind, so a freeze does not
+                // read as a DENY verdict.
+                let verdict = match d.kind {
+                    BriefDecisionKind::Evaluation => plain(&d.effect).to_uppercase(),
+                    BriefDecisionKind::VerifyAfterCustody
+                    | BriefDecisionKind::Freeze
+                    | BriefDecisionKind::Unfreeze => {
+                        format!("{} [{}]", plain(&d.kind), plain(&d.effect))
+                    }
+                };
                 s.push_str(&format!(
                     "- {}  {}/{} `{}` {} ({}) — plan {}\n",
                     d.timestamp,
                     plain(&d.principal),
                     plain(&d.capability),
                     d.model,
-                    plain(&d.effect).to_uppercase(),
+                    verdict,
                     rule_label(d.rule_id),
                     short(&d.plan_id),
                 ));
@@ -1842,6 +1858,73 @@ mod tests {
         assert_eq!(agent.allow, 1);
         assert_eq!(agent.require_review, 1);
         assert_eq!(agent.deny, 1);
+    }
+
+    /// #2043: freeze, unfreeze and verification rows are listed with their
+    /// kind but never counted as policy verdicts. Only evaluations count.
+    #[test]
+    fn agent_activity_counts_only_evaluations_and_lists_every_kind() {
+        let evaluation = decision(
+            9,
+            PolicyPrincipal::Agent,
+            PolicyEffect::Allow,
+            "fct_orders",
+            Some(0),
+        );
+        let mut freeze = decision(10, PolicyPrincipal::Human, PolicyEffect::Deny, "*", None);
+        freeze.plan_id = format!("{}marts", policy::FREEZE_PLAN_PREFIX);
+        let mut unfreeze = decision(11, PolicyPrincipal::Human, PolicyEffect::Allow, "*", None);
+        unfreeze.plan_id = format!("{}marts", policy::UNFREEZE_PLAN_PREFIX);
+        let mut verification = decision(
+            12,
+            PolicyPrincipal::Agent,
+            PolicyEffect::Deny,
+            "fct_orders",
+            None,
+        );
+        verification.verify_after = vec!["not_null".to_string()];
+        let d = [evaluation, freeze, unfreeze, verification];
+        let refs: Vec<&PolicyDecisionRecord> = d.iter().collect();
+        let section = build_agent_activity(&refs);
+
+        assert_eq!(section.availability, SectionAvailability::Available);
+        assert_eq!(section.total, 1);
+        assert_eq!(section.allow, 1);
+        assert_eq!(section.require_review, 0);
+        assert_eq!(section.deny, 0);
+        // The human only froze and unfroze: no evaluation, no roll-up row.
+        assert_eq!(section.by_principal.len(), 1);
+        assert_eq!(section.by_principal[0].principal, PolicyPrincipal::Agent);
+        assert_eq!(section.by_principal[0].total, 1);
+        assert_eq!(section.by_principal[0].deny, 0);
+        // Every row stays in the list, labelled with its kind.
+        let kinds: Vec<BriefDecisionKind> = section.decisions.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                BriefDecisionKind::Evaluation,
+                BriefDecisionKind::Freeze,
+                BriefDecisionKind::Unfreeze,
+                BriefDecisionKind::VerifyAfterCustody,
+            ]
+        );
+        let json = serde_json::to_value(&section.decisions[3]).unwrap();
+        assert_eq!(json["kind"], "verify_after_custody");
+
+        // The text renderer prints the kind, not a bare DENY, on the
+        // non-evaluation rows.
+        let mut out = empty_brief(ts(13), BriefSince::Hours24, Some(ts(1)), "n/a");
+        out.agent_activity = section;
+        let md = render_markdown(&out);
+        assert!(
+            md.contains("1 decision(s): 1 allow · 0 review · 0 deny"),
+            "{md}"
+        );
+        assert!(md.contains("`fct_orders` ALLOW"), "{md}");
+        assert!(md.contains("freeze [deny]"), "{md}");
+        assert!(md.contains("unfreeze [allow]"), "{md}");
+        assert!(md.contains("verify_after_custody [deny]"), "{md}");
+        assert!(!md.contains("DENY"), "{md}");
     }
 
     #[test]

@@ -42,6 +42,12 @@ export type PolicyCapability =
  */
 export type PolicyEffect = "allow" | "require_review" | "deny";
 /**
+ * The kind of a policy-decision ledger row, as the brief reports it.
+ *
+ * Mirrors [`rocky_core::state::DecisionKind`], which is derived on read and deliberately not serialized.
+ */
+export type BriefDecisionKind = "evaluation" | "verify_after_custody" | "freeze" | "unfreeze";
+/**
  * How the digest window was resolved.
  */
 export type BriefSinceMode = "last" | "24h" | "7d";
@@ -116,19 +122,33 @@ export interface BriefOutput {
  * Agent-activity section — the policy-decision ledger rolled up by principal.
  */
 export interface BriefAgentActivitySection {
+  /**
+   * Evaluations whose effect was `allow`.
+   */
   allow: number;
   availability: SectionAvailability;
   /**
-   * One roll-up per acting principal (`human` / `agent`).
+   * One roll-up per acting principal (`human` / `agent`). Counts evaluation rows only, by the same rule as `total`.
    */
   by_principal: BriefPrincipalActivity[];
   /**
-   * Every decision in the window, newest first, each fully cited.
+   * Every ledger row in the window, newest first, each fully cited.
+   *
+   * This lists every kind of row, so it can be longer than `total`. Freeze, unfreeze and verification rows appear here with their `kind`, but not in the counts.
    */
   decisions: BriefDecisionEntry[];
+  /**
+   * Evaluations whose effect was `deny`.
+   */
   deny: number;
   note?: string | null;
+  /**
+   * Evaluations whose effect was `require_review`.
+   */
   require_review: number;
+  /**
+   * Policy evaluations in the window. Freeze, unfreeze and post-apply verification rows are not evaluations and are not counted, as in `rocky audit`. So `total` does not always equal the length of `decisions`.
+   */
   total: number;
   [k: string]: unknown;
 }
@@ -155,6 +175,10 @@ export interface BriefDecisionEntry {
    */
   decision_ref: string;
   effect: PolicyEffect;
+  /**
+   * What kind of ledger row this is. Only `evaluation` rows carry a policy verdict in `effect`; the brief counts only those.
+   */
+  kind: BriefDecisionKind;
   /**
    * The model the decision was about.
    */

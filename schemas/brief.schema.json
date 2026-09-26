@@ -32,6 +32,7 @@
       "description": "Agent-activity section — the policy-decision ledger rolled up by principal.",
       "properties": {
         "allow": {
+          "description": "Evaluations whose effect was `allow`.",
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
@@ -40,20 +41,21 @@
           "$ref": "#/definitions/SectionAvailability"
         },
         "by_principal": {
-          "description": "One roll-up per acting principal (`human` / `agent`).",
+          "description": "One roll-up per acting principal (`human` / `agent`). Counts evaluation rows only, by the same rule as `total`.",
           "items": {
             "$ref": "#/definitions/BriefPrincipalActivity"
           },
           "type": "array"
         },
         "decisions": {
-          "description": "Every decision in the window, newest first, each fully cited.",
+          "description": "Every ledger row in the window, newest first, each fully cited.\n\nThis lists every kind of row, so it can be longer than `total`. Freeze, unfreeze and verification rows appear here with their `kind`, but not in the counts.",
           "items": {
             "$ref": "#/definitions/BriefDecisionEntry"
           },
           "type": "array"
         },
         "deny": {
+          "description": "Evaluations whose effect was `deny`.",
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
@@ -65,11 +67,13 @@
           ]
         },
         "require_review": {
+          "description": "Evaluations whose effect was `require_review`.",
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
         },
         "total": {
+          "description": "Policy evaluations in the window. Freeze, unfreeze and post-apply verification rows are not evaluations and are not counted, as in `rocky audit`. So `total` does not always equal the length of `decisions`.",
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
@@ -240,6 +244,14 @@
         "effect": {
           "$ref": "#/definitions/PolicyEffect"
         },
+        "kind": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/BriefDecisionKind"
+            }
+          ],
+          "description": "What kind of ledger row this is. Only `evaluation` rows carry a policy verdict in `effect`; the brief counts only those."
+        },
         "model": {
           "description": "The model the decision was about.",
           "type": "string"
@@ -273,6 +285,7 @@
         "capability",
         "decision_ref",
         "effect",
+        "kind",
         "model",
         "plan_id",
         "principal",
@@ -280,6 +293,39 @@
         "timestamp"
       ],
       "type": "object"
+    },
+    "BriefDecisionKind": {
+      "description": "The kind of a policy-decision ledger row, as the brief reports it.\n\nMirrors [`rocky_core::state::DecisionKind`], which is derived on read and deliberately not serialized.",
+      "oneOf": [
+        {
+          "description": "A policy gate evaluated a plan. `effect` is a policy verdict.",
+          "enum": [
+            "evaluation"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A post-apply verification row. `effect` records whether the checks passed, not a policy verdict.",
+          "enum": [
+            "verify_after_custody"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "An operator froze a scope. `effect` is `deny` as an admin act.",
+          "enum": [
+            "freeze"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "An operator lifted a freeze. `effect` is `allow` as an admin act.",
+          "enum": [
+            "unfreeze"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "BriefDegradedRule": {
       "description": "A budget-exhausted (degraded) rule inside [`BriefAutonomySection`].",

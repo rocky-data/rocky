@@ -9357,13 +9357,25 @@ pub struct BriefAgentActivitySection {
     pub availability: SectionAvailability,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Policy evaluations in the window. Freeze, unfreeze and post-apply
+    /// verification rows are not evaluations and are not counted, as in
+    /// `rocky audit`. So `total` does not always equal the length of
+    /// `decisions`.
     pub total: u64,
+    /// Evaluations whose effect was `allow`.
     pub allow: u64,
+    /// Evaluations whose effect was `require_review`.
     pub require_review: u64,
+    /// Evaluations whose effect was `deny`.
     pub deny: u64,
-    /// One roll-up per acting principal (`human` / `agent`).
+    /// One roll-up per acting principal (`human` / `agent`). Counts
+    /// evaluation rows only, by the same rule as `total`.
     pub by_principal: Vec<BriefPrincipalActivity>,
-    /// Every decision in the window, newest first, each fully cited.
+    /// Every ledger row in the window, newest first, each fully cited.
+    ///
+    /// This lists every kind of row, so it can be longer than `total`.
+    /// Freeze, unfreeze and verification rows appear here with their
+    /// `kind`, but not in the counts.
     pub decisions: Vec<BriefDecisionEntry>,
 }
 
@@ -9397,12 +9409,45 @@ pub struct BriefDecisionEntry {
     /// The model the decision was about.
     pub model: String,
     pub effect: rocky_core::config::PolicyEffect,
+    /// What kind of ledger row this is. Only `evaluation` rows carry a
+    /// policy verdict in `effect`; the brief counts only those.
+    pub kind: BriefDecisionKind,
     /// Index of the winning `[[policy.rules]]` entry, or `null` for the
     /// default posture.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule_id: Option<usize>,
     /// Human-readable explanation of how the effect was reached.
     pub reason: String,
+}
+
+/// The kind of a policy-decision ledger row, as the brief reports it.
+///
+/// Mirrors [`rocky_core::state::DecisionKind`], which is derived on read
+/// and deliberately not serialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BriefDecisionKind {
+    /// A policy gate evaluated a plan. `effect` is a policy verdict.
+    Evaluation,
+    /// A post-apply verification row. `effect` records whether the checks
+    /// passed, not a policy verdict.
+    VerifyAfterCustody,
+    /// An operator froze a scope. `effect` is `deny` as an admin act.
+    Freeze,
+    /// An operator lifted a freeze. `effect` is `allow` as an admin act.
+    Unfreeze,
+}
+
+impl From<rocky_core::state::DecisionKind> for BriefDecisionKind {
+    fn from(kind: rocky_core::state::DecisionKind) -> Self {
+        use rocky_core::state::DecisionKind;
+        match kind {
+            DecisionKind::Evaluation => Self::Evaluation,
+            DecisionKind::VerifyAfterCustody => Self::VerifyAfterCustody,
+            DecisionKind::Freeze => Self::Freeze,
+            DecisionKind::Unfreeze => Self::Unfreeze,
+        }
+    }
 }
 
 /// Escalations section — `require_review` decisions still awaiting a human.

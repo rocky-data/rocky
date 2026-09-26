@@ -28,6 +28,38 @@ class BriefBudgetStatus(BaseModel):
     """
 
 
+class BriefDecisionKind1(StrEnum):
+    """
+    A policy gate evaluated a plan. `effect` is a policy verdict.
+    """
+
+    evaluation = "evaluation"
+
+
+class BriefDecisionKind2(StrEnum):
+    """
+    A post-apply verification row. `effect` records whether the checks passed, not a policy verdict.
+    """
+
+    verify_after_custody = "verify_after_custody"
+
+
+class BriefDecisionKind3(StrEnum):
+    """
+    An operator froze a scope. `effect` is `deny` as an admin act.
+    """
+
+    freeze = "freeze"
+
+
+class BriefDecisionKind4(StrEnum):
+    """
+    An operator lifted a freeze. `effect` is `allow` as an admin act.
+    """
+
+    unfreeze = "unfreeze"
+
+
 class BriefDegradedRule(BaseModel):
     """
     A budget-exhausted (degraded) rule inside [`BriefAutonomySection`].
@@ -443,6 +475,15 @@ class BriefDecisionEntry(BaseModel):
 
     Ordered by restrictiveness for incomparable-rule tie-breaking: `Deny` is a hard override (handled separately), and among non-deny verdicts `RequireReview` is more restrictive than `Allow`.
     """
+    kind: (
+        BriefDecisionKind1
+        | BriefDecisionKind2
+        | BriefDecisionKind3
+        | BriefDecisionKind4
+    )
+    """
+    What kind of ledger row this is. Only `evaluation` rows carry a policy verdict in `effect`; the brief counts only those.
+    """
     model: str
     """
     The model the decision was about.
@@ -637,6 +678,9 @@ class BriefAgentActivitySection(BaseModel):
     """
 
     allow: conint(ge=0)
+    """
+    Evaluations whose effect was `allow`.
+    """
     availability: SectionAvailability7 | SectionAvailability8 | SectionAvailability9
     """
     Whether a brief section's underlying query succeeded and had data.
@@ -645,16 +689,27 @@ class BriefAgentActivitySection(BaseModel):
     """
     by_principal: list[BriefPrincipalActivity]
     """
-    One roll-up per acting principal (`human` / `agent`).
+    One roll-up per acting principal (`human` / `agent`). Counts evaluation rows only, by the same rule as `total`.
     """
     decisions: list[BriefDecisionEntry]
     """
-    Every decision in the window, newest first, each fully cited.
+    Every ledger row in the window, newest first, each fully cited.
+
+    This lists every kind of row, so it can be longer than `total`. Freeze, unfreeze and verification rows appear here with their `kind`, but not in the counts.
     """
     deny: conint(ge=0)
+    """
+    Evaluations whose effect was `deny`.
+    """
     note: str | None = None
     require_review: conint(ge=0)
+    """
+    Evaluations whose effect was `require_review`.
+    """
     total: conint(ge=0)
+    """
+    Policy evaluations in the window. Freeze, unfreeze and post-apply verification rows are not evaluations and are not counted, as in `rocky audit`. So `total` does not always equal the length of `decisions`.
+    """
 
 
 class BriefOutput(BaseModel):
