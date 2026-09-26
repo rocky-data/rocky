@@ -74,6 +74,8 @@ timestamp_column = "_fivetran_synced"
 
 The timestamp column must exist in the source table, and its values must only increase. If the source system backfills history with old timestamps, a watermark run misses those rows. Partition checksums, below, catch that case.
 
+Rocky checks the column before it copies anything. If the source table does not have it, that table fails with a message that names the source table and the missing column. No statement runs for that table.
+
 ## Merge strategy
 
 Use the merge strategy for data whose rows change after they are first written. It matches rows on a unique key and updates them in place:

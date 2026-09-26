@@ -14043,6 +14043,68 @@ fn epoch_watermark_sentinel() -> chrono::DateTime<Utc> {
     chrono::DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_else(Utc::now)
 }
 
+/// The column a watermark strategy filters and records on, or `None` for a
+/// strategy that keeps no watermark. Exhaustive on purpose: a new strategy
+/// must decide whether it reads a timestamp column.
+fn watermark_timestamp_column(strategy: &MaterializationStrategy) -> Option<&str> {
+    match strategy {
+        MaterializationStrategy::Incremental { timestamp_column }
+        | MaterializationStrategy::Microbatch {
+            timestamp_column, ..
+        } => Some(timestamp_column.as_str()),
+        MaterializationStrategy::FullRefresh
+        | MaterializationStrategy::Merge { .. }
+        | MaterializationStrategy::View
+        | MaterializationStrategy::MaterializedView
+        | MaterializationStrategy::DynamicTable { .. }
+        | MaterializationStrategy::TimeInterval { .. }
+        | MaterializationStrategy::Ephemeral
+        | MaterializationStrategy::DeleteInsert { .. }
+        | MaterializationStrategy::ContentAddressed { .. } => None,
+    }
+}
+
+/// Refuse a watermark strategy whose `timestamp_column` is not among the
+/// discovered source columns (#2155). The match ignores ASCII case, as the
+/// warehouses resolve unquoted identifiers that way. An empty
+/// `source_cols` (a failed probe) passes: it cannot prove the column is
+/// absent.
+fn check_source_has_timestamp_column(
+    source_table: &TableRef,
+    source_cols: &[ColumnInfo],
+    timestamp_column: &str,
+) -> Result<()> {
+    if source_cols.is_empty()
+        || source_cols
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(timestamp_column))
+    {
+        return Ok(());
+    }
+    let columns = source_cols
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    // DuckDB sources have no catalog; name the table without a leading dot.
+    let source = [
+        &source_table.catalog,
+        &source_table.schema,
+        &source_table.table,
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .map(String::as_str)
+    .collect::<Vec<_>>()
+    .join(".");
+    anyhow::bail!(
+        "source `{source}` has no column `{timestamp_column}` (the pipeline's timestamp_column); \
+         columns: {columns}. Nothing ran for this table. Set `timestamp_column` to a \
+         column the source has, or use a strategy that keeps no watermark \
+         (e.g. strategy = \"full_refresh\")"
+    )
+}
+
 /// Processes a single table: drift detection + replication.
 ///
 /// Uses `WarehouseAdapter` for all SQL execution and schema introspection,
@@ -14245,6 +14307,18 @@ async fn process_table(
             };
             (src.unwrap_or_default(), target_cols)
         };
+    // #2155: a watermark strategy reads `timestamp_column` from the source
+    // (the WHERE filter) and then from the target (the post-copy watermark).
+    // Check it against the discovered source columns before any statement
+    // runs, so a missing column fails the table here with a Rocky message
+    // naming the source — not after the copy, as a warehouse binder error
+    // on the target. An empty `source_cols` means the probe failed; that
+    // cannot prove the column is absent, so the post-copy read stays the
+    // second line of defence.
+    if let Some(ts_col) = watermark_timestamp_column(&strategy) {
+        check_source_has_timestamp_column(&source_table, &source_cols, ts_col)?;
+    }
+
     let target_exists = !target_cols.is_empty();
 
     let mut use_full_refresh = !target_exists || (uses_watermark && prior_watermark.is_none());
@@ -25879,6 +25953,171 @@ backend = "local"
             n,
             Some(1),
             "run 2 must not re-copy the fractional-second row into the target"
+        );
+    }
+
+    /// #2155: the issue's repro end to end. An incremental replication
+    /// whose source lacks the default `timestamp_column`
+    /// (`_fivetran_synced`) fails the table BEFORE any copy statement runs,
+    /// with a Rocky message naming the source table and the missing column
+    /// — not after the copy, as a DuckDB binder error on the target's
+    /// watermark read. The target table never existing proves no copy ran.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn incremental_missing_timestamp_column_fails_before_the_copy() {
+        use rocky_core::state::StateStore;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("repro.duckdb");
+        let config_path = tmp.path().join("rocky.toml");
+        let state_path = tmp.path().join("state.redb");
+        // No `timestamp_column`: the default `_fivetran_synced` applies, as
+        // in the `rocky init --template duckdb` scaffold the issue used.
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.repro]
+strategy = "incremental"
+
+[pipeline.repro.source.discovery]
+adapter = "default"
+
+[pipeline.repro.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.repro.target]
+catalog_template = "repro"
+schema_template = "staging__{{source}}"
+
+[pipeline.repro.target.governance]
+auto_create_schemas = true
+
+[pipeline.repro.checks]
+row_count = false
+column_match = false
+
+[pipeline.repro.execution]
+concurrency = 1
+
+[state]
+backend = "local"
+"#,
+                db_path.display()
+            ),
+        )
+        .expect("write rocky.toml");
+
+        {
+            let db = DuckDbWarehouseAdapter::open(&db_path).expect("seed duckdb");
+            for sql in [
+                "CREATE SCHEMA raw__orders",
+                "CREATE TABLE raw__orders.orders (id INTEGER, amount DOUBLE)",
+                "INSERT INTO raw__orders.orders VALUES (1, 9.5)",
+            ] {
+                db.execute_statement(sql).await.unwrap();
+            }
+        }
+
+        let err = super::run(
+            &config_path,
+            Arc::new(rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap()),
+            None,
+            Some("repro"),
+            &state_path,
+            None,
+            true,
+            None,
+            false,
+            None,
+            false,
+            None,
+            &PartitionRunOptions::default(),
+            None,
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            Some("missing-ts"),
+            None,
+            false,
+            None, // #1460
+        )
+        .await
+        .expect_err("a source without the timestamp column must fail the table");
+        assert!(
+            format!("{err:#}").contains("1 table(s) failed"),
+            "the table failure must surface as a run failure: {err:#}"
+        );
+
+        let progress = StateStore::open(&state_path)
+            .expect("open state")
+            .get_run_progress("missing-ts")
+            .expect("read progress")
+            .expect("run progress recorded");
+        let table_error = progress
+            .tables
+            .iter()
+            .find_map(|t| t.error.clone())
+            .expect("the failed table records its error");
+        assert!(
+            table_error.contains(
+                "source `raw__orders.orders` has no column `_fivetran_synced` \
+                 (the pipeline's timestamp_column); columns: id, amount"
+            ),
+            "expected the Rocky pre-copy refusal, got: {table_error}"
+        );
+        assert!(
+            !table_error.contains("Binder Error"),
+            "the refusal must come from Rocky, not the warehouse: {table_error}"
+        );
+
+        let db = DuckDbWarehouseAdapter::open(&db_path).expect("verify duckdb");
+        let target = db
+            .execute_query(
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_schema = 'staging__orders' AND table_name = 'orders'",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            target.rows[0][0], "0",
+            "no copy statement may run: the target table must not exist"
+        );
+    }
+
+    /// #2155: the pre-copy check passes on a case-only difference (the
+    /// warehouses resolve unquoted identifiers without case) and on an empty
+    /// column list (a failed source probe cannot prove absence).
+    #[test]
+    fn source_timestamp_column_check_ignores_case_and_an_empty_probe() {
+        let source = TableRef {
+            catalog: "c".into(),
+            schema: "s".into(),
+            table: "t".into(),
+        };
+        let col = |name: &str| ColumnInfo {
+            name: name.into(),
+            data_type: "TIMESTAMP".into(),
+            nullable: true,
+        };
+        assert!(check_source_has_timestamp_column(&source, &[col("TS")], "ts").is_ok());
+        assert!(check_source_has_timestamp_column(&source, &[], "ts").is_ok());
+        let err = check_source_has_timestamp_column(&source, &[col("id")], "ts")
+            .expect_err("a missing column must refuse");
+        assert!(
+            err.to_string()
+                .starts_with("source `c.s.t` has no column `ts`"),
+            "{err}"
         );
     }
 
