@@ -6629,7 +6629,12 @@ pub async fn run(
     let verify_after_result = super::drift_governance::finalize_drift_verify_after(
         state_store.as_ref(),
         &run_id,
-        rocky_cfg.policy.as_ref(),
+        // No policy when the auto-apply opt-in is off: nothing was healed, so
+        // there is no gate, and an unreadable ledger does not halt the run.
+        rocky_cfg
+            .policy
+            .as_ref()
+            .filter(|_| rocky_cfg.resilience.auto_apply_additive_drift),
     );
     if let Err(custody_err) = &verify_after_result {
         output.tables_failed += 1;

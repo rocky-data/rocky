@@ -476,8 +476,10 @@ fn decision_plan_id(run_id: &str) -> String {
 /// required check failed or was absent. The migration already landed and,
 /// with no rollback substrate, stays in place until a human reverts it.
 ///
-/// A no-op when the store is unavailable, nothing was auto-applied, or no
-/// granting rule demanded checks.
+/// A no-op when the store is unavailable, no policy is in force (the caller
+/// passes `None` when the auto-apply opt-in is off), nothing was
+/// auto-applied, or no granting rule demanded checks. An unreadable
+/// decision ledger is none of these: it halts the run.
 pub(crate) fn finalize_drift_verify_after(
     store: Option<&StateStore>,
     run_id: &str,
@@ -486,9 +488,22 @@ pub(crate) fn finalize_drift_verify_after(
     let Some(store) = store else {
         return Ok(());
     };
-    let Ok(decisions) = store.list_policy_decisions() else {
+    // No policy, no gate: a heal with no granting rule requires no check (see
+    // the `required` resolution below), so the ledger need not be read.
+    if policy.is_none() {
         return Ok(());
-    };
+    }
+    // An unreadable ledger is not "nothing was healed" (#1814 finding 4). It
+    // hides exactly the rows this gate exists to verify, so it refuses, the
+    // same fail-closed posture as the evaluation-time read in `govern`.
+    let decisions = store.list_policy_decisions().map_err(|e| {
+        anyhow::anyhow!(
+            "verify_after could not read the policy-decision ledger ({e}), so it cannot \
+             tell which tables this run auto-migrated or confirm them. Any auto-applied \
+             migration stays in place. Repair or restore the state store, then review the \
+             run's schema changes before re-running"
+        )
+    })?;
     let decision_plan = decision_plan_id(run_id);
     // Applied decision rows are PLAIN (empty verify_after); the non-empty
     // filter excludes verification-outcome rows a partial earlier finalize
@@ -875,6 +890,45 @@ mod tests {
         let (store, _d) = temp_store();
         let policy = granting_policy(&["row_count"], None);
         assert!(finalize_drift_verify_after(Some(&store), "run-1", Some(&policy)).is_ok());
+    }
+
+    /// #1814 finding 4: an unreadable decision ledger used to return `Ok(())`
+    /// before any healed table was identified, so no required check ran and
+    /// the run's provisional `Success` stood. It now refuses, naming the
+    /// ledger as the cause.
+    #[test]
+    fn an_unreadable_ledger_halts_instead_of_skipping_verification() {
+        let (store, _d) = temp_store();
+        let policy = granting_policy(&["row_count"], None);
+        store
+            .record_policy_decision(&applied_decision("run-1", "wh.raw.orders"))
+            .unwrap();
+        store
+            .record_run(&run_with_checks("run-1", &[("row_count", false)]))
+            .unwrap();
+        store
+            .insert_corrupt_policy_decision_row("zzz-corrupt")
+            .unwrap();
+
+        let err = finalize_drift_verify_after(Some(&store), "run-1", Some(&policy))
+            .expect_err("an unreadable ledger must halt the run");
+        let message = err.to_string();
+        assert!(
+            message.contains("could not read the policy-decision ledger"),
+            "unexpected error: {message}"
+        );
+    }
+
+    /// With no policy in force (the run path passes `None` when the auto-apply
+    /// opt-in is off) no heal can carry a gate, so the ledger is not read and
+    /// an unreadable one does not halt the run.
+    #[test]
+    fn no_policy_does_not_read_the_ledger() {
+        let (store, _d) = temp_store();
+        store
+            .insert_corrupt_policy_decision_row("zzz-corrupt")
+            .unwrap();
+        assert!(finalize_drift_verify_after(Some(&store), "run-1", None).is_ok());
     }
 
     #[test]

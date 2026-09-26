@@ -5328,6 +5328,20 @@ impl StateStore {
         self.commit_write(txn)?;
         Ok(())
     }
+
+    /// Test-only: write a byte blob under a `policy_decisions` key that is not
+    /// valid `PolicyDecisionRecord` JSON, so [`Self::list_policy_decisions`]
+    /// fails. Used to prove callers fail closed on an unreadable ledger.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_corrupt_policy_decision_row(&self, key: &str) -> Result<(), StateError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(POLICY_DECISIONS)?;
+            table.insert(key, b"{not valid policy decision json".as_slice())?;
+        }
+        self.commit_write(txn)?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
