@@ -1483,10 +1483,11 @@ fn map_microbatch_strategy(
     }
 
     // dbt microbatch idempotently REPLACES each batch partition. Rocky's
-    // Microbatch strategy emits an append-only INSERT (sql_gen.rs), so importing
-    // it as-is silently re-inserts the lookback window every run. dbt microbatch
-    // requires a `unique_key`, so map it to an idempotent Rocky merge instead;
-    // only fall back to append-only (loudly) if a key is somehow absent.
+    // `microbatch` is an alias of `time_interval` (#2054): it needs a body
+    // bounded by `@start_date`/`@end_date`, which dbt's compiled code lacks.
+    // That rewrite is the `--microbatch-as=time_interval` path above. dbt
+    // microbatch requires a `unique_key`, so map it to an idempotent Rocky
+    // merge instead; fall back to `full_refresh` (loudly) if a key is absent.
     let unique_keys: Option<Vec<String>> = config.unique_key.as_ref().map(|uk| match uk {
         UniqueKeyValue::Single(s) => vec![s.clone()],
         UniqueKeyValue::Multiple(v) => v.clone(),
@@ -1526,10 +1527,10 @@ fn map_microbatch_strategy(
                 model: model_name.to_string(),
                 mapped_to: "full_refresh".to_string(),
             });
-            // Neither `incremental` (refused, #1990) nor `microbatch` (the
-            // same unfiltered append, #2054): both would re-insert every row
-            // on each run. A full rebuild is the one mapping that cannot
-            // duplicate.
+            // Neither `incremental` (refused, #1990: it re-inserts every row
+            // on each run) nor `microbatch` (a `time_interval` alias, #2054,
+            // whose body must carry `@start_date`/`@end_date`). A full
+            // rebuild is the one mapping that cannot duplicate.
             StrategyConfig::FullRefresh
         }
     }
@@ -3827,8 +3828,9 @@ FROM {{ ref('stg_events') }}
         let result = import_from_manifest_json(&manifest);
         assert_eq!(result.imported.len(), 1);
         // A microbatch without a unique_key has no append mapping: `incremental`
-        // is refused on transformation models (#1990) and `microbatch` is the
-        // same unfiltered INSERT (#2054). It rebuilds in full, loudly.
+        // is refused on transformation models (#1990), and a Rocky `microbatch`
+        // is a `time_interval` alias that needs `@start_date`/`@end_date`
+        // (#2054). It rebuilds in full, loudly.
         assert!(
             matches!(
                 result.imported[0].config.strategy,

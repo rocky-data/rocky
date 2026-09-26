@@ -481,6 +481,38 @@ fn default_microbatch_granularity() -> TimeGrain {
     TimeGrain::Hour
 }
 
+/// Resolve a strategy alias to the strategy it names.
+///
+/// `microbatch` is documented as an alias for `time_interval` with an `hour`
+/// default grain (`reference/model-format.md`). It becomes a
+/// [`StrategyConfig::TimeInterval`] here, at model load, so E024 and the
+/// partition planner apply to it. Before #2054 it reached SQL generation as
+/// its own strategy and appended every row again on each run.
+fn normalize_strategy_alias(strategy: StrategyConfig) -> StrategyConfig {
+    match strategy {
+        StrategyConfig::Microbatch {
+            timestamp_column,
+            granularity,
+        } => StrategyConfig::TimeInterval {
+            time_column: timestamp_column,
+            granularity,
+            lookback: 0,
+            batch_size: default_batch_size(),
+            first_partition: None,
+        },
+        other @ (StrategyConfig::FullRefresh
+        | StrategyConfig::Incremental { .. }
+        | StrategyConfig::Merge { .. }
+        | StrategyConfig::TimeInterval { .. }
+        | StrategyConfig::Ephemeral
+        | StrategyConfig::DeleteInsert { .. }
+        | StrategyConfig::View
+        | StrategyConfig::MaterializedView
+        | StrategyConfig::DynamicTable { .. }
+        | StrategyConfig::ContentAddressed { .. }) => other,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Raw deserialization types (all fields optional for inference)
 // ---------------------------------------------------------------------------
@@ -1105,11 +1137,12 @@ fn resolve_model_config(
     }
 
     // Precedence: per-model sidecar > group > directory defaults.
-    let strategy = raw
-        .strategy
-        .or_else(|| group.and_then(|g| g.strategy.clone()))
-        .or_else(|| defaults.and_then(|d| d.strategy.clone()))
-        .unwrap_or_default();
+    let strategy = normalize_strategy_alias(
+        raw.strategy
+            .or_else(|| group.and_then(|g| g.strategy.clone()))
+            .or_else(|| defaults.and_then(|d| d.strategy.clone()))
+            .unwrap_or_default(),
+    );
 
     let intent = raw
         .intent
@@ -2270,6 +2303,83 @@ FROM analytics.staging.customers
             model.config.strategy,
             StrategyConfig::Merge { .. }
         ));
+    }
+
+    /// #2054: `microbatch` is the documented alias of `time_interval`. It
+    /// resolves at load, so E024 and the partition planner apply to it, and
+    /// it never reaches SQL generation as an unfiltered append.
+    #[test]
+    fn test_microbatch_loads_as_time_interval() {
+        let content = r#"---toml
+name = "fct_hourly_events"
+
+[strategy]
+type = "microbatch"
+timestamp_column = "event_at"
+
+[target]
+catalog = "analytics"
+schema = "warehouse"
+table = "fct_hourly_events"
+---
+
+SELECT event_at FROM raw.events
+WHERE event_at >= @start_date AND event_at < @end_date
+"#;
+        let model = parse_model_inline(content, Path::new("fct_hourly_events.sql"), None).unwrap();
+        match &model.config.strategy {
+            StrategyConfig::TimeInterval {
+                time_column,
+                granularity,
+                lookback,
+                batch_size,
+                first_partition,
+            } => {
+                assert_eq!(time_column, "event_at");
+                assert_eq!(*granularity, TimeGrain::Hour, "the documented default");
+                assert_eq!(*lookback, 0);
+                assert_eq!(batch_size.get(), 1);
+                assert!(first_partition.is_none());
+            }
+            other => panic!("microbatch must load as time_interval, got {other:?}"),
+        }
+        assert!(matches!(
+            model.to_model_ir().materialization,
+            MaterializationStrategy::TimeInterval { .. }
+        ));
+    }
+
+    /// The alias also resolves when `microbatch` comes from `_defaults.toml`,
+    /// and an explicit grain is kept.
+    #[test]
+    fn test_microbatch_from_dir_defaults_loads_as_time_interval() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("_defaults.toml"),
+            "[strategy]\ntype = \"microbatch\"\ntimestamp_column = \"d\"\ngranularity = \"day\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("m.toml"),
+            "[target]\ncatalog = \"c\"\nschema = \"s\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("m.sql"),
+            "SELECT d FROM t WHERE d >= @start_date AND d < @end_date",
+        )
+        .unwrap();
+        let models = load_models_from_dir(dir.path(), None).unwrap();
+        assert_eq!(models.len(), 1);
+        assert!(
+            matches!(
+                &models[0].config.strategy,
+                StrategyConfig::TimeInterval { time_column, granularity: TimeGrain::Day, .. }
+                    if time_column == "d"
+            ),
+            "got {:?}",
+            models[0].config.strategy
+        );
     }
 
     #[test]

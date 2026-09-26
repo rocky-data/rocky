@@ -468,10 +468,10 @@ pub fn generate_transformation_sql_with_warehouse(
         MaterializationStrategy::Microbatch {
             timestamp_column, ..
         } => {
-            // No windowing and no watermark filter exist for a transformation
-            // model: this is an unfiltered `INSERT INTO <target> <model SQL>`,
-            // so every run after the first appends the whole result again.
-            // Tracked in #2054; left legal pending that ruling.
+            // An unfiltered `INSERT INTO <target> <model SQL>`. A sidecar
+            // `microbatch` never reaches this arm: model load resolves it to
+            // `time_interval` (`models.rs`, #2054), which bounds each run to
+            // its partition window. Only a hand-built IR takes this arm.
             validation::validate_identifier(timestamp_column)?;
             Ok(vec![dialect.insert_into(&target, &model_ir.sql)])
         }
@@ -2331,9 +2331,10 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     fn test_lakehouse_append_ignores_format_on_insert() {
         // An append INSERT should not emit lakehouse DDL — that's for
         // initial table creation. The format field is silently ignored for
-        // the INSERT path, since the table already exists. Uses `microbatch`,
-        // the append strategy still legal on transformation models (#2054);
-        // `incremental` is refused before this path (#1990).
+        // the INSERT path, since the table already exists. Uses the
+        // `Microbatch` IR arm, the one append arm left in SQL generation.
+        // A sidecar `microbatch` loads as `time_interval` (#2054) and
+        // `incremental` is refused (#1990), so only a hand-built IR gets here.
         let plan = lakehouse_ir(
             LakehouseFormat::DeltaTable,
             LakehouseOptions::default(),
@@ -2360,8 +2361,9 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
                 table_properties: vec![("delta.enableChangeDataFeed".into(), "true".into())],
                 ..LakehouseOptions::default()
             },
-            // An append strategy still legal on transformation models (#2054);
-            // `incremental` is refused before any DDL (#1990).
+            // The `Microbatch` IR arm: the one append arm left in SQL
+            // generation (a sidecar `microbatch` loads as `time_interval`,
+            // #2054; `incremental` is refused, #1990).
             MaterializationStrategy::Microbatch {
                 timestamp_column: "updated_at".into(),
                 granularity: rocky_ir::TimeGrain::Hour,
@@ -2583,8 +2585,9 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
                 comment: Some("Incremental orders mart".into()),
                 ..LakehouseOptions::default()
             },
-            // `microbatch`, the append strategy still legal on transformation
-            // models (#2054); `incremental` is refused before any DDL (#1990).
+            // The `Microbatch` IR arm: the one append arm left in SQL
+            // generation (a sidecar `microbatch` loads as `time_interval`,
+            // #2054; `incremental` is refused, #1990).
             MaterializationStrategy::Microbatch {
                 timestamp_column: "updated_at".into(),
                 granularity: rocky_ir::TimeGrain::Hour,

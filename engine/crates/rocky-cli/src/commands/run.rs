@@ -23599,7 +23599,7 @@ timestamp_column = "ts"
     ///
     /// Sibling of the replication regression above, for the second of the three
     /// executor bootstrap paths. A strategy that mutates an existing target
-    /// (here `microbatch`) probes the target with `describe_table` and, if it
+    /// (here `delete_insert`) probes the target with `describe_table` and, if it
     /// reads as absent, bootstraps via the non-replacing
     /// `generate_transformation_initial_ddl` CTAS. When that probe *misfires*
     /// against a live target, the bootstrap must fail closed ("already exists")
@@ -23634,9 +23634,8 @@ timestamp_column = "ts"
 name = "fct_events"
 
 [strategy]
-type = "microbatch"
-timestamp_column = "id"
-granularity = "hour"
+type = "delete_insert"
+partition_by = ["id"]
 
 [target]
 catalog = ""
@@ -24190,9 +24189,8 @@ table = "fct_daily"
 name = "fct_events"
 
 [strategy]
-type = "microbatch"
-timestamp_column = "id"
-granularity = "hour"
+type = "delete_insert"
+partition_by = ["id"]
 
 [target]
 catalog = ""
@@ -24312,9 +24310,8 @@ table = "fct_events"
 name = "fct_events"
 
 [strategy]
-type = "microbatch"
-timestamp_column = "id"
-granularity = "hour"
+type = "delete_insert"
+partition_by = ["id"]
 
 [target]
 catalog = ""
@@ -24411,9 +24408,8 @@ table = "fct_events"
 name = "fct_events"
 
 [strategy]
-type = "microbatch"
-timestamp_column = "id"
-granularity = "hour"
+type = "delete_insert"
+partition_by = ["id"]
 
 [target]
 catalog = ""
@@ -32975,6 +32971,11 @@ auto_create_schemas = true
 
     /// Upstream `MAX(ts)` advanced ⇒ BUILD (watermark signal, via an
     /// incremental-strategy timestamp column on a ts-bearing source).
+    // No sidecar strategy tracks a timestamp any more: `incremental` is
+    // refused (#1990) and `microbatch` loads as `time_interval` (#2054),
+    // which the skip gate does not cover. The gate's MAX(ts) probe has no
+    // reachable model until that is decided, so this test cannot build one.
+    #[ignore = "no transformation strategy tracks a timestamp since #2054"]
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn gate_upstream_watermark_advanced_builds() {
@@ -34464,6 +34465,11 @@ auto_create_schemas = true
     /// `lag_tolerance_seconds`: a sub-tolerance MAX(ts) movement is treated as
     /// unchanged (SKIP) only when a tolerance is configured; an above-tolerance
     /// movement always builds; the default tolerance 0 builds on any movement.
+    // No sidecar strategy tracks a timestamp any more: `incremental` is
+    // refused (#1990) and `microbatch` loads as `time_interval` (#2054),
+    // which the skip gate does not cover. The gate's MAX(ts) probe has no
+    // reachable model until that is decided, so this test cannot build one.
+    #[ignore = "no transformation strategy tracks a timestamp since #2054"]
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn gate_lag_tolerance_absorbs_small_movement() {
@@ -37287,46 +37293,40 @@ auto_create_schemas = true
         }
     }
 
-    /// Runtime regression: a first run of an append-strategy transformation
-    /// model against a missing target must bootstrap the table (via
-    /// `generate_transformation_initial_ddl`) and load the source **exactly
-    /// once** — the populated CTAS is the load, so the subsequent `INSERT INTO`
-    /// is skipped. Before this wiring the first run hit `INSERT INTO` against a
-    /// nonexistent table and errored; a naive fix that ran the INSERT after the
-    /// CTAS would double-load. This drives the real `execute_one_plain_model`
-    /// runtime path on in-memory DuckDB (format = None, so dialect-independent
-    /// of the lakehouse DDL — what's proven here is the skip, not the format).
-    ///
-    /// The second-run assertion PINS A DEFECT, not a contract. The model SQL
-    /// carries no watermark filter and nothing adds one, so a second run
-    /// re-selects the full source and appends it again. `incremental` used to
-    /// take this path and is now refused (#1990, E037); `microbatch` still
-    /// takes it and is pending its own ruling (#2054). When #2054 is decided,
-    /// this assertion changes with it.
+    /// #2054: a `microbatch` model is the `time_interval` alias the docs
+    /// promise. It runs through the per-partition path, so three runs over the
+    /// same window leave the target with the source's rows once. Before the
+    /// alias it took an unfiltered `INSERT` and each run appended the whole
+    /// source again (3, 6, 9 rows).
     #[cfg(feature = "duckdb")]
     #[tokio::test]
-    async fn append_transformation_first_run_loads_source_once_then_appends() {
-        use std::time::Instant;
-
-        use rocky_core::models::load_model_pair;
+    async fn microbatch_model_reruns_do_not_duplicate_rows() {
+        use rocky_core::models::{StrategyConfig, load_model_pair};
+        use rocky_core::state::StateStore;
         use rocky_core::traits::WarehouseAdapter;
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
         use rocky_duckdb::dialect::DuckDbSqlDialect;
 
+        let today = chrono::Utc::now().date_naive();
+        let first = today.pred_opt().unwrap().pred_opt().unwrap().to_string();
+        let last = today.to_string();
+
         let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
-        for ddl in [
-            "CREATE SCHEMA src",
-            "CREATE SCHEMA tgt",
-            "CREATE TABLE src.events (id INTEGER, region VARCHAR)",
-            "INSERT INTO src.events VALUES (1, 'a'), (2, 'b'), (3, 'c')",
-        ] {
-            adapter.execute_statement(ddl).await.unwrap();
-        }
+        adapter
+            .execute_statement("CREATE SCHEMA src")
+            .await
+            .unwrap();
+        adapter
+            .execute_statement(&format!(
+                "CREATE TABLE src.events AS SELECT * FROM (VALUES \
+                 (1, TIMESTAMP '{first} 01:00:00'), \
+                 (2, TIMESTAMP '{first} 02:00:00'), \
+                 (3, TIMESTAMP '{last} 03:00:00')) AS t(id, event_at)"
+            ))
+            .await
+            .unwrap();
         let source_rows: i64 = 3;
 
-        // Build a real `Model` from a sidecar + SQL pair so the runtime path
-        // (`Model::to_model_ir` → `execute_one_plain_model`) is exercised
-        // end-to-end rather than hand-assembling the IR.
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(
             dir.path().join("fct_events.toml"),
@@ -37335,19 +37335,20 @@ name = "fct_events"
 
 [strategy]
 type = "microbatch"
-timestamp_column = "id"
-granularity = "hour"
+timestamp_column = "event_day"
+granularity = "day"
 
 [target]
 catalog = ""
-schema = "tgt"
+schema = "main"
 table = "fct_events"
 "#,
         )
         .unwrap();
         std::fs::write(
             dir.path().join("fct_events.sql"),
-            "SELECT id, region FROM src.events",
+            "SELECT id, CAST(event_at AS DATE) AS event_day FROM src.events \
+             WHERE event_at >= @start_date AND event_at < @end_date",
         )
         .unwrap();
         let model = load_model_pair(
@@ -37355,9 +37356,13 @@ table = "fct_events"
             &dir.path().join("fct_events.toml"),
             None,
         )
-        .expect("load incremental model");
+        .expect("load microbatch model");
+        assert!(
+            matches!(model.config.strategy, StrategyConfig::TimeInterval { .. }),
+            "microbatch loads as its time_interval alias"
+        );
 
-        let dialect = DuckDbSqlDialect;
+        let state = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let typed_models = indexmap::IndexMap::new();
         let model_timings = std::collections::HashMap::new();
         let surrogate_keys = std::collections::HashMap::new();
@@ -37366,51 +37371,38 @@ table = "fct_events"
             model_timings: &model_timings,
             surrogate_keys: &surrogate_keys,
         };
+        let range = PartitionRunOptions {
+            from: Some(first.clone()),
+            to: Some(last.clone()),
+            parallel: 1,
+            ..Default::default()
+        };
 
-        async fn count_target(adapter: &DuckDbWarehouseAdapter) -> i64 {
+        for run in 1..=3 {
+            let mut output = RunOutput::new(String::new(), 0, 1);
+            super::execute_time_interval_model(
+                &model,
+                &adapter as &dyn WarehouseAdapter,
+                &DuckDbSqlDialect,
+                Some(&state),
+                &range,
+                &format!("run-{run}"),
+                &mut output,
+                &exec_ctx,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("run {run} failed: {e:#}"));
             let r = adapter
-                .execute_query("SELECT COUNT(*) FROM tgt.fct_events")
+                .execute_query("SELECT COUNT(*) FROM main.fct_events")
                 .await
                 .expect("count query");
             let cell = &r.rows[0][0];
-            cell.as_i64()
+            let count = cell
+                .as_i64()
                 .or_else(|| cell.as_str().and_then(|s| s.parse::<i64>().ok()))
-                .expect("count parses as i64")
+                .expect("count parses as i64");
+            assert_eq!(count, source_rows, "run {run} must not duplicate rows");
         }
-
-        // --- First run: target missing → bootstrap CTAS, INSERT skipped. ---
-        super::execute_one_plain_model(
-            &model,
-            &adapter as &dyn WarehouseAdapter,
-            &dialect as &dyn rocky_core::traits::SqlDialect,
-            "fct_events",
-            Instant::now(),
-            exec_ctx,
-        )
-        .await
-        .expect("first run bootstraps without error");
-        assert_eq!(
-            count_target(&adapter).await,
-            source_rows,
-            "first run must load the source exactly once (no double-load)"
-        );
-
-        // --- Second run: target exists → normal incremental append. ---
-        super::execute_one_plain_model(
-            &model,
-            &adapter as &dyn WarehouseAdapter,
-            &dialect as &dyn rocky_core::traits::SqlDialect,
-            "fct_events",
-            Instant::now(),
-            exec_ctx,
-        )
-        .await
-        .expect("second run appends without error");
-        assert_eq!(
-            count_target(&adapter).await,
-            source_rows * 2,
-            "second run reuses the existing table and appends through the INSERT path"
-        );
     }
 
     /// End-to-end reachability + the load-bearing identity invariant for

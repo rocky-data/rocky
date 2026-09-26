@@ -68,7 +68,7 @@ The `.toml` file names the model, lists what it depends on, picks a materializat
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `type` | string | `"full_refresh"` | Materialization type. One of `"full_refresh"`, `"merge"`, `"time_interval"`, `"view"`, `"materialized_view"`, `"dynamic_table"`, `"delete_insert"`, `"microbatch"`, `"content_addressed"`. Two are refused: `"incremental"` on a transformation model (`E037`, see [Incremental](#incremental)), and `"ephemeral"` outright (`E038`, see [Ephemeral](#ephemeral)). |
-| `timestamp_column` | string | | Column used as the incremental watermark. Required when `type = "microbatch"`. |
+| `timestamp_column` | string | | Partition column for `microbatch`, the same as `time_column` for `time_interval`. Required when `type = "microbatch"`. |
 | `unique_key` | list of strings | | Key columns for merge matching. Required when `type = "merge"`. |
 | `update_columns` | list of strings | | Columns to update on merge match. Defaults to all non-key columns if omitted. |
 | `partition_by` | list of strings | | Column(s) identifying the partition to delete. Required when `type = "delete_insert"`. |
@@ -750,6 +750,8 @@ table = "fct_daily_activity"
 ### Microbatch
 
 An alias for `time_interval` that defaults to `hour` granularity. The name matches dbt's for partition-based incremental processing.
+
+Rocky reads a `microbatch` model as a `time_interval` model. `timestamp_column` becomes `time_column`. `lookback` is `0`, `batch_size` is `1`, and there is no `first_partition`. Everything on [Time Interval](#time-interval) applies. The model SQL must use `@start_date` and `@end_date`, or the compile fails with `E024`. For `lookback`, `batch_size` or `first_partition`, write `type = "time_interval"`.
 
 **Config** (`models/fct_hourly_events.toml`):
 

@@ -166,9 +166,9 @@ fn incremental_iceberg_model(
             schema: tgt_schema.to_string(),
             table: table.to_string(),
         },
-        // An append strategy that is still legal on transformation models:
-        // `incremental` is refused there (#1990); `microbatch` takes the same
-        // bootstrap-then-INSERT path and is pending its own ruling (#2054).
+        // The `Microbatch` IR arm, the one append arm left in SQL generation.
+        // A sidecar `microbatch` loads as `time_interval` (#2054) and
+        // `incremental` is refused (#1990); this IR is built by hand.
         MaterializationStrategy::Microbatch {
             timestamp_column: "updated_at".into(),
             granularity: rocky_ir::TimeGrain::Hour,

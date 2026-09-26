@@ -80,9 +80,8 @@ The higher-level builder. It takes a `ModelDetail` from
 `time_interval`, it calls the pure builder above.
 
 It returns `None` for every other strategy: `full_refresh`,
-`merge`, `delete_insert`, and `view`. It also
-returns `None` for `microbatch` today, even though that strategy is
-time-based.
+`merge`, `delete_insert`, and `view`. A `microbatch` model loads as
+`time_interval`, so it gets partitions too.
 
 ```python
 from dagster_rocky import partitions_def_for_model_detail, RockyResource

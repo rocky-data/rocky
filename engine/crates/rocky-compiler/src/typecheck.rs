@@ -1167,9 +1167,8 @@ fn check_merge_strategy(
 /// transformation model (replication tables have no sidecar and never reach
 /// this pass), so no variant check is needed here.
 ///
-/// `microbatch` takes the same unfiltered path and is deliberately NOT refused
-/// here: it is tracked separately in #2054, and the suggestion below does not
-/// offer it.
+/// `microbatch` is not refused here: model load resolves it to its
+/// `time_interval` alias (#2054), so E024 bounds it instead.
 fn check_incremental_strategy(model: &rocky_core::models::Model) -> Vec<Diagnostic> {
     use rocky_core::models::StrategyConfig;
 
@@ -1245,7 +1244,8 @@ fn check_time_interval_placeholders(model_name: &str, sql: &str) -> Vec<Diagnost
                 Diagnostic::error(
                     E024,
                     model_name,
-                    "time_interval model must reference both `@start_date` and `@end_date` in its SQL",
+                    "time_interval model must reference both `@start_date` and `@end_date` in its SQL \
+                     (`microbatch` is an alias of `time_interval`)",
                 )
                 .with_suggestion(
                     "Add `WHERE <ts_col> >= @start_date AND <ts_col> < @end_date` to the model SQL",

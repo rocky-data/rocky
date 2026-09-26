@@ -991,6 +991,36 @@ fn an_incremental_transformation_model_is_refused_with_e037() {
     assert!(result.has_errors, "an E037 must make the compile fail");
 }
 
+/// #2054: `microbatch` is the `time_interval` alias the docs promise. A body
+/// with no `@start_date`/`@end_date` is refused by E024 as an error, so
+/// `rocky run` excludes it instead of appending every row again on each run.
+/// The message names the alias so a `microbatch` author sees why.
+#[test]
+fn an_unbounded_microbatch_model_is_refused_with_e024() {
+    let result = compile_strategy_project(
+        "type = \"microbatch\"\ntimestamp_column = \"updated_at\"\ngranularity = \"day\"",
+    );
+    let e024: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| &*d.code == "E024")
+        .collect();
+    assert_eq!(
+        e024.len(),
+        1,
+        "exactly one E024, got: {:?}",
+        result.diagnostics
+    );
+    assert!(e024[0].is_error());
+    assert_eq!(e024[0].model, "leaf");
+    assert!(
+        e024[0].message.contains("microbatch"),
+        "the message names the alias: {}",
+        e024[0].message
+    );
+    assert!(result.has_errors);
+}
+
 /// #1996: an ephemeral model is never materialized and never inlined, so a
 /// consumer reads whatever physical table carries the name. The refusal must
 /// be an ERROR on the model that declares the strategy, for the same reason
@@ -1048,7 +1078,7 @@ fn e038_does_not_fire_for_other_strategies() {
 
 /// Boundary: the refusal is scoped to `incremental`. A `full_refresh` leaf
 /// compiles clean of E037, and `microbatch` is not refused by this check:
-/// its ruling is pending in #2054, so a change here must be deliberate.
+/// it loads as its `time_interval` alias and E024 bounds it (#2054).
 #[test]
 fn e037_does_not_fire_for_other_strategies() {
     for strategy in [
