@@ -211,6 +211,13 @@
             "null"
           ]
         },
+        "schemas": {
+          "description": "The schemas and tables a `type = \"manual\"` discovery adapter reports. Ignored on every other adapter type. `rocky validate` refuses a manual adapter that declares none (`V057`), because it can never plan.\n\n```toml [[adapter.local_discovery.schemas]] name = \"raw__orders\" tables = [\"orders\", \"order_items\"] ```",
+          "items": {
+            "$ref": "#/definitions/ManualSchemaConfig"
+          },
+          "type": "array"
+        },
         "stampede": {
           "anyOf": [
             {
@@ -1824,6 +1831,28 @@
       "required": [
         "catalog",
         "schema"
+      ],
+      "type": "object"
+    },
+    "ManualSchemaConfig": {
+      "additionalProperties": false,
+      "description": "One schema of a `type = \"manual\"` discovery adapter: a static list of tables for a source with no discovery API.\n\n```toml [adapter.local_discovery] type = \"manual\" kind = \"discovery\"\n\n[[adapter.local_discovery.schemas]] name = \"raw__orders\" tables = [\"orders\", \"order_items\", \"returns\"]\n\n[[adapter.local_discovery.schemas]] name = \"raw__customers\" tables = [\"customers\", \"addresses\"] ```",
+      "properties": {
+        "name": {
+          "description": "The source schema name, as the pipeline's `schema_pattern` parses it.",
+          "type": "string"
+        },
+        "tables": {
+          "description": "The tables in this schema.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "tables"
       ],
       "type": "object"
     },

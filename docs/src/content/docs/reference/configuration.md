@@ -151,7 +151,35 @@ The connection fields, authentication, and examples for each adapter type live o
 
 ### `type = "manual"`
 
-Define source schemas and tables inline in `rocky.toml` instead of discovering them from an API. Use it for tests and for small sources whose shape does not change.
+A discovery adapter that lists source schemas and tables from `rocky.toml`. It calls no API. Use it when the source warehouse has no discovery adapter, such as Databricks or Snowflake, or for a small source whose shape does not change.
+
+A manual adapter is discovery-only. Bind it with `[pipeline.NAME.source.discovery]`, not as `source.adapter`.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `kind` | string | required | Must be `"discovery"`. |
+| `schemas` | array of tables | required | One `[[adapter.NAME.schemas]]` block per source schema. |
+| `schemas[].name` | string | required | The source schema name. The pipeline's `schema_pattern` parses it, so it must start with the `prefix`. |
+| `schemas[].tables` | array of strings | required | The tables in that schema. |
+
+```toml
+[adapter.local_discovery]
+type = "manual"
+kind = "discovery"
+
+[[adapter.local_discovery.schemas]]
+name = "raw__orders"
+tables = ["orders", "order_items"]
+
+[pipeline.poc.source]
+adapter = "databricks_prod"
+catalog = "main"
+
+[pipeline.poc.source.discovery]
+adapter = "local_discovery"
+```
+
+Discovery returns each declared schema whose name starts with the pipeline's `schema_pattern.prefix`. A manual source has no sync time and no row counts. `rocky validate` refuses a manual adapter with no `schemas` (`V057`), because it can never discover a table.
 
 ### `[adapter.NAME.retry]`
 

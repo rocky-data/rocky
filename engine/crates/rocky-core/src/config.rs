@@ -4427,6 +4427,18 @@ pub struct AdapterConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub circuit_breaker: Option<FivetranCircuitBreakerConfig>,
 
+    /// The schemas and tables a `type = "manual"` discovery adapter reports.
+    /// Ignored on every other adapter type. `rocky validate` refuses a
+    /// manual adapter that declares none (`V057`), because it can never plan.
+    ///
+    /// ```toml
+    /// [[adapter.local_discovery.schemas]]
+    /// name = "raw__orders"
+    /// tables = ["orders", "order_items"]
+    /// ```
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schemas: Vec<crate::source::ManualSchemaConfig>,
+
     /// Escape hatch for adapter-specific keys this struct doesn't model.
     ///
     /// `AdapterConfig` is `#[serde(deny_unknown_fields)]` so typos at the
@@ -4493,6 +4505,7 @@ impl std::fmt::Debug for AdapterConfig {
             .field("ratelimit", &self.ratelimit)
             .field("stampede", &self.stampede)
             .field("circuit_breaker", &self.circuit_breaker)
+            .field("schemas", &self.schemas)
             .field("extra", &self.extra)
             .finish()
     }
@@ -12204,6 +12217,7 @@ table = "customers_history"
             ratelimit: None,
             stampede: None,
             circuit_breaker: None,
+            schemas: Vec::new(),
             extra: std::collections::BTreeMap::new(),
         };
 

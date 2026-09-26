@@ -653,13 +653,34 @@ fn validate_adapter(
             });
         }
         "manual" => {
-            msgs.push(ValidateMessage {
-                severity: "ok".into(),
-                code: "V010".into(),
-                message: format!("adapter.{name}: manual"),
-                file: None,
-                field: None,
-            });
+            // V057 (#1994): a manual discovery adapter reports only the
+            // schemas it declares. With none it discovers nothing, and
+            // every `plan` and `run` through it does nothing.
+            if adapter.schemas.is_empty() {
+                ok = false;
+                msgs.push(ValidateMessage {
+                    severity: "error".into(),
+                    code: "V057".into(),
+                    message: format!(
+                        "adapter.{name}: a manual adapter declares no schemas, so it discovers \
+                         nothing. Add at least one [[adapter.{name}.schemas]] block with \
+                         `name` and `tables`."
+                    ),
+                    file: None,
+                    field: Some(format!("adapter.{name}.schemas")),
+                });
+            } else {
+                msgs.push(ValidateMessage {
+                    severity: "ok".into(),
+                    code: "V010".into(),
+                    message: format!(
+                        "adapter.{name}: manual ({} schema(s))",
+                        adapter.schemas.len()
+                    ),
+                    file: None,
+                    field: None,
+                });
+            }
         }
         "duckdb" => {
             msgs.push(ValidateMessage {

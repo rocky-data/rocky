@@ -536,6 +536,7 @@ mod tests {
             ratelimit: None,
             stampede: None,
             circuit_breaker: None,
+            schemas: Vec::new(),
             extra: std::collections::BTreeMap::new(),
         }
     }

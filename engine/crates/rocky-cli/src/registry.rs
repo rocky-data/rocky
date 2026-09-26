@@ -16,6 +16,7 @@ use crate::error_reporter;
 use rocky_adapter_sdk::LoaderAdapter;
 use rocky_core::adapter_capability::capability_for;
 use rocky_core::config::{AdapterConfig, AdapterKind, RockyConfig};
+use rocky_core::source::ManualDiscoveryAdapter;
 use rocky_core::traits::{
     BatchCheckAdapter, DiscoveryAdapter, GovernanceAdapter, NoopGovernanceAdapter, WarehouseAdapter,
 };
@@ -375,8 +376,10 @@ impl AdapterRegistry {
                     discovery.insert(name.clone(), adapter as Arc<dyn DiscoveryAdapter>);
                 }
                 "manual" => {
-                    // Manual discovery doesn't need an adapter instance;
-                    // it's handled inline from pipeline source config.
+                    // The schemas and tables come from config; no client.
+                    let adapter =
+                        Arc::new(ManualDiscoveryAdapter::new(adapter_cfg.schemas.clone()));
+                    discovery.insert(name.clone(), adapter as Arc<dyn DiscoveryAdapter>);
                 }
                 "snowflake" => {
                     let account = adapter_cfg

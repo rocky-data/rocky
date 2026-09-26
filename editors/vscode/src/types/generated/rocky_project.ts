@@ -648,6 +648,12 @@ export interface AdapterConfig {
    */
   role?: string | null;
   /**
+   * The schemas and tables a `type = "manual"` discovery adapter reports. Ignored on every other adapter type. `rocky validate` refuses a manual adapter that declares none (`V057`), because it can never plan.
+   *
+   * ```toml [[adapter.local_discovery.schemas]] name = "raw__orders" tables = ["orders", "order_items"] ```
+   */
+  schemas?: ManualSchemaConfig[];
+  /**
    * Optional distributed cache-stampede lock (Fivetran-only).
    *
    * On a cold-start herd, N processes simultaneously miss the cache, fan out N API calls, and write back N times. The stampede lock elects a single leader to issue the API call; followers poll the cache until the leader publishes the envelope. Ignored on non-fivetran adapters. When absent the adapter behaves as if every process is the leader (the pre-stampede behavior).
@@ -813,6 +819,25 @@ export interface RetryConfig {
    * `None` (default) keeps legacy behaviour — per-statement [`RetryConfig::max_retries`] is the only bound. `Some(0)` means no retries are allowed for the whole run.
    */
   max_retries_per_run?: number | null;
+}
+/**
+ * One schema of a `type = "manual"` discovery adapter: a static list of tables for a source with no discovery API.
+ *
+ * ```toml [adapter.local_discovery] type = "manual" kind = "discovery"
+ *
+ * [[adapter.local_discovery.schemas]] name = "raw__orders" tables = ["orders", "order_items", "returns"]
+ *
+ * [[adapter.local_discovery.schemas]] name = "raw__customers" tables = ["customers", "addresses"] ```
+ */
+export interface ManualSchemaConfig {
+  /**
+   * The source schema name, as the pipeline's `schema_pattern` parses it.
+   */
+  name: string;
+  /**
+   * The tables in this schema.
+   */
+  tables: string[];
 }
 /**
  * Distributed cache-stampede protection config for the Fivetran adapter (Layer 1).

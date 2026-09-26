@@ -150,30 +150,106 @@ pub struct SourceType {
     pub source_type: String,
 }
 
-/// Manual source: a static list of schemas/tables for teams without Fivetran.
+/// One schema of a `type = "manual"` discovery adapter: a static list of
+/// tables for a source with no discovery API.
 ///
 /// ```toml
-/// [source]
+/// [adapter.local_discovery]
 /// type = "manual"
-/// catalog = "my_catalog"
+/// kind = "discovery"
 ///
-/// [[source.schemas]]
-/// name = "raw_orders"
+/// [[adapter.local_discovery.schemas]]
+/// name = "raw__orders"
 /// tables = ["orders", "order_items", "returns"]
 ///
-/// [[source.schemas]]
-/// name = "raw_customers"
+/// [[adapter.local_discovery.schemas]]
+/// name = "raw__customers"
 /// tables = ["customers", "addresses"]
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ManualSchemaConfig {
+    /// The source schema name, as the pipeline's `schema_pattern` parses it.
     pub name: String,
+    /// The tables in this schema.
     pub tables: Vec<String>,
+}
+
+/// The discovery adapter for `type = "manual"`: it reports the schemas and
+/// tables declared in config, and makes no call to any system.
+///
+/// Each declared schema whose name starts with the pipeline's prefix becomes
+/// one [`DiscoveredConnector`] with `source_type = "manual"`. A manual source
+/// has no sync clock, no row counts and no external ids, so those stay empty
+/// and the cross-source collision check skips it.
+pub struct ManualDiscoveryAdapter {
+    schemas: Vec<ManualSchemaConfig>,
+}
+
+impl ManualDiscoveryAdapter {
+    pub fn new(schemas: Vec<ManualSchemaConfig>) -> Self {
+        Self { schemas }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::traits::DiscoveryAdapter for ManualDiscoveryAdapter {
+    async fn discover(&self, schema_prefix: &str) -> crate::traits::AdapterResult<DiscoveryResult> {
+        let connectors = self
+            .schemas
+            .iter()
+            .filter(|s| s.name.starts_with(schema_prefix))
+            .map(|s| DiscoveredConnector {
+                id: s.name.clone(),
+                schema: s.name.clone(),
+                source_type: "manual".to_string(),
+                last_sync_at: None,
+                tables: s
+                    .tables
+                    .iter()
+                    .map(|t| DiscoveredTable {
+                        name: t.clone(),
+                        row_count: None,
+                    })
+                    .collect(),
+                metadata: IndexMap::new(),
+                external_object_ids: Vec::new(),
+            })
+            .collect();
+        // The list is static config, so nothing can partially fail.
+        Ok(DiscoveryResult::ok(connectors))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::DiscoveryAdapter;
+
+    #[tokio::test]
+    async fn manual_discovery_lists_declared_schemas_matching_the_prefix() {
+        let adapter = ManualDiscoveryAdapter::new(vec![
+            ManualSchemaConfig {
+                name: "raw__orders".into(),
+                tables: vec!["orders".into(), "order_items".into()],
+            },
+            ManualSchemaConfig {
+                name: "other".into(),
+                tables: vec!["ignored".into()],
+            },
+        ]);
+        let result = adapter.discover("raw__").await.unwrap();
+        assert!(result.failed.is_empty());
+        assert_eq!(result.connectors.len(), 1);
+        let c = &result.connectors[0];
+        assert_eq!(c.schema, "raw__orders");
+        assert_eq!(c.id, "raw__orders");
+        assert_eq!(c.source_type, "manual");
+        assert!(c.last_sync_at.is_none());
+        assert!(c.external_object_ids.is_empty());
+        let names: Vec<&str> = c.tables.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["orders", "order_items"]);
+    }
 
     #[test]
     fn test_discovered_connector_serialization() {

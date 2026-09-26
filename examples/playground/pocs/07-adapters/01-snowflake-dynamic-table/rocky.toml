@@ -10,13 +10,16 @@ account = "${SNOWFLAKE_ACCOUNT:-demo_account}"
 # sidecar field — the warehouse lives on the adapter, the target_lag on the model.
 warehouse = "ANALYTICS_WH"
 
-# Discovery adapter — Snowflake is data-only, so we declare a
-# manual discovery adapter to satisfy the pipeline's discovery
-# binding without enumerating any source tables (the POC only
-# exercises target-side dynamic-table materialization, not discovery).
+# Discovery adapter — Snowflake is data-only, so a manual discovery
+# adapter lists the source tables this POC reads. Rocky makes no
+# discovery call for it; it reports exactly these schemas.
 [adapter.local_discovery]
 type = "manual"
 kind = "discovery"
+
+[[adapter.local_discovery.schemas]]
+name = "RAW__ORDERS"
+tables = ["ORDERS"]
 
 [pipeline.poc]
 strategy = "full_refresh"

@@ -866,6 +866,30 @@ class LoadOptionsConfig(BaseModel):
     """
 
 
+class ManualSchemaConfig(BaseModel):
+    """
+    One schema of a `type = "manual"` discovery adapter: a static list of tables for a source with no discovery API.
+
+    ```toml [adapter.local_discovery] type = "manual" kind = "discovery"
+
+    [[adapter.local_discovery.schemas]] name = "raw__orders" tables = ["orders", "order_items", "returns"]
+
+    [[adapter.local_discovery.schemas]] name = "raw__customers" tables = ["customers", "addresses"] ```
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    name: str
+    """
+    The source schema name, as the pipeline's `schema_pattern` parses it.
+    """
+    tables: list[str]
+    """
+    The tables in this schema.
+    """
+
+
 class MaskStrategy1(StrEnum):
     """
     SHA-256 hex digest of the column value. Deterministic, one-way.
@@ -2013,6 +2037,12 @@ class AdapterConfig(BaseModel):
     role: str | None = None
     """
     Snowflake role to use for the session.
+    """
+    schemas: list[ManualSchemaConfig] | None = None
+    """
+    The schemas and tables a `type = "manual"` discovery adapter reports. Ignored on every other adapter type. `rocky validate` refuses a manual adapter that declares none (`V057`), because it can never plan.
+
+    ```toml [[adapter.local_discovery.schemas]] name = "raw__orders" tables = ["orders", "order_items"] ```
     """
     stampede: FivetranStampedeConfig | None = None
     """
