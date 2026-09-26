@@ -102,7 +102,11 @@ struct Cli {
     /// branch state, partitions, and run history aren't silently left
     /// behind. Passing this flag explicitly is always honoured verbatim
     /// and skips the fallback logic.
-    #[arg(long)]
+    ///
+    /// `ROCKY_STATE_PATH` sets the same value. `rocky fulfill` exports it
+    /// to the worker it dispatches, so the worker's `rocky mcp --profile
+    /// worker` opens the store the loop runs against (#2169).
+    #[arg(long, global = true, env = "ROCKY_STATE_PATH")]
     state_path: Option<PathBuf>,
 
     /// Per-pipeline / per-client state-file namespace.
@@ -3423,7 +3427,15 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                          pending-review queue"
                     );
                 };
-                rocky_cli::commands::run_review(&cli.config, &plan_id, &base, approve, json).await
+                rocky_cli::commands::run_review(
+                    &cli.config,
+                    &plan_id,
+                    &base,
+                    approve,
+                    cli.state_path.as_deref(),
+                    json,
+                )
+                .await
             }
         }
         Command::Backfill {
@@ -5093,7 +5105,11 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             rocky_cli::commands::run_completions::<Cli>(shell, &mut std::io::stdout());
             Ok(())
         }
-        Command::Mcp { config, profile } => rocky_mcp::serve_stdio(config, profile.into()).await,
+        // An explicit `--state-path` (or `ROCKY_STATE_PATH`) reaches the
+        // server; unset, it resolves the default next to its models dir.
+        Command::Mcp { config, profile } => {
+            rocky_mcp::serve_stdio(config, profile.into(), cli.state_path.clone()).await
+        }
     };
 
     // SIGINT: map `commands::Interrupted` to the conventional shell exit

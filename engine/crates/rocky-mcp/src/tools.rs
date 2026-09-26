@@ -781,6 +781,12 @@ pub struct RockyMcpServer {
     /// prompts: the worker profile serves variants that end at the handoff to
     /// the trusted runner instead of instructing tools the profile excludes.
     profile: McpProfile,
+    /// An explicit state store (`rocky mcp --state-path`, or
+    /// `ROCKY_STATE_PATH`), honoured verbatim. `None` resolves the default
+    /// next to the models directory. The fulfillment loop sets it on the
+    /// worker it dispatches, so the worker's server opens the store the
+    /// loop runs against instead of a second one inside `models/` (#2169).
+    state_path_override: Option<PathBuf>,
     /// The `instructions` this profile serves, resolved at construction.
     ///
     /// Built here rather than in [`RockyMcpServer::get_info`] because the
@@ -2255,14 +2261,26 @@ impl RockyMcpServer {
             models_dir,
             root,
             profile,
+            state_path_override: None,
             instructions,
             tool_router,
             prompt_router,
         })
     }
 
+    /// Open the state store at `state_path` instead of the default one,
+    /// the way the CLI honours an explicit `--state-path` (#2169). `None`
+    /// keeps the default resolution. A relative path resolves against the
+    /// process working directory, as the CLI flag does.
+    #[must_use]
+    pub fn with_state_path(mut self, state_path: Option<PathBuf>) -> Self {
+        self.state_path_override = state_path;
+        self
+    }
+
     fn state_path(&self) -> PathBuf {
-        rocky_core::state::resolve_state_path(None, &self.models_dir).path
+        rocky_core::state::resolve_state_path(self.state_path_override.as_deref(), &self.models_dir)
+            .path
     }
 
     /// Whether this server serves the `review_queue` APPROVE action — writing
@@ -9429,6 +9447,22 @@ database = ":memory:"
         // `get_info` and the routers never touch the filesystem, so an
         // arbitrary path is fine here.
         RockyMcpServer::new_with_profile(PathBuf::from("rocky.toml"), profile)
+    }
+
+    /// #2169: `rocky mcp --state-path` (or `ROCKY_STATE_PATH`) reaches the
+    /// server, so a worker the fulfillment loop dispatches opens the loop's
+    /// store rather than resolving the default one inside `models/`.
+    #[test]
+    fn an_explicit_state_path_replaces_the_default_store() {
+        let explicit = PathBuf::from("/runner/owned/state.redb");
+        let default = server_with(McpProfile::Worker);
+        assert_ne!(
+            default.state_path(),
+            explicit,
+            "unset, the default resolution runs"
+        );
+        let server = server_with(McpProfile::Worker).with_state_path(Some(explicit.clone()));
+        assert_eq!(server.state_path(), explicit);
     }
 
     /// Every `paths:` list in a workflow, as its quoted entries. Enough YAML

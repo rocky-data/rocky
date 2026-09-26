@@ -54,7 +54,9 @@ pub use tools::{
 /// convention. `profile` selects the tool surface: [`McpProfile::Default`]
 /// serves every tool with the `review_queue` approve action refused,
 /// [`McpProfile::Approver`] the same tools with that action served, and
-/// [`McpProfile::Worker`] the minimal drafting allowlist.
+/// [`McpProfile::Worker`] the minimal drafting allowlist. `state_path` is
+/// an explicit state store (`--state-path` / `ROCKY_STATE_PATH`), honoured
+/// verbatim; `None` resolves the default next to the models directory.
 /// Logging goes to stderr (stdout is reserved for the MCP wire protocol).
 ///
 /// # Errors
@@ -71,6 +73,7 @@ pub use tools::{
 pub async fn serve_stdio(
     config_path: std::path::PathBuf,
     profile: McpProfile,
+    state_path: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     let server = RockyMcpServer::try_new_with_profile(config_path, profile).map_err(|drift| {
         anyhow::anyhow!(
@@ -79,6 +82,7 @@ pub async fn serve_stdio(
              unprojected text would hand a worker the default workflow."
         )
     })?;
+    let server = server.with_state_path(state_path);
     tracing::info!(?profile, "starting rocky MCP server over stdio");
     let service = server.serve(stdio()).await.inspect_err(|e| {
         tracing::error!("rocky MCP serve error: {e:?}");

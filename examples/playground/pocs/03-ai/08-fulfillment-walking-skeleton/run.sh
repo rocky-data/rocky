@@ -17,6 +17,12 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
+# `rocky fulfill` refuses a state store inside models/ (#2169): the drafting
+# worker may write models/. Every rocky call below reads this as its
+# --state-path. It is RELATIVE on purpose, so each scratch project a step
+# `cd`s into keeps its own store.
+export ROCKY_STATE_PATH=.rocky-state.redb
+
 PRODUCT="revenue_daily"
 MANIFEST=".rocky/fulfillment/${PRODUCT}/lowering-manifest.json"
 

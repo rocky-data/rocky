@@ -26,8 +26,8 @@
 //!   is the D7-conceded hostile-local-worker residual, pinned by an
 //!   exhibit test below and addressed only by the Phase-2 OS-sandbox /
 //!   PID-namespace containment.
-//! - The worker's environment is ONLY `env_allow`: everything else is
-//!   cleared before spawn.
+//! - The worker's environment is ONLY `env_allow`, plus the runner's own
+//!   [`STATE_PATH_ENV`] (#2169): everything else is cleared before spawn.
 //! - Windows is not supervised in v0: the driver refuses with a typed
 //!   `unsupported driver platform` error (the crate still compiles).
 //!
@@ -118,7 +118,20 @@ pub struct TaskBrief {
     /// [`OUTBOX_MODEL_SIDECAR`] here, and the runner commits the model
     /// files ONLY when the tree on disk still matches that hand-off.
     pub outbox_dir: PathBuf,
+    /// The state store the loop runs against (#2169), exported to the
+    /// worker as [`STATE_PATH_ENV`] so its `rocky mcp --profile worker`
+    /// reads and records into the same store instead of resolving the
+    /// default one inside `models/`. `None` exports nothing.
+    pub state_path: Option<PathBuf>,
 }
+
+/// The environment variable that carries the loop's state store to the
+/// worker (#2169). `rocky` reads it as the global `--state-path` flag, so
+/// the worker's `rocky mcp --profile worker` — and any other `rocky` it
+/// runs — opens the store the loop runs against. It is set on the worker
+/// even though `env_allow` clears everything else: it is the runner's
+/// value, not one inherited from the runner's environment.
+pub const STATE_PATH_ENV: &str = "ROCKY_STATE_PATH";
 
 /// What a driver task produced — typed, per task kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,6 +338,9 @@ impl AgentDriver for SubprocessDriver {
             if let Ok(value) = std::env::var(key) {
                 cmd.env(key, value);
             }
+        }
+        if let Some(state_path) = &brief.state_path {
+            cmd.env(STATE_PATH_ENV, state_path);
         }
 
         let mut leader = cmd
@@ -900,6 +916,11 @@ impl AgentDriver for ReplayDriver {
             // Same supervision as every driver: the server is the group
             // leader and dies with the group.
             .process_group(0);
+        // The recorded server opens the loop's state store, like a live
+        // worker's would (#2169).
+        if let Some(state_path) = &brief.state_path {
+            cmd.env(STATE_PATH_ENV, state_path);
+        }
         let mut server = cmd
             .spawn()
             .map_err(|e| DriverError::Spawn(format!("{}: {e}", argv[0])))?;
@@ -1119,6 +1140,7 @@ mod supervision_tests {
             project_root: dir.to_path_buf(),
             transcript_dir: dir.join("transcripts"),
             outbox_dir: dir.join("outbox"),
+            state_path: None,
         }
     }
 
@@ -1596,6 +1618,7 @@ mod windows_tests {
             project_root: dir.clone(),
             transcript_dir: dir.join("t"),
             outbox_dir: dir.join("o"),
+            state_path: None,
         };
         let mut on_group = |_group: GroupStamp| Ok(());
         let outcome = driver.run_task(&brief, &mut on_group).await;
@@ -1615,6 +1638,7 @@ mod escape_scope_tests {
             project_root: dir.to_path_buf(),
             transcript_dir: dir.join("transcripts"),
             outbox_dir: dir.join("outbox"),
+            state_path: None,
         }
     }
 

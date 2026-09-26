@@ -19,6 +19,9 @@ set -uo pipefail
 : "${ANTHROPIC_API_KEY:?Set ANTHROPIC_API_KEY to run the live lane (it is the worker credential)}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# `rocky fulfill` refuses a state store inside models/ (#2169). Relative, so
+# it resolves inside the working copy every rocky call below runs in.
+export ROCKY_STATE_PATH=.rocky-state.redb
 PRODUCT="revenue_daily"
 BUNDLE="$HERE/expected/live"
 

@@ -21,7 +21,8 @@ trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/poc"
 cp -R "$HERE"/. "$WORK/poc/"
 rm -rf "$WORK/poc/products" "$WORK/poc/.rocky" "$WORK/poc/expected" "$WORK/poc/wh.duckdb" \
-       "$WORK/poc/models/.rocky-state.redb" "$WORK/poc/models/revenue_daily."* 2>/dev/null
+       "$WORK/poc/models/.rocky-state.redb" "$WORK/poc/.rocky-state.redb" \
+       "$WORK/poc/models/revenue_daily."* 2>/dev/null
 
 declare -a WHAT=(
   "1:lie about the candidate hand-off digest (runner refuses the write)"

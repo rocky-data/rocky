@@ -137,15 +137,30 @@ pub(crate) fn review_marker_state(root: &Path, plan_id: &str) -> ReviewMarkerSta
 ///
 /// Resolves the worktree root from the process cwd (mirroring
 /// [`crate::commands::run_apply`]) and delegates to [`run_review_in`].
+///
+/// `state_path` is an explicit state store (`--state-path` /
+/// `ROCKY_STATE_PATH`), honoured verbatim for the schema cache the
+/// breaking-change gate types against. `None` resolves the default next to
+/// the plan's models directory, as before (#2169).
 pub async fn run_review(
     config_path: &Path,
     plan_id: &str,
     base_ref: &str,
     approve: bool,
+    state_path: Option<&Path>,
     output_json: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
-    run_review_in(&cwd, config_path, plan_id, base_ref, approve, output_json).await
+    run_review_in(
+        &cwd,
+        config_path,
+        plan_id,
+        base_ref,
+        approve,
+        state_path,
+        output_json,
+    )
+    .await
 }
 
 /// Inner implementation — takes an explicit `root` for the plans / marker
@@ -157,9 +172,12 @@ pub(crate) async fn run_review_in(
     plan_id: &str,
     base_ref: &str,
     approve: bool,
+    state_path: Option<&Path>,
     output_json: bool,
 ) -> Result<()> {
-    let output = compute_review(root, config_path, plan_id, base_ref, approve).await?;
+    let output =
+        compute_review_with_state_path(root, config_path, plan_id, base_ref, approve, state_path)
+            .await?;
 
     if output_json {
         print_json(&output)?;
@@ -221,6 +239,20 @@ pub async fn compute_review(
     base_ref: &str,
     approve: bool,
 ) -> Result<ReviewOutput> {
+    compute_review_with_state_path(root, config_path, plan_id, base_ref, approve, None).await
+}
+
+/// [`compute_review`] reading the schema cache from an explicit state store
+/// when `state_path` is `Some` — the CLI's `--state-path` (#2169). `None`
+/// resolves the default next to the plan's models directory.
+pub async fn compute_review_with_state_path(
+    root: &Path,
+    config_path: &Path,
+    plan_id: &str,
+    base_ref: &str,
+    approve: bool,
+    state_path: Option<&Path>,
+) -> Result<ReviewOutput> {
     let plan = read_plan(root, plan_id)
         .with_context(|| format!("failed to read plan '{plan_id}' for review"))?;
 
@@ -264,7 +296,8 @@ pub async fn compute_review(
     // the process cwd — the governor's MCP server reviews from a cwd that is
     // not the project, and a cwd-relative path would silently skip the
     // breaking-change gate there.
-    let (models_dir, state_path) = review_gate_paths(root, run_plan.models_dir.as_deref());
+    let (models_dir, state_path) =
+        review_gate_paths(root, run_plan.models_dir.as_deref(), state_path);
 
     // `?` here is the whole point of the change: a present-but-unloadable
     // `rocky.toml` propagates BEFORE the `--approve` branch below, so no marker
@@ -477,9 +510,16 @@ fn build_message(
 ///   [`rocky_core::state::resolve_state_path`] defaulting the CLI and the MCP
 ///   server use (`<models_dir>/.rocky-state.redb` et al.) — not a hardcoded
 ///   cwd-relative file.
-fn review_gate_paths(root: &Path, plan_models_dir: Option<&str>) -> (PathBuf, PathBuf) {
+///
+/// An explicit `state_path` (`--state-path`) is honoured verbatim, the way
+/// every other command honours it (#2169).
+fn review_gate_paths(
+    root: &Path,
+    plan_models_dir: Option<&str>,
+    state_path: Option<&Path>,
+) -> (PathBuf, PathBuf) {
     let models_dir = root.join(plan_models_dir.unwrap_or("models"));
-    let state_path = rocky_core::state::resolve_state_path(None, &models_dir).path;
+    let state_path = rocky_core::state::resolve_state_path(state_path, &models_dir).path;
     (models_dir, state_path)
 }
 
@@ -1738,7 +1778,7 @@ mod tests {
         let root = dir.path();
         std::fs::create_dir_all(root.join("models")).unwrap();
 
-        let (models_dir, state_path) = review_gate_paths(root, Some("models"));
+        let (models_dir, state_path) = review_gate_paths(root, Some("models"), None);
         assert_eq!(models_dir, root.join("models"));
         assert!(
             models_dir.is_dir(),
@@ -1753,12 +1793,20 @@ mod tests {
         let (abs_dir, _) = review_gate_paths(
             Path::new("/somewhere/else"),
             Some(root.join("models").to_str().unwrap()),
+            None,
         );
         assert_eq!(abs_dir, root.join("models"));
 
         // Default when the plan recorded none.
-        let (default_dir, _) = review_gate_paths(root, None);
+        let (default_dir, _) = review_gate_paths(root, None, None);
         assert_eq!(default_dir, root.join("models"));
+
+        // #2169: an explicit `--state-path` is honoured verbatim, so
+        // `rocky review --approve` reads the store the fulfillment loop
+        // runs against instead of resolving the default inside models/.
+        let explicit = root.join("elsewhere").join("state.redb");
+        let (_, state_path) = review_gate_paths(root, Some("models"), Some(&explicit));
+        assert_eq!(state_path, explicit);
     }
 
     /// FIX: an approved plan's later apply-time re-evaluation rows (same
@@ -1896,7 +1944,7 @@ mod tests {
         // REFUSE on a broken one. Without this the assertion below would pass
         // for the wrong reason — the marker is written here anyway, because
         // the base compile has no git repo to read.
-        let (models_dir, state_path) = review_gate_paths(root, Some("models"));
+        let (models_dir, state_path) = review_gate_paths(root, Some("models"), None);
         assert!(
             compute_review_findings(&config_path, &models_dir, &state_path, "HEAD").is_ok(),
             "an absent rocky.toml must skip the gate, never refuse it"

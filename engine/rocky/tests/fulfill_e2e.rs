@@ -227,7 +227,10 @@ fn rocky_env(
     cmd.args(["--output", "json"])
         .args(args)
         .current_dir(dir)
-        .env("RUST_LOG", "error");
+        .env("RUST_LOG", "error")
+        // `rocky fulfill` refuses a state store inside models/ (#2169), so
+        // every invocation shares one outside it, the way an operator would.
+        .env("ROCKY_STATE_PATH", state_store_path(dir));
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -253,8 +256,20 @@ fn materialize_target(dir: &Path) {
     .expect("materialize the target");
 }
 
+/// The project's state store: outside `models/`, as `rocky fulfill`
+/// requires (#2169).
+fn state_store_path(dir: &Path) -> PathBuf {
+    dir.join(".rocky-state.redb")
+}
+
+/// A printed next step as the loop prints it: with the store it ran
+/// against (#2169).
+fn next_step(dir: &Path, command: &str) -> String {
+    format!("{command} --state-path {}", state_store_path(dir).display())
+}
+
 fn state_store(dir: &Path) -> rocky_core::state::StateStore {
-    rocky_core::state::StateStore::open(&dir.join("models/.rocky-state.redb")).expect("store")
+    rocky_core::state::StateStore::open(&state_store_path(dir)).expect("store")
 }
 
 /// Count the declared data checks in the MERGED sidecar, independently
@@ -354,6 +369,131 @@ fn approve_and_apply(dir: &Path, plan_id: &str) {
         .query_row("SELECT COUNT(*) FROM out.revenue_daily", [], |r| r.get(0))
         .expect("target table");
     assert_eq!(count, 1);
+}
+
+/// #2169: `rocky fulfill` refuses a state store inside `models/`, which
+/// the drafting worker may write, and names `--state-path` as the fix.
+/// Both verbs refuse before they touch anything: no candidate, no store.
+#[test]
+fn the_loop_refuses_a_state_store_inside_models() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_project(dir, &session_json(&[]));
+    let inside = dir.join("models/.rocky-state.redb");
+    let inside = inside.to_str().expect("utf-8 temp path");
+
+    for args in [
+        &["fulfill", PRODUCT][..],
+        &["fulfill", "approve-spec", PRODUCT][..],
+    ] {
+        let (code, _json, out, err) = rocky_env(dir, args, &[("ROCKY_STATE_PATH", inside)]);
+        assert_ne!(code, 0, "{args:?} must refuse: {out}{err}");
+        assert!(
+            err.contains("--state-path") && err.contains("inside the models directory"),
+            "{args:?}: the refusal names the cause and the fix: {err}"
+        );
+    }
+    assert!(
+        !dir.join(format!("products/{PRODUCT}.toml")).exists(),
+        "a refused loop dispatches no worker"
+    );
+    assert!(
+        !dir.join("models/.rocky-state.redb").exists(),
+        "nothing opened the store"
+    );
+
+    // The default resolution is the same file, so a bare invocation with no
+    // --state-path at all refuses too.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rocky"));
+    let out = cmd
+        .args(["--output", "json", "fulfill", PRODUCT])
+        .current_dir(dir)
+        .env("RUST_LOG", "error")
+        .env_remove("ROCKY_STATE_PATH")
+        .output()
+        .expect("spawn rocky");
+    assert_ne!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--state-path"));
+}
+
+/// #2169: the loop threads its state store to the readers that used to
+/// resolve their own. The printed next step names it, and the worker's
+/// `rocky mcp --profile worker` records its policy decisions in it
+/// instead of creating a second store inside `models/`.
+///
+/// The store is passed as the `--state-path` FLAG here, with
+/// `ROCKY_STATE_PATH` removed from the runner's environment. Otherwise the
+/// replay driver's server would inherit the variable from the runner and
+/// this would pass without the loop threading anything.
+#[test]
+fn the_state_path_reaches_the_next_step_and_the_worker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_project(dir, &session_json(&[]));
+    // Not `.rocky-state.redb`: a server that resolved its own store would
+    // fall back to that legacy name in its working directory and find the
+    // loop's store by accident.
+    let store = dir.join("loop-state.redb");
+    let rocky = |dir: &Path, args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_rocky"))
+            .args(["--output", "json", "--state-path"])
+            .arg(&store)
+            .args(args)
+            .current_dir(dir)
+            .env("RUST_LOG", "error")
+            .env_remove("ROCKY_STATE_PATH")
+            .output()
+            .expect("spawn rocky");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let json = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok();
+        (out.status.code().unwrap_or(-1), json, stdout, stderr)
+    };
+
+    let (code, json, _out, err) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "elicit stop: {err}");
+    let json = json.expect("fulfill json");
+    let next = json["next_command"].as_str().expect("a next step");
+    assert_eq!(
+        next,
+        format!(
+            "rocky fulfill approve-spec {PRODUCT} --state-path {}",
+            store.display()
+        ),
+        "the printed next step carries the loop's store"
+    );
+
+    let (code, _json, _out, err) = rocky(dir, &["fulfill", "approve-spec", PRODUCT]);
+    assert_eq!(code, 0, "approve-spec: {err}");
+    let (code, json, out, err) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "drive to proposed: {err}{out}");
+    let json = json.expect("fulfill json");
+    let plan_id = json["plan_id"].as_str().expect("plan pinned");
+    assert_eq!(
+        json["next_command"].as_str(),
+        Some(
+            format!(
+                "rocky review {plan_id} --approve --state-path {}",
+                store.display()
+            )
+            .as_str()
+        ),
+        "{json}"
+    );
+    assert!(
+        !dir.join("models/.rocky-state.redb").exists(),
+        "the worker opened a store inside models/ instead of the loop's"
+    );
+    let decisions = rocky_core::state::StateStore::open_read_only(&store)
+        .expect("the loop's store")
+        .list_policy_decisions()
+        .expect("decisions");
+    assert!(
+        decisions
+            .iter()
+            .any(|d| d.plan_id == format!("draft:{PRODUCT}")),
+        "the worker's draft_model gate recorded into the loop's store: {decisions:?}"
+    );
 }
 
 #[test]
@@ -2160,7 +2300,7 @@ fn a_reroute_to_an_unresolvable_adapter_reports_routing_not_custody() {
     );
     assert_eq!(
         json["next_command"].as_str(),
-        Some(format!("rocky fulfill {PRODUCT}").as_str()),
+        Some(next_step(dir, &format!("rocky fulfill {PRODUCT}")).as_str()),
         "re-running after fixing the config IS the remedy here: {json}"
     );
 
@@ -2495,7 +2635,7 @@ fn a_digest_from_an_older_scheme_blocks_with_a_remedy_that_works() {
     );
     assert_eq!(
         json["next_command"].as_str(),
-        Some(format!("rocky fulfill {PRODUCT} --retry").as_str()),
+        Some(next_step(dir, &format!("rocky fulfill {PRODUCT} --retry")).as_str()),
         "and the printed command is the one that starts a generation this build can pin: \
          {json}"
     );
