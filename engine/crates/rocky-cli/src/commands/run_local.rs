@@ -762,13 +762,15 @@ pub async fn run_quality(
                         schema: table_ref.schema.clone(),
                         table: table_name.clone(),
                     };
-                    match rocky_core::quarantine::compile_quarantine_sql(
+                    match compile_quarantine_plan(
+                        warehouse_adapter.as_ref(),
                         &pipeline.checks.assertions,
                         table_name,
                         &ir_ref,
-                        dialect,
                         q_cfg,
-                    ) {
+                    )
+                    .await
+                    {
                         Ok(Some(plan)) => {
                             let (q_output, write_error) = execute_quarantine_plan(
                                 warehouse_adapter.as_ref(),
@@ -1226,6 +1228,48 @@ fn classify_assertion(
             Some((n == 0, n))
         }
     }
+}
+
+/// Compile the quarantine plan for one table, describing the source first
+/// when the mode writes labels (#2065).
+///
+/// A label replaces a source column of the same name, so `tag` and `split`
+/// need the source's columns. A describe that fails is a quarantine that did
+/// not compile: the caller records it as `quarantine:compile`, before any
+/// statement runs.
+async fn compile_quarantine_plan(
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    assertions: &[rocky_core::config::QualityAssertion],
+    table_name: &str,
+    table: &rocky_ir::TableRef,
+    config: &rocky_core::config::QuarantineConfig,
+) -> Result<Option<rocky_core::quarantine::QuarantinePlan>, rocky_core::quarantine::QuarantineError>
+{
+    let source_columns: Vec<String> =
+        if rocky_core::quarantine::reads_source_columns(assertions, table_name, config) {
+            warehouse
+                .describe_table(table)
+                .await
+                .map_err(|e| {
+                    rocky_core::quarantine::QuarantineError::Adapter(format!(
+                        "could not describe {}.{}.{} to read its columns: {e}",
+                        table.catalog, table.schema, table.table
+                    ))
+                })?
+                .into_iter()
+                .map(|c| c.name)
+                .collect()
+        } else {
+            Vec::new()
+        };
+    rocky_core::quarantine::compile_quarantine_sql(
+        assertions,
+        table_name,
+        table,
+        warehouse.dialect(),
+        config,
+        &source_columns,
+    )
 }
 
 /// Execute a compiled [`rocky_core::quarantine::QuarantinePlan`] against
@@ -3702,6 +3746,7 @@ auto_create_schemas = true
                 suffix_valid: "__valid".into(),
                 suffix_quarantine: "__quarantine".into(),
             },
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -3816,5 +3861,148 @@ auto_create_schemas = true
         let write_error = write_error.expect("a failed write returns its error entry");
         assert_eq!(write_error.failure_kind, super::FailureKind::Unknown);
         assert_eq!(write_error.cooldown_seconds, None);
+    }
+
+    /// Compiles `mode` for a `not_null(name)` quarantine of `main.orders`
+    /// through the production path (describe, compile, execute) and runs it.
+    async fn quarantine_orders(
+        adapter: &DuckDbWarehouseAdapter,
+        mode: rocky_core::config::QuarantineMode,
+    ) {
+        let assertions = vec![rocky_core::config::QualityAssertion {
+            table: "orders".into(),
+            name: None,
+            test: rocky_core::tests::TestDecl {
+                test_type: rocky_core::tests::TestType::NotNull,
+                column: Some("name".into()),
+                severity: rocky_core::tests::TestSeverity::Error,
+                filter: None,
+            },
+        }];
+        let plan = super::compile_quarantine_plan(
+            adapter,
+            &assertions,
+            "orders",
+            &rocky_ir::TableRef {
+                catalog: String::new(),
+                schema: "main".into(),
+                table: "orders".into(),
+            },
+            &rocky_core::config::QuarantineConfig {
+                enabled: true,
+                mode,
+                suffix_valid: "__valid".into(),
+                suffix_quarantine: "__quarantine".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (out, write_error) =
+            super::execute_quarantine_plan(adapter, vec!["orders".into()], plan).await;
+        assert!(out.ok, "{out:?}");
+        assert!(write_error.is_none(), "{write_error:?}");
+    }
+
+    /// The column names of `main.<table>`, in order.
+    async fn columns_of(adapter: &DuckDbWarehouseAdapter, table: &str) -> Vec<String> {
+        adapter
+            .describe_table(&rocky_ir::TableRef {
+                catalog: String::new(),
+                schema: "main".into(),
+                table: table.into(),
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.name)
+            .collect()
+    }
+
+    /// A second `tag` replaces the first one's label column rather than
+    /// keeping it stale beside a renamed fresh one (#2065).
+    ///
+    /// `tag` rewrites its source, so the second run reads the first run's
+    /// labels. `SELECT *, <label>` left `_error_not_null_name` (stale) and
+    /// `_error_not_null_name_1` (fresh) on DuckDB.
+    #[tokio::test]
+    async fn a_second_tag_run_replaces_its_label_column() {
+        use rocky_core::config::QuarantineMode;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        adapter
+            .execute_statement(
+                "CREATE TABLE main.orders AS \
+                 SELECT * FROM (VALUES (1, 'ada'), (2, NULL)) AS t(id, name)",
+            )
+            .await
+            .unwrap();
+
+        quarantine_orders(&adapter, QuarantineMode::Tag).await;
+        assert_eq!(
+            columns_of(&adapter, "orders").await,
+            vec!["id", "name", "_error_not_null_name"]
+        );
+
+        // Between runs the row is fixed, so a fresh label is NULL and a stale
+        // one still says it failed.
+        adapter
+            .execute_statement("UPDATE main.orders SET name = 'bob' WHERE id = 2")
+            .await
+            .unwrap();
+        quarantine_orders(&adapter, QuarantineMode::Tag).await;
+        assert_eq!(
+            columns_of(&adapter, "orders").await,
+            vec!["id", "name", "_error_not_null_name"],
+            "exactly one label column, not a stale one plus `_1`"
+        );
+        let labelled = adapter
+            .execute_query(
+                "SELECT COUNT(*) FROM main.orders WHERE _error_not_null_name IS NOT NULL",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            labelled.rows[0][0].to_string().trim_matches('"'),
+            "0",
+            "the label is this run's, not the first run's"
+        );
+    }
+
+    /// In `split`, a source column named like a label is replaced by the
+    /// label in `__quarantine`, and kept as it is in `__valid` (#2065).
+    #[tokio::test]
+    async fn a_split_label_replaces_a_source_column_of_its_name() {
+        use rocky_core::config::QuarantineMode;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        adapter
+            .execute_statement(
+                "CREATE TABLE main.orders AS SELECT * FROM (VALUES \
+                 (1, 'ada', 'stale'), (2, NULL, NULL)) AS t(id, name, _error_not_null_name)",
+            )
+            .await
+            .unwrap();
+
+        quarantine_orders(&adapter, QuarantineMode::Split).await;
+        assert_eq!(
+            columns_of(&adapter, "orders__quarantine").await,
+            vec!["id", "name", "_error_not_null_name"]
+        );
+        let label = adapter
+            .execute_query("SELECT _error_not_null_name FROM main.orders__quarantine")
+            .await
+            .unwrap();
+        assert_eq!(label.rows.len(), 1, "{:?}", label.rows);
+        assert_eq!(
+            label.rows[0][0].as_str(),
+            Some("_error_not_null_name"),
+            "the column carries the label, not the source's value"
+        );
+        assert_eq!(
+            columns_of(&adapter, "orders__valid").await,
+            vec!["id", "name", "_error_not_null_name"],
+            "the valid table keeps exactly the source's columns"
+        );
     }
 }

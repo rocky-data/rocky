@@ -409,6 +409,10 @@ Rocky builds the quarantine predicate from every quarantinable assertion, combin
 
 `__valid` keeps exactly the source's columns. Rocky writes it with `SELECT * EXCLUDE (...)` on DuckDB and Snowflake, and `SELECT * EXCEPT (...)` on Databricks and BigQuery. A dialect with no such form refuses `split` with a `quarantine:compile` check. Trino is one, and so is any adapter whose dialect does not provide it.
 
+A label replaces a source column with the same name. A second `tag` run reads the first run's labels, so each run leaves exactly one fresh `_error_<name>` column. `split` does the same in `__quarantine`; `__valid` keeps the source's column. To find those columns, Rocky reads the source's columns once per table before it runs `tag` or `split`.
+
+Rocky refuses any table or column name it builds that is longer than 255 characters, the limit on Snowflake and Databricks. The refusal is a `quarantine:compile` check, so nothing runs. Shorten the table name, the suffix, or the assertion's column or `name`.
+
 `tag` rewrites its source with one statement that reads and replaces it. A dialect whose `CREATE TABLE ... AS` cannot replace a table refuses `tag` with a `quarantine:compile` check. So does a dialect with no star-exclusion form. Trino is both. Use `drop` there.
 
 On Trino, `CREATE TABLE ... AS` cannot replace a table. So before it writes `__valid`, `drop` runs `DROP TABLE IF EXISTS` on it. A second run then replaces the table instead of failing. The check names that statement's role `pre_drop`.

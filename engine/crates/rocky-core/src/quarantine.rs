@@ -195,6 +195,11 @@ pub enum StatementRole {
 /// pipeline's [`crate::config::ChecksConfig`]. Filtering by target table
 /// happens here; filtering by severity and kind also happens here.
 ///
+/// `source_columns` is the source table's column names, as the warehouse
+/// describes them. `tag` and `split` read it: a label replaces a source
+/// column of the same name (#2065). `drop` writes no label and ignores it.
+/// [`reads_source_columns`] says whether a caller must describe the source.
+///
 /// Not deterministic for `split`: each call draws a new token for the
 /// intermediate table and its label columns. See
 /// [`QuarantinePlan::drop_intermediate`].
@@ -204,6 +209,7 @@ pub fn compile_quarantine_sql(
     table_ref: &TableRef,
     dialect: &dyn SqlDialect,
     config: &QuarantineConfig,
+    source_columns: &[String],
 ) -> Result<Option<QuarantinePlan>, QuarantineError> {
     let token = uuid::Uuid::new_v4().simple().to_string();
     compile_with_token(
@@ -212,8 +218,38 @@ pub fn compile_quarantine_sql(
         table_ref,
         dialect,
         config,
+        source_columns,
         &token[..SPLIT_TOKEN_LEN],
     )
+}
+
+/// Whether [`compile_quarantine_sql`] reads `source_columns` for this table:
+/// quarantine is enabled, its mode writes labels, and the table has an
+/// assertion to label. A caller describes the source only when this is true,
+/// so a table with nothing to quarantine costs no round trip.
+pub fn reads_source_columns(
+    assertions: &[QualityAssertion],
+    unqualified_table: &str,
+    config: &QuarantineConfig,
+) -> bool {
+    let writes_labels = match config.mode {
+        QuarantineMode::Split | QuarantineMode::Tag => true,
+        QuarantineMode::Drop => false,
+    };
+    config.enabled && writes_labels && !quarantinable(assertions, unqualified_table).is_empty()
+}
+
+/// The assertions on `unqualified_table` that quarantine lowers.
+fn quarantinable<'a>(
+    assertions: &'a [QualityAssertion],
+    unqualified_table: &str,
+) -> Vec<&'a QualityAssertion> {
+    assertions
+        .iter()
+        .filter(|a| a.table == unqualified_table)
+        .filter(|a| a.test.severity == TestSeverity::Error)
+        .filter(|a| is_quarantinable(&a.test.test_type))
+        .collect()
 }
 
 /// Hex digits of the per-plan token `split` names its working objects with:
@@ -238,18 +274,14 @@ fn compile_with_token(
     table_ref: &TableRef,
     dialect: &dyn SqlDialect,
     config: &QuarantineConfig,
+    source_columns: &[String],
     token: &str,
 ) -> Result<Option<QuarantinePlan>, QuarantineError> {
     if !config.enabled {
         return Ok(None);
     }
 
-    let quarantinable: Vec<&QualityAssertion> = assertions
-        .iter()
-        .filter(|a| a.table == unqualified_table)
-        .filter(|a| a.test.severity == TestSeverity::Error)
-        .filter(|a| is_quarantinable(&a.test.test_type))
-        .collect();
+    let quarantinable = quarantinable(assertions, unqualified_table);
 
     if quarantinable.is_empty() {
         return Ok(None);
@@ -296,7 +328,7 @@ fn compile_with_token(
             let working: Vec<String> = (0..labeled.len())
                 .map(|i| {
                     let name = format!("_ql{i}_{token}");
-                    validation::validate_identifier(&name)?;
+                    validation::validate_generated_identifier(&name)?;
                     Ok::<_, QuarantineError>(name)
                 })
                 .collect::<Result<_, _>>()?;
@@ -307,8 +339,19 @@ fn compile_with_token(
                 },
             )?;
 
+            // The quarantine table carries each label under its own name, so
+            // a source column of that name is left out of its `*`: the label
+            // replaces it (#2065).
+            let replaced = labels_the_source_has(&labeled, source_columns);
+            let excluded: Vec<&str> = working.iter().chain(&replaced).copied().collect();
+            let without_labels_or_replaced = dialect.star_excluding(&excluded).ok_or(
+                QuarantineError::SplitNeedsStarExclusion {
+                    dialect: dialect.name(),
+                },
+            )?;
+
             let intermediate_name = format!("{SPLIT_TABLE_PREFIX}{token}");
-            validation::validate_identifier(&intermediate_name)?;
+            validation::validate_generated_identifier(&intermediate_name)?;
             let intermediate_table = dialect.format_table_ref(
                 &table_ref.catalog,
                 &table_ref.schema,
@@ -318,6 +361,7 @@ fn compile_with_token(
             statements.push(build_label_ctas(
                 StatementRole::Label,
                 &intermediate_table,
+                "*",
                 &source_table,
                 &labeled,
                 &working,
@@ -330,7 +374,7 @@ fn compile_with_token(
                     &intermediate_table,
                     &labeled,
                     &working,
-                    &without_labels,
+                    &without_labels_or_replaced,
                     dialect,
                 ),
                 dialect,
@@ -366,10 +410,27 @@ fn compile_with_token(
         }
         QuarantineMode::Tag => {
             refuse_tag_without_replace(dialect)?;
+            // A label replaces a source column of the same name (#2065). A
+            // second `tag` reads the first one's labels, and `SELECT *, <label>`
+            // would keep the stale column and add a renamed fresh one.
+            // `EXCLUDE` of a column the source lacks is an error on DuckDB, so
+            // only the columns the source has are left out.
+            let replaced = labels_the_source_has(&labeled, source_columns);
+            let star = if replaced.is_empty() {
+                "*".to_string()
+            } else {
+                dialect
+                    .star_excluding(&replaced)
+                    .ok_or(QuarantineError::TagNotSupported {
+                        dialect: dialect.name(),
+                        reason: "this warehouse has no star-exclusion form",
+                    })?
+            };
             let names: Vec<&str> = labeled.iter().map(|p| p.label.as_str()).collect();
             statements.push(build_label_ctas(
                 StatementRole::Tag,
                 &source_table,
+                &star,
                 &source_table,
                 &labeled,
                 &names,
@@ -438,6 +499,26 @@ fn refuse_tag_without_replace(dialect: &dyn SqlDialect) -> Result<(), Quarantine
     })
 }
 
+/// The labels that name a column the source already has, as the labels
+/// spell them.
+///
+/// Compared without ASCII case. A label is written unquoted, so each warehouse
+/// folds it the way it folds the source's unquoted column names: Snowflake
+/// reports `_ERROR_X` for a label written `_error_x`. A source column created
+/// quoted in another case on Snowflake (`"_error_x"`) is a different column
+/// there, and is still matched here: the `EXCLUDE` then names a column the
+/// source lacks, and the warehouse refuses the statement.
+fn labels_the_source_has<'a>(
+    labeled: &'a [LabeledPredicate],
+    source_columns: &[String],
+) -> Vec<&'a str> {
+    labeled
+        .iter()
+        .map(|p| p.label.as_str())
+        .filter(|label| source_columns.iter().any(|c| c.eq_ignore_ascii_case(label)))
+        .collect()
+}
+
 struct LabeledPredicate {
     label: String,
     valid_pred: String,
@@ -484,12 +565,12 @@ fn safe_error_label(
     };
 
     let mut candidate = format!("_error_{base}");
-    validation::validate_identifier(&candidate)?;
+    validation::validate_generated_identifier(&candidate)?;
 
     let mut n = 2u32;
     while taken.contains(&candidate) {
         candidate = format!("_error_{base}_{n}");
-        validation::validate_identifier(&candidate)?;
+        validation::validate_generated_identifier(&candidate)?;
         n += 1;
     }
     taken.insert(candidate.clone());
@@ -720,10 +801,12 @@ fn wrap_filter(
 /// passed that assertion.
 ///
 /// `columns[i]` names the column for `labeled[i]`: the label itself for
-/// `tag`, a working name for `split`.
+/// `tag`, a working name for `split`. `star` selects the source's columns:
+/// `*`, or `* EXCLUDE (...)` when `tag` replaces columns the source has.
 fn build_label_ctas(
     role: StatementRole,
     target: &str,
+    star: &str,
     source: &str,
     labeled: &[LabeledPredicate],
     columns: &[&str],
@@ -740,7 +823,7 @@ fn build_label_ctas(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let select = format!("SELECT *, {error_cols} FROM {source}");
+    let select = format!("SELECT {star}, {error_cols} FROM {source}");
     // `split`'s intermediate table must be new: replacing an existing table
     // would destroy something this run does not own, and the drop after it
     // would finish the job. `tag` replaces its source by design.
@@ -872,7 +955,7 @@ fn refuse_colliding_names(
 fn suffixed_table_name(table: &str, suffix: &str) -> Result<String, QuarantineError> {
     validation::validate_identifier(table)?;
     let candidate = format!("{table}{suffix}");
-    validation::validate_identifier(&candidate)?;
+    validation::validate_generated_identifier(&candidate)?;
     Ok(candidate)
 }
 
@@ -1004,8 +1087,8 @@ mod unit_tests {
             Some("customer_id"),
             TestSeverity::Error,
         )];
-        let plan =
-            compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg).unwrap();
+        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
+            .unwrap();
         assert!(plan.is_none());
     }
 
@@ -1023,8 +1106,8 @@ mod unit_tests {
                 TestSeverity::Warning,
             ),
         ];
-        let plan =
-            compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg).unwrap();
+        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
+            .unwrap();
         assert!(plan.is_none());
     }
 
@@ -1037,9 +1120,17 @@ mod unit_tests {
             Some("customer_id"),
             TestSeverity::Error,
         )];
-        let plan = compile_with_token(&assertions, "orders", &table(), &TestDialect, &cfg, "t0k3n")
-            .unwrap()
-            .unwrap();
+        let plan = compile_with_token(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &[],
+            "t0k3n",
+        )
+        .unwrap()
+        .unwrap();
         let roles: Vec<StatementRole> = plan.statements.iter().map(|s| s.role).collect();
         assert_eq!(
             roles,
@@ -1075,9 +1166,17 @@ mod unit_tests {
             Some("customer_id"),
             TestSeverity::Error,
         )];
-        let plan = compile_with_token(&assertions, "orders", &table(), &TestDialect, &cfg, "t0k3n")
-            .unwrap()
-            .unwrap();
+        let plan = compile_with_token(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &[],
+            "t0k3n",
+        )
+        .unwrap()
+        .unwrap();
         let sql: Vec<&str> = plan.statements.iter().map(|s| s.sql.as_str()).collect();
         assert_eq!(
             sql,
@@ -1188,9 +1287,10 @@ mod unit_tests {
                 mode,
                 ..split_config()
             };
-            let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-                .unwrap_or_else(|e| panic!("{mode:?}: {e:?}"))
-                .expect("a plan");
+            let plan =
+                compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
+                    .unwrap_or_else(|e| panic!("{mode:?}: {e:?}"))
+                    .expect("a plan");
             for fragment in fragments {
                 let total: usize = plan
                     .statements
@@ -1227,9 +1327,15 @@ mod unit_tests {
         let dialect = StubDialect(LiteralEscape::Standard);
         assert!(dialect.star_excluding(&["x"]).is_none(), "precondition");
 
-        let err =
-            compile_quarantine_sql(&assertions, "orders", &table(), &dialect, &split_config())
-                .unwrap_err();
+        let err = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &dialect,
+            &split_config(),
+            &[],
+        )
+        .unwrap_err();
         assert!(
             matches!(err, QuarantineError::SplitNeedsStarExclusion { .. }),
             "{err:?}"
@@ -1240,7 +1346,7 @@ mod unit_tests {
             mode: QuarantineMode::Drop,
             ..split_config()
         };
-        compile_quarantine_sql(&assertions, "orders", &table(), &dialect, &cfg)
+        compile_quarantine_sql(&assertions, "orders", &table(), &dialect, &cfg, &[])
             .unwrap_or_else(|e| panic!("drop does not exclude columns: {e:?}"))
             .expect("a plan");
 
@@ -1250,8 +1356,8 @@ mod unit_tests {
             mode: QuarantineMode::Tag,
             ..split_config()
         };
-        let err =
-            compile_quarantine_sql(&assertions, "orders", &table(), &dialect, &cfg).unwrap_err();
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &dialect, &cfg, &[])
+            .unwrap_err();
         assert!(
             matches!(err, QuarantineError::TagNotSupported { .. }),
             "{err:?}"
@@ -1362,6 +1468,7 @@ mod unit_tests {
             &table(),
             &PredropDialect,
             &cfg(QuarantineMode::Drop),
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -1388,6 +1495,7 @@ mod unit_tests {
             &table(),
             &PredropDialect,
             &cfg(QuarantineMode::Split),
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -1420,6 +1528,7 @@ mod unit_tests {
             &table(),
             &PredropDialect,
             &cfg(QuarantineMode::Tag),
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -1440,6 +1549,7 @@ mod unit_tests {
             &table(),
             &TestDialect,
             &cfg(QuarantineMode::Drop),
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -1474,6 +1584,7 @@ mod unit_tests {
                 &table(),
                 &TestDialect,
                 &split_config(),
+                &[],
             )
             .unwrap()
             .unwrap()
@@ -1522,10 +1633,16 @@ mod unit_tests {
             TestSeverity::Error,
         );
         a.table = long_table.clone();
-        let plan =
-            compile_quarantine_sql(&[a], &long_table, &table_ref, &TestDialect, &split_config())
-                .unwrap()
-                .unwrap();
+        let plan = compile_quarantine_sql(
+            &[a],
+            &long_table,
+            &table_ref,
+            &TestDialect,
+            &split_config(),
+            &[],
+        )
+        .unwrap()
+        .unwrap();
         let intermediate = plan.statements[0]
             .target
             .strip_prefix("poc.staging__orders.")
@@ -1567,7 +1684,7 @@ mod unit_tests {
                 suffix_quarantine: quarantine.into(),
                 ..split_config()
             };
-            compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
         };
         let collision = |r: Result<Option<QuarantinePlan>, QuarantineError>| {
             matches!(r, Err(QuarantineError::TableNameCollision { .. }))
@@ -1611,6 +1728,155 @@ mod unit_tests {
         }
     }
 
+    /// A label replaces a source column of the same name (#2065): `tag` and
+    /// `split`'s quarantine table leave that column out of their `*`, and only
+    /// when the source has it, since `EXCLUDE` of a missing column errors.
+    #[test]
+    fn a_label_replaces_a_source_column_of_its_name() {
+        let assertions = vec![assertion(
+            None,
+            TestType::NotNull,
+            Some("customer_id"),
+            TestSeverity::Error,
+        )];
+        let compile = |mode, columns: &[String]| {
+            let cfg = QuarantineConfig {
+                mode,
+                ..split_config()
+            };
+            compile_with_token(
+                &assertions,
+                "orders",
+                &table(),
+                &TestDialect,
+                &cfg,
+                columns,
+                "tok",
+            )
+            .unwrap()
+            .unwrap()
+        };
+        // Snowflake reports an unquoted column upper-cased.
+        let had = vec![
+            "customer_id".to_string(),
+            "_ERROR_NOT_NULL_CUSTOMER_ID".to_string(),
+        ];
+        let fresh = vec!["customer_id".to_string()];
+
+        let tag = compile(QuarantineMode::Tag, &had);
+        assert!(
+            tag.statements[0].sql.contains(
+                "SELECT * EXCLUDE (_error_not_null_customer_id), CASE WHEN NOT (customer_id IS NOT NULL) \
+                 THEN '_error_not_null_customer_id' END AS _error_not_null_customer_id FROM"
+            ),
+            "{}",
+            tag.statements[0].sql
+        );
+        let tag = compile(QuarantineMode::Tag, &fresh);
+        assert!(
+            tag.statements[0].sql.contains("SELECT *, CASE"),
+            "no EXCLUDE when the source lacks the column: {}",
+            tag.statements[0].sql
+        );
+
+        let split = compile(QuarantineMode::Split, &had);
+        let sql = |role| {
+            split
+                .statements
+                .iter()
+                .find(|s| s.role == role)
+                .map(|s| s.sql.clone())
+                .unwrap()
+        };
+        assert!(
+            sql(StatementRole::Label).contains("SELECT *, CASE"),
+            "{}",
+            sql(StatementRole::Label)
+        );
+        assert!(
+            sql(StatementRole::Quarantine).contains(
+                "SELECT * EXCLUDE (_ql0_tok, _error_not_null_customer_id), \
+                 _ql0_tok AS _error_not_null_customer_id FROM"
+            ),
+            "{}",
+            sql(StatementRole::Quarantine)
+        );
+        assert!(
+            sql(StatementRole::Valid).contains("SELECT * EXCLUDE (_ql0_tok) FROM"),
+            "the valid table keeps the source's column: {}",
+            sql(StatementRole::Valid)
+        );
+        let split = compile(QuarantineMode::Split, &fresh);
+        assert!(
+            split.statements[1]
+                .sql
+                .contains("SELECT * EXCLUDE (_ql0_tok), _ql0_tok AS"),
+            "{}",
+            split.statements[1].sql
+        );
+    }
+
+    /// Every name quarantine builds is refused at compile time when it is
+    /// longer than 255 characters, the Snowflake and Databricks limit (#2065).
+    /// Each part is legal on its own; only the joined name is too long.
+    #[test]
+    fn a_generated_name_over_255_characters_is_refused_at_compile() {
+        let too_long = |r: Result<Option<QuarantinePlan>, QuarantineError>| {
+            matches!(
+                r,
+                Err(QuarantineError::Validation(
+                    ValidationError::GeneratedIdentifierTooLong { .. }
+                ))
+            )
+        };
+
+        // A 250-character table plus `__valid` is 257 characters.
+        let long_table = "t".repeat(250);
+        let table_ref = TableRef {
+            table: long_table.clone(),
+            ..table()
+        };
+        let mut a = assertion(None, TestType::NotNull, Some("id"), TestSeverity::Error);
+        a.table = long_table.clone();
+        for mode in [QuarantineMode::Split, QuarantineMode::Drop] {
+            let cfg = QuarantineConfig {
+                mode,
+                ..split_config()
+            };
+            let r = compile_quarantine_sql(
+                std::slice::from_ref(&a),
+                &long_table,
+                &table_ref,
+                &TestDialect,
+                &cfg,
+                &[],
+            );
+            assert!(too_long(r), "{mode:?}");
+        }
+
+        // A 240-character column plus `_error_not_null_` is 256 characters.
+        let long_column = "c".repeat(240);
+        let a = assertion(
+            None,
+            TestType::NotNull,
+            Some(&long_column),
+            TestSeverity::Error,
+        );
+        let cfg = QuarantineConfig {
+            mode: QuarantineMode::Tag,
+            ..split_config()
+        };
+        let r = compile_quarantine_sql(&[a], "orders", &table(), &TestDialect, &cfg, &[]);
+        assert!(too_long(r));
+
+        // Control: at the limit is accepted.
+        let column = "c".repeat(255 - "_error_not_null_".len());
+        let a = assertion(None, TestType::NotNull, Some(&column), TestSeverity::Error);
+        compile_quarantine_sql(&[a], "orders", &table(), &TestDialect, &cfg, &[])
+            .unwrap()
+            .expect("a plan");
+    }
+
     #[test]
     fn accepted_values_predicate_is_null_permissive() {
         // This is the advisor's flagged case: NULL must pass the
@@ -1624,7 +1890,7 @@ mod unit_tests {
             Some("status"),
             TestSeverity::Error,
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
             .unwrap()
             .unwrap();
         // Valid predicate: NULL or in list.
@@ -1646,7 +1912,7 @@ mod unit_tests {
             Some("name"),
             TestSeverity::Error,
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
             .unwrap()
             .unwrap();
         assert!(plan.statements[0].sql.contains("'it''s'"));
@@ -1663,7 +1929,7 @@ mod unit_tests {
             None,
             TestSeverity::Error,
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
             .unwrap()
             .unwrap();
         // COALESCE makes NULL `amount >= 0` resolve to TRUE (preserves
@@ -1694,9 +1960,17 @@ mod unit_tests {
                 TestSeverity::Error,
             ),
         ];
-        let plan = compile_with_token(&assertions, "orders", &table(), &TestDialect, &cfg, "t0k3n")
-            .unwrap()
-            .unwrap();
+        let plan = compile_with_token(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &cfg,
+            &[],
+            "t0k3n",
+        )
+        .unwrap()
+        .unwrap();
         // Split combines the labels: any set goes to quarantine, none set to valid.
         let working = "_ql0_t0k3n, _ql1_t0k3n";
         let quarantine_sql = &plan.statements[1].sql;
@@ -1727,9 +2001,16 @@ mod unit_tests {
             mode: QuarantineMode::Drop,
             ..split_config()
         };
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &drop_cfg)
-            .unwrap()
-            .unwrap();
+        let plan = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &TestDialect,
+            &drop_cfg,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
         let valid_sql = &plan.statements[0].sql;
         assert!(valid_sql.contains("customer_id IS NOT NULL AND"));
         assert!(valid_sql.contains("status IS NULL OR status IN ('pending')"));
@@ -1793,6 +2074,7 @@ mod unit_tests {
                     &table(),
                     &TestDialect,
                     &cfg,
+                    &[],
                 )
                 .unwrap_or_else(|e| panic!("{mode:?} must accept {:?}: {e:?}", case.test))
                 .expect("a quarantinable assertion produces a plan");
@@ -1819,6 +2101,7 @@ mod unit_tests {
             &table(),
             &TestDialect,
             &split_config(),
+            &[],
         )
         .unwrap_err();
         assert!(err.to_string().contains("my_udf"), "{err}");
@@ -1836,7 +2119,7 @@ mod unit_tests {
             Some("customer_id"),
             TestSeverity::Error,
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
             .unwrap()
             .unwrap();
         assert_eq!(plan.statements.len(), 1);
@@ -1856,7 +2139,7 @@ mod unit_tests {
             Some("customer_id"),
             TestSeverity::Error,
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
             .unwrap()
             .unwrap();
         assert_eq!(plan.statements.len(), 1);
@@ -1885,7 +2168,7 @@ mod unit_tests {
             Some("customer_id"),
             TestSeverity::Error,
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
             .unwrap()
             .unwrap();
         assert!(
@@ -1913,7 +2196,7 @@ mod unit_tests {
                 TestSeverity::Error,
             ),
         ];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
             .unwrap()
             .unwrap();
         // The quarantine table is where the labels carry their own names.
@@ -1931,7 +2214,7 @@ mod unit_tests {
             Some("customer_id"),
             TestSeverity::Error,
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
             .unwrap()
             .unwrap();
         // Quarantine runs before valid so a partial failure leaves a stray
@@ -1949,7 +2232,8 @@ mod unit_tests {
             Some("col; DROP TABLE"),
             TestSeverity::Error,
         )];
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg).err();
+        let err =
+            compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[]).err();
         assert!(err.is_some());
     }
 
@@ -1965,7 +2249,8 @@ mod unit_tests {
             Some("customer_id"),
             TestSeverity::Error,
         )];
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg).err();
+        let err =
+            compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[]).err();
         assert!(err.is_some());
     }
 
@@ -2000,7 +2285,7 @@ mod unit_tests {
             Some("amount"),
             TestSeverity::Error,
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
             .unwrap()
             .unwrap();
         // Label CTAS: (amount IS NULL OR NOT (amount < 0 OR amount > 1000))
@@ -2022,7 +2307,7 @@ mod unit_tests {
             Some("email"),
             TestSeverity::Error,
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
             .unwrap()
             .unwrap();
         // Label CTAS: (email IS NULL OR regexp_matches(email, '^[a-z]+$'))
@@ -2041,7 +2326,7 @@ mod unit_tests {
             Some("customer_id"),
             Some("region = 'US'"),
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
             .unwrap()
             .unwrap();
         // Out-of-scope rows (filter false/null) pass unconditionally:
@@ -2065,7 +2350,7 @@ mod unit_tests {
             Some("amount"),
             TestSeverity::Error,
         )];
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
             .err()
             .unwrap();
         assert!(matches!(err, QuarantineError::InvalidInRangeBound { .. }));
@@ -2082,7 +2367,7 @@ mod unit_tests {
             Some("email"),
             TestSeverity::Error,
         )];
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
             .err()
             .unwrap();
         assert!(matches!(err, QuarantineError::UnsafeRegexPattern { .. }));
@@ -2147,6 +2432,7 @@ mod unit_tests {
             &table(),
             &StubDialect(LiteralEscape::Standard),
             &cfg,
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -2162,6 +2448,7 @@ mod unit_tests {
             &table(),
             &StubDialect(LiteralEscape::Backslash),
             &cfg,
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -2185,7 +2472,7 @@ mod unit_tests {
             None,
             TestSeverity::Error,
         )];
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("statement terminator"), "{msg}");
@@ -2212,7 +2499,7 @@ mod unit_tests {
             None,
             TestSeverity::Error,
         )];
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
             .unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -2235,7 +2522,7 @@ mod unit_tests {
             None,
             TestSeverity::Error,
         )];
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
             .unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -2257,7 +2544,7 @@ mod unit_tests {
             None,
             TestSeverity::Error,
         )];
-        compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
             .expect("an ordinary predicate must still compile");
     }
 
@@ -2366,7 +2653,7 @@ mod unit_tests {
 
         // TestDialect -> name() defaults to "unknown" -> GenericDialect, which
         // parses the operator.
-        compile_quarantine_sql(&assertions(), "orders", &table(), &TestDialect, &cfg)
+        compile_quarantine_sql(&assertions(), "orders", &table(), &TestDialect, &cfg, &[])
             .expect("the generic parser accepts this operator");
 
         // The same expression, same call site, a dialect NAMED snowflake.
@@ -2374,8 +2661,15 @@ mod unit_tests {
         // a JSON operator — so the same text parses to a different AST and
         // the walker refuses it. The reason does not matter here; the
         // DIFFERENCE does, and it can only come from the name being threaded.
-        compile_quarantine_sql(&assertions(), "orders", &table(), &SnowflakeNamed, &cfg)
-            .expect_err("the snowflake parser must not accept this operator");
+        compile_quarantine_sql(
+            &assertions(),
+            "orders",
+            &table(),
+            &SnowflakeNamed,
+            &cfg,
+            &[],
+        )
+        .expect_err("the snowflake parser must not accept this operator");
     }
 
     /// The same proof for the quarantine FILTER route.
@@ -2394,10 +2688,17 @@ mod unit_tests {
                 Some("(a->'k') IS NOT NULL"),
             )]
         };
-        compile_quarantine_sql(&assertions(), "orders", &table(), &TestDialect, &cfg)
+        compile_quarantine_sql(&assertions(), "orders", &table(), &TestDialect, &cfg, &[])
             .expect("the generic parser accepts this operator");
-        compile_quarantine_sql(&assertions(), "orders", &table(), &SnowflakeNamed, &cfg)
-            .expect_err("the snowflake parser must not accept it");
+        compile_quarantine_sql(
+            &assertions(),
+            "orders",
+            &table(),
+            &SnowflakeNamed,
+            &cfg,
+            &[],
+        )
+        .expect_err("the snowflake parser must not accept it");
     }
 
     /// The `filter` reaches the same CTAS as the predicate, so it gets the
@@ -2412,7 +2713,7 @@ mod unit_tests {
             Some("customer_id"),
             Some("my_udf(id) IS NOT NULL"),
         )];
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("my_udf"), "must name the function: {msg}");
@@ -2431,7 +2732,7 @@ mod unit_tests {
             Some("customer_id"),
             Some("amount >"),
         )];
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
             .unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -2450,7 +2751,7 @@ mod unit_tests {
             Some("customer_id"),
             Some("status <> 'void'"),
         )];
-        compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
             .expect("an ordinary filter must still compile");
     }
 
@@ -2462,7 +2763,7 @@ mod unit_tests {
             Some("customer_id"),
             Some("1=1); SELECT 1; --"),
         )];
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("statement terminator"), "{msg}");
@@ -2482,7 +2783,7 @@ mod unit_tests {
             None,
             TestSeverity::Error,
         )];
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
             .unwrap_err();
         assert!(err.to_string().contains("unterminated"), "{err}");
     }
@@ -2495,7 +2796,7 @@ mod unit_tests {
             Some("customer_id"),
             Some("region = 'US;CA'"),
         )];
-        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg, &[])
             .unwrap()
             .unwrap();
         assert!(

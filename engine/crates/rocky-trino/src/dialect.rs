@@ -380,6 +380,7 @@ mod tests {
                     mode,
                     ..QuarantineConfig::default()
                 },
+                &[],
             )
         };
 

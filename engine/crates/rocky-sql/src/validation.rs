@@ -47,6 +47,17 @@ pub enum ValidationError {
     #[error("SQL identifier cannot be empty")]
     EmptyIdentifier,
 
+    #[error(
+        "generated SQL identifier '{value}' is {len} characters long, over the \
+         {max}-character limit of Snowflake and Databricks. Shorten the table, column, \
+         suffix or name it is built from"
+    )]
+    GeneratedIdentifierTooLong {
+        value: String,
+        len: usize,
+        max: usize,
+    },
+
     #[error("principal name cannot be empty")]
     EmptyPrincipal,
 
@@ -207,6 +218,33 @@ pub fn validate_identifier(value: &str) -> Result<&str, ValidationError> {
     if !SQL_IDENTIFIER_RE.is_match(value) {
         return Err(ValidationError::InvalidIdentifier {
             value: value.to_string(),
+        });
+    }
+    Ok(value)
+}
+
+/// The longest identifier Rocky builds by joining names, in characters.
+///
+/// Snowflake and Databricks cap an identifier at 255 characters. BigQuery
+/// allows more, so one bound for every warehouse is conservative there, not
+/// wrong. Names Rocky builds from a user's name plus a suffix can cross it
+/// even when every part is legal (#2065).
+pub const MAX_GENERATED_IDENTIFIER_LEN: usize = 255;
+
+/// Validates an identifier Rocky builds from other names, such as a table
+/// name plus a suffix: [`validate_identifier`], plus a length bound of
+/// [`MAX_GENERATED_IDENTIFIER_LEN`].
+///
+/// Refusing here, before any statement runs, turns a warehouse error in the
+/// middle of a run into a refusal at compile time.
+pub fn validate_generated_identifier(value: &str) -> Result<&str, ValidationError> {
+    validate_identifier(value)?;
+    // The identifier is ASCII (checked above), so bytes are characters.
+    if value.len() > MAX_GENERATED_IDENTIFIER_LEN {
+        return Err(ValidationError::GeneratedIdentifierTooLong {
+            value: value.to_string(),
+            len: value.len(),
+            max: MAX_GENERATED_IDENTIFIER_LEN,
         });
     }
     Ok(value)
@@ -549,6 +587,32 @@ pub fn format_principal(name: &str) -> Result<String, ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_generated_identifier_over_255_characters_is_refused() {
+        let at_limit = "a".repeat(MAX_GENERATED_IDENTIFIER_LEN);
+        assert!(validate_generated_identifier(&at_limit).is_ok());
+        let over = "a".repeat(MAX_GENERATED_IDENTIFIER_LEN + 1);
+        let err = validate_generated_identifier(&over).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ValidationError::GeneratedIdentifierTooLong {
+                    len: 256,
+                    max: 255,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        // Characters are still checked, and first.
+        assert!(matches!(
+            validate_generated_identifier("a;b"),
+            Err(ValidationError::InvalidIdentifier { .. })
+        ));
+        // The plain check has no length bound.
+        assert!(validate_identifier(&over).is_ok());
+    }
 
     #[test]
     fn test_valid_identifiers() {
