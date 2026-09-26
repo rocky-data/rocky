@@ -127,6 +127,7 @@ fn emit_models(
             .map(|c| c.freshness.clone())
             .unwrap_or_default(),
         run_vars: run_vars.clone(),
+        external_dependencies: Default::default(),
     };
     let result = match compile::compile(&config) {
         Ok(r) => r,

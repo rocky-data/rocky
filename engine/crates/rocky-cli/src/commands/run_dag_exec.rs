@@ -8,7 +8,7 @@
 //! Results are emitted as a [`DagRunOutput`] in JSON mode so orchestrators
 //! can correlate per-node status, timing, and errors.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -100,6 +100,32 @@ impl StateTurnstile {
     }
 }
 
+tokio::task_local! {
+    /// The seed names the unified DAG resolved, visible to the sub-runs it
+    /// dispatches (#2138).
+    ///
+    /// A model may declare `depends_on = ["<seed>"]`. The DAG orders the model
+    /// after that seed node. The sub-run then compiles the model's pipeline
+    /// alone, where the seed is not a model, and an unknown `depends_on` name
+    /// fails that compile. `execute_models` reads these names into
+    /// `CompilerConfig::external_dependencies`, so the sub-run accepts exactly
+    /// the names the DAG already ordered.
+    ///
+    /// A task-local rather than one more parameter on `run()` and
+    /// `execute_models`: only [`default_sub_runner`] sets it, around one
+    /// sub-run future, and every other caller of those two functions keeps the
+    /// default (empty) without a change at each call site.
+    static DAG_EXTERNAL_DEPENDENCIES: Arc<BTreeSet<String>>;
+}
+
+/// The seed names the enclosing `rocky run --dag` resolved, or an empty set
+/// outside a DAG sub-run. See [`DAG_EXTERNAL_DEPENDENCIES`].
+pub(super) fn dag_external_dependencies() -> BTreeSet<String> {
+    DAG_EXTERNAL_DEPENDENCIES
+        .try_with(|names| (**names).clone())
+        .unwrap_or_default()
+}
+
 /// The production [`SubRunner`]: drives one pipeline through [`super::run::run`]
 /// with the DAG sub-run's fixed arguments (no `--defer`/`--var`, config-derived
 /// TTL, no idempotency key). Only `config`, `loaded`, `state`, `pipeline`,
@@ -116,17 +142,21 @@ impl StateTurnstile {
 /// `SkipGate::upstream_unchanged`). That is fail-safe — never a stale skip — but
 /// more conservative than a single monolithic run, where the per-layer barrier
 /// makes every upstream verdict visible. Raw-source freshness skips still apply.
-fn default_sub_runner() -> SubRunner {
+///
+/// `seed_names` are the seed nodes of this DAG. Each sub-run sees them through
+/// [`DAG_EXTERNAL_DEPENDENCIES`] (#2138).
+fn default_sub_runner(seed_names: Arc<BTreeSet<String>>) -> SubRunner {
     Arc::new(
-        |config_path: PathBuf,
-         loaded: Arc<rocky_core::config::LoadedConfig>,
-         state_path: PathBuf,
-         pipeline_name: String,
-         model_name: Option<String>,
-         partition_opts,
-         skip_opts,
-         shadow_config: Option<rocky_core::shadow::ShadowConfig>| {
-            Box::pin(async move {
+        move |config_path: PathBuf,
+              loaded: Arc<rocky_core::config::LoadedConfig>,
+              state_path: PathBuf,
+              pipeline_name: String,
+              model_name: Option<String>,
+              partition_opts,
+              skip_opts,
+              shadow_config: Option<rocky_core::shadow::ShadowConfig>| {
+            let seed_names = Arc::clone(&seed_names);
+            Box::pin(DAG_EXTERNAL_DEPENDENCIES.scope(seed_names, async move {
                 super::run::run(
                     &config_path,
                     loaded,
@@ -165,7 +195,7 @@ fn default_sub_runner() -> SubRunner {
                 .await
                 .map(|_| ())
                 .map_err(|e| format!("{e:#}"))
-            })
+            }))
         },
     )
 }
@@ -277,6 +307,15 @@ pub async fn run_with_dag(
 
     let mut dag = unified_dag::build_unified_dag(cfg, &models_by_pipeline, &seeds)
         .context("failed to build unified DAG")?;
+
+    // The seed names each sub-run's compile accepts in `depends_on` (#2138).
+    let seed_names: Arc<BTreeSet<String>> = Arc::new(
+        dag.nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Seed)
+            .map(|n| n.label.clone())
+            .collect(),
+    );
 
     // Infer cross-step edges from each model's SQL `FROM` references so a
     // model that reads a seed (or replication load) is ordered *after* it,
@@ -396,7 +435,7 @@ pub async fn run_with_dag(
         partition_opts: partition_opts.clone(),
         skip_opts: *skip_opts,
         shadow_config: shadow_config.cloned(),
-        sub_runner: default_sub_runner(),
+        sub_runner: default_sub_runner(seed_names),
         state_turns: StateTurnstile::new(),
     };
     let executor = dag_executor_with_bound(dispatcher, node_concurrency);
@@ -1742,7 +1781,7 @@ mod tests {
             partition_opts: PartitionRunOptions::default(),
             skip_opts: SkipRunOptions::default(),
             shadow_config: None,
-            sub_runner: default_sub_runner(),
+            sub_runner: default_sub_runner(Arc::default()),
             state_turns: StateTurnstile::new(),
         };
         let id = NodeId::new("seed", "countries");
@@ -1880,6 +1919,88 @@ mod tests {
             .execute_sql("SELECT COUNT(*) FROM proj.silver.dim_country")
             .unwrap();
         assert_eq!(cell_i64(&model_rows.rows[0][0]), 2, "model rows");
+    }
+
+    /// #2138: a model whose `depends_on` names a seed runs under `--dag`.
+    ///
+    /// The issue's two-node shape: seed `orders`, and model `stg_orders` with
+    /// only `depends_on = ["orders"]` (its SQL never reads the seed). The DAG
+    /// orders the model after the seed. Before the fix, the model's sub-run
+    /// compiled its pipeline alone, the seed name was an unknown dependency,
+    /// and the node failed, so the whole run failed.
+    #[tokio::test]
+    async fn a_model_depending_on_a_seed_by_name_runs_under_dag() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+
+        let db_path = root.join("proj.duckdb");
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter.local]\n\
+                 type = \"duckdb\"\n\
+                 path = \"{}\"\n\n\
+                 [pipeline.silver]\n\
+                 type = \"transformation\"\n\n\
+                 [pipeline.silver.target]\n\
+                 adapter = \"local\"\n\n\
+                 [pipeline.silver.target.governance]\n\
+                 auto_create_catalogs = true\n\
+                 auto_create_schemas = true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join("seeds/orders.csv"), "id\n1\n2\n").unwrap();
+        std::fs::write(
+            root.join("seeds/orders.toml"),
+            "name = \"orders\"\n\n\
+             [target]\n\
+             catalog = \"proj\"\n\
+             schema = \"seeds\"\n\
+             table = \"orders\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("models/stg_orders.sql"), "SELECT 7 AS id\n").unwrap();
+        std::fs::write(
+            root.join("models/stg_orders.toml"),
+            "name = \"stg_orders\"\n\
+             depends_on = [\"orders\"]\n\n\
+             [target]\n\
+             catalog = \"proj\"\n\
+             schema = \"silver\"\n\
+             table = \"stg_orders\"\n",
+        )
+        .unwrap();
+
+        let config_path = root.join("rocky.toml");
+        let state_path = root.join(".rocky-state.redb");
+        run_with_dag(
+            &config_path,
+            dag_snapshot(&config_path),
+            &state_path,
+            false,
+            &PartitionRunOptions::default(),
+            &crate::commands::run::SkipRunOptions::default(),
+            None,
+            None,
+        )
+        .await
+        .expect("a model whose depends_on names a seed must run under --dag");
+
+        let adapter = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        let model = guard
+            .execute_sql("SELECT id FROM proj.silver.stg_orders")
+            .unwrap();
+        assert_eq!(cell_i64(&model.rows[0][0]), 7, "the model's own value");
+        let seed = guard
+            .execute_sql("SELECT COUNT(*) FROM proj.seeds.orders")
+            .unwrap();
+        assert_eq!(cell_i64(&seed.rows[0][0]), 2, "the seed loaded too");
     }
 
     /// #2018: `rocky run --dag` must load a seed on a project with MORE THAN
@@ -2279,7 +2400,7 @@ mod tests {
             partition_opts: PartitionRunOptions::default(),
             skip_opts: SkipRunOptions::default(),
             shadow_config: None,
-            sub_runner: default_sub_runner(),
+            sub_runner: default_sub_runner(Arc::default()),
             state_turns: StateTurnstile::new(),
         };
         let id = NodeId::new("seed", "orders");
@@ -2388,7 +2509,7 @@ mod tests {
             partition_opts: PartitionRunOptions::default(),
             skip_opts: SkipRunOptions::default(),
             shadow_config: None,
-            sub_runner: default_sub_runner(),
+            sub_runner: default_sub_runner(Arc::default()),
             state_turns: StateTurnstile::new(),
         };
         let id = NodeId::new("seed", "orders");

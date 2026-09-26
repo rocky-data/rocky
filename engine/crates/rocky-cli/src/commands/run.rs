@@ -10675,6 +10675,9 @@ pub(crate) async fn execute_models(
         // This pre-execution compile stays scoped to typecheck +
         // contract diagnostics to avoid broadening its signature.
         run_vars: run_vars.clone(),
+        // Seed names a `--dag` sub-run's model may name in `depends_on`: the
+        // DAG already ordered them (#2138). Empty outside `rocky run --dag`.
+        external_dependencies: super::run_dag_exec::dag_external_dependencies(),
         ..Default::default()
     };
 

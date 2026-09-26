@@ -53,7 +53,7 @@ The `.toml` file names the model, lists what it depends on, picks a materializat
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string | Yes | Model identifier. Must be unique across all models. |
-| `depends_on` | list of strings | No | Names of upstream models that must run before this one. Defaults to `[]`. |
+| `depends_on` | list of strings | No | Names of upstream models that must run before this one. Defaults to `[]`. Under `rocky run --dag` an entry can also name a seed. The DAG loads that seed first. |
 | `group` | string | No | Name of a [config group](#config-groups) (`models/groups/<name>.toml`) this model opts into for shared routing and materialization. |
 | `retention` | string | No | Data retention policy for this model. Grammar `^\d+[dy]$` — e.g. `"90d"` or `"1y"`. See [Retention](#retention). |
 | `replace_existing` | string | No | `"view"` or `"table"`. The existing object kind Rocky may drop when the strategy switches between `view` and `full_refresh`. See [Switching between a view and a table](#switching-between-a-view-and-a-table). |

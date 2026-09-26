@@ -4,7 +4,7 @@
 //! and a computed execution order. It loads models from a directory, resolves
 //! inter-model dependencies from SQL, and builds the execution DAG.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rocky_core::models::{self, Model, ModelConfig, TargetConfig};
@@ -347,6 +347,23 @@ impl Project {
     /// Useful when models come from sources other than a directory
     /// (e.g., DSL lowering, dbt import).
     pub fn from_models(models: Vec<Model>) -> Result<Self, ProjectError> {
+        Self::from_models_with_external_dependencies(models, &BTreeSet::new())
+    }
+
+    /// Build a project from pre-loaded models, where a `depends_on` entry may
+    /// also name something outside this project.
+    ///
+    /// `external_dependencies` lists names a caller has already resolved to a
+    /// node it orders itself. `rocky run --dag` passes its seed names: the DAG
+    /// puts a model with `depends_on = ["<seed>"]` after that seed, then
+    /// compiles the model's pipeline alone for the sub-run, where the seed is
+    /// not a model (#2138). Such a name leaves the project DAG instead of
+    /// failing it as an unknown dependency. A name that is also a model here
+    /// stays a model edge. Every other unknown name still fails.
+    pub fn from_models_with_external_dependencies(
+        models: Vec<Model>,
+        external_dependencies: &BTreeSet<String>,
+    ) -> Result<Self, ProjectError> {
         // Reject duplicate model names up front. `model()` is first-wins and
         // `resolve` collapses names into a HashSet, so a second model with the
         // same name would silently shadow the first — a real source of "my edit
@@ -364,8 +381,17 @@ impl Project {
         // rejected — see the field doc on `Project::target_collisions`.
         let target_collisions = collide_on_target(&models);
 
-        let (dag_nodes, lineage_cache, resolve_diagnostics) =
+        let (mut dag_nodes, lineage_cache, resolve_diagnostics) =
             resolve::resolve_dependencies(&models)?;
+        if !external_dependencies.is_empty() {
+            let model_names: HashSet<&str> =
+                models.iter().map(|m| m.config.name.as_str()).collect();
+            for node in &mut dag_nodes {
+                node.depends_on.retain(|dep| {
+                    model_names.contains(dep.as_str()) || !external_dependencies.contains(dep)
+                });
+            }
+        }
         let execution_order = dag::topological_sort(&dag_nodes)?;
         let layers = dag::execution_layers(&dag_nodes)?;
 
@@ -1023,6 +1049,49 @@ mod tests {
         let result = Project::from_models(models);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("circular"));
+    }
+
+    /// #2138: a `depends_on` name the caller already resolved outside the
+    /// project (a `--dag` seed) leaves the project DAG. Any other unknown name
+    /// still fails, and a name that is also a model stays a model edge.
+    #[test]
+    fn external_dependency_names_leave_the_project_dag() {
+        let with_deps = |deps: &[&str]| {
+            let mut stg = make_model("stg_orders", "SELECT 1 AS id");
+            stg.config.depends_on = deps.iter().map(|d| d.to_string()).collect();
+            vec![make_model("customers", "SELECT 1 AS id"), stg]
+        };
+        let external: BTreeSet<String> = ["orders".to_string(), "customers".to_string()].into();
+
+        let err = Project::from_models(with_deps(&["orders"]))
+            .expect_err("without the external set, a seed name is unknown");
+        assert!(
+            matches!(
+                &err,
+                ProjectError::Dag(dag::DagError::UnknownDependency { dependency, .. })
+                    if dependency == "orders"
+            ),
+            "{err:?}"
+        );
+
+        let project = Project::from_models_with_external_dependencies(
+            with_deps(&["orders", "customers"]),
+            &external,
+        )
+        .expect("a resolved external name is not an unknown dependency");
+        let stg = project
+            .dag_nodes
+            .iter()
+            .find(|n| n.name == "stg_orders")
+            .expect("stg_orders node");
+        assert_eq!(
+            stg.depends_on,
+            vec!["customers".to_string()],
+            "the seed name leaves the DAG; the model name stays an edge"
+        );
+
+        Project::from_models_with_external_dependencies(with_deps(&["typo"]), &external)
+            .expect_err("a name outside the external set still fails");
     }
 
     /// `load_dir_models` must pick up BOTH `.sql` (sidecar) and `.rocky` DSL

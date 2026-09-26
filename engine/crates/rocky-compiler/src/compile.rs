@@ -130,6 +130,12 @@ pub struct CompilerConfig {
     /// E028 error diagnostic naming the variable. Distinct from `${ENV}`
     /// config-time interpolation, which resolves while parsing `rocky.toml`.
     pub run_vars: rocky_core::run_vars::RunVars,
+    /// Names a model's `depends_on` may reference that are not models of this
+    /// compile, because the caller orders them itself. Only `rocky run --dag`
+    /// sets it, to its seed names, for each per-model sub-run (#2138). See
+    /// [`Project::from_models_with_external_dependencies`]. Empty by default:
+    /// an unknown `depends_on` name fails the compile.
+    pub external_dependencies: std::collections::BTreeSet<String>,
 }
 
 /// Result of compilation.
@@ -279,7 +285,8 @@ fn compile_preloaded_models_inner(
     load_start: Instant,
 ) -> Result<CompileResult, CompileError> {
     let run_var_diagnostics = substitute_run_vars_into_models(&mut models, &config.run_vars);
-    let project = Project::from_models(models)?;
+    let project =
+        Project::from_models_with_external_dependencies(models, &config.external_dependencies)?;
     let project_load_ms = load_start.elapsed().as_millis() as u64;
 
     let mut result = compile_project(project, config, run_var_diagnostics)?;
