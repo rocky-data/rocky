@@ -138,7 +138,11 @@ pub const STATE_PATH_ENV: &str = "ROCKY_STATE_PATH";
 pub enum DriverOutcome {
     /// An elicitation task's hand-off. The runner verifies
     /// `expected_digest` against the bytes BEFORE the confined write and
-    /// refuses a mismatch.
+    /// refuses a mismatch. For the [`SubprocessDriver`] that comparison is
+    /// a trait-boundary guard, not an integrity check: the driver computes
+    /// the digest from the bytes it read, so the two always agree. The
+    /// [`ReplayDriver`]'s digest comes from the recorded session, so there
+    /// the check is real.
     Elicitation {
         /// The candidate spec, raw bytes.
         candidate_spec_bytes: Vec<u8>,
@@ -202,6 +206,10 @@ pub enum DriverError {
     /// An elicitation task ended without the outbox hand-off.
     #[error("elicitation produced no candidate: {0}")]
     OutboxMissing(String),
+    /// An outbox file is there but the runner refuses to read it: a
+    /// symlink, a hardlink, not a regular file, or too large (#1633).
+    #[error("refusing the worker's hand-off: {0}")]
+    OutboxRefused(String),
     /// The recorded session is unusable or its expectations failed.
     #[error("replay session error: {0}")]
     Session(String),
@@ -497,13 +505,15 @@ fn collect_outcome(
     match brief.kind {
         TaskBriefKind::Elicitation => {
             let candidate = brief.outbox_dir.join(OUTBOX_CANDIDATE);
-            let candidate_spec_bytes = std::fs::read(&candidate).map_err(|e| {
-                DriverError::OutboxMissing(format!(
-                    "the worker did not write {} ({e})",
-                    candidate.display()
-                ))
+            let candidate_spec_bytes = read_outbox_bytes(&candidate, |e| {
+                format!("the worker did not write {} ({e})", candidate.display())
             })?;
             let questions = read_questions(&brief.outbox_dir.join(OUTBOX_QUESTIONS))?;
+            // Derived from the bytes just read, so the runner's digest check
+            // cannot fail for this driver: it is a trait-boundary guard,
+            // not an integrity check on this read (#1633; see
+            // `DriverOutcome::Elicitation`). The replay driver's recorded
+            // digest is the one that is checked for real.
             let expected_digest = rocky_core::product::spec::spec_digest(&candidate_spec_bytes);
             Ok(DriverOutcome::Elicitation {
                 candidate_spec_bytes,
@@ -538,21 +548,48 @@ fn collect_outcome(
 /// One required outbox file, or the typed outbox error naming it.
 fn read_outbox_file(brief: &TaskBrief, name: &str) -> Result<Vec<u8>, DriverError> {
     let path = brief.outbox_dir.join(name);
-    std::fs::read(&path).map_err(|e| {
-        DriverError::OutboxMissing(format!(
+    read_outbox_bytes(&path, |e| {
+        format!(
             "the worker did not hand off {} ({e}) — the worker-profile `draft_model` tool \
              writes it; a round that never drafted, or was denied, has nothing to commit",
             path.display()
-        ))
+        )
+    })
+}
+
+/// Read one outbox file through a descriptor (#1633, finding 2).
+///
+/// The outbox is the one directory the worker writes, so what sits there
+/// is the worker's to choose. A plain `std::fs::read` follows a symlink
+/// and reads a HARDLINK's shared bytes, so a worker could hand off a file
+/// from outside the project — an outside spec copied into
+/// `products/<name>.toml`, or outside bytes committed as a model. This
+/// uses [`read_no_follow_bytes`](rocky_core::product::commit::read_no_follow_bytes):
+/// on unix it refuses a symlinked leaf and a descriptor with more than one
+/// link, and it refuses anything that is not a regular file or is over
+/// its size bound. Windows keeps a following read, the stated gap in
+/// `rocky_core::product::commit`.
+///
+/// Nothing at the path is [`DriverError::OutboxMissing`], with the text
+/// `missing` builds; anything else is [`DriverError::OutboxRefused`].
+fn read_outbox_bytes(
+    path: &Path,
+    missing: impl FnOnce(&std::io::Error) -> String,
+) -> Result<Vec<u8>, DriverError> {
+    rocky_core::product::commit::read_no_follow_bytes(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            DriverError::OutboxMissing(missing(&e))
+        } else {
+            DriverError::OutboxRefused(format!("{}: {e}", path.display()))
+        }
     })
 }
 
 fn read_questions(path: &Path) -> Result<Vec<String>, DriverError> {
-    if !path.exists() {
+    if !path.exists() && !path.is_symlink() {
         return Ok(Vec::new());
     }
-    let raw = std::fs::read(path)
-        .map_err(|e| DriverError::OutboxMissing(format!("{}: {e}", path.display())))?;
+    let raw = read_outbox_bytes(path, |e| format!("{}: {e}", path.display()))?;
     serde_json::from_slice::<Vec<String>>(&raw).map_err(|e| {
         DriverError::OutboxMissing(format!(
             "{} is not a JSON array of strings: {e}",
@@ -1470,6 +1507,45 @@ mod supervision_tests {
             match outcome {
                 Err(DriverError::OutboxMissing(msg)) => assert!(msg.contains("model.sql"), "{msg}"),
                 other => panic!("{kind:?}: no hand-off must be typed: {other:?}"),
+            }
+        }
+    }
+
+    /// #1633, finding 2: the outbox is the worker's to write, so the runner
+    /// reads it through a descriptor. A HARDLINK or a SYMLINK there, naming
+    /// a file outside the project, is refused instead of imported — the
+    /// candidate would otherwise be copied into `products/<name>.toml`, and
+    /// a model hand-off committed into `models/`.
+    #[tokio::test]
+    async fn an_outbox_link_to_an_outside_file_is_refused_not_imported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = dir.path().join("outside_spec.toml");
+        std::fs::write(&outside, "[product]\nname = \"not_yours\"\n").expect("outside");
+        let outside = outside.display().to_string();
+
+        for (kind, file, link) in [
+            (TaskBriefKind::Elicitation, "candidate_spec.toml", "ln"),
+            (TaskBriefKind::Elicitation, "candidate_spec.toml", "ln -s"),
+            (TaskBriefKind::Drafting, "model.sql", "ln"),
+        ] {
+            let project = dir
+                .path()
+                .join(format!("p-{}-{}", kind.as_str(), link.len()));
+            let brief = brief(kind, &project);
+            let outbox = brief.outbox_dir.display().to_string();
+            let script = format!(
+                "{link} {outside} {outbox}/{file}; printf 'x' > {outbox}/model.toml; \
+                 echo {{brief}}"
+            );
+            let driver = subprocess(
+                &["/bin/sh", "-c", &script],
+                Duration::from_secs(30),
+                Duration::from_secs(2),
+            );
+            let (outcome, _) = run(&driver, &brief).await;
+            match outcome {
+                Err(DriverError::OutboxRefused(msg)) => assert!(msg.contains(file), "{msg}"),
+                other => panic!("{kind:?} `{link}` {file}: must be refused: {other:?}"),
             }
         }
     }

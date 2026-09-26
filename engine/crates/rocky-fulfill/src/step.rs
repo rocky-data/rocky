@@ -1614,7 +1614,17 @@ impl Runner {
                 expected_digest,
                 ..
             }) => {
-                // Integrity: the hand-off digest must match the bytes.
+                // The hand-off digest must match the bytes. What that
+                // proves depends on the driver (#1633, ruling 2026-09-26:
+                // document, do not change the protocol). For the
+                // `SubprocessDriver` it is a TRAIT-BOUNDARY guard, not an
+                // integrity check: that driver derives `expected_digest`
+                // from the same bytes it hands over, so this comparison
+                // cannot fail for it. It catches a driver whose digest and
+                // bytes came apart. For the `ReplayDriver` the digest is the
+                // one the recorded session claims, so there it is a real
+                // check (the integrity drill relies on it). Neither proves
+                // the worker wrote the whole candidate.
                 let actual = rocky_core::product::spec::spec_digest(&candidate_spec_bytes);
                 if actual != expected_digest {
                     return Ok(Event::ElicitationFinished {

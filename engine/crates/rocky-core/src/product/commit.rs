@@ -76,15 +76,18 @@
 //! Every leaf the protocol WRITES is guarded at the OPEN —
 //! O_EXCL on each create (portable), `O_NOFOLLOW` on an in-place write
 //! (unix) — and so is every read whose bytes go on to LAND somewhere: the
-//! `.ff-prev` backup source, Phase B's sidecar read, the draft rollback
-//! snapshot. Those two carry a link-count check on the descriptor as well,
+//! `.ff-prev` backup source, recovery's read of that backup, Phase B's
+//! sidecar read, the draft rollback snapshot. Those two carry a link-count check on the descriptor as well,
 //! also unix. Read every claim below about an EXISTING leaf as unix-only;
 //! the Windows paragraph at the end of this header is the whole story
 //! there, and it is a weaker one.
 //!
 //! At the OPEN, precisely. Custody of the staged inode ends when the write
-//! closes it, and the rename that PUBLISHES it (`.ff-staged` → final, and
-//! recovery's `.ff-prev` → final) is pathname-based: a writer who replaces
+//! closes it, and the rename that PUBLISHES it (`.ff-staged` → final) is
+//! pathname-based. Recovery's restore is not a rename: it reads the
+//! `.ff-prev` backup through a no-follow, link-count-checked descriptor and
+//! writes those bytes over the final (#1633), so it publishes the bytes it
+//! validated, never a name. The staged publish stays a rename: a writer who replaces
 //! the staged name with a symlink between the close and the rename gets that
 //! symlink renamed into place as the artifact, because `rename` acts on the
 //! name it is given and never follows it. Nothing is written through the
@@ -1149,6 +1152,44 @@ struct CommitOps<'a> {
     remove: RemoveOp<'a>,
 }
 
+/// Restore one `.ff-prev` backup over its final by copying BYTES through
+/// descriptors, never by renaming the backup's name into place (#1633).
+///
+/// A rename publishes whatever the name `prev` points at. Recovery only
+/// checked that name with `is_symlink`, so a HARDLINK to a file outside the
+/// project, parked at `<final>.ff-prev` under a forged journal entry, was a
+/// regular file to every check and was renamed in: the committed final then
+/// named an outside inode. Here the backup is read with
+/// [`read_no_follow_bytes`], which refuses a symlinked leaf and a hardlinked
+/// descriptor on unix, and the bytes are written with [`write_no_follow`],
+/// which refuses the same at the final. The object validated is the object
+/// read. Windows keeps the path pre-check only, as the module header says.
+///
+/// The restore is now a copy, so it is not atomic. That is safe for the
+/// same reason the rename was: the backup is removed only after the write
+/// succeeds, and the journal only after the whole loop. A crash mid-write
+/// leaves a partial final, the `.ff-prev` and the journal, and the next
+/// recovery reads the marker as uncommitted and repeats this copy.
+///
+/// The final keeps its own mode rather than taking the backup's: an
+/// in-place write does not change it.
+fn restore_backup(prev: &Path, final_path: &Path) -> SpecResult<()> {
+    let bytes = read_no_follow_bytes(prev).map_err(|err| {
+        SpecRejected::new(
+            "commit-io",
+            format!(
+                "reading the backup {} failed: {err}. Recovery restores a backup only by \
+                 reading it through a descriptor that is not a link, so it changes nothing \
+                 here. Inspect that file, replace it with a plain copy if it is the \
+                 previous generation, and re-run.",
+                prev.display()
+            ),
+        )
+    })?;
+    write_no_follow(final_path, &bytes).map_err(|err| io_reject("restoring", final_path, &err))?;
+    std::fs::remove_file(prev).map_err(|err| io_reject("removing", prev, &err))
+}
+
 fn io_reject(action: &str, path: &Path, err: &std::io::Error) -> SpecRejected {
     SpecRejected::new(
         "commit-io",
@@ -1635,8 +1676,7 @@ pub fn recover_generation(project_root: &Path, parsed: &ParsedSpec) -> SpecResul
         // failed attempt would be renamed over the final, undoing a commit
         // the journal never recorded a backup for (#1502).
         if entry.has_prev && prev.exists() {
-            std::fs::rename(&prev, final_path)
-                .map_err(|err| io_reject("restoring", final_path, &err))?;
+            restore_backup(&prev, final_path)?;
         } else if !entry.has_prev && prev.exists() {
             // A backup the journal does not know about. Refusing is the
             // conservative half of the trade this module already made: the
@@ -2922,6 +2962,105 @@ mod tests {
             b"orphan bytes from a failed earlier attempt",
             "recovery must not delete a file it did not create"
         );
+    }
+
+    /// #1633, finding 1: recovery must not publish a HARDLINKED backup.
+    ///
+    /// A hardlink to an outside file, parked at `<final>.ff-prev` under a
+    /// journal entry that records a backup, is a regular file to every path
+    /// check. The rename recovery used to do moved that NAME over the final,
+    /// so the project's committed file named the outside inode. The restore
+    /// now reads the backup through a descriptor that refuses a second link,
+    /// so it refuses and changes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_refuses_a_hardlinked_backup_and_publishes_nothing() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = dir.path().join("outside.toml");
+        write_file(&outside, b"bytes this project does not own");
+        let project = dir.path().join("project");
+        let models = project.join("models");
+        std::fs::create_dir_all(&models).expect("mkdir");
+
+        let final_path = models.join("revenue_daily.contract.toml");
+        write_file(&final_path, b"the uncommitted new contract");
+        let prev = prev_sibling(&final_path);
+        std::fs::hard_link(&outside, &prev).expect("hardlink the backup name to the outside file");
+
+        // `has_prev: true`, and a manifest that never committed, selects the
+        // rollback branch — the one that used to rename `prev` into place.
+        write_journal(
+            &project,
+            "revenue_daily",
+            &forged_journal_payload(&[serde_json::json!({
+                "final": "models/revenue_daily.contract.toml",
+                "staged_sha": content_digest(b"the uncommitted new contract"),
+                "has_prev": true,
+            })]),
+        );
+
+        let error = recover_generation(&project, &parsed_d3())
+            .expect_err("a hardlinked backup must refuse recovery");
+        assert_eq!(error.code, "commit-io", "{error:?}");
+        assert!(error.message.contains(".ff-prev"), "{}", error.message);
+
+        let outside_ino = std::fs::metadata(&outside).expect("outside").ino();
+        assert_ne!(
+            std::fs::metadata(&final_path).expect("final").ino(),
+            outside_ino,
+            "the committed final must not name the outside inode"
+        );
+        assert_eq!(
+            std::fs::read(&final_path).expect("final intact"),
+            b"the uncommitted new contract"
+        );
+        assert_eq!(
+            std::fs::read(&outside).expect("outside intact"),
+            b"bytes this project does not own"
+        );
+        assert!(
+            journal_path(&project, "revenue_daily").is_file(),
+            "a refused recovery keeps its journal"
+        );
+    }
+
+    /// #1633: the restore is a copy, so a crash can leave the final half
+    /// written. The backup and the journal survive until the copy completes,
+    /// so the next recovery repeats it and lands the backup's bytes.
+    #[test]
+    fn a_half_restored_final_is_restored_again_from_the_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("project");
+        let models = project.join("models");
+        std::fs::create_dir_all(&models).expect("mkdir");
+
+        let final_path = models.join("revenue_daily.contract.toml");
+        // What a crash mid-write leaves: a truncated final beside the intact
+        // backup, and the journal that records it.
+        write_file(&final_path, b"the prev");
+        let prev = prev_sibling(&final_path);
+        write_file(&prev, b"the previous committed contract");
+        write_journal(
+            &project,
+            "revenue_daily",
+            &forged_journal_payload(&[serde_json::json!({
+                "final": "models/revenue_daily.contract.toml",
+                "staged_sha": content_digest(b"the uncommitted new contract"),
+                "has_prev": true,
+            })]),
+        );
+
+        assert_eq!(
+            recover_generation(&project, &parsed_d3()).expect("recovers"),
+            RecoveryAction::RolledBack
+        );
+        assert_eq!(
+            std::fs::read(&final_path).expect("final"),
+            b"the previous committed contract"
+        );
+        assert!(!prev.exists(), "the backup is consumed once it is restored");
+        assert!(!journal_path(&project, "revenue_daily").exists());
     }
 
     /// The refusal must be a PAUSE, not a dead end.

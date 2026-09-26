@@ -190,6 +190,12 @@ pub fn load_template(
                              briefs_dir must be a plain relative directory inside the project"
                     )
                 })?;
+            // A brief override is a TRUSTED input, like `rocky.toml`
+            // (decided 2026-09-17 with #1943; #1633). So this is a plain
+            // following read after the containment check, not a
+            // descriptor-bound one: a worker able to write this file is
+            // already outside what the loop defends, and the docs list the
+            // overrides among the files that must stay closed to it.
             if candidate.exists() {
                 std::fs::read_to_string(&candidate).with_context(|| {
                     format!("failed to read brief override {}", candidate.display())
