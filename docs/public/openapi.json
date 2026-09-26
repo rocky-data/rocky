@@ -13948,7 +13948,7 @@
             "type": "string"
           },
           "branch_schema": {
-            "description": "Schema prefix the branch run wrote into (e.g. `branch__fix-price`).",
+            "description": "Schema prefix the branch run wrote into (e.g. `branch__fix_price`).",
             "type": "string"
           },
           "command": {
@@ -21016,16 +21016,31 @@
       "TableCompareResult": {
         "properties": {
           "production_count": {
+            "description": "Null when the warehouse count could not be read.",
             "format": "uint64",
             "minimum": 0.0,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "production_table": {
             "type": "string"
           },
+          "reasons": {
+            "description": "Read errors for an `error` row, or threshold reasons for `warn`/`fail`. Empty for `pass`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "row_count_diff_pct": {
+            "description": "Null unless both counts were read.",
             "format": "double",
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           },
           "row_count_match": {
             "type": "boolean"
@@ -21040,9 +21055,13 @@
             "type": "boolean"
           },
           "shadow_count": {
+            "description": "Null when the warehouse count could not be read.",
             "format": "uint64",
             "minimum": 0.0,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "shadow_table": {
             "type": "string"
@@ -21052,13 +21071,11 @@
           }
         },
         "required": [
-          "production_count",
           "production_table",
-          "row_count_diff_pct",
+          "reasons",
           "row_count_match",
           "schema_diffs",
           "schema_match",
-          "shadow_count",
           "shadow_table",
           "verdict"
         ],

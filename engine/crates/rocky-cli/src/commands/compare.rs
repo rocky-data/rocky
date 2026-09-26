@@ -82,6 +82,77 @@ pub async fn compare(
     thresholds: &ComparisonThresholds,
     output_json: bool,
 ) -> Result<()> {
+    let output = compute_compare(
+        config_path,
+        filter,
+        pipeline_name_arg,
+        shadow_config,
+        thresholds,
+    )
+    .await?;
+
+    if output_json {
+        print_json(&output)?;
+    } else {
+        println!("  Rocky Compare");
+        println!();
+        println!(
+            "  Tables: {} compared, {} passed, {} warned, {} failed",
+            output.tables_compared,
+            output.tables_passed,
+            output.tables_warned,
+            output.tables_failed
+        );
+        println!("  Overall: {}", output.overall_verdict.to_uppercase());
+        println!();
+        for result in &output.results {
+            let icon = match result.verdict.as_str() {
+                "pass" => "  OK",
+                "warn" => "WARN",
+                "fail" => "FAIL",
+                "error" => " ERR",
+                _ => "  ??",
+            };
+            let count = |value: Option<u64>| {
+                value.map_or_else(|| "unreadable".to_string(), |n| n.to_string())
+            };
+            let diff = result.row_count_diff_pct.map_or_else(
+                || "unavailable".to_string(),
+                |pct| format!("{:.2}%", pct * 100.0),
+            );
+            println!(
+                "  [{icon}] {} (prod={}, shadow={}, diff={})",
+                result.production_table,
+                count(result.production_count),
+                count(result.shadow_count),
+                diff,
+            );
+            // Surface WHY, not just that it failed/warned — in particular a
+            // read failure on either side, which used to vanish behind a
+            // silently-defaulted `shadow=0` (#2137).
+            for reason in &result.reasons {
+                println!("         - {reason}");
+            }
+        }
+    }
+
+    if output.tables_failed > 0 {
+        anyhow::bail!("{} table(s) failed comparison", output.tables_failed);
+    }
+
+    Ok(())
+}
+
+/// Build the [`CompareOutput`] `compare` reports — the pure fetch-and-compare
+/// core, with no printing and no exit-status decision, so it can be tested
+/// directly against the real per-pair logic (#2137).
+async fn compute_compare(
+    config_path: &Path,
+    filter: Option<&str>,
+    pipeline_name_arg: Option<&str>,
+    shadow_config: &ShadowConfig,
+    thresholds: &ComparisonThresholds,
+) -> Result<CompareOutput> {
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
         "failed to load config from {}",
         config_path.display()
@@ -154,26 +225,22 @@ pub async fn compare(
     for prod_target in prod_targets {
         let shadow_target = rocky_core::shadow::shadow_target(&prod_target, shadow_config);
 
-        // Get row counts
-        let (prod_count, prod_count_error) = read_or_default(
-            get_row_count(&*adapter, &prod_target).await,
-            &format!(
-                "failed to read production row count for {}",
+        let prod_count = get_row_count(&*adapter, &prod_target).await.map_err(|e| {
+            format!(
+                "failed to read production row count for {}: {e}",
                 prod_target.full_name()
-            ),
-        );
-        let (shadow_count, shadow_count_error) = read_or_default(
-            get_row_count(&*adapter, &shadow_target).await,
-            &format!(
-                "failed to read shadow row count for {}",
+            )
+        });
+        let shadow_count = get_row_count(&*adapter, &shadow_target).await.map_err(|e| {
+            format!(
+                "failed to read shadow row count for {}: {e}",
                 shadow_target.full_name()
-            ),
-        );
-        let counts_read = prod_count_error.is_none() && shadow_count_error.is_none();
-
-        let (row_count_match, row_count_diff, row_count_diff_pct) =
-            compare::compare_row_counts(shadow_count, prod_count);
-        let row_count_match = counts_read && row_count_match;
+            )
+        });
+        let row_metrics = match (prod_count.as_ref(), shadow_count.as_ref()) {
+            (Ok(prod), Ok(shadow)) => Some(compare::compare_row_counts(*shadow, *prod)),
+            _ => None,
+        };
 
         // Get schemas
         let prod_table_ref = rocky_ir::TableRef {
@@ -187,64 +254,73 @@ pub async fn compare(
             table: shadow_target.table.clone(),
         };
 
-        let (prod_cols, prod_schema_error) = read_or_default(
-            adapter.describe_table(&prod_table_ref).await,
-            &format!(
-                "failed to read production schema for {}",
+        let prod_cols = adapter.describe_table(&prod_table_ref).await.map_err(|e| {
+            format!(
+                "failed to read production schema for {}: {e}",
                 prod_target.full_name()
-            ),
-        );
-        let (shadow_cols, shadow_schema_error) = read_or_default(
-            adapter.describe_table(&shadow_table_ref).await,
-            &format!(
-                "failed to read shadow schema for {}",
-                shadow_target.full_name()
-            ),
-        );
-        let schemas_read = prod_schema_error.is_none() && shadow_schema_error.is_none();
-
-        let schema_diffs = compare::compare_schemas(&shadow_cols, &prod_cols);
-        let schema_match = schemas_read && schema_diffs.is_empty();
-
-        // Build comparison result and evaluate
-        let comparison = ComparisonResult {
-            table: prod_target.full_name(),
-            row_count_match,
-            shadow_count,
-            production_count: prod_count,
-            row_count_diff,
-            row_count_diff_pct,
-            schema_match,
-            schema_diffs: schema_diffs.clone(),
-            sample_match: None,
-            sample_mismatches: vec![],
+            )
+        });
+        let shadow_cols = adapter
+            .describe_table(&shadow_table_ref)
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to read shadow schema for {}: {e}",
+                    shadow_target.full_name()
+                )
+            });
+        let schema_diffs = match (prod_cols.as_ref(), shadow_cols.as_ref()) {
+            (Ok(prod), Ok(shadow)) => compare::compare_schemas(shadow, prod),
+            _ => Vec::new(),
         };
-
+        let schema_match = prod_cols.is_ok() && shadow_cols.is_ok() && schema_diffs.is_empty();
         let read_failures: Vec<String> = [
-            prod_count_error,
-            shadow_count_error,
-            prod_schema_error,
-            shadow_schema_error,
+            prod_count.as_ref().err(),
+            shadow_count.as_ref().err(),
+            prod_cols.as_ref().err(),
+            shadow_cols.as_ref().err(),
         ]
         .into_iter()
         .flatten()
+        .cloned()
         .collect();
-        let verdict = if read_failures.is_empty() {
-            compare::evaluate_comparison(&comparison, thresholds)
+
+        let (verdict_str, verdict_reasons) = if !read_failures.is_empty() {
+            ("error", read_failures)
+        } else if let (
+            Ok(prod),
+            Ok(shadow),
+            Some((row_count_match, row_count_diff, row_count_diff_pct)),
+        ) = (prod_count.as_ref(), shadow_count.as_ref(), row_metrics)
+        {
+            let comparison = ComparisonResult {
+                table: prod_target.full_name(),
+                row_count_match,
+                shadow_count: *shadow,
+                production_count: *prod,
+                row_count_diff,
+                row_count_diff_pct,
+                schema_match,
+                schema_diffs: schema_diffs.clone(),
+                sample_match: None,
+                sample_mismatches: vec![],
+            };
+            match compare::evaluate_comparison(&comparison, thresholds) {
+                ComparisonVerdict::Pass => ("pass", Vec::new()),
+                ComparisonVerdict::Warn(reasons) => ("warn", reasons),
+                ComparisonVerdict::Fail(reasons) => ("fail", reasons),
+            }
         } else {
-            ComparisonVerdict::Fail(read_failures)
+            anyhow::bail!(
+                "comparison read state was inconsistent for {}",
+                prod_target.full_name()
+            );
         };
 
-        let verdict_str = match &verdict {
-            ComparisonVerdict::Pass => "pass",
-            ComparisonVerdict::Warn(_) => "warn",
-            ComparisonVerdict::Fail(_) => "fail",
-        };
-
-        match verdict {
-            ComparisonVerdict::Pass => output.tables_passed += 1,
-            ComparisonVerdict::Warn(_) => output.tables_warned += 1,
-            ComparisonVerdict::Fail(_) => output.tables_failed += 1,
+        match verdict_str {
+            "pass" => output.tables_passed += 1,
+            "warn" => output.tables_warned += 1,
+            _ => output.tables_failed += 1,
         }
 
         let schema_diff_strs: Vec<String> = schema_diffs.iter().map(|d| format!("{d:?}")).collect();
@@ -252,13 +328,14 @@ pub async fn compare(
         output.results.push(TableCompareResult {
             production_table: prod_target.full_name(),
             shadow_table: shadow_target.full_name(),
-            row_count_match,
-            production_count: prod_count,
-            shadow_count,
-            row_count_diff_pct,
+            row_count_match: row_metrics.is_some_and(|metrics| metrics.0),
+            production_count: prod_count.ok(),
+            shadow_count: shadow_count.ok(),
+            row_count_diff_pct: row_metrics.map(|metrics| metrics.2),
             schema_match,
             schema_diffs: schema_diff_strs,
             verdict: verdict_str.to_string(),
+            reasons: verdict_reasons,
         });
 
         output.tables_compared += 1;
@@ -280,52 +357,7 @@ pub async fn compare(
         "pass".to_string()
     };
 
-    if output_json {
-        print_json(&output)?;
-    } else {
-        println!("  Rocky Compare");
-        println!();
-        println!(
-            "  Tables: {} compared, {} passed, {} warned, {} failed",
-            output.tables_compared,
-            output.tables_passed,
-            output.tables_warned,
-            output.tables_failed
-        );
-        println!("  Overall: {}", output.overall_verdict.to_uppercase());
-        println!();
-        for result in &output.results {
-            let icon = match result.verdict.as_str() {
-                "pass" => "  OK",
-                "warn" => "WARN",
-                "fail" => "FAIL",
-                _ => "  ??",
-            };
-            println!(
-                "  [{icon}] {} (prod={}, shadow={}, diff={:.2}%)",
-                result.production_table,
-                result.production_count,
-                result.shadow_count,
-                result.row_count_diff_pct * 100.0,
-            );
-        }
-    }
-
-    if output.tables_failed > 0 {
-        anyhow::bail!("{} table(s) failed comparison", output.tables_failed);
-    }
-
-    Ok(())
-}
-
-fn read_or_default<T: Default, E: std::fmt::Display>(
-    result: std::result::Result<T, E>,
-    context: &str,
-) -> (T, Option<String>) {
-    match result {
-        Ok(value) => (value, None),
-        Err(error) => (T::default(), Some(format!("{context}: {error}"))),
-    }
+    Ok(output)
 }
 
 /// Get the row count for a target table.
@@ -441,6 +473,115 @@ auto_create_schemas = true
         assert!(
             error.to_string().contains("1 table(s) failed comparison"),
             "the model's target must have been compared, not skipped: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_branch_table_is_an_error_without_an_invented_count() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let db_path = temp.path().join("compare.duckdb");
+        let adapter = DuckDbWarehouseAdapter::open(&db_path).expect("open DuckDB");
+        for stmt in [
+            "CREATE SCHEMA mart",
+            "CREATE TABLE mart.orders (id INTEGER)",
+            "INSERT INTO mart.orders VALUES (1)",
+        ] {
+            adapter.execute_statement(stmt).await.expect(stmt);
+        }
+        drop(adapter);
+
+        let models = temp.path().join("models");
+        std::fs::create_dir_all(&models).expect("mkdir models");
+        std::fs::write(models.join("orders.sql"), "SELECT 1 AS id").expect("write sql");
+        std::fs::write(
+            models.join("orders.toml"),
+            "name = \"orders\"\n[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"compare\"\nschema = \"mart\"\ntable = \"orders\"\n",
+        )
+        .expect("write sidecar");
+        let config_path = temp.path().join("rocky.toml");
+        let escaped_db_path = db_path.to_string_lossy().replace('\\', "\\\\");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"{escaped_db_path}\"\n\
+                 [pipeline.marts]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+                 [pipeline.marts.target.governance]\nauto_create_schemas = true\n"
+            ),
+        )
+        .expect("write config");
+        let state_path = temp.path().join("state.redb");
+        crate::commands::branch::run_branch_create(&state_path, "pr_preview_x", None, false)
+            .expect("register branch");
+        let shadow = crate::commands::branch::resolve_branch_shadow_config(
+            &state_path,
+            "pr_preview_x",
+            "_rocky_shadow".to_string(),
+        )
+        .expect("resolve branch");
+
+        let output = compute_compare(
+            &config_path,
+            None,
+            None,
+            &shadow,
+            &ComparisonThresholds::default(),
+        )
+        .await
+        .expect("build comparison rows");
+        assert_eq!(output.tables_failed, 1);
+        let row = &output.results[0];
+        assert_eq!(row.verdict, "error");
+        assert_eq!(row.production_count, Some(1));
+        assert_eq!(row.shadow_count, None);
+        assert_eq!(row.row_count_diff_pct, None);
+        assert!(
+            row.reasons
+                .iter()
+                .any(|r| r.contains("failed to read shadow row count"))
+        );
+        let json = serde_json::to_value(row).expect("serialize row");
+        assert!(json["shadow_count"].is_null());
+        assert!(json["row_count_diff_pct"].is_null());
+
+        let err = compare(
+            &config_path,
+            None,
+            None,
+            &shadow,
+            &ComparisonThresholds::default(),
+            false,
+        )
+        .await
+        .expect_err("the real compare command must fail on an unreadable shadow");
+        assert!(err.to_string().contains("1 table(s) failed comparison"));
+
+        let adapter = DuckDbWarehouseAdapter::open(&db_path).expect("reopen DuckDB");
+        for stmt in [
+            "CREATE SCHEMA branch__pr_preview_x",
+            "CREATE TABLE branch__pr_preview_x.orders (id INTEGER)",
+            "INSERT INTO branch__pr_preview_x.orders VALUES (1), (2)",
+            "DROP TABLE mart.orders",
+        ] {
+            adapter.execute_statement(stmt).await.expect(stmt);
+        }
+        drop(adapter);
+        let output = compute_compare(
+            &config_path,
+            None,
+            None,
+            &shadow,
+            &ComparisonThresholds::default(),
+        )
+        .await
+        .expect("build comparison rows");
+        let row = &output.results[0];
+        assert_eq!(row.verdict, "error");
+        assert_eq!(row.production_count, None);
+        assert_eq!(row.shadow_count, Some(2));
+        assert!(
+            row.reasons
+                .iter()
+                .any(|r| r.contains("failed to read production row count"))
         );
     }
 

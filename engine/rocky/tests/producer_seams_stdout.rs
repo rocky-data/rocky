@@ -293,7 +293,7 @@ fn branch_list_and_show_print_what_their_seams_return() {
     let state_path = dir.path().join("state.redb");
     // Seeded through the production create path, in process; its own JSON
     // goes to this test's stdout and is not under test.
-    run_branch_create(&state_path, "fix-price", Some("a description"), true).unwrap();
+    run_branch_create(&state_path, "fix_price", Some("a description"), true).unwrap();
     let state = state_path.to_str().unwrap();
 
     let list = rocky_stdout(
@@ -305,7 +305,7 @@ fn branch_list_and_show_print_what_their_seams_return() {
         reference_bytes!(compute_branch_list(&state_path).unwrap())
     );
     assert!(
-        list.contains("fix-price"),
+        list.contains("fix_price"),
         "the list names the branch: {list}"
     );
 
@@ -316,14 +316,14 @@ fn branch_list_and_show_print_what_their_seams_return() {
             state,
             "branch",
             "show",
-            "fix-price",
+            "fix_price",
             "--output",
             "json",
         ],
     );
     assert_eq!(
         show,
-        reference_bytes!(compute_branch_show(&state_path, "fix-price").unwrap())
+        reference_bytes!(compute_branch_show(&state_path, "fix_price").unwrap())
     );
     assert!(
         show.contains("\"command\": \"branch show\""),

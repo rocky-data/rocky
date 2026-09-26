@@ -81,6 +81,11 @@ pub async fn run_preview_create(
     branch_name: Option<&str>,
     json: bool,
 ) -> Result<()> {
+    let resolved_branch_name = match branch_name {
+        Some(name) => name.to_string(),
+        None => default_branch_name_from_git()?,
+    };
+    crate::commands::branch::validate_branch_name_pub(&resolved_branch_name)?;
     let start = Instant::now();
 
     // `base_ref` is operator-/CI-supplied and flows into `git` as a positional
@@ -134,24 +139,13 @@ pub async fn run_preview_create(
         .filter(|m| !prune_names.contains(m))
         .collect();
 
-    // Resolve branch name (default: from current git branch).
-    let resolved_branch_name = match branch_name {
-        Some(n) => n.to_string(),
-        None => default_branch_name_from_git()?,
-    };
-
     // Step 6+7: register branch in state store. Idempotent — if the branch
     // already exists, surface a crisp error directing the user to
     // `rocky branch list`.
-    crate::commands::run_branch_create(
-        state_path,
-        &resolved_branch_name,
-        None,
-        /*json=*/ false,
-    )
-    .with_context(|| {
-        format!("failed to register preview branch '{resolved_branch_name}' in the state store")
-    })?;
+    crate::commands::branch::register_branch(state_path, &resolved_branch_name, None)
+        .with_context(|| {
+            format!("failed to register preview branch '{resolved_branch_name}' in the state store")
+        })?;
 
     let branch_schema = format!("branch__{resolved_branch_name}");
 
@@ -496,6 +490,8 @@ pub async fn run_preview_diff(
     json: bool,
 ) -> Result<()> {
     use crate::output::PreviewDiffOutput;
+
+    crate::commands::branch::validate_branch_name_pub(branch_name)?;
 
     let store = rocky_core::state::StateStore::open_read_only(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
@@ -1251,6 +1247,8 @@ pub async fn run_preview_cost(
 ) -> Result<()> {
     use crate::output::PreviewCostOutput;
 
+    crate::commands::branch::validate_branch_name_pub(branch_name)?;
+
     let store = rocky_core::state::StateStore::open_read_only(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
@@ -1764,6 +1762,25 @@ fn git_head_sha() -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Slug a git ref (or anything else) down to `[A-Za-z0-9_]`, the charset
+/// [`validate_branch_name`](crate::commands::branch) — reached via
+/// [`run_branch_create`] — actually accepts (#2137: a branch's unquoted
+/// schema `branch__<name>` must pass the SQL-identifier rule
+/// `^[a-zA-Z0-9_]+$`). Every character outside `[A-Za-z0-9_]` becomes `_`,
+/// including `/`, `-`, and a non-ASCII letter such as `é` — `char::is_alphanumeric`
+/// accepts the latter, which is why this uses `is_ascii_alphanumeric` instead.
+fn slugify_git_ref(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+fn preview_branch_name_from_git_ref(raw: &str) -> String {
+    const PREFIX: &str = "pr_preview_";
+    let slug = slugify_git_ref(raw);
+    format!("{PREFIX}{}", &slug[..slug.len().min(64 - PREFIX.len())])
+}
+
 /// Resolve the current branch name into a stable preview-branch slug.
 /// Falls back to a timestamp-based name if no branch is checked out
 /// (e.g. detached HEAD).
@@ -1773,24 +1790,13 @@ fn default_branch_name_from_git() -> Result<String> {
         .output()
         .context("`git rev-parse --abbrev-ref HEAD` failed")?;
     if !out.status.success() {
-        return Ok(format!("pr-preview-{}", Utc::now().format("%Y%m%d-%H%M%S")));
+        return Ok(format!("pr_preview_{}", Utc::now().format("%Y%m%d_%H%M%S")));
     }
     let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if raw.is_empty() || raw == "HEAD" {
-        Ok(format!("pr-preview-{}", Utc::now().format("%Y%m%d-%H%M%S")))
+        Ok(format!("pr_preview_{}", Utc::now().format("%Y%m%d_%H%M%S")))
     } else {
-        // Slug: replace `/` and other path-unfriendly chars with `_`.
-        let slug: String = raw
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        Ok(format!("pr-preview-{slug}"))
+        Ok(preview_branch_name_from_git_ref(&raw))
     }
 }
 
@@ -2230,6 +2236,74 @@ mod tests {
     };
     use std::io::Write;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn preview_name_entry_points_refuse_hyphens_before_io() {
+        let temp = TempDir::new().unwrap();
+        let config = temp.path().join("missing.toml");
+        let state = temp.path().join("missing.redb");
+        let models = temp.path().join("missing-models");
+        let errors = [
+            run_preview_create(
+                &config,
+                &state,
+                &models,
+                "main",
+                Some("pr-preview-x"),
+                false,
+            )
+            .await
+            .unwrap_err(),
+            run_preview_diff(
+                &config,
+                &state,
+                &models,
+                "pr-preview-x",
+                "main",
+                PreviewDiffAlgorithmSelector::Bisection,
+                false,
+            )
+            .await
+            .unwrap_err(),
+            run_preview_cost(&config, &state, &models, "pr-preview-x", false)
+                .await
+                .unwrap_err(),
+        ];
+        for error in errors {
+            let message = format!("{error:#}");
+            assert!(message.contains("[A-Za-z0-9_]"), "{message}");
+            assert!(message.contains("pr_preview_x"), "{message}");
+            assert!(!message.contains("failed to open state store"), "{message}");
+        }
+    }
+
+    /// #2137: a git branch like `fix/price-bug` used to slug to
+    /// `fix_price-bug` (the hyphen was deliberately preserved) — a shape
+    /// `validate_branch_name` now refuses. Every non-ASCII-alphanumeric
+    /// character, hyphen included, must become `_`. A non-ASCII letter such
+    /// as `é` is the regression this guards specifically: `char::is_alphanumeric`
+    /// (Unicode-aware) would have let it through unslugged, which also fails
+    /// `^[A-Za-z0-9_]+$`.
+    #[test]
+    fn slugify_git_ref_produces_only_ascii_alphanumeric_and_underscore() {
+        assert_eq!(slugify_git_ref("fix/price-bug"), "fix_price_bug");
+        assert_eq!(slugify_git_ref("fix-é-price"), "fix___price");
+        assert_eq!(slugify_git_ref("feature_ok_123"), "feature_ok_123");
+        let name = preview_branch_name_from_git_ref(&"x".repeat(100));
+        assert_eq!(name.len(), 64);
+        crate::commands::branch::validate_branch_name_pub(&name).unwrap();
+    }
+
+    #[test]
+    fn default_preview_branch_name_is_accepted_by_branch_create_rule() {
+        let from_ref = preview_branch_name_from_git_ref("fix/price-bug");
+        assert!(from_ref.starts_with("pr_preview_"), "{from_ref}");
+        crate::commands::branch::validate_branch_name_pub(&from_ref).unwrap();
+        let name = default_branch_name_from_git().expect("derive preview name from git");
+        assert!(name.starts_with("pr_preview_"), "{name}");
+        crate::commands::branch::validate_branch_name_pub(&name)
+            .expect("the default must be accepted by branch create");
+    }
 
     /// A no-op preview (no changes, no copies, no skips, no run) renders
     /// without panicking and surfaces the `<no-op>` sentinel.

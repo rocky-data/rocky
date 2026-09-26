@@ -101,7 +101,7 @@ The gate fires once. A blocked promote produces no `plan_id`, so `rocky apply` h
 In a project whose `rocky.toml` declares more than one pipeline, pass `--pipeline <name>` to `rocky plan promote`. The plan records the resolved pipeline, so `rocky apply <plan-id>` reads it from the plan and needs no `--pipeline` flag of its own:
 
 ```bash
-plan_id=$(rocky plan promote fix-price --pipeline shopify_us --output json | jq -r .plan_id)
+plan_id=$(rocky plan promote fix_price --pipeline shopify_us --output json | jq -r .plan_id)
 rocky apply "$plan_id"
 ```
 :::
@@ -111,11 +111,11 @@ rocky apply "$plan_id"
 rocky ci-diff --semantic
 
 # Promote-time: gate (blocks on `breaking` findings)
-plan_id=$(rocky plan promote fix-price --base main --output json | jq -r .plan_id)
+plan_id=$(rocky plan promote fix_price --base main --output json | jq -r .plan_id)
 rocky apply "$plan_id"
 
 # Promote-time override (audited)
-plan_id=$(rocky plan promote fix-price --base main --allow-breaking --output json | jq -r .plan_id)
+plan_id=$(rocky plan promote fix_price --base main --allow-breaking --output json | jq -r .plan_id)
 rocky apply "$plan_id"
 ```
 
