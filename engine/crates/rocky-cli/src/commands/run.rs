@@ -12970,7 +12970,8 @@ fn strategy_implies_object_kind(
 #[error(
     "target {target} exists as a {existing_kind}, but the strategy now asks for a \
      {expected_kind}. Rocky does not drop an existing object implicitly. Run \
-     `DROP {existing_kind_sql} {target}` first, then re-run."
+     `DROP {existing_kind_sql} {target}` first, then re-run. Or set \
+     `replace_existing = \"{existing_kind}\"` in the model sidecar to let Rocky drop it."
 )]
 struct StrategyKindMismatch {
     target: String,
@@ -13089,11 +13090,25 @@ async fn execute_one_plain_model(
         // Exhaustive over `existing_kind` (no `_ =>`) so a future
         // `ObjectKind` variant fails to compile here instead of silently
         // falling into "skip" or "mismatch".
-        match existing_kind {
-            rocky_core::traits::ObjectKind::Unknown => {}
-            rocky_core::traits::ObjectKind::Table | rocky_core::traits::ObjectKind::View
-                if existing_kind == expected_kind => {}
-            rocky_core::traits::ObjectKind::Table => {
+        //
+        // A mismatch refuses unless the sidecar's `replace_existing` names
+        // the kind the warehouse reported (#2037, part 2). The drop is then
+        // the reviewed opt-in: `Unknown` never reaches it.
+        use rocky_core::models::ReplaceExisting;
+        let drop_sql = match (existing_kind, model.config.replace_existing) {
+            (rocky_core::traits::ObjectKind::Unknown, _) => None,
+            (rocky_core::traits::ObjectKind::Table | rocky_core::traits::ObjectKind::View, _)
+                if existing_kind == expected_kind =>
+            {
+                None
+            }
+            (rocky_core::traits::ObjectKind::Table, Some(ReplaceExisting::Table)) => {
+                Some(dialect.drop_table_sql(&target_ref))
+            }
+            (rocky_core::traits::ObjectKind::View, Some(ReplaceExisting::View)) => {
+                Some(format!("DROP VIEW IF EXISTS {target_ref}"))
+            }
+            (rocky_core::traits::ObjectKind::Table, None | Some(ReplaceExisting::View)) => {
                 return Err(strategy_kind_mismatch_error(
                     model_name,
                     &target_ref,
@@ -13102,7 +13117,7 @@ async fn execute_one_plain_model(
                     "TABLE",
                 ));
             }
-            rocky_core::traits::ObjectKind::View => {
+            (rocky_core::traits::ObjectKind::View, None | Some(ReplaceExisting::Table)) => {
                 return Err(strategy_kind_mismatch_error(
                     model_name,
                     &target_ref,
@@ -13111,6 +13126,18 @@ async fn execute_one_plain_model(
                     "VIEW",
                 ));
             }
+        };
+        if let Some(drop_sql) = drop_sql {
+            tracing::warn!(
+                model = model_name,
+                target = %target_ref,
+                "replace_existing: dropping the existing object before the strategy replaces it"
+            );
+            warehouse
+                .execute_statement(&drop_sql)
+                .await
+                .map_err(anyhow::Error::from)
+                .with_context(|| format!("model '{model_name}' failed"))?;
         }
     }
 
@@ -23918,6 +23945,155 @@ table = "orders_view"
             .await
             .unwrap();
         assert_eq!(kind, ObjectKind::Table);
+    }
+
+    /// Runs `orders_view` once over a pre-existing target for the #2037
+    /// `replace_existing` tests. Returns the run result, the target's kind
+    /// afterwards, and its row count.
+    #[cfg(feature = "duckdb")]
+    async fn run_strategy_switch(
+        existing_ddl: &str,
+        strategy: &str,
+        replace_existing: &str,
+    ) -> (
+        Result<MaterializationOutput>,
+        rocky_core::traits::ObjectKind,
+        i64,
+    ) {
+        use rocky_core::models::load_model_pair;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+        use rocky_ir::TableRef;
+
+        let warehouse = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for ddl in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.orders (id INTEGER)",
+            "INSERT INTO src.orders VALUES (1), (2)",
+            existing_ddl,
+        ] {
+            warehouse.execute_statement(ddl).await.unwrap();
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("orders_view.toml"),
+            format!(
+                "name = \"orders_view\"\n{replace_existing}\n\n[strategy]\ntype = \"{strategy}\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"tgt\"\ntable = \"orders_view\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("orders_view.sql"),
+            "SELECT id FROM src.orders",
+        )
+        .unwrap();
+        let model = load_model_pair(
+            &dir.path().join("orders_view.sql"),
+            &dir.path().join("orders_view.toml"),
+            None,
+        )
+        .expect("load model");
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+        };
+        let result = super::execute_one_plain_model(
+            &model,
+            &warehouse as &dyn WarehouseAdapter,
+            &DuckDbSqlDialect as &dyn rocky_core::traits::SqlDialect,
+            "orders_view",
+            std::time::Instant::now(),
+            exec_ctx,
+        )
+        .await;
+        let kind = warehouse
+            .object_kind(&TableRef {
+                catalog: String::new(),
+                schema: "tgt".into(),
+                table: "orders_view".into(),
+            })
+            .await
+            .unwrap();
+        let r = warehouse
+            .execute_query("SELECT COUNT(*) FROM tgt.orders_view")
+            .await
+            .unwrap();
+        let cell = &r.rows[0][0];
+        let rows = cell
+            .as_i64()
+            .or_else(|| cell.as_str().and_then(|s| s.parse::<i64>().ok()))
+            .unwrap();
+        (result, kind, rows)
+    }
+
+    /// #2037, part 2: `replace_existing = "view"` lets a `view` ->
+    /// `full_refresh` switch drop the old view and build the table.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn replace_existing_view_lets_full_refresh_replace_a_view() {
+        let (result, kind, rows) = run_strategy_switch(
+            "CREATE VIEW tgt.orders_view AS SELECT * FROM src.orders",
+            "full_refresh",
+            "replace_existing = \"view\"",
+        )
+        .await;
+        if let Err(e) = result {
+            panic!("the opt-in names the existing kind, so the run succeeds: {e:#}");
+        }
+        assert_eq!(kind, rocky_core::traits::ObjectKind::Table);
+        assert_eq!(rows, 2);
+    }
+
+    /// #2037, part 2, the reverse: `replace_existing = "table"` lets a
+    /// `full_refresh` -> `view` switch drop the old table.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn replace_existing_table_lets_view_replace_a_table() {
+        let (result, kind, rows) = run_strategy_switch(
+            "CREATE TABLE tgt.orders_view AS SELECT * FROM src.orders",
+            "view",
+            "replace_existing = \"table\"",
+        )
+        .await;
+        if let Err(e) = result {
+            panic!("the opt-in names the existing kind, so the run succeeds: {e:#}");
+        }
+        assert_eq!(kind, rocky_core::traits::ObjectKind::View);
+        assert_eq!(rows, 2);
+    }
+
+    /// #2037, part 2: the opt-in names the kind it may drop. A setting that
+    /// names the other kind does not authorize this drop: Rocky refuses,
+    /// leaves the object, and names the setting that would allow it.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn replace_existing_for_the_other_kind_still_refuses() {
+        let (result, kind, _) = run_strategy_switch(
+            "CREATE VIEW tgt.orders_view AS SELECT * FROM src.orders",
+            "full_refresh",
+            "replace_existing = \"table\"",
+        )
+        .await;
+        let message = match result {
+            Ok(_) => panic!("a setting for the other kind must not drop the view"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            message.contains("DROP VIEW tgt.orders_view"),
+            "names the manual fix: {message}"
+        );
+        assert!(
+            message.contains("replace_existing = \"view\""),
+            "names the opt-in: {message}"
+        );
+        assert_eq!(kind, rocky_core::traits::ObjectKind::View);
     }
 
     /// Fail-closed bootstrap — time_interval path (`execute_time_interval_model`).

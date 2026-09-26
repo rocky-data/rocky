@@ -272,6 +272,13 @@ pub struct ModelConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip: Option<SkipConfig>,
 
+    /// The existing object kind this model may drop when its strategy asks
+    /// for the other kind (#2037). Parsed from the `replace_existing`
+    /// sidecar key. `None` ⇒ Rocky refuses and names the `DROP` to run.
+    /// See [`ReplaceExisting`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_existing: Option<ReplaceExisting>,
+
     /// Pre-substitution value of the `name` field as it appeared in the
     /// sidecar TOML (or the filename stem when `name` was omitted).
     ///
@@ -574,6 +581,11 @@ pub struct RawModelConfig {
     #[serde(default)]
     pub skip: Option<SkipConfig>,
 
+    /// The `replace_existing` sidecar key. See
+    /// [`ModelConfig::replace_existing`].
+    #[serde(default)]
+    pub replace_existing: Option<ReplaceExisting>,
+
     /// Name of a config group (`models/groups/<name>.toml`) this model opts
     /// into. The group supplies shared routing (`schema_template`) and
     /// `strategy` for a fan-out of models; per-model sidecar fields still win
@@ -630,6 +642,33 @@ pub struct SkipConfig {
     /// `None` ⇒ trust the static scan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deterministic: Option<bool>,
+}
+
+/// `replace_existing` — the one object kind a model may drop when its
+/// strategy switches between `view` and `full_refresh` (#2037).
+///
+/// `CREATE OR REPLACE <kind>` replaces only an object of the same kind. When
+/// the target exists as the other kind, Rocky refuses by default: a table can
+/// hold rows Rocky cannot rebuild. This key names the kind Rocky may drop, so
+/// the drop is a reviewed, per-model decision:
+///
+/// ```toml
+/// name = "orders_view"
+/// replace_existing = "table"   # the target was a table; it may be dropped
+///
+/// [strategy]
+/// type = "view"
+/// ```
+///
+/// Rocky acts only when the warehouse reports the target's kind and that
+/// kind matches this value. It never drops an object of unknown kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplaceExisting {
+    /// An existing view may be dropped so a table can replace it.
+    View,
+    /// An existing table may be dropped so a view can replace it.
+    Table,
 }
 
 /// Permissive target config — all fields optional.
@@ -1252,6 +1291,7 @@ fn resolve_model_config(
         retention,
         budget: raw.budget,
         skip: raw.skip,
+        replace_existing: raw.replace_existing,
         name_declared,
         target_table_declared,
     })

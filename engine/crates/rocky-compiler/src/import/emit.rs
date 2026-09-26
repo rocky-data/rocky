@@ -1075,6 +1075,7 @@ mod tests {
                 retention: None,
                 budget: None,
                 skip: None,
+                replace_existing: None,
                 name_declared: String::new(),
                 target_table_declared: String::new(),
             },
@@ -1179,6 +1180,7 @@ mod tests {
             retention: None,
             budget: None,
             skip: None,
+            replace_existing: None,
             name_declared: String::new(),
             target_table_declared: String::new(),
         };

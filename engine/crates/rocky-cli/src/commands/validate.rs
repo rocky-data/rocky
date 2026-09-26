@@ -3946,6 +3946,7 @@ schema_template = "demo"
                 retention: None,
                 budget: None,
                 skip: None,
+                replace_existing: None,
                 name_declared: "customer_facts".into(),
                 target_table_declared: "${ROCKY_TABLE_OVERRIDE:-customer_facts}".into(),
             },
@@ -4008,6 +4009,7 @@ target.adapter = "default"
                 budget: None,
                 // Declared literally — same value as `name_declared`.
                 skip: None,
+                replace_existing: None,
                 name_declared: "customer_facts".into(),
                 target_table_declared: "customer_facts".into(),
             },

@@ -1107,6 +1107,7 @@ fn import_manifest_node(
         retention: None,
         budget: None,
         skip: None,
+        replace_existing: None,
         name_declared: String::new(),
         target_table_declared: String::new(),
     };
@@ -2194,6 +2195,7 @@ fn import_single_model(
         retention: None,
         budget: None,
         skip: None,
+        replace_existing: None,
         name_declared: String::new(),
         target_table_declared: String::new(),
     };

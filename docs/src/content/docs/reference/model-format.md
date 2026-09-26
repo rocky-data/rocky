@@ -56,6 +56,7 @@ The `.toml` file names the model, lists what it depends on, picks a materializat
 | `depends_on` | list of strings | No | Names of upstream models that must run before this one. Defaults to `[]`. |
 | `group` | string | No | Name of a [config group](#config-groups) (`models/groups/<name>.toml`) this model opts into for shared routing and materialization. |
 | `retention` | string | No | Data retention policy for this model. Grammar `^\d+[dy]$` — e.g. `"90d"` or `"1y"`. See [Retention](#retention). |
+| `replace_existing` | string | No | `"view"` or `"table"`. The existing object kind Rocky may drop when the strategy switches between `view` and `full_refresh`. See [Switching between a view and a table](#switching-between-a-view-and-a-table). |
 
 **`[args]`** -- Placeholder values for a config group's `schema_template` (only meaningful when the model declares a `group`):
 
@@ -132,6 +133,31 @@ deterministic = true    # owner asserts the SQL is pure → re-eligible despite 
 - it uses a `content_addressed` or `time_interval` strategy (a `full_refresh` model **is** eligible).
 
 `deterministic = true` overrides only the first bullet. Even an eligible model is skipped only when its logic and every upstream's data are both unchanged. See [Skip Unchanged Models and Defer to Prod](/guides/skip-and-defer/) for the full workflow and the `[run]` tuning knobs.
+
+### Switching between a view and a table
+
+`CREATE OR REPLACE VIEW` replaces only a view. `CREATE OR REPLACE TABLE` replaces only a table. So when a model moves between `type = "view"` and `type = "full_refresh"`, the old object is in the way.
+
+Rocky does not drop an existing object implicitly. The run fails for that model, and the message names the target, its kind, and the `DROP` statement to run. A table can hold rows that Rocky cannot rebuild, so the drop is your decision.
+
+To let Rocky drop it, name the kind it may drop in the sidecar:
+
+```toml
+name = "orders_view"
+replace_existing = "table"   # the target is a table today; Rocky may drop it
+
+[strategy]
+type = "view"
+```
+
+| Existing object | Strategy | `replace_existing` | Result |
+|---|---|---|---|
+| view | `full_refresh` | `"view"` | Rocky drops the view, then builds the table. |
+| table | `view` | `"table"` | Rocky drops the table, then creates the view. |
+| view or table | the other kind | absent, or the other value | The run refuses and names the `DROP` to run. |
+| unknown | any | any | Rocky drops nothing. The warehouse's own statement runs. |
+
+Rocky acts only when the warehouse reports the object's kind. Today only DuckDB reports it. On other warehouses the setting has no effect, and a kind mismatch fails with the warehouse's own error. Remove the key after the switch: it is not needed once the target has the new kind.
 
 ### Environment variables
 

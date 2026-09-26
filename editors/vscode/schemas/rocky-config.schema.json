@@ -75,6 +75,11 @@
         }
       },
       "additionalProperties": false
+    },
+    "replace_existing": {
+      "type": "string",
+      "enum": ["view", "table"],
+      "description": "The existing object kind Rocky may drop when the strategy switches between view and full_refresh. Without it, Rocky refuses and names the DROP to run."
     }
   },
   "additionalProperties": false,
