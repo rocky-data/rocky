@@ -4996,6 +4996,7 @@ pub async fn run_apply_inline_for_run(
     skip_opts: &crate::commands::run::SkipRunOptions,
     run_vars: &rocky_core::run_vars::RunVars,
     assume_fresh_state: bool,
+    contracts_dir: Option<&Path>,
 ) -> Result<()> {
     // THE single fingerprinted config load for a bare `rocky run` (#1120):
     // this entry point loaded nothing before this change (run() re-read the
@@ -5006,7 +5007,7 @@ pub async fn run_apply_inline_for_run(
             .with_context(|| format!("failed to load config from {}", config_path.display()))?,
     );
     // Thin passthrough — routes to the existing run implementation.
-    crate::commands::run::run(
+    crate::commands::run::run_with_explicit_contracts(
         config_path,
         loaded,
         filter,
@@ -5036,6 +5037,7 @@ pub async fn run_apply_inline_for_run(
         // validated it against the configured `[state]` backend).
         assume_fresh_state,
         None, // #1460: inline `rocky run`, not a persisted plan
+        contracts_dir,
     )
     .await
     .map(|_| ())

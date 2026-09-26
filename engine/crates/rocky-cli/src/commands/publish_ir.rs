@@ -80,6 +80,7 @@ pub fn run_publish_ir(
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: contracts_dir.map(Path::to_path_buf),
+        required_explicit_contract_model: None,
         source_schemas,
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: Vec::new(),

@@ -2578,8 +2578,65 @@ fn resolve_resume_progress(
 
 /// Execute `rocky run` — full pipeline.
 #[allow(clippy::too_many_arguments)]
-#[tracing::instrument(skip_all, name = "run", fields(run_id))]
 pub async fn run(
+    config_path: &Path,
+    loaded: std::sync::Arc<rocky_core::config::LoadedConfig>,
+    filter: Option<&str>,
+    pipeline_name_arg: Option<&str>,
+    state_path: &Path,
+    governance_override: Option<&GovernanceOverride>,
+    output_json: bool,
+    models_dir: Option<&Path>,
+    run_all: bool,
+    resume_run_id: Option<&str>,
+    resume_latest: bool,
+    shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
+    partition_opts: &PartitionRunOptions,
+    model_name_filter: Option<&str>,
+    cache_ttl_override: Option<u64>,
+    idempotency_key: Option<&str>,
+    env: Option<&str>,
+    defer_opts: &DeferOptions,
+    skip_opts: &SkipRunOptions,
+    run_vars: &rocky_core::run_vars::RunVars,
+    run_id_override: Option<&str>,
+    governed_ctx: Option<&crate::commands::apply::GovernedRunContext<'_>>,
+    assume_fresh_state: bool,
+    reviewed_source_state: Option<(&str, &[crate::output::ReplicationConnectorSnapshot])>,
+) -> Result<RunTermination> {
+    run_with_explicit_contracts(
+        config_path,
+        loaded,
+        filter,
+        pipeline_name_arg,
+        state_path,
+        governance_override,
+        output_json,
+        models_dir,
+        run_all,
+        resume_run_id,
+        resume_latest,
+        shadow_config,
+        partition_opts,
+        model_name_filter,
+        cache_ttl_override,
+        idempotency_key,
+        env,
+        defer_opts,
+        skip_opts,
+        run_vars,
+        run_id_override,
+        governed_ctx,
+        assume_fresh_state,
+        reviewed_source_state,
+        None,
+    )
+    .await
+}
+
+#[tracing::instrument(skip_all, name = "run", fields(run_id))]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_explicit_contracts(
     // Kept for directory resolution and sub-paths (models dir defaults,
     // hooks, the DAG replay) — NEVER re-read as a config: the parsed config
     // and its fingerprint arrive via `loaded` below.
@@ -2667,7 +2724,40 @@ pub async fn run(
     // SAME `decide_drift_scope` rule at the point the work is actually built,
     // which keeps the filter-scope tolerance identical.
     reviewed_source_state: Option<(&str, &[crate::output::ReplicationConnectorSnapshot])>,
+    contracts_dir: Option<&Path>,
 ) -> Result<RunTermination> {
+    // This first explicit-contract route is deliberately model-only. Validate
+    // it before the idempotency claim, state session, adapter, or warehouse
+    // work. In particular, an old idempotency key must never skip reading a
+    // changed model or contract while reporting a guarded success.
+    if contracts_dir.is_some() {
+        anyhow::ensure!(
+            model_name_filter.is_some() && pipeline_name_arg.is_some(),
+            "--contracts requires both --model and --pipeline"
+        );
+        anyhow::ensure!(
+            filter.is_none()
+                && models_dir.is_none()
+                && !run_all
+                && resume_run_id.is_none()
+                && !resume_latest
+                && shadow_config.is_none()
+                && !partition_opts.any_set()
+                && !defer_opts.enabled
+                && defer_opts.defer_to.is_none()
+                && idempotency_key.is_none()
+                && !skip_opts.skip_unchanged
+                && !skip_opts.no_prune
+                && governed_ctx.is_none()
+                && run_id_override.is_none()
+                && reviewed_source_state.is_none()
+                && !assume_fresh_state,
+            "--contracts supports only a fresh selected-model run; remove filter, models override, mixed execution, resume, shadow/branch, partition, defer, skip, idempotency, and governed-apply options"
+        );
+        // The named pipeline must be a transformation pipeline. Do not fall
+        // back to another adapter when the operator asked for a guard.
+        resolve_model_run_target(&loaded.config, pipeline_name_arg)?;
+    }
     // With `-o json` stdout is reserved for the JSON payload — route any
     // human-readable summary/progress line (e.g. a `depends_on` upstream
     // pipeline's "Copied …") to stderr so it can't precede the JSON document.
@@ -2813,8 +2903,11 @@ pub async fn run(
     // Resolve the model-skip gate once. Shadow / branch runs are never
     // skip-eligible (they write to different targets), so a shadow config
     // forces the gate inert regardless of the flag / config.
-    let skip_gate =
+    let mut skip_gate =
         SkipGateConfig::resolve(skip_opts, &rocky_cfg.run, shadow_config.is_some());
+    if contracts_dir.is_some() {
+        skip_gate.force_rebuild = true;
+    }
 
     let resume_requested = resume_run_id.is_some() || resume_latest;
 
@@ -2982,6 +3075,7 @@ pub async fn run(
             0, // duration filled at end
             1, // concurrency
         );
+        output.pipeline_type = Some("transformation".to_string());
         if let Some(ctx) = &idempotency_ctx {
             output.idempotency_key = Some(ctx.key.clone());
         }
@@ -2990,7 +3084,7 @@ pub async fn run(
         // error / contained runtime failure that still returns `Ok`) skips
         // governance below, not just a hard `Err`.
         let failures_before = output.tables_failed;
-        let exec_result = execute_models(
+        let exec_result = execute_models_with_explicit_contracts(
             &mdir,
             models_glob.as_deref(),
             warehouse.as_ref(),
@@ -3011,13 +3105,13 @@ pub async fn run(
             // not passed (clause 1 of the fail-closed decision). `--no-reuse`
             // suppresses the whole reuse path for this invocation — both the
             // point-to decision and the spine population it would feed.
-            rocky_cfg.reuse.enabled && !skip_opts.no_reuse,
+            rocky_cfg.reuse.enabled && !skip_opts.no_reuse && contracts_dir.is_none(),
             // Content-addressed column-level skip — its own `[reuse]` sub-key,
             // orthogonal to the point-to switch above but also disabled by
             // `--no-reuse`: the flag is the documented "force every
             // content-addressed model to BUILD" escape hatch, and a column
             // skip is a content-addressed non-build.
-            rocky_cfg.reuse.column_level && !skip_opts.no_reuse,
+            rocky_cfg.reuse.column_level && !skip_opts.no_reuse && contracts_dir.is_none(),
             run_vars,
             rocky_cfg.resilience.clone(),
             rocky_cfg.run.strict_scheduling,
@@ -3026,6 +3120,7 @@ pub async fn run(
             Some(&freeze_fence),
             // Finding #4: the `--model` path reconciles no masks.
             false,
+            contracts_dir,
         )
         .await;
 
@@ -10227,9 +10322,68 @@ pub(crate) async fn reconcile_model_governance(
     }
 }
 
-#[tracing::instrument(skip_all, name = "execute_models")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_models(
+    models_dir: &Path,
+    models_glob: Option<&str>,
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    state_store: Option<&StateStore>,
+    partition_opts: &PartitionRunOptions,
+    run_id: &str,
+    model_name_filter: Option<&str>,
+    model_set: Option<&std::collections::BTreeSet<String>>,
+    output: &mut RunOutput,
+    hook_registry: Option<&HookRegistry>,
+    pipeline_name: Option<&str>,
+    schema_cache_config: &rocky_core::config::SchemaCacheConfig,
+    auto_create_schemas: bool,
+    shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
+    defer_opts: &DeferOptions,
+    skip_gate: SkipGateConfig,
+    reuse_enabled: bool,
+    column_level_enabled: bool,
+    run_vars: &rocky_core::run_vars::RunVars,
+    resilience: rocky_core::config::ResilienceConfig,
+    strict_scheduling: bool,
+    retry_policy_allows: bool,
+    exec_fp_gate: Option<&crate::commands::apply::ExecFingerprintGate>,
+    freeze_fence: Option<&super::freeze_fence::FreezeFence>,
+    reconciles_masks: bool,
+) -> Result<GovernanceSnapshot> {
+    execute_models_with_explicit_contracts(
+        models_dir,
+        models_glob,
+        warehouse,
+        state_store,
+        partition_opts,
+        run_id,
+        model_name_filter,
+        model_set,
+        output,
+        hook_registry,
+        pipeline_name,
+        schema_cache_config,
+        auto_create_schemas,
+        shadow_config,
+        defer_opts,
+        skip_gate,
+        reuse_enabled,
+        column_level_enabled,
+        run_vars,
+        resilience,
+        strict_scheduling,
+        retry_policy_allows,
+        exec_fp_gate,
+        freeze_fence,
+        reconciles_masks,
+        None,
+    )
+    .await
+}
+
+#[tracing::instrument(skip_all, name = "execute_models")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_models_with_explicit_contracts(
     models_dir: &Path,
     models_glob: Option<&str>,
     warehouse: &dyn rocky_core::traits::WarehouseAdapter,
@@ -10332,6 +10486,7 @@ pub(crate) async fn execute_models(
     // that path never masks would falsely refuse. The plan side computes the same
     // value from the resolved pipeline type, keeping the fingerprint symmetric.
     reconciles_masks: bool,
+    contracts_dir: Option<&Path>,
 ) -> Result<GovernanceSnapshot> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
 
@@ -10399,7 +10554,9 @@ pub(crate) async fn execute_models(
 
     let compile_config = rocky_compiler::compile::CompilerConfig {
         models_dir: models_dir.to_path_buf(),
-        contracts_dir: None,
+        contracts_dir: contracts_dir.map(Path::to_path_buf),
+        required_explicit_contract_model: contracts_dir
+            .and_then(|_| model_name_filter.map(str::to_string)),
         source_schemas,
         // W004 wiring happens on the governance compile path later in
         // this function (it already holds the loaded `RockyConfig`).
@@ -10441,10 +10598,18 @@ pub(crate) async fn execute_models(
     };
 
     if let Some(name) = model_name_filter {
-        anyhow::ensure!(
-            compile_result.project.model(name).is_some(),
-            "model '{name}' not found (no transformation model with that name)"
-        );
+        let selected = compile_result.project.model(name).ok_or_else(|| {
+            anyhow::anyhow!("model '{name}' not found (no transformation model with that name)")
+        })?;
+        if contracts_dir.is_some() {
+            anyhow::ensure!(
+                matches!(
+                    selected.config.strategy,
+                    rocky_core::models::StrategyConfig::FullRefresh
+                ),
+                "--contracts currently supports only full_refresh models; '{name}' uses another strategy"
+            );
+        }
     }
 
     // #1291 is enforced by the E036 error diagnostic rather than a refusal
@@ -10471,6 +10636,14 @@ pub(crate) async fn execute_models(
             selected_model_paths.contains(path)
         })
         .context("invalid surrogate_key configuration")?;
+    if let Some(name) = model_name_filter
+        && contracts_dir.is_some()
+    {
+        anyhow::ensure!(
+            !surrogate_keys.contains_key(name),
+            "--contracts cannot yet guard model '{name}' because its surrogate_key changes the output after contract compilation"
+        );
+    }
 
     // ‼️ Governed-apply TOCTOU gate (E) — the single execution choke-point. The
     // fingerprint is recomputed over the EXACT compiled set about to execute
@@ -27415,6 +27588,85 @@ backend = "local"
             conn.execute_sql("SELECT id FROM main.broken").is_err(),
             "the compile-failed model must not have been materialized"
         );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn selected_contract_failure_preserves_the_existing_duckdb_table() {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = dir.path().join("models");
+        let contracts = dir.path().join("contracts");
+        std::fs::create_dir(&models).expect("models dir");
+        std::fs::create_dir(&contracts).expect("contracts dir");
+        write_plain_model(&models, "protected", "SELECT 8 AS id");
+        std::fs::write(
+            contracts.join("protected.contract.toml"),
+            "[rules]\nrequired = [\"id\", \"amount\"]\n",
+        )
+        .expect("contract");
+
+        let db_path = dir.path().join("t.duckdb");
+        {
+            let conn = rocky_duckdb::DuckDbConnector::open(&db_path).expect("open db");
+            conn.execute_sql("CREATE TABLE main.protected AS SELECT 7 AS id, 99 AS amount")
+                .expect("existing table");
+        }
+        let adapter = DuckDbWarehouseAdapter::open(&db_path).expect("open warehouse");
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        let result = super::execute_models_with_explicit_contracts(
+            &models,
+            None,
+            &adapter,
+            None,
+            &PartitionRunOptions::default(),
+            "guarded-test",
+            Some("protected"),
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            false,
+            None,
+            &DeferOptions::default(),
+            super::SkipGateConfig::off(),
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig::default(),
+            false,
+            true,
+            None,
+            None,
+            false,
+            Some(&contracts),
+        )
+        .await;
+        result.expect("compile rejection is carried in RunOutput");
+        assert_eq!(output.tables_failed, 1);
+        assert!(output.materializations.is_empty());
+        assert!(matches!(
+            output.derive_run_status(),
+            rocky_core::state::RunStatus::Failure
+        ));
+        assert!(
+            output.errors.iter().any(|error| {
+                error.failure_kind == crate::output::FailureKind::CompileError
+                    && error.error.contains("E010")
+                    && error.error.contains("amount")
+            }),
+            "E010 must reach the run's output errors: {:?}",
+            output.errors
+        );
+
+        drop(adapter);
+        let conn = rocky_duckdb::DuckDbConnector::open(&db_path).expect("reopen db");
+        let rows = conn
+            .execute_sql("SELECT 1 FROM main.protected WHERE id = 7 AND amount = 99")
+            .expect("original table must still have amount");
+        assert_eq!(rows.rows.len(), 1, "the original row must survive");
     }
 
     /// When every model fails to compile, the run is a total `Failure`:

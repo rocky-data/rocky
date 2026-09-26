@@ -59,12 +59,20 @@ pub struct ContractRules {
 pub fn load_contracts(dir: &Path) -> Result<HashMap<String, CompilerContract>, String> {
     let mut contracts = HashMap::new();
 
-    if !dir.exists() {
-        return Ok(contracts);
-    }
-
-    let entries =
-        std::fs::read_dir(dir).map_err(|e| format!("failed to read {}: {e}", dir.display()))?;
+    let entries = std::fs::read_dir(dir).map_err(|e| {
+        let why = if e.kind() == std::io::ErrorKind::NotFound {
+            match rocky_core::path_presence::classify_not_found(dir) {
+                rocky_core::path_presence::PathPresence::Present { detail } => detail,
+                rocky_core::path_presence::PathPresence::Absent => e.to_string(),
+            }
+        } else {
+            e.to_string()
+        };
+        format!(
+            "failed to read explicit contracts directory {}: {why}",
+            dir.display()
+        )
+    })?;
 
     for entry in entries {
         let entry = entry.map_err(|e| e.to_string())?;

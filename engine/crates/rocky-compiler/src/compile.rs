@@ -86,6 +86,10 @@ pub struct CompilerConfig {
     pub models_dir: PathBuf,
     /// Optional directory containing `.contract.toml` files.
     pub contracts_dir: Option<PathBuf>,
+    /// Require this model's contract to exist in the explicit directory.
+    /// Used by a selected model run so an empty or unrelated directory cannot
+    /// be reported as successful contract enforcement.
+    pub required_explicit_contract_model: Option<String>,
     /// Known source schemas (from warehouse DESCRIBE or cache).
     /// Keys are fully qualified table names (e.g., "catalog.schema.table").
     ///
@@ -381,9 +385,23 @@ pub fn compile_project(
             .map_err(CompileError::ContractLoad)?;
 
         // Merge explicit contracts dir (explicit wins on collision)
+        if config.required_explicit_contract_model.is_some() && config.contracts_dir.is_none() {
+            return Err(CompileError::ContractLoad(
+                "selected-model contract enforcement requires an explicit contracts directory"
+                    .to_string(),
+            ));
+        }
         if let Some(ref contracts_dir) = config.contracts_dir {
             let explicit =
                 contracts::load_contracts(contracts_dir).map_err(CompileError::ContractLoad)?;
+            if let Some(name) = &config.required_explicit_contract_model
+                && !explicit.contains_key(name)
+            {
+                return Err(CompileError::ContractLoad(format!(
+                    "explicit contracts directory {} has no contract for selected model '{name}'",
+                    contracts_dir.display()
+                )));
+            }
             contract_map.extend(explicit);
         }
 
@@ -615,9 +633,23 @@ pub fn compile_incremental(
         let mut contract_map = contracts::discover_contracts_from_models(&project.models)
             .map_err(CompileError::ContractLoad)?;
 
+        if config.required_explicit_contract_model.is_some() && config.contracts_dir.is_none() {
+            return Err(CompileError::ContractLoad(
+                "selected-model contract enforcement requires an explicit contracts directory"
+                    .to_string(),
+            ));
+        }
         if let Some(ref contracts_dir) = config.contracts_dir {
             let explicit =
                 contracts::load_contracts(contracts_dir).map_err(CompileError::ContractLoad)?;
+            if let Some(name) = &config.required_explicit_contract_model
+                && !explicit.contains_key(name)
+            {
+                return Err(CompileError::ContractLoad(format!(
+                    "explicit contracts directory {} has no contract for selected model '{name}'",
+                    contracts_dir.display()
+                )));
+            }
             contract_map.extend(explicit);
         }
 
@@ -889,6 +921,122 @@ mod tests {
             std::fs::write(dir.join(format!("{name}.sql")), "SELECT 1 AS id\n")
                 .expect("write model");
         }
+    }
+
+    #[test]
+    fn selected_model_requires_a_contract_in_the_explicit_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        write_flat_models(&models_dir, 12);
+        // Auto-discovery must not satisfy an explicitly requested guard.
+        std::fs::write(
+            models_dir.join("m00.contract.toml"),
+            "[rules]\nrequired = [\"ghost\"]\n",
+        )
+        .expect("auto contract");
+
+        let explicit_dir = tmp.path().join("explicit");
+        let config = CompilerConfig {
+            models_dir: models_dir.clone(),
+            contracts_dir: Some(explicit_dir.clone()),
+            required_explicit_contract_model: Some("m00".to_string()),
+            ..Default::default()
+        };
+        let load_error = |config: &CompilerConfig| match compile(config) {
+            Err(CompileError::ContractLoad(message)) => message,
+            Err(other) => panic!("unexpected compile error: {other}"),
+            Ok(_) => panic!("explicit contract requirement was not enforced"),
+        };
+        assert!(
+            load_error(&config).contains("failed to read explicit contracts directory"),
+            "missing directory must fail"
+        );
+
+        std::fs::create_dir(&explicit_dir).expect("explicit dir");
+        assert!(
+            load_error(&config).contains("no contract for selected model 'm00'"),
+            "an empty explicit directory must fail despite auto-discovery"
+        );
+        std::fs::write(
+            explicit_dir.join("m01.contract.toml"),
+            "[rules]\nrequired = [\"id\"]\n",
+        )
+        .expect("unrelated contract");
+        assert!(
+            load_error(&config).contains("no contract for selected model 'm00'"),
+            "an unrelated explicit contract must fail"
+        );
+
+        std::fs::write(
+            explicit_dir.join("m00.contract.toml"),
+            "[rules]\nrequired = [\"id\"]\n",
+        )
+        .expect("selected contract");
+        let valid = compile(&config).expect("explicit contract replaces auto-discovered one");
+        assert!(
+            !valid
+                .diagnostics
+                .iter()
+                .any(|d| d.model == "m00" && d.code.as_ref() == "E010"),
+            "the selected explicit contract must win over the auto-discovered ghost requirement"
+        );
+
+        std::fs::write(
+            explicit_dir.join("m00.contract.toml"),
+            "[rules]\nrequired = [\"amount\"]\n",
+        )
+        .expect("breaking contract");
+        let broken = compile(&config).expect("diagnostic-bearing compile");
+        assert!(
+            broken.diagnostics.iter().any(|d| {
+                d.model == "m00" && d.code.as_ref() == "E010" && d.message.contains("amount")
+            }),
+            "the selected contract must produce E010 on the owned compile result"
+        );
+    }
+
+    #[test]
+    fn incremental_compile_rechecks_the_required_explicit_contract() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models_dir = tmp.path().join("models");
+        let contracts_dir = tmp.path().join("contracts");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        std::fs::create_dir_all(&contracts_dir).expect("contracts dir");
+        write_flat_models(&models_dir, 12);
+        std::fs::write(
+            contracts_dir.join("m00.contract.toml"),
+            "[rules]\nrequired = [\"id\"]\n",
+        )
+        .expect("contract");
+        let config = CompilerConfig {
+            models_dir: models_dir.clone(),
+            contracts_dir: Some(contracts_dir.clone()),
+            required_explicit_contract_model: Some("m00".to_string()),
+            ..Default::default()
+        };
+        let first = compile(&config).expect("healthy baseline");
+        assert!(!first.has_errors);
+
+        let edited = models_dir.join("m00.sql");
+        std::fs::write(&edited, "SELECT 1 AS qty\n").expect("break model");
+        let incremental = compile_incremental(&config, std::slice::from_ref(&edited), &first)
+            .expect("incremental compile");
+        assert!(
+            incremental
+                .diagnostics
+                .iter()
+                .any(|d| d.model == "m00" && d.code.as_ref() == "E010"),
+            "incremental compilation must not reuse the former passing contract result"
+        );
+
+        std::fs::remove_file(contracts_dir.join("m00.contract.toml"))
+            .expect("remove required contract");
+        let result = compile_incremental(&config, std::slice::from_ref(&edited), &first);
+        assert!(
+            matches!(result, Err(CompileError::ContractLoad(ref message)) if message.contains("no contract for selected model 'm00'")),
+            "incremental compile must not treat a removed explicit contract as success"
+        );
     }
 
     /// The companion to the non-UTF-8 test below, on an ordinary ASCII path so
