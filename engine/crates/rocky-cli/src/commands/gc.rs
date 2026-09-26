@@ -1538,6 +1538,37 @@ async fn gc_seam_regate(
     fresh_store: Option<&StateStore>,
     stage: &str,
 ) -> Result<(), rocky_core::state_sync::StateSyncError> {
+    seam_regate(
+        "gc",
+        cfg,
+        plan_id,
+        principal,
+        touched,
+        models_dir,
+        models_glob,
+        prior_decisions,
+        fresh_store,
+        stage,
+    )
+    .await
+}
+
+/// [`gc_seam_regate`] for any review-gated seam: `plan_kind` names the plan
+/// kind in a refusal (`gc`, `restore`). The restore seam re-runs the same
+/// gate per attempt and before every object-store write (#1242).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn seam_regate(
+    plan_kind: &str,
+    cfg: Option<&rocky_core::config::RockyConfig>,
+    plan_id: &str,
+    principal: rocky_core::config::PolicyPrincipal,
+    touched: &BTreeMap<String, PolicyCapability>,
+    models_dir: &Path,
+    models_glob: Option<&str>,
+    prior_decisions: &[rocky_core::state::PolicyDecisionRecord],
+    fresh_store: Option<&StateStore>,
+    stage: &str,
+) -> Result<(), rocky_core::state_sync::StateSyncError> {
     use rocky_core::state_sync::StateSyncError;
     let Some(cfg) = cfg else {
         return Ok(());
@@ -1569,7 +1600,7 @@ async fn gc_seam_regate(
         }) => {
             let rule = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
             return Err(StateSyncError::SeamTransition(format!(
-                "policy DENIES gc plan '{plan_id}' {stage}: model '{model}'{rule} — {reason}"
+                "policy DENIES {plan_kind} plan '{plan_id}' {stage}: model '{model}'{rule} — {reason}"
             )));
         }
         Err(_) => return Ok(()),
@@ -1600,7 +1631,7 @@ async fn gc_seam_regate(
     {
         let rule = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
         return Err(StateSyncError::SeamTransition(format!(
-            "policy DENIES gc plan '{plan_id}' {stage}: model '{model}'{rule} — {reason}"
+            "policy DENIES {plan_kind} plan '{plan_id}' {stage}: model '{model}'{rule} — {reason}"
         )));
     }
     Ok(())

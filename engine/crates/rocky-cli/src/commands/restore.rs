@@ -507,6 +507,51 @@ async fn discover_table_state(
         .map_err(|e| anyhow!("could not discover the table's state from its _delta_log: {e}"))
 }
 
+/// The policy fence a remote restore runs before every object-store write
+/// (#1242).
+///
+/// A restored object is written outside the state blob, so the blob's CAS
+/// cannot undo it. A freeze that lands mid-loop, as a marker or as a ledger
+/// row, must stop the next write. The fence re-runs the real gate: a fresh
+/// marker LIST plus the attempt's decision snapshot. A LIST failure refuses.
+/// It owns its inputs so a [`LedgerSeamSession`] attempt can carry it.
+///
+/// [`LedgerSeamSession`]: rocky_core::state_sync::LedgerSeamSession
+#[derive(Clone)]
+struct RestoreFence {
+    cfg: rocky_core::config::RockyConfig,
+    plan_id: String,
+    principal: PolicyPrincipal,
+    touched: BTreeMap<String, PolicyCapability>,
+    models_dir: std::path::PathBuf,
+    models_glob: Option<String>,
+    prior_decisions: Vec<rocky_core::state::PolicyDecisionRecord>,
+}
+
+impl RestoreFence {
+    /// Re-run the gate. `fresh_store` records the decision rows (audit) at
+    /// the start of an attempt; the fences inside the attempt pass `None`.
+    async fn check(
+        &self,
+        fresh_store: Option<&StateStore>,
+        stage: &str,
+    ) -> Result<(), rocky_core::state_sync::StateSyncError> {
+        crate::commands::gc::seam_regate(
+            "restore",
+            Some(&self.cfg),
+            &self.plan_id,
+            self.principal,
+            &self.touched,
+            &self.models_dir,
+            self.models_glob.as_deref(),
+            &self.prior_decisions,
+            fresh_store,
+            stage,
+        )
+        .await
+    }
+}
+
 /// Restore one planned tombstone. Most early exits are refusals that wrote
 /// nothing — the pre-write verification is fail-closed — with ONE exception:
 /// an artifact that re-derived, hash-verified, and was written can still refuse
@@ -516,6 +561,10 @@ async fn discover_table_state(
 /// tombstone → bind recipe to the exact hash → re-derive → **hash-verify before
 /// any write** → materialize (verify-or-create-only) → reinstate the ledger row
 /// atomically.
+///
+/// With a `fence`, the gate re-runs right before the object-store step. A
+/// fence refusal is an `Err`: it aborts the whole attempt, not just this row.
+#[allow(clippy::too_many_arguments)]
 async fn restore_one(
     store: &StateStore,
     stores: &dyn RestoreStores,
@@ -524,15 +573,16 @@ async fn restore_one(
     plan_id: &str,
     planned: &RestorePlanRestoration,
     now: DateTime<Utc>,
-) -> RestoreOneOutcome {
+    fence: Option<&RestoreFence>,
+) -> Result<RestoreOneOutcome> {
     let refuse = |reason: String| {
-        RestoreOneOutcome::Refused(RestoreRefusedOutput {
+        Ok(RestoreOneOutcome::Refused(RestoreRefusedOutput {
             model_name: planned.model_name.clone(),
             run_id: planned.run_id.clone(),
             blake3_hash: planned.blake3_hash.clone(),
             size_bytes: planned.size_bytes,
             reason,
-        })
+        }))
     };
 
     // 1. Re-resolve the LIVE tombstone at FULL identity — the plan is
@@ -673,6 +723,12 @@ async fn restore_one(
         }
     };
     let obj_path = ObjPath::from(format!("{key_prefix}/{relative}"));
+    if let Some(fence) = fence {
+        fence
+            .check(None, "before writing restored bytes")
+            .await
+            .map_err(anyhow::Error::from)?;
+    }
     let bytes_written =
         match verify_or_create(&obj_store, &obj_path, &parquet, &tomb.blake3_hash).await {
             Ok(wrote) => wrote,
@@ -702,7 +758,7 @@ async fn restore_one(
         }
     };
     match outcome {
-        RestoreOutcome::Restored => RestoreOneOutcome::Restored(RestoredOutput {
+        RestoreOutcome::Restored => Ok(RestoreOneOutcome::Restored(RestoredOutput {
             model_name: tomb.model_name.clone(),
             run_id: tomb.run_id.clone(),
             blake3_hash: tomb.blake3_hash.clone(),
@@ -718,9 +774,9 @@ async fn restore_one(
                  ledger row reinstated"
                     .to_string()
             },
-        }),
+        })),
         RestoreOutcome::AlreadyRestored => {
-            RestoreOneOutcome::AlreadyRestored(tomb.blake3_hash.clone())
+            Ok(RestoreOneOutcome::AlreadyRestored(tomb.blake3_hash.clone()))
         }
         RestoreOutcome::HashMismatch { expected, found } => refuse(format!(
             "the ledger row at this location changed to hash {}… (expected {}…) between \
@@ -809,7 +865,9 @@ async fn verify_or_create(
 /// The restoration engine: re-resolve each planned tombstone against the live
 /// custody ledger and restore it fail-closed. Pure over its inputs (`store`,
 /// `stores`, `now`) so tests drive it directly; the review + policy gates live
-/// in [`run_restore_apply_in_with`] and run *before* this is called.
+/// in [`run_restore_apply_in_with`] and run *before* this is called. A remote
+/// restore passes a `fence`, which re-runs the gate before every object-store
+/// write; a fence refusal is the only `Err` after a mutation.
 async fn execute_restore_apply(
     store: &StateStore,
     stores: &dyn RestoreStores,
@@ -817,6 +875,7 @@ async fn execute_restore_apply(
     plan_id: &str,
     plan: &RestorePlan,
     now: DateTime<Utc>,
+    fence: Option<&RestoreFence>,
 ) -> Result<RestoreApplyOutput> {
     let tombstones = store
         .list_tombstones()
@@ -827,7 +886,18 @@ async fn execute_restore_apply(
     let mut already_restored: Vec<String> = Vec::new();
 
     for planned in &plan.restorations {
-        match restore_one(store, stores, warehouse, &tombstones, plan_id, planned, now).await {
+        match restore_one(
+            store,
+            stores,
+            warehouse,
+            &tombstones,
+            plan_id,
+            planned,
+            now,
+            fence,
+        )
+        .await?
+        {
             RestoreOneOutcome::Restored(out) => restored.push(out),
             RestoreOneOutcome::AlreadyRestored(hash) => already_restored.push(hash),
             RestoreOneOutcome::Refused(r) => refused.push(r),
@@ -899,8 +969,8 @@ pub(crate) async fn run_restore_apply_in(
         state_path,
         runtime_principal,
         json,
-        &S3RestoreStores,
-        warehouse.as_ref(),
+        Arc::new(S3RestoreStores),
+        warehouse,
         // Finding 1: reuse the SAME snapshot the adapter was built from.
         Some(cfg),
     )
@@ -918,8 +988,9 @@ pub(crate) async fn run_restore_apply_in_with(
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
     json: bool,
-    stores: &dyn RestoreStores,
-    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    // Owned (`Arc`) so a remote restore's ledger-seam attempt can carry them.
+    stores: Arc<dyn RestoreStores>,
+    warehouse: Arc<dyn rocky_core::traits::WarehouseAdapter>,
     // Finding 1: the SAME config snapshot the caller already loaded (the outer
     // `run_restore_apply_in` loaded it to build the recording-warehouse adapter).
     // Threaded in so the freeze/policy gate + `[state]` sync read the config the
@@ -1014,27 +1085,95 @@ pub(crate) async fn run_restore_apply_in_with(
         );
     }
 
-    let store = StateStore::open(state_path)
-        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-    // Finding 5: restore MUTATES the object store + the local artifact/tombstone
-    // ledger as it executes, so a mid-run failure can still have committed state.
-    // CAPTURE the result (don't `?` it), release the store lock, ALWAYS run the
-    // fail-closed upload-after, THEN handle the captured result — a failure must
-    // not skip the durability upload (else the next run's start-download reverts
-    // the partial restoration).
-    let exec_result =
-        execute_restore_apply(&store, stores, warehouse, plan_id, &plan, Utc::now()).await;
-    // Drop the store to release the advisory lock / flush the file before upload.
-    drop(store);
-
-    // Finding 2b + 5 (upload-after, unconditional): push whatever restore wrote to
-    // local state to the remote backend (fail-closed) so it is durable.
-    crate::commands::apply::upload_remote_ledger_fail_closed(
-        loaded_cfg.as_ref(),
-        state_path,
-        "restore apply",
-    )
-    .await?;
+    let remote_cfg = loaded_cfg
+        .as_ref()
+        .filter(|cfg| !matches!(cfg.state.backend, rocky_core::config::StateBackend::Local));
+    let exec_result = match remote_cfg {
+        // Remote backend: the restoration is a ledger-seam transition (#1242).
+        // Under effective CAS the session replays the WHOLE transition on the
+        // winner after a conflict: a fresh download, the gate re-run on the
+        // fresh ledger, every tombstone re-resolved, every present object
+        // re-hashed, every ledger row re-applied. Without CAS it keeps the
+        // legacy shape (download, transition, forced-`Fail` upload). A
+        // refused attempt publishes nothing; its local rows are replaced by
+        // the remote winner. Bytes it already wrote are hash-verified evicted
+        // bytes, so a re-run reinstates them without writing.
+        Some(cfg) => {
+            let session = rocky_core::state_sync::LedgerSeamSession::new(
+                &cfg.state,
+                state_path,
+                cfg.cache.schemas.replicate,
+            );
+            let base_fence = RestoreFence {
+                cfg: cfg.clone(),
+                plan_id: plan_id.to_string(),
+                principal: plan_record.enforcement_principal(runtime_principal),
+                touched: touched.clone(),
+                models_dir: models_dir.clone(),
+                models_glob: models_glob.clone(),
+                prior_decisions: Vec::new(),
+            };
+            let seam_plan = plan.clone();
+            let now = Utc::now();
+            session
+                .execute(move |fresh_store, _fresh_base| {
+                    let mut fence = base_fence.clone();
+                    let plan = seam_plan.clone();
+                    let stores = Arc::clone(&stores);
+                    let warehouse = Arc::clone(&warehouse);
+                    Box::pin(async move {
+                        use rocky_core::state_sync::StateSyncError;
+                        // Snapshot BEFORE this attempt records anything, so a
+                        // fence never reads the attempt's own rows back.
+                        fence.prior_decisions =
+                            fresh_store.list_policy_decisions().map_err(|e| {
+                                StateSyncError::SeamTransition(format!(
+                                    "could not snapshot the fresh decision ledger: {e:#}"
+                                ))
+                            })?;
+                        fence
+                            .check(Some(fresh_store), "during this restore apply")
+                            .await?;
+                        let out = execute_restore_apply(
+                            fresh_store,
+                            stores.as_ref(),
+                            warehouse.as_ref(),
+                            &fence.plan_id,
+                            &plan,
+                            now,
+                            Some(&fence),
+                        )
+                        .await
+                        .map_err(|e| StateSyncError::SeamTransition(format!("{e:#}")))?;
+                        fence
+                            .check(None, "after restoration, before publish")
+                            .await?;
+                        Ok(out)
+                    })
+                })
+                .await
+                .with_context(|| {
+                    format!("failed to commit restore apply '{plan_id}' to shared remote state")
+                })
+        }
+        // Local backend or no config: the on-disk file is the state. There is
+        // no remote to publish to.
+        None => {
+            let store = StateStore::open(state_path).with_context(|| {
+                format!("failed to open state store at {}", state_path.display())
+            })?;
+            execute_restore_apply(
+                &store,
+                stores.as_ref(),
+                warehouse.as_ref(),
+                plan_id,
+                &plan,
+                Utc::now(),
+                None,
+            )
+            .await
+        }
+    };
 
     let output = exec_result?;
     if json {
@@ -1584,8 +1723,8 @@ mod tests {
                 &state_path,
                 PolicyPrincipal::Human,
                 true,
-                &stores,
-                &fresh_duckdb(),
+                Arc::new(SharedStore(stores.0.clone())),
+                Arc::new(fresh_duckdb()),
                 rocky_core::config::load_rocky_config(&config).ok(),
             )
             .await
@@ -1625,8 +1764,8 @@ mod tests {
                 &state_path,
                 PolicyPrincipal::Human,
                 true,
-                &stores,
-                &fresh_duckdb(),
+                Arc::new(SharedStore(stores.0.clone())),
+                Arc::new(fresh_duckdb()),
                 rocky_core::config::load_rocky_config(&config).ok(),
             )
             .await
@@ -1897,8 +2036,10 @@ mod tests {
                 "restore-plan",
                 &planned,
                 Utc::now(),
+                None,
             )
-            .await;
+            .await
+            .unwrap();
 
             let RestoreOneOutcome::Refused(refused) = outcome else {
                 panic!(
@@ -1965,8 +2106,8 @@ mod tests {
                 &state_path,
                 PolicyPrincipal::Human,
                 true,
-                &SharedStore(cas.clone()),
-                &fresh_duckdb(),
+                Arc::new(SharedStore(cas.clone())),
+                Arc::new(fresh_duckdb()),
                 rocky_core::config::load_rocky_config(&config).ok(),
             )
             .await
@@ -2078,6 +2219,7 @@ mod tests {
                     }],
                 },
                 Utc::now(),
+                None,
             )
             .await
             .unwrap();
@@ -2145,6 +2287,7 @@ mod tests {
                     }],
                 },
                 Utc::now(),
+                None,
             )
             .await
             .unwrap();
@@ -2192,8 +2335,8 @@ mod tests {
                 &state_path,
                 PolicyPrincipal::Human,
                 true,
-                &SharedStore(cas.clone()),
-                &fresh_duckdb(),
+                Arc::new(SharedStore(cas.clone())),
+                Arc::new(fresh_duckdb()),
                 rocky_core::config::load_rocky_config(&config).ok(),
             )
             .await
@@ -2221,8 +2364,8 @@ mod tests {
                 &state_path,
                 PolicyPrincipal::Human,
                 true,
-                &SharedStore(cas.clone()),
-                &fresh_duckdb(),
+                Arc::new(SharedStore(cas.clone())),
+                Arc::new(fresh_duckdb()),
                 rocky_core::config::load_rocky_config(&config).ok(),
             )
             .await
@@ -2560,6 +2703,7 @@ mod tests {
                 "restore-live-plan",
                 &plan,
                 Utc::now(),
+                None,
             )
             .await
             .expect("restore apply");
@@ -2604,6 +2748,7 @@ mod tests {
                 "restore-live-plan",
                 &plan,
                 Utc::now(),
+                None,
             )
             .await
             .expect("idempotent re-apply");
@@ -2631,6 +2776,302 @@ mod tests {
                 ))
                 .await
                 .expect("teardown");
+        }
+
+        // -- #1242: the restore apply seam under compare-and-swap ----------
+
+        /// A remote `[state]` on the harness's in-memory "S3", with CAS on.
+        /// `policy` adds an empty `[policy]` block so the fence evaluates.
+        fn write_cas_restore_config(root: &Path, policy: bool) -> std::path::PathBuf {
+            std::fs::create_dir_all(root.join("models")).unwrap();
+            let path = root.join("rocky.toml");
+            let mut body = "[state]\nbackend = \"s3\"\ns3_bucket = \"test\"\n\
+                            concurrency_control = \"cas\"\non_upload_failure = \"skip\"\n\n\
+                            [state.retry]\nmax_retries = 0\n"
+                .to_string();
+            if policy {
+                body.push_str("\n[policy]\nversion = 1\n");
+            }
+            std::fs::write(&path, body).unwrap();
+            path
+        }
+
+        /// What a [`HookStores`] does on its `n`-th `store_for` call. That
+        /// call runs inside a seam attempt, after the attempt's download and
+        /// before its CAS put.
+        enum Hook {
+            /// Another pod publishes a run record: a genuine CAS winner.
+            PublishWinner(Box<rocky_core::config::StateConfig>, std::path::PathBuf),
+            /// An operator freezes every principal with a durable marker.
+            FreezeMarker(rocky_core::object_store::ObjectStoreProvider),
+        }
+
+        struct HookStores {
+            cas: Arc<InMemory>,
+            calls: std::sync::atomic::AtomicUsize,
+            on_call: usize,
+            hook: Hook,
+        }
+
+        impl RestoreStores for HookStores {
+            fn store_for(&self, _storage_prefix: &str) -> Result<Arc<dyn ObjectStore>> {
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if n == self.on_call {
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            match &self.hook {
+                                Hook::PublishWinner(cfg, path) => {
+                                    let _ =
+                                        rocky_core::state_sync::download_state(cfg, path, false)
+                                            .await
+                                            .unwrap();
+                                    {
+                                        let store = StateStore::open(path).unwrap();
+                                        record_run(&store, "r-winner", "winner_model");
+                                    }
+                                    rocky_core::state_sync::upload_state(cfg, path, false)
+                                        .await
+                                        .unwrap();
+                                }
+                                Hook::FreezeMarker(provider) => {
+                                    let marker = rocky_core::freeze_marker::FreezeMarker {
+                                        freeze_id: "mid-restore".to_string(),
+                                        principal: PolicyPrincipal::Human,
+                                        scope: "any".to_string(),
+                                        reason: "freeze landed mid-restore".to_string(),
+                                        created_at: Utc::now(),
+                                    };
+                                    rocky_core::freeze_marker::write_freeze_marker(
+                                        provider, &marker,
+                                    )
+                                    .await
+                                    .unwrap();
+                                }
+                            }
+                        });
+                    });
+                }
+                Ok(self.cas.clone() as Arc<dyn ObjectStore>)
+            }
+        }
+
+        /// Seed pod B with an evicted artifact, publish it as the remote
+        /// generation G0, and write a reviewed restore plan for it.
+        async fn seed_remote_restore(
+            harness: &rocky_core::test_harness::CrossPodHarness,
+            root: &Path,
+            cas: Arc<InMemory>,
+        ) -> (WriteResult, ObjPath, String) {
+            let (wr, obj_path) = seed_evicted(root, &harness.pod_b.state_path, cas).await;
+            harness.upload(&harness.pod_b).await.unwrap();
+            run_restore_plan_in(
+                root,
+                &harness.pod_b.state_path,
+                "orders",
+                PolicyPrincipal::Human,
+                true,
+            )
+            .unwrap();
+            let plan_id = find_plan_id(&root.join(".rocky").join("plans"));
+            write_review_marker(root, &plan_id);
+            (wr, obj_path, plan_id)
+        }
+
+        fn state_object_key() -> String {
+            format!(
+                "v{}/state.redb",
+                rocky_core::state::current_schema_version()
+            )
+        }
+
+        /// #1228's loss scenario on the restore seam. One armed conflict
+        /// rejects attempt 1. On attempt 2 another pod publishes a run
+        /// between the attempt's download and its CAS put, so that put loses
+        /// a genuine race. Attempt 3 replays the whole restoration on the
+        /// winner. The published blob holds BOTH effects, and no blob put is
+        /// unconditional. The object already exists, so every attempt
+        /// re-hashes it and none writes it. Before #1242 the restore
+        /// published with an unconditional put and erased the winner.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn cas_restore_seam_preserves_a_winner_landing_mid_seam() {
+            use rocky_core::fault_store::PutKind;
+            let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+            let harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+            let dir = TempDir::new().unwrap();
+            let root = dir.path();
+            let cas = Arc::new(InMemory::new());
+            let (wr, obj_path, plan_id) = seed_remote_restore(&harness, root, cas.clone()).await;
+            let seeded = cas.get(&obj_path).await.unwrap().bytes().await.unwrap();
+
+            let key = state_object_key();
+            harness.faults.arm_precondition_failures(&key, 1);
+            let updates = harness.faults.put_count(&key, PutKind::Update);
+            let unconditional = harness.faults.put_count(&key, PutKind::Unconditional);
+
+            let stores = Arc::new(HookStores {
+                cas: cas.clone(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                on_call: 2,
+                hook: Hook::PublishWinner(
+                    Box::new(harness.pod_a.cfg.clone()),
+                    harness.pod_a.state_path.clone(),
+                ),
+            });
+            let config = write_cas_restore_config(root, false);
+            run_restore_apply_in_with(
+                root,
+                &config,
+                &plan_id,
+                &harness.pod_b.state_path,
+                PolicyPrincipal::Human,
+                true,
+                stores.clone(),
+                Arc::new(fresh_duckdb()),
+                rocky_core::config::load_rocky_config(&config).ok(),
+            )
+            .await
+            .expect("the replay on the winner must commit");
+
+            assert_eq!(
+                harness.faults.put_count(&key, PutKind::Update) - updates,
+                3,
+                "an armed and an injected conflict force exactly three CAS attempts"
+            );
+            assert_eq!(
+                harness.faults.put_count(&key, PutKind::Unconditional) - unconditional,
+                1,
+                "the only unconditional put is the injected winner's own upload; the \
+                 restore seam never publishes with one"
+            );
+            assert_eq!(
+                stores.calls.load(std::sync::atomic::Ordering::SeqCst),
+                3,
+                "each attempt re-proves the restoration on its own download"
+            );
+            assert_eq!(
+                cas.get(&obj_path).await.unwrap().bytes().await.unwrap(),
+                seeded,
+                "the existing bytes were verified, never rewritten"
+            );
+
+            let _authority = harness.download(&harness.pod_a).await.unwrap();
+            let published = harness.open_store(&harness.pod_a);
+            assert!(
+                published.get_run("r-winner").unwrap().is_some(),
+                "the mid-seam winner survives the restore publish (#1228)"
+            );
+            assert_eq!(published.refcount_for_hash(&wr.blake3_hash).unwrap(), 1);
+            let tombs = published.list_tombstones().unwrap();
+            assert_eq!(tombs.len(), 1);
+            assert_eq!(tombs[0].restore_plan_id.as_deref(), Some(plan_id.as_str()));
+        }
+
+        /// Three straight conflicts exhaust the seam. The command fails with
+        /// the typed seam-conflict error and the remote keeps G0: no
+        /// restoration is published over it, and pod B's local file is back
+        /// to the remote winner.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn cas_restore_seam_exhaustion_fails_and_preserves_the_remote() {
+            let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+            let harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+            let dir = TempDir::new().unwrap();
+            let root = dir.path();
+            let cas = Arc::new(InMemory::new());
+            let (wr, _obj_path, plan_id) = seed_remote_restore(&harness, root, cas.clone()).await;
+            harness
+                .faults
+                .arm_precondition_failures(state_object_key(), 3);
+
+            let config = write_cas_restore_config(root, false);
+            let err = run_restore_apply_in_with(
+                root,
+                &config,
+                &plan_id,
+                &harness.pod_b.state_path,
+                PolicyPrincipal::Human,
+                true,
+                Arc::new(SharedStore(cas.clone())),
+                Arc::new(fresh_duckdb()),
+                rocky_core::config::load_rocky_config(&config).ok(),
+            )
+            .await
+            .expect_err("exhaustion must fail the command");
+            let cause = err
+                .chain()
+                .find_map(|c| c.downcast_ref::<rocky_core::state_sync::StateSyncError>());
+            assert!(
+                matches!(
+                    cause,
+                    Some(rocky_core::state_sync::StateSyncError::LedgerSeamConflict { .. })
+                ),
+                "got: {err:#}"
+            );
+
+            // Pod A reads the published blob; pod B's local file was put back
+            // to the remote winner by the session.
+            let _authority = harness.download(&harness.pod_a).await.unwrap();
+            for pod in [&harness.pod_a, &harness.pod_b] {
+                let store = harness.open_store(pod);
+                assert_eq!(
+                    store.refcount_for_hash(&wr.blake3_hash).unwrap(),
+                    0,
+                    "no restoration may outlive an exhausted seam"
+                );
+                assert!(store.list_tombstones().unwrap()[0].restored_at.is_none());
+            }
+        }
+
+        /// A freeze that lands mid-restore, between the attempt's gate and its
+        /// object write, is caught by the fence before the write. Nothing is
+        /// written to the object store and nothing is published.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_freeze_landing_mid_restore_stops_the_next_object_write() {
+            use rocky_core::fault_store::PutKind;
+            let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+            let harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+            let dir = TempDir::new().unwrap();
+            let root = dir.path();
+            let cas = Arc::new(InMemory::new());
+            let (wr, obj_path, plan_id) = seed_remote_restore(&harness, root, cas.clone()).await;
+            cas.delete(&obj_path).await.unwrap();
+            let key = state_object_key();
+            let updates = harness.faults.put_count(&key, PutKind::Update);
+
+            let stores = Arc::new(HookStores {
+                cas: cas.clone(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                on_call: 1,
+                hook: Hook::FreezeMarker(harness.provider.clone()),
+            });
+            let config = write_cas_restore_config(root, true);
+            let err = run_restore_apply_in_with(
+                root,
+                &config,
+                &plan_id,
+                &harness.pod_b.state_path,
+                PolicyPrincipal::Human,
+                true,
+                stores,
+                Arc::new(fresh_duckdb()),
+                rocky_core::config::load_rocky_config(&config).ok(),
+            )
+            .await
+            .expect_err("the fence must refuse the write");
+            assert!(
+                format!("{err:#}").contains("before writing restored bytes"),
+                "got: {err:#}"
+            );
+            assert!(
+                matches!(
+                    cas.get(&obj_path).await,
+                    Err(object_store::Error::NotFound { .. })
+                ),
+                "the fence runs BEFORE the object write"
+            );
+            assert_eq!(harness.faults.put_count(&key, PutKind::Update) - updates, 0);
+            let _authority = harness.download(&harness.pod_a).await.unwrap();
+            let published = harness.open_store(&harness.pod_a);
+            assert_eq!(published.refcount_for_hash(&wr.blake3_hash).unwrap(), 0);
         }
     }
 }
