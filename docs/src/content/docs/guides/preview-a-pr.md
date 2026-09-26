@@ -38,7 +38,7 @@ This does five things:
 
 `preview create` does **not** run the prune-set models itself. It emits `run_status: "planned"` with an empty `run_id`. Run `rocky run --branch <name>`, with a selector limited to the prune set, before `preview diff` or `preview cost`. That gives them a branch run to compare against.
 
-`preview diff` and `preview cost` pair the latest run whose `rocky_branch` is the preview name with a base run. Run `rocky run --branch pr_preview_fix_price` first. The current git branch can have a different name. The base selection excludes all `--branch` runs. An unmeasured row count stays unknown in the diff. `--sample-size` is accepted but ignored.
+`preview diff` and `preview cost` pair the latest run whose `rocky_branch` is the preview name with a base run. Run `rocky run --branch pr_preview_fix_price` first. The current git branch can have a different name. The base is always a production run. Base selection skips every `--branch` run and every plain `--shadow` or `--shadow-schema` run, because those runs wrote shadow tables. An unmeasured row count stays unknown in the diff. `--sample-size` is accepted but ignored.
 
 
 The output is a `PreviewCreateOutput` JSON document:

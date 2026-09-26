@@ -341,7 +341,7 @@ fn newest_branch_and_base_runs(
                     r.git_commit
                         .as_deref()
                         .is_some_and(|c| c.eq_ignore_ascii_case(&base_lower))
-                        && r.rocky_branch.is_none()
+                        && r.is_production()
                 })?
                 .into_iter()
                 .next();
@@ -361,15 +361,18 @@ fn newest_branch_and_base_runs(
                 )),
             ));
         }
-        // A NAMED base must match an ORDINARY run on that git branch, not a
+        // A NAMED base must match a PRODUCTION run on that git branch, not a
         // `--branch`-scoped one recorded there: `rocky run --branch scratch`
         // executed from git checkout `main` records `git_branch:
         // Some("main")`, `rocky_branch: Some("scratch")` — matching on
         // `git_branch` alone would hand a `--base main` caller that scoped
-        // run instead of an ordinary main run.
+        // run instead of an ordinary main run. A plain `--shadow` run is
+        // excluded the same way: it records no branch, but its targets are
+        // shadow tables, not the base (#2172). `RunRecord::is_production`
+        // reads both.
         let by_branch = store
             .list_runs_matching(1, |r| {
-                r.git_branch.as_deref() == Some(base_ref) && r.rocky_branch.is_none()
+                r.git_branch.as_deref() == Some(base_ref) && r.is_production()
             })?
             .into_iter()
             .next();
@@ -382,7 +385,7 @@ fn newest_branch_and_base_runs(
                 r.git_commit
                     .as_deref()
                     .is_some_and(|c| c.eq_ignore_ascii_case(&base_lower))
-                    && r.rocky_branch.is_none()
+                    && r.is_production()
             })?
             .into_iter()
             .next();
@@ -405,7 +408,7 @@ fn newest_branch_and_base_runs(
                     r.git_commit
                         .as_deref()
                         .is_some_and(|c| c.to_ascii_lowercase().starts_with(&base_lower))
-                        && r.rocky_branch.is_none()
+                        && r.is_production()
                 })?
                 .into_iter()
                 .next();
@@ -420,7 +423,7 @@ fn newest_branch_and_base_runs(
                         r.git_commit.as_deref().is_some_and(|c| {
                             let lower = c.to_ascii_lowercase();
                             lower.starts_with(&base_lower) && lower != first_sha
-                        }) && r.rocky_branch.is_none()
+                        }) && r.is_production()
                     })?
                     .into_iter()
                     .next();
@@ -452,27 +455,26 @@ fn newest_branch_and_base_runs(
             )),
         ));
     }
-    // Unnamed selection (the cost preview): newest run not on this branch —
-    // byte-for-byte main's behavior, detached runs included. Cost baselines
-    // from detached CI runs are deliberate (`run_audit` records
-    // `rocky_branch: None` there), and excluding them yielded an empty cost
-    // report mislabeled "No branch run yet".
+    // Unnamed selection (the cost preview): the newest PRODUCTION run,
+    // detached runs included. Cost baselines from detached CI runs are
+    // deliberate (`run_audit` records `rocky_branch: None` there), and
+    // excluding them yielded an empty cost report mislabeled "No branch run
+    // yet".
     //
-    // Matches on `rocky_branch`, same as the branch-side selection above and
-    // for the same reason (#2032): this must exclude the branch's OWN run
-    // from becoming its own base, and only `rocky_branch` reliably identifies
-    // that run.
+    // Production only (#2172): this branch's own run, another branch's run
+    // and a plain `--shadow` run all wrote shadow tables, so none of them is
+    // a base. `RunRecord::is_production` reads `run_scope`, and
+    // `rocky_branch` for a `--branch` run recorded before `run_scope`
+    // existed.
     //
     // The second clause covers a record written BEFORE `rocky_branch`
-    // existed: it forward-deserializes with `rocky_branch: None`, so the
-    // first clause alone cannot see it — but if its `git_branch` happens to
-    // equal this preview's branch name, that is the shape a pre-#2032 branch
-    // run actually had (back when `git_branch` was the pairing key), and it
-    // must not be treated as an ordinary "not this branch" candidate.
+    // existed (#2032): it forward-deserializes as production — but if its
+    // `git_branch` equals this preview's branch name, that is the shape a
+    // pre-#2032 branch run actually had (back when `git_branch` was the
+    // pairing key), and it must not be treated as a base candidate.
     let fallback = store
         .list_runs_matching(1, |r| {
-            r.rocky_branch.as_deref() != Some(branch_name)
-                && !(r.rocky_branch.is_none() && r.git_branch.as_deref() == Some(branch_name))
+            r.is_production() && r.git_branch.as_deref() != Some(branch_name)
         })?
         .into_iter()
         .next();
@@ -2588,6 +2590,44 @@ mod tests {
         assert!(note.is_none());
     }
 
+    /// #2172: a plain `rocky run --shadow` run records no `rocky_branch`,
+    /// the same as a production run, so it could become the preview base.
+    /// Its targets are shadow tables. Every base selection must skip it: by
+    /// git branch, by full commit sha, by sha prefix, and the unnamed cost
+    /// fallback. The shadow run is the NEWEST run on `main` at the same
+    /// commit, so it wins each race unless it is excluded.
+    #[test]
+    fn a_plain_shadow_run_is_never_the_base() {
+        use rocky_core::state::RunScope;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = chrono::Utc::now();
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut production = sample_run("production-main", base);
+            production.git_branch = Some("main".to_string());
+            production.git_commit = Some(sha.to_string());
+            store.record_run(&production).unwrap();
+            let mut shadow = sample_run("shadow-main", base + chrono::Duration::minutes(1));
+            shadow.git_branch = Some("main".to_string());
+            shadow.git_commit = Some(sha.to_string());
+            shadow.run_scope = RunScope::Shadow { schema: None };
+            store.record_run(&shadow).unwrap();
+        }
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        for base_ref in [Some("main"), Some(sha), Some(&sha[..10]), None] {
+            let (_b, base_run, note) =
+                newest_branch_and_base_runs(&store, "pr_7_fix_price", base_ref).unwrap();
+            assert_eq!(
+                base_run.map(|r| r.run_id).as_deref(),
+                Some("production-main"),
+                "base {base_ref:?} must be the production run, not the shadow run ({note:?})"
+            );
+        }
+    }
+
     /// Drain review of #2158, finding 4: a NAMED base match by git branch
     /// must exclude a `--branch`-scoped run recorded on that git checkout.
     /// `rocky run --branch scratch` executed from git branch `main` records
@@ -3342,6 +3382,7 @@ mod tests {
             // `run_record()` test. `newest_branch_and_base_runs`'s
             // selection tests use `sample_run()` instead.
             rocky_branch: None,
+            run_scope: rocky_core::state::RunScope::Production,
         }
     }
 

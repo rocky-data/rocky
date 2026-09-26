@@ -54,6 +54,11 @@ pub(crate) struct AuditContext {
     /// CLI flag. Distinct from `git_branch`: see
     /// [`rocky_core::state::RunRecord::rocky_branch`] (#2032).
     pub rocky_branch: Option<String>,
+    /// Where this run wrote: production, a plain shadow target, or a named
+    /// branch. Derived from the same `ShadowConfig` as `rocky_branch`, so the
+    /// two cannot disagree. See [`rocky_core::state::RunRecord::run_scope`]
+    /// (#2172).
+    pub run_scope: rocky_core::state::RunScope,
 }
 
 impl AuditContext {
@@ -70,14 +75,15 @@ impl AuditContext {
     ///   transformation/quality/snapshot/load pipelines it's the fully
     ///   resolved `target.catalog`. `None` on model-only runs where no
     ///   pipeline context exists.
-    /// * `rocky_branch` — the `--branch <name>` value in force for this run,
-    ///   or `None` for a production / plain-`--shadow` run. Not detected
-    ///   from the environment (unlike every other field here): the caller
-    ///   already resolved it while building the run's `ShadowConfig`.
+    /// * `shadow` — the run's `ShadowConfig`, or `None` for a production
+    ///   run. Not detected from the environment (unlike every other field
+    ///   here): the caller already built it from `--shadow` /
+    ///   `--shadow-schema` / `--branch`. Both `rocky_branch` and
+    ///   `run_scope` come from it.
     pub fn detect(
         idempotency_key: Option<String>,
         target_catalog: Option<String>,
-        rocky_branch: Option<String>,
+        shadow: Option<&rocky_core::shadow::ShadowConfig>,
     ) -> Self {
         Self {
             triggering_identity: detect_triggering_identity(),
@@ -88,7 +94,8 @@ impl AuditContext {
             target_catalog,
             hostname: detect_hostname(),
             rocky_version: ROCKY_VERSION.to_string(),
-            rocky_branch,
+            rocky_branch: shadow.and_then(|cfg| cfg.branch.clone()),
+            run_scope: rocky_core::state::RunScope::from_shadow(shadow),
         }
     }
 }
@@ -299,15 +306,35 @@ mod tests {
         assert_eq!(ctx.target_catalog, Some("warehouse_main".to_string()));
     }
 
-    /// `rocky_branch` is threaded straight through, unlike every other
-    /// field here — the caller resolves it (from `ShadowConfig::branch`),
-    /// not this detector (#2032).
+    /// `rocky_branch` and `run_scope` come from the caller's
+    /// `ShadowConfig`, unlike every other field here (#2032, #2172). A plain
+    /// `--shadow` run records no branch but is still not a production run.
     #[test]
-    fn rocky_branch_threaded_through() {
-        let ctx = AuditContext::detect(None, None, Some("pr-preview-fix-price".to_string()));
-        assert_eq!(ctx.rocky_branch, Some("pr-preview-fix-price".to_string()));
+    fn rocky_branch_and_run_scope_threaded_through() {
+        use rocky_core::shadow::ShadowConfig;
+        use rocky_core::state::RunScope;
+
+        let branch = ShadowConfig {
+            schema_override: Some("branch__pr_preview_fix_price".to_string()),
+            branch: Some("pr_preview_fix_price".to_string()),
+            ..ShadowConfig::default()
+        };
+        let ctx = AuditContext::detect(None, None, Some(&branch));
+        assert_eq!(ctx.rocky_branch, Some("pr_preview_fix_price".to_string()));
+        assert_eq!(
+            ctx.run_scope,
+            RunScope::Branch {
+                name: "pr_preview_fix_price".to_string()
+            }
+        );
+
+        let shadow = ShadowConfig::default();
+        let ctx = AuditContext::detect(None, None, Some(&shadow));
+        assert_eq!(ctx.rocky_branch, None);
+        assert_eq!(ctx.run_scope, RunScope::Shadow { schema: None });
 
         let ctx = AuditContext::detect(None, None, None);
         assert_eq!(ctx.rocky_branch, None);
+        assert_eq!(ctx.run_scope, RunScope::Production);
     }
 }

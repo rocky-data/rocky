@@ -702,6 +702,7 @@ mod tests {
             // Deliberately different from `git_branch` — the two are
             // independent fields (#2032).
             rocky_branch: Some("pr-preview-governance".to_string()),
+            run_scope: rocky_core::state::RunScope::Production,
         }
     }
 
@@ -807,6 +808,7 @@ mod tests {
             check_gate_failed: false,
             verify_after_failed: false,
             rocky_branch: None,
+            run_scope: rocky_core::state::RunScope::Production,
         }
     }
 

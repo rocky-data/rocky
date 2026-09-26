@@ -595,6 +595,7 @@ mod tests {
             check_gate_failed: false,
             verify_after_failed: false,
             rocky_branch: None,
+            run_scope: rocky_core::state::RunScope::Production,
         }
     }
 

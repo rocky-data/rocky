@@ -329,7 +329,7 @@ pub async fn run_transformation(
     let audit_ctx = super::run_audit::AuditContext::detect(
         idempotency_key.map(str::to_string),
         None,
-        shadow_config.and_then(|c| c.branch.clone()),
+        shadow_config,
     );
     let audit = super::run::audit_to_record(&audit_ctx);
     let custody = super::run::RecordCustody::from_persisted(super::run::persist_run_record(

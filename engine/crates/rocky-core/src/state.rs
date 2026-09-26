@@ -2688,6 +2688,77 @@ pub struct RunRecord {
     /// Guarded by `test_pre_rocky_branch_run_record_forward_deserializes_to_none`.
     #[serde(default)]
     pub rocky_branch: Option<String>,
+
+    /// Where this run wrote: production, a plain `--shadow` /
+    /// `--shadow-schema` target, or a named `--branch` (#2172).
+    ///
+    /// [`Self::rocky_branch`] alone cannot tell a plain shadow run from a
+    /// production run: both record `None`. So a `rocky run --shadow` run
+    /// looked like a production run, and `rocky preview diff` / `preview
+    /// cost` could pick it as the base, although its targets are shadow
+    /// tables. Base selection reads [`Self::is_production`] instead.
+    ///
+    /// Serde-defaulted to [`RunScope::Production`], so a record written
+    /// before this field existed forward-deserializes with no
+    /// `CURRENT_SCHEMA_VERSION` bump (the #1955 constraint). That default is
+    /// right for such a record, with one exception: a `--branch` run from
+    /// before this field. It carries `rocky_branch`, and
+    /// [`Self::is_production`] reads that too. Guarded by
+    /// `test_pre_run_scope_run_record_forward_deserializes_to_production`.
+    #[serde(default)]
+    pub run_scope: RunScope,
+}
+
+impl RunRecord {
+    /// Whether this run wrote production targets: its recorded scope is
+    /// [`RunScope::Production`] AND it carries no [`Self::rocky_branch`].
+    ///
+    /// The second half covers a `--branch` run recorded before
+    /// [`Self::run_scope`] existed. That record defaults to `Production`
+    /// but names its branch in `rocky_branch`, so it is not a production run.
+    pub fn is_production(&self) -> bool {
+        matches!(self.run_scope, RunScope::Production) && self.rocky_branch.is_none()
+    }
+}
+
+/// Where a run wrote its targets. Persisted on [`RunRecord::run_scope`]
+/// (#2172).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RunScope {
+    /// No `--shadow`, `--shadow-schema` or `--branch`: the run wrote the
+    /// configured targets. Also the value for a record written before this
+    /// field existed.
+    #[default]
+    Production,
+    /// A plain `rocky run --shadow` / `--shadow-schema` run.
+    Shadow {
+        /// The `--shadow-schema` value. `None` in suffix mode, where the
+        /// shadow tables sit next to production under a suffixed name.
+        schema: Option<String>,
+    },
+    /// A `rocky run --branch <name>` run.
+    Branch {
+        /// The literal `--branch` value, the same string as
+        /// [`RunRecord::rocky_branch`].
+        name: String,
+    },
+}
+
+impl RunScope {
+    /// The scope of a run executed under `shadow` (the run's
+    /// [`crate::shadow::ShadowConfig`], or `None` for a production run).
+    pub fn from_shadow(shadow: Option<&crate::shadow::ShadowConfig>) -> Self {
+        match shadow {
+            None => Self::Production,
+            Some(cfg) => match &cfg.branch {
+                Some(name) => Self::Branch { name: name.clone() },
+                None => Self::Shadow {
+                    schema: cfg.schema_override.clone(),
+                },
+            },
+        }
+    }
 }
 
 /// One executed data-quality check's pass/fail outcome, captured on a
@@ -7983,6 +8054,7 @@ mod tests {
             check_gate_failed: false,
             verify_after_failed: false,
             rocky_branch: None,
+            run_scope: RunScope::Production,
         }
     }
 
@@ -8384,6 +8456,89 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&branched).unwrap()).unwrap();
         assert_eq!(round.git_branch.as_deref(), Some("fix-price"));
         assert_eq!(round.rocky_branch.as_deref(), Some("pr-preview-fix-price"));
+    }
+
+    /// A `RunRecord` blob written before `run_scope` existed (#2172) has no
+    /// `run_scope` key. It must forward-deserialize as a production run,
+    /// unless it carries `rocky_branch`: that is a pre-#2172 `--branch`
+    /// run, and `is_production` must refuse it as a preview base.
+    #[test]
+    fn test_pre_run_scope_run_record_forward_deserializes_to_production() {
+        let strip = |record: &RunRecord| -> RunRecord {
+            let mut value = serde_json::to_value(record).expect("serialize run record");
+            let obj = value.as_object_mut().expect("record is an object");
+            assert!(
+                obj.remove("run_scope").is_some(),
+                "precondition: the field is serialized, so removing it models an old blob"
+            );
+            serde_json::from_slice(&serde_json::to_vec(&value).unwrap())
+                .expect("a pre-run_scope RunRecord must forward-deserialize")
+        };
+
+        let old_production = strip(&minimal_run_record("run-old-prod", vec![]));
+        assert_eq!(old_production.run_scope, RunScope::Production);
+        assert!(old_production.is_production());
+
+        let mut branched = minimal_run_record("run-old-branch", vec![]);
+        branched.rocky_branch = Some("fix_price".to_string());
+        let old_branch = strip(&branched);
+        assert_eq!(old_branch.run_scope, RunScope::Production);
+        assert!(
+            !old_branch.is_production(),
+            "an old --branch run names its branch in rocky_branch and is not production"
+        );
+
+        // Each scope round-trips and only production reads as production.
+        for scope in [
+            RunScope::Shadow { schema: None },
+            RunScope::Shadow {
+                schema: Some("_rocky_shadow".to_string()),
+            },
+            RunScope::Branch {
+                name: "fix_price".to_string(),
+            },
+        ] {
+            let mut record = minimal_run_record("run-scoped", vec![]);
+            record.run_scope = scope.clone();
+            let round: RunRecord =
+                serde_json::from_slice(&serde_json::to_vec(&record).unwrap()).unwrap();
+            assert_eq!(round.run_scope, scope);
+            assert!(!round.is_production(), "{scope:?} is not production");
+        }
+    }
+
+    /// `RunScope::from_shadow` maps the three run shapes: no shadow config,
+    /// a plain `--shadow` / `--shadow-schema`, and `--branch`.
+    #[test]
+    fn run_scope_from_shadow_maps_each_run_shape() {
+        use crate::shadow::ShadowConfig;
+        assert_eq!(RunScope::from_shadow(None), RunScope::Production);
+        let suffix = ShadowConfig::default();
+        assert_eq!(
+            RunScope::from_shadow(Some(&suffix)),
+            RunScope::Shadow { schema: None }
+        );
+        let schema = ShadowConfig {
+            schema_override: Some("_rocky_shadow".to_string()),
+            ..ShadowConfig::default()
+        };
+        assert_eq!(
+            RunScope::from_shadow(Some(&schema)),
+            RunScope::Shadow {
+                schema: Some("_rocky_shadow".to_string())
+            }
+        );
+        let branch = ShadowConfig {
+            schema_override: Some("branch__fix_price".to_string()),
+            branch: Some("fix_price".to_string()),
+            ..ShadowConfig::default()
+        };
+        assert_eq!(
+            RunScope::from_shadow(Some(&branch)),
+            RunScope::Branch {
+                name: "fix_price".to_string()
+            }
+        );
     }
 
     #[test]

@@ -1011,7 +1011,7 @@ rocky preview rows   --model <name> [--cte <name>] [--limit <N>]
 
 ### `rocky preview create`
 
-Compute the prune set and copy the rest from the base schema into a per-PR branch. It does not run the prune set: it reports `run_status: "planned"` with an empty `run_id`. Run `rocky run --branch <name>` over the prune set before `preview diff` or `preview cost`. `preview diff` pairs the run by its recorded `rocky_branch`, the literal `--branch` value. The base run excludes `--branch` runs.
+Compute the prune set and copy the rest from the base schema into a per-PR branch. It does not run the prune set: it reports `run_status: "planned"` with an empty `run_id`. Run `rocky run --branch <name>` over the prune set before `preview diff` or `preview cost`. `preview diff` pairs the run by its recorded `rocky_branch`, the literal `--branch` value. The base is always a production run: base selection skips `--branch`, `--shadow` and `--shadow-schema` runs.
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
